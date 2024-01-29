@@ -1,0 +1,10 @@
+.settings/
+/.settings/
+.cproject
+/.cproject
+/.project
+.vscode/c_cpp_properties.json
+.vscode/settings.json
+/build/
+language.settings.xml
+.DS_Store
