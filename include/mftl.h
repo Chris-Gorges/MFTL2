@@ -131,6 +131,17 @@ struct MFTL_Object
   UT_hash_handle hh;
 };
 
+/** Vector and quaternion operation */
+typedef struct _VecD
+{
+  MFTL_DOUBLE _[3];
+} VecD;
+
+typedef struct _QuatD
+{
+  MFTL_DOUBLE _[4];
+} QuatD;
+
 typedef struct MFTL_Point MFTL_Point;
 typedef struct MFTL_Triangle MFTL_Triangle;
 typedef struct MFTL_Vertex MFTL_Vertex;

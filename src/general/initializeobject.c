@@ -96,11 +96,11 @@ MFTL_ErrorCode MFTL_InitializeObject(MFTL_Object *Object, MFTL_INT M[3], MFTL_DO
   return (MFTL_SUCCESS);
 }
 
-MFTL_ErrorCode MFTL_InitializeObjectWithComm(MFTL_Object *Object, int M[3], double xmin[3], double xmax[3], MPI_Comm ObjectComm)
+MFTL_ErrorCode MFTL_InitializeObjectWithComm(MFTL_Object *Object, MFTL_INT M[3], MFTL_DOUBLE xmin[3], MFTL_DOUBLE xmax[3], MPI_Comm ObjectComm)
 {
   MFTL_INT ix[3];
   MFTL_DOUBLE dx[3];
-  int result;
+  MFTL_INT result;
 
   MPI_Comm_compare(MPI_COMM_WORLD, ObjectComm, &result);
 

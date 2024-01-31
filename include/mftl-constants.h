@@ -19,6 +19,7 @@ typedef long MFTL_LONG;
 typedef unsigned char MFTL_BYTE;
 typedef int MFTL_ErrorCode;
 typedef int ObjectIDType;
+typedef short MFTL_BOOL;
 
 extern MPI_Datatype MFTL_MPI_DOUBLE;
 extern MPI_Datatype MFTL_MPI_INT;

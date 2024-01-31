@@ -20,7 +20,7 @@
 
 int main(int argc, char *argv[])
 {
-  MFTL_Object MyObject;
+  MFTL_Object Object;
 
   // Domain size
   MFTL_DOUBLE xmin[] = {-5.0, -5.0, -5.0};
@@ -44,27 +44,28 @@ int main(int argc, char *argv[])
   /**********************************************/
   if (Object.rank == 0)
   {
-    MFTLGenerateSphere(&Object, 4);
-    MFTLScaleSurface(&Object, scale);
+    MFTL_GenerateSphere(&Object, 4);
+    MFTL_ScaleSurface(&Object, scale);
   }
   /**********************************************/
 
   // Print the data about the object (distribution over processors, volume,
   // centre)
-  MFTLShowSummary(&Object);
-  Volume = MFTLSurfaceCenter(&Object, Center);
-  printf("Proc %d: Object Characteristics: Volume %lf, Centre: %e %e %e\n", Object.rank, Volume, Center[0], Center[1], Center[2]);
+  MFTL_ShowSummary(&Object);
+  Volume = MFTL_SurfaceCenter(&Object, Center);
+  printf("Proc %d: Object Characteristics: Volume %lf, Centre: %e %e %e\n", (int) Object.rank, (double) Volume, (double) Center[0], (double) Center[1],
+         (double) Center[2]);
   MPI_Barrier(Object.OBJECT_COMM_WORLD[0]);
 
   //  // Rotate and move the body
-  double angle1[3] = {0.0, 0.0, 0.523599};
-  double centre_of_rotation[3] = {0., 0., 0.};
-  MFTLRotateBody(&Object, angle1, centre_of_rotation);
+  MFTL_DOUBLE angle1[3] = {0.0, 0.0, 0.523599};
+  MFTL_DOUBLE centre_of_rotation[3] = {0., 0., 0.};
+  MFTL_RotateBody(&Object, angle1, centre_of_rotation);
 
-  MFTLMoveBody(&Object, move);
+  MFTL_MoveBody(&Object, move);
 
-  MFTLShowSummary(&Object);
-  Volume = MFTLSurfaceCenter(&Object, Center);
+  MFTL_ShowSummary(&Object);
+  Volume = MFTL_SurfaceCenter(&Object, Center);
   printf("Proc %d: Object Characteristics: Volume %lf, Centre: %e %e %e\n", Object.rank, Volume, Center[0], Center[1], Center[2]);
   MPI_Barrier(Object.OBJECT_COMM_WORLD[0]);
 
