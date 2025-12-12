@@ -8,3 +8,10 @@
 /build/
 language.settings.xml
 .DS_Store
+.cache
+*.h5
+/rest/
+.cache/
+.vscode/
+/results/
+/build/
