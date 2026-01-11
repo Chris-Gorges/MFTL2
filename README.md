@@ -10,7 +10,7 @@ A high-performance C library for efficient manipulation and processing of triang
 - **Mesh Remeshing**: Advanced remeshing algorithms including edge collapse, edge flip, edge split, and vertex smoothing
 - **I/O Support**: Read/write support for GTS (GNU Triangulated Surface) and VTK formats
 - **Bounding Box Operations**: Oriented and unit bounding box generation for spatial queries
-- **Data Redistribution**: Automatic load balancing and data redistribution across processors
+- **Data Redistribution**: (Automatic load balancing) and data redistribution across processors
 - **Object Generation**: Built-in generators for spheres, cylinders, boxes, and cubes
 
 ## Requirements

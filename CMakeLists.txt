@@ -1,38 +1,68 @@
-cmake_minimum_required(VERSION 2.6)
+# Set the minimum required version of CMake.
+cmake_minimum_required(VERSION 3.10)
 
-project(MFTL2)
+# Define the project name and specify that it's a C project.
+project(MFTL C)
 
-#
-# Set compiler
-#
-set(MPIHOME $ENV{MPI_HOME})
-set(MFTL_SOURCE_DIR "/home/berend/git/Code/MFTL2")
+# --- Compiler and Build Settings ---
 
-IF(NOT MPIHOME)
-  message(FATAL_ERROR "Please set MPI_HOME variable to the place where MPI resides before running CMake")
-ENDIF(NOT MPIHOME)
+# This automatically finds mpicc and sets the necessary flags.
+find_package(MPI REQUIRED)
 
-set(CMAKE_C_COMPILER ${MPIHOME}/bin/mpicc)
-set(CMAKE_CXX_COMPILER ${MPIHOME}/bin/mpiCC)
+# Set the C standard to C99.
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
 
-set(CMAKE_C_FLAGS "-O0 -g -fPIC")
+# Add compiler and linker flags for the Address Sanitizer, but *only*
+# for the Debug build type, using a generator expression.
+add_compile_options($<$<CONFIG:Debug>:-fsanitize=address>)
+add_link_options($<$<CONFIG:Debug>:-fsanitize=address>)
 
-# Includes
-include_directories(${MFTL_SOURCE_DIR}/include)
+# Set a variable for our library's include directory.
+set(MFTL_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/include)
+# Set a variable for our library's output directory.
+set(MFTL_LIB_DIR ${CMAKE_BINARY_DIR}/lib)
 
-# C files
-FILE(GLOB_RECURSE MYFILES ABSOLUTE ${MFTL_SOURCE_DIR}/src/*.c)
+# Add the include directory to the search path for header files.
+include_directories(${MFTL_INCLUDE_DIR})
+include_directories(${CMAKE_SOURCE_DIR}/external)
 
-add_library(MFTL STATIC ${MYFILES})
+# --- Library Target ---
 
-set(mylibs lapack blas gsl gslcblas)
-set(mylibdirs $ENV{PETSC_DIR}/$ENV{PETSC_ARCH}/lib)
-set(mylibdirs /usr/lib64/)
-link_directories(${mylibdirs})
+# Find all the .c files in the src/ directory and its subdirectories.
+file(GLOB_RECURSE MFTL_SOURCES "src/*.c")
 
-# add_executable(MFTL ${MYFILES})
+# Create a static library named "MFTL" from the source files.
+# This will produce libMFTL.a
+add_library(MFTL STATIC ${MFTL_SOURCES})
 
-# target_link_libraries(MFTL ${mylibs})
+# Link the MFTL library itself against MPI. This provides the necessary
+# include directories (for mpi.h) and compiler flags.
+target_link_libraries(MFTL PUBLIC MPI::MPI_C)
 
-# find_package(GSL REQUIRED)
-# target_link_libraries(MFTL)
+# Set the output directory for the compiled library file (.a)
+set_target_properties(MFTL PROPERTIES
+    ARCHIVE_OUTPUT_DIRECTORY ${MFTL_LIB_DIR}
+)
+
+# --- Executable Target ---
+
+# Create an executable named "MFTLTest" from main.c
+# add_executable(MFTLTest examples/sphere_creation_serial.c)
+# add_executable(MFTLTest examples/parallel_advection_redistribute_sequential.c)
+# add_executable(MFTLTest examples/parallel_advection_redistribute_list.c)
+
+
+# Link the executable against our MFTL library.
+# This automatically handles finding libMFTL.a and linking it.
+# target_link_libraries(MFTLTest PRIVATE MFTL)
+
+# Also link against the math library (-lm). The MPI library is already
+# linked transitively through our MFTL library.
+# target_link_libraries(MFTLTest PRIVATE m)
+
+# Ensure the executable knows where to find the MFTL headers.
+# target_include_directories(MFTLTest PRIVATE ${MFTL_INCLUDE_DIR})
+
+# A message to show where the library will be built.
+message(STATUS "MFTL library will be built in: ${MFTL_LIB_DIR}")

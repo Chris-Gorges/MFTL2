@@ -18,7 +18,7 @@
 #include "mftl.h"
 #include <stdio.h>
 
-int main(int argc, char *argv[])
+mftl_int_t main(mftl_int_t argc, char *argv[])
 {
   MFTL_Object Object;
 
@@ -53,7 +53,7 @@ int main(int argc, char *argv[])
   // centre)
   MFTL_ShowSummary(&Object);
   Volume = MFTL_SurfaceCenter(&Object, Center);
-  printf("Proc %d: Object Characteristics: Volume %lf, Centre: %e %e %e\n", (int) Object.rank, (double) Volume, (double) Center[0], (double) Center[1],
+  printf("Proc %d: Object Characteristics: Volume %lf, Centre: %e %e %e\n", (mftl_int_t) Object.rank, (double) Volume, (double) Center[0], (double) Center[1],
          (double) Center[2]);
   MPI_Barrier(Object.OBJECT_COMM_WORLD[0]);
 
