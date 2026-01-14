@@ -32,7 +32,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
-#include "mftl_types.h"
+#include "mftl_core.h"
 #include "mftl_arrayfunctions.h"
 
 // -----------------------------------------------------------------------------

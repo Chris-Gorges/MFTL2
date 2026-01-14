@@ -12,7 +12,7 @@
 #include <stddef.h>
 #include <mpi.h>
 #include <khash.h>
-#include "mftl_types.h"
+#include "mftl_core.h"
 #include "mftl_constants.h"
 #include "mftl_communication.h"
 #include "mftl_arrayfunctions.h"
@@ -28,10 +28,6 @@ MPI_Datatype MPI_GhostUpdatePayload;
 
 void MFTLRegisterMpiTypes()
 {
-  // --- 0. Determine the MPI type for mftl_int_t ---
-  // We match the signed/unsigned nature of your typedefs.
-  // Since typedef is int64_t/int32_t (signed), we use MPI_INT64_T/MPI_INT32_T.
-  // Initialize the handle based on compilation mode
 #ifdef MFTL_USE_64BIT
   MPI_MFTL_INT = MPI_INT64_T;
 #else
@@ -334,10 +330,10 @@ static inline void MFTLResetObjectData(MFTL_Object* obj)
  * @param out_recv_buf Pointer to the received buffer.
  * @param out_recv_count Pointer to the received count.
  */
-static void MFTLMpiExchangeBuffers(MFTL_Object* ref_obj, MFTL_SendBuffer* send_bufs, MPI_Datatype type, size_t type_size, bool use_global_path,
+static void MFTLMpiExchangeBuffers(MFTL_Domain* domain, MFTL_SendBuffer* send_bufs, MPI_Datatype type, size_t type_size, bool use_global_path,
                                    void** out_recv_buf, int* out_recv_count)
 {
-  int nproc = (int) ref_obj->nproc;
+  int nproc = (int) domain->nproc;
   *out_recv_count = 0;
 
   if (use_global_path)
@@ -353,7 +349,7 @@ static void MFTLMpiExchangeBuffers(MFTL_Object* ref_obj, MFTL_SendBuffer* send_b
 
     // 2. Exchange Counts
     for (int r = 0; r < nproc; ++r) send_counts[r] = send_bufs[r].count;
-    MPI_Alltoall(send_counts, 1, MPI_MFTL_INT, recv_counts, 1, MPI_MFTL_INT, ref_obj->cart_comm);
+    MPI_Alltoall(send_counts, 1, MPI_MFTL_INT, recv_counts, 1, MPI_MFTL_INT, domain->comm_cart);
 
     // 3. Calculate Displacements
     int total_send = 0;
@@ -377,7 +373,7 @@ static void MFTLMpiExchangeBuffers(MFTL_Object* ref_obj, MFTL_SendBuffer* send_b
 
     // 5. Execute Exchange
     *out_recv_buf = malloc((*out_recv_count) * type_size);
-    MPI_Alltoallv(flat_send_buf, send_counts, send_displs, type, *out_recv_buf, recv_counts, recv_displs, type, ref_obj->cart_comm);
+    MPI_Alltoallv(flat_send_buf, send_counts, send_displs, type, *out_recv_buf, recv_counts, recv_displs, type, domain->comm_cart);
 
     // Cleanup
     free(flat_send_buf);
@@ -391,7 +387,7 @@ static void MFTLMpiExchangeBuffers(MFTL_Object* ref_obj, MFTL_SendBuffer* send_b
     // --- NEIGHBOR PATH ---
     // printf("Neighbor Path\n");
 
-    int num_neighbors = ref_obj->num_neighbors;
+    int num_neighbors = domain->num_neighbors;
 
     // 1. Setup Arrays (Sized to Neighbors, not NPROC)
     int* n_send = calloc(num_neighbors, sizeof(int));
@@ -402,9 +398,9 @@ static void MFTLMpiExchangeBuffers(MFTL_Object* ref_obj, MFTL_SendBuffer* send_b
     // 2. Exchange Counts
     for (int i = 0; i < num_neighbors; ++i)
     {
-      n_send[i] = send_bufs[ref_obj->neighbors[i]].count;
+      n_send[i] = send_bufs[domain->neighbors[i]].count;
     }
-    MPI_Neighbor_alltoall(n_send, 1, MPI_MFTL_INT, n_recv, 1, MPI_MFTL_INT, ref_obj->graph_comm);
+    MPI_Neighbor_alltoall(n_send, 1, MPI_MFTL_INT, n_recv, 1, MPI_MFTL_INT, domain->comm_graph);
 
     // 3. Calculate Displacements
     int total_send = 0;
@@ -423,14 +419,14 @@ static void MFTLMpiExchangeBuffers(MFTL_Object* ref_obj, MFTL_SendBuffer* send_b
       if (n_send[i] > 0)
       {
         // Map Neighbor Index -> Global Rank -> Buffer
-        int target_rank = ref_obj->neighbors[i];
+        int target_rank = domain->neighbors[i];
         memcpy(flat_send_buf + (s_displs[i] * type_size), send_bufs[target_rank].buffer, n_send[i] * type_size);
       }
     }
 
     // 5. Execute Exchange
     *out_recv_buf = malloc((*out_recv_count) * type_size);
-    MPI_Neighbor_alltoallv(flat_send_buf, n_send, s_displs, type, *out_recv_buf, n_recv, r_displs, type, ref_obj->graph_comm);
+    MPI_Neighbor_alltoallv(flat_send_buf, n_send, s_displs, type, *out_recv_buf, n_recv, r_displs, type, domain->comm_graph);
 
     // Cleanup
     free(flat_send_buf);
@@ -439,43 +435,6 @@ static void MFTLMpiExchangeBuffers(MFTL_Object* ref_obj, MFTL_SendBuffer* send_b
     free(s_displs);
     free(r_displs);
   }
-}
-
-/**
- * @brief Determines which process owns a given 3D coordinate.
- * @details This function implements a deterministic ownership rule for points on
- * processor domain boundaries. A point on a shared boundary is assigned
- * to the processor with the lowest rank that contains it. This prevents
- * ambiguity and ensures each point has a unique owner.
- * The primary rule is [min, max) for all dimensions. If a point is not
- * found, it must lie on a max boundary, so a second pass checks for
- * containment in the closed interval [min, max].
- *
- * MPI works with 32 bit int, so its safer to stay with int here.
- */
-mftl_int_t MFTLGetOwnerProc(const MFTL_Object* object, const double pos[3])
-{
-  // Pre-check: Ensure the point is within the global domain.
-  assert(pos[0] >= object->global_bbox_min[0] && pos[0] <= object->global_bbox_max[0] && pos[1] >= object->global_bbox_min[1] &&
-         pos[1] <= object->global_bbox_max[1] && pos[2] >= object->global_bbox_min[2] && pos[2] <= object->global_bbox_max[2] &&
-         "Point is outside the global simulation box");
-
-  // Calculate grid indices.
-  int i = (int) floor((pos[0] - object->global_bbox_min[0]) / object->domain_size[0] * object->cuts[0]);
-  int j = (int) floor((pos[1] - object->global_bbox_min[1]) / object->domain_size[1] * object->cuts[1]);
-  int k = (int) floor((pos[2] - object->global_bbox_min[2]) / object->domain_size[2] * object->cuts[2]);
-
-  // Clamp to handle points exactly on the max boundary
-  if (i >= object->cuts[0]) i = object->cuts[0] - 1;
-  if (j >= object->cuts[1]) j = object->cuts[1] - 1;
-  if (k >= object->cuts[2]) k = object->cuts[2] - 1;
-
-  int owner_rank;
-  int coords[3] = {i, j, k};
-  MPI_Cart_rank(object->cart_comm, coords, &owner_rank);
-
-  assert(owner_rank >= 0 && owner_rank < object->nproc);
-  return owner_rank;
 }
 
 /**
@@ -554,24 +513,26 @@ static inline void permute_vertices(PackedVertex* array, const mftl_int_t* indic
  * 
  * @todo incorporate void data pointer to triangle communication & ghost layer
  */
-mftl_int_t MFTLRedistributeListOfObjects(MFTL_Object** objects, mftl_int_t num_objects, bool TriangleGhosts)
+mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble, bool TriangleGhosts)
 {
-  if (num_objects == 0 || objects == MFTL_NULL) return MFTL_ERROR;
+  if (ensemble->num_objects == 0 || ensemble->objects == MFTL_NULL) return MFTL_ERROR;
 
-  MFTL_Object* reference_object = objects[0];  // Reference object for MPI Comm.
+  MFTL_Domain* domain = &ensemble->domain;
+  mftl_int_t num_objects = ensemble->num_objects;
+  MFTL_Object** objects = ensemble->objects;
 
-  if (reference_object->nproc < 2) return MFTL_SUCCESS;  // No redistribution needed if there is only one process.
+  if (domain->nproc < 2) return MFTL_SUCCESS;  // No redistribution needed if there is only one process.
 
   // --- Phase 0: Setup and MPI Queries ---
-  mftl_int_t nproc = reference_object->nproc;
-  mftl_int_t my_rank = reference_object->rank;
+  int nproc = domain->nproc;
+  int my_rank = domain->rank;
   mftl_int_t requires_global_comm_local = 0;
 
   // Create a fast O(1) lookup map locally
   char* is_neighbor_map = (char*) calloc(nproc, sizeof(char));
-  for (mftl_int_t i = 0; i < reference_object->num_neighbors; ++i)
+  for (mftl_int_t i = 0; i < domain->num_neighbors; ++i)
   {
-    is_neighbor_map[reference_object->neighbors[i]] = 1;
+    is_neighbor_map[domain->neighbors[i]] = 1;
   }
 
   // 1. Transient Buffers: Used for sorting/uniquing current object's data
@@ -610,8 +571,8 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Object** objects, mftl_int_t num_o
 
   // Store owners in simple flat arrays, not inside structs scattered in memory
   // Do this outside the loop to avoid heap thrashing and realloc if size is not enough.
-  mftl_int_t last_size_tris = reference_object->n_triangles;
-  mftl_int_t last_size_verts = reference_object->n_vertices;
+  mftl_int_t last_size_tris = objects[0]->n_triangles;
+  mftl_int_t last_size_verts = objects[0]->n_vertices;
   mftl_int_t* vert_owners = malloc(last_size_verts * sizeof(mftl_int_t));
   mftl_int_t* tri_owners = malloc(last_size_tris * sizeof(mftl_int_t));
   mftl_int_t* flat_tri_verts = malloc(last_size_tris * 3 * sizeof(mftl_int_t));
@@ -667,7 +628,7 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Object** objects, mftl_int_t num_o
     for (mftl_int_t i = 0; i < n_vertices; ++i)
     {
       MFTL_Vertex* v = &vert_base[i];
-      v->owner_proc = MFTLGetOwnerProc(object, v->pos);
+      v->owner_proc = MFTLGetOwnerProc(domain, v->pos);
       vert_owners[i] = v->owner_proc;
     }
 
@@ -675,7 +636,7 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Object** objects, mftl_int_t num_o
     for (mftl_int_t i = 0; i < n_triangles; ++i)
     {
       MFTL_Triangle* tri = &tri_base[i];
-      tri->owner_proc = MFTLGetOwnerProc(object, tri->center);
+      tri->owner_proc = MFTLGetOwnerProc(domain, tri->center);
       tri_owners[i] = tri->owner_proc;
     }
 
@@ -892,7 +853,7 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Object** objects, mftl_int_t num_o
 
   // Look for our own rank in the triangle send buffer
   // Do the same for vertices
-  mftl_int_t own_rank = reference_object->rank;
+  int own_rank = domain->rank;
   for (mftl_int_t r = 0; r < nproc; ++r)
   {
     if (r == own_rank)
@@ -917,7 +878,7 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Object** objects, mftl_int_t num_o
 
   // --- Phase 2: Decide on Communication Strategy ---
   mftl_int_t global_decision;
-  MPI_Allreduce(&requires_global_comm_local, &global_decision, 1, MPI_INT, MPI_LOR, reference_object->cart_comm);
+  MPI_Allreduce(&requires_global_comm_local, &global_decision, 1, MPI_INT, MPI_LOR, domain->comm_cart);
 
   // --- Phase 3: Execute Communication ---
   PackedTriangleComplex* recv_buf_tris = MFTL_NULL;
@@ -925,11 +886,10 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Object** objects, mftl_int_t num_o
   mftl_int_t total_recv_tris = 0, total_recv_verts = 0;
 
   // Use the Generic MPI Exchange Helper
-  MFTLMpiExchangeBuffers(reference_object, send_tri_bufs, MPI_PackedTriangleComplex, sizeof(PackedTriangleComplex), global_decision, (void**) &recv_buf_tris,
+  MFTLMpiExchangeBuffers(domain, send_tri_bufs, MPI_PackedTriangleComplex, sizeof(PackedTriangleComplex), global_decision, (void**) &recv_buf_tris,
                          &total_recv_tris);
 
-  MFTLMpiExchangeBuffers(reference_object, send_vert_bufs, MPI_PackedVertex, sizeof(PackedVertex), global_decision, (void**) &recv_buf_verts,
-                         &total_recv_verts);
+  MFTLMpiExchangeBuffers(domain, send_vert_bufs, MPI_PackedVertex, sizeof(PackedVertex), global_decision, (void**) &recv_buf_verts, &total_recv_verts);
 
   // --- Final Cleanup of Send Buffers ---
   // At this point, all data has been sent. We can free the send maps and the buffers they hold.
@@ -1022,6 +982,7 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Object** objects, mftl_int_t num_o
       mftl_int_t range_len = end_idx - start_idx;
 
       // Find the actual MFTL_Object pointer
+      // TODO: This is a linear search. We should use a hash map.
       MFTL_Object* target_obj = MFTL_NULL;
       for (mftl_int_t o = 0; o < num_objects; ++o)
       {
@@ -1195,6 +1156,7 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Object** objects, mftl_int_t num_o
       mftl_int_t range_len = current_idx - start_idx;
 
       // Find MFTL_Object
+      // TODO: This is a linear search. We should use a hash map.
       MFTL_Object* target_obj = MFTL_NULL;
       for (mftl_int_t o = 0; o < num_objects; ++o)
       {
@@ -1305,16 +1267,18 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Object** objects, mftl_int_t num_o
 mftl_int_t MFTLRedistributeObject(MFTL_Object* object, bool TriangleGhosts)
 {
   assert(object);
-  if (object->nproc < 2) return MFTL_SUCCESS;
 
-  mftl_int_t nproc = object->nproc;
-  mftl_int_t my_rank = object->rank;
+  MFTL_Domain* domain = object->domain;
+  int nproc = domain->nproc;
+  if (nproc < 2) return MFTL_SUCCESS;
+
+  int my_rank = domain->rank;
   mftl_int_t requires_global_comm_local = 0;
 
   // --- 1. Setup ---
   // Fast neighbor lookup
   char* is_neighbor_map = calloc(nproc, sizeof(char));
-  for (mftl_int_t i = 0; i < object->num_neighbors; ++i) is_neighbor_map[object->neighbors[i]] = 1;
+  for (mftl_int_t i = 0; i < domain->num_neighbors; ++i) is_neighbor_map[domain->neighbors[i]] = 1;
 
   // Buffers
   IntBuffer* trans_tri_bufs = calloc(nproc, sizeof(IntBuffer));
@@ -1349,13 +1313,13 @@ mftl_int_t MFTLRedistributeObject(MFTL_Object* object, bool TriangleGhosts)
   for (mftl_int_t i = 0; i < n_vertices; ++i)
   {
     MFTL_Vertex* v = &vert_base[i];
-    v->owner_proc = MFTLGetOwnerProc(object, v->pos);
+    v->owner_proc = MFTLGetOwnerProc(domain, v->pos);
     vert_owners[i] = v->owner_proc;
   }
   for (mftl_int_t i = 0; i < n_triangles; ++i)
   {
     MFTL_Triangle* tri = &tri_base[i];
-    tri->owner_proc = MFTLGetOwnerProc(object, tri->center);
+    tri->owner_proc = MFTLGetOwnerProc(domain, tri->center);
     tri_owners[i] = tri->owner_proc;
   }
 
@@ -1482,16 +1446,16 @@ mftl_int_t MFTLRedistributeObject(MFTL_Object* object, bool TriangleGhosts)
 
   // --- 5. Communication (Phase 2 & 3) ---
   mftl_int_t global_decision;
-  MPI_Allreduce(&requires_global_comm_local, &global_decision, 1, MPI_MFTL_INT, MPI_LOR, object->cart_comm);
+  MPI_Allreduce(&requires_global_comm_local, &global_decision, 1, MPI_MFTL_INT, MPI_LOR, domain->comm_cart);
 
   PackedTriangleComplex* recv_tris;
   PackedVertex* recv_verts;
   mftl_int_t n_recv_tris, n_recv_verts;
 
   // Use the Generic MPI Exchange Helper
-  MFTLMpiExchangeBuffers(object, send_tri_bufs, MPI_PackedTriangleComplex, sizeof(PackedTriangleComplex), global_decision, (void**) &recv_tris, &n_recv_tris);
+  MFTLMpiExchangeBuffers(domain, send_tri_bufs, MPI_PackedTriangleComplex, sizeof(PackedTriangleComplex), global_decision, (void**) &recv_tris, &n_recv_tris);
 
-  MFTLMpiExchangeBuffers(object, send_vert_bufs, MPI_PackedVertex, sizeof(PackedVertex), global_decision, (void**) &recv_verts, &n_recv_verts);
+  MFTLMpiExchangeBuffers(domain, send_vert_bufs, MPI_PackedVertex, sizeof(PackedVertex), global_decision, (void**) &recv_verts, &n_recv_verts);
 
   // Cleanup Send Buffers
   for (int i = 0; i < nproc; ++i)
@@ -1660,31 +1624,35 @@ mftl_int_t MFTLRedistributeObject(MFTL_Object* object, bool TriangleGhosts)
 
 /**
  * @brief Synchronizes ghost vertex positions for a list of objects.
- * @param objects Array of object pointers.
- * @param num_objects Number of objects.
+ * @param ens Ensemble pointer.
  * @param object_lookup Optional hash map (BodyID -> Index). Pass MFTL_NULL to use linear search fallback.
  * @return MFTL_SUCCESS on success.
  */
-mftl_int_t MFTLUpdateGhostPositions(MFTL_Object** objects, mftl_int_t num_objects, khash_t(object_map) * object_lookup)
+mftl_int_t MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lookup)
 {
-  if (num_objects == 0 || objects == MFTL_NULL) return MFTL_SUCCESS;
+  if (ens->num_objects == 0 || ens->objects == MFTL_NULL) return MFTL_SUCCESS;
 
-  MFTL_Object* ref_obj = objects[0];
-  mftl_int_t num_neighbors = ref_obj->num_neighbors;
+  MFTL_Object** objects = ens->objects;
+  MFTL_Domain* domain = &ens->domain;
+  int nproc = domain->nproc;
+  int my_rank = domain->rank;
 
-  if (num_neighbors == 0 || ref_obj->nproc == 1) return MFTL_SUCCESS;
+  mftl_int_t num_neighbors = domain->num_neighbors;
+  mftl_int_t num_objects = ens->num_objects;
+
+  if (num_neighbors == 0 || nproc == 1) return MFTL_SUCCESS;
 
   // --- 1. Setup Buffers ---
   IntBuffer* req_send_bufs = calloc(num_neighbors, sizeof(IntBuffer));
   for (int i = 0; i < num_neighbors; ++i) buffer_init(&req_send_bufs[i], 1024);  // TODO: Optimize Buffer Size
 
   // Fast Map: Global Rank -> Neighbor Index
-  int* rank_to_neigh_idx = malloc(ref_obj->nproc * sizeof(int));
-  memset(rank_to_neigh_idx, -1, ref_obj->nproc * sizeof(int));
-  for (int i = 0; i < num_neighbors; ++i) rank_to_neigh_idx[ref_obj->neighbors[i]] = i;
+  int* rank_to_neigh_idx = malloc(nproc * sizeof(int));
+  memset(rank_to_neigh_idx, -1, nproc * sizeof(int));
+  for (int i = 0; i < num_neighbors; ++i) rank_to_neigh_idx[domain->neighbors[i]] = i;
 
   // --- 2. Build Requests (Iterate ALL objects) ---
-  for (mftl_int_t o = 0; o < num_objects; ++o)
+  for (mftl_int_t o = 0; o < ens->num_objects; ++o)
   {
     MFTL_Object* obj = objects[o];
     MFTL_Vertex* verts = obj->vertices;
@@ -1716,7 +1684,7 @@ mftl_int_t MFTLUpdateGhostPositions(MFTL_Object** objects, mftl_int_t num_object
     n_send_reqs[i] = req_send_bufs[i].size;  // Actual count is size (2 * num_requests)
   }
 
-  MPI_Neighbor_alltoall(n_send_reqs, 1, MPI_MFTL_INT, n_recv_reqs, 1, MPI_MFTL_INT, ref_obj->graph_comm);
+  MPI_Neighbor_alltoall(n_send_reqs, 1, MPI_MFTL_INT, n_recv_reqs, 1, MPI_MFTL_INT, domain->comm_graph);
 
   // --- 4. Exchange Requests ---
   mftl_int_t* s_displs = calloc(num_neighbors + 1, sizeof(mftl_int_t));
@@ -1743,7 +1711,7 @@ mftl_int_t MFTLUpdateGhostPositions(MFTL_Object** objects, mftl_int_t num_object
 
   mftl_int_t* flat_recv_reqs = malloc(total_recv_ints * sizeof(mftl_int_t));
 
-  MPI_Neighbor_alltoallv(flat_send_reqs, n_send_reqs, s_displs, MPI_MFTL_INT, flat_recv_reqs, n_recv_reqs, r_displs, MPI_MFTL_INT, ref_obj->graph_comm);
+  MPI_Neighbor_alltoallv(flat_send_reqs, n_send_reqs, s_displs, MPI_MFTL_INT, flat_recv_reqs, n_recv_reqs, r_displs, MPI_MFTL_INT, domain->comm_graph);
 
   free(flat_send_reqs);
 
@@ -1839,7 +1807,7 @@ mftl_int_t MFTLUpdateGhostPositions(MFTL_Object** objects, mftl_int_t num_object
   GhostUpdatePayload* recv_payloads = malloc(total_recv_replies * sizeof(GhostUpdatePayload));
 
   MPI_Neighbor_alltoallv(reply_payloads, n_send_replies, s_rep_displs, MPI_GhostUpdatePayload, recv_payloads, n_recv_replies, r_rep_displs,
-                         MPI_GhostUpdatePayload, ref_obj->graph_comm);
+                         MPI_GhostUpdatePayload, domain->comm_graph);
 
   free(reply_payloads);
 

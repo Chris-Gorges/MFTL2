@@ -12,7 +12,9 @@
 #include <string.h>
 #include <stddef.h>  // Required for offsetof
 #include <stdint.h>  // For int64_t
-#include "mftl_types.h"
+#include <assert.h>
+#include <stdbool.h>
+#include "mftl_core.h"
 #include "mftl_constants.h"
 #include "khash.h"
 
@@ -164,8 +166,36 @@ void MFTLFreeMpiTypes();
  * The primary rule is [min, max) for all dimensions. If a point is not
  * found, it must lie on a max boundary, so a second pass checks for
  * containment in the closed interval [min, max].
+ *
+ * MPI works with 32 bit int, so its safer to stay with int here.
  */
-mftl_int_t MFTLGetOwnerProc(const MFTL_Object *object, const double pos[3]);
+static inline mftl_int_t MFTLGetOwnerProc(const MFTL_Domain *domain, const double pos[3])
+{
+  // Pre-check: Ensure the point is within the global domain.
+  assert(pos[0] >= domain->global_min[0] && pos[0] <= domain->global_max[0] && pos[1] >= domain->global_min[1] && pos[1] <= domain->global_max[1] &&
+         pos[2] >= domain->global_min[2] && pos[2] <= domain->global_max[2] && "Point is outside the global simulation box");
+
+  // 1. Math Optimization:
+  // Use pre-calculated factors (multiplication is faster than division).
+  // Use (int) cast instead of floor() (faster, safe because assertions ensure pos >= min).
+
+  int i = (int) ((pos[0] - domain->global_min[0]) * domain->grid_factors[0]);
+  int j = (int) ((pos[1] - domain->global_min[1]) * domain->grid_factors[1]);
+  int k = (int) ((pos[2] - domain->global_min[2]) * domain->grid_factors[2]);
+
+  // 2. Clamp Indices
+  // (Handling the edge case where pos is exactly on the max boundary)
+  if (i >= domain->cuts[0]) i = domain->cuts[0] - 1;
+  if (j >= domain->cuts[1]) j = domain->cuts[1] - 1;
+  if (k >= domain->cuts[2]) k = domain->cuts[2] - 1;
+
+  // 3. Lookup Optimization
+  // Direct array access instead of MPI_Cart_rank
+  int linear_idx = i + (j * domain->cuts[0]) + (k * domain->cuts[0] * domain->cuts[1]);
+
+  // No assert needed for owner_rank if initialization logic is correct
+  return domain->rank_map[linear_idx];
+}
 
 /**
  * @brief Intelligently redistributes the mesh using the fastest available communication pattern.
@@ -190,20 +220,19 @@ mftl_int_t MFTLGetOwnerProc(const MFTL_Object *object, const double pos[3]);
  * triangles it kept, de-duplicates vertices by their unique global IDs,
  * and reconstructs its new local portion of the mesh.
  *
- * @param object The MFTL object containing the mesh and MPI info.
+ * @param ensemble The MFTL ensemble containing the objects and MPI info.
  * @param base The geometric basis for determining ownership (VERTEX_BASED or CENTER_BASED).
  * @return 0 on success, -1 on failure.
  */
 mftl_int_t MFTLRedistributeObject(MFTL_Object *object, bool TriangleGhosts);
-mftl_int_t MFTLRedistributeListOfObjects(MFTL_Object **objects, mftl_int_t num_objects, bool TriangleGhosts);
+mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble *ensemble, bool TriangleGhosts);
 
 /**
  * @brief Synchronizes ghost vertex positions for a list of objects.
- * @param objects Array of object pointers.
- * @param num_objects Number of objects.
+ * @param ensemble The ensemble containing the objects.
  * @param object_lookup Optional hash map (BodyID -> Index). Pass MFTL_NULL to use linear search fallback.
  * @return MFTL_SUCCESS on success.
  */
-mftl_int_t MFTLUpdateGhostPositions(MFTL_Object **objects, mftl_int_t num_objects, khash_t(object_map) * object_lookup);
+mftl_int_t MFTLUpdateGhostPositions(MFTL_Ensemble *ens, khash_t(object_map) * object_lookup);
 
 #endif

@@ -8,7 +8,7 @@
 #ifndef MFTL_TOPOLOGY_H
 #define MFTL_TOPOLOGY_H
 
-#include "mftl_types.h"
+#include "mftl_core.h"
 #include <assert.h>
 
 // -----------------------------------------------------------------------------

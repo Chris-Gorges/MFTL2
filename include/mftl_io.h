@@ -1,7 +1,7 @@
 #ifndef MFTL_IO_H
 #define MFTL_IO_H
 
-#include "mftl_types.h"
+#include "mftl_core.h"
 
 //------------------------------------------------------------------------------
 // Function Prototypes
@@ -23,12 +23,10 @@ mftl_int_t MFTLWriteVtk(const MFTL_Object *object, const char *base_filename);
  * @brief Writes ALL MFTL objects to a SINGLE parallel VTK file set (.pvtu + .vtu).
  * * Features:
  * - Aggregates multiple independent meshes (spheres) into one UnstructuredGrid.
- * - Maintains "Smart Periodic Unwrapping" for each object.
- * - Adds "BodyID" data array to distinguish between objects.
- * * @param objects Array of pointers to MFTL_Object.
- * @param num_objects Number of objects in the array.
+ * - Supports "Smart Periodic Unwrapping" for each object.
+ * * @param ensemble The ensemble object containing the objects to write.
  * @param filename_prefix Base path/name for output files.
  */
-void MFTLWriteVtu(MFTL_Object **objects, int num_objects, const char *filename_prefix);
+void MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix);
 
 #endif  // MFTL_IO_H

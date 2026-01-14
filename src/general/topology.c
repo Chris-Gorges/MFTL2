@@ -6,7 +6,7 @@
  */
 
 #include "mftl_topology.h"
-#include "mftl_types.h"
+#include "mftl_core.h"
 #include "mftl_constants.h"
 #include <stdlib.h>  // for malloc/free
 #include <stdio.h>  // for fprintf

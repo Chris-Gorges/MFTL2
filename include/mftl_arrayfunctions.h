@@ -3,7 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>  // For size_t
-#include "mftl_types.h"
+#include "mftl_core.h"
 
 /**
  * High-level wrapper. 

@@ -5,19 +5,17 @@
  * @Last Modified time: 2025-09-26 10:30:53
  */
 
-#include "mftl_types.h"
-#include "mftl_constants.h"
-#include "mftl_vectoroperations.h"
-#include "mftl_geometry.h"
-#include "mftl_topology.h"
 #include <assert.h>  // For assert()
-#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include "khash.h"
 #include <stdint.h>
-#include "mftl_object.h"
+#include "mftl_core.h"
+#include "mftl_constants.h"
+#include "mftl_vectoroperations.h"
+#include "mftl_geometry.h"
+#include "mftl_topology.h"
 
 // ------------------------------
 // Safe realloc wrapper
@@ -64,6 +62,8 @@ static void MFTLMeshEnsureCapacity(MFTL_Object *object, size_t vert_cap, size_t 
  */
 static mftl_int_t tessellate_sphere(MFTL_Object *object)
 {
+  MFTL_Domain *domain = object->domain;
+
   // --- 1. Snapshot Old Data (Base Pointers) ---
   const size_t old_nv = object->n_vertices;
   const size_t old_nt = object->n_triangles;
@@ -133,7 +133,7 @@ static mftl_int_t tessellate_sphere(MFTL_Object *object)
 
     // Topology Init
     mid->global_id = object->next_vertex_gid++;
-    mid->owner_proc = object->rank;
+    mid->owner_proc = domain->rank;
     mid->is_ghost = MFTL_FALSE;
     mid->out_he_idx = MFTL_ERROR;  // Will set in Step 5
 
@@ -189,7 +189,7 @@ static mftl_int_t tessellate_sphere(MFTL_Object *object)
       // 1. Setup Triangle
       MFTL_Triangle *tri = &new_triangles[new_tri_idx];
       tri->global_id = object->next_triangle_gid++;
-      tri->owner_proc = object->rank;
+      tri->owner_proc = domain->rank;
       tri->is_ghost = MFTL_FALSE;
       tri->he_idx = new_he_idx;  // Points to first HE created below
 
@@ -259,6 +259,8 @@ static mftl_int_t tessellate_sphere(MFTL_Object *object)
  */
 static mftl_int_t generate_icosahedron(MFTL_Object *object)
 {
+  MFTL_Domain *domain = object->domain;
+
   // --- Constants for icosahedron geometry ---
   const double X = 0.525731112119133606;
   const double Z = 0.850650808352039932;
@@ -283,7 +285,7 @@ static mftl_int_t generate_icosahedron(MFTL_Object *object)
   {
     MFTL_Vertex *v = &object->vertices[i];
     v->global_id = i;
-    v->owner_proc = object->rank;
+    v->owner_proc = domain->rank;
     v->is_ghost = MFTL_FALSE;
     memcpy(v->pos, vertices_data[i], 3 * sizeof(double));
     v->out_he_idx = -1;  // will be set later
@@ -297,7 +299,7 @@ static mftl_int_t generate_icosahedron(MFTL_Object *object)
   {
     MFTL_Triangle *tri = &object->triangles[i];
     tri->global_id = i;
-    tri->owner_proc = object->rank;
+    tri->owner_proc = domain->rank;
     tri->is_ghost = MFTL_FALSE;
     // mftl_int_t ret;
     // khiter_t k = kh_put(triangle_map, object->triangle_lookup, tri->global_id, &ret);
@@ -340,11 +342,22 @@ static mftl_int_t generate_icosahedron(MFTL_Object *object)
   return MFTL_SUCCESS;
 }
 
-mftl_int_t MFTLGenerateSphere(MFTL_Object *object, const double center[3], double radius, mftl_int_t refinements)
+/**
+ * @brief Public function to generate a sphere.
+ * @param ensemble The ensemble containing the domain context (MPI, Periodicity).
+ * @param object The object to generate the sphere on.
+ * @param center The center position of the sphere.
+ * @param radius The radius of the sphere.
+ * @param refinements The number of refinements for the sphere.
+ */
+mftl_int_t MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, mftl_int_t refinements)
 {
   assert(object);
 
-  if (object->rank == 0)
+  // Access the domain for MPI and Physics context
+  MFTL_Domain *domain = object->domain;
+
+  if (domain->rank == 0)
   {
     generate_icosahedron(object);
     for (mftl_int_t i = 0; i < refinements; ++i)
@@ -359,15 +372,15 @@ mftl_int_t MFTLGenerateSphere(MFTL_Object *object, const double center[3], doubl
       object->vertices[i].pos[0] = center[0] + radius * object->vertices[i].pos[0];
       object->vertices[i].pos[1] = center[1] + radius * object->vertices[i].pos[1];
       object->vertices[i].pos[2] = center[2] + radius * object->vertices[i].pos[2];
-      MFTLApplyPeriodicity(object, object->vertices[i].pos);
+      MFTLApplyPeriodicity(domain, object->vertices[i].pos);
     }
   }
 
-  MPI_Bcast(&object->next_vertex_gid, 1, MPI_MFTL_INT, 0, object->comm);
-  MPI_Bcast(&object->next_triangle_gid, 1, MPI_MFTL_INT, 0, object->comm);
-  MPI_Bcast(&object->next_halfedge_gid, 1, MPI_MFTL_INT, 0, object->comm);
+  MPI_Bcast(&object->next_vertex_gid, 1, MPI_MFTL_INT, 0, domain->comm_world);
+  MPI_Bcast(&object->next_triangle_gid, 1, MPI_MFTL_INT, 0, domain->comm_world);
+  MPI_Bcast(&object->next_halfedge_gid, 1, MPI_MFTL_INT, 0, domain->comm_world);
 
-  MFTLUpdateObjectGlobalCounts(&object, 1);
+  MFTLObjectUpdateGlobalStats(object);
 
   return MFTL_SUCCESS;
 }
