@@ -21,4 +21,6 @@ CMakeCache.txt
 cmake_install.cmake
 CMakeConfigureLog.yaml
 lib/
+*.vtu
+
 

@@ -327,6 +327,14 @@ MFTL_Ensemble *MFTLEnsembleCreate(MPI_Comm comm, int cuts[3], double global_min[
                                   mftl_int_t initial_object_capacity);
 
 /**
+ * @brief Adds an object to the ensemble and links the domain.
+ * @param ensemble The ensemble to add to.
+ * @param object The object to add.
+ * @return MFTL_SUCCESS on success.
+ */
+mftl_int_t MFTLEnsembleAddObject(MFTL_Ensemble *ensemble, MFTL_Object *object);
+
+/**
  * @brief Destroys an MFTL Ensemble and frees all associated resources.
  *
  * This function performs a comprehensive cleanup:

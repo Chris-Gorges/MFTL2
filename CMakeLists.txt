@@ -47,22 +47,27 @@ set_target_properties(MFTL PROPERTIES
 
 # --- Executable Target ---
 
-# Create an executable named "MFTLTest" from main.c
-# add_executable(MFTLTest examples/sphere_creation_serial.c)
-# add_executable(MFTLTest examples/parallel_advection_redistribute_sequential.c)
-# add_executable(MFTLTest examples/parallel_advection_redistribute_list.c)
+# --- Executable Target ---
+
+# Find all .c files in the examples/ directory
+file(GLOB EXAMPLE_SOURCES "examples/*.c")
+
+# Iterate over each example source file found
+foreach(SOURCE_FILE ${EXAMPLE_SOURCES})
+    # Extract the filename without extension to use as the target name
+    get_filename_component(TARGET_NAME ${SOURCE_FILE} NAME_WE)
+
+    # Create an executable for each example
+    add_executable(${TARGET_NAME} ${SOURCE_FILE})
+
+    # Link the executable against our MFTL library and math library
+    target_link_libraries(${TARGET_NAME} PRIVATE MFTL m)
+
+    # Ensure the executable knows where to find the MFTL headers
+    target_include_directories(${TARGET_NAME} PRIVATE ${MFTL_INCLUDE_DIR})
+endforeach()
 
 
-# Link the executable against our MFTL library.
-# This automatically handles finding libMFTL.a and linking it.
-# target_link_libraries(MFTLTest PRIVATE MFTL)
-
-# Also link against the math library (-lm). The MPI library is already
-# linked transitively through our MFTL library.
-# target_link_libraries(MFTLTest PRIVATE m)
-
-# Ensure the executable knows where to find the MFTL headers.
-# target_include_directories(MFTLTest PRIVATE ${MFTL_INCLUDE_DIR})
 
 # A message to show where the library will be built.
 message(STATUS "MFTL library will be built in: ${MFTL_LIB_DIR}")
