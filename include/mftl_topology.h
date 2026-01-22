@@ -9,6 +9,7 @@
 #define MFTL_TOPOLOGY_H
 
 #include "mftl_core.h"
+#include "mftl_constants.h"
 #include <assert.h>
 
 // -----------------------------------------------------------------------------
@@ -137,6 +138,163 @@ static inline MFTL_Triangle *MFTLHeAdjacentTriangle(const MFTL_Object *obj, cons
   MFTL_HalfEdge *twin = MFTLHeTwin(obj, he);
   assert(twin != MFTL_NULL);
   return MFTLGetTriangle(obj, twin->triangle_idx);
+}
+
+/* VERTEX ONE-RING TRAVERSAL FUNCTIONS */
+
+/**
+ * @brief Retrieves the 1-ring of triangles surrounding a vertex.
+ * * @param obj The mesh object.
+ * @param v The vertex to query.
+ * @param[out] out_tris User-allocated buffer for triangle pointers.
+ * @param max_tris Safety limit for the buffer.
+ * @param is_inner Set to MFTL_TRUE if you are CERTAIN the vertex is an inner vertex and has a full one ring neighborhood.
+ * This skips the boundary search (Rewind step) for performance.
+ * @return The number of triangles found.
+ */
+static inline mftl_int_t MFTLGetVertexOneRing(const MFTL_Object *obj, const MFTL_Vertex *v, MFTL_Triangle **out_tris, mftl_int_t max_tris, bool is_inner)
+{
+  mftl_int_t count = 0;
+
+  // 1. Start at the vertex's primary outgoing half-edge
+  MFTL_HalfEdge *start_he = MFTL_NULL;
+  start_he = MFTLVOutHe(obj, v);
+  assert(start_he);
+
+  MFTL_HalfEdge *curr = start_he;
+
+  // 2. Rewind (Only if NOT inner)
+  // If we know it's an inner vertex, we are already inside a closed loop,
+  // so any starting edge is valid and we don't need to find a "start" point.
+  if (is_inner == MFTL_FALSE)
+  {
+    while (true)
+    {
+      MFTL_HalfEdge *incoming = MFTLHePrev(obj, curr);
+      MFTL_HalfEdge *cw_neighbor = MFTLHeTwin(obj, incoming);
+
+      // Stop if we hit a boundary
+      if (!cw_neighbor) break;
+
+      // Stop if we wrapped around (closed 1-ring)
+      if (cw_neighbor == start_he) break;
+
+      curr = cw_neighbor;
+    }
+    // Update start_he so the CCW loop knows when it has completed the circle
+    start_he = curr;
+  }
+
+  // 3. Replay: Move Counter-Clockwise (CCW) to collect triangles.
+  do
+  {
+    // Buffer safety check
+    assert(count < max_tris && "Buffer overflow in MFTLGetVertexOneRing");
+
+    // Add the triangle belonging to the current half-edge
+    out_tris[count++] = MFTLGetTriangle(obj, curr->triangle_idx);
+
+    // Move to the next outgoing half-edge in CCW order
+    MFTL_HalfEdge *twin = MFTL_NULL;
+    twin = MFTLHeTwin(obj, curr);
+
+    // Boundary check (Required even for inner loops to detect the end of the loop logic in case of boundary edges)
+    if (twin == MFTL_NULL) break;
+
+    curr = MFTLHeNext(obj, twin);
+
+  } while (curr != start_he);
+
+  return count;
+}
+
+/**
+ * @brief Retrieves the 1-ring of neighbor vertices.
+ *
+ * @param obj The mesh object.
+ * @param v The central vertex.
+ * @param[out] out_verts User-allocated array for vertex pointers.
+ * @param max_verts Safety limit for the buffer.
+ * @param is_inner Optimization flag. Set to TRUE to skip boundary rewind.
+ * @return The number of neighbors found.
+ */
+static inline mftl_int_t MFTLGetVertexOneRingVertices(const MFTL_Object *obj, const MFTL_Vertex *v, MFTL_Vertex **out_verts, mftl_int_t max_verts,
+                                                      bool is_inner)
+{
+  mftl_int_t count = 0;
+
+  MFTL_HalfEdge *start_he = MFTL_NULL;
+  start_he = MFTLVOutHe(obj, v);
+  assert(start_he);
+
+  MFTL_HalfEdge *curr = start_he;
+
+  // 2. Rewind (Optional)
+  if (is_inner == MFTL_FALSE)
+  {
+    while (true)
+    {
+      MFTL_HalfEdge *incoming = MFTLHePrev(obj, curr);
+      MFTL_HalfEdge *cw_neighbor = MFTLHeTwin(obj, incoming);
+
+      if (!cw_neighbor || cw_neighbor == start_he) break;
+      curr = cw_neighbor;
+    }
+    start_he = curr;
+  }
+
+  // 3. Replay (CCW)
+  do
+  {
+    assert(count < max_verts && "Buffer overflow in MFTLGetVertexOneRingVertices");
+
+    // Add Neighbor (Target of outgoing HE)
+    out_verts[count++] = MFTLHeTarget(obj, curr);
+
+    // Advance
+    MFTL_HalfEdge *twin = MFTL_NULL;
+    twin = MFTLHeTwin(obj, curr);
+    if (!twin) break;
+
+    curr = MFTLHeNext(obj, twin);
+
+  } while (curr != start_he);
+
+  return count;
+}
+
+/**
+ * @brief Retrieves the three neighboring triangles of a given triangle.
+ * * The neighbors are ordered corresponding to the triangle's half-edges (CCW).
+ * * @param obj The mesh object.
+ * @param tri The triangle to query.
+ * @param[out] out_neighbors An array of 3 MFTL_Triangle* pointers. 
+ * Entries will be NULL if the edge is a boundary.
+ */
+static inline void MFTLGetTriangleNeighbors(MFTL_Object *obj, MFTL_Triangle *tri, MFTL_Triangle *out_neighbors[3])
+{
+  // 1. Get the three half-edges of the triangle in CCW order
+  MFTL_HalfEdge *edges[3];
+  MFTLGetTriangleHalfedges(obj, tri, edges);
+
+  // 2. Iterate over the edges to find the adjacent triangles
+  for (int i = 0; i < 3; i++)
+  {
+    // The neighbor is located across the Twin half-edge
+    MFTL_HalfEdge *twin = MFTL_NULL;
+    twin = MFTLHeTwin(obj, edges[i]);
+
+    if (twin)
+    {
+      // Found a neighbor
+      out_neighbors[i] = MFTLHeTriangle(obj, twin);
+    }
+    else
+    {
+      // This edge is a boundary (no neighbor)
+      out_neighbors[i] = MFTL_NULL;
+    }
+  }
 }
 
 /**
