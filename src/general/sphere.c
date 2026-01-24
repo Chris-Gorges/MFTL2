@@ -382,5 +382,7 @@ mftl_int_t MFTLGenerateSphere(MFTL_Object *object, double center[3], double radi
 
   MFTLObjectUpdateGlobalStats(object);
 
+  MFTLFlattenConnectivity(object);
+
   return MFTL_SUCCESS;
 }

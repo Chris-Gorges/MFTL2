@@ -45,14 +45,14 @@ int main(int argc, char* argv[])
   }
 
   // --- Simulation Constants ---
-  const int NUM_SPHERES = 1000;
-  const double SPHERE_RADIUS = 0.1;
-  const int REFINEMENTS = 4;
-  const double global_min[3] = {-4.0, -2.0, -2.0};
-  const double global_max[3] = {4.0, 2.0, 2.0};
+  int NUM_SPHERES = 1000;
+  double SPHERE_RADIUS = 0.1;
+  int REFINEMENTS = 4;
+  double global_min[3] = {-4.0, -2.0, -2.0};
+  double global_max[3] = {4.0, 2.0, 2.0};
 
   // --- Create Ensemble ---
-  MFTL_Ensemble* ensemble = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, (double*) global_min, (double*) global_max, periodicity, NUM_SPHERES);
+  MFTL_Ensemble* ensemble = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, global_min, global_max, periodicity, NUM_SPHERES);
   if (!ensemble)
   {
     MPI_Abort(MPI_COMM_WORLD, 1);
@@ -69,9 +69,9 @@ int main(int argc, char* argv[])
     double rand_y = (double) rand() / RAND_MAX;
     double rand_z = (double) rand() / RAND_MAX;
 
-    const double center[3] = {-3.0 + rand_x * (3.0 - (-3.0)), -1.85 + rand_y * (1.85 - (-1.85)), -1.85 + rand_z * (1.85 - (-1.85))};
+    double center[3] = {-3.0 + rand_x * (3.0 - (-3.0)), -1.85 + rand_y * (1.85 - (-1.85)), -1.85 + rand_z * (1.85 - (-1.85))};
 
-    MFTLGenerateSphere(object, (double*) center, SPHERE_RADIUS, REFINEMENTS);
+    MFTLGenerateSphere(object, center, SPHERE_RADIUS, REFINEMENTS);
     // Note: ComputeTriangleProperties might be needed after gen
     MFTLComputeTriangleProperties(object);
   }

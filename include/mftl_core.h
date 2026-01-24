@@ -186,6 +186,13 @@ typedef struct MFTL_Object
   khash_t(triangle_map) * triangle_lookup;
   khash_t(halfedge_map) * halfedge_lookup;
 
+  // --- Acceleration Structures (Flattened Topology) ---
+  // These are allocated by MFTLFlattenConnectivity()
+  mftl_int_t *flat_tri_verts;  ///< Size: 3 * n_triangles. Vert indices for each tri.
+  mftl_int_t *flat_tri_neighbors;  ///< Size: 3 * n_triangles. Neighbor tri indices.
+  mftl_int_t *vert_offsets;  ///< Size: n_vertices + 1. CSR offsets for V2T map.
+  mftl_int_t *vert_tris;  ///< Size: 3 * n_triangles. CSR values for V2T map.
+
   mftl_int_t global_id;  ///< A unique ID across all processors for tracking.
 
   // Pointer to the domain this object lives in.

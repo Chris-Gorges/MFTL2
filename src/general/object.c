@@ -35,10 +35,24 @@ MFTL_Object* MFTLObjectCreate(mftl_int_t global_id)
 
   object->global_id = global_id;
 
+  // Initialize Domain to NULL
+  object->domain = MFTL_NULL;
+
+  // Initialize Arrays to NULL
+  object->vertices = MFTL_NULL;
+  object->triangles = MFTL_NULL;
+  object->half_edges = MFTL_NULL;
+
   // Initialize Hash Maps
   object->vertex_lookup = kh_init(vertex_map);
   object->triangle_lookup = kh_init(triangle_map);
   object->halfedge_lookup = kh_init(halfedge_map);
+
+  // Initialize Acceleration Pointers to NULL
+  object->flat_tri_verts = MFTL_NULL;
+  object->flat_tri_neighbors = MFTL_NULL;
+  object->vert_offsets = MFTL_NULL;
+  object->vert_tris = MFTL_NULL;
 
   // Initialize ID counters
   object->next_vertex_gid = 0;
@@ -64,14 +78,20 @@ void MFTLObjectDestroy(MFTL_Object** p_object)
   MFTL_Object* object = *p_object;
 
   // Free Data Pools
-  if (object->vertices) free(object->vertices);
-  if (object->triangles) free(object->triangles);
-  if (object->half_edges) free(object->half_edges);
+  free(object->vertices);
+  free(object->triangles);
+  free(object->half_edges);
 
   // Free Hash Maps
   kh_destroy(vertex_map, object->vertex_lookup);
   kh_destroy(triangle_map, object->triangle_lookup);
   kh_destroy(halfedge_map, object->halfedge_lookup);
+
+  // Free Acceleration Structures
+  free(object->flat_tri_verts);
+  free(object->flat_tri_neighbors);
+  free(object->vert_tris);
+  free(object->vert_offsets);
 
   free(object);
   *p_object = MFTL_NULL;
@@ -166,9 +186,10 @@ void MFTLEnsembleUpdateGlobalCounts(MFTL_Ensemble* ensemble)
 void MFTLObjectUpdateGlobalStats(MFTL_Object* object)
 {
   // Safety checks
-  if (!object) return;
+  assert(object);
 
-  MPI_Comm comm = object->domain->comm_world;
+  MFTL_Domain* domain = object->domain;
+  assert(domain);
 
   // 1. Calculate Local Counts (Owned entities only)
   mftl_int_t t_count = 0;
@@ -200,7 +221,7 @@ void MFTLObjectUpdateGlobalStats(MFTL_Object* object)
   // 2. Global Reduction
   mftl_int_t global_counts[2];
   // We reduce 2 integers: one for tris, one for verts
-  MPI_Allreduce(local_counts, global_counts, 2, MPI_MFTL_INT, MPI_SUM, comm);
+  MPI_Allreduce(local_counts, global_counts, 2, MPI_MFTL_INT, MPI_SUM, domain->comm_world);
 
   // 3. Store Results
   object->global_n_triangles = global_counts[0];

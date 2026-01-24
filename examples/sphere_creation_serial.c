@@ -9,7 +9,6 @@
  */
 
 #include "mftl_core.h"
-
 #include "mftl_topology.h"
 #include "mftl_io.h"
 #include <mpi.h>
@@ -25,10 +24,10 @@ mftl_int_t main(int argc, char *argv[])
 
   // --- 1. Define Simulation Parameters ---
   // Note: MPI cuts are standard 'int', not 'mftl_int_t'
-  const int cuts[3] = {1, 1, 1};
-  const double global_min[3] = {-2.0, -2.0, -2.0};
-  const double global_max[3] = {2.0, 2.0, 2.0};
-  const bool periodicity[3] = {false, false, false};
+  int cuts[3] = {1, 1, 1};
+  double global_min[3] = {-2.0, -2.0, -2.0};
+  double global_max[3] = {2.0, 2.0, 2.0};
+  bool periodicity[3] = {false, false, false};
 
   // --- 2. Create the Ensemble (The Context) ---
   // This sets up the Domain, MPI Topologies, and registers MPI Types.
@@ -57,9 +56,9 @@ mftl_int_t main(int argc, char *argv[])
   // This is a COLLECTIVE call. All ranks must participate because of MPI_Bcast inside.
   // The function internally checks 'if (object->domain->rank == 0)' for the generation part.
 
-  const double center[3] = {0.0, 0.0, 0.0};
-  const double radius = 1.0;
-  const mftl_int_t refinements = 5;
+  double center[3] = {0.0, 0.0, 0.0};
+  double radius = 1.0;
+  mftl_int_t refinements = 5;
 
   if (rank == 0) printf("Rank %d: Generating sphere (refinements=%lld)...\n", rank, (long long) refinements);
 

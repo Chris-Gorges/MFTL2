@@ -308,12 +308,12 @@ void MFTLRebuildTwins(MFTL_Object *obj);
 void MFTLConvertGlobalToLocalIndices(MFTL_Object *obj);
 
 /**
- * @brief Flattens mesh connectivity into integer arrays for cache-friendly processing.
- * * @param object The mesh object containing triangles and half-edges.
- * @param flat_tri_verts Output array for vertex indices (Size: 3 * n_triangles). Can be NULL.
- * @param flat_tri_neighbors Output array for neighbor triangle indices (Size: 3 * n_triangles). Can be NULL.
+ * @brief Builds internal cache-friendly integer arrays for mesh connectivity.
+ * Populates: flat_tri_verts, flat_tri_neighbors, vert_offsets, vert_tris.
+ * 1. Triangle Maps (flat_tri_*): Direct lookup of vertices and neighbors for a triangle.
+ * 2. Vertex Maps (vert_*): Compressed Sparse Row (CSR) structure for lookup of incident triangles for a vertex.
  */
-void MFTLFlattenConnectivity(MFTL_Object *object, mftl_int_t *flat_tri_verts, mftl_int_t *flat_tri_neighbors);
+void MFTLFlattenConnectivity(MFTL_Object *obj);
 
 mftl_int_t MFTLCheckMeshIntegrity(MFTL_Object *object);
 

@@ -575,8 +575,6 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble, bool TriangleG
   mftl_int_t last_size_verts = objects[0]->n_vertices;
   mftl_int_t* vert_owners = malloc(last_size_verts * sizeof(mftl_int_t));
   mftl_int_t* tri_owners = malloc(last_size_tris * sizeof(mftl_int_t));
-  mftl_int_t* flat_tri_verts = malloc(last_size_tris * 3 * sizeof(mftl_int_t));
-  mftl_int_t* flat_tri_neighbors = malloc(last_size_tris * 3 * sizeof(mftl_int_t));
 
   // 1a. Calculate destinations
   for (mftl_int_t o = 0; o < num_objects; ++o)
@@ -598,17 +596,7 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble, bool TriangleG
     {
       last_size_tris = n_triangles;
 
-      mftl_int_t* tmp;
-
-      tmp = realloc(flat_tri_verts, last_size_tris * 3 * sizeof(mftl_int_t));
-      assert(tmp && "realloc failed for flat_tri_verts");
-      flat_tri_verts = tmp;
-
-      tmp = realloc(flat_tri_neighbors, last_size_tris * 3 * sizeof(mftl_int_t));
-      assert(tmp && "realloc failed for flat_tri_neighbors");
-      flat_tri_neighbors = tmp;
-
-      tmp = realloc(tri_owners, last_size_tris * sizeof(mftl_int_t));
+      mftl_int_t* tmp = realloc(tri_owners, last_size_tris * sizeof(mftl_int_t));
       assert(tmp && "realloc failed for tri_owners");
       tri_owners = tmp;
     }
@@ -622,7 +610,15 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble, bool TriangleG
       vert_owners = tmp;
     }
 
-    MFTLFlattenConnectivity(object, flat_tri_verts, flat_tri_neighbors);
+    // Ensure topology is built. If NULL, build it now (Lazy Init).
+    if (!object->flat_tri_verts || !object->flat_tri_neighbors)
+    {
+      MFTLFlattenConnectivity(object);
+    }
+
+    // Direct pointers to object memory (Zero Copy)
+    mftl_int_t* flat_tri_verts = object->flat_tri_verts;
+    mftl_int_t* flat_tri_neighbors = object->flat_tri_neighbors;
 
     // --- Pre-calculate Vertex Owners ---
     for (mftl_int_t i = 0; i < n_vertices; ++i)
@@ -736,8 +732,6 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble, bool TriangleG
     }
   }
 
-  free(flat_tri_verts);
-  free(flat_tri_neighbors);
   free(vert_owners);
   free(tri_owners);
 
@@ -1254,6 +1248,9 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble, bool TriangleG
     // STEP 2: Rebuild Twins (Topology)
     // This relies on the valid local vertex indices set in Step 1
     MFTLRebuildTwins(object);
+
+    // STEP 3: Rebuild flattened connectivity arrays
+    MFTLFlattenConnectivity(object);
   }
 
   return MFTL_SUCCESS;
@@ -1304,10 +1301,16 @@ mftl_int_t MFTLRedistributeObject(MFTL_Object* object, bool TriangleGhosts)
 
   mftl_int_t* vert_owners = malloc(n_vertices * sizeof(mftl_int_t));
   mftl_int_t* tri_owners = malloc(n_triangles * sizeof(mftl_int_t));
-  mftl_int_t* flat_tri_verts = malloc(n_triangles * 3 * sizeof(mftl_int_t));
-  mftl_int_t* flat_tri_neighbors = malloc(n_triangles * 3 * sizeof(mftl_int_t));
 
-  MFTLFlattenConnectivity(object, flat_tri_verts, flat_tri_neighbors);
+  // Ensure topology is built. If NULL, build it now (Lazy Init).
+  if (!object->flat_tri_verts || !object->flat_tri_neighbors)
+  {
+    MFTLFlattenConnectivity(object);
+  }
+
+  // Direct pointers to object memory (Zero Copy)
+  mftl_int_t* flat_tri_verts = object->flat_tri_verts;
+  mftl_int_t* flat_tri_neighbors = object->flat_tri_neighbors;
 
   // Pre-calculate Owners
   for (mftl_int_t i = 0; i < n_vertices; ++i)
@@ -1369,8 +1372,6 @@ mftl_int_t MFTLRedistributeObject(MFTL_Object* object, bool TriangleGhosts)
   }
 
   // Cleanup helper arrays
-  free(flat_tri_verts);
-  free(flat_tri_neighbors);
   free(vert_owners);
   free(tri_owners);
 
@@ -1618,6 +1619,7 @@ mftl_int_t MFTLRedistributeObject(MFTL_Object* object, bool TriangleGhosts)
   // 7. Final Topology
   MFTLConvertGlobalToLocalIndices(object);
   MFTLRebuildTwins(object);
+  MFTLFlattenConnectivity(object);
 
   return MFTL_SUCCESS;
 }
