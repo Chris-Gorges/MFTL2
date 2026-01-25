@@ -77,7 +77,7 @@ int main(int argc, char* argv[])
   }
 
   // Redistribute all at once
-  MFTLRedistributeListOfObjects(ensemble, MFTL_TRUE);
+  MFTLRedistributeListOfObjects(ensemble);
 
   double dt = 0.1, u = 1.0;
   int step = 0;
@@ -120,7 +120,7 @@ int main(int argc, char* argv[])
     }
 
     double t_redist_start = MPI_Wtime();
-    MFTLRedistributeListOfObjects(ensemble, MFTL_TRUE);
+    MFTLRedistributeListOfObjects(ensemble);
     double t_redist_end = MPI_Wtime();
     total_redist_time += (t_redist_end - t_redist_start);
 

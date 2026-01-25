@@ -17,40 +17,6 @@
 #include "mftl_geometry.h"
 #include "mftl_topology.h"
 
-// ------------------------------
-// Safe realloc wrapper
-// ------------------------------
-// Ensures that memory allocation always succeeds or exits the program.
-static void *safe_realloc(void *ptr, size_t size)
-{
-  void *new_ptr = realloc(ptr, size);
-  if (!new_ptr && size > 0)
-  {
-    fprintf(stderr, "FATAL ERROR: realloc failed.\n");
-    exit(EXIT_FAILURE);
-  }
-  return new_ptr;
-}
-
-static void MFTLMeshEnsureCapacity(MFTL_Object *object, size_t vert_cap, size_t tri_cap, size_t he_cap)
-{
-  if (object->capacity_vertices < vert_cap)
-  {
-    object->vertices = (MFTL_Vertex *) safe_realloc(object->vertices, vert_cap * sizeof(MFTL_Vertex));
-    object->capacity_vertices = vert_cap;
-  }
-  if (object->capacity_triangles < tri_cap)
-  {
-    object->triangles = (MFTL_Triangle *) safe_realloc(object->triangles, tri_cap * sizeof(MFTL_Triangle));
-    object->capacity_triangles = tri_cap;
-  }
-  if (object->capacity_half_edges < he_cap)
-  {
-    object->half_edges = (MFTL_HalfEdge *) safe_realloc(object->half_edges, he_cap * sizeof(MFTL_HalfEdge));
-    object->capacity_half_edges = he_cap;
-  }
-}
-
 /**
  * @brief Performs one level of 1-to-4 triangle subdivision on the object
  *        using khash-based edge lookups for midpoint vertices and twins.
@@ -236,7 +202,6 @@ static mftl_int_t tessellate_sphere(MFTL_Object *object)
   object->n_triangles = new_nt;
   object->n_half_edges = new_nhe;
 
-  // Update capacities if tracking them
   object->capacity_vertices = new_nv;
   object->capacity_triangles = new_nt;
   object->capacity_half_edges = new_nhe;
@@ -272,7 +237,10 @@ static mftl_int_t generate_icosahedron(MFTL_Object *object)
                                         {7, 10, 3}, {7, 6, 10}, {7, 11, 6}, {11, 0, 6}, {0, 1, 6}, {6, 1, 10}, {9, 0, 11}, {9, 11, 2}, {9, 2, 5}, {7, 2, 11}};
 
   // --- Allocate space for icosahedron (12 vertices, 20 faces, 60 halfedges) ---
-  MFTLMeshEnsureCapacity(object, 12, 20, 60);
+  MFTL_RESERVE_ADDITIONAL(object->vertices, &object->n_vertices, &object->capacity_vertices, 12, MFTL_Vertex);
+  MFTL_RESERVE_ADDITIONAL(object->triangles, &object->n_triangles, &object->capacity_triangles, 20, MFTL_Triangle);
+  MFTL_RESERVE_ADDITIONAL(object->half_edges, &object->n_half_edges, &object->capacity_half_edges, 60, MFTL_HalfEdge);
+
   object->n_vertices = 12;
   object->n_triangles = 20;
   object->n_half_edges = 60;

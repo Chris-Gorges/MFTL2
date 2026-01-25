@@ -224,8 +224,8 @@ static inline mftl_int_t MFTLGetOwnerProc(const MFTL_Domain *domain, const doubl
  * @param base The geometric basis for determining ownership (VERTEX_BASED or CENTER_BASED).
  * @return 0 on success, -1 on failure.
  */
-mftl_int_t MFTLRedistributeObject(MFTL_Object *object, bool TriangleGhosts);
-mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble *ensemble, bool TriangleGhosts);
+mftl_int_t MFTLRedistributeObject(MFTL_Object *object);
+mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble *ensemble);
 
 /**
  * @brief Synchronizes ghost vertex positions for a list of objects.

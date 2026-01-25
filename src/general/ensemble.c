@@ -13,6 +13,7 @@
 #include "mftl_constants.h"
 #include "mftl_core.h"
 #include "mftl_communication.h"
+#include "mftl_memory.h"
 
 // --- Static Reference Counter ---
 // This variable is hidden inside this translation unit.
@@ -272,21 +273,8 @@ mftl_int_t MFTLEnsembleAddObject(MFTL_Ensemble* ensemble, MFTL_Object* object)
   // 1. Link the Object to the Domain
   object->domain = &ensemble->domain;
 
-  // 2. Simple dynamic array resize logic here if num_objects == capacity
-  if (ensemble->num_objects == ensemble->capacity_objects)
-  {
-    mftl_int_t new_capacity = ensemble->capacity_objects * 2;
-
-    // 1. Use a temporary pointer
-    MFTL_Object** temp = (MFTL_Object**) realloc(ensemble->objects, new_capacity * sizeof(MFTL_Object*));
-
-    // 2. Check for failure
-    assert(temp);
-
-    // 3. Assign only on success
-    ensemble->objects = temp;
-    ensemble->capacity_objects = new_capacity;
-  }
+  // 2. Dynamic resize using unified macro
+  MFTL_RESERVE_ADDITIONAL(ensemble->objects, &ensemble->num_objects, &ensemble->capacity_objects, 1, MFTL_Object*);
   ensemble->objects[ensemble->num_objects++] = object;
   return MFTL_SUCCESS;
 }

@@ -317,4 +317,65 @@ void MFTLFlattenConnectivity(MFTL_Object *obj);
 
 mftl_int_t MFTLCheckMeshIntegrity(MFTL_Object *object);
 
+/**
+ * @struct MFTL_Neighborhood
+ * @brief Container for the results of a neighborhood search.
+ * Includes dynamic arrays for vertices and triangles found during traversal.
+ */
+typedef struct MFTL_Neighborhood
+{
+  mftl_int_t *vert_indices;  ///< Array of gathered vertex local indices
+  mftl_int_t n_verts;  ///< Number of vertices found
+  mftl_int_t cap_verts;  ///< Current capacity of the vertex array
+
+  mftl_int_t *tri_indices;  ///< Array of gathered triangle local indices
+  mftl_int_t n_tris;  ///< Number of triangles found
+  mftl_int_t cap_tris;  ///< Current capacity of the triangle array
+} MFTL_Neighborhood;
+
+/**
+ * @brief Helper to free the neighborhood result arrays.
+ */
+static inline void MFTLFreeNeighborhood(MFTL_Neighborhood *nb)
+{
+  free(nb->vert_indices);
+  free(nb->tri_indices);
+  nb->n_verts = 0;
+  nb->n_tris = 0;
+}
+
+/**
+ * @brief Gather the neighborhood of a set of seeds by traversing the mesh topology.
+ *
+ * @details This function performs a Breadth-First Search (BFS) starting from the provided
+ * seed indices (vertices or triangles). It treats the mesh as a bipartite graph
+ * where vertices connect to triangles, and triangles connect to vertices.
+ * * It alternates expansion types at each step:
+ * - If currently holding **Vertices**: It gathers all incident **Triangles**.
+ * - If currently holding **Triangles**: It gathers all incident **Vertices**.
+ * * This approach is more robust than purely edge-based traversal as it naturally 
+ * captures the full "star" of a vertex or the full set of corners of a triangle.
+ *
+ * ### Optimization
+ * The function uses the flattened connectivity arrays (`vert_offsets` / `vert_tris` for V->T 
+ * and `flat_tri_verts` for T->V) to ensure maximum cache coherency and avoid pointer chasing.
+ * It uses a double-buffered queue system to minimize memory allocation overhead during the loop.
+ *
+ * @note    The meaning of `steps` is topological hops, not geometric distance:
+ * - **1 Step** from a Vertex gathers its incident Triangles (the "Umbrella").
+ * - **2 Steps** from a Vertex gathers incident Triangles AND their other Vertices (the full "1-Ring").
+ *
+ * @param[in]  obj               The mesh object containing the topology.
+ * @param[in]  seed_indices      Array of local indices serving as the starting front.
+ * @param[in]  n_seeds           Number of indices in `seed_indices`.
+ * @param[in]  use_vertex_seeds  Set to `true` if seeds are Vertex indices, `false` for Triangle indices.
+ * @param[in]  steps             Number of bipartite hops to expand. 
+ * (e.g., 2 steps = V->T->V).
+ * @param[out] out_result        Pointer to a user-allocated `MFTL_Neighborhood` struct 
+ * where the results will be stored. Arrays are allocated internally 
+ * and must be freed by the user (or `MFTLFreeNeighborhood`).
+ */
+void MFTLGetNeighborhood(MFTL_Object *restrict obj, mftl_int_t *restrict seed_indices, mftl_int_t n_seeds, bool use_vertex_seeds, int steps,
+                         MFTL_Neighborhood *restrict out_result);
+
 #endif  // MFTL_TOPOLOGY_H

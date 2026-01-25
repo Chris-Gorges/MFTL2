@@ -16,6 +16,7 @@
 #include <stdint.h>  // For int64_t
 #include <limits.h>
 #include "mftl_constants.h"
+#include "mftl_memory.h"
 #include "khash.h"
 
 #ifdef MFTL_USE_64BIT

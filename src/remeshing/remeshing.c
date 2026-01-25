@@ -6,22 +6,18 @@
  */
 
 // #include <stdio.h>
-// #include <stdlib.h>
-// #include <string.h>
-// #include <mpi.h>
-// #include "mftl_arrayfunctions.h"
-// #include "mftl_constants.h"
-// #include "mftl_core.h"
-// #include "mftl_communication.h"
-// #include "mftl_remeshing.h"
+#include <stdlib.h>
+#include <string.h>
+#include <mpi.h>
+#include "mftl_arrayfunctions.h"
+#include "mftl_constants.h"
+#include "mftl_core.h"
+#include "mftl_communication.h"
+#include "mftl_remeshing.h"
 
 // void ActionBufferPush(ActionBuffer *buf, MFTL_RemeshAction action)
 // {
-//   if (buf->count >= buf->capacity)
-//   {
-//     buf->capacity = (buf->capacity == 0) ? 128 : buf->capacity * 2;
-//     buf->data = realloc(buf->data, buf->capacity * sizeof(MFTL_RemeshAction));
-//   }
+//   MFTL_ENSURE_CAPACITY(buf->data, &buf->count, &buf->capacity, 1, MFTL_RemeshAction);
 //   buf->data[buf->count++] = action;
 // }
 

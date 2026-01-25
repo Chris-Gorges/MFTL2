@@ -8,6 +8,7 @@
 #include "mftl_topology.h"
 #include "mftl_core.h"
 #include "mftl_constants.h"
+#include "mftl_memory.h"
 #include <stdlib.h>  // for malloc/free
 #include <stdio.h>  // for fprintf
 
@@ -489,218 +490,186 @@ void MFTLFlattenConnectivity(MFTL_Object *obj)
   v_offsets[0] = 0;
 }
 
-// typedef struct MFTL_Neighborhood
-// {
-//   mftl_int_t *vert_indices;
-//   mftl_int_t n_verts;
-//   mftl_int_t cap_verts;
+/**
+ * @brief Gather the neighborhood of a set of seeds by traversing the mesh topology.
+ *
+ * @details This function performs a Breadth-First Search (BFS) starting from the provided
+ * seed indices (vertices or triangles). It treats the mesh as a bipartite graph
+ * where vertices connect to triangles, and triangles connect to vertices.
+ * * It alternates expansion types at each step:
+ * - If currently holding **Vertices**: It gathers all incident **Triangles**.
+ * - If currently holding **Triangles**: It gathers all incident **Vertices**.
+ * * This approach is more robust than purely edge-based traversal as it naturally 
+ * captures the full "star" of a vertex or the full set of corners of a triangle.
+ *
+ * ### Optimization
+ * The function uses the flattened connectivity arrays (`vert_offsets` / `vert_tris` for V->T 
+ * and `flat_tri_verts` for T->V) to ensure maximum cache coherency and avoid pointer chasing.
+ * It uses a double-buffered queue system to minimize memory allocation overhead during the loop.
+ *
+ * @note    The meaning of `steps` is topological hops, not geometric distance:
+ * - **1 Step** from a Vertex gathers its incident Triangles (the "Umbrella").
+ * - **2 Steps** from a Vertex gathers incident Triangles AND their other Vertices (the full "1-Ring").
+ *
+ * @param[in]  obj               The mesh object containing the topology.
+ * @param[in]  seed_indices      Array of local indices serving as the starting front.
+ * @param[in]  n_seeds           Number of indices in `seed_indices`.
+ * @param[in]  use_vertex_seeds  Set to `true` if seeds are Vertex indices, `false` for Triangle indices.
+ * @param[in]  steps             Number of bipartite hops to expand. 
+ * (e.g., 2 steps = V->T->V).
+ * @param[out] out_result        Pointer to a user-allocated `MFTL_Neighborhood` struct 
+ * where the results will be stored. Arrays are allocated internally 
+ * and must be freed by the user (or `MFTLFreeNeighborhood`).
+ */
+void MFTLGetNeighborhood(MFTL_Object *restrict obj, mftl_int_t *restrict seed_indices, mftl_int_t n_seeds, bool use_vertex_seeds, int steps,
+                         MFTL_Neighborhood *restrict out_result)
+{
+  // --- 1. Validation & Setup ---
+  if (!obj->flat_tri_verts || !obj->vert_tris) MFTLFlattenConnectivity(obj);
 
-//   mftl_int_t *tri_indices;
-//   mftl_int_t n_tris;
-//   mftl_int_t cap_tris;
-// } MFTL_Neighborhood;
+  // Use local restrictive pointers for compiler optimization
+  MFTL_Vertex *restrict const vert_base = obj->vertices;
+  MFTL_Triangle *restrict const tri_base = obj->triangles;
 
-// static void add_to_list(mftl_int_t **list, mftl_int_t *count, mftl_int_t *cap, mftl_int_t val)
-// {
-//   if (*count >= *cap)
-//   {
-//     *cap = (*cap == 0) ? MFTL_INIT_CAPACITY : (*cap * 2);
-//     *list = (mftl_int_t *) realloc(*list, (*cap) * sizeof(mftl_int_t));
-//   }
-//   (*list)[(*count)++] = val;
-// }
+  // Connectivity Arrays (Read-Only)
+  const mftl_int_t *restrict const flat_tri_verts = obj->flat_tri_verts;
+  const mftl_int_t *restrict const vert_offsets = obj->vert_offsets;
+  const mftl_int_t *restrict const vert_tris = obj->vert_tris;
 
-// // -----------------------------------------------------------------------------
-// // MAIN NEIGHBORHOOD FUNCTION
-// // -----------------------------------------------------------------------------
+  // --- 2. Initialize Result ---
+  out_result->n_verts = 0;
+  out_result->cap_verts = 0;
+  out_result->vert_indices = MFTL_NULL;
+  out_result->n_tris = 0;
+  out_result->cap_tris = 0;
+  out_result->tri_indices = MFTL_NULL;
 
-// void MFTLGetNeighborhood(MFTL_Object *obj, mftl_int_t *seed_indices, mftl_int_t n_seeds, bool use_vertex_seeds, int layers, MFTL_Neighborhood *out_result)
-// {
-//   // 1. Enforce Acceleration Structures
-//   // If the flattened arrays don't exist, we build them immediately.
-//   if (!obj->flat_tri_verts || !obj->flat_tri_neighbors || !obj->vert_tris || !obj->vert_offsets)
-//   {
-//     MFTLFlattenConnectivity(obj);
-//   }
+  // --- 3. Initialize Synchronized Queues ---
+  // We use ONE capacity variable for BOTH queues.
+  mftl_int_t cap_q = (n_seeds * 6 < MFTL_INIT_CAPACITY) ? MFTL_INIT_CAPACITY : n_seeds * 6;
 
-//   // 2. Initialize Result Structure
-//   out_result->n_verts = 0;
-//   out_result->cap_verts = MFTL_INIT_CAPACITY;
-//   out_result->vert_indices = (mftl_int_t *) malloc(out_result->cap_verts * sizeof(mftl_int_t));
+  mftl_int_t *q_curr = (mftl_int_t *) malloc(cap_q * sizeof(mftl_int_t));
+  mftl_int_t *q_next = (mftl_int_t *) malloc(cap_q * sizeof(mftl_int_t));
 
-//   out_result->n_tris = 0;
-//   out_result->cap_tris = MFTL_INIT_CAPACITY;
-//   out_result->tri_indices = (mftl_int_t *) malloc(out_result->cap_tris * sizeof(mftl_int_t));
+  mftl_int_t n_curr = 0;
+  mftl_int_t n_next = 0;
 
-//   // 3. Initialize BFS Queues
-//   mftl_int_t *q_curr = (mftl_int_t *) malloc(n_seeds * sizeof(mftl_int_t));
-//   mftl_int_t n_curr = 0;
-//   mftl_int_t cap_curr = n_seeds;
+  // State toggle: Are the IDs in q_curr Vertices or Triangles?
+  bool is_expanding_vertices = use_vertex_seeds;
 
-//   mftl_int_t *q_next = NULL;
-//   mftl_int_t n_next = 0;
-//   mftl_int_t cap_next = 0;
+  for (mftl_int_t i = 0; i < n_seeds; ++i)
+  {
+    mftl_int_t idx = seed_indices[i];
 
-//   // 4. Process Seeds (Layer 0)
-//   for (mftl_int_t i = 0; i < n_seeds; i++)
-//   {
-//     mftl_int_t idx = seed_indices[i];
+    if (use_vertex_seeds)
+    {
+      MFTL_Vertex *v = &vert_base[idx];
+      if (v->flags & MFTL_FLAG_VISITED) continue;
+      v->flags |= MFTL_FLAG_VISITED;  // Mark as visited
 
-//     if (use_vertex_seeds)
-//     {
-//       MFTL_Vertex *v = &obj->vertices[idx];
-//       if (!(v->flags & MFTL_FLAG_VISITED))
-//       {
-//         v->flags |= MFTL_FLAG_VISITED;
-//         add_to_list(&out_result->vert_indices, &out_result->n_verts, &out_result->cap_verts, idx);
+      MFTL_ENSURE_CAPACITY(out_result->vert_indices, &out_result->n_verts, &out_result->cap_verts, 1, mftl_int_t);
+      out_result->vert_indices[out_result->n_verts++] = idx;
+    }
+    else
+    {
+      MFTL_Triangle *t = &tri_base[idx];
+      if (t->flags & MFTL_FLAG_VISITED) continue;
+      t->flags |= MFTL_FLAG_VISITED;  // Mark as visited
 
-//         // Add to BFS queue
-//         if (n_curr == cap_curr)
-//         {
-//           cap_curr = (cap_curr == 0) ? MFTL_INIT_CAPACITY : cap_curr * 2;
-//           q_curr = (mftl_int_t *) realloc(q_curr, cap_curr * sizeof(mftl_int_t));
-//         }
-//         q_curr[n_curr++] = idx;
-//       }
-//     }
-//     else
-//     {
-//       MFTL_Triangle *t = &obj->triangles[idx];
-//       if (!(t->flags & MFTL_FLAG_VISITED))
-//       {
-//         t->flags |= MFTL_FLAG_VISITED;
-//         add_to_list(&out_result->tri_indices, &out_result->n_tris, &out_result->cap_tris, idx);
+      MFTL_ENSURE_CAPACITY(out_result->tri_indices, &out_result->n_tris, &out_result->cap_tris, 1, mftl_int_t);
+      out_result->tri_indices[out_result->n_tris++] = idx;
+    }
 
-//         if (n_curr == cap_curr)
-//         {
-//           cap_curr = (cap_curr == 0) ? MFTL_INIT_CAPACITY : cap_curr * 2;
-//           q_curr = (mftl_int_t *) realloc(q_curr, cap_curr * sizeof(mftl_int_t));
-//         }
-//         q_curr[n_curr++] = idx;
-//       }
-//     }
-//   }
+    // We already ensured capacity for q_curr above
+    q_curr[n_curr++] = idx;
+  }
 
-//   // 5. BFS Loop (Fast Path ONLY)
-//   for (int l = 0; l <= layers; l++)
-//   {
-//     cap_next = (n_curr > 0) ? n_curr * 4 : MFTL_INIT_CAPACITY;
-//     q_next = (mftl_int_t *) malloc(cap_next * sizeof(mftl_int_t));
-//     n_next = 0;
+  // --- 5. The Unified BFS Loop ---
+  for (int s = 0; s < steps; ++s)
+  {
+    if (n_curr == 0) break;
+    n_next = 0;
 
-//     for (mftl_int_t i = 0; i < n_curr; i++)
-//     {
-//       mftl_int_t curr_idx = q_curr[i];
+    for (mftl_int_t i = 0; i < n_curr; ++i)
+    {
+      mftl_int_t idx = q_curr[i];
 
-//       if (use_vertex_seeds)
-//       {
-//         // --- VERTEX PROPAGATION ---
-//         // 1. Get Incident Triangles via CSR (vert_offsets -> vert_tris)
-//         mftl_int_t start = obj->vert_offsets[curr_idx];
-//         mftl_int_t end = obj->vert_offsets[curr_idx + 1];
+      if (is_expanding_vertices)
+      {
+        // EXPAND: Vertex -> Triangles (using CSR)
+        mftl_int_t start = vert_offsets[idx];
+        mftl_int_t end = vert_offsets[idx + 1];
 
-//         for (mftl_int_t k = start; k < end; k++)
-//         {
-//           mftl_int_t tri_idx = obj->vert_tris[k];
-//           MFTL_Triangle *t = &obj->triangles[tri_idx];
+        for (mftl_int_t k = start; k < end; ++k)
+        {
+          mftl_int_t t_idx = vert_tris[k];
+          MFTL_Triangle *t = &tri_base[t_idx];
 
-//           if (!(t->flags & MFTL_FLAG_VISITED))
-//           {
-//             t->flags |= MFTL_FLAG_VISITED;
-//             add_to_list(&out_result->tri_indices, &out_result->n_tris, &out_result->cap_tris, tri_idx);
-//           }
+          if (!(t->flags & MFTL_FLAG_VISITED))
+          {
+            t->flags |= MFTL_FLAG_VISITED;
 
-//           // 2. Propagate to Neighbor Vertices (via those triangles)
-//           // (Only if not the last layer)
-//           if (l < layers)
-//           {
-//             mftl_int_t base = 3 * tri_idx;
-//             for (int m = 0; m < 3; m++)
-//             {
-//               mftl_int_t v_idx = obj->flat_tri_verts[base + m];
-//               MFTL_Vertex *v = &obj->vertices[v_idx];
+            // Add to Results
+            MFTL_ENSURE_CAPACITY(out_result->tri_indices, &out_result->n_tris, &out_result->cap_tris, 1, mftl_int_t);
+            out_result->tri_indices[out_result->n_tris++] = t_idx;
 
-//               if (!(v->flags & MFTL_FLAG_VISITED))
-//               {
-//                 v->flags |= MFTL_FLAG_VISITED;
-//                 add_to_list(&out_result->vert_indices, &out_result->n_verts, &out_result->cap_verts, v_idx);
+            // Add to Next Queue (Synchronized Growth)
+            if (n_next >= cap_q)
+            {
+              // If one grows, BOTH grow. This keeps capacities identical.
+              cap_q *= 2;
+              q_next = (mftl_int_t *) realloc(q_next, cap_q * sizeof(mftl_int_t));
+              q_curr = (mftl_int_t *) realloc(q_curr, cap_q * sizeof(mftl_int_t));
+            }
+            q_next[n_next++] = t_idx;
+          }
+        }
+      }
+      else
+      {
+        // EXPAND: Triangle -> Vertices (using Flat Array)
+        mftl_int_t base = 3 * idx;
+        for (int k = 0; k < 3; ++k)
+        {
+          mftl_int_t v_idx = flat_tri_verts[base + k];
+          MFTL_Vertex *v = &vert_base[v_idx];
 
-//                 if (n_next == cap_next)
-//                 {
-//                   cap_next *= 2;
-//                   q_next = (mftl_int_t *) realloc(q_next, cap_next * sizeof(mftl_int_t));
-//                 }
-//                 q_next[n_next++] = v_idx;
-//               }
-//             }
-//           }
-//         }
-//       }
-//       else
-//       {
-//         // --- TRIANGLE PROPAGATION ---
-//         mftl_int_t base = 3 * curr_idx;
+          if (!(v->flags & MFTL_FLAG_VISITED))
+          {
+            v->flags |= MFTL_FLAG_VISITED;
 
-//         // 1. Collect Incident Vertices
-//         for (int k = 0; k < 3; k++)
-//         {
-//           mftl_int_t v_idx = obj->flat_tri_verts[base + k];
-//           MFTL_Vertex *v = &obj->vertices[v_idx];
+            // Add to Results
+            MFTL_ENSURE_CAPACITY(out_result->vert_indices, &out_result->n_verts, &out_result->cap_verts, 1, mftl_int_t);
+            out_result->vert_indices[out_result->n_verts++] = v_idx;
 
-//           if (!(v->flags & MFTL_FLAG_VISITED))
-//           {
-//             v->flags |= MFTL_FLAG_VISITED;
-//             add_to_list(&out_result->vert_indices, &out_result->n_verts, &out_result->cap_verts, v_idx);
-//           }
-//         }
+            // Add to Next Queue (Synchronized Growth)
+            if (n_next >= cap_q)
+            {
+              cap_q *= 2;
+              q_next = (mftl_int_t *) realloc(q_next, cap_q * sizeof(mftl_int_t));
+              q_curr = (mftl_int_t *) realloc(q_curr, cap_q * sizeof(mftl_int_t));
+            }
+            q_next[n_next++] = v_idx;
+          }
+        }
+      }
+    }
 
-//         // 2. Propagate to Neighbor Triangles
-//         if (l < layers)
-//         {
-//           for (int k = 0; k < 3; k++)
-//           {
-//             mftl_int_t nei_idx = obj->flat_tri_neighbors[base + k];  // -1 if boundary
+    // Swap Queues and Toggle Mode
+    // Because capacities are strictly synced, we ONLY swap pointers.
+    mftl_int_t *temp = q_curr;
+    q_curr = q_next;
+    q_next = temp;
 
-//             if (nei_idx != -1)
-//             {
-//               MFTL_Triangle *t = &obj->triangles[nei_idx];
-//               if (!(t->flags & MFTL_FLAG_VISITED))
-//               {
-//                 t->flags |= MFTL_FLAG_VISITED;
-//                 add_to_list(&out_result->tri_indices, &out_result->n_tris, &out_result->cap_tris, nei_idx);
+    n_curr = n_next;
+    is_expanding_vertices = !is_expanding_vertices;
+  }
 
-//                 if (n_next == cap_next)
-//                 {
-//                   cap_next *= 2;
-//                   q_next = (mftl_int_t *) realloc(q_next, cap_next * sizeof(mftl_int_t));
-//                 }
-//                 q_next[n_next++] = nei_idx;
-//               }
-//             }
-//           }
-//         }
-//       }
-//     }  // End loop over current frontier
+  // --- 6. Cleanup ---
+  free(q_curr);
+  free(q_next);
 
-//     free(q_curr);
-//     q_curr = q_next;
-//     n_curr = n_next;
-//     cap_curr = cap_next;
-
-//     if (n_curr == 0) break;
-
-//   }  // End loop layers
-
-//   if (q_curr) free(q_curr);
-
-//   // 6. Cleanup: Clear Visited Flags
-//   // Only iterate over collected results (O(k) efficiency)
-//   for (mftl_int_t i = 0; i < out_result->n_verts; i++)
-//   {
-//     obj->vertices[out_result->vert_indices[i]].flags &= ~MFTL_FLAG_VISITED;
-//   }
-//   for (mftl_int_t i = 0; i < out_result->n_tris; i++)
-//   {
-//     obj->triangles[out_result->tri_indices[i]].flags &= ~MFTL_FLAG_VISITED;
-//   }
-// }
+  // Clear flags (O(k))
+  for (mftl_int_t i = 0; i < out_result->n_verts; i++) obj->vertices[out_result->vert_indices[i]].flags &= ~MFTL_FLAG_VISITED;
+  for (mftl_int_t i = 0; i < out_result->n_tris; i++) obj->triangles[out_result->tri_indices[i]].flags &= ~MFTL_FLAG_VISITED;
+}

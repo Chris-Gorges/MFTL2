@@ -17,6 +17,7 @@
 #include "mftl_communication.h"
 #include "mftl_arrayfunctions.h"
 #include "mftl_topology.h"
+#include "mftl_memory.h"
 
 // --- Global Variable Definitions ---
 MPI_Datatype MPI_MFTL_INT;
@@ -207,12 +208,7 @@ void buffer_init(IntBuffer* buf, mftl_int_t initial_cap)
 // Fast append with geometric growth
 static inline void buffer_add(IntBuffer* buf, mftl_int_t val)
 {
-  if (buf->size == buf->capacity)
-  {
-    mftl_int_t new_cap = buf->capacity * 2;  // Double size
-    buf->data = (mftl_int_t*) realloc(buf->data, new_cap * sizeof(mftl_int_t));
-    buf->capacity = new_cap;
-  }
+  MFTL_ENSURE_CAPACITY(buf->data, &buf->size, &buf->capacity, 1, mftl_int_t);
   buf->data[buf->size++] = val;
 }
 
@@ -513,7 +509,7 @@ static inline void permute_vertices(PackedVertex* array, const mftl_int_t* indic
  * 
  * @todo incorporate void data pointer to triangle communication & ghost layer
  */
-mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble, bool TriangleGhosts)
+mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
 {
   if (ensemble->num_objects == 0 || ensemble->objects == MFTL_NULL) return MFTL_ERROR;
 
@@ -576,6 +572,10 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble, bool TriangleG
   mftl_int_t* vert_owners = malloc(last_size_verts * sizeof(mftl_int_t));
   mftl_int_t* tri_owners = malloc(last_size_tris * sizeof(mftl_int_t));
 
+  // Dummy variable: We always start writing from index 0 for each object.
+  // We use this to tell the macro "The buffer is effectively empty right now".
+  mftl_int_t zero_count = 0;
+
   // 1a. Calculate destinations
   for (mftl_int_t o = 0; o < num_objects; ++o)
   {
@@ -592,23 +592,11 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble, bool TriangleG
       buffer_reset(&trans_vert_bufs[r]);
     }
 
-    if (n_triangles > last_size_tris)
-    {
-      last_size_tris = n_triangles;
+    MFTL_ENSURE_CAPACITY(tri_owners, &zero_count, &last_size_tris, n_triangles, mftl_int_t);
+    MFTL_ENSURE_CAPACITY(vert_owners, &zero_count, &last_size_verts, n_vertices, mftl_int_t);
 
-      mftl_int_t* tmp = realloc(tri_owners, last_size_tris * sizeof(mftl_int_t));
-      assert(tmp && "realloc failed for tri_owners");
-      tri_owners = tmp;
-    }
-
-    if (n_vertices > last_size_verts)
-    {
-      last_size_verts = n_vertices;
-
-      mftl_int_t* tmp = realloc(vert_owners, last_size_verts * sizeof(mftl_int_t));
-      assert(tmp && "realloc failed for vert_owners");
-      vert_owners = tmp;
-    }
+    last_size_tris = n_triangles;
+    last_size_verts = n_vertices;
 
     // Ensure topology is built. If NULL, build it now (Lazy Init).
     if (!object->flat_tri_verts || !object->flat_tri_neighbors)
@@ -657,16 +645,13 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble, bool TriangleG
       distinct_ranks[count++] = vert_owners[flat_tri_verts[3 * i + 2]];
 
       // --- 3. Who owns my neighbors? ---
-      if (TriangleGhosts)
+      for (mftl_int_t j = 0; j < 3; ++j)
       {
-        for (mftl_int_t j = 0; j < 3; ++j)
-        {
-          mftl_int_t adj_idx = flat_tri_neighbors[3 * i + j];
+        mftl_int_t adj_idx = flat_tri_neighbors[3 * i + j];
 
-          if (adj_idx != -1)
-          {
-            distinct_ranks[count++] = tri_owners[adj_idx];
-          }
+        if (adj_idx != -1)
+        {
+          distinct_ranks[count++] = tri_owners[adj_idx];
         }
       }
 
@@ -1261,7 +1246,7 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble, bool TriangleG
  * @details Removes the overhead of sorting/grouping multiple bodies.
  * Assumes all ranks call this for the SAME object at the same time.
  */
-mftl_int_t MFTLRedistributeObject(MFTL_Object* object, bool TriangleGhosts)
+mftl_int_t MFTLRedistributeObject(MFTL_Object* object)
 {
   assert(object);
 
@@ -1344,13 +1329,10 @@ mftl_int_t MFTLRedistributeObject(MFTL_Object* object, bool TriangleGhosts)
     distinct_ranks[count++] = vert_owners[flat_tri_verts[3 * i + 1]];
     distinct_ranks[count++] = vert_owners[flat_tri_verts[3 * i + 2]];
 
-    if (TriangleGhosts)
+    for (mftl_int_t j = 0; j < 3; ++j)
     {
-      for (mftl_int_t j = 0; j < 3; ++j)
-      {
-        mftl_int_t adj_idx = flat_tri_neighbors[3 * i + j];
-        if (adj_idx != -1) distinct_ranks[count++] = tri_owners[adj_idx];
-      }
+      mftl_int_t adj_idx = flat_tri_neighbors[3 * i + j];
+      if (adj_idx != -1) distinct_ranks[count++] = tri_owners[adj_idx];
     }
 
     mftl_int_t unique_dests[7];

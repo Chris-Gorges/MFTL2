@@ -73,7 +73,7 @@ int main(int argc, char* argv[])
 
     MFTLGenerateSphere(object, (double*) center, SPHERE_RADIUS, REFINEMENTS);
     MFTLComputeTriangleProperties(object);
-    MFTLRedistributeObject(object, MFTL_TRUE);
+    MFTLRedistributeObject(object);
   }
 
   double dt = 0.1, u = 1.0;
@@ -110,7 +110,7 @@ int main(int argc, char* argv[])
       MFTLComputeTriangleProperties(object);
 
       double t_redist_start = MPI_Wtime();
-      MFTLRedistributeObject(object, MFTL_TRUE);
+      MFTLRedistributeObject(object);
       double t_redist_end = MPI_Wtime();
       total_redist_time += (t_redist_end - t_redist_start);
     }
