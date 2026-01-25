@@ -97,3 +97,7 @@ message(STATUS "LTO (Release)    : ${IPO_SUPPORTED}")
 message(STATUS "Build Examples   : ${BUILD_EXAMPLES}")
 message(STATUS "Output Directory : ${MFTL_LIB_DIR}")
 message(STATUS "-------------------------------------------------")
+
+# --- Testing ---
+enable_testing()
+add_subdirectory(tests)
