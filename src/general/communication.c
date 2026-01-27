@@ -1647,6 +1647,7 @@ mftl_int_t MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * ob
       if (v->is_ghost)
       {
         mftl_int_t owner = v->owner_proc;
+        assert(owner >= 0 && owner < nproc && "Ghost owner rank out of bounds!");
         int n_idx = rank_to_neigh_idx[owner];
 
         // Safety: Ghost owner MUST be a neighbor in the graph communicator
