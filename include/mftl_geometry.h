@@ -89,6 +89,26 @@ static inline double MFTLGetEdgeLength(MFTL_Object *object, MFTL_HalfEdge *he)
   return MFTL_SQRT(edge_vec[0] * edge_vec[0] + edge_vec[1] * edge_vec[1] + edge_vec[2] * edge_vec[2]);
 }
 
+/*
+ * @brief Calculate an edge's length.
+ *
+ * @param mesh The mesh object.
+ * @param he The half-edge whose length is to be calculated.
+ * @return The length of the edge.
+ */
+static inline double MFTLGetEdgeLengthSquared(MFTL_Object *object, MFTL_HalfEdge *he)
+{
+  // Calculate Edge Vector for a specific HalfEdge 'he'
+  MFTL_Vertex *v_start = MFTLHeOrigin(object, he);
+  MFTL_Vertex *v_end = MFTLHeTarget(object, he);
+
+  double edge_vec[3];
+  MFTLGetMinimumImageVector(object->domain, edge_vec, v_start->pos, v_end->pos);
+
+  // Now calculate the magnitude of the corrected vector
+  return edge_vec[0] * edge_vec[0] + edge_vec[1] * edge_vec[1] + edge_vec[2] * edge_vec[2];
+}
+
 /**
  * @brief Calculates the fundamental geometric properties of a triangle in one
  * pass.

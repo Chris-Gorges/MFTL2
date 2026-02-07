@@ -1955,8 +1955,7 @@ static void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc
 
 /**
  * @brief Extends the ghost layer by 'steps' topological layers.
- * Uses a Request-Reply pattern to ensure correct mirror identification.
- * Batches neighborhood generation for maximum performance.
+ * Uses a Request-Reply pattern with direct Neighbor communication.
  */
 mftl_int_t MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
 {
@@ -1968,17 +1967,19 @@ mftl_int_t MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
 
   int num_neighbors = domain->num_neighbors;
 
-  // -----------------------------------------------------------------------
+  // =========================================================================
   // PHASE 1: IDENTIFY & REQUEST
   // "I have ghost X, please expand it for me."
-  // -----------------------------------------------------------------------
+  // =========================================================================
 
   IntBuffer* req_bufs = calloc(num_neighbors, sizeof(IntBuffer));
-  for (int i = 0; i < num_neighbors; ++i) buffer_init(&req_bufs[i], 1024);
+  for (int i = 0; i < num_neighbors; ++i) buffer_init(&req_bufs[i], MFTL_INIT_CAPACITY);
 
-  // Fast Map: Global Rank -> Neighbor Index
+  // Optimization: Pre-compute Rank -> Neighbor Index map once
+  // (Assuming nproc isn't massive; if nproc > 100k, use a hash map or linear search on small neighbor lists)
   int* rank_to_neigh = malloc(nproc * sizeof(int));
-  memset(rank_to_neigh, -1, nproc * sizeof(int));
+  // Initialize to -1
+  for (int i = 0; i < nproc; ++i) rank_to_neigh[i] = -1;
   for (int i = 0; i < num_neighbors; ++i) rank_to_neigh[domain->neighbors[i]] = i;
 
   for (mftl_int_t o = 0; o < ens->num_objects; ++o)
@@ -1992,6 +1993,7 @@ mftl_int_t MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
       if (v->is_ghost)
       {
         int n_idx = rank_to_neigh[v->owner_proc];
+        // Safety: Ghost owner MUST be a neighbor in the graph communicator
         if (n_idx != -1)
         {
           buffer_add(&req_bufs[n_idx], obj->global_id);
@@ -2002,30 +2004,28 @@ mftl_int_t MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
   }
   free(rank_to_neigh);
 
-  // Exchange Requests
+  // Exchange Counts
   mftl_int_t* n_send_ints = calloc(num_neighbors, sizeof(mftl_int_t));
   mftl_int_t* n_recv_ints = malloc(num_neighbors * sizeof(mftl_int_t));
-  mftl_int_t total_send = 0;
 
-  for (int i = 0; i < num_neighbors; ++i)
-  {
-    n_send_ints[i] = req_bufs[i].size;
-    total_send += req_bufs[i].size;
-  }
+  for (int i = 0; i < num_neighbors; ++i) n_send_ints[i] = req_bufs[i].size;
 
   MPI_Neighbor_alltoall(n_send_ints, 1, MPI_MFTL_INT, n_recv_ints, 1, MPI_MFTL_INT, domain->comm_graph);
 
+  // Calc Displacements
   mftl_int_t* s_displs = calloc(num_neighbors + 1, sizeof(mftl_int_t));
   mftl_int_t* r_displs = calloc(num_neighbors + 1, sizeof(mftl_int_t));
-  mftl_int_t total_recv = 0;
+  mftl_int_t total_send = 0, total_recv = 0;
 
   for (int i = 0; i < num_neighbors; ++i)
   {
     s_displs[i + 1] = s_displs[i] + n_send_ints[i];
     r_displs[i + 1] = r_displs[i] + n_recv_ints[i];
+    total_send += n_send_ints[i];
     total_recv += n_recv_ints[i];
   }
 
+  // Flatten Requests
   mftl_int_t* flat_send_req = malloc(total_send * sizeof(mftl_int_t));
   for (int i = 0; i < num_neighbors; ++i)
   {
@@ -2033,10 +2033,12 @@ mftl_int_t MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
     {
       memcpy(flat_send_req + s_displs[i], req_bufs[i].data, req_bufs[i].size * sizeof(mftl_int_t));
     }
+    // Cleanup early
     free(req_bufs[i].data);
   }
   free(req_bufs);
 
+  // Exchange Requests
   mftl_int_t* flat_recv_req = malloc(total_recv * sizeof(mftl_int_t));
   MPI_Neighbor_alltoallv(flat_send_req, n_send_ints, s_displs, MPI_MFTL_INT, flat_recv_req, n_recv_ints, r_displs, MPI_MFTL_INT, domain->comm_graph);
 
@@ -2044,16 +2046,22 @@ mftl_int_t MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
   free(s_displs);
   free(n_send_ints);
 
-  // -----------------------------------------------------------------------
-  // PHASE 2: BATCH EXPANSION (OPTIMIZED)
-  // Gather all requests per neighbor/object, execute ONE traversal, then pack.
-  // -----------------------------------------------------------------------
+  // =========================================================================
+  // PHASE 2: BATCH PROCESSING & PACKING
+  // =========================================================================
 
-  MFTL_SendBuffer* send_tri_bufs = calloc(num_neighbors, sizeof(MFTL_SendBuffer));
-  MFTL_SendBuffer* send_vert_bufs = calloc(num_neighbors, sizeof(MFTL_SendBuffer));
+  // Use raw dynamically resizing arrays instead of MFTL_SendBuffer struct
+  // to avoid mapping confusion.
+  PackedTriangleComplex** raw_send_tris = calloc(num_neighbors, sizeof(PackedTriangleComplex*));
+  PackedVertex** raw_send_verts = calloc(num_neighbors, sizeof(PackedVertex*));
 
-  // Collector: Groups seeds by object ID for batching.
-  // We re-use this buffer for every neighbor loop to save memory.
+  mftl_int_t* cnt_send_tris = calloc(num_neighbors, sizeof(mftl_int_t));
+  mftl_int_t* cap_send_tris = calloc(num_neighbors, sizeof(mftl_int_t));
+
+  mftl_int_t* cnt_send_verts = calloc(num_neighbors, sizeof(mftl_int_t));
+  mftl_int_t* cap_send_verts = calloc(num_neighbors, sizeof(mftl_int_t));
+
+  // Collector reuse
   IntBuffer* seed_collector = calloc(ens->num_objects, sizeof(IntBuffer));
   for (int i = 0; i < ens->num_objects; ++i) buffer_init(&seed_collector[i], 256);
 
@@ -2062,25 +2070,21 @@ mftl_int_t MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
     mftl_int_t start_idx = r_displs[n];
     mftl_int_t end_idx = r_displs[n + 1];
 
-    // 1. Reset Collector (Clear bins)
+    // 1. Reset Collector
     for (int i = 0; i < ens->num_objects; ++i) buffer_reset(&seed_collector[i]);
 
-    // 2. Binning: Sort requests into object buckets
+    // 2. Binning
     for (mftl_int_t k = start_idx; k < end_idx; k += 2)
     {
       mftl_int_t body_id = flat_recv_req[k];
       mftl_int_t gid = flat_recv_req[k + 1];
 
-      // Find object
-      MFTL_Object* obj = MFTL_NULL;
-      // Note: O(NumObj) search inside loop is fine for small NumObj.
-      // Use hash map if NumObj > 100.
+      // Find Object (Optimize: use hash map if many objects)
       for (mftl_int_t o = 0; o < ens->num_objects; ++o)
       {
         if (ens->objects[o]->global_id == body_id)
         {
-          obj = ens->objects[o];
-          // Convert GID -> Local Index and Add to Batch
+          MFTL_Object* obj = ens->objects[o];
           khiter_t it = kh_get(vertex_map, obj->vertex_lookup, gid);
           if (it != kh_end(obj->vertex_lookup))
           {
@@ -2091,54 +2095,47 @@ mftl_int_t MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
       }
     }
 
-    // 3. One-Shot Execution per Object
+    // 3. Expansion & Packing
     MFTL_Neighborhood nb;
     for (mftl_int_t o = 0; o < ens->num_objects; ++o)
     {
-      // If no requests for this object from this neighbor, skip
       if (seed_collector[o].size == 0) continue;
 
       MFTL_Object* obj = ens->objects[o];
 
-      // *** BATCH CALL ***
-      // We pass the entire list of seeds (seed_collector[o].data) at once.
-      // The topology function performs a single BFS front.
-      MFTLGetNeighborhood(obj, seed_collector[o].data, seed_collector[o].size, true, steps, &nb);
+      // Batch Topology Search
+      MFTLGetNeighborhood(obj, seed_collector[o].data, seed_collector[o].size, true, steps * 2, &nb);
 
-      // --- Pack Results ---
+      // --- Pack Triangles ---
       if (nb.n_tris > 0)
       {
-        mftl_int_t needed = nb.n_tris;
-        mftl_int_t cur_cap = send_tri_bufs[n].capacity;
-        if (send_tri_bufs[n].count + needed > cur_cap)
+        // Geometric Growth for Amortized O(1)
+        if (cnt_send_tris[n] + nb.n_tris > cap_send_tris[n])
         {
-          mftl_int_t new_cap = (cur_cap == 0) ? (needed * 2) : (cur_cap * 2 + needed);
-          send_tri_bufs[n].buffer = realloc(send_tri_bufs[n].buffer, new_cap * sizeof(PackedTriangleComplex));
-          send_tri_bufs[n].capacity = new_cap;
+          mftl_int_t new_cap = (cap_send_tris[n] == 0) ? (nb.n_tris + 128) : (cap_send_tris[n] * 2 + nb.n_tris);
+          raw_send_tris[n] = realloc(raw_send_tris[n], new_cap * sizeof(PackedTriangleComplex));
+          cap_send_tris[n] = new_cap;
         }
 
-        PackedTriangleComplex* buf = (PackedTriangleComplex*) send_tri_bufs[n].buffer;
         for (mftl_int_t t = 0; t < nb.n_tris; ++t)
         {
-          MFTLPackSingleTriangle(obj, nb.tri_indices[t], &buf[send_tri_bufs[n].count++], false);
+          MFTLPackSingleTriangle(obj, nb.tri_indices[t], &raw_send_tris[n][cnt_send_tris[n]++], false);
         }
       }
 
+      // --- Pack Vertices ---
       if (nb.n_verts > 0)
       {
-        mftl_int_t needed = nb.n_verts;
-        mftl_int_t cur_cap = send_vert_bufs[n].capacity;
-        if (send_vert_bufs[n].count + needed > cur_cap)
+        if (cnt_send_verts[n] + nb.n_verts > cap_send_verts[n])
         {
-          mftl_int_t new_cap = (cur_cap == 0) ? (needed * 2) : (cur_cap * 2 + needed);
-          send_vert_bufs[n].buffer = realloc(send_vert_bufs[n].buffer, new_cap * sizeof(PackedVertex));
-          send_vert_bufs[n].capacity = new_cap;
+          mftl_int_t new_cap = (cap_send_verts[n] == 0) ? (nb.n_verts + 128) : (cap_send_verts[n] * 2 + nb.n_verts);
+          raw_send_verts[n] = realloc(raw_send_verts[n], new_cap * sizeof(PackedVertex));
+          cap_send_verts[n] = new_cap;
         }
 
-        PackedVertex* buf = (PackedVertex*) send_vert_bufs[n].buffer;
         for (mftl_int_t v = 0; v < nb.n_verts; ++v)
         {
-          MFTLPackSingleVertex(obj, nb.vert_indices[v], &buf[send_vert_bufs[n].count++], false);
+          MFTLPackSingleVertex(obj, nb.vert_indices[v], &raw_send_verts[n][cnt_send_verts[n]++], false);
         }
       }
       MFTLFreeNeighborhood(&nb);
@@ -2147,35 +2144,96 @@ mftl_int_t MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
 
   free(flat_recv_req);
   free(r_displs);
-  free(n_recv_ints);
+  free(n_recv_ints);  // from phase 1
   for (int i = 0; i < ens->num_objects; ++i) free(seed_collector[i].data);
   free(seed_collector);
 
-  // -----------------------------------------------------------------------
-  // PHASE 3: EXCHANGE & INTEGRATE
-  // -----------------------------------------------------------------------
+  // =========================================================================
+  // PHASE 3: DIRECT DATA EXCHANGE
+  // =========================================================================
 
-  PackedTriangleComplex* recv_tris = MFTL_NULL;
-  PackedVertex* recv_verts = MFTL_NULL;
-  int n_recv_tris = 0;
-  int n_recv_verts = 0;
+  // --- Exchange Counts ---
+  mftl_int_t* n_recv_tris = malloc(num_neighbors * sizeof(mftl_int_t));
+  mftl_int_t* n_recv_verts = malloc(num_neighbors * sizeof(mftl_int_t));
 
-  MFTLMpiExchangeBuffers(domain, send_tri_bufs, MPI_PackedTriangleComplex, sizeof(PackedTriangleComplex), false, (void**) &recv_tris, &n_recv_tris);
-  MFTLMpiExchangeBuffers(domain, send_vert_bufs, MPI_PackedVertex, sizeof(PackedVertex), false, (void**) &recv_verts, &n_recv_verts);
+  MPI_Neighbor_alltoall(cnt_send_tris, 1, MPI_MFTL_INT, n_recv_tris, 1, MPI_MFTL_INT, domain->comm_graph);
+  MPI_Neighbor_alltoall(cnt_send_verts, 1, MPI_MFTL_INT, n_recv_verts, 1, MPI_MFTL_INT, domain->comm_graph);
+
+  // --- Exchange Triangles ---
+  mftl_int_t* s_disp_t = calloc(num_neighbors + 1, sizeof(mftl_int_t));
+  mftl_int_t* r_disp_t = calloc(num_neighbors + 1, sizeof(mftl_int_t));
+  mftl_int_t tot_send_t = 0, tot_recv_t = 0;
 
   for (int i = 0; i < num_neighbors; ++i)
   {
-    free(send_tri_bufs[i].buffer);
-    free(send_vert_bufs[i].buffer);
+    s_disp_t[i + 1] = s_disp_t[i] + cnt_send_tris[i];
+    r_disp_t[i + 1] = r_disp_t[i] + n_recv_tris[i];
+    tot_send_t += cnt_send_tris[i];
+    tot_recv_t += n_recv_tris[i];
   }
-  free(send_tri_bufs);
-  free(send_vert_bufs);
+
+  // Linearize Send Buffer (Triangles)
+  PackedTriangleComplex* flat_send_tris = malloc(tot_send_t * sizeof(PackedTriangleComplex));
+  for (int i = 0; i < num_neighbors; ++i)
+  {
+    if (cnt_send_tris[i] > 0) memcpy(flat_send_tris + s_disp_t[i], raw_send_tris[i], cnt_send_tris[i] * sizeof(PackedTriangleComplex));
+    free(raw_send_tris[i]);  // Free individual buffers immediately
+  }
+  free(raw_send_tris);
+
+  PackedTriangleComplex* recv_tris = malloc(tot_recv_t * sizeof(PackedTriangleComplex));
+  MPI_Neighbor_alltoallv(flat_send_tris, cnt_send_tris, s_disp_t, MPI_PackedTriangleComplex, recv_tris, n_recv_tris, r_disp_t, MPI_PackedTriangleComplex,
+                         domain->comm_graph);
+
+  free(flat_send_tris);
+  free(s_disp_t);
+  // free(r_disp_t); // Keep for Phase 4 loops if needed, or just iterate recv buffer linearly
+
+  // --- Exchange Vertices ---
+  mftl_int_t* s_disp_v = calloc(num_neighbors + 1, sizeof(mftl_int_t));
+  mftl_int_t* r_disp_v = calloc(num_neighbors + 1, sizeof(mftl_int_t));
+  mftl_int_t tot_send_v = 0, tot_recv_v = 0;
+
+  for (int i = 0; i < num_neighbors; ++i)
+  {
+    s_disp_v[i + 1] = s_disp_v[i] + cnt_send_verts[i];
+    r_disp_v[i + 1] = r_disp_v[i] + n_recv_verts[i];
+    tot_send_v += cnt_send_verts[i];
+    tot_recv_v += n_recv_verts[i];
+  }
+
+  PackedVertex* flat_send_verts = malloc(tot_send_v * sizeof(PackedVertex));
+  for (int i = 0; i < num_neighbors; ++i)
+  {
+    if (cnt_send_verts[i] > 0) memcpy(flat_send_verts + s_disp_v[i], raw_send_verts[i], cnt_send_verts[i] * sizeof(PackedVertex));
+    free(raw_send_verts[i]);
+  }
+  free(raw_send_verts);
+
+  PackedVertex* recv_verts = malloc(tot_recv_v * sizeof(PackedVertex));
+  MPI_Neighbor_alltoallv(flat_send_verts, cnt_send_verts, s_disp_v, MPI_PackedVertex, recv_verts, n_recv_verts, r_disp_v, MPI_PackedVertex, domain->comm_graph);
+
+  free(flat_send_verts);
+  free(s_disp_v);
+
+  // Cleanup Counts
+  free(cnt_send_tris);
+  free(cap_send_tris);
+  free(cnt_send_verts);
+  free(cap_send_verts);
+  free(n_recv_tris);
+  free(n_recv_verts);
+
+  // =========================================================================
+  // PHASE 4: INTEGRATION
+  // =========================================================================
 
   // Integrate Vertices
-  for (int i = 0; i < n_recv_verts; ++i)
+  for (int i = 0; i < tot_recv_v; ++i)
   {
     PackedVertex* pv = &recv_verts[i];
 
+    // Simple Linear Search for Object (Assumption: low N_objects)
     MFTL_Object* obj = MFTL_NULL;
     for (mftl_int_t o = 0; o < ens->num_objects; ++o)
     {
@@ -2185,17 +2243,19 @@ mftl_int_t MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
         break;
       }
     }
-    if (!obj) continue;
 
-    khiter_t it = kh_get(vertex_map, obj->vertex_lookup, pv->global_id);
-    if (it == kh_end(obj->vertex_lookup))
+    if (obj)
     {
-      MFTLAppendGhostVertex(obj, pv);
+      khiter_t it = kh_get(vertex_map, obj->vertex_lookup, pv->global_id);
+      if (it == kh_end(obj->vertex_lookup))
+      {
+        MFTLAppendGhostVertex(obj, pv);
+      }
     }
   }
 
   // Integrate Triangles
-  for (int i = 0; i < n_recv_tris; ++i)
+  for (int i = 0; i < tot_recv_t; ++i)
   {
     PackedTriangleComplex* ptc = &recv_tris[i];
 
@@ -2208,21 +2268,25 @@ mftl_int_t MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
         break;
       }
     }
-    if (!obj) continue;
 
-    khiter_t it = kh_get(triangle_map, obj->triangle_lookup, ptc->triangle.global_id);
-    if (it == kh_end(obj->triangle_lookup))
+    if (obj)
     {
-      MFTLAppendGhostTriangle(obj, ptc);
+      khiter_t it = kh_get(triangle_map, obj->triangle_lookup, ptc->triangle.global_id);
+      if (it == kh_end(obj->triangle_lookup))
+      {
+        MFTLAppendGhostTriangle(obj, ptc);
+      }
     }
   }
 
   free(recv_tris);
   free(recv_verts);
+  free(r_disp_t);
+  free(r_disp_v);
 
-  // -----------------------------------------------------------------------
-  // PHASE 4: REPAIR TOPOLOGY
-  // -----------------------------------------------------------------------
+  // =========================================================================
+  // PHASE 5: REPAIR TOPOLOGY
+  // =========================================================================
   for (mftl_int_t o = 0; o < ens->num_objects; ++o)
   {
     MFTL_Object* obj = ens->objects[o];

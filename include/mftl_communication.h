@@ -235,4 +235,12 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble *ensemble);
  */
 mftl_int_t MFTLUpdateGhostPositions(MFTL_Ensemble *ens, khash_t(object_map) * object_lookup);
 
+/**
+ * @brief Extends the ghost layer by a specified number of topological steps.
+ * @param ens The ensemble.
+ * @param steps Number of steps to extend (e.g. 1 step = V->T->V).
+ * @return MFTL_SUCCESS on success.
+ */
+mftl_int_t MFTLExtendGhostLayer(MFTL_Ensemble *ens, int steps);
+
 #endif

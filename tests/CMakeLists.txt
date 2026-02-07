@@ -36,3 +36,11 @@ target_include_directories(test_mpi_stress PRIVATE ${CMAKE_SOURCE_DIR}/include)
 
 # Run with 8 ranks for stress testing (or 4 if 8 is too heavy for local CI)
 add_test(NAME MPIStressTest COMMAND mpirun -np 8 $<TARGET_FILE:test_mpi_stress>)
+
+# --- Phase 4: Ghost Layer Integration Test ---
+add_executable(test_ghost_layers test_ghost_layers.c)
+target_link_libraries(test_ghost_layers PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_ghost_layers PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
+# Requires exactly 4 ranks
+add_test(NAME MPIGhostLayers COMMAND mpirun -np 4 $<TARGET_FILE:test_ghost_layers>)
