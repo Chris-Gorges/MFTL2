@@ -63,6 +63,7 @@ typedef struct MFTL_RemeshParameters
   double max_edge_length_sq;
   double target_length;
   double aspect_ratio_tolerance;  // For collapse/swap
+  int iterations;
 } MFTL_RemeshParameters;
 
 // --- Core Topological Operators ---

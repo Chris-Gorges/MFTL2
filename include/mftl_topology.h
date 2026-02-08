@@ -264,6 +264,63 @@ static inline mftl_int_t MFTLGetVertexOneRingVertices(const MFTL_Object *obj, co
 }
 
 /**
+ * @brief Retrieves the indices of the 1-ring of outgoing half-edges for a vertex.
+ * This is the "Edge-based" variant of the one-ring search.
+ *
+ * @param obj The mesh object.
+ * @param v The central vertex.
+ * @param[out] out_he_indices User-allocated array for half-edge INDICES.
+ * @param max_he Safety limit for the buffer (usually 64 is plenty).
+ * @param is_inner Optimization flag. Set to true if you are certain the vertex is not on the boundary.
+ * @return The number of edges found.
+ */
+static inline mftl_int_t MFTLGetVertexOneRingHalfedges(const MFTL_Object *obj, const MFTL_Vertex *v, mftl_int_t *out_he_indices, mftl_int_t max_he,
+                                                       bool is_inner)
+{
+  mftl_int_t count = 0;
+
+  // 1. Get Start
+  MFTL_HalfEdge *start_he = MFTLVOutHe(obj, v);
+  if (!start_he) return 0;  // Isolated vertex
+
+  MFTL_HalfEdge *curr = start_he;
+
+  // 2. Rewind (Find the "first" edge in the fan if on boundary)
+  if (is_inner == false)
+  {
+    while (true)
+    {
+      MFTL_HalfEdge *incoming = MFTLHePrev(obj, curr);  // Uses Next->Next
+      MFTL_HalfEdge *cw_neighbor = MFTLHeTwin(obj, incoming);
+
+      // Stop if boundary hit or loop closed
+      if (!cw_neighbor || cw_neighbor == start_he) break;
+      curr = cw_neighbor;
+    }
+    start_he = curr;
+  }
+
+  // 3. Replay (Collect Indices)
+  do
+  {
+    assert(count < max_he && "Buffer overflow in MFTLGetVertexOneRingHalfedges");
+
+    // CALCULATE INDEX: Pointer Arithmetic (Safe within this function scope)
+    // This converts the pointer 'curr' back to its integer index in the pool.
+    out_he_indices[count++] = (mftl_int_t) (curr - obj->half_edges);
+
+    // Advance
+    MFTL_HalfEdge *twin = MFTLHeTwin(obj, curr);
+    if (!twin) break;  // Boundary stop
+
+    curr = MFTLHeNext(obj, twin);
+
+  } while (curr != start_he);
+
+  return count;
+}
+
+/**
  * @brief Retrieves the three neighboring triangles of a given triangle.
  * * The neighbors are ordered corresponding to the triangle's half-edges (CCW).
  * * @param obj The mesh object.

@@ -423,92 +423,178 @@ mftl_int_t MFTLSplitEdge(MFTL_Object *obj, mftl_int_t he_ab_idx)
   return v_m_idx;
 }
 
-// // Check if collapsing he (A->B) is topologically valid
-// static bool is_collapse_legal(MFTL_Object *obj, mftl_int_t he_idx)
-// {
-//   // 1. Boundary check (don't collapse boundary vertices into interior unless careful)
-//   // 2. Link Condition:
-//   //    Get 1-ring of A. Get 1-ring of B.
-//   //    Count duplicates. Should be exactly 2 (C and D) for internal edge.
-//   return true;  // Placeholder
-// }
+// Helper to link twins and bypass a dead edge
+// Connects OuterTwin1 <-> OuterTwin2
+void glue_wings(MFTL_Object *o, mftl_int_t edge1, mftl_int_t edge2)
+{
+  mftl_int_t t1 = o->half_edges[edge1].twin_idx;
+  mftl_int_t t2 = o->half_edges[edge2].twin_idx;
 
-// mftl_int_t MFTLCollapseEdge(MFTL_Object *obj, mftl_int_t he_idx)
-// {
-//   if (!is_collapse_legal(obj, he_idx)) return MFTL_ERROR;
+  if (t1 != MFTL_ERROR)
+  {
+    o->half_edges[t1].twin_idx = t2;
+    // Safety: Update vertex out pointer
+    mftl_int_t v = o->half_edges[t1].vertex_idx;  // Origin of t2
+    // Actually origin of t1 is target of edge1.
+    // Target of edge1 is the vertex 'C'.
+    o->vertices[o->half_edges[edge1].vertex_idx].out_he_idx = t1;
+  }
+  if (t2 != MFTL_ERROR)
+  {
+    o->half_edges[t2].twin_idx = t1;
+    // Safety: Update vertex out pointer
+    o->vertices[o->half_edges[edge2].vertex_idx].out_he_idx = t2;
+  }
+};
 
-//   // 1. Resolve Indices
-//   MFTL_HalfEdge *he_ab = &obj->half_edges[he_idx];
-//   mftl_int_t v_a_idx = MFTLHeOrigin(obj, he_ab)->vertex_idx;  // We delete A
-//   mftl_int_t v_b_idx = he_ab->vertex_idx;  // We keep B
+void MFTLCollapseEdge(MFTL_Object *obj, mftl_int_t he_ab_idx)
+{
+  // --- 1. Gather Context ---
+  MFTL_HalfEdge *he_ab = &obj->half_edges[he_ab_idx];
+  mftl_int_t he_ba_idx = he_ab->twin_idx;
 
-//   mftl_int_t he_ba_idx = he_ab->twin_idx;
+  // Identify Vertices: A (Origin -> Remove), B (Target -> Keep)
+  mftl_int_t prev_he = obj->half_edges[obj->half_edges[he_ab_idx].next_idx].next_idx;
+  mftl_int_t v_a_idx = obj->half_edges[prev_he].vertex_idx;
+  mftl_int_t v_b_idx = he_ab->vertex_idx;
 
-//   // 2. Re-point A's neighborhood to B
-//   // Iterate all incoming half-edges to A
-//   MFTL_HalfEdge *curr = &obj->half_edges[obj->vertices[v_a_idx].out_he_idx];
+  // --- 2. Re-point A's Neighborhood to B ---
+  // Use halfedge index-based ring function to get handles to all edges A->X
+  mftl_int_t a_outgoing[13];
+  mftl_int_t a_degree = MFTLGetVertexOneRingHalfedges(obj, &obj->vertices[v_a_idx], a_outgoing, 13, false);
 
-//   // We need to iterate the "Umbrella" of A.
-//   // For every HE starting at A, we find its twin (pointing to A).
-//   // Wait, simpler: Iterate A's outgoing half-edges.
-//   // For each outgoing he (A->X), he->twin is (X->A).
-//   // Change X->A to X->B.
+  for (int i = 0; i < a_degree; ++i)
+  {
+    mftl_int_t he_out = a_outgoing[i];  // A->Neighbor
+    mftl_int_t he_in = obj->half_edges[he_out].twin_idx;  // Neighbor->A
 
-//   // CAUTION: Iterating while modifying topology is tricky.
-//   // Collect all incoming edges to A first?
-//   // In Half-Edge, we rotate around A.
+    // If a twin exists, repoint Neighbor->A to Neighbor->B
+    if (he_in != MFTL_ERROR)
+    {
+      obj->half_edges[he_in].vertex_idx = v_b_idx;
+    }
+  }
 
-//   mftl_int_t start_he = obj->vertices[v_a_idx].out_he_idx;
-//   mftl_int_t curr_he = start_he;
+  // --- 3. Remove Degenerate Faces (Gluing the Wings) ---
 
-//   do
-//   {
-//     MFTL_HalfEdge *he = &obj->half_edges[curr_he];
-//     mftl_int_t twin_idx = he->twin_idx;
+  // -> Process Top Face (T1: A-B-C)
+  mftl_int_t t1_idx = he_ab->triangle_idx;
 
-//     if (twin_idx != -1)
-//     {
-//       // Twin points TO A. Make it point TO B.
-//       obj->half_edges[twin_idx].vertex_idx = v_b_idx;
-//     }
+  obj->triangles[t1_idx].flags |= MFTL_FLAG_DEAD;
 
-//     // Move to next spoke
-//     if (he->prev_idx == -1) break;  // Should not happen in closed mesh
-//     mftl_int_t prev_he = he->prev_idx;
-//     if (obj->half_edges[prev_he].twin_idx == -1) break;  // Boundary stop
+  mftl_int_t he_bc = he_ab->next_idx;
+  mftl_int_t he_ca = obj->half_edges[he_bc].next_idx;
 
-//     curr_he = obj->half_edges[prev_he].twin_idx;
-//   } while (curr_he != start_he);
+  // Glue AC and BC wings
+  glue_wings(obj, he_ca, he_bc);
 
-//   // 3. Delete the degenerate triangles (A,B,C) and (B,A,D)
-//   // Mark associated edges/faces as DEAD.
+  obj->half_edges[he_bc].flags |= MFTL_FLAG_DEAD;
+  obj->half_edges[he_ca].flags |= MFTL_FLAG_DEAD;
 
-//   // (A,B,C) is he_ab->triangle_idx
-//   obj->triangles[he_ab->triangle_idx].flags |= MFTL_FLAG_DEAD;
-//   // (B,A,D) is obj->half_edges[he_ba_idx].triangle_idx
-//   if (he_ba_idx != -1) obj->triangles[obj->half_edges[he_ba_idx].triangle_idx].flags |= MFTL_FLAG_DEAD;
+  // -> Process Bottom Face (T2: B-A-D)
+  if (he_ba_idx != MFTL_ERROR)
+  {
+    mftl_int_t t2_idx = obj->half_edges[he_ba_idx].triangle_idx;
+    obj->triangles[t2_idx].flags |= MFTL_FLAG_DEAD;
 
-//   // Mark edges A->B and B->A as DEAD
-//   obj->half_edges[he_idx].flags |= MFTL_FLAG_DEAD;
-//   if (he_ba_idx != -1) obj->half_edges[he_ba_idx].flags |= MFTL_FLAG_DEAD;
+    mftl_int_t he_ad = obj->half_edges[he_ba_idx].next_idx;
+    mftl_int_t he_db = obj->half_edges[he_ad].next_idx;
 
-//   // Mark vertex A as DEAD
-//   obj->vertices[v_a_idx].flags |= MFTL_FLAG_DEAD;
+    // Glue AD and DB wings
+    glue_wings(obj, he_ad, he_db);
 
-//   // 4. Update B's connectivity
-//   // B might point to the deleted edge B->A. Update B->out_he_idx to something safe.
-//   // Find a neighbor of B that isn't A.
+    obj->half_edges[he_ad].flags |= MFTL_FLAG_DEAD;
+    obj->half_edges[he_db].flags |= MFTL_FLAG_DEAD;
+  }
 
-//   // 5. Glue the "flaps"
-//   // The edges AC and BC are now effectively parallel and identical.
-//   // You must merge the half-edge AC with BC.
-//   // This is the specific logic of "Collapsing":
-//   // The twin of (C->A) was (A->C). Now (C->A) points to B (C->B).
-//   // There is already a (C->B). We have duplicate edges.
-//   // We must remove the "inner" duplicate edges and link the "outer" ones.
+  // --- 4. Final Cleanup ---
+  // Mark A and the connecting edge dead
+  obj->vertices[v_a_idx].flags |= MFTL_FLAG_DEAD;
+  obj->half_edges[he_ab_idx].flags |= MFTL_FLAG_DEAD;
+  if (he_ba_idx != MFTL_ERROR) obj->half_edges[he_ba_idx].flags |= MFTL_FLAG_DEAD;
 
-//   return v_b_idx;
-// }
+  // Update B's position to midpoint (Smoothness)
+  for (int k = 0; k < 3; ++k)
+  {
+    obj->vertices[v_b_idx].pos[k] = 0.5 * (obj->vertices[v_b_idx].pos[k] + obj->vertices[v_a_idx].pos[k]);
+  }
+
+  // Safety: Ensure B points to a valid outgoing edge
+  // (We might have killed its previous out_he!)
+  mftl_int_t check_he = obj->vertices[v_b_idx].out_he_idx;
+  if (obj->half_edges[check_he].flags & MFTL_FLAG_DEAD)
+  {
+    // the twin of he_ca must be a valid outgoing he for B
+    obj->vertices[v_b_idx].out_he_idx = obj->half_edges[he_ca].twin_idx;
+  }
+}
+
+// Helper to check if vertex is on boundary (uses the 1-ring logic implicitly)
+static bool IsBoundaryVertex(const MFTL_Object *obj, mftl_int_t v_idx)
+{
+  // Fast check: just see if the circulation hits a null twin
+  MFTL_HalfEdge *start = &obj->half_edges[obj->vertices[v_idx].out_he_idx];
+  MFTL_HalfEdge *curr = start;
+  do
+  {
+    if (curr->twin_idx == MFTL_ERROR) return MFTL_TRUE;
+    curr = &obj->half_edges[obj->half_edges[curr->twin_idx].next_idx];
+  } while (curr != start);
+  return MFTL_FALSE;
+}
+
+int CollapseApproved(MFTL_Object *obj, mftl_int_t he_idx, MFTL_RemeshParameters *params)
+{
+  MFTL_HalfEdge *he = &obj->half_edges[he_idx];
+
+  // 1. Status Checks
+  if (he->flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) return MFTL_FALSE;
+  if (he->twin_idx == MFTL_ERROR) return MFTL_FALSE;  // Generally avoid collapsing boundary edges unless robust
+
+  // 2. Length Check (Squared distance optimization)
+  double len_sq = MFTLGetEdgeLengthSq(obj, he);
+  if (len_sq > params->min_edge_length_sq) return MFTL_FALSE;
+
+  // 3. Topology: Link Condition (The Intersection Test)
+  // We need to ensure A and B share exactly 2 neighbors (for interior edge).
+
+  // Get Pointers for Ring Function
+  mftl_int_t prev_he = obj->half_edges[obj->half_edges[he_idx].next_idx].next_idx;
+  mftl_int_t v_a = obj->half_edges[prev_he].vertex_idx;
+  mftl_int_t v_b = he->vertex_idx;
+
+  MFTL_Vertex *v_a_ptr = &obj->vertices[v_a];
+  MFTL_Vertex *v_b_ptr = &obj->vertices[v_b];
+
+  // Get Rings
+  MFTL_Vertex *ring_a[13];
+  MFTL_Vertex *ring_b[13];
+  mftl_int_t count_a = MFTLGetVertexOneRingVertices(obj, v_a_ptr, ring_a, 13, MFTL_FALSE);  // Check if MFTL_FALSE OR TRUE IS BETTER HERE
+  mftl_int_t count_b = MFTLGetVertexOneRingVertices(obj, v_b_ptr, ring_b, 13, MFTL_FALSE);  // Check if MFTL_FALSE OR TRUE IS BETTER HERE
+
+  // Count Common Neighbors
+  int common = 0;
+  for (int i = 0; i < count_a; ++i)
+  {
+    for (int j = 0; j < count_b; ++j)
+    {
+      // Compare IDs (safer than pointers if realloc occurred, though safe here)
+      if (ring_a[i] == ring_b[j]) common++;
+    }
+  }
+
+  // Threshold: Interior edge must share exactly 2 neighbors.
+  // (If boundary edge logic is supported, threshold is 1)
+  if (common != 2) return MFTL_FALSE;
+
+  // 4. Boundary Geometry Check
+  // Don't collapse boundary vertex into interior vertex
+  bool a_bound = IsBoundaryVertex(obj, v_a);
+  bool b_bound = IsBoundaryVertex(obj, v_b);
+  if (a_bound && !b_bound) return MFTL_FALSE;
+
+  return MFTL_TRUE;
+}
 
 static inline int SplitApproved(MFTL_Object *obj, mftl_int_t he_idx, MFTL_RemeshParameters *params)
 {
@@ -527,120 +613,243 @@ static inline int SplitApproved(MFTL_Object *obj, mftl_int_t he_idx, MFTL_Remesh
   return approved;
 }
 
-void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
+/**
+ * @brief Finalizes the object state after remeshing.
+ * Smartly chooses between a fast "append-only" update (if only splits happened)
+ * or a full "compaction & rebuild" (if collapses happened).
+ * * @param obj The mesh object.
+ * @param start_num_v The number of vertices BEFORE the remeshing pass.
+ * @param start_num_t The number of triangles BEFORE the remeshing pass.
+ * @param start_num_h The number of half-edges BEFORE the remeshing pass.
+ * @param collapses_occurred Set to true if ANY collapse operation was performed.
+ */
+void MFTLFinalizeObject(MFTL_Object *obj, mftl_int_t start_num_v, mftl_int_t start_num_t, mftl_int_t start_num_h, bool collapses_occurred)
 {
-  for (mftl_int_t i = 0; i < ens->num_objects; i++)
+  // Reset visited flags
+  for (mftl_int_t j = 0; j < obj->n_half_edges; ++j)
   {
-    MFTL_Object *obj = ens->objects[i];
+    obj->half_edges[j].flags &= ~MFTL_FLAG_VISITED;
+  }
 
-    // --- 0. Snapshot Initial Counts ---
-    // We use these to identify exactly which elements are "new" after the pass.
-    mftl_int_t start_n_vertices = obj->n_vertices;
-    mftl_int_t start_n_triangles = obj->n_triangles;
-    mftl_int_t start_n_halfedges = obj->n_half_edges;
-
-    // Reset visited flags
-    for (mftl_int_t j = 0; j < obj->n_half_edges; ++j)
+  // ---------------------------------------------------------
+  // PATH A: FAST APPEND (Only Splits - No Compaction Needed)
+  // ---------------------------------------------------------
+  if (!collapses_occurred)
+  {
+    // 1. Vertices (Only process the new ones)
+    if (obj->n_vertices > start_num_v)
     {
-      obj->half_edges[j].flags &= ~MFTL_FLAG_VISITED;
-    }
-
-    // 1. SPLIT
-    // Iterate active edges (loop over HEs, process if index < twin_index)
-    // Note: Iterate BACKWARDS or use a separate list, because splitting adds new edges
-    // that you don't want to split again in this pass.
-    for (mftl_int_t j = obj->n_half_edges - 1; j >= 0; j--)
-    {
-      if (SplitApproved(obj, j, params))
-      {
-        MFTLSplitEdge(obj, j);
-      }
-    }
-
-    // // 2. COLLAPSE
-    // // Use a while loop because collapsing changes indices drastically
-    // bool collapsed_something = true;
-    // while (collapsed_something)
-    // {
-    //   collapsed_something = false;
-    //   for (mftl_int_t i = 0; i < obj->n_half_edges; i++)
-    //   {
-    //     if (obj->half_edges[i].flags & MFTL_FLAG_DEAD) continue;
-
-    //     // Check Length < min
-    //     double len = MFTLGetEdgeLength(obj, &obj->half_edges[i]);
-    //     if (len < params->min_edge_length)
-    //     {
-    //       if (MFTLCollapseEdge(obj, i) != MFTL_ERROR)
-    //       {
-    //         collapsed_something = true;
-    //         // Don't break, continue pass? Or restart?
-    //         // Restarting is safer but slower.
-    //       }
-    //     }
-    //   }
-    // }
-
-    // 3. SWAP (Valence Optimization)
-    // Flip edges to target valence 6
-
-    // 4. SMOOTH (Tangential)
-    // Simple Laplacian smoothing to improve quality
-
-    // --- BATCH UPDATE HASH MAPS (The Optimization) ---
-    // We only iterate over the elements added during this remeshing pass.
-
-    // A. Vertices
-    if (obj->n_vertices > start_n_vertices)
-    {
-      // 1. Resize once to avoid multiple rehashes
+      // Optimal: Resize once to fit the final count
       kh_resize(vertex_map, obj->vertex_lookup, obj->n_vertices);
 
-      // 2. Insert only the new vertices
-      for (mftl_int_t v = start_n_vertices; v < obj->n_vertices; ++v)
+      for (mftl_int_t i = start_num_v; i < obj->n_vertices; ++i)
       {
-        // // Skip if dead (relevant if collapse is active)
-        // if (obj->vertices[v].flags & MFTL_FLAG_DEAD) continue;
-
         int ret;
-        mftl_int_t gid = obj->vertices[v].global_id;
-        khiter_t iter = kh_put(vertex_map, obj->vertex_lookup, gid, &ret);
-        kh_value(obj->vertex_lookup, iter) = v;
+        khiter_t iter = kh_put(vertex_map, obj->vertex_lookup, obj->vertices[i].global_id, &ret);
+        kh_value(obj->vertex_lookup, iter) = i;
       }
     }
 
-    // B. Triangles
-    if (obj->n_triangles > start_n_triangles)
+    // 2. Triangles
+    if (obj->n_triangles > start_num_t)
     {
       kh_resize(triangle_map, obj->triangle_lookup, obj->n_triangles);
 
-      for (mftl_int_t t = start_n_triangles; t < obj->n_triangles; ++t)
+      for (mftl_int_t i = start_num_t; i < obj->n_triangles; ++i)
       {
-        // if (obj->triangles[t].flags & MFTL_FLAG_DEAD) continue;
-
         int ret;
-        mftl_int_t gid = obj->triangles[t].global_id;
-        khiter_t iter = kh_put(triangle_map, obj->triangle_lookup, gid, &ret);
-        kh_value(obj->triangle_lookup, iter) = t;
+        khiter_t iter = kh_put(triangle_map, obj->triangle_lookup, obj->triangles[i].global_id, &ret);
+        kh_value(obj->triangle_lookup, iter) = i;
       }
     }
 
-    // C. Half-Edges (Optional - only if your library relies on Global ID lookups for HEs)
-    // Most half-edge ops rely on local indices, so this might be unnecessary overhead.
-    // TODO: Check if this is actually needed. Currently we only need the halfedge lookup after redistribution.
-    if (obj->halfedge_lookup && obj->n_half_edges > start_n_halfedges)
+    // 3. Half-Edges (If used)
+    if (obj->halfedge_lookup && obj->n_half_edges > start_num_h)
     {
       kh_resize(halfedge_map, obj->halfedge_lookup, obj->n_half_edges);
 
-      for (mftl_int_t h = start_n_halfedges; h < obj->n_half_edges; ++h)
+      for (mftl_int_t i = start_num_h; i < obj->n_half_edges; ++i)
       {
-        // if (obj->half_edges[h].flags & MFTL_FLAG_DEAD) continue;
-
         int ret;
-        mftl_int_t gid = obj->half_edges[h].global_id;
-        khiter_t iter = kh_put(halfedge_map, obj->halfedge_lookup, gid, &ret);
-        kh_value(obj->halfedge_lookup, iter) = h;
+        khiter_t iter = kh_put(halfedge_map, obj->halfedge_lookup, obj->half_edges[i].global_id, &ret);
+        kh_value(obj->halfedge_lookup, iter) = i;
       }
+    }
+
+    return;  // DONE! (Fast exit)
+  }
+
+  // ---------------------------------------------------------
+  // PATH B: FULL COMPACTION (Collapses Happened - Move Data)
+  // ---------------------------------------------------------
+
+  // 1. Setup Maps
+  mftl_int_t *v_map = malloc(obj->n_vertices * sizeof(mftl_int_t));
+  mftl_int_t *t_map = malloc(obj->n_triangles * sizeof(mftl_int_t));
+  mftl_int_t *h_map = malloc(obj->n_half_edges * sizeof(mftl_int_t));
+
+  assert(v_map && t_map && h_map);
+
+  // 2. Compact Arrays (Standard Logic)
+  // --- Vertices ---
+  mftl_int_t new_v_count = 0;
+  for (mftl_int_t i = 0; i < obj->n_vertices; i++)
+  {
+    if (obj->vertices[i].flags & MFTL_FLAG_DEAD)
+    {
+      v_map[i] = MFTL_ERROR;
+    }
+    else
+    {
+      v_map[i] = new_v_count;
+      if (i != new_v_count) obj->vertices[new_v_count] = obj->vertices[i];
+      new_v_count++;
+    }
+  }
+  obj->n_vertices = new_v_count;
+
+  // --- Triangles ---
+  mftl_int_t new_t_count = 0;
+  for (mftl_int_t i = 0; i < obj->n_triangles; i++)
+  {
+    if (obj->triangles[i].flags & MFTL_FLAG_DEAD)
+    {
+      t_map[i] = MFTL_ERROR;
+    }
+    else
+    {
+      t_map[i] = new_t_count;
+      if (i != new_t_count) obj->triangles[new_t_count] = obj->triangles[i];
+      new_t_count++;
+    }
+  }
+  obj->n_triangles = new_t_count;
+
+  // --- Half-Edges ---
+  mftl_int_t new_h_count = 0;
+  for (mftl_int_t i = 0; i < obj->n_half_edges; i++)
+  {
+    if (obj->half_edges[i].flags & MFTL_FLAG_DEAD)
+    {
+      h_map[i] = MFTL_ERROR;
+    }
+    else
+    {
+      h_map[i] = new_h_count;
+      if (i != new_h_count) obj->half_edges[new_h_count] = obj->half_edges[i];
+      new_h_count++;
+    }
+  }
+  obj->n_half_edges = new_h_count;
+
+  // 3. Relink Pointers
+  // Update Vertices
+  for (mftl_int_t i = 0; i < obj->n_vertices; i++)
+  {
+    obj->vertices[i].out_he_idx = h_map[obj->vertices[i].out_he_idx];
+  }
+  // Update Triangles
+  for (mftl_int_t i = 0; i < obj->n_triangles; i++)
+  {
+    obj->triangles[i].he_idx = h_map[obj->triangles[i].he_idx];
+  }
+  // Update Half-Edges
+  for (mftl_int_t i = 0; i < obj->n_half_edges; i++)
+  {
+    MFTL_HalfEdge *he = &obj->half_edges[i];
+    he->next_idx = h_map[he->next_idx];
+    he->twin_idx = h_map[he->twin_idx];
+    he->vertex_idx = v_map[he->vertex_idx];
+    he->triangle_idx = t_map[he->triangle_idx];
+  }
+
+  // 4. Free Maps
+  free(v_map);
+  free(t_map);
+  free(h_map);
+
+  // 5. Rebuild Hash Maps (The Full Reset)
+  // Since indices shifted arbitrarily, we clear and fill from scratch.
+
+  // Vertices
+  kh_clear(vertex_map, obj->vertex_lookup);
+  kh_resize(vertex_map, obj->vertex_lookup, obj->n_vertices);
+  for (mftl_int_t i = 0; i < obj->n_vertices; ++i)
+  {
+    int ret;
+    khiter_t iter = kh_put(vertex_map, obj->vertex_lookup, obj->vertices[i].global_id, &ret);
+    kh_value(obj->vertex_lookup, iter) = i;
+  }
+
+  // Triangles
+  kh_clear(triangle_map, obj->triangle_lookup);
+  kh_resize(triangle_map, obj->triangle_lookup, obj->n_triangles);
+  for (mftl_int_t i = 0; i < obj->n_triangles; ++i)
+  {
+    int ret;
+    khiter_t iter = kh_put(triangle_map, obj->triangle_lookup, obj->triangles[i].global_id, &ret);
+    kh_value(obj->triangle_lookup, iter) = i;
+  }
+
+  // Half-Edges
+  if (obj->halfedge_lookup)
+  {
+    kh_clear(halfedge_map, obj->halfedge_lookup);
+    kh_resize(halfedge_map, obj->halfedge_lookup, obj->n_half_edges);
+    for (mftl_int_t i = 0; i < obj->n_half_edges; ++i)
+    {
+      int ret;
+      khiter_t iter = kh_put(halfedge_map, obj->halfedge_lookup, obj->half_edges[i].global_id, &ret);
+      kh_value(obj->halfedge_lookup, iter) = i;
+    }
+  }
+}
+
+void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
+{
+  for (int iter = 0; iter < params->iterations; iter++)
+  {
+    for (mftl_int_t i = 0; i < ens->num_objects; i++)
+    {
+      MFTL_Object *obj = ens->objects[i];
+
+      // --- 0. Snapshot Initial Counts ---
+      // We use these to identify exactly which elements are "new" after the pass.
+      mftl_int_t start_n_vertices = obj->n_vertices;
+      mftl_int_t start_n_triangles = obj->n_triangles;
+      mftl_int_t start_n_halfedges = obj->n_half_edges;
+
+      bool collapses_occurred = MFTL_FALSE;
+
+      // 1. SPLIT
+      // Iterate active edges (loop over HEs, process if index < twin_index)
+      // Note: Iterate BACKWARDS or use a separate list, because splitting adds new edges
+      // that you don't want to split again in this pass.
+      for (mftl_int_t j = obj->n_half_edges - 1; j >= 0; j--)
+      {
+        if (SplitApproved(obj, j, params))
+        {
+          MFTLSplitEdge(obj, j);
+        }
+      }
+
+      // 2. COLLAPSE
+      for (mftl_int_t j = 0; j < obj->n_half_edges; ++j)
+      {
+        if (CollapseApproved(obj, j, params))
+        {
+          MFTLCollapseEdge(obj, j);
+          collapses_occurred = MFTL_TRUE;
+        }
+      }
+
+      // 3. SWAP (Valence Optimization)
+      // Flip edges to target valence 6
+
+      // 4. SMOOTH (Tangential)
+      // Simple Laplacian smoothing to improve quality
+
+      MFTLFinalizeObject(obj, start_n_vertices, start_n_triangles, start_n_halfedges, collapses_occurred);
     }
   }
 }
