@@ -22,5 +22,6 @@ cmake_install.cmake
 CMakeConfigureLog.yaml
 lib/
 *.vtu
+*.pvtu
 
 
