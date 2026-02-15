@@ -44,3 +44,9 @@ target_include_directories(test_ghost_layers PRIVATE ${CMAKE_SOURCE_DIR}/include
 
 # Requires exactly 4 ranks
 add_test(NAME MPIGhostLayers COMMAND mpirun -np 4 $<TARGET_FILE:test_ghost_layers>)
+
+# --- Phase 5: Remeshing Unit Tests ---
+add_executable(test_remeshing test_remeshing.c)
+target_link_libraries(test_remeshing PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_remeshing PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME UnitRemeshing COMMAND mpirun -np 1 $<TARGET_FILE:test_remeshing>)

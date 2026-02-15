@@ -71,7 +71,7 @@ typedef struct MFTL_RemeshParameters
 // or MFTL_ERROR on failure.
 
 mftl_int_t MFTLSplitEdge(MFTL_Object *obj, mftl_int_t he_ab_idx);
-mftl_int_t MFTLCollapseEdge(MFTL_Object *obj, mftl_int_t he_idx);
+void MFTLCollapseEdge(MFTL_Object *obj, mftl_int_t he_ab_idx);
 mftl_int_t MFTLSwapEdge(MFTL_Object *obj, mftl_int_t he_idx);
 
 // --- High Level Routine ---

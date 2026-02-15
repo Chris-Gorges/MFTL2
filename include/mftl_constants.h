@@ -42,7 +42,7 @@
 #define MFTL_ONE_THIRD 0.33333333333333333333
 
 #define MFTL_MAX_VALENCE 32
-#define MFTL_FLAG_VISITED (1 << 0)
+#define MFTL_FLAG_VISITED (1 << 2)
 
 // Memory Management
 #define MFTL_INIT_CAPACITY 128

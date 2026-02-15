@@ -24,12 +24,20 @@ static inline MFTL_Vertex *MFTLGetVertex(const MFTL_Object *obj, mftl_int_t idx)
 /**
  * @brief Get a pointer to a half-edge by its local index.
  */
-static inline MFTL_HalfEdge *MFTLGetHalfedge(const MFTL_Object *obj, mftl_int_t idx) { return &obj->half_edges[idx]; }
+static inline MFTL_HalfEdge *MFTLGetHalfedge(const MFTL_Object *obj, mftl_int_t idx)
+{
+  if (idx == MFTL_ERROR) return MFTL_NULL;
+  return &obj->half_edges[idx];
+}
 
 /**
  * @brief Get a pointer to a triangle by its local index.
  */
-static inline MFTL_Triangle *MFTLGetTriangle(const MFTL_Object *obj, mftl_int_t idx) { return &obj->triangles[idx]; }
+static inline MFTL_Triangle *MFTLGetTriangle(const MFTL_Object *obj, mftl_int_t idx)
+{
+  if (idx == MFTL_ERROR) return MFTL_NULL;
+  return &obj->triangles[idx];
+}
 
 // -----------------------------------------------------------------------------
 // 2. VERTEX NAVIGATION

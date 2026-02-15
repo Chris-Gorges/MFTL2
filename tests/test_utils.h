@@ -79,4 +79,24 @@ static int g_tests_failed = 0;
     }                                                                                                                                              \
   } while (0)
 
+#define TEST_ASSERT_NOT_EQUAL_INT(expected, actual)                                                                                                      \
+  do                                                                                                                                                     \
+  {                                                                                                                                                      \
+    if ((expected) == (actual))                                                                                                                          \
+    {                                                                                                                                                    \
+      printf("\n  %sAssertion failed: Expected NOT %d, Got %d%s\n  File: %s:%d\n  ", ANSI_COLOR_RED, (int) (expected), (int) (actual), ANSI_COLOR_RESET, \
+             __FILE__, __LINE__);                                                                                                                        \
+      return 1;                                                                                                                                          \
+    }                                                                                                                                                    \
+  } while (0)
+
+#define TEST_ASSERT_TRUE(cond) TEST_ASSERT(cond)
+
+#define TEST_FAIL()                                                                                            \
+  do                                                                                                           \
+  {                                                                                                            \
+    printf("\n  %sForced Failure%s\n  File: %s:%d\n  ", ANSI_COLOR_RED, ANSI_COLOR_RESET, __FILE__, __LINE__); \
+    return 1;                                                                                                  \
+  } while (0)
+
 #endif  // MFTL_TEST_UTILS_H
