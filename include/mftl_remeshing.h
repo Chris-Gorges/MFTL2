@@ -50,21 +50,80 @@ typedef struct
 // // Rule: The rank with the lower ID owns the shared edge.
 // static inline bool MFTLIsEdgeOwner(int my_rank, int neighbor_rank) { return my_rank < neighbor_rank; }
 
-// --- Flags for internal state ---
-#define MFTL_FLAG_DEAD (1 << 0)  // Element is deleted
-#define MFTL_FLAG_MODIFIED (1 << 1)  // Element was touched (for next pass)
-
-// --- Remeshing Parameters ---
-typedef struct MFTL_RemeshParameters
+typedef enum
 {
+  MFTL_REMESH_ISOTROPIC,  // Botsch & Kobbelt (4/5 and 4/3 limits)
+  MFTL_REMESH_ANISOTROPIC,  // Metric-driven remeshing
+  MFTL_REMESH_CUSTOM  // Manual user-defined limits
+} MFTL_RemeshType;
+
+typedef enum
+{
+  MFTL_SMOOTH_VERTEX_BASED,
+  MFTL_SMOOTH_TRIANGLE_BASED
+} MFTL_SmoothMode;
+
+typedef struct
+{
+  MFTL_RemeshType type;
+  MFTL_SmoothMode smooth_mode;
+  int iterations;
+
+  // Length targets
+  double target_length;
   double min_edge_length;
   double max_edge_length;
   double min_edge_length_sq;
   double max_edge_length_sq;
-  double target_length;
-  double aspect_ratio_tolerance;  // For collapse/swap
-  int iterations;
+
+  double feature_angle_threshold;
+
+  // ... any other parameters like smoothing weights, boundary locks, etc.
 } MFTL_RemeshParameters;
+
+/**
+ * @brief Initializes remeshing parameters based on standard literature values.
+ */
+static inline void MFTLInitRemeshParams(MFTL_RemeshParameters *params, MFTL_RemeshType type, double target_length, int iterations, MFTL_SmoothMode smooth_mode,
+                                        double feature_angle_threshold)
+{
+  params->type = type;
+  params->target_length = target_length;
+  params->iterations = iterations;
+  params->smooth_mode = smooth_mode;
+  params->feature_angle_threshold = feature_angle_threshold;
+
+  switch (type)
+  {
+    case MFTL_REMESH_ISOTROPIC:
+      // Standard Botsch & Kobbelt isotropic limits
+      params->min_edge_length = (4.0 / 5.0) * target_length;
+      params->max_edge_length = (4.0 / 3.0) * target_length;
+      break;
+
+    case MFTL_REMESH_ANISOTROPIC:
+      // For metric-driven anisotropic remeshing, lengths are evaluated
+      // in metric space where the target length is always exactly 1.0.
+      // We set the physical target_length to 1.0 to reflect metric space.
+      params->target_length = 1.0;
+      params->min_edge_length = (4.0 / 5.0);
+      params->max_edge_length = (4.0 / 3.0);
+      // Note: Your distance functions will need to be updated to compute
+      // metric distance instead of Euclidean distance if type == ANISOTROPIC.
+      break;
+
+    case MFTL_REMESH_CUSTOM:
+      // Do nothing. The user must manually set min/max.
+      // (You could set defaults here if you wanted).
+      params->min_edge_length = target_length;
+      params->max_edge_length = target_length;
+      break;
+  }
+
+  // Pre-calculate squared values for fast distance checks
+  params->min_edge_length_sq = params->min_edge_length * params->min_edge_length;
+  params->max_edge_length_sq = params->max_edge_length * params->max_edge_length;
+}
 
 // --- Core Topological Operators ---
 // These return the index of the central vertex (split) or remaining vertex (collapse)

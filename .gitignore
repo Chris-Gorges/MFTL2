@@ -23,5 +23,8 @@ CMakeConfigureLog.yaml
 lib/
 *.vtu
 *.pvtu
-
-
+.poltergeist.log
+.watchmanconfig
+info
+poltergeist.config.json
+run_mpi.sh

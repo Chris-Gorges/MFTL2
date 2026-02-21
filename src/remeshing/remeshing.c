@@ -354,6 +354,12 @@ mftl_int_t MFTLSplitEdge(MFTL_Object *obj, mftl_int_t he_ab_idx)
   obj->half_edges[he_ab_idx].flags |= MFTL_FLAG_VISITED;
   obj->half_edges[he_mb_idx].flags |= MFTL_FLAG_VISITED;
 
+  // If the original edge was a feature, the two new sub-edges must also be features!
+  if (obj->half_edges[he_ab_idx].flags & MFTL_FLAG_FEATURE)
+  {
+    obj->half_edges[he_mb_idx].flags |= MFTL_FLAG_FEATURE;
+  }
+
   // --- 4. Split Bottom Triangle (T3: ABD) if not boundary ---
   if (he_ba_idx != MFTL_ERROR)
   {
@@ -417,6 +423,11 @@ mftl_int_t MFTLSplitEdge(MFTL_Object *obj, mftl_int_t he_ab_idx)
     // Mark the split segments as visited so the remeshing loop doesn't split them again
     obj->half_edges[he_ba_idx].flags |= MFTL_FLAG_VISITED;
     obj->half_edges[he_ma_idx].flags |= MFTL_FLAG_VISITED;
+
+    if (obj->half_edges[he_ba_idx].flags & MFTL_FLAG_FEATURE)
+    {
+      obj->half_edges[he_ma_idx].flags |= MFTL_FLAG_FEATURE;
+    }
   }
 
   // --- 5. Set Vertex Outgoing Edges ---
@@ -624,6 +635,78 @@ static bool IsBoundaryVertex(const MFTL_Object *obj, mftl_int_t v_idx)
   return MFTL_FALSE;
 }
 
+/**
+ * @brief Counts the number of feature edges (or boundary edges) connected to a vertex.
+ */
+int CountFeatureEdges(MFTL_Object *obj, mftl_int_t v_idx)
+{
+  MFTL_Vertex *v = &obj->vertices[v_idx];
+
+  // Safety check: skip dead or isolated vertices
+  if ((v->flags & MFTL_FLAG_DEAD) || v->out_he_idx == MFTL_ERROR) return 0;
+
+  int feat_count = 0;
+  mftl_int_t curr_he_idx = v->out_he_idx;
+  mftl_int_t start_he_idx = curr_he_idx;
+
+  // --- 1. REWIND TO START OF FAN ---
+  // If the vertex is on a boundary, we must find the leftmost edge.
+  while (1)
+  {
+    // Get the incoming half-edge inside the current triangle
+    mftl_int_t next_idx = obj->half_edges[curr_he_idx].next_idx;
+    mftl_int_t prev_idx = obj->half_edges[next_idx].next_idx;
+
+    mftl_int_t twin_idx = obj->half_edges[prev_idx].twin_idx;
+
+    // If no twin, we hit the boundary dead-end. If we reach start, it's an interior vertex.
+    if (twin_idx == MFTL_ERROR || twin_idx == start_he_idx) break;
+
+    curr_he_idx = twin_idx;
+  }
+
+  start_he_idx = curr_he_idx;  // This is the true start of our sweep
+
+  // --- 2. SWEEP FORWARD AND COUNT ---
+  while (1)
+  {
+    MFTL_HalfEdge *he = &obj->half_edges[curr_he_idx];
+
+    // Is this outgoing edge a feature or a boundary?
+    if ((he->flags & MFTL_FLAG_FEATURE) || he->twin_idx == MFTL_ERROR)
+    {
+      feat_count++;
+    }
+
+    // Move to the next outgoing half-edge
+    if (he->twin_idx == MFTL_ERROR)
+    {
+      // We reached the rightmost boundary edge. The forward sweep is done.
+      break;
+    }
+
+    curr_he_idx = obj->half_edges[he->twin_idx].next_idx;
+
+    // If we circled all the way back, we are done (Interior vertex)
+    if (curr_he_idx == start_he_idx) break;
+  }
+
+  // --- 3. HANDLE THE FINAL INCOMING BOUNDARY EDGE ---
+  // If we stopped because of a boundary (twin == ERROR), there is exactly ONE
+  // physical edge we missed: the very first incoming boundary edge at the start of the fan.
+  mftl_int_t next_idx = obj->half_edges[start_he_idx].next_idx;
+  mftl_int_t prev_idx = obj->half_edges[next_idx].next_idx;
+  MFTL_HalfEdge *incoming_start_he = &obj->half_edges[prev_idx];
+
+  if (incoming_start_he->twin_idx == MFTL_ERROR)
+  {
+    // Boundary edges act as features automatically
+    feat_count++;
+  }
+
+  return feat_count;
+}
+
 int CollapseApproved(MFTL_Object *obj, mftl_int_t he_idx, MFTL_RemeshParameters *params)
 {
   MFTL_HalfEdge *he = &obj->half_edges[he_idx];
@@ -657,10 +740,10 @@ int CollapseApproved(MFTL_Object *obj, mftl_int_t he_idx, MFTL_RemeshParameters 
   MFTL_Vertex *v_b_ptr = &obj->vertices[v_b_idx];
 
   // Get Rings
-  MFTL_Vertex *ring_a[13];
-  MFTL_Vertex *ring_b[13];
-  mftl_int_t count_a = MFTLGetVertexOneRingVertices(obj, v_a_ptr, ring_a, 13, MFTL_FALSE);  // Check if MFTL_FALSE OR TRUE IS BETTER HERE
-  mftl_int_t count_b = MFTLGetVertexOneRingVertices(obj, v_b_ptr, ring_b, 13, MFTL_FALSE);  // Check if MFTL_FALSE OR TRUE IS BETTER HERE
+  MFTL_Vertex *ring_a[64];
+  MFTL_Vertex *ring_b[64];
+  mftl_int_t count_a = MFTLGetVertexOneRingVertices(obj, v_a_ptr, ring_a, 64, MFTL_FALSE);  // Check if MFTL_FALSE OR TRUE IS BETTER HERE
+  mftl_int_t count_b = MFTLGetVertexOneRingVertices(obj, v_b_ptr, ring_b, 64, MFTL_FALSE);  // Check if MFTL_FALSE OR TRUE IS BETTER HERE
 
   // Count Common Neighbors
   int common = 0;
@@ -691,6 +774,54 @@ int CollapseApproved(MFTL_Object *obj, mftl_int_t he_idx, MFTL_RemeshParameters 
   bool b_bound = IsBoundaryVertex(obj, v_b_idx);
   if (a_bound && !b_bound) return MFTL_FALSE;
 
+  // --- 5. Ping-Pong Prevention (The Stretch Check) ---
+  // Calculate proposed midpoint M
+  double pos_m[3];
+  for (int k = 0; k < 3; ++k)
+  {
+    pos_m[k] = 0.5 * (v_a_ptr->pos[k] + v_b_ptr->pos[k]);
+  }
+
+  // Check neighbors of A
+  for (int i = 0; i < count_a; ++i)
+  {
+    // Don't check B, it's collapsing
+    if (ring_a[i] == v_b_ptr) continue;
+
+    double dx = ring_a[i]->pos[0] - pos_m[0];
+    double dy = ring_a[i]->pos[1] - pos_m[1];
+    double dz = ring_a[i]->pos[2] - pos_m[2];
+    double new_len_sq = dx * dx + dy * dy + dz * dz;
+
+    // If the new edge will be longer than max allowed, reject the collapse!
+    if (new_len_sq > params->max_edge_length_sq) return MFTL_FALSE;
+  }
+
+  // Check neighbors of B
+  for (int i = 0; i < count_b; ++i)
+  {
+    if (ring_b[i] == v_a_ptr) continue;
+
+    double dx = ring_b[i]->pos[0] - pos_m[0];
+    double dy = ring_b[i]->pos[1] - pos_m[1];
+    double dz = ring_b[i]->pos[2] - pos_m[2];
+    double new_len_sq = dx * dx + dy * dy + dz * dz;
+
+    if (new_len_sq > params->max_edge_length_sq) return MFTL_FALSE;
+  }
+
+  // Count how many feature edges connect to A and B
+  int a_feat_count = CountFeatureEdges(obj, v_a_idx);
+  int b_feat_count = CountFeatureEdges(obj, v_b_idx);
+
+  // If A is on a feature line, and B is not, collapsing A into the midpoint
+  // will pull the feature line off its trajectory.
+  if (a_feat_count > 0 && b_feat_count == 0) return MFTL_FALSE;
+  if (b_feat_count > 0 && a_feat_count == 0) return MFTL_FALSE;
+
+  // If A is a hard corner (>= 3 feature edges), you cannot collapse it!
+  if (a_feat_count > 2 || b_feat_count > 2) return MFTL_FALSE;
+
   return MFTL_TRUE;
 }
 
@@ -719,6 +850,129 @@ static inline int SplitApproved(MFTL_Object *obj, mftl_int_t he_idx, MFTL_Remesh
   }
 
   return approved;
+}
+
+void MFTLFlipEdge(MFTL_Object *obj, mftl_int_t he_idx)
+{
+  // get the two triangles involved
+  mftl_int_t tri1_idx = obj->half_edges[he_idx].triangle_idx;
+  mftl_int_t tri2_idx = obj->half_edges[obj->half_edges[he_idx].twin_idx].triangle_idx;  // ensure this is not a boundary edge
+
+  // get the halfedges involved
+  mftl_int_t he_ab_idx = he_idx;
+  mftl_int_t he_bc_idx = obj->half_edges[he_ab_idx].next_idx;
+  mftl_int_t he_ca_idx = obj->half_edges[he_bc_idx].next_idx;
+  mftl_int_t he_ba_idx = obj->half_edges[he_ab_idx].twin_idx;
+  mftl_int_t he_ad_idx = obj->half_edges[he_ba_idx].next_idx;
+  mftl_int_t he_db_idx = obj->half_edges[he_ad_idx].next_idx;
+
+  // get the vertices involved
+  mftl_int_t v_a = obj->half_edges[he_ba_idx].vertex_idx;
+  mftl_int_t v_b = obj->half_edges[he_ab_idx].vertex_idx;
+  mftl_int_t v_c = obj->half_edges[he_bc_idx].vertex_idx;
+  mftl_int_t v_d = obj->half_edges[he_ad_idx].vertex_idx;
+
+  // update the outgoing halfedges of the vertices a and b (simply do it instead of also checking)
+  obj->vertices[v_a].out_he_idx = he_ad_idx;
+  obj->vertices[v_b].out_he_idx = he_bc_idx;
+
+  // update the halfedge for t1 and t2 (simply do it instead of also checking)
+  obj->triangles[tri1_idx].he_idx = he_ab_idx;
+  obj->triangles[tri2_idx].he_idx = he_ba_idx;
+
+  // update the tris in the halfedges
+  obj->half_edges[he_ab_idx].triangle_idx = tri1_idx;
+  obj->half_edges[he_ca_idx].triangle_idx = tri1_idx;
+  obj->half_edges[he_ad_idx].triangle_idx = tri1_idx;
+  obj->half_edges[he_ba_idx].triangle_idx = tri2_idx;
+  obj->half_edges[he_db_idx].triangle_idx = tri2_idx;
+  obj->half_edges[he_bc_idx].triangle_idx = tri2_idx;
+
+  // update the next pointers
+  obj->half_edges[he_ab_idx].next_idx = he_ca_idx;
+  obj->half_edges[he_ca_idx].next_idx = he_ad_idx;
+  obj->half_edges[he_ad_idx].next_idx = he_ab_idx;
+  obj->half_edges[he_ba_idx].next_idx = he_db_idx;
+  obj->half_edges[he_db_idx].next_idx = he_bc_idx;
+  obj->half_edges[he_bc_idx].next_idx = he_ba_idx;
+
+  // update the vertex indices
+  obj->half_edges[he_ab_idx].vertex_idx = v_c;
+  obj->half_edges[he_ba_idx].vertex_idx = v_d;
+}
+
+int FlipApproved(MFTL_Object *obj, mftl_int_t he_idx)
+{
+  MFTL_HalfEdge *he_ab = &obj->half_edges[he_idx];
+
+  mftl_int_t he_ba_idx = he_ab->twin_idx;
+
+  MFTL_HalfEdge *he_ba = &obj->half_edges[he_ba_idx];
+
+  // --- 2. Identify the 4 Vertices (A, B, C, D) ---
+  // he_ab is A->B, so target is B. he_ba is B->A, so target is A.
+  mftl_int_t v_b = he_ab->vertex_idx;
+  mftl_int_t v_a = he_ba->vertex_idx;
+
+  mftl_int_t he_bc_idx = he_ab->next_idx;
+  mftl_int_t he_ad_idx = he_ba->next_idx;
+
+  mftl_int_t v_c = obj->half_edges[he_bc_idx].vertex_idx;
+  mftl_int_t v_d = obj->half_edges[he_ad_idx].vertex_idx;
+
+  // --- 3. Gather Current Valences ---
+  // We use your existing 1-ring function just to get the degree/count
+  MFTL_Vertex *ring_buffer[32];  // 32 is plenty for a safe maximum valence
+  mftl_int_t val_a = MFTLGetVertexOneRingVertices(obj, &obj->vertices[v_a], ring_buffer, 32, MFTL_FALSE);
+  mftl_int_t val_b = MFTLGetVertexOneRingVertices(obj, &obj->vertices[v_b], ring_buffer, 32, MFTL_FALSE);
+
+  // Topological Safety Check 1: Prevent Degenerate Triangles
+  // Flipping reduces the valence of A and B by 1. A vertex must have at least valence 3.
+  if (val_a <= 3 || val_b <= 3) return MFTL_FALSE;
+
+  mftl_int_t val_c = MFTLGetVertexOneRingVertices(obj, &obj->vertices[v_c], ring_buffer, 32, MFTL_FALSE);
+
+  // Topological Safety Check 2: Prevent Non-Manifold Edges
+  // If C and D are ALREADY connected by an edge, flipping AB to CD would create
+  // two overlapping edges between C and D, breaking the manifold property.
+  // We can check this by seeing if D is already in C's 1-ring.
+  for (int i = 0; i < val_c; ++i)
+  {
+    // ring_buffer is populated with C's neighbors
+    if (ring_buffer[i] == &obj->vertices[v_d]) return MFTL_FALSE;
+  }
+
+  mftl_int_t val_d = MFTLGetVertexOneRingVertices(obj, &obj->vertices[v_d], ring_buffer, 32, MFTL_FALSE);
+
+  // --- 4. Determine Target Valences ---
+  // Ideal valence is 6 for interior vertices, 4 for boundary vertices
+  mftl_int_t opt_a = IsBoundaryVertex(obj, v_a) ? 4 : 6;
+  mftl_int_t opt_b = IsBoundaryVertex(obj, v_b) ? 4 : 6;
+  mftl_int_t opt_c = IsBoundaryVertex(obj, v_c) ? 4 : 6;
+  mftl_int_t opt_d = IsBoundaryVertex(obj, v_d) ? 4 : 6;
+
+  // --- 5. Calculate Current Error (Energy) ---
+  mftl_int_t err_current =
+      (val_a - opt_a) * (val_a - opt_a) + (val_b - opt_b) * (val_b - opt_b) + (val_c - opt_c) * (val_c - opt_c) + (val_d - opt_d) * (val_d - opt_d);
+
+  // --- 6. Calculate Flipped Error (Energy) ---
+  // If flipped, A and B lose an edge, C and D gain an edge
+  mftl_int_t val_a_new = val_a - 1;
+  mftl_int_t val_b_new = val_b - 1;
+  mftl_int_t val_c_new = val_c + 1;
+  mftl_int_t val_d_new = val_d + 1;
+
+  mftl_int_t err_flipped = (val_a_new - opt_a) * (val_a_new - opt_a) + (val_b_new - opt_b) * (val_b_new - opt_b) + (val_c_new - opt_c) * (val_c_new - opt_c) +
+                           (val_d_new - opt_d) * (val_d_new - opt_d);
+
+  // --- 7. The Golden Rule ---
+  // Only approve if the total deviation strictly decreases!
+  if (err_flipped < err_current)
+  {
+    return MFTL_TRUE;
+  }
+
+  return MFTL_FALSE;
 }
 
 /**
@@ -946,34 +1200,270 @@ void MFTLFinalizeRemeshing(MFTL_Object *obj, mftl_int_t start_num_v, mftl_int_t 
   }
 }
 
+/**
+ * @brief Performs one iteration of Tangential Laplacian Smoothing.
+ * @param obj The mesh object.
+ * @param mode The smoothing mode (Vertex-based or Triangle-based).
+ * @param relaxation Factor between 0.0 and 1.0 (usually 1.0 for remeshing).
+ */
+void MFTLSmoothTangential(MFTL_Object *obj, MFTL_SmoothMode mode, double relaxation)
+{
+  if (obj->n_vertices == 0) return;
+
+  // Allocate buffer for simultaneous (Jacobi) updates
+  double(*new_pos)[3] = malloc(obj->n_vertices * sizeof(double[3]));
+  assert(new_pos != MFTL_NULL);
+
+  MFTL_Vertex *ring_verts[32];
+  MFTL_Triangle *ring_tris[32];
+
+  // --- PASS 1: Calculate New Positions ---
+  for (mftl_int_t i = 0; i < obj->n_vertices; ++i)
+  {
+    MFTL_Vertex *v = &obj->vertices[i];
+
+    // Skip dead or isolated vertices
+    if ((v->flags & MFTL_FLAG_DEAD) || v->out_he_idx == MFTL_ERROR) continue;
+
+    // Default: no movement
+    new_pos[i][0] = v->pos[0];
+    new_pos[i][1] = v->pos[1];
+    new_pos[i][2] = v->pos[2];
+
+    // ---------------------------------------------------------
+    // FEATURE DETECTION: Circulate the 1-ring
+    // ---------------------------------------------------------
+    int bnd_count = 0;
+    int feat_count = 0;
+    double line_center[3] = {0, 0, 0};
+
+    MFTL_HalfEdge *curr = MFTLVOutHe(obj, v);
+    MFTL_HalfEdge *start = curr;
+
+    // Circulate to count boundary and feature edges
+    if (curr != MFTL_NULL)
+    {
+      do
+      {
+        if (curr->twin_idx == MFTL_ERROR)
+        {
+          bnd_count++;
+          // Add neighbor position
+          mftl_int_t nbr_v = obj->half_edges[curr->next_idx].vertex_idx;
+          line_center[0] += obj->vertices[nbr_v].pos[0];
+          line_center[1] += obj->vertices[nbr_v].pos[1];
+          line_center[2] += obj->vertices[nbr_v].pos[2];
+        }
+        else if (curr->flags & MFTL_FLAG_FEATURE)
+        {
+          feat_count++;
+          mftl_int_t nbr_v = curr->vertex_idx;
+          line_center[0] += obj->vertices[nbr_v].pos[0];
+          line_center[1] += obj->vertices[nbr_v].pos[1];
+          line_center[2] += obj->vertices[nbr_v].pos[2];
+        }
+
+        MFTL_HalfEdge *twin = MFTLHeTwin(obj, curr);
+        if (!twin) break;
+        curr = MFTLHeNext(obj, twin);
+      } while (curr != start);
+    }
+
+    // ---------------------------------------------------------
+    // APPLY SOTA FEATURE SMOOTHING
+    // ---------------------------------------------------------
+    if (bnd_count > 0 || feat_count > 2)
+    {
+      // CORNER OR COMPLEX BOUNDARY: 0D Lock
+      // Position is already set to v->pos above, so we do nothing.
+    }
+    else if (feat_count == 2)
+    {
+      // RIDGE LINE: 1D Smoothing
+      // Smooth only along the feature vector to preserve the sharp edge
+      new_pos[i][0] = line_center[0] / 2.0;
+      new_pos[i][1] = line_center[1] / 2.0;
+      new_pos[i][2] = line_center[2] / 2.0;
+    }
+    else
+    {
+      // INTERIOR (feat_count == 0 or 1): 2D Tangential Smoothing
+      double center[3] = {0, 0, 0};
+      mftl_int_t degree = 0;
+
+      if (mode == MFTL_SMOOTH_VERTEX_BASED)
+      {
+        degree = MFTLGetVertexOneRingVertices(obj, v, ring_verts, 32, MFTL_TRUE);
+        for (int k = 0; k < degree; ++k)
+        {
+          center[0] += ring_verts[k]->pos[0];
+          center[1] += ring_verts[k]->pos[1];
+          center[2] += ring_verts[k]->pos[2];
+        }
+      }
+      else  // MFTL_SMOOTH_TRIANGLE_BASED
+      {
+        degree = MFTLGetVertexOneRing(obj, v, ring_tris, 32, MFTL_TRUE);
+        for (int k = 0; k < degree; ++k)
+        {
+          MFTL_Vertex *t_verts[3];
+          MFTLGetTriangleVertices(obj, ring_tris[k], t_verts);
+          center[0] += (t_verts[0]->pos[0] + t_verts[1]->pos[0] + t_verts[2]->pos[0]) / 3.0;
+          center[1] += (t_verts[0]->pos[1] + t_verts[1]->pos[1] + t_verts[2]->pos[1]) / 3.0;
+          center[2] += (t_verts[0]->pos[2] + t_verts[1]->pos[2] + t_verts[2]->pos[2]) / 3.0;
+        }
+      }
+
+      if (degree > 0)
+      {
+        center[0] /= degree;
+        center[1] /= degree;
+        center[2] /= degree;
+
+        // 1. Calculate the displacement vector (Center - Current)
+        double disp[3] = {center[0] - v->pos[0], center[1] - v->pos[1], center[2] - v->pos[2]};
+
+        // 2. Compute Vertex Normal (Simple area-weighted or uniform)
+        double nx = 0, ny = 0, nz = 0;
+        degree = MFTLGetVertexOneRingVertices(obj, v, ring_verts, 32, MFTL_TRUE);
+        for (int k = 0; k < degree; ++k)
+        {
+          MFTL_Vertex *v1 = ring_verts[k];
+          MFTL_Vertex *v2 = ring_verts[(k + 1) % degree];  // CCW neighbor
+
+          double d1[3] = {v1->pos[0] - v->pos[0], v1->pos[1] - v->pos[1], v1->pos[2] - v->pos[2]};
+          double d2[3] = {v2->pos[0] - v->pos[0], v2->pos[1] - v->pos[1], v2->pos[2] - v->pos[2]};
+
+          nx += (d1[1] * d2[2] - d1[2] * d2[1]);
+          ny += (d1[2] * d2[0] - d1[0] * d2[2]);
+          nz += (d1[0] * d2[1] - d1[1] * d2[0]);
+        }
+
+        // Normalize normal
+        double n_len = sqrt(nx * nx + ny * ny + nz * nz);
+        if (n_len > 1e-12)
+        {
+          nx /= n_len;
+          ny /= n_len;
+          nz /= n_len;
+        }
+
+        // 3. Project displacement onto the Tangent Plane
+        double dot = disp[0] * nx + disp[1] * ny + disp[2] * nz;
+
+        double tangent_disp[3] = {disp[0] - dot * nx, disp[1] - dot * ny, disp[2] - dot * nz};
+
+        // 4. Apply Tangential Update
+        new_pos[i][0] = v->pos[0] + relaxation * tangent_disp[0];
+        new_pos[i][1] = v->pos[1] + relaxation * tangent_disp[1];
+        new_pos[i][2] = v->pos[2] + relaxation * tangent_disp[2];
+      }
+    }
+  }
+
+  // --- PASS 2: Apply Updates ---
+  for (mftl_int_t i = 0; i < obj->n_vertices; ++i)
+  {
+    if ((obj->vertices[i].flags & MFTL_FLAG_DEAD) || obj->vertices[i].out_he_idx == MFTL_ERROR) continue;
+
+    obj->vertices[i].pos[0] = new_pos[i][0];
+    obj->vertices[i].pos[1] = new_pos[i][1];
+    obj->vertices[i].pos[2] = new_pos[i][2];
+  }
+
+  free(new_pos);
+}
+
+// Adds MFTL_FLAG_FEATURE to half-edges that exceed the angle threshold
+void MFTLDetectFeatures(MFTL_Object *obj, double angle_degrees)
+{
+  // Convert angle to dot-product threshold for fast comparison
+  // e.g., 30 degrees -> cos(30) = 0.866. If dot < 0.866, angle > 30.
+  double threshold_dot = MFTL_COS(angle_degrees * MFTL_PI / 180.0);
+
+  for (mftl_int_t i = 0; i < obj->n_half_edges; ++i)
+  {
+    MFTL_HalfEdge *he = &obj->half_edges[i];
+
+    // Skip dead edges, boundaries, or already processed twins
+    if (he->flags & MFTL_FLAG_DEAD) continue;
+    if (he->twin_idx == MFTL_ERROR)
+    {
+      // It's a boundary! Mark it as a feature to protect it.
+      he->flags |= MFTL_FLAG_FEATURE;
+      continue;
+    }
+    if (i > he->twin_idx) continue;
+
+    mftl_int_t t1_idx = he->triangle_idx;
+    mftl_int_t t2_idx = obj->half_edges[he->twin_idx].triangle_idx;
+
+    // Get pre-computed triangle normals
+    double *n1 = obj->triangles[t1_idx].normal;
+    double *n2 = obj->triangles[t2_idx].normal;
+
+    double dot = n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2];
+
+    // If the angle between normals is larger than the threshold, mark it!
+    if (dot < threshold_dot)
+    {
+      he->flags |= MFTL_FLAG_FEATURE;
+      obj->half_edges[he->twin_idx].flags |= MFTL_FLAG_FEATURE;
+    }
+    else
+    {
+      // Ensure flag is cleared if geometry smoothed out
+      he->flags &= ~MFTL_FLAG_FEATURE;
+      obj->half_edges[he->twin_idx].flags &= ~MFTL_FLAG_FEATURE;
+    }
+  }
+}
+
 void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
 {
-  mftl_int_t counter_split = 0;
-  mftl_int_t counter_collapse = 0;
-  for (int iter = 0; iter < params->iterations; iter++)
+  for (mftl_int_t i = 0; i < ens->num_objects; i++)
   {
+    MFTL_Object *obj = ens->objects[i];
+
+    // DETECT FEATURES
+    MFTLDetectFeatures(obj, params->feature_angle_threshold);
+  }
+
+  int iter = 0;
+
+  // Loop continues IF:
+  // 1. Iterations is set to MFTL_ERROR (Run until convergence)
+  // 2. OR we haven't reached the user-defined iteration limit
+  while (params->iterations == MFTL_ERROR || iter < params->iterations)
+  {
+    printf("--- Iteration %d ---\n", iter + 1);
+
+    mftl_int_t total_split = 0;
+    mftl_int_t total_collapse = 0;
+    mftl_int_t total_swap = 0;
+
     for (mftl_int_t i = 0; i < ens->num_objects; i++)
     {
       MFTL_Object *obj = ens->objects[i];
 
       // --- 0. Snapshot Initial Counts ---
-      // We use these to identify exactly which elements are "new" after the pass.
       mftl_int_t start_n_vertices = obj->n_vertices;
       mftl_int_t start_n_triangles = obj->n_triangles;
       mftl_int_t start_n_halfedges = obj->n_half_edges;
 
       bool collapses_occurred = MFTL_FALSE;
 
+      mftl_int_t obj_split = 0;
+      mftl_int_t obj_collapse = 0;
+      mftl_int_t obj_swap = 0;
+
       // 1. SPLIT
-      // Iterate active edges (loop over HEs, process if index < twin_index)
-      // Note: Iterate BACKWARDS or use a separate list, because splitting adds new edges
-      // that you don't want to split again in this pass.
       for (mftl_int_t j = obj->n_half_edges - 1; j >= 0; j--)
       {
         if (SplitApproved(obj, j, params))
         {
           MFTLSplitEdge(obj, j);
-          counter_split++;
+          obj_split++;
         }
       }
 
@@ -984,19 +1474,76 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
         {
           MFTLCollapseEdge(obj, j);
           collapses_occurred = MFTL_TRUE;
-          counter_collapse++;
+          obj_collapse++;
         }
       }
 
-      // 3. SWAP (Valence Optimization)
-      // Flip edges to target valence 6
+      // 3. SWAP / FLIP (Valence Optimization)
+      for (mftl_int_t j = 0; j < obj->n_half_edges; ++j)
+      {
+        MFTL_HalfEdge *he = &obj->half_edges[j];
+
+        // Skip dead edges
+        if (he->flags & MFTL_FLAG_DEAD) continue;
+
+        // Skip boundary edges
+        if (he->twin_idx == MFTL_ERROR) continue;
+
+        // Only process the half-edge with the smaller index (avoid checking twin)
+        if (j > he->twin_idx) continue;
+
+        // Skip feature edges
+        if (he->flags & MFTL_FLAG_FEATURE) continue;
+
+        // Now evaluate for flip
+        if (FlipApproved(obj, j))
+        {
+          MFTLFlipEdge(obj, j);
+          obj_swap++;
+        }
+      }
 
       // 4. SMOOTH (Tangential)
-      // Simple Laplacian smoothing to improve quality
+      // Usually, it's beneficial to run multiple smoothing iterations per pass
+      // to really relax the mesh before the next split/collapse phase.
+      int smooth_iters = 3;
+      for (int s = 0; s < smooth_iters; s++)
+      {
+        MFTLSmoothTangential(obj, params->smooth_mode, 1.0);
+      }
 
       MFTLFinalizeRemeshing(obj, start_n_vertices, start_n_triangles, start_n_halfedges, collapses_occurred);
+
+      // Accumulate totals
+      total_split += obj_split;
+      total_collapse += obj_collapse;
+      total_swap += obj_swap;
     }
+
+    // WE NEED TO UPDATE THE GEOMETRIC PROPERTIES HERE!!!!!
+    // NORMALS AREA ETC
+
+    printf("Operations -> Split: %d | Collapsed: %d | Swapped: %d\n", total_split, total_collapse, total_swap);
+
+    // --- CONVERGENCE CHECK ---
+    mftl_int_t total_ops = total_split + total_collapse + total_swap;
+    if (total_ops < 10)
+    {
+      printf("Remeshing converged successfully after %d iterations.\n", iter + 1);
+      break;
+    }
+
+    // --- FAILSAFE ---
+    // Prevent infinite loops if floating-point drift causes non-convergence
+    if (iter >= 15 && params->iterations == MFTL_ERROR)
+    {
+      printf("Warning: Remeshing reached failsafe limit (15 iterations). Exiting to prevent hang.\n");
+      break;
+    }
+
+    iter++;
   }
-  printf("Split %d times\n", counter_split);
-  printf("Collapsed %d times\n", counter_collapse);
 }
+
+//this is a test save
+// this is a second test save

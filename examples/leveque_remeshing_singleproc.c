@@ -108,7 +108,7 @@ int main(int argc, char* argv[])
 
   double center[3] = {0.35, 0.35, 0.35};
 
-  MFTLGenerateSphere(object, center, 0.15, 5);
+  MFTLGenerateSphere(object, center, 0.15, 4);
   MFTLComputeTriangleProperties(object);
 
   double length_sum = 0.0;
@@ -119,13 +119,12 @@ int main(int argc, char* argv[])
     length_sum += len;
   }
 
+  // Calculate your average edge length
+  double avg_len = length_sum / object->n_half_edges;
+
+  // Setup parameters
   MFTL_RemeshParameters params;
-  params.target_length = length_sum / object->n_half_edges;
-  params.min_edge_length = 0.7 * params.target_length;
-  params.max_edge_length = 1.3 * params.target_length;
-  params.max_edge_length_sq = params.max_edge_length * params.max_edge_length;
-  params.min_edge_length_sq = params.min_edge_length * params.min_edge_length;
-  params.iterations = 1;
+  MFTLInitRemeshParams(&params, MFTL_REMESH_ISOTROPIC, avg_len, 10, MFTL_SMOOTH_TRIANGLE_BASED, 30.0);
 
   // --- Simulation Constants ---
   double T = 3.0;
@@ -133,8 +132,8 @@ int main(int argc, char* argv[])
   int step = 0;
 
   char filename_prefix[256];
-  // snprintf(filename_prefix, sizeof(filename_prefix), "output_%04d", step);
-  // MFTLWriteVtu(ensemble, filename_prefix);
+  snprintf(filename_prefix, sizeof(filename_prefix), "output_%04d", step);
+  MFTLWriteVtu(ensemble, filename_prefix);
 
   for (double time = 0.0; time < T; time += dt)
   {
@@ -146,8 +145,8 @@ int main(int argc, char* argv[])
     MFTLRemeshEnsemble(ensemble, &params);
 
     step++;
-    // snprintf(filename_prefix, sizeof(filename_prefix), "output_%04d", step);
-    // MFTLWriteVtu(ensemble, filename_prefix);
+    snprintf(filename_prefix, sizeof(filename_prefix), "output_%04d", step);
+    MFTLWriteVtu(ensemble, filename_prefix);
   }
 
   MFTLEnsembleDestroy(&ensemble);
