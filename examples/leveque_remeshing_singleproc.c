@@ -108,7 +108,7 @@ int main(int argc, char* argv[])
 
   double center[3] = {0.35, 0.35, 0.35};
 
-  MFTLGenerateSphere(object, center, 0.15, 4);
+  MFTLGenerateSphere(object, center, 0.15, 5);
   MFTLComputeTriangleProperties(object);
 
   double length_sum = 0.0;
@@ -124,7 +124,7 @@ int main(int argc, char* argv[])
 
   // Setup parameters
   MFTL_RemeshParameters params;
-  MFTLInitRemeshParams(&params, MFTL_REMESH_ISOTROPIC, avg_len, 10, MFTL_SMOOTH_TRIANGLE_BASED, 30.0);
+  MFTLInitRemeshParams(&params, MFTL_REMESH_ISOTROPIC, avg_len, 10, MFTL_SMOOTH_TRIANGLE_BASED, 45.0);
 
   // --- Simulation Constants ---
   double T = 3.0;

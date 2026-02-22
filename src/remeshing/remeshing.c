@@ -558,14 +558,14 @@ void MFTLCollapseEdge(MFTL_Object *obj, mftl_int_t he_ab_idx)
   // --- 2.1 Fallback Safety Sweep (Robustness) ---
   // In case the 1-ring traversal missed any incoming edges (e.g. boundary weirdness),
   // we do a full sweep to ensure NO edge points to A.
-  for (mftl_int_t k = 0; k < obj->n_half_edges; ++k)
-  {
-    if (obj->half_edges[k].flags & MFTL_FLAG_DEAD) continue;
-    if (obj->half_edges[k].vertex_idx == v_a_idx)
-    {
-      obj->half_edges[k].vertex_idx = v_b_idx;
-    }
-  }
+  // for (mftl_int_t k = 0; k < obj->n_half_edges; ++k)
+  // {
+  //   if (obj->half_edges[k].flags & MFTL_FLAG_DEAD) continue;
+  //   if (obj->half_edges[k].vertex_idx == v_a_idx)
+  //   {
+  //     obj->half_edges[k].vertex_idx = v_b_idx;
+  //   }
+  // }
 
   // --- 3. Remove Degenerate Faces (Gluing) ---
   // (Copy your existing code for Step 3 exactly as is)
@@ -987,17 +987,6 @@ int FlipApproved(MFTL_Object *obj, mftl_int_t he_idx)
  */
 void MFTLFinalizeRemeshing(MFTL_Object *obj, mftl_int_t start_num_v, mftl_int_t start_num_t, mftl_int_t start_num_h, bool collapses_occurred)
 {
-  // Reset visited flags
-  for (mftl_int_t j = 0; j < obj->n_half_edges; ++j)
-  {
-    obj->half_edges[j].flags &= ~MFTL_FLAG_VISITED;
-  }
-
-  for (mftl_int_t j = 0; j < obj->n_vertices; ++j)
-  {
-    obj->vertices[j].flags &= ~MFTL_FLAG_VISITED;
-  }
-
   // ---------------------------------------------------------
   // PATH A: FAST APPEND (Only Splits - No Compaction Needed)
   // ---------------------------------------------------------
@@ -1217,160 +1206,163 @@ void MFTLSmoothTangential(MFTL_Object *obj, MFTL_SmoothMode mode, double relaxat
   MFTL_Vertex *ring_verts[32];
   MFTL_Triangle *ring_tris[32];
 
-  // --- PASS 1: Calculate New Positions ---
-  for (mftl_int_t i = 0; i < obj->n_vertices; ++i)
+  int smooth_iters = 3;
+  for (int s = 0; s < smooth_iters; s++)
   {
-    MFTL_Vertex *v = &obj->vertices[i];
-
-    // Skip dead or isolated vertices
-    if ((v->flags & MFTL_FLAG_DEAD) || v->out_he_idx == MFTL_ERROR) continue;
-
-    // Default: no movement
-    new_pos[i][0] = v->pos[0];
-    new_pos[i][1] = v->pos[1];
-    new_pos[i][2] = v->pos[2];
-
-    // ---------------------------------------------------------
-    // FEATURE DETECTION: Circulate the 1-ring
-    // ---------------------------------------------------------
-    int bnd_count = 0;
-    int feat_count = 0;
-    double line_center[3] = {0, 0, 0};
-
-    MFTL_HalfEdge *curr = MFTLVOutHe(obj, v);
-    MFTL_HalfEdge *start = curr;
-
-    // Circulate to count boundary and feature edges
-    if (curr != MFTL_NULL)
+    // --- PASS 1: Calculate New Positions ---
+    for (mftl_int_t i = 0; i < obj->n_vertices; ++i)
     {
-      do
+      MFTL_Vertex *v = &obj->vertices[i];
+
+      // Skip dead or isolated vertices
+      if ((v->flags & MFTL_FLAG_DEAD) || v->out_he_idx == MFTL_ERROR) continue;
+
+      // Default: no movement
+      new_pos[i][0] = v->pos[0];
+      new_pos[i][1] = v->pos[1];
+      new_pos[i][2] = v->pos[2];
+
+      // ---------------------------------------------------------
+      // FEATURE DETECTION: Circulate the 1-ring
+      // ---------------------------------------------------------
+      int bnd_count = 0;
+      int feat_count = 0;
+      double line_center[3] = {0, 0, 0};
+
+      MFTL_HalfEdge *curr = MFTLVOutHe(obj, v);
+      MFTL_HalfEdge *start = curr;
+
+      // Circulate to count boundary and feature edges
+      if (curr != MFTL_NULL)
       {
-        if (curr->twin_idx == MFTL_ERROR)
+        do
         {
-          bnd_count++;
-          // Add neighbor position
-          mftl_int_t nbr_v = obj->half_edges[curr->next_idx].vertex_idx;
-          line_center[0] += obj->vertices[nbr_v].pos[0];
-          line_center[1] += obj->vertices[nbr_v].pos[1];
-          line_center[2] += obj->vertices[nbr_v].pos[2];
-        }
-        else if (curr->flags & MFTL_FLAG_FEATURE)
-        {
-          feat_count++;
-          mftl_int_t nbr_v = curr->vertex_idx;
-          line_center[0] += obj->vertices[nbr_v].pos[0];
-          line_center[1] += obj->vertices[nbr_v].pos[1];
-          line_center[2] += obj->vertices[nbr_v].pos[2];
-        }
+          if (curr->twin_idx == MFTL_ERROR)
+          {
+            bnd_count++;
+            // Add neighbor position
+            mftl_int_t nbr_v = obj->half_edges[curr->next_idx].vertex_idx;
+            line_center[0] += obj->vertices[nbr_v].pos[0];
+            line_center[1] += obj->vertices[nbr_v].pos[1];
+            line_center[2] += obj->vertices[nbr_v].pos[2];
+          }
+          else if (curr->flags & MFTL_FLAG_FEATURE)
+          {
+            feat_count++;
+            mftl_int_t nbr_v = curr->vertex_idx;
+            line_center[0] += obj->vertices[nbr_v].pos[0];
+            line_center[1] += obj->vertices[nbr_v].pos[1];
+            line_center[2] += obj->vertices[nbr_v].pos[2];
+          }
 
-        MFTL_HalfEdge *twin = MFTLHeTwin(obj, curr);
-        if (!twin) break;
-        curr = MFTLHeNext(obj, twin);
-      } while (curr != start);
-    }
-
-    // ---------------------------------------------------------
-    // APPLY SOTA FEATURE SMOOTHING
-    // ---------------------------------------------------------
-    if (bnd_count > 0 || feat_count > 2)
-    {
-      // CORNER OR COMPLEX BOUNDARY: 0D Lock
-      // Position is already set to v->pos above, so we do nothing.
-    }
-    else if (feat_count == 2)
-    {
-      // RIDGE LINE: 1D Smoothing
-      // Smooth only along the feature vector to preserve the sharp edge
-      new_pos[i][0] = line_center[0] / 2.0;
-      new_pos[i][1] = line_center[1] / 2.0;
-      new_pos[i][2] = line_center[2] / 2.0;
-    }
-    else
-    {
-      // INTERIOR (feat_count == 0 or 1): 2D Tangential Smoothing
-      double center[3] = {0, 0, 0};
-      mftl_int_t degree = 0;
-
-      if (mode == MFTL_SMOOTH_VERTEX_BASED)
-      {
-        degree = MFTLGetVertexOneRingVertices(obj, v, ring_verts, 32, MFTL_TRUE);
-        for (int k = 0; k < degree; ++k)
-        {
-          center[0] += ring_verts[k]->pos[0];
-          center[1] += ring_verts[k]->pos[1];
-          center[2] += ring_verts[k]->pos[2];
-        }
-      }
-      else  // MFTL_SMOOTH_TRIANGLE_BASED
-      {
-        degree = MFTLGetVertexOneRing(obj, v, ring_tris, 32, MFTL_TRUE);
-        for (int k = 0; k < degree; ++k)
-        {
-          MFTL_Vertex *t_verts[3];
-          MFTLGetTriangleVertices(obj, ring_tris[k], t_verts);
-          center[0] += (t_verts[0]->pos[0] + t_verts[1]->pos[0] + t_verts[2]->pos[0]) / 3.0;
-          center[1] += (t_verts[0]->pos[1] + t_verts[1]->pos[1] + t_verts[2]->pos[1]) / 3.0;
-          center[2] += (t_verts[0]->pos[2] + t_verts[1]->pos[2] + t_verts[2]->pos[2]) / 3.0;
-        }
+          MFTL_HalfEdge *twin = MFTLHeTwin(obj, curr);
+          if (!twin) break;
+          curr = MFTLHeNext(obj, twin);
+        } while (curr != start);
       }
 
-      if (degree > 0)
+      // ---------------------------------------------------------
+      // APPLY SOTA FEATURE SMOOTHING
+      // ---------------------------------------------------------
+      if (bnd_count > 0 || feat_count > 2)
       {
-        center[0] /= degree;
-        center[1] /= degree;
-        center[2] /= degree;
-
-        // 1. Calculate the displacement vector (Center - Current)
-        double disp[3] = {center[0] - v->pos[0], center[1] - v->pos[1], center[2] - v->pos[2]};
-
-        // 2. Compute Vertex Normal (Simple area-weighted or uniform)
-        double nx = 0, ny = 0, nz = 0;
-        degree = MFTLGetVertexOneRingVertices(obj, v, ring_verts, 32, MFTL_TRUE);
-        for (int k = 0; k < degree; ++k)
-        {
-          MFTL_Vertex *v1 = ring_verts[k];
-          MFTL_Vertex *v2 = ring_verts[(k + 1) % degree];  // CCW neighbor
-
-          double d1[3] = {v1->pos[0] - v->pos[0], v1->pos[1] - v->pos[1], v1->pos[2] - v->pos[2]};
-          double d2[3] = {v2->pos[0] - v->pos[0], v2->pos[1] - v->pos[1], v2->pos[2] - v->pos[2]};
-
-          nx += (d1[1] * d2[2] - d1[2] * d2[1]);
-          ny += (d1[2] * d2[0] - d1[0] * d2[2]);
-          nz += (d1[0] * d2[1] - d1[1] * d2[0]);
-        }
-
-        // Normalize normal
-        double n_len = sqrt(nx * nx + ny * ny + nz * nz);
-        if (n_len > 1e-12)
-        {
-          nx /= n_len;
-          ny /= n_len;
-          nz /= n_len;
-        }
-
-        // 3. Project displacement onto the Tangent Plane
-        double dot = disp[0] * nx + disp[1] * ny + disp[2] * nz;
-
-        double tangent_disp[3] = {disp[0] - dot * nx, disp[1] - dot * ny, disp[2] - dot * nz};
-
-        // 4. Apply Tangential Update
-        new_pos[i][0] = v->pos[0] + relaxation * tangent_disp[0];
-        new_pos[i][1] = v->pos[1] + relaxation * tangent_disp[1];
-        new_pos[i][2] = v->pos[2] + relaxation * tangent_disp[2];
+        // CORNER OR COMPLEX BOUNDARY: 0D Lock
+        // Position is already set to v->pos above, so we do nothing.
       }
+      else if (feat_count == 2)
+      {
+        // RIDGE LINE: 1D Smoothing
+        // Smooth only along the feature vector to preserve the sharp edge
+        new_pos[i][0] = 0.5 * line_center[0];
+        new_pos[i][1] = 0.5 * line_center[1];
+        new_pos[i][2] = 0.5 * line_center[2];
+      }
+      else
+      {
+        // INTERIOR (feat_count == 0 or 1): 2D Tangential Smoothing
+        double center[3] = {0, 0, 0};
+        mftl_int_t degree = 0;
+
+        if (mode == MFTL_SMOOTH_VERTEX_BASED)
+        {
+          degree = MFTLGetVertexOneRingVertices(obj, v, ring_verts, 32, MFTL_TRUE);
+          for (int k = 0; k < degree; ++k)
+          {
+            center[0] += ring_verts[k]->pos[0];
+            center[1] += ring_verts[k]->pos[1];
+            center[2] += ring_verts[k]->pos[2];
+          }
+        }
+        else  // MFTL_SMOOTH_TRIANGLE_BASED
+        {
+          degree = MFTLGetVertexOneRing(obj, v, ring_tris, 32, MFTL_TRUE);
+          for (int k = 0; k < degree; ++k)
+          {
+            MFTL_Vertex *t_verts[3];
+            MFTLGetTriangleVertices(obj, ring_tris[k], t_verts);
+            center[0] += (t_verts[0]->pos[0] + t_verts[1]->pos[0] + t_verts[2]->pos[0]) / 3.0;
+            center[1] += (t_verts[0]->pos[1] + t_verts[1]->pos[1] + t_verts[2]->pos[1]) / 3.0;
+            center[2] += (t_verts[0]->pos[2] + t_verts[1]->pos[2] + t_verts[2]->pos[2]) / 3.0;
+          }
+        }
+
+        if (degree > 0)
+        {
+          center[0] /= degree;
+          center[1] /= degree;
+          center[2] /= degree;
+
+          // 1. Calculate the displacement vector (Center - Current)
+          double disp[3] = {center[0] - v->pos[0], center[1] - v->pos[1], center[2] - v->pos[2]};
+
+          // 2. Compute Vertex Normal (Simple area-weighted or uniform)
+          double nx = 0, ny = 0, nz = 0;
+          degree = MFTLGetVertexOneRingVertices(obj, v, ring_verts, 32, MFTL_TRUE);
+          for (int k = 0; k < degree; ++k)
+          {
+            MFTL_Vertex *v1 = ring_verts[k];
+            MFTL_Vertex *v2 = ring_verts[(k + 1) % degree];  // CCW neighbor
+
+            double d1[3] = {v1->pos[0] - v->pos[0], v1->pos[1] - v->pos[1], v1->pos[2] - v->pos[2]};
+            double d2[3] = {v2->pos[0] - v->pos[0], v2->pos[1] - v->pos[1], v2->pos[2] - v->pos[2]};
+
+            nx += (d1[1] * d2[2] - d1[2] * d2[1]);
+            ny += (d1[2] * d2[0] - d1[0] * d2[2]);
+            nz += (d1[0] * d2[1] - d1[1] * d2[0]);
+          }
+
+          // Normalize normal
+          double n_len = sqrt(nx * nx + ny * ny + nz * nz);
+          if (n_len > 1e-12)
+          {
+            nx /= n_len;
+            ny /= n_len;
+            nz /= n_len;
+          }
+
+          // 3. Project displacement onto the Tangent Plane
+          double dot = disp[0] * nx + disp[1] * ny + disp[2] * nz;
+
+          double tangent_disp[3] = {disp[0] - dot * nx, disp[1] - dot * ny, disp[2] - dot * nz};
+
+          // 4. Apply Tangential Update
+          new_pos[i][0] = v->pos[0] + relaxation * tangent_disp[0];
+          new_pos[i][1] = v->pos[1] + relaxation * tangent_disp[1];
+          new_pos[i][2] = v->pos[2] + relaxation * tangent_disp[2];
+        }
+      }
+    }
+
+    // --- PASS 2: Apply Updates ---
+    for (mftl_int_t i = 0; i < obj->n_vertices; ++i)
+    {
+      if ((obj->vertices[i].flags & MFTL_FLAG_DEAD) || obj->vertices[i].out_he_idx == MFTL_ERROR) continue;
+
+      obj->vertices[i].pos[0] = new_pos[i][0];
+      obj->vertices[i].pos[1] = new_pos[i][1];
+      obj->vertices[i].pos[2] = new_pos[i][2];
     }
   }
-
-  // --- PASS 2: Apply Updates ---
-  for (mftl_int_t i = 0; i < obj->n_vertices; ++i)
-  {
-    if ((obj->vertices[i].flags & MFTL_FLAG_DEAD) || obj->vertices[i].out_he_idx == MFTL_ERROR) continue;
-
-    obj->vertices[i].pos[0] = new_pos[i][0];
-    obj->vertices[i].pos[1] = new_pos[i][1];
-    obj->vertices[i].pos[2] = new_pos[i][2];
-  }
-
   free(new_pos);
 }
 
@@ -1431,6 +1423,22 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
 
   int iter = 0;
 
+  bool collapses_occurred[ens->num_objects];
+  // --- Snapshot Initial Counts ---
+  mftl_int_t start_n_vertices[ens->num_objects];
+  mftl_int_t start_n_triangles[ens->num_objects];
+  mftl_int_t start_n_halfedges[ens->num_objects];
+
+  for (mftl_int_t i = 0; i < ens->num_objects; i++)
+  {
+    MFTL_Object *obj = ens->objects[i];
+
+    collapses_occurred[i] = MFTL_FALSE;
+    start_n_vertices[i] = obj->n_vertices;
+    start_n_triangles[i] = obj->n_triangles;
+    start_n_halfedges[i] = obj->n_half_edges;
+  }
+
   // Loop continues IF:
   // 1. Iterations is set to MFTL_ERROR (Run until convergence)
   // 2. OR we haven't reached the user-defined iteration limit
@@ -1445,13 +1453,6 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
     for (mftl_int_t i = 0; i < ens->num_objects; i++)
     {
       MFTL_Object *obj = ens->objects[i];
-
-      // --- 0. Snapshot Initial Counts ---
-      mftl_int_t start_n_vertices = obj->n_vertices;
-      mftl_int_t start_n_triangles = obj->n_triangles;
-      mftl_int_t start_n_halfedges = obj->n_half_edges;
-
-      bool collapses_occurred = MFTL_FALSE;
 
       mftl_int_t obj_split = 0;
       mftl_int_t obj_collapse = 0;
@@ -1473,7 +1474,7 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
         if (CollapseApproved(obj, j, params))
         {
           MFTLCollapseEdge(obj, j);
-          collapses_occurred = MFTL_TRUE;
+          collapses_occurred[i] = MFTL_TRUE;
           obj_collapse++;
         }
       }
@@ -1506,13 +1507,18 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
       // 4. SMOOTH (Tangential)
       // Usually, it's beneficial to run multiple smoothing iterations per pass
       // to really relax the mesh before the next split/collapse phase.
-      int smooth_iters = 3;
-      for (int s = 0; s < smooth_iters; s++)
+      MFTLSmoothTangential(obj, params->smooth_mode, 1.0);
+
+      // Reset visited flags
+      for (mftl_int_t j = 0; j < obj->n_half_edges; ++j)
       {
-        MFTLSmoothTangential(obj, params->smooth_mode, 1.0);
+        obj->half_edges[j].flags &= ~MFTL_FLAG_VISITED;
       }
 
-      MFTLFinalizeRemeshing(obj, start_n_vertices, start_n_triangles, start_n_halfedges, collapses_occurred);
+      for (mftl_int_t j = 0; j < obj->n_vertices; ++j)
+      {
+        obj->vertices[j].flags &= ~MFTL_FLAG_VISITED;
+      }
 
       // Accumulate totals
       total_split += obj_split;
@@ -1543,7 +1549,11 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
 
     iter++;
   }
-}
 
-//this is a test save
-// this is a second test save
+  // Reset the arrays and hash maps and delete the dead elements
+  for (mftl_int_t i = 0; i < ens->num_objects; i++)
+  {
+    MFTL_Object *obj = ens->objects[i];
+    MFTLFinalizeRemeshing(obj, start_n_vertices[i], start_n_triangles[i], start_n_halfedges[i], collapses_occurred[i]);
+  }
+}
