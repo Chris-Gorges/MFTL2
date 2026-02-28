@@ -50,3 +50,9 @@ add_executable(test_remeshing test_remeshing.c)
 target_link_libraries(test_remeshing PRIVATE MFTL MPI::MPI_C m)
 target_include_directories(test_remeshing PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_test(NAME UnitRemeshing COMMAND mpirun -np 1 $<TARGET_FILE:test_remeshing>)
+
+# --- Phase 6: Intersection Test ---
+add_executable(unit_tests_intersection test_intersection.c)
+target_link_libraries(unit_tests_intersection PRIVATE MFTL m)
+target_include_directories(unit_tests_intersection PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME UnitIntersection COMMAND unit_tests_intersection)

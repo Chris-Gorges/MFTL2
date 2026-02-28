@@ -111,7 +111,7 @@ typedef struct
 {
   mftl_int_t count;  // Will be used as the current packing index
   mftl_int_t capacity;
-  void *buffer;
+  void* buffer;
 } MFTL_SendBuffer;
 
 // A lightweight struct to send just the necessary data.
@@ -131,7 +131,7 @@ typedef struct
 {
   mftl_int_t count;
   mftl_int_t capacity;
-  mftl_int_t *gids;
+  mftl_int_t* gids;
 } MFTL_GidList;
 
 // --- Global MPI Datatype Handles ---
@@ -169,7 +169,7 @@ void MFTLFreeMpiTypes();
  *
  * MPI works with 32 bit int, so its safer to stay with int here.
  */
-static inline mftl_int_t MFTLGetOwnerProc(const MFTL_Domain *domain, const double pos[3])
+static inline mftl_int_t MFTLGetOwnerProc(const MFTL_Domain* domain, const double pos[3])
 {
   // Pre-check: Ensure the point is within the global domain.
   assert(pos[0] >= domain->global_min[0] && pos[0] <= domain->global_max[0] && pos[1] >= domain->global_min[1] && pos[1] <= domain->global_max[1] &&
@@ -224,8 +224,14 @@ static inline mftl_int_t MFTLGetOwnerProc(const MFTL_Domain *domain, const doubl
  * @param base The geometric basis for determining ownership (VERTEX_BASED or CENTER_BASED).
  * @return 0 on success, -1 on failure.
  */
-mftl_int_t MFTLRedistributeObject(MFTL_Object *object);
-mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble *ensemble);
+mftl_int_t MFTLRedistributeObject(MFTL_Object* object);
+mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble);
+
+void MFTLPackSingleVertex(MFTL_Object* obj, mftl_int_t vert_idx, PackedVertex* dst, bool is_ghost);
+void MFTLPackSingleTriangle(MFTL_Object* obj, mftl_int_t tri_idx, PackedTriangleComplex* dst, bool is_ghost);
+
+void MFTLAppendGhostVertex(MFTL_Object* obj, PackedVertex* pv);
+void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc);
 
 /**
  * @brief Synchronizes ghost vertex positions for a list of objects.
@@ -233,7 +239,7 @@ mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble *ensemble);
  * @param object_lookup Optional hash map (BodyID -> Index). Pass MFTL_NULL to use linear search fallback.
  * @return MFTL_SUCCESS on success.
  */
-mftl_int_t MFTLUpdateGhostPositions(MFTL_Ensemble *ens, khash_t(object_map) * object_lookup);
+mftl_int_t MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lookup);
 
 /**
  * @brief Extends the ghost layer by a specified number of topological steps.
@@ -241,6 +247,6 @@ mftl_int_t MFTLUpdateGhostPositions(MFTL_Ensemble *ens, khash_t(object_map) * ob
  * @param steps Number of steps to extend (e.g. 1 step = V->T->V).
  * @return MFTL_SUCCESS on success.
  */
-mftl_int_t MFTLExtendGhostLayer(MFTL_Ensemble *ens, int steps);
+mftl_int_t MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps);
 
 #endif

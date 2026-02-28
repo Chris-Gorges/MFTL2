@@ -235,7 +235,7 @@ static inline void MFTLCalcBufferCapacities(mftl_int_t n_tris, mftl_int_t n_vert
 /**
  * @brief Packs a single triangle and its half-edges into the transfer struct.
  */
-static inline void MFTLPackSingleTriangle(MFTL_Object* obj, mftl_int_t tri_idx, PackedTriangleComplex* dst, bool is_ghost)
+void MFTLPackSingleTriangle(MFTL_Object* obj, mftl_int_t tri_idx, PackedTriangleComplex* dst, bool is_ghost)
 {
   MFTL_Triangle* src = &obj->triangles[tri_idx];
 
@@ -270,7 +270,7 @@ static inline void MFTLPackSingleTriangle(MFTL_Object* obj, mftl_int_t tri_idx, 
 /**
  * @brief Packs a single vertex into the transfer struct.
  */
-static inline void MFTLPackSingleVertex(MFTL_Object* obj, mftl_int_t vert_idx, PackedVertex* dst, bool is_ghost)
+void MFTLPackSingleVertex(MFTL_Object* obj, mftl_int_t vert_idx, PackedVertex* dst, bool is_ghost)
 {
   MFTL_Vertex* src = &obj->vertices[vert_idx];
 
@@ -1885,7 +1885,7 @@ mftl_int_t MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * ob
 /**
  * @brief Helper to append a new vertex to the object during ghost integration.
  */
-static void MFTLAppendGhostVertex(MFTL_Object* obj, PackedVertex* pv)
+void MFTLAppendGhostVertex(MFTL_Object* obj, PackedVertex* pv)
 {
   MFTL_ENSURE_CAPACITY(obj->vertices, &obj->n_vertices, &obj->capacity_vertices, 1, MFTL_Vertex);
 
@@ -1912,7 +1912,7 @@ static void MFTLAppendGhostVertex(MFTL_Object* obj, PackedVertex* pv)
 /**
  * @brief Helper to append a new triangle (and its halfedges) during ghost integration.
  */
-static void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc)
+void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc)
 {
   MFTL_ENSURE_CAPACITY(obj->triangles, &obj->n_triangles, &obj->capacity_triangles, 1, MFTL_Triangle);
   MFTL_ENSURE_CAPACITY(obj->half_edges, &obj->n_half_edges, &obj->capacity_half_edges, 3, MFTL_HalfEdge);
