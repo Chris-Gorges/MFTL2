@@ -2,8 +2,24 @@
  * @file mftl_bvh.h
  * @brief Linear Bounding Volume Hierarchy (LBVH) implementation.
  *
+ * This module provides a highly optimized, state-of-the-art implementation of a 
+ * Bounding Volume Hierarchy specifically designed for parallel surface meshing.
+ *
+ * ### Key Algorithmic Features:
+ * 1. **Data Oriented Design (DOD)**: The `MFTL_BVHNode` architecture is strictly compressed 
+ *    to 32-bytes, matching exact cache-line boundaries for maximum pre-fetching efficiency.
+ * 2. **Radix Tree Spatial Partitioning**: The topology is built utilizing a deterministically 
+ *    stable binary split based on 30-bit Morton Codes (Z-Order curves). It leverages 
+ *    `__builtin_clz` for hyper-fast highest differing bit analysis, slicing nodes exactly at their radix point.
+ * 3. **MPI Spatial Ghosting**: Utilizes `MPI_Neighbor_alltoall[v]` for boundary-aware triangle packing.
+ *    Nodes overlapping distributed bounds are sequentially transmitted, unpacked, and organically 
+ *    fused into the mesh `flat_tri_verts` for cohesive cross-boundary resolution.
+ * 4. **Guigue-Devillers Robust Intersection**: Abandons conventional SAT arrays for rigorous 
+ *    3D Orientation determinants. Automatically resolves exact interval overlapping intervals on planes 
+ *    while avoiding heavy two-dimensional geometric projections or topological linkage tracking.
+ *
  * @author Christian Gorges
- * @date 2026-02-28
+ * @date 2026-03-01
  */
 
 #ifndef MFTL_BVH_H

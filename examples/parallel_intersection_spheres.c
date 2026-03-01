@@ -1,9 +1,11 @@
 /*
  * @Author: MFTL
- * @Date: 2026-02-28
+ * @Date: 2026-03-01
  *
  * This program checks the intersection of two spheres in parallel.
  * It strictly tests the new LBVH approach and robust SAT triangles intersections.
+ * The spheres start at opposite ends of the domain and move towards each other,
+ * crossing processor boundaries to rigorously test dynamic spatial ghosting.
  */
 
 #include "mftl_core.h"
@@ -28,9 +30,11 @@ int main(int argc, char** argv)
   MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
 
   // Provide a valid geometric domain mapping dynamically based on parallel threads
+  // For 4 procs, cuts will be {4, 1, 1} over a domain [-2.0, 2.0].
+  // Processor boundaries will be at x = -1.0, 0.0, 1.0.
   int cuts[3] = {nprocs, 1, 1};
-  double global_min[3] = {-5.0, -5.0, -5.0};
-  double global_max[3] = {5.0, 5.0, 5.0};
+  double global_min[3] = {-2.0, -2.0, -2.0};
+  double global_max[3] = {2.0, 2.0, 2.0};
   bool periodicity[3] = {false, false, false};
 
   MFTL_Ensemble* ensemble = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, global_min, global_max, periodicity, 10);
@@ -42,84 +46,108 @@ int main(int argc, char** argv)
   }
 
   // --- Generate Objects ---
+  double radius = 0.5;
 
-  // Sphere A
+  // Sphere A: Starts at x = -1.5, moves right (+1.0 velocity)
   MFTL_Object* objA = MFTLObjectCreate(1);
   MFTLEnsembleAddObject(ensemble, objA);
-  double centerA[3] = {-0.5, 0.0, 0.0};
-  MFTLGenerateSphere(objA, centerA, 1.0, 4);  // Refinement level 4 generates hundreds of triangles
+  double centerA[3] = {-1.5, 0.0, 0.0};
+  MFTLGenerateSphere(objA, centerA, radius, 3);
   MFTLComputeTriangleProperties(objA);
   MFTLRedistributeObject(objA);
 
-  // Sphere B
+  // Sphere B: Starts at x = 1.5, moves left (-1.0 velocity)
   MFTL_Object* objB = MFTLObjectCreate(2);
   MFTLEnsembleAddObject(ensemble, objB);
-  // Placed symmetrically across the X=0 processor boundary to test spatial ghosting
-  double centerB[3] = {0.5, 0.0, 0.0};
-  MFTLGenerateSphere(objB, centerB, 1.0, 4);
+  double centerB[3] = {1.5, 0.0, 0.0};
+  MFTLGenerateSphere(objB, centerB, radius, 3);
   MFTLComputeTriangleProperties(objB);
   MFTLRedistributeObject(objB);
 
-  // VERY IMPORTANT: Our optimized SAT math operates on purely contiguous vertex memory,
-  // so we map the topological half-edge loops out into `flat_tri_verts`
-  MFTLFlattenConnectivity(objA);
-  MFTLFlattenConnectivity(objB);
-
-  // Invoke the SOTA Spatial Ghosting exchange to handle cross-boundary collisions
-  MFTL_CreateSpatialGhosts(objA, objB);
-
-  // --- Bounding Volume Hierarchies ---
-
-  // Time the BVH builds
-  double t_bvh_start = MPI_Wtime();
-  MFTL_BVH* bvhA = MFTL_GenerateLBVH(objA);
-  MFTL_BVH* bvhB = MFTL_GenerateLBVH(objB);
-  double t_bvh_end = MPI_Wtime();
-
   if (rank == 0)
   {
     printf("========================================\n");
-    printf("MFTL Parallel Sphere Intersection Test\n");
+    printf("MFTL Dynamic Sphere Intersection Test\n");
     printf("========================================\n");
     printf("Ranks: %d\n", nprocs);
-    printf("Sphere A: %lld triangles\n", (long long) objA->n_triangles);
-    printf("Sphere B: %lld triangles\n", (long long) objB->n_triangles);
-    printf("BVH build time: %.5f ms\n", (t_bvh_end - t_bvh_start) * 1000.0);
-    printf("Starting Traversal...\n");
-  }
-
-  // --- Intersection Check ---
-
-  MPI_Barrier(MPI_COMM_WORLD);
-  double t_start = MPI_Wtime();
-
-  local_intersections = 0;
-  if (bvhA && bvhB)
-  {
-    MFTL_IntersectObjects(objA, bvhA, objB, bvhB, sphere_intersection_cb, NULL);
-  }
-
-  MPI_Barrier(MPI_COMM_WORLD);
-  double t_end = MPI_Wtime();
-
-  // Aggregate intersections across all domains
-  long long local_cnt = (long long) local_intersections;
-  long long global_cnt = 0;
-  MPI_Reduce(&local_cnt, &global_cnt, 1, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
-
-  if (rank == 0)
-  {
-    double dt = t_end - t_start;
-    printf("Traversal and SAT intersection time: %.5f ms\n", dt * 1000.0);
-    printf("Total Sub-Triangle Intersections Found = %lld\n", global_cnt);
+    printf("Domain: [%.1f, %.1f] in X\n", global_min[0], global_max[0]);
+    printf("Sphere A starting at x=-1.5, vel=+1.0\n");
+    printf("Sphere B starting at x=+1.5, vel=-1.0\n");
+    printf("Expected intersection around t=1.0 at x=0.0 (domain center/boundary!)\n");
     printf("========================================\n");
   }
 
-  // --- Cleanup ---
-  if (bvhA) MFTL_DestroyBVH(bvhA);
-  if (bvhB) MFTL_DestroyBVH(bvhB);
-  MFTLEnsembleDestroy(&ensemble);
+  // --- Time Loop ---
+  double dt = 0.1;
+  double velA = 1.0;
+  double velB = -1.0;
 
+  for (double time = 0.0; time <= 2.0 + 1e-9; time += dt)
+  {
+    if (rank == 0) printf("\n--- Timestep t = %.1f ---\n", time);
+
+    // 1. Advect vertices
+    if (time > 0.0)  // skip movement on frame 0 to check initial state
+    {
+      for (int i = 0; i < objA->n_vertices; i++)
+      {
+        if (objA->vertices[i].owner_proc == rank) objA->vertices[i].pos[0] += velA * dt;
+      }
+      for (int i = 0; i < objB->n_vertices; i++)
+      {
+        if (objB->vertices[i].owner_proc == rank) objB->vertices[i].pos[0] += velB * dt;
+      }
+
+      // Recompute properties and redistribute to handle migrating triangles
+      MFTLUpdateGhostPositions(ensemble, MFTL_NULL);
+      MFTLComputeTriangleProperties(objA);
+      MFTLComputeTriangleProperties(objB);
+      MFTLRedistributeListOfObjects(ensemble);
+    }
+
+    // 2. Flatten Topology for fast array access in intersection tests
+    MFTLFlattenConnectivity(objA);
+    MFTLFlattenConnectivity(objB);
+
+    // 3. SOTA Spatial Ghosting exchange to handle cross-boundary collisions accurately
+    MFTL_CreateSpatialGhosts(objA, objB);
+
+    // 4. Bounding Volume Hierarchies
+    MFTL_BVH* bvhA = MFTL_GenerateLBVH(objA);
+    MFTL_BVH* bvhB = MFTL_GenerateLBVH(objB);
+
+    // 5. Intersection Check
+    local_intersections = 0;
+    if (bvhA && bvhB)
+    {
+      MFTL_IntersectObjects(objA, bvhA, objB, bvhB, sphere_intersection_cb, NULL);
+    }
+
+    // Aggregate intersections across all domains
+    long long local_cnt = (long long) local_intersections;
+    long long global_cnt = 0;
+    MPI_Reduce(&local_cnt, &global_cnt, 1, MPI_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    if (rank == 0)
+    {
+      if (global_cnt > 0)
+      {
+        printf("[!] Intersection DETECTED! %lld triangle pairs overlapping.\n", global_cnt);
+      }
+      else
+      {
+        printf("    No intersection.\n");
+      }
+    }
+
+    // Cleanup for next step
+    if (bvhA) MFTL_DestroyBVH(bvhA);
+    if (bvhB) MFTL_DestroyBVH(bvhB);
+  }
+
+  if (rank == 0) printf("========================================\n");
+
+  MFTLEnsembleDestroy(&ensemble);
   MPI_Finalize();
   return 0;
 }
