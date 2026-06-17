@@ -36,10 +36,10 @@ MFTL_Object* CreateTestObject(MFTL_Ensemble** out_ens)
 // -----------------------------------------------------------------------------
 // HELPER: Add Vertex
 // -----------------------------------------------------------------------------
-mftl_int_t AddVertex(MFTL_Object* obj, double x, double y, double z)
+int AddVertex(MFTL_Object* obj, double x, double y, double z)
 {
   MFTL_ENSURE_CAPACITY(obj->vertices, &obj->n_vertices, &obj->capacity_vertices, 1, MFTL_Vertex);
-  mftl_int_t idx = obj->n_vertices++;
+  int idx = obj->n_vertices++;
   MFTL_Vertex* v = &obj->vertices[idx];
   v->pos[0] = x;
   v->pos[1] = y;
@@ -53,10 +53,10 @@ mftl_int_t AddVertex(MFTL_Object* obj, double x, double y, double z)
 // -----------------------------------------------------------------------------
 // HELPER: Add HalfEdge
 // -----------------------------------------------------------------------------
-mftl_int_t AddHalfEdge(MFTL_Object* obj)
+int AddHalfEdge(MFTL_Object* obj)
 {
   MFTL_ENSURE_CAPACITY(obj->half_edges, &obj->n_half_edges, &obj->capacity_half_edges, 1, MFTL_HalfEdge);
-  mftl_int_t idx = obj->n_half_edges++;
+  int idx = obj->n_half_edges++;
   MFTL_HalfEdge* he = &obj->half_edges[idx];
   he->next_idx = MFTL_ERROR;
   he->twin_idx = MFTL_ERROR;
@@ -70,10 +70,10 @@ mftl_int_t AddHalfEdge(MFTL_Object* obj)
 // -----------------------------------------------------------------------------
 // HELPER: Add Triangle
 // -----------------------------------------------------------------------------
-mftl_int_t AddTriangle(MFTL_Object* obj)
+int AddTriangle(MFTL_Object* obj)
 {
   MFTL_ENSURE_CAPACITY(obj->triangles, &obj->n_triangles, &obj->capacity_triangles, 1, MFTL_Triangle);
-  mftl_int_t idx = obj->n_triangles++;
+  int idx = obj->n_triangles++;
   MFTL_Triangle* t = &obj->triangles[idx];
   t->he_idx = MFTL_ERROR;
   t->flags = MFTL_FLAG_NONE;
@@ -91,11 +91,11 @@ mftl_int_t AddTriangle(MFTL_Object* obj)
 int ValidateMeshConnectivity(MFTL_Object* obj)
 {
   // 1. Check Vertices
-  for (mftl_int_t i = 0; i < obj->n_vertices; ++i)
+  for (int i = 0; i < obj->n_vertices; ++i)
   {
     if (obj->vertices[i].flags & MFTL_FLAG_DEAD) continue;
 
-    mftl_int_t out_he = obj->vertices[i].out_he_idx;
+    int out_he = obj->vertices[i].out_he_idx;
     if (out_he == MFTL_ERROR)
     {
       printf("Vertex %lld (Dead? %d) has out_he == -1\n", (long long) i, (obj->vertices[i].flags & MFTL_FLAG_DEAD) ? 1 : 0);
@@ -146,7 +146,7 @@ int ValidateMeshConnectivity(MFTL_Object* obj)
   }
 
   // 2. Check Half-Edges
-  for (mftl_int_t i = 0; i < obj->n_half_edges; ++i)
+  for (int i = 0; i < obj->n_half_edges; ++i)
   {
     if (obj->half_edges[i].flags & MFTL_FLAG_DEAD) continue;
 
@@ -171,7 +171,7 @@ int ValidateMeshConnectivity(MFTL_Object* obj)
     {
       TEST_ASSERT(!(obj->triangles[he->triangle_idx].flags & MFTL_FLAG_DEAD));
       // Triangle must point to one of its edges
-      mftl_int_t t_he = obj->triangles[he->triangle_idx].he_idx;
+      int t_he = obj->triangles[he->triangle_idx].he_idx;
       // It doesn't have to be THIS edge, but it must be in the loop
       MFTL_HalfEdge* t_start = &obj->half_edges[t_he];
       MFTL_HalfEdge* t_curr = t_start;
@@ -202,10 +202,10 @@ int ValidateMeshConnectivity(MFTL_Object* obj)
 void CreateFullOneRing(MFTL_Object* obj, int n_spokes, bool is_closed)
 {
   // Center
-  mftl_int_t center_v = AddVertex(obj, 0, 0, 0);
+  int center_v = AddVertex(obj, 0, 0, 0);
 
   // Ring Vertices
-  mftl_int_t* ring_v = malloc(n_spokes * sizeof(mftl_int_t));
+  int* ring_v = malloc(n_spokes * sizeof(int));
   for (int i = 0; i < n_spokes; ++i)
   {
     double angle = 2.0 * 3.14159 * i / (is_closed ? n_spokes : (n_spokes - 1));  // Semi-circle if open
@@ -216,22 +216,22 @@ void CreateFullOneRing(MFTL_Object* obj, int n_spokes, bool is_closed)
   // Create Triangles (Fan)
   // Triangle i connects Center -> Ring[i] -> Ring[i+1] -> Center
   int n_tris = is_closed ? n_spokes : (n_spokes - 1);
-  mftl_int_t first_spoke_he = MFTL_ERROR;
-  mftl_int_t prev_spoke_twin = MFTL_ERROR;
+  int first_spoke_he = MFTL_ERROR;
+  int prev_spoke_twin = MFTL_ERROR;
 
   for (int i = 0; i < n_tris; ++i)
   {
     int next_i = (i + 1) % n_spokes;
 
-    mftl_int_t t = AddTriangle(obj);
+    int t = AddTriangle(obj);
 
     // HEs:
     // he_c_r1: Center -> Ring[i]
     // he_r1_r2: Ring[i] -> Ring[next]
     // he_r2_c: Ring[next] -> Center
-    mftl_int_t he_c_r1 = AddHalfEdge(obj);
-    mftl_int_t he_r1_r2 = AddHalfEdge(obj);
-    mftl_int_t he_r2_c = AddHalfEdge(obj);
+    int he_c_r1 = AddHalfEdge(obj);
+    int he_r1_r2 = AddHalfEdge(obj);
+    int he_r2_c = AddHalfEdge(obj);
 
     // Setup Cycle
     obj->half_edges[he_c_r1].vertex_idx = ring_v[i];
@@ -289,7 +289,7 @@ void CreateFullOneRing(MFTL_Object* obj, int n_spokes, bool is_closed)
 // -----------------------------------------------------------------------------
 // HELPER: Create Single Triangle Mesh (Legacy kept for split test)
 // -----------------------------------------------------------------------------
-void CreateSingleTriangle(MFTL_Object* obj, mftl_int_t v[3], mftl_int_t he[3], mftl_int_t* tri)
+void CreateSingleTriangle(MFTL_Object* obj, int v[3], int he[3], int* tri)
 {
   v[0] = AddVertex(obj, 0.0, 0.0, 0.0);
   v[1] = AddVertex(obj, 1.0, 0.0, 0.0);
@@ -332,16 +332,16 @@ int TestSplitBoundary()
 {
   MFTL_Ensemble* ens = NULL;
   MFTL_Object* obj = CreateTestObject(&ens);
-  mftl_int_t v[3], he[3], tri;
+  int v[3], he[3], tri;
   CreateSingleTriangle(obj, v, he, &tri);
 
   TEST_VALIDATE(obj);  // Pre-check
 
   // Split Edge 0 (0->1)
-  mftl_int_t initial_v = obj->n_vertices;
-  mftl_int_t initial_t = obj->n_triangles;
+  int initial_v = obj->n_vertices;
+  int initial_t = obj->n_triangles;
 
-  mftl_int_t new_v_idx = MFTLSplitEdge(obj, he[0]);
+  int new_v_idx = MFTLSplitEdge(obj, he[0]);
 
   // Checks
   TEST_ASSERT_EQUAL_INT(initial_v + 1, obj->n_vertices);
@@ -371,7 +371,7 @@ int TestSplitInternal()
 
   // Split one of the spoke edges, e.g., obj->half_edges[0] which is likely 0->1 (or close to it)
   // Find an edge starting at 0
-  mftl_int_t edge_to_split = obj->vertices[0].out_he_idx;
+  int edge_to_split = obj->vertices[0].out_he_idx;
 
   MFTLSplitEdge(obj, edge_to_split);
 
@@ -395,14 +395,14 @@ int TestCollapseInternal()
 
   TEST_VALIDATE(obj);
 
-  mftl_int_t initial_v = obj->n_vertices;
-  mftl_int_t initial_t = obj->n_triangles;
+  int initial_v = obj->n_vertices;
+  int initial_t = obj->n_triangles;
 
   // Pick an edge to collapse: Center -> Ring[0]
   // In CreateFullOneRing, edges from Center are created as he_c_r1.
   // The first created half-edge is at index 0? No, AddHalfEdge increments.
   // Safe way: Get out_he from Center.
-  mftl_int_t he_collapse = obj->vertices[0].out_he_idx;
+  int he_collapse = obj->vertices[0].out_he_idx;
 
   // Verify it is a valid spoke
   TEST_ASSERT(obj->half_edges[he_collapse].vertex_idx != 0);  // Target is ring
@@ -458,7 +458,7 @@ int TestCollapseBoundary()
 
   // Find edge 0->2.
   // It's not guaranteed index. Use geometry or iteration.
-  mftl_int_t he_tocal = MFTL_ERROR;
+  int he_tocal = MFTL_ERROR;
   for (int i = 0; i < obj->n_half_edges; ++i)
   {
     if (obj->half_edges[i].flags & MFTL_FLAG_DEAD) continue;
@@ -475,7 +475,7 @@ int TestCollapseBoundary()
     {  // Points to center
       // Origin is ?
       // Actually, let's just use the twin.
-      mftl_int_t twin = obj->half_edges[i].twin_idx;
+      int twin = obj->half_edges[i].twin_idx;
       if (twin != MFTL_ERROR && obj->half_edges[twin].vertex_idx == 2)
       {
         he_tocal = twin;

@@ -23,7 +23,7 @@
  * "output/sphere"). .vtk will be appended.
  * @return 0 on success, -1 on error.
  */
-mftl_int_t MFTLWriteVtk(const MFTL_Object *object, const char *base_filename)
+int MFTLWriteVtk(const MFTL_Object *object, const char *base_filename)
 {
   if (!object)
   {
@@ -67,14 +67,14 @@ mftl_int_t MFTLWriteVtk(const MFTL_Object *object, const char *base_filename)
     const MFTL_Triangle *tri = &t_base[i];
 
     // Navigate Topology via Indices
-    mftl_int_t he0_idx = tri->he_idx;
-    mftl_int_t he1_idx = he_base[he0_idx].next_idx;
-    mftl_int_t he2_idx = he_base[he1_idx].next_idx;
+    int he0_idx = tri->he_idx;
+    int he1_idx = he_base[he0_idx].next_idx;
+    int he2_idx = he_base[he1_idx].next_idx;
 
     // Vertices of the triangle:
-    mftl_int_t v0_idx = he_base[he2_idx].vertex_idx;
-    mftl_int_t v1_idx = he_base[he0_idx].vertex_idx;
-    mftl_int_t v2_idx = he_base[he1_idx].vertex_idx;
+    int v0_idx = he_base[he2_idx].vertex_idx;
+    int v1_idx = he_base[he0_idx].vertex_idx;
+    int v2_idx = he_base[he1_idx].vertex_idx;
 
     // Note: VTK expects 0-based indices into the POINTS list written above.
     // This corresponds exactly to our local indices.
@@ -136,28 +136,28 @@ void MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix)
 {
   if (ensemble->num_objects == 0) return;
 
-  mftl_int_t num_objects = ensemble->num_objects;
+  int num_objects = ensemble->num_objects;
   MFTL_Domain *domain = &ensemble->domain;
   int my_rank = domain->rank;
   int nproc = domain->nproc;
 
   // --- PRE-CALCULATION: Count Wrapped Triangles per Object ---
-  mftl_int_t *wrapped_counts = (mftl_int_t *) calloc(ensemble->num_objects, sizeof(mftl_int_t));
+  int *wrapped_counts = (int *) calloc(ensemble->num_objects, sizeof(int));
   double dummy_p1[3], dummy_p2[3];
 
-  mftl_int_t total_file_points = 0;
-  mftl_int_t total_file_cells = 0;
+  int total_file_points = 0;
+  int total_file_cells = 0;
 
-  for (mftl_int_t o = 0; o < num_objects; ++o)
+  for (int o = 0; o < num_objects; ++o)
   {
     MFTL_Object *obj = ensemble->objects[o];
-    mftl_int_t current_wrapped = 0;
+    int current_wrapped = 0;
 
-    for (mftl_int_t i = 0; i < obj->n_triangles; ++i)
+    for (int i = 0; i < obj->n_triangles; ++i)
     {
-      mftl_int_t he0 = obj->triangles[i].he_idx;
-      mftl_int_t he1 = obj->half_edges[he0].next_idx;
-      mftl_int_t he2 = obj->half_edges[he1].next_idx;
+      int he0 = obj->triangles[i].he_idx;
+      int he1 = obj->half_edges[he0].next_idx;
+      int he2 = obj->half_edges[he1].next_idx;
 
       double *p0 = obj->vertices[obj->half_edges[he2].vertex_idx].pos;
       double *p1 = obj->vertices[obj->half_edges[he0].vertex_idx].pos;
@@ -190,8 +190,14 @@ void MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix)
   fprintf(fp, "<?xml version=\"1.0\"?>\n");
   fprintf(fp, "<VTKFile type=\"UnstructuredGrid\" version=\"1.0\" byte_order=\"LittleEndian\">\n");
   fprintf(fp, "  <UnstructuredGrid>\n");
-  // UPDATED: Use MFTL_FMT for counts
-  fprintf(fp, "    <Piece NumberOfPoints=\"" MFTL_FMT "\" NumberOfCells=\"" MFTL_FMT "\">\n", total_file_points, total_file_cells);
+  // UPDATED: Use "%d" for counts
+  fprintf(fp,
+          "    <Piece NumberOfPoints=\""
+          "%d"
+          "\" NumberOfCells=\""
+          "%d"
+          "\">\n",
+          total_file_points, total_file_cells);
 
   // ======================================================================
   // 1. POINTS (Coordinates)
@@ -199,22 +205,22 @@ void MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix)
   fprintf(fp, "      <Points>\n");
   fprintf(fp, "        <DataArray type=\"Float64\" Name=\"Coordinates\" NumberOfComponents=\"3\" format=\"ascii\">\n");
 
-  for (mftl_int_t o = 0; o < num_objects; ++o)
+  for (int o = 0; o < num_objects; ++o)
   {
     MFTL_Object *obj = ensemble->objects[o];
 
     // A. Original Vertices
-    for (mftl_int_t i = 0; i < obj->n_vertices; ++i)
+    for (int i = 0; i < obj->n_vertices; ++i)
     {
       fprintf(fp, "          %.10e %.10e %.10e\n", obj->vertices[i].pos[0], obj->vertices[i].pos[1], obj->vertices[i].pos[2]);
     }
 
     // B. Visual Ghost Vertices (Unwrapped)
-    for (mftl_int_t i = 0; i < obj->n_triangles; ++i)
+    for (int i = 0; i < obj->n_triangles; ++i)
     {
-      mftl_int_t he0 = obj->triangles[i].he_idx;
-      mftl_int_t he1 = obj->half_edges[he0].next_idx;
-      mftl_int_t he2 = obj->half_edges[he1].next_idx;
+      int he0 = obj->triangles[i].he_idx;
+      int he1 = obj->half_edges[he0].next_idx;
+      int he2 = obj->half_edges[he1].next_idx;
 
       double *p0 = obj->vertices[obj->half_edges[he2].vertex_idx].pos;
       double *p1 = obj->vertices[obj->half_edges[he0].vertex_idx].pos;
@@ -236,22 +242,22 @@ void MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix)
   // 2. CELLS (Connectivity)
   // ======================================================================
   fprintf(fp, "      <Cells>\n");
-  fprintf(fp, "        <DataArray type=\"%s\" Name=\"connectivity\" format=\"ascii\">\n", MFTL_VTK_TYPE);
+  fprintf(fp, "        <DataArray type=\"%s\" Name=\"connectivity\" format=\"ascii\">\n", "Int32");
 
   // Global Offset Tracker
-  mftl_int_t global_vertex_offset = 0;
+  int global_vertex_offset = 0;
 
-  for (mftl_int_t o = 0; o < num_objects; ++o)
+  for (int o = 0; o < num_objects; ++o)
   {
     MFTL_Object *obj = ensemble->objects[o];
-    mftl_int_t local_ghost_start_idx = global_vertex_offset + obj->n_vertices;
-    mftl_int_t current_ghost_idx = local_ghost_start_idx;
+    int local_ghost_start_idx = global_vertex_offset + obj->n_vertices;
+    int current_ghost_idx = local_ghost_start_idx;
 
     for (size_t i = 0; i < obj->n_triangles; ++i)
     {
-      mftl_int_t he0 = obj->triangles[i].he_idx;
-      mftl_int_t he1 = obj->half_edges[he0].next_idx;
-      mftl_int_t he2 = obj->half_edges[he1].next_idx;
+      int he0 = obj->triangles[i].he_idx;
+      int he1 = obj->half_edges[he0].next_idx;
+      int he2 = obj->half_edges[he1].next_idx;
 
       double *p0 = obj->vertices[obj->half_edges[he2].vertex_idx].pos;
       double *p1 = obj->vertices[obj->half_edges[he0].vertex_idx].pos;
@@ -259,13 +265,29 @@ void MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix)
 
       if (MFTLCheckWrap(domain, p0, p1, p2, dummy_p1, dummy_p2))
       {
-        fprintf(fp, "          " MFTL_FMT " " MFTL_FMT " " MFTL_FMT "\n", current_ghost_idx, current_ghost_idx + 1, current_ghost_idx + 2);
+        fprintf(fp,
+                "          "
+                "%d"
+                " "
+                "%d"
+                " "
+                "%d"
+                "\n",
+                current_ghost_idx, current_ghost_idx + 1, current_ghost_idx + 2);
         current_ghost_idx += 3;
       }
       else
       {
-        fprintf(fp, "          " MFTL_FMT " " MFTL_FMT " " MFTL_FMT "\n", global_vertex_offset + obj->half_edges[he2].vertex_idx,
-                global_vertex_offset + obj->half_edges[he0].vertex_idx, global_vertex_offset + obj->half_edges[he1].vertex_idx);
+        fprintf(fp,
+                "          "
+                "%d"
+                " "
+                "%d"
+                " "
+                "%d"
+                "\n",
+                global_vertex_offset + obj->half_edges[he2].vertex_idx, global_vertex_offset + obj->half_edges[he0].vertex_idx,
+                global_vertex_offset + obj->half_edges[he1].vertex_idx);
       }
     }
 
@@ -274,23 +296,27 @@ void MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix)
   fprintf(fp, "        </DataArray>\n");
 
   // --- Offsets ---
-  fprintf(fp, "        <DataArray type=\"%s\" Name=\"offsets\" format=\"ascii\">\n", MFTL_VTK_TYPE);
-  mftl_int_t running_offset = 0;
-  for (mftl_int_t o = 0; o < num_objects; ++o)
+  fprintf(fp, "        <DataArray type=\"%s\" Name=\"offsets\" format=\"ascii\">\n", "Int32");
+  int running_offset = 0;
+  for (int o = 0; o < num_objects; ++o)
   {
-    for (mftl_int_t i = 0; i < ensemble->objects[o]->n_triangles; ++i)
+    for (int i = 0; i < ensemble->objects[o]->n_triangles; ++i)
     {
       running_offset += 3;
-      fprintf(fp, "          " MFTL_FMT "\n", running_offset);
+      fprintf(fp,
+              "          "
+              "%d"
+              "\n",
+              running_offset);
     }
   }
   fprintf(fp, "        </DataArray>\n");
 
   // --- Types ---
   fprintf(fp, "        <DataArray type=\"UInt8\" Name=\"types\" format=\"ascii\">\n");
-  for (mftl_int_t o = 0; o < num_objects; ++o)
+  for (int o = 0; o < num_objects; ++o)
   {
-    for (mftl_int_t i = 0; i < ensemble->objects[o]->n_triangles; ++i)
+    for (int i = 0; i < ensemble->objects[o]->n_triangles; ++i)
     {
       fprintf(fp, "          5\n");
     }
@@ -305,21 +331,21 @@ void MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix)
   // VertexOwner is usually an MPI rank (int32), keeping as Int32.
   fprintf(fp, "        <DataArray type=\"Int32\" Name=\"VertexOwner\" format=\"ascii\">\n");
 
-  for (mftl_int_t o = 0; o < num_objects; ++o)
+  for (int o = 0; o < num_objects; ++o)
   {
     MFTL_Object *obj = ensemble->objects[o];
 
     // A. Original
-    for (mftl_int_t i = 0; i < obj->n_vertices; ++i)
+    for (int i = 0; i < obj->n_vertices; ++i)
     {
       fprintf(fp, "          %d\n", obj->vertices[i].owner_proc);
     }
     // B. Ghosts
-    for (mftl_int_t i = 0; i < obj->n_triangles; ++i)
+    for (int i = 0; i < obj->n_triangles; ++i)
     {
-      mftl_int_t he0 = obj->triangles[i].he_idx;
-      mftl_int_t he1 = obj->half_edges[he0].next_idx;
-      mftl_int_t he2 = obj->half_edges[he1].next_idx;
+      int he0 = obj->triangles[i].he_idx;
+      int he1 = obj->half_edges[he0].next_idx;
+      int he2 = obj->half_edges[he1].next_idx;
       double *p0 = obj->vertices[obj->half_edges[he2].vertex_idx].pos;
       double *p1 = obj->vertices[obj->half_edges[he0].vertex_idx].pos;
       double *p2 = obj->vertices[obj->half_edges[he1].vertex_idx].pos;
@@ -342,23 +368,27 @@ void MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix)
 
   // A. Triangle Owner (Int32 for ranks)
   fprintf(fp, "        <DataArray type=\"Int32\" Name=\"TriangleOwner\" format=\"ascii\">\n");
-  for (mftl_int_t o = 0; o < num_objects; ++o)
+  for (int o = 0; o < num_objects; ++o)
   {
-    for (mftl_int_t i = 0; i < ensemble->objects[o]->n_triangles; ++i)
+    for (int i = 0; i < ensemble->objects[o]->n_triangles; ++i)
     {
       fprintf(fp, "          %d\n", ensemble->objects[o]->triangles[i].owner_proc);
     }
   }
   fprintf(fp, "        </DataArray>\n");
 
-  // B. Body ID (Object Global ID - uses mftl_int_t)
-  fprintf(fp, "        <DataArray type=\"%s\" Name=\"BodyID\" format=\"ascii\">\n", MFTL_VTK_TYPE);
-  for (mftl_int_t o = 0; o < num_objects; ++o)
+  // B. Body ID (Object Global ID - uses int)
+  fprintf(fp, "        <DataArray type=\"%s\" Name=\"BodyID\" format=\"ascii\">\n", "Int32");
+  for (int o = 0; o < num_objects; ++o)
   {
-    mftl_int_t body_id = (mftl_int_t) ensemble->objects[o]->global_id;
-    for (mftl_int_t i = 0; i < ensemble->objects[o]->n_triangles; ++i)
+    int body_id = (int) ensemble->objects[o]->global_id;
+    for (int i = 0; i < ensemble->objects[o]->n_triangles; ++i)
     {
-      fprintf(fp, "          " MFTL_FMT "\n", body_id);
+      fprintf(fp,
+              "          "
+              "%d"
+              "\n",
+              body_id);
     }
   }
   fprintf(fp, "        </DataArray>\n");
@@ -396,10 +426,10 @@ void MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix)
 
       fprintf(fp, "    <PCellData Scalars=\"BodyID\">\n");
       fprintf(fp, "      <PDataArray type=\"Int32\" Name=\"TriangleOwner\"/>\n");
-      fprintf(fp, "      <PDataArray type=\"%s\" Name=\"BodyID\"/>\n", MFTL_VTK_TYPE);
+      fprintf(fp, "      <PDataArray type=\"%s\" Name=\"BodyID\"/>\n", "Int32");
       fprintf(fp, "    </PCellData>\n");
 
-      for (mftl_int_t i = 0; i < nproc; ++i)
+      for (int i = 0; i < nproc; ++i)
       {
         const char *last_slash = strrchr(filename_prefix, '/');
         const char *basename = (last_slash) ? last_slash + 1 : filename_prefix;

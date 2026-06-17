@@ -104,7 +104,7 @@ int test_integrity_valid()
   MFTL_Object obj;
   create_single_triangle_mesh(&obj);
 
-  mftl_int_t status = MFTLCheckMeshIntegrity(&obj);
+  int status = MFTLCheckMeshIntegrity(&obj);
 
   cleanup_mesh(&obj);
 
@@ -122,7 +122,7 @@ int test_integrity_invalid()
 
   // Silence stderr for expected error?
   // For unit tests, sometimes we want to suppress it, but here it's fine.
-  mftl_int_t status = MFTLCheckMeshIntegrity(&obj);
+  int status = MFTLCheckMeshIntegrity(&obj);
 
   cleanup_mesh(&obj);
 

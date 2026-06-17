@@ -31,7 +31,7 @@ static inline void MFTLGetMinimumImageVector(const MFTL_Domain *domain, double v
   vec_out[2] = p2[2] - p1[2];
 
   // Apply periodic correction for each dimension
-  for (mftl_int_t i = 0; i < 3; ++i)
+  for (int i = 0; i < 3; ++i)
   {
     if (domain->is_periodic[i])
     {
@@ -53,7 +53,7 @@ static inline void MFTLGetMinimumImageVector(const MFTL_Domain *domain, double v
  */
 static inline void MFTLApplyPeriodicity(const MFTL_Domain *domain, double pos[3])
 {
-  for (mftl_int_t i = 0; i < 3; ++i)
+  for (int i = 0; i < 3; ++i)
   {
     if (domain->is_periodic[i])
     {

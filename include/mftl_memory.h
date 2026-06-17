@@ -25,7 +25,7 @@
 #define _MFTL_REALLOC_CORE(ptr, capacity, target_cap, type)                                                            \
   do                                                                                                                   \
   {                                                                                                                    \
-    mftl_int_t _req_cap = (target_cap);                                                                                \
+    int _req_cap = (target_cap);                                                                                       \
     /* Safety: Only realloc if we actually need more space */                                                          \
     if (_req_cap > (*(capacity)))                                                                                      \
     {                                                                                                                  \
@@ -44,19 +44,19 @@
  * @brief Default Geometric Growth (x2).
  * Use this for incremental additions (e.g., inside a loop).
  */
-#define MFTL_ENSURE_CAPACITY(ptr, count, capacity, needed, type)                     \
-  do                                                                                 \
-  {                                                                                  \
-    if ((*(count)) + (needed) > (*(capacity)))                                       \
-    {                                                                                \
-      mftl_int_t _new_cap = (*(capacity) == 0) ? MFTL_INIT_CAPACITY : (*(capacity)); \
-      /* Geometric doubling until we fit the need */                                 \
-      while (_new_cap < (*(count)) + (needed))                                       \
-      {                                                                              \
-        _new_cap *= 2;                                                               \
-      }                                                                              \
-      _MFTL_REALLOC_CORE(ptr, capacity, _new_cap, type);                             \
-    }                                                                                \
+#define MFTL_ENSURE_CAPACITY(ptr, count, capacity, needed, type)              \
+  do                                                                          \
+  {                                                                           \
+    if ((*(count)) + (needed) > (*(capacity)))                                \
+    {                                                                         \
+      int _new_cap = (*(capacity) == 0) ? MFTL_INIT_CAPACITY : (*(capacity)); \
+      /* Geometric doubling until we fit the need */                          \
+      while (_new_cap < (*(count)) + (needed))                                \
+      {                                                                       \
+        _new_cap *= 2;                                                        \
+      }                                                                       \
+      _MFTL_REALLOC_CORE(ptr, capacity, _new_cap, type);                      \
+    }                                                                         \
   } while (0)
 
 /**
@@ -69,7 +69,7 @@
   {                                                                 \
     if ((*(count)) + (needed) > (*(capacity)))                      \
     {                                                               \
-      mftl_int_t _new_cap = (*(count)) + (needed);                  \
+      int _new_cap = (*(count)) + (needed);                         \
       _MFTL_REALLOC_CORE(ptr, capacity, _new_cap, type);            \
     }                                                               \
   } while (0)

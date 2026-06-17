@@ -5,6 +5,9 @@
 #include <math.h>
 #include <stdio.h>
 
+// Forward declaration
+int MFTL_TriTriProximity(MFTL_Object* objA, int triA_id, MFTL_Object* objB, int triB_id, double proximity_tolerance);
+
 // Expands a 10-bit integer into 30 bits by inserting 2 zeros after each bit.
 static inline uint32_t MFTL_ExpandBits(uint32_t v)
 {
@@ -16,7 +19,7 @@ static inline uint32_t MFTL_ExpandBits(uint32_t v)
 }
 
 // Calculates a 30-bit Morton code for the given 3D point located within the unit cube [0,1].
-static inline mftl_int_t MFTL_Morton3D(float x, float y, float z)
+static inline int MFTL_Morton3D(float x, float y, float z)
 {
   x = fminf(fmaxf(x * 1024.0f, 0.0f), 1023.0f);
   y = fminf(fmaxf(y * 1024.0f, 0.0f), 1023.0f);
@@ -24,7 +27,7 @@ static inline mftl_int_t MFTL_Morton3D(float x, float y, float z)
   uint32_t xx = MFTL_ExpandBits((uint32_t) x);
   uint32_t yy = MFTL_ExpandBits((uint32_t) y);
   uint32_t zz = MFTL_ExpandBits((uint32_t) z);
-  return (mftl_int_t) ((xx << 2) | (yy << 1) | zz);
+  return (int) ((xx << 2) | (yy << 1) | zz);
 }
 
 /**
@@ -41,9 +44,9 @@ static inline mftl_int_t MFTL_Morton3D(float x, float y, float z)
  * @param prim_count Count of active primitives for this subtree.
  * @param morton_codes The fully sorted array of Morton code signatures.
  */
-static void MFTL_BuildTopology(MFTL_BVH* bvh, mftl_int_t node_idx, mftl_int_t first_prim, mftl_int_t prim_count, mftl_int_t* morton_codes)
+static void MFTL_BuildTopology(MFTL_BVH* bvh, int node_idx, int first_prim, int prim_count, int* morton_codes)
 {
-  mftl_int_t last_prim = first_prim + prim_count - 1;
+  int last_prim = first_prim + prim_count - 1;
 
   // 1. SOTA FIX: Removed the `first_code == last_code` trap!
   // We now strictly enforce the geometric threshold (<= 4 primitives).
@@ -64,13 +67,13 @@ static void MFTL_BuildTopology(MFTL_BVH* bvh, mftl_int_t node_idx, mftl_int_t fi
   // Use the 64-bit version of count-leading-zeros (__builtin_clzll)
   int common_prefix = __builtin_clzll(first_key ^ last_key);
 
-  mftl_int_t split_idx = first_prim;
-  mftl_int_t step = prim_count;
+  int split_idx = first_prim;
+  int step = prim_count;
 
   do
   {
     step = (step + 1) >> 1;  // ceiling division by 2
-    mftl_int_t new_idx = split_idx + step;
+    int new_idx = split_idx + step;
 
     if (new_idx < last_prim)
     {
@@ -93,7 +96,7 @@ static void MFTL_BuildTopology(MFTL_BVH* bvh, mftl_int_t node_idx, mftl_int_t fi
   split_idx++;
 
   // Allocate two children contiguously
-  mftl_int_t left_child = bvh->nodes_used;
+  int left_child = bvh->nodes_used;
   bvh->nodes_used += 2;
 
   bvh->nodes[node_idx].payload = ((uint64_t) left_child << 1);
@@ -112,24 +115,24 @@ static void MFTL_BuildTopology(MFTL_BVH* bvh, mftl_int_t node_idx, mftl_int_t fi
  * @param node_idx Iterated index.
  * @param obj Pointer to the referenced geometry object holding the vertex positions.
  */
-static void MFTL_RefitBVH(MFTL_BVH* bvh, mftl_int_t node_idx, MFTL_Object* obj)
+static void MFTL_RefitBVH(MFTL_BVH* bvh, int node_idx, MFTL_Object* obj)
 {
   uint64_t payload = bvh->nodes[node_idx].payload;
   if (payload & 1)
   {
     // Leaf
-    mftl_int_t count = (payload >> 1) & 0x7FFFFFFF;
-    mftl_int_t first = (payload >> 32);
+    int count = (payload >> 1) & 0x7FFFFFFF;
+    int first = (payload >> 32);
 
     float min_b[3] = {1e30f, 1e30f, 1e30f};
     float max_b[3] = {-1e30f, -1e30f, -1e30f};
 
-    for (mftl_int_t i = 0; i < count; i++)
+    for (int i = 0; i < count; i++)
     {
-      mftl_int_t tri_idx = bvh->prim_indices[first + i];
-      mftl_int_t v0 = obj->flat_tri_verts[3 * tri_idx + 0];
-      mftl_int_t v1 = obj->flat_tri_verts[3 * tri_idx + 1];
-      mftl_int_t v2 = obj->flat_tri_verts[3 * tri_idx + 2];
+      int tri_idx = bvh->prim_indices[first + i];
+      int v0 = obj->flat_tri_verts[3 * tri_idx + 0];
+      int v1 = obj->flat_tri_verts[3 * tri_idx + 1];
+      int v2 = obj->flat_tri_verts[3 * tri_idx + 2];
 
       for (int k = 0; k < 3; k++)
       {
@@ -141,17 +144,22 @@ static void MFTL_RefitBVH(MFTL_BVH* bvh, mftl_int_t node_idx, MFTL_Object* obj)
         max_b[k] = fmaxf(max_b[k], fmaxf(p0, fmaxf(p1, p2)));
       }
     }
+
+    // Make this a user-defined parameter later. Increases the AABB size by a small amount to account for instance for lubrication models.
+    // Could be a factor of the mesh size.
+    double proximity_tolerance = 1e-4;
+
     for (int k = 0; k < 3; k++)
     {
-      bvh->nodes[node_idx].aabb_min[k] = min_b[k];
-      bvh->nodes[node_idx].aabb_max[k] = max_b[k];
+      bvh->nodes[node_idx].aabb_min[k] = min_b[k] - proximity_tolerance;
+      bvh->nodes[node_idx].aabb_max[k] = max_b[k] + proximity_tolerance;
     }
   }
   else
   {
     // Internal
-    mftl_int_t left = payload >> 1;
-    mftl_int_t right = left + 1;
+    int left = payload >> 1;
+    int right = left + 1;
 
     MFTL_RefitBVH(bvh, left, obj);
     MFTL_RefitBVH(bvh, right, obj);
@@ -180,23 +188,23 @@ static void MFTL_RefitBVH(MFTL_BVH* bvh, mftl_int_t node_idx, MFTL_Object* obj)
  * @return `MFTL_SUCCESS` on successful network exchange and data serialization mapping.
  */
 /* THIS IS CURRENTLY NOT OPTIMAL COMMUNICATION-WISE BUT BRUTE FORCE, NEEDS TO BE OPTIMIZED*/
-mftl_int_t MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
+int MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
 {
   if (!objA || !objB || !objA->domain || objA->domain->nproc < 2) return MFTL_SUCCESS;
   MFTL_Domain* domain = objA->domain;
-  mftl_int_t num_neighbors = domain->num_neighbors;
+  int num_neighbors = domain->num_neighbors;
   if (num_neighbors == 0) return MFTL_SUCCESS;
 
   // 1. Compute Macro-AABBs
   double local_aabbA_min[3] = {1e30, 1e30, 1e30}, local_aabbA_max[3] = {-1e30, -1e30, -1e30};
   double local_aabbB_min[3] = {1e30, 1e30, 1e30}, local_aabbB_max[3] = {-1e30, -1e30, -1e30};
 
-  for (mftl_int_t i = 0; i < objA->n_triangles; i++)
+  for (int i = 0; i < objA->n_triangles; i++)
   {
     if (objA->triangles[i].is_ghost) continue;
     for (int j = 0; j < 3; j++)
     {
-      mftl_int_t v_idx = objA->flat_tri_verts[3 * i + j];
+      int v_idx = objA->flat_tri_verts[3 * i + j];
       for (int d = 0; d < 3; d++)
       {
         double p = objA->vertices[v_idx].pos[d];
@@ -206,12 +214,12 @@ mftl_int_t MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
     }
   }
 
-  for (mftl_int_t i = 0; i < objB->n_triangles; i++)
+  for (int i = 0; i < objB->n_triangles; i++)
   {
     if (objB->triangles[i].is_ghost) continue;
     for (int j = 0; j < 3; j++)
     {
-      mftl_int_t v_idx = objB->flat_tri_verts[3 * i + j];
+      int v_idx = objB->flat_tri_verts[3 * i + j];
       for (int d = 0; d < 3; d++)
       {
         double p = objB->vertices[v_idx].pos[d];
@@ -225,7 +233,7 @@ mftl_int_t MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
   double* send_aabb_both = malloc(num_neighbors * 12 * sizeof(double));
   double* recv_aabb_both = malloc(num_neighbors * 12 * sizeof(double));
 
-  for (mftl_int_t i = 0; i < num_neighbors; i++)
+  for (int i = 0; i < num_neighbors; i++)
   {
     send_aabb_both[i * 12 + 0] = local_aabbA_min[0];
     send_aabb_both[i * 12 + 1] = local_aabbA_min[1];
@@ -249,10 +257,10 @@ mftl_int_t MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
   int* n_send_triB = calloc(num_neighbors, sizeof(int));
   int* n_send_vertB = calloc(num_neighbors, sizeof(int));
 
-  mftl_int_t* pack_triA = malloc(num_neighbors * objA->n_triangles * sizeof(mftl_int_t));
-  mftl_int_t* pack_triB = malloc(num_neighbors * objB->n_triangles * sizeof(mftl_int_t));
+  int* pack_triA = malloc(num_neighbors * objA->n_triangles * sizeof(int));
+  int* pack_triB = malloc(num_neighbors * objB->n_triangles * sizeof(int));
 
-  for (mftl_int_t n = 0; n < num_neighbors; n++)
+  for (int n = 0; n < num_neighbors; n++)
   {
     double* remoteA_min = &recv_aabb_both[n * 12 + 0];
     double* remoteA_max = &recv_aabb_both[n * 12 + 3];
@@ -265,13 +273,13 @@ mftl_int_t MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
 
     if (overlap_A_my_B_remote)
     {
-      for (mftl_int_t i = 0; i < objA->n_triangles; i++)
+      for (int i = 0; i < objA->n_triangles; i++)
       {
         if (objA->triangles[i].is_ghost) continue;
         double tmin[3] = {1e30, 1e30, 1e30}, tmax[3] = {-1e30, -1e30, -1e30};
         for (int j = 0; j < 3; j++)
         {
-          mftl_int_t v_idx = objA->flat_tri_verts[3 * i + j];
+          int v_idx = objA->flat_tri_verts[3 * i + j];
           for (int d = 0; d < 3; d++)
           {
             double p = objA->vertices[v_idx].pos[d];
@@ -297,13 +305,13 @@ mftl_int_t MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
 
     if (overlap_B_my_A_remote)
     {
-      for (mftl_int_t i = 0; i < objB->n_triangles; i++)
+      for (int i = 0; i < objB->n_triangles; i++)
       {
         if (objB->triangles[i].is_ghost) continue;
         double tmin[3] = {1e30, 1e30, 1e30}, tmax[3] = {-1e30, -1e30, -1e30};
         for (int j = 0; j < 3; j++)
         {
-          mftl_int_t v_idx = objB->flat_tri_verts[3 * i + j];
+          int v_idx = objB->flat_tri_verts[3 * i + j];
           for (int d = 0; d < 3; d++)
           {
             double p = objB->vertices[v_idx].pos[d];
@@ -347,7 +355,7 @@ mftl_int_t MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
   int total_send_triB = 0, total_recv_triB = 0;
   int total_send_vertB = 0, total_recv_vertB = 0;
 
-  for (mftl_int_t i = 0; i < num_neighbors; i++)
+  for (int i = 0; i < num_neighbors; i++)
   {
     sdispls_triA[i + 1] = sdispls_triA[i] + n_send_triA[i];
     rdispls_triA[i + 1] = rdispls_triA[i] + n_recv_triA[i];
@@ -372,13 +380,13 @@ mftl_int_t MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
   PackedTriangleComplex* sendbuf_triB = malloc(total_send_triB * sizeof(PackedTriangleComplex));
   PackedVertex* sendbuf_vertB = malloc(total_send_vertB * sizeof(PackedVertex));
 
-  for (mftl_int_t n = 0; n < num_neighbors; n++)
+  for (int n = 0; n < num_neighbors; n++)
   {
     int ptr_tA = sdispls_triA[n];
     int ptr_vA = sdispls_vertA[n];
     for (int i = 0; i < n_send_triA[n]; i++)
     {
-      mftl_int_t tri_idx = pack_triA[n * objA->n_triangles + i];
+      int tri_idx = pack_triA[n * objA->n_triangles + i];
       MFTLPackSingleTriangle(objA, tri_idx, &sendbuf_triA[ptr_tA++], true);
       MFTLPackSingleVertex(objA, objA->flat_tri_verts[3 * tri_idx + 0], &sendbuf_vertA[ptr_vA++], true);
       MFTLPackSingleVertex(objA, objA->flat_tri_verts[3 * tri_idx + 1], &sendbuf_vertA[ptr_vA++], true);
@@ -389,7 +397,7 @@ mftl_int_t MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
     int ptr_vB = sdispls_vertB[n];
     for (int i = 0; i < n_send_triB[n]; i++)
     {
-      mftl_int_t tri_idx = pack_triB[n * objB->n_triangles + i];
+      int tri_idx = pack_triB[n * objB->n_triangles + i];
       MFTLPackSingleTriangle(objB, tri_idx, &sendbuf_triB[ptr_tB++], true);
       MFTLPackSingleVertex(objB, objB->flat_tri_verts[3 * tri_idx + 0], &sendbuf_vertB[ptr_vB++], true);
       MFTLPackSingleVertex(objB, objB->flat_tri_verts[3 * tri_idx + 1], &sendbuf_vertB[ptr_vB++], true);
@@ -411,19 +419,19 @@ mftl_int_t MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
   MPI_Neighbor_alltoallv(sendbuf_vertB, n_send_vertB, sdispls_vertB, MPI_PackedVertex, recvbuf_vertB, n_recv_vertB, rdispls_vertB, MPI_PackedVertex,
                          domain->comm_graph);
 
-  mftl_int_t old_tris_A = objA->n_triangles;
+  int old_tris_A = objA->n_triangles;
   for (int i = 0; i < total_recv_vertA; i++) MFTLAppendGhostVertex(objA, &recvbuf_vertA[i]);
   for (int i = 0; i < total_recv_triA; i++) MFTLAppendGhostTriangle(objA, &recvbuf_triA[i]);
 
   if (total_recv_triA > 0)
   {
-    objA->flat_tri_verts = realloc(objA->flat_tri_verts, objA->n_triangles * 3 * sizeof(mftl_int_t));
+    objA->flat_tri_verts = realloc(objA->flat_tri_verts, objA->n_triangles * 3 * sizeof(int));
     for (int i = 0; i < total_recv_triA; i++)
     {
       PackedTriangleComplex* ptc = &recvbuf_triA[i];
       for (int j = 0; j < 3; j++)
       {
-        mftl_int_t v_gid = ptc->half_edges[j].vertex_gid;
+        int v_gid = ptc->half_edges[j].vertex_gid;
         khiter_t k = kh_get(vertex_map, objA->vertex_lookup, v_gid);
         if (k != kh_end(objA->vertex_lookup))
         {
@@ -437,19 +445,19 @@ mftl_int_t MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
     }
   }
 
-  mftl_int_t old_tris_B = objB->n_triangles;
+  int old_tris_B = objB->n_triangles;
   for (int i = 0; i < total_recv_vertB; i++) MFTLAppendGhostVertex(objB, &recvbuf_vertB[i]);
   for (int i = 0; i < total_recv_triB; i++) MFTLAppendGhostTriangle(objB, &recvbuf_triB[i]);
 
   if (total_recv_triB > 0)
   {
-    objB->flat_tri_verts = realloc(objB->flat_tri_verts, objB->n_triangles * 3 * sizeof(mftl_int_t));
+    objB->flat_tri_verts = realloc(objB->flat_tri_verts, objB->n_triangles * 3 * sizeof(int));
     for (int i = 0; i < total_recv_triB; i++)
     {
       PackedTriangleComplex* ptc = &recvbuf_triB[i];
       for (int j = 0; j < 3; j++)
       {
-        mftl_int_t v_gid = ptc->half_edges[j].vertex_gid;
+        int v_gid = ptc->half_edges[j].vertex_gid;
         khiter_t k = kh_get(vertex_map, objB->vertex_lookup, v_gid);
         if (k != kh_end(objB->vertex_lookup))
         {
@@ -515,22 +523,23 @@ MFTL_BVH* MFTL_GenerateLBVH(MFTL_Object* obj)
   MFTL_BVH* bvh = (MFTL_BVH*) malloc(sizeof(MFTL_BVH));
   bvh->nodes_capacity = obj->n_triangles * 2;
   bvh->nodes = (MFTL_BVHNode*) malloc(bvh->nodes_capacity * sizeof(MFTL_BVHNode));
-  bvh->prim_indices = (mftl_int_t*) malloc(obj->n_triangles * sizeof(mftl_int_t));
+  bvh->prim_indices = (int*) malloc(obj->n_triangles * sizeof(int));
 
-  mftl_int_t* morton_codes = (mftl_int_t*) malloc(obj->n_triangles * sizeof(mftl_int_t));
+  int* morton_codes = (int*) malloc(obj->n_triangles * sizeof(int));
 
   // Centroid Bounds
   float global_min[3] = {1e30f, 1e30f, 1e30f};
   float global_max[3] = {-1e30f, -1e30f, -1e30f};
 
   // First pass compute centroids and bounds
+  /* ATTENTION: IS THIS CORRECT FOR PERIODIC DOMAINS ?*/
   float* centroids = (float*) malloc(3 * obj->n_triangles * sizeof(float));
 
-  for (mftl_int_t i = 0; i < obj->n_triangles; i++)
+  for (int i = 0; i < obj->n_triangles; i++)
   {
-    mftl_int_t v0 = obj->flat_tri_verts[3 * i + 0];
-    mftl_int_t v1 = obj->flat_tri_verts[3 * i + 1];
-    mftl_int_t v2 = obj->flat_tri_verts[3 * i + 2];
+    int v0 = obj->flat_tri_verts[3 * i + 0];
+    int v1 = obj->flat_tri_verts[3 * i + 1];
+    int v2 = obj->flat_tri_verts[3 * i + 2];
 
     float cx = (obj->vertices[v0].pos[0] + obj->vertices[v1].pos[0] + obj->vertices[v2].pos[0]) / 3.0f;
     float cy = (obj->vertices[v0].pos[1] + obj->vertices[v1].pos[1] + obj->vertices[v2].pos[1]) / 3.0f;
@@ -555,7 +564,7 @@ MFTL_BVH* MFTL_GenerateLBVH(MFTL_Object* obj)
     if (extent[k] == 0.0f) extent[k] = 1e-6f;
 
   // Generate Morton Codes
-  for (mftl_int_t i = 0; i < obj->n_triangles; i++)
+  for (int i = 0; i < obj->n_triangles; i++)
   {
     float nx = (centroids[3 * i + 0] - global_min[0]) / extent[0];
     float ny = (centroids[3 * i + 1] - global_min[1]) / extent[1];
@@ -602,8 +611,8 @@ static inline int AABB_Overlap(const float minA[3], const float maxA[3], const f
   return 1;
 }
 
-static void TraverseBVHPair(MFTL_Object* objA, MFTL_BVH* bvhA, mftl_int_t nodeA, MFTL_Object* objB, MFTL_BVH* bvhB, mftl_int_t nodeB,
-                            IntersectionCallback callback, void* user_data)
+static void TraverseBVHPair(MFTL_Object* objA, MFTL_BVH* bvhA, int nodeA, MFTL_Object* objB, MFTL_BVH* bvhB, int nodeB, IntersectionCallback callback,
+                            void* user_data)
 {
   if (!AABB_Overlap(bvhA->nodes[nodeA].aabb_min, bvhA->nodes[nodeA].aabb_max, bvhB->nodes[nodeB].aabb_min, bvhB->nodes[nodeB].aabb_max))
   {
@@ -615,20 +624,19 @@ static void TraverseBVHPair(MFTL_Object* objA, MFTL_BVH* bvhA, mftl_int_t nodeA,
 
   if (is_leafA && is_leafB)
   {
-    mftl_int_t countA = (bvhA->nodes[nodeA].payload >> 1) & 0x7FFFFFFF;
-    mftl_int_t firstA = (bvhA->nodes[nodeA].payload >> 32);
+    int countA = (bvhA->nodes[nodeA].payload >> 1) & 0x7FFFFFFF;
+    int firstA = (bvhA->nodes[nodeA].payload >> 32);
 
-    mftl_int_t countB = (bvhB->nodes[nodeB].payload >> 1) & 0x7FFFFFFF;
-    mftl_int_t firstB = (bvhB->nodes[nodeB].payload >> 32);
+    int countB = (bvhB->nodes[nodeB].payload >> 1) & 0x7FFFFFFF;
+    int firstB = (bvhB->nodes[nodeB].payload >> 32);
 
-    for (mftl_int_t i = 0; i < countA; i++)
+    for (int i = 0; i < countA; i++)
     {
-      for (mftl_int_t j = 0; j < countB; j++)
+      for (int j = 0; j < countB; j++)
       {
-        mftl_int_t triA = bvhA->prim_indices[firstA + i];
-        mftl_int_t triB = bvhB->prim_indices[firstB + j];
-
-        if (MFTL_TriTriIntersect(objA, triA, objB, triB))
+        int triA = bvhA->prim_indices[firstA + i];
+        int triB = bvhB->prim_indices[firstB + j];
+        if (MFTL_TriTriProximity(objA, triA, objB, triB, 1e-6))
         {
           callback(objA, triA, objB, triB, user_data);
         }
@@ -637,13 +645,13 @@ static void TraverseBVHPair(MFTL_Object* objA, MFTL_BVH* bvhA, mftl_int_t nodeA,
   }
   else if (is_leafA)
   {
-    mftl_int_t leftB = bvhB->nodes[nodeB].payload >> 1;
+    int leftB = bvhB->nodes[nodeB].payload >> 1;
     TraverseBVHPair(objA, bvhA, nodeA, objB, bvhB, leftB, callback, user_data);
     TraverseBVHPair(objA, bvhA, nodeA, objB, bvhB, leftB + 1, callback, user_data);
   }
   else if (is_leafB)
   {
-    mftl_int_t leftA = bvhA->nodes[nodeA].payload >> 1;
+    int leftA = bvhA->nodes[nodeA].payload >> 1;
     TraverseBVHPair(objA, bvhA, leftA, objB, bvhB, nodeB, callback, user_data);
     TraverseBVHPair(objA, bvhA, leftA + 1, objB, bvhB, nodeB, callback, user_data);
   }
@@ -658,13 +666,13 @@ static void TraverseBVHPair(MFTL_Object* objA, MFTL_BVH* bvhA, mftl_int_t nodeA,
 
     if (volA > volB)
     {
-      mftl_int_t leftA = bvhA->nodes[nodeA].payload >> 1;
+      int leftA = bvhA->nodes[nodeA].payload >> 1;
       TraverseBVHPair(objA, bvhA, leftA, objB, bvhB, nodeB, callback, user_data);
       TraverseBVHPair(objA, bvhA, leftA + 1, objB, bvhB, nodeB, callback, user_data);
     }
     else
     {
-      mftl_int_t leftB = bvhB->nodes[nodeB].payload >> 1;
+      int leftB = bvhB->nodes[nodeB].payload >> 1;
       TraverseBVHPair(objA, bvhA, nodeA, objB, bvhB, leftB, callback, user_data);
       TraverseBVHPair(objA, bvhA, nodeA, objB, bvhB, leftB + 1, callback, user_data);
     }
@@ -682,8 +690,8 @@ void MFTL_IntersectObjects(MFTL_Object* objA, MFTL_BVH* bvhA, MFTL_Object* objB,
   // we bypass function call overhead and return immediately.
   if (bvhA->nodes_used > 0 && bvhB->nodes_used > 0)
   {
-    mftl_int_t rootA = bvhA->root_index;
-    mftl_int_t rootB = bvhB->root_index;
+    int rootA = bvhA->root_index;
+    int rootB = bvhB->root_index;
     if (!AABB_Overlap(bvhA->nodes[rootA].aabb_min, bvhA->nodes[rootA].aabb_max, bvhB->nodes[rootB].aabb_min, bvhB->nodes[rootB].aabb_max))
     {
       return;  // The objects do not collide globally.
@@ -787,16 +795,16 @@ static inline int MFTL_CheckIntervals(const double* A0, const double* A1, const 
   }
 }
 
-int MFTL_TriTriIntersect(MFTL_Object* objA, mftl_int_t triA_id, MFTL_Object* objB, mftl_int_t triB_id)
+int MFTL_TriTriIntersect(MFTL_Object* objA, int triA_id, MFTL_Object* objB, int triB_id)
 {
   // Extract vertex indices
-  mftl_int_t a0_idx = objA->flat_tri_verts[3 * triA_id + 0];
-  mftl_int_t a1_idx = objA->flat_tri_verts[3 * triA_id + 1];
-  mftl_int_t a2_idx = objA->flat_tri_verts[3 * triA_id + 2];
+  int a0_idx = objA->flat_tri_verts[3 * triA_id + 0];
+  int a1_idx = objA->flat_tri_verts[3 * triA_id + 1];
+  int a2_idx = objA->flat_tri_verts[3 * triA_id + 2];
 
-  mftl_int_t b0_idx = objB->flat_tri_verts[3 * triB_id + 0];
-  mftl_int_t b1_idx = objB->flat_tri_verts[3 * triB_id + 1];
-  mftl_int_t b2_idx = objB->flat_tri_verts[3 * triB_id + 2];
+  int b0_idx = objB->flat_tri_verts[3 * triB_id + 0];
+  int b1_idx = objB->flat_tri_verts[3 * triB_id + 1];
+  int b2_idx = objB->flat_tri_verts[3 * triB_id + 2];
 
   // Extract coordinates
   const double* A0 = objA->vertices[a0_idx].pos;
@@ -843,4 +851,276 @@ int MFTL_TriTriIntersect(MFTL_Object* objA, mftl_int_t triA_id, MFTL_Object* obj
 
   // 4. Guigue-Devillers Interval Permutation & Test
   return MFTL_CheckIntervals(A0, A1, A2, B0, B1, B2, dA0, dA1, dA2, dB0, dB1, dB2);
+}
+
+// --- Helper Macros for Vector Math ---
+#ifndef MFTL_DOT
+#define MFTL_DOT(u, v) ((u)[0] * (v)[0] + (u)[1] * (v)[1] + (u)[2] * (v)[2])
+#endif
+
+#ifndef MFTL_SUB
+#define MFTL_SUB(dest, v1, v2)     \
+  do                               \
+  {                                \
+    (dest)[0] = (v1)[0] - (v2)[0]; \
+    (dest)[1] = (v1)[1] - (v2)[1]; \
+    (dest)[2] = (v1)[2] - (v2)[2]; \
+  } while (0)
+#endif
+
+#ifndef MFTL_MIN_DIST
+#define MFTL_MIN_DIST(a, b) ((a) < (b) ? (a) : (b))
+#endif
+
+// -----------------------------------------------------------------------------
+// 1. Edge-to-Edge Distance Squared
+// -----------------------------------------------------------------------------
+static double MFTL_EdgeEdgeDistanceSq(const double P0[3], const double P1[3], const double Q0[3], const double Q1[3])
+{
+  double u[3], v[3], w[3];
+  MFTL_SUB(u, P1, P0);
+  MFTL_SUB(v, Q1, Q0);
+  MFTL_SUB(w, P0, Q0);
+
+  double a = MFTL_DOT(u, u);
+  double b = MFTL_DOT(u, v);
+  double c = MFTL_DOT(v, v);
+  double d = MFTL_DOT(u, w);
+  double e = MFTL_DOT(v, w);
+  double D = a * c - b * b;
+  double sc, sN, sD = D;
+  double tc, tN, tD = D;
+
+  if (D < 1e-12)
+  {
+    sN = 0.0;
+    sD = 1.0;
+    tN = e;
+    tD = c;
+  }
+  else
+  {
+    sN = (b * e - c * d);
+    tN = (a * e - b * d);
+    if (sN < 0.0)
+    {
+      sN = 0.0;
+      tN = e;
+      tD = c;
+    }
+    else if (sN > sD)
+    {
+      sN = sD;
+      tN = e + b;
+      tD = c;
+    }
+  }
+
+  if (tN < 0.0)
+  {
+    tN = 0.0;
+    if (-d < 0.0)
+      sN = 0.0;
+    else if (-d > a)
+      sN = sD;
+    else
+    {
+      sN = -d;
+      sD = a;
+    }
+  }
+  else if (tN > tD)
+  {
+    tN = tD;
+    if ((-d + b) < 0.0)
+      sN = 0.0;
+    else if ((-d + b) > a)
+      sN = sD;
+    else
+    {
+      sN = (-d + b);
+      sD = a;
+    }
+  }
+
+  sc = (fabs(sN) < 1e-12 ? 0.0 : sN / sD);
+  tc = (fabs(tN) < 1e-12 ? 0.0 : tN / tD);
+
+  double dP[3] = {w[0] + (sc * u[0]) - (tc * v[0]), w[1] + (sc * u[1]) - (tc * v[1]), w[2] + (sc * u[2]) - (tc * v[2])};
+
+  return MFTL_DOT(dP, dP);
+}
+
+// -----------------------------------------------------------------------------
+// 2. Point-to-Face Distance Squared
+// Returns 1e30 if the orthogonal projection falls outside the triangle bounds
+// -----------------------------------------------------------------------------
+static double MFTL_PointFaceDistanceSq(const double P[3], const double A[3], const double B[3], const double C[3])
+{
+  double edge0[3], edge1[3], v0[3];
+  MFTL_SUB(edge0, B, A);
+  MFTL_SUB(edge1, C, A);
+  MFTL_SUB(v0, A, P);  // Vector from P to A
+
+  double a = MFTL_DOT(edge0, edge0);
+  double b = MFTL_DOT(edge0, edge1);
+  double c = MFTL_DOT(edge1, edge1);
+  double d = MFTL_DOT(edge0, v0);
+  double e = MFTL_DOT(edge1, v0);
+
+  double det = a * c - b * b;
+  if (det < 1e-12) return 1e30;  // Degenerate triangle safeguard
+
+  double s = b * e - c * d;
+  double t = b * d - a * e;
+
+  // Verify projection is strictly inside the barycentric bounds of the triangle
+  if (s >= 0.0 && t >= 0.0 && (s + t) <= det)
+  {
+    double invDet = 1.0 / det;
+    s *= invDet;
+    t *= invDet;
+    double proj[3] = {A[0] + s * edge0[0] + t * edge1[0], A[1] + s * edge0[1] + t * edge1[1], A[2] + s * edge0[2] + t * edge1[2]};
+    double dist_vec[3] = {proj[0] - P[0], proj[1] - P[1], proj[2] - P[2]};
+    return MFTL_DOT(dist_vec, dist_vec);
+  }
+
+  // If outside, Edge-Edge distance will safely catch the closest boundary point
+  return 1e30;
+}
+
+// -----------------------------------------------------------------------------
+// 3. The Main Proximity Aggregator
+// -----------------------------------------------------------------------------
+int MFTL_TriTriProximity(MFTL_Object* objA, int triA_id, MFTL_Object* objB, int triB_id, double proximity_tolerance)
+{
+  // 1. FAST PATH: Check for pure mathematical intersection first
+  if (MFTL_TriTriIntersect(objA, triA_id, objB, triB_id))
+  {
+    return 1;
+  }
+
+  // 2. Extract Coordinates
+  int a0_idx = objA->flat_tri_verts[3 * triA_id + 0];
+  int a1_idx = objA->flat_tri_verts[3 * triA_id + 1];
+  int a2_idx = objA->flat_tri_verts[3 * triA_id + 2];
+
+  int b0_idx = objB->flat_tri_verts[3 * triB_id + 0];
+  int b1_idx = objB->flat_tri_verts[3 * triB_id + 1];
+  int b2_idx = objB->flat_tri_verts[3 * triB_id + 2];
+
+  const double* A[3] = {objA->vertices[a0_idx].pos, objA->vertices[a1_idx].pos, objA->vertices[a2_idx].pos};
+  const double* B[3] = {objB->vertices[b0_idx].pos, objB->vertices[b1_idx].pos, objB->vertices[b2_idx].pos};
+
+  double min_dist_sq = 1e30;
+
+  // 3. Evaluate 9 Edge-to-Edge Distances
+  for (int i = 0; i < 3; i++)
+  {
+    for (int j = 0; j < 3; j++)
+    {
+      double d_sq = MFTL_EdgeEdgeDistanceSq(A[i], A[(i + 1) % 3], B[j], B[(j + 1) % 3]);
+      min_dist_sq = MFTL_MIN_DIST(min_dist_sq, d_sq);
+    }
+  }
+
+  // 4. Evaluate 6 Point-to-Face Interior Distances
+  for (int i = 0; i < 3; i++)
+  {
+    // Distance from Triangle A's vertices to Triangle B's face
+    double d_sq_A = MFTL_PointFaceDistanceSq(A[i], B[0], B[1], B[2]);
+    min_dist_sq = MFTL_MIN_DIST(min_dist_sq, d_sq_A);
+
+    // Distance from Triangle B's vertices to Triangle A's face
+    double d_sq_B = MFTL_PointFaceDistanceSq(B[i], A[0], A[1], A[2]);
+    min_dist_sq = MFTL_MIN_DIST(min_dist_sq, d_sq_B);
+  }
+
+  // 5. Check against the user-defined tolerance envelope
+  double tol_sq = proximity_tolerance * proximity_tolerance;
+
+  return (min_dist_sq <= tol_sq) ? 1 : 0;
+}
+
+/**
+ * @brief Scalable intersection pipeline for full ensembles.
+ * @param ensA Primary ensemble (Required).
+ * @param ensB Secondary ensemble (Optional). Pass NULL to self-intersect ensA.
+ * @param callback The Triangle-Triangle hit response function.
+ * @param user_data Physics payload pointer.
+ */
+void MFTLEnsembleIntersectObjects(MFTL_Ensemble* ensA, MFTL_Ensemble* ensB, IntersectionCallback callback, void* user_data)
+{
+  if (!ensA || ensA->num_objects == 0) return;
+
+  // 1. Bulk Spatial Ghosting
+  if (ensB)
+  {
+    for (int i = 0; i < ensA->num_objects; i++)
+      for (int j = 0; j < ensB->num_objects; j++) MFTL_CreateSpatialGhosts(ensA->objects[i], ensB->objects[j]);
+  }
+  else
+  {
+    for (int i = 0; i < ensA->num_objects; i++)
+      for (int j = i + 1; j < ensA->num_objects; j++) MFTL_CreateSpatialGhosts(ensA->objects[i], ensA->objects[j]);
+  }
+
+  // 2. Generate Acceleration Structures (LBVH)
+  MFTL_BVH** bvhsA = malloc(ensA->num_objects * sizeof(MFTL_BVH*));
+  for (int i = 0; i < ensA->num_objects; i++)
+  {
+    bvhsA[i] = MFTL_GenerateLBVH(ensA->objects[i]);
+  }
+
+  MFTL_BVH** bvhsB = MFTL_NULL;
+  if (ensB)
+  {
+    bvhsB = malloc(ensB->num_objects * sizeof(MFTL_BVH*));
+    for (int i = 0; i < ensB->num_objects; i++)
+    {
+      bvhsB[i] = MFTL_GenerateLBVH(ensB->objects[i]);
+    }
+  }
+
+  // 3. Object-Object Global AABB Traversal
+  if (ensB)
+  {
+    // Two distinctly different ensembles (e.g., Fluids vs Rigid Bodies)
+    for (int i = 0; i < ensA->num_objects; i++)
+    {
+      for (int j = 0; j < ensB->num_objects; j++)
+      {
+        MFTL_IntersectObjects(ensA->objects[i], bvhsA[i], ensB->objects[j], bvhsB[j], callback, user_data);
+      }
+    }
+  }
+  else
+  {
+    // Self-intersection mapping within a single ensemble
+    // Note: Starts j at i+1 to avoid intersecting Object 1 with Object 1,
+    // and prevents double-testing (tests 1v2, but skips 2v1)
+    for (int i = 0; i < ensA->num_objects; i++)
+    {
+      for (int j = i + 1; j < ensA->num_objects; j++)
+      {
+        MFTL_IntersectObjects(ensA->objects[i], bvhsA[i], ensA->objects[j], bvhsA[j], callback, user_data);
+      }
+    }
+  }
+
+  // 4. Memory Cleanup
+  for (int i = 0; i < ensA->num_objects; i++)
+  {
+    MFTL_DestroyBVH(bvhsA[i]);
+  }
+  free(bvhsA);
+
+  if (ensB)
+  {
+    for (int i = 0; i < ensB->num_objects; i++)
+    {
+      MFTL_DestroyBVH(bvhsB[i]);
+    }
+    free(bvhsB);
+  }
 }

@@ -14,39 +14,39 @@
 
 // Helper to get the start vertex of a half-edge
 // (Assumes triangular mesh where prev == next->next)
-static inline mftl_int_t get_start_vertex(MFTL_HalfEdge *he_base, mftl_int_t he_idx)
+static inline int get_start_vertex(MFTL_HalfEdge *he_base, int he_idx)
 {
-  mftl_int_t next_idx = he_base[he_idx].next_idx;
-  mftl_int_t prev_idx = he_base[next_idx].next_idx;
+  int next_idx = he_base[he_idx].next_idx;
+  int prev_idx = he_base[next_idx].next_idx;
   return he_base[prev_idx].vertex_idx;
 }
 
 void MFTLRebuildTwins(MFTL_Object *obj)
 {
-  const mftl_int_t n_he = obj->n_half_edges;
-  const mftl_int_t n_vert = obj->n_vertices;
+  const int n_he = obj->n_half_edges;
+  const int n_vert = obj->n_vertices;
   MFTL_HalfEdge *he_base = obj->half_edges;
 
   // --- 1. Allocation ---
   // v_heads: Maps Vertex Index -> Index of the first Half-Edge starting at this vertex
-  mftl_int_t *v_heads = (mftl_int_t *) malloc(sizeof(mftl_int_t) * n_vert);
+  int *v_heads = (int *) malloc(sizeof(int) * n_vert);
 
   // he_next: Links Half-Edges sharing the same Start Vertex
-  mftl_int_t *he_next = (mftl_int_t *) malloc(sizeof(mftl_int_t) * n_he);
+  int *he_next = (int *) malloc(sizeof(int) * n_he);
 
   assert(v_heads && he_next);
 
   // Initialize heads to INVALID (-1)
-  for (mftl_int_t i = 0; i < n_vert; i++)
+  for (int i = 0; i < n_vert; i++)
   {
     v_heads[i] = MFTL_ERROR;
   }
 
   // --- 2. Build Adjacency List (Pass 1) ---
-  for (mftl_int_t i = 0; i < n_he; i++)
+  for (int i = 0; i < n_he; i++)
   {
     // Find start vertex of edge i
-    mftl_int_t u = get_start_vertex(he_base, i);
+    int u = get_start_vertex(he_base, i);
     assert(u >= 0 && u < n_vert);
 
     // Insert 'i' at the front of the list for vertex 'u'
@@ -59,18 +59,18 @@ void MFTLRebuildTwins(MFTL_Object *obj)
   }
 
   // --- 3. Find Twins (Pass 2) ---
-  for (mftl_int_t i = 0; i < n_he; i++)
+  for (int i = 0; i < n_he; i++)
   {
     MFTL_HalfEdge *he = &he_base[i];
 
-    mftl_int_t u = get_start_vertex(he_base, i);  // Start
-    mftl_int_t v = he->vertex_idx;  // End
+    int u = get_start_vertex(he_base, i);  // Start
+    int v = he->vertex_idx;  // End
     assert(v >= 0 && v < n_vert);
 
     // We want to find an edge that goes v -> u.
     // Look in the list of edges STARTING at v.
-    mftl_int_t candidate = v_heads[v];
-    mftl_int_t twin_idx = MFTL_ERROR;
+    int candidate = v_heads[v];
+    int twin_idx = MFTL_ERROR;
 
     while (candidate != MFTL_ERROR)
     {
@@ -95,7 +95,7 @@ void MFTLConvertGlobalToLocalIndices(MFTL_Object *obj)
 {
   // --- 1. Convert Vertex "Out Half-Edge" Indices ---
   MFTL_Vertex *v_base = obj->vertices;
-  for (mftl_int_t i = 0; i < obj->n_vertices; ++i)
+  for (int i = 0; i < obj->n_vertices; ++i)
   {
     MFTL_Vertex *v = &v_base[i];
 
@@ -115,7 +115,7 @@ void MFTLConvertGlobalToLocalIndices(MFTL_Object *obj)
 
   // --- 2. Convert Half-Edge "Vertex" Indices ---
   MFTL_HalfEdge *he_base = obj->half_edges;
-  for (mftl_int_t i = 0; i < obj->n_half_edges; ++i)
+  for (int i = 0; i < obj->n_half_edges; ++i)
   {
     MFTL_HalfEdge *he = &he_base[i];
 
@@ -133,14 +133,14 @@ void MFTLConvertGlobalToLocalIndices(MFTL_Object *obj)
       exit(EXIT_FAILURE);
     }
 
-    mftl_int_t local_v_idx = kh_value(obj->vertex_lookup, k);
+    int local_v_idx = kh_value(obj->vertex_lookup, k);
     he->vertex_idx = local_v_idx;  // Replace GID with Local Index
 
     // --- REPAIR STRATEGY ---
     // Since we process sequentially, we can simply repair the TARGET vertex of the current HE
     // (which is `local_v_idx`).
 
-    mftl_int_t next_he_idx = he->next_idx;  // This is already a Local Index (set during unpack)
+    int next_he_idx = he->next_idx;  // This is already a Local Index (set during unpack)
 
     // Check the vertex 'v' that this edge 'he' points TO.
     if (v_base[local_v_idx].out_he_idx == MFTL_ERROR)
@@ -155,22 +155,22 @@ void MFTLConvertGlobalToLocalIndices(MFTL_Object *obj)
   }
 }
 
-mftl_int_t MFTLCheckMeshIntegrity(MFTL_Object *object)
+int MFTLCheckMeshIntegrity(MFTL_Object *object)
 {
-  mftl_int_t ok = MFTL_SUCCESS;
-  mftl_int_t MFTL_ID_INVALID = MFTL_ERROR;
+  int ok = MFTL_SUCCESS;
+  int MFTL_ID_INVALID = MFTL_ERROR;
 
   // --- 1. Setup Base Pointers for Speed ---
   const MFTL_Vertex *const v_base = object->vertices;
   const MFTL_Triangle *const t_base = object->triangles;
   const MFTL_HalfEdge *const he_base = object->half_edges;
 
-  const mftl_int_t n_verts = object->n_vertices;
-  const mftl_int_t n_tris = object->n_triangles;
-  const mftl_int_t n_hes = object->n_half_edges;
+  const int n_verts = object->n_vertices;
+  const int n_tris = object->n_triangles;
+  const int n_hes = object->n_half_edges;
 
   // --- Check Vertices ---
-  for (mftl_int_t i = 0; i < n_verts; ++i)
+  for (int i = 0; i < n_verts; ++i)
   {
     const MFTL_Vertex *v = &v_base[i];
 
@@ -189,7 +189,7 @@ mftl_int_t MFTLCheckMeshIntegrity(MFTL_Object *object)
   }
 
   // --- Check Triangles ---
-  for (mftl_int_t i = 0; i < n_tris; ++i)
+  for (int i = 0; i < n_tris; ++i)
   {
     const MFTL_Triangle *tri = &t_base[i];
 
@@ -207,10 +207,10 @@ mftl_int_t MFTLCheckMeshIntegrity(MFTL_Object *object)
     }
 
     // Cycle Check: HE -> Next -> Next -> Next == HE
-    mftl_int_t idx0 = tri->he_idx;
+    int idx0 = tri->he_idx;
 
     // Check Hop 1
-    mftl_int_t idx1 = he_base[idx0].next_idx;
+    int idx1 = he_base[idx0].next_idx;
     if (idx1 == MFTL_ID_INVALID)
     {
       fprintf(stderr, "[MeshCheck] Triangle %d broken cycle (he->next is invalid)\n", tri->global_id);
@@ -225,7 +225,7 @@ mftl_int_t MFTLCheckMeshIntegrity(MFTL_Object *object)
     }
 
     // Check Hop 2
-    mftl_int_t idx2 = he_base[idx1].next_idx;
+    int idx2 = he_base[idx1].next_idx;
     if (idx2 == MFTL_ID_INVALID)
     {
       fprintf(stderr, "[MeshCheck] Triangle %d broken cycle (he->next->next is invalid)\n", tri->global_id);
@@ -247,7 +247,7 @@ mftl_int_t MFTLCheckMeshIntegrity(MFTL_Object *object)
     }
 
     // Belonging Check: Does the HE point back to this triangle?
-    if (he_base[idx0].triangle_idx != (mftl_int_t) i)
+    if (he_base[idx0].triangle_idx != (int) i)
     {
       fprintf(stderr, "[MeshCheck] Triangle %d: he0 does not point back to triangle index %d\n", tri->global_id, i);
       ok = MFTL_ERROR;
@@ -255,7 +255,7 @@ mftl_int_t MFTLCheckMeshIntegrity(MFTL_Object *object)
   }
 
   // --- Check Half-Edges ---
-  for (mftl_int_t i = 0; i < n_hes; ++i)
+  for (int i = 0; i < n_hes; ++i)
   {
     const MFTL_HalfEdge *he = &he_base[i];
 
@@ -323,10 +323,10 @@ mftl_int_t MFTLCheckMeshIntegrity(MFTL_Object *object)
       // This requires traversing prev pointers (next->next). We must bounds check every hop!
 
       // --- Calculate Start of HE (Origin) ---
-      mftl_int_t he_next = he->next_idx;
+      int he_next = he->next_idx;
       // Bounds check for next was done above, so safe to access he_base[he_next]
 
-      mftl_int_t he_prev = he_base[he_next].next_idx;
+      int he_prev = he_base[he_next].next_idx;
       if (he_prev < 0 || he_prev >= n_hes)
       {
         fprintf(stderr, "[MeshCheck] Half-edge %d cycle broken at 2nd hop (OOB)\n", he->global_id);
@@ -335,7 +335,7 @@ mftl_int_t MFTLCheckMeshIntegrity(MFTL_Object *object)
       }
 
       // Get Start Vertex
-      mftl_int_t v_start_idx = he_base[he_prev].vertex_idx;
+      int v_start_idx = he_base[he_prev].vertex_idx;
       if (v_start_idx < 0 || v_start_idx >= n_verts)
       {
         fprintf(stderr, "[MeshCheck] Half-edge %d start vertex is OOB\n", he->global_id);
@@ -343,7 +343,7 @@ mftl_int_t MFTLCheckMeshIntegrity(MFTL_Object *object)
       }
 
       // --- Calculate Start of Twin ---
-      mftl_int_t twin_next = twin->next_idx;
+      int twin_next = twin->next_idx;
       if (twin_next < 0 || twin_next >= n_hes)
       {
         fprintf(stderr, "[MeshCheck] Twin of %d has OOB next index\n", he->global_id);
@@ -351,7 +351,7 @@ mftl_int_t MFTLCheckMeshIntegrity(MFTL_Object *object)
         continue;
       }
 
-      mftl_int_t twin_prev = he_base[twin_next].next_idx;
+      int twin_prev = he_base[twin_next].next_idx;
       if (twin_prev < 0 || twin_prev >= n_hes)
       {
         fprintf(stderr, "[MeshCheck] Twin of %d has OOB next->next index\n", he->global_id);
@@ -359,7 +359,7 @@ mftl_int_t MFTLCheckMeshIntegrity(MFTL_Object *object)
         continue;
       }
 
-      mftl_int_t v_twin_start_idx = he_base[twin_prev].vertex_idx;
+      int v_twin_start_idx = he_base[twin_prev].vertex_idx;
       if (v_twin_start_idx < 0 || v_twin_start_idx >= n_verts)
       {
         fprintf(stderr, "[MeshCheck] Twin of %d has OOB start vertex\n", he->global_id);
@@ -368,10 +368,10 @@ mftl_int_t MFTLCheckMeshIntegrity(MFTL_Object *object)
 
       // --- Compare ---
       // Target of Twin
-      mftl_int_t v_twin_target_idx = twin->vertex_idx;  // Already checked bounds via loop invariant for other edge, but good to be safe
+      int v_twin_target_idx = twin->vertex_idx;  // Already checked bounds via loop invariant for other edge, but good to be safe
 
       // Target of HE
-      mftl_int_t v_target_idx = he->vertex_idx;
+      int v_target_idx = he->vertex_idx;
 
       if (v_start_idx == v_twin_target_idx && v_target_idx == v_twin_start_idx)
       {
@@ -402,8 +402,8 @@ void MFTLFlattenConnectivity(MFTL_Object *obj)
 {
   assert(obj != MFTL_NULL);
 
-  mftl_int_t n_tris = obj->n_triangles;
-  mftl_int_t n_verts = obj->n_vertices;
+  int n_tris = obj->n_triangles;
+  int n_verts = obj->n_vertices;
 
   if (n_tris < 1 || n_verts < 1) return;
 
@@ -412,43 +412,43 @@ void MFTLFlattenConnectivity(MFTL_Object *obj)
   free(obj->flat_tri_neighbors);
   free(obj->vert_tris);
   free(obj->vert_offsets);
-  obj->flat_tri_verts = (mftl_int_t *) malloc(3 * n_tris * sizeof(mftl_int_t));
-  obj->flat_tri_neighbors = (mftl_int_t *) malloc(3 * n_tris * sizeof(mftl_int_t));
-  obj->vert_tris = (mftl_int_t *) malloc(3 * n_tris * sizeof(mftl_int_t));
-  obj->vert_offsets = (mftl_int_t *) calloc(n_verts + 1, sizeof(mftl_int_t));
+  obj->flat_tri_verts = (int *) malloc(3 * n_tris * sizeof(int));
+  obj->flat_tri_neighbors = (int *) malloc(3 * n_tris * sizeof(int));
+  obj->vert_tris = (int *) malloc(3 * n_tris * sizeof(int));
+  obj->vert_offsets = (int *) calloc(n_verts + 1, sizeof(int));
 
   assert(obj->flat_tri_verts && obj->flat_tri_neighbors && obj->vert_tris && obj->vert_offsets);
 
   MFTL_Triangle *tri_base = obj->triangles;
 
   // Using restrict to help compiler optimize
-  mftl_int_t *restrict flat_verts = obj->flat_tri_verts;
-  mftl_int_t *restrict flat_neigh = obj->flat_tri_neighbors;
-  mftl_int_t *restrict v_offsets = obj->vert_offsets;
-  mftl_int_t *restrict v_tris = obj->vert_tris;
+  int *restrict flat_verts = obj->flat_tri_verts;
+  int *restrict flat_neigh = obj->flat_tri_neighbors;
+  int *restrict v_offsets = obj->vert_offsets;
+  int *restrict v_tris = obj->vert_tris;
 
-  for (mftl_int_t i = 0; i < n_tris; ++i)
+  for (int i = 0; i < n_tris; ++i)
   {
     MFTL_Triangle *tri = &tri_base[i];
     MFTL_HalfEdge *he[3];
     MFTLGetTriangleHalfedges(obj, tri, he);
 
-    mftl_int_t base_idx = 3 * i;
+    int base_idx = 3 * i;
 
     for (int j = 0; j < 3; ++j)
     {
       // Note: Verify if you need 'origin' or 'target' vertex here.
       // Assuming target (he->vertex_idx) is desired:
-      mftl_int_t v_idx = he[j]->vertex_idx;
+      int v_idx = he[j]->vertex_idx;
       flat_verts[base_idx + j] = v_idx;
 
       // Flatten Neighbors
-      mftl_int_t neighbor_idx = -1;
+      int neighbor_idx = -1;
       if (!he[j]->boundary)
       {
         MFTL_Triangle *adj_tri = MFTLHeAdjacentTriangle(obj, he[j]);
         // PTRDIFF: Ensure adj_tri is within the tri_base array range
-        neighbor_idx = (mftl_int_t) (adj_tri - tri_base);
+        neighbor_idx = (int) (adj_tri - tri_base);
       }
       flat_neigh[base_idx + j] = neighbor_idx;
 
@@ -460,30 +460,30 @@ void MFTLFlattenConnectivity(MFTL_Object *obj)
   // --- PASS 2: CSR Construction ---
 
   // Prefix Sum (Convert counts to Start Offsets)
-  mftl_int_t sum = 0;
-  for (mftl_int_t i = 0; i < n_verts; ++i)
+  int sum = 0;
+  for (int i = 0; i < n_verts; ++i)
   {
-    mftl_int_t count = v_offsets[i];
+    int count = v_offsets[i];
     v_offsets[i] = sum;
     sum += count;
   }
   v_offsets[n_verts] = sum;
 
-  mftl_int_t total_indices = 3 * n_tris;
+  int total_indices = 3 * n_tris;
 
-  for (mftl_int_t i = 0; i < total_indices; ++i)
+  for (int i = 0; i < total_indices; ++i)
   {
-    mftl_int_t v_idx = flat_verts[i];
-    mftl_int_t t_idx = i / 3;
+    int v_idx = flat_verts[i];
+    int t_idx = i / 3;
 
-    mftl_int_t pos = v_offsets[v_idx];
+    int pos = v_offsets[v_idx];
     v_tris[pos] = t_idx;
 
     v_offsets[v_idx]++;
   }
 
   // Restore Offsets
-  for (mftl_int_t i = n_verts; i > 0; --i)
+  for (int i = n_verts; i > 0; --i)
   {
     v_offsets[i] = v_offsets[i - 1];
   }
@@ -521,7 +521,7 @@ void MFTLFlattenConnectivity(MFTL_Object *obj)
  * where the results will be stored. Arrays are allocated internally 
  * and must be freed by the user (or `MFTLFreeNeighborhood`).
  */
-void MFTLGetNeighborhood(MFTL_Object *restrict obj, mftl_int_t *restrict seed_indices, mftl_int_t n_seeds, bool use_vertex_seeds, int steps,
+void MFTLGetNeighborhood(MFTL_Object *restrict obj, int *restrict seed_indices, int n_seeds, bool use_vertex_seeds, int steps,
                          MFTL_Neighborhood *restrict out_result)
 {
   // --- 1. Validation & Setup ---
@@ -532,9 +532,9 @@ void MFTLGetNeighborhood(MFTL_Object *restrict obj, mftl_int_t *restrict seed_in
   MFTL_Triangle *restrict const tri_base = obj->triangles;
 
   // Connectivity Arrays (Read-Only)
-  const mftl_int_t *restrict const flat_tri_verts = obj->flat_tri_verts;
-  const mftl_int_t *restrict const vert_offsets = obj->vert_offsets;
-  const mftl_int_t *restrict const vert_tris = obj->vert_tris;
+  const int *restrict const flat_tri_verts = obj->flat_tri_verts;
+  const int *restrict const vert_offsets = obj->vert_offsets;
+  const int *restrict const vert_tris = obj->vert_tris;
 
   // --- 2. Initialize Result ---
   out_result->n_verts = 0;
@@ -546,20 +546,20 @@ void MFTLGetNeighborhood(MFTL_Object *restrict obj, mftl_int_t *restrict seed_in
 
   // --- 3. Initialize Synchronized Queues ---
   // We use ONE capacity variable for BOTH queues.
-  mftl_int_t cap_q = (n_seeds * 6 < MFTL_INIT_CAPACITY) ? MFTL_INIT_CAPACITY : n_seeds * 6;
+  int cap_q = (n_seeds * 6 < MFTL_INIT_CAPACITY) ? MFTL_INIT_CAPACITY : n_seeds * 6;
 
-  mftl_int_t *q_curr = (mftl_int_t *) malloc(cap_q * sizeof(mftl_int_t));
-  mftl_int_t *q_next = (mftl_int_t *) malloc(cap_q * sizeof(mftl_int_t));
+  int *q_curr = (int *) malloc(cap_q * sizeof(int));
+  int *q_next = (int *) malloc(cap_q * sizeof(int));
 
-  mftl_int_t n_curr = 0;
-  mftl_int_t n_next = 0;
+  int n_curr = 0;
+  int n_next = 0;
 
   // State toggle: Are the IDs in q_curr Vertices or Triangles?
   bool is_expanding_vertices = use_vertex_seeds;
 
-  for (mftl_int_t i = 0; i < n_seeds; ++i)
+  for (int i = 0; i < n_seeds; ++i)
   {
-    mftl_int_t idx = seed_indices[i];
+    int idx = seed_indices[i];
 
     if (use_vertex_seeds)
     {
@@ -567,7 +567,7 @@ void MFTLGetNeighborhood(MFTL_Object *restrict obj, mftl_int_t *restrict seed_in
       if (v->flags & MFTL_FLAG_VISITED) continue;
       v->flags |= MFTL_FLAG_VISITED;  // Mark as visited
 
-      MFTL_ENSURE_CAPACITY(out_result->vert_indices, &out_result->n_verts, &out_result->cap_verts, 1, mftl_int_t);
+      MFTL_ENSURE_CAPACITY(out_result->vert_indices, &out_result->n_verts, &out_result->cap_verts, 1, int);
       out_result->vert_indices[out_result->n_verts++] = idx;
     }
     else
@@ -576,7 +576,7 @@ void MFTLGetNeighborhood(MFTL_Object *restrict obj, mftl_int_t *restrict seed_in
       if (t->flags & MFTL_FLAG_VISITED) continue;
       t->flags |= MFTL_FLAG_VISITED;  // Mark as visited
 
-      MFTL_ENSURE_CAPACITY(out_result->tri_indices, &out_result->n_tris, &out_result->cap_tris, 1, mftl_int_t);
+      MFTL_ENSURE_CAPACITY(out_result->tri_indices, &out_result->n_tris, &out_result->cap_tris, 1, int);
       out_result->tri_indices[out_result->n_tris++] = idx;
     }
 
@@ -590,19 +590,19 @@ void MFTLGetNeighborhood(MFTL_Object *restrict obj, mftl_int_t *restrict seed_in
     if (n_curr == 0) break;
     n_next = 0;
 
-    for (mftl_int_t i = 0; i < n_curr; ++i)
+    for (int i = 0; i < n_curr; ++i)
     {
-      mftl_int_t idx = q_curr[i];
+      int idx = q_curr[i];
 
       if (is_expanding_vertices)
       {
         // EXPAND: Vertex -> Triangles (using CSR)
-        mftl_int_t start = vert_offsets[idx];
-        mftl_int_t end = vert_offsets[idx + 1];
+        int start = vert_offsets[idx];
+        int end = vert_offsets[idx + 1];
 
-        for (mftl_int_t k = start; k < end; ++k)
+        for (int k = start; k < end; ++k)
         {
-          mftl_int_t t_idx = vert_tris[k];
+          int t_idx = vert_tris[k];
           MFTL_Triangle *t = &tri_base[t_idx];
 
           if (!(t->flags & MFTL_FLAG_VISITED))
@@ -610,7 +610,7 @@ void MFTLGetNeighborhood(MFTL_Object *restrict obj, mftl_int_t *restrict seed_in
             t->flags |= MFTL_FLAG_VISITED;
 
             // Add to Results
-            MFTL_ENSURE_CAPACITY(out_result->tri_indices, &out_result->n_tris, &out_result->cap_tris, 1, mftl_int_t);
+            MFTL_ENSURE_CAPACITY(out_result->tri_indices, &out_result->n_tris, &out_result->cap_tris, 1, int);
             out_result->tri_indices[out_result->n_tris++] = t_idx;
 
             // Add to Next Queue (Synchronized Growth)
@@ -618,8 +618,8 @@ void MFTLGetNeighborhood(MFTL_Object *restrict obj, mftl_int_t *restrict seed_in
             {
               // If one grows, BOTH grow. This keeps capacities identical.
               cap_q *= 2;
-              q_next = (mftl_int_t *) realloc(q_next, cap_q * sizeof(mftl_int_t));
-              q_curr = (mftl_int_t *) realloc(q_curr, cap_q * sizeof(mftl_int_t));
+              q_next = (int *) realloc(q_next, cap_q * sizeof(int));
+              q_curr = (int *) realloc(q_curr, cap_q * sizeof(int));
             }
             q_next[n_next++] = t_idx;
           }
@@ -628,10 +628,10 @@ void MFTLGetNeighborhood(MFTL_Object *restrict obj, mftl_int_t *restrict seed_in
       else
       {
         // EXPAND: Triangle -> Vertices (using Flat Array)
-        mftl_int_t base = 3 * idx;
+        int base = 3 * idx;
         for (int k = 0; k < 3; ++k)
         {
-          mftl_int_t v_idx = flat_tri_verts[base + k];
+          int v_idx = flat_tri_verts[base + k];
           MFTL_Vertex *v = &vert_base[v_idx];
 
           if (!(v->flags & MFTL_FLAG_VISITED))
@@ -639,15 +639,15 @@ void MFTLGetNeighborhood(MFTL_Object *restrict obj, mftl_int_t *restrict seed_in
             v->flags |= MFTL_FLAG_VISITED;
 
             // Add to Results
-            MFTL_ENSURE_CAPACITY(out_result->vert_indices, &out_result->n_verts, &out_result->cap_verts, 1, mftl_int_t);
+            MFTL_ENSURE_CAPACITY(out_result->vert_indices, &out_result->n_verts, &out_result->cap_verts, 1, int);
             out_result->vert_indices[out_result->n_verts++] = v_idx;
 
             // Add to Next Queue (Synchronized Growth)
             if (n_next >= cap_q)
             {
               cap_q *= 2;
-              q_next = (mftl_int_t *) realloc(q_next, cap_q * sizeof(mftl_int_t));
-              q_curr = (mftl_int_t *) realloc(q_curr, cap_q * sizeof(mftl_int_t));
+              q_next = (int *) realloc(q_next, cap_q * sizeof(int));
+              q_curr = (int *) realloc(q_curr, cap_q * sizeof(int));
             }
             q_next[n_next++] = v_idx;
           }
@@ -657,7 +657,7 @@ void MFTLGetNeighborhood(MFTL_Object *restrict obj, mftl_int_t *restrict seed_in
 
     // Swap Queues and Toggle Mode
     // Because capacities are strictly synced, we ONLY swap pointers.
-    mftl_int_t *temp = q_curr;
+    int *temp = q_curr;
     q_curr = q_next;
     q_next = temp;
 
@@ -670,6 +670,6 @@ void MFTLGetNeighborhood(MFTL_Object *restrict obj, mftl_int_t *restrict seed_in
   free(q_next);
 
   // Clear flags (O(k))
-  for (mftl_int_t i = 0; i < out_result->n_verts; i++) obj->vertices[out_result->vert_indices[i]].flags &= ~MFTL_FLAG_VISITED;
-  for (mftl_int_t i = 0; i < out_result->n_tris; i++) obj->triangles[out_result->tri_indices[i]].flags &= ~MFTL_FLAG_VISITED;
+  for (int i = 0; i < out_result->n_verts; i++) obj->vertices[out_result->vert_indices[i]].flags &= ~MFTL_FLAG_VISITED;
+  for (int i = 0; i < out_result->n_tris; i++) obj->triangles[out_result->tri_indices[i]].flags &= ~MFTL_FLAG_VISITED;
 }

@@ -14,7 +14,7 @@
 #include <mpi.h>
 #include <stdio.h>
 
-mftl_int_t main(int argc, char *argv[])
+int main(int argc, char *argv[])
 {
   // --- MPI Initialization ---
   MPI_Init(&argc, &argv);
@@ -23,7 +23,7 @@ mftl_int_t main(int argc, char *argv[])
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
   // --- 1. Define Simulation Parameters ---
-  // Note: MPI cuts are standard 'int', not 'mftl_int_t'
+  // Note: MPI cuts are standard 'int', not 'int'
   int cuts[3] = {1, 1, 1};
   double global_min[3] = {-2.0, -2.0, -2.0};
   double global_max[3] = {2.0, 2.0, 2.0};
@@ -58,12 +58,12 @@ mftl_int_t main(int argc, char *argv[])
 
   double center[3] = {0.0, 0.0, 0.0};
   double radius = 1.0;
-  mftl_int_t refinements = 5;
+  int refinements = 5;
 
   if (rank == 0) printf("Rank %d: Generating sphere (refinements=%lld)...\n", rank, (long long) refinements);
 
   // Notice: We pass 'object', and it knows its own domain now.
-  mftl_int_t result = MFTLGenerateSphere(object, center, radius, refinements);
+  int result = MFTLGenerateSphere(object, center, radius, refinements);
 
   if (result != MFTL_SUCCESS)
   {

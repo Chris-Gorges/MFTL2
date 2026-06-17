@@ -61,7 +61,7 @@ int main(int argc, char* argv[])
   for (size_t o = 0; o < NUM_SPHERES; o++)
   {
     // --- Create the Mesh Object ---
-    MFTL_Object* object = MFTLObjectCreate((mftl_int_t) o);
+    MFTL_Object* object = MFTLObjectCreate((int) o);
     MFTLEnsembleAddObject(ensemble, object);
 
     // --- Generate random center coordinates ---

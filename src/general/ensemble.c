@@ -21,7 +21,7 @@
 static int g_mftl_ensemble_ref_count = 0;
 
 // Helper: Internal function to setup the complex MPI Graph (moved from Object)
-static mftl_int_t MFTLDomainInitComm(MFTL_Domain* domain)
+static int MFTLDomainInitComm(MFTL_Domain* domain)
 {
   if (!domain) return MFTL_ERROR;
 
@@ -179,8 +179,7 @@ static mftl_int_t MFTLDomainInitComm(MFTL_Domain* domain)
   return MFTL_SUCCESS;
 }
 
-MFTL_Ensemble* MFTLEnsembleCreate(MPI_Comm comm, int cuts[3], double global_min[3], double global_max[3], bool is_periodic[3],
-                                  mftl_int_t initial_object_capacity)
+MFTL_Ensemble* MFTLEnsembleCreate(MPI_Comm comm, int cuts[3], double global_min[3], double global_max[3], bool is_periodic[3], int initial_object_capacity)
 {
   MFTL_Ensemble* ens = (MFTL_Ensemble*) calloc(1, sizeof(MFTL_Ensemble));
   if (!ens) return MFTL_NULL;
@@ -240,7 +239,7 @@ void MFTLEnsembleDestroy(MFTL_Ensemble** p_ens)
   MFTL_Ensemble* ens = *p_ens;
 
   // 1. Destroy all contained Objects
-  for (mftl_int_t i = 0; i < ens->num_objects; ++i)
+  for (int i = 0; i < ens->num_objects; ++i)
   {
     MFTLObjectDestroy(&ens->objects[i]);
   }
@@ -268,7 +267,7 @@ void MFTLEnsembleDestroy(MFTL_Ensemble** p_ens)
   }
 }
 
-mftl_int_t MFTLEnsembleAddObject(MFTL_Ensemble* ensemble, MFTL_Object* object)
+int MFTLEnsembleAddObject(MFTL_Ensemble* ensemble, MFTL_Object* object)
 {
   // 1. Link the Object to the Domain
   object->domain = &ensemble->domain;

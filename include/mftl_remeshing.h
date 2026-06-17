@@ -26,15 +26,15 @@ typedef enum
 typedef struct
 {
   int8_t type;  // MFTL_RemeshOpType
-  mftl_int_t edge_gid;  // The global ID of the edge being operated on
+  int edge_gid;  // The global ID of the edge being operated on
 
   // Payload for Split:
   double new_pos[3];  // Exact position of the new vertex
-  mftl_int_t new_vert_gid;  // Pre-assigned GID for the new vertex (deterministic!)
-  mftl_int_t new_edge_gid;  // Pre-assigned GID for the new halfedge
+  int new_vert_gid;  // Pre-assigned GID for the new vertex (deterministic!)
+  int new_edge_gid;  // Pre-assigned GID for the new halfedge
 
   // Payload for Collapse:
-  mftl_int_t keep_vert_gid;  // The GID of the vertex to keep
+  int keep_vert_gid;  // The GID of the vertex to keep
 
 } MFTL_RemeshAction;
 
@@ -49,6 +49,77 @@ typedef struct
 // // Helper to determine edge ownership deterministically
 // // Rule: The rank with the lower ID owns the shared edge.
 // static inline bool MFTLIsEdgeOwner(int my_rank, int neighbor_rank) { return my_rank < neighbor_rank; }
+
+/* ── Per-entity flag additions ────────────────────────────────────────── */
+#define MFTL_FLAG_FROZEN (1 << 4) /* in freeze band; do not modify  */
+#define MFTL_FLAG_FROZEN_NEXT (1 << 5) /* staging flag for dilation pass */
+#define MFTL_FLAG_NEVER_INTERIOR (1 << 6) /* set at pass-start; cleared     */
+/* when entity becomes unfrozen   */
+/* even once — convergence cert.  */
+
+#define MFTL_FLAG_IMMUTABLE (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED | MFTL_FLAG_FROZEN)
+
+/* ── Phase schedule ────────────────────────────────────────────────────
+ *
+ * MFTL_SHIFT_PHASES[p][k]:
+ *   0  →  no shift in axis k for phase p
+ *   1  →  shift cut planes by h_k/2 in axis k for phase p
+ *
+ * The ordering maximises useful work in the fewest phases:
+ *
+ *   Phases 0–1  :  resolve O(δ/h)       slab   conflicts   (~95–99 %)
+ *   Phases 2–4  :  resolve O((δ/h)²)    tube   conflicts   (even OA)
+ *   Phases 5–7  :  resolve O((δ/h)³)    corner conflicts   (odd set)
+ *
+ * All 8 phases together form {0, h/2}³, which guarantees that every
+ * entity is strictly interior (unfrozen) in at least one phase,
+ * provided the hard constraint  δ < h_min/4  holds.
+ * ─────────────────────────────────────────────────────────────────── */
+static const int MFTL_SHIFT_PHASES[8][3] = {
+    {0, 0, 0}, /* phase 0 – canonical / baseline                      */
+    {1, 1, 1}, /* phase 1 – full diagonal; resolves all slab conflicts */
+    {0, 1, 1}, /* phase 2 – even orthogonal-array member 1            */
+    {1, 0, 1}, /* phase 3 – even orthogonal-array member 2            */
+    {1, 1, 0}, /* phase 4 – even orthogonal-array member 3            */
+    {1, 0, 0}, /* phase 5 – odd set member 1                          */
+    {0, 1, 0}, /* phase 6 – odd set member 2                          */
+    {0, 0, 1} /* phase 7 – odd set member 3                          */
+};
+#define MFTL_NUM_SHIFT_PHASES 8
+
+/* ── Centering threshold ────────────────────────────────────────────────
+ *
+ * Object-centering migration uses ONLY 26-neighbour communication.
+ * This is safe when every triangle of an object can reach the object's
+ * centroid rank by a single MPI_Neighbor_alltoallv hop.
+ *
+ * Derivation:
+ *   The 26-neighbour shell of the centroid rank extends exactly one
+ *   rank-box width h_min beyond its boundary in each axis.  An object
+ *   of bounding-box width W whose centroid sits at the worst-case
+ *   position (a rank-box corner) has its farthest triangle at distance W
+ *   from the rank boundary.  Strict 26-neighbour reachability requires:
+ *
+ *       W  <  h_min
+ *
+ *   The factor 0.5 provides a safety margin for:
+ *     – centroid not coinciding with the object's geometric centre
+ *     – discrete half-edge stencil extending slightly beyond the
+ *       geometric bounding box
+ * ─────────────────────────────────────────────────────────────────── */
+#define MFTL_CENTERING_WIDTH_FACTOR 0.5
+
+typedef enum
+{
+  MFTL_ENSEMBLE_DISPERSED = 0, /* bubbles/droplets; R_obj expected << h  */
+  MFTL_ENSEMBLE_SPANNING = 1 /* jets, films, large interfaces; R >> h  */
+} MFTL_EnsembleType;
+
+typedef enum
+{
+  MFTL_ALGO_CENTERING = 0, /* object-center migration + serial kern  */
+  MFTL_ALGO_SHIFT_SCHEME = 1 /* spatial shift / freeze / migrate loop  */
+} MFTL_RemeshAlgorithm;
 
 typedef enum
 {
@@ -129,11 +200,81 @@ static inline void MFTLInitRemeshParams(MFTL_RemeshParameters *params, MFTL_Reme
 // These return the index of the central vertex (split) or remaining vertex (collapse)
 // or MFTL_ERROR on failure.
 
-mftl_int_t MFTLSplitEdge(MFTL_Object *obj, mftl_int_t he_ab_idx);
-void MFTLCollapseEdge(MFTL_Object *obj, mftl_int_t he_ab_idx);
-mftl_int_t MFTLSwapEdge(MFTL_Object *obj, mftl_int_t he_idx);
+int MFTLSplitEdge(MFTL_Object *obj, int he_ab_idx);
+void MFTLCollapseEdge(MFTL_Object *obj, int he_ab_idx);
+int MFTLSwapEdge(MFTL_Object *obj, int he_idx);
 
 // --- High Level Routine ---
 void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params);
+
+/* ══════════════════════════════════════════════════════════════════════
+ * MFTLDomainGetHMin
+ *
+ * Returns the minimum rank-box width across all three domain axes.
+ *
+ *   h_k  =  domain_size[k] / cuts[k]        (box width in axis k)
+ *   h_min = min(h_0, h_1, h_2)
+ *
+ * This is the quantity that appears in the shift-scheme hard constraint
+ *   δ  <  h_min / 4
+ * and in the centering-threshold test
+ *   W_typical  <  MFTL_CENTERING_WIDTH_FACTOR * h_min.
+ *
+ * Complexity : O(1), no communication.
+ * ══════════════════════════════════════════════════════════════════════ */
+static inline double MFTLDomainGetHMin(MFTL_Domain *dom)
+{
+  MFTL_ASSERT(dom != MFTL_NULL);
+  MFTL_ASSERT(dom->cuts[0] > 0 && dom->cuts[1] > 0 && dom->cuts[2] > 0 && "cuts must be positive");
+  MFTL_ASSERT(dom->domain_size[0] > 0.0 && dom->domain_size[1] > 0.0 && dom->domain_size[2] > 0.0 && "domain_size must be positive");
+
+  double h_min = MFTL_DBL_MAX;
+
+  for (int k = 0; k < 3; ++k)
+  {
+    double h = dom->domain_size[k] / (double) dom->cuts[k];
+    if (h < h_min) h_min = h;
+  }
+
+  MFTL_ASSERT(h_min < MFTL_DBL_MAX); /* unreachable if assertions above pass */
+  return h_min;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
+ * MFTLDomainSetShiftPhase
+ *
+ * Sets dom->decomp_shift[k] for each axis k according to the selected
+ * phase from the MFTL_SHIFT_PHASES table:
+ *
+ *   decomp_shift[k] = MFTL_SHIFT_PHASES[phase_idx][k]  *  (h_k / 2)
+ *
+ * After this call, MFTLGetOwnerProc uses the updated decomp_shift to
+ * determine which rank owns a given triangle centroid position.
+ *
+ * The shift causes all cut planes in axis k to translate by h_k/2
+ * (when the table entry is 1), which is the core geometric operation
+ * of the freeze/migrate scheme.
+ *
+ * Precondition : 0 <= phase_idx < MFTL_NUM_SHIFT_PHASES (= 8)
+ * Postcondition: dom->decomp_shift is updated; no entity data is moved.
+ *                The caller must follow this with
+ *                MFTLRedistributeListOfObjects() to actually migrate
+ *                entities to their new owning ranks.
+ *
+ * Complexity : O(1), no communication.
+ * ══════════════════════════════════════════════════════════════════════ */
+static inline void MFTLDomainSetShiftPhase(MFTL_Domain *dom, int phase_idx)
+{
+  MFTL_ASSERT(dom != MFTL_NULL);
+  MFTL_ASSERT(phase_idx >= 0 && phase_idx < MFTL_NUM_SHIFT_PHASES);
+
+  for (int k = 0; k < 3; ++k)
+  {
+    double h = dom->domain_size[k] / (double) dom->cuts[k];
+
+    /* Ternary keeps branch-free in the common case. */
+    dom->decomp_shift[k] = MFTL_SHIFT_PHASES[phase_idx][k] ? 0.5 * h : 0.0;
+  }
+}
 
 #endif

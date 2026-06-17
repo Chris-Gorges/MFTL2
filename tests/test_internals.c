@@ -7,7 +7,7 @@
 // --- Sorting Tests ---
 int test_sort_ids()
 {
-  mftl_int_t data[] = {5, 1, 3, 2, 4};
+  int data[] = {5, 1, 3, 2, 4};
   MFTLSortIds(data, 5);
   for (int i = 0; i < 5; i++) TEST_ASSERT_EQUAL_INT(i + 1, data[i]);
 
@@ -15,7 +15,7 @@ int test_sort_ids()
   MFTLSortIds(NULL, 0);  // Should not crash
 
   // Reverse
-  mftl_int_t rev[] = {3, 2, 1};
+  int rev[] = {3, 2, 1};
   MFTLSortIds(rev, 3);
   TEST_ASSERT_EQUAL_INT(1, rev[0]);
   TEST_ASSERT_EQUAL_INT(2, rev[1]);
@@ -26,12 +26,12 @@ int test_sort_ids()
 
 int test_unique_int_array()
 {
-  mftl_int_t data[] = {1, 1, 2, 2, 3, 3, 3, 4, 10, 10};
-  mftl_int_t n = 10;
+  int data[] = {1, 1, 2, 2, 3, 3, 3, 4, 10, 10};
+  int n = 10;
   // Array must be sorted for UniqueIntArray to work! (Based on doc)
   // Our data is sorted.
 
-  mftl_int_t new_n = MFTLUniqueIntArray(data, n);
+  int new_n = MFTLUniqueIntArray(data, n);
 
   TEST_ASSERT_EQUAL_INT(5, new_n);  // 1, 2, 3, 4, 10
   TEST_ASSERT_EQUAL_INT(1, data[0]);

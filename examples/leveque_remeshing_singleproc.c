@@ -16,7 +16,7 @@ int AdvectFront(MFTL_Object* Object, double time, double dt, double T)
 
   MFTL_Vertex* Vertex_base = Object->vertices;
 
-  for (mftl_int_t i = 0; i < Object->n_vertices; ++i)
+  for (int i = 0; i < Object->n_vertices; ++i)
   {
     MFTL_Vertex* Vertex = &Vertex_base[i];
 
@@ -103,7 +103,7 @@ int main(int argc, char* argv[])
   }
 
   // --- Create the Mesh Object ---
-  MFTL_Object* object = MFTLObjectCreate((mftl_int_t) 0);
+  MFTL_Object* object = MFTLObjectCreate((int) 0);
   MFTLEnsembleAddObject(ensemble, object);
 
   double center[3] = {0.35, 0.35, 0.35};

@@ -26,7 +26,7 @@
  *  /      \   ----->    / \/ \
  * v2------v3          v2--m3--v3
  */
-static mftl_int_t tessellate_sphere(MFTL_Object *object)
+static int tessellate_sphere(MFTL_Object *object)
 {
   MFTL_Domain *domain = object->domain;
 
@@ -69,12 +69,12 @@ static mftl_int_t tessellate_sphere(MFTL_Object *object)
   // --- 4. Create Midpoints ---
 
   // A temporary map: old_he_index -> new_midpoint_vertex_index
-  mftl_int_t *midpoint_map = malloc(old_nhe * sizeof(mftl_int_t));
+  int *midpoint_map = malloc(old_nhe * sizeof(int));
 
   // Initialize with -1
   for (size_t i = 0; i < old_nhe; ++i) midpoint_map[i] = MFTL_ERROR;
 
-  mftl_int_t next_midpoint_idx = (mftl_int_t) old_nv;  // Start creating after old verts
+  int next_midpoint_idx = (int) old_nv;  // Start creating after old verts
 
   for (size_t i = 0; i < old_nhe; ++i)
   {
@@ -86,7 +86,7 @@ static mftl_int_t tessellate_sphere(MFTL_Object *object)
     const MFTL_Vertex *v1 = &old_vertices[he->vertex_idx];  // Target
 
     // Find Origin (using twin if available, or manual lookup)
-    mftl_int_t twin_idx = he->twin_idx;
+    int twin_idx = he->twin_idx;
     const MFTL_Vertex *v0 = &old_vertices[old_half_edges[twin_idx].vertex_idx];
 
     // Create Midpoint Vertex
@@ -118,39 +118,39 @@ static mftl_int_t tessellate_sphere(MFTL_Object *object)
   //   / \  / \
   // v0 -- m0 -- v1
 
-  mftl_int_t new_tri_idx = 0;
-  mftl_int_t new_he_idx = 0;
+  int new_tri_idx = 0;
+  int new_he_idx = 0;
 
   for (size_t i = 0; i < old_nt; ++i)
   {
     const MFTL_Triangle *old_tri = &old_triangles[i];
 
     // Get Old Half-Edges indices
-    mftl_int_t he0_idx = old_tri->he_idx;
-    mftl_int_t he1_idx = old_half_edges[he0_idx].next_idx;
-    mftl_int_t he2_idx = old_half_edges[he1_idx].next_idx;
+    int he0_idx = old_tri->he_idx;
+    int he1_idx = old_half_edges[he0_idx].next_idx;
+    int he2_idx = old_half_edges[he1_idx].next_idx;
 
     // Get Vertex Indices (Indices in new array match old array)
     // v0 is Origin of he0 (Target of he2)
-    mftl_int_t v0_idx = old_half_edges[he2_idx].vertex_idx;
-    mftl_int_t v1_idx = old_half_edges[he0_idx].vertex_idx;
-    mftl_int_t v2_idx = old_half_edges[he1_idx].vertex_idx;
+    int v0_idx = old_half_edges[he2_idx].vertex_idx;
+    int v1_idx = old_half_edges[he0_idx].vertex_idx;
+    int v2_idx = old_half_edges[he1_idx].vertex_idx;
 
     // Get Midpoint Indices (Direct Lookup!)
-    mftl_int_t m0_idx = midpoint_map[he0_idx];  // on edge v0-v1
-    mftl_int_t m1_idx = midpoint_map[he1_idx];  // on edge v1-v2
-    mftl_int_t m2_idx = midpoint_map[he2_idx];  // on edge v2-v0
+    int m0_idx = midpoint_map[he0_idx];  // on edge v0-v1
+    int m1_idx = midpoint_map[he1_idx];  // on edge v1-v2
+    int m2_idx = midpoint_map[he2_idx];  // on edge v2-v0
 
     // Define the 4 new triangles (CCW winding)
     // Each row is a triangle: {Vert A, Vert B, Vert C}
-    mftl_int_t sub_tris[4][3] = {
+    int sub_tris[4][3] = {
         {v0_idx, m0_idx, m2_idx},  // Corner 0
         {v1_idx, m1_idx, m0_idx},  // Corner 1
         {v2_idx, m2_idx, m1_idx},  // Corner 2
         {m0_idx, m1_idx, m2_idx}  // Center
     };
 
-    for (mftl_int_t j = 0; j < 4; ++j)
+    for (int j = 0; j < 4; ++j)
     {
       // 1. Setup Triangle
       MFTL_Triangle *tri = &new_triangles[new_tri_idx];
@@ -160,11 +160,11 @@ static mftl_int_t tessellate_sphere(MFTL_Object *object)
       tri->he_idx = new_he_idx;  // Points to first HE created below
 
       // 2. Setup 3 Half-Edges
-      for (mftl_int_t k = 0; k < 3; ++k)
+      for (int k = 0; k < 3; ++k)
       {
         MFTL_HalfEdge *he = &new_half_edges[new_he_idx + k];
-        mftl_int_t current_v_idx = sub_tris[j][k];
-        mftl_int_t next_v_idx = sub_tris[j][(k + 1) % 3];
+        int current_v_idx = sub_tris[j][k];
+        int next_v_idx = sub_tris[j][(k + 1) % 3];
 
         he->global_id = object->next_halfedge_gid++;
 
@@ -220,9 +220,9 @@ static mftl_int_t tessellate_sphere(MFTL_Object *object)
  * rebuilds twin relationships automatically via hashing.
  *
  * @param object Mesh object (must be initialized).
- * @return mftl_int_t 0 on success.
+ * @return int 0 on success.
  */
-static mftl_int_t generate_icosahedron(MFTL_Object *object)
+static int generate_icosahedron(MFTL_Object *object)
 {
   MFTL_Domain *domain = object->domain;
 
@@ -249,7 +249,7 @@ static mftl_int_t generate_icosahedron(MFTL_Object *object)
   object->next_halfedge_gid = 60;
 
   // --- Create vertices ---
-  for (mftl_int_t i = 0; i < 12; ++i)
+  for (int i = 0; i < 12; ++i)
   {
     MFTL_Vertex *v = &object->vertices[i];
     v->global_id = i;
@@ -257,19 +257,19 @@ static mftl_int_t generate_icosahedron(MFTL_Object *object)
     v->is_ghost = MFTL_FALSE;
     memcpy(v->pos, vertices_data[i], 3 * sizeof(double));
     v->out_he_idx = -1;  // will be set later
-    // mftl_int_t ret;
+    // int ret;
     // khiter_t k = kh_put(vertex_map, object->vertex_lookup, v->global_id, &ret);
     // kh_value(object->vertex_lookup, k) = base_vertex_gid + i;
   }
 
   // --- Create triangles and half-edges ---
-  for (mftl_int_t i = 0; i < 20; ++i)
+  for (int i = 0; i < 20; ++i)
   {
     MFTL_Triangle *tri = &object->triangles[i];
     tri->global_id = i;
     tri->owner_proc = domain->rank;
     tri->is_ghost = MFTL_FALSE;
-    // mftl_int_t ret;
+    // int ret;
     // khiter_t k = kh_put(triangle_map, object->triangle_lookup, tri->global_id, &ret);
     // kh_value(object->triangle_lookup, k) = base_triangle_gid + i;
 
@@ -277,7 +277,7 @@ static mftl_int_t generate_icosahedron(MFTL_Object *object)
 
     // Each triangle gets 3 half-edges
     MFTL_HalfEdge *he[3];
-    for (mftl_int_t j = 0; j < 3; ++j)
+    for (int j = 0; j < 3; ++j)
     {
       he[j] = &object->half_edges[i * 3 + j];
       he[j]->global_id = i * 3 + j;
@@ -286,7 +286,7 @@ static mftl_int_t generate_icosahedron(MFTL_Object *object)
       he[j]->twin_idx = -1;  // will be rebuilt
       he[j]->next_idx = -1;  // will be set later
 
-      //   mftl_int_t ret;
+      //   int ret;
       //   khiter_t k = kh_put(halfedge_map, object->halfedge_lookup, he[j]->global_id, &ret);
       //   kh_value(object->halfedge_lookup, k) = base_he_gid + (i * 3 + j);
 
@@ -318,7 +318,7 @@ static mftl_int_t generate_icosahedron(MFTL_Object *object)
  * @param radius The radius of the sphere.
  * @param refinements The number of refinements for the sphere.
  */
-mftl_int_t MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, mftl_int_t refinements)
+int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int refinements)
 {
   assert(object);
 
@@ -328,7 +328,7 @@ mftl_int_t MFTLGenerateSphere(MFTL_Object *object, double center[3], double radi
   if (domain->rank == 0)
   {
     generate_icosahedron(object);
-    for (mftl_int_t i = 0; i < refinements; ++i)
+    for (int i = 0; i < refinements; ++i)
     {
       // printf("Performing refinement level %d...\n", i + 1);
       tessellate_sphere(object);

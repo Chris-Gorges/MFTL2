@@ -17,7 +17,7 @@
  * "output/sphere"). .vtk will be appended.
  * @return 0 on success, -1 on error.
  */
-mftl_int_t MFTLWriteVtk(const MFTL_Object *object, const char *base_filename);
+int MFTLWriteVtk(const MFTL_Object *object, const char *base_filename);
 
 /**
  * @brief Writes ALL MFTL objects to a SINGLE parallel VTK file set (.pvtu + .vtu).

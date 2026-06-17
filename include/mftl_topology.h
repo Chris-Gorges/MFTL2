@@ -19,12 +19,12 @@
 /**
  * @brief Get a pointer to a vertex by its local index.
  */
-static inline MFTL_Vertex *MFTLGetVertex(const MFTL_Object *obj, mftl_int_t idx) { return &obj->vertices[idx]; }
+static inline MFTL_Vertex *MFTLGetVertex(const MFTL_Object *obj, int idx) { return &obj->vertices[idx]; }
 
 /**
  * @brief Get a pointer to a half-edge by its local index.
  */
-static inline MFTL_HalfEdge *MFTLGetHalfedge(const MFTL_Object *obj, mftl_int_t idx)
+static inline MFTL_HalfEdge *MFTLGetHalfedge(const MFTL_Object *obj, int idx)
 {
   if (idx == MFTL_ERROR) return MFTL_NULL;
   return &obj->half_edges[idx];
@@ -33,7 +33,7 @@ static inline MFTL_HalfEdge *MFTLGetHalfedge(const MFTL_Object *obj, mftl_int_t 
 /**
  * @brief Get a pointer to a triangle by its local index.
  */
-static inline MFTL_Triangle *MFTLGetTriangle(const MFTL_Object *obj, mftl_int_t idx)
+static inline MFTL_Triangle *MFTLGetTriangle(const MFTL_Object *obj, int idx)
 {
   if (idx == MFTL_ERROR) return MFTL_NULL;
   return &obj->triangles[idx];
@@ -160,9 +160,9 @@ static inline MFTL_Triangle *MFTLHeAdjacentTriangle(const MFTL_Object *obj, cons
  * This skips the boundary search (Rewind step) for performance.
  * @return The number of triangles found.
  */
-static inline mftl_int_t MFTLGetVertexOneRing(const MFTL_Object *obj, const MFTL_Vertex *v, MFTL_Triangle **out_tris, mftl_int_t max_tris, bool is_inner)
+static inline int MFTLGetVertexOneRing(const MFTL_Object *obj, const MFTL_Vertex *v, MFTL_Triangle **out_tris, int max_tris, bool is_inner)
 {
-  mftl_int_t count = 0;
+  int count = 0;
 
   // 1. Start at the vertex's primary outgoing half-edge
   MFTL_HalfEdge *start_he = MFTL_NULL;
@@ -226,10 +226,9 @@ static inline mftl_int_t MFTLGetVertexOneRing(const MFTL_Object *obj, const MFTL
  * @param is_inner Optimization flag. Set to TRUE to skip boundary rewind.
  * @return The number of neighbors found.
  */
-static inline mftl_int_t MFTLGetVertexOneRingVertices(const MFTL_Object *obj, const MFTL_Vertex *v, MFTL_Vertex **out_verts, mftl_int_t max_verts,
-                                                      bool is_inner)
+static inline int MFTLGetVertexOneRingVertices(const MFTL_Object *obj, const MFTL_Vertex *v, MFTL_Vertex **out_verts, int max_verts, bool is_inner)
 {
-  mftl_int_t count = 0;
+  int count = 0;
 
   MFTL_HalfEdge *start_he = MFTL_NULL;
   start_he = MFTLVOutHe(obj, v);
@@ -282,10 +281,9 @@ static inline mftl_int_t MFTLGetVertexOneRingVertices(const MFTL_Object *obj, co
  * @param is_inner Optimization flag. Set to true if you are certain the vertex is not on the boundary.
  * @return The number of edges found.
  */
-static inline mftl_int_t MFTLGetVertexOneRingHalfedges(const MFTL_Object *obj, const MFTL_Vertex *v, mftl_int_t *out_he_indices, mftl_int_t max_he,
-                                                       bool is_inner)
+static inline int MFTLGetVertexOneRingHalfedges(const MFTL_Object *obj, const MFTL_Vertex *v, int *out_he_indices, int max_he, bool is_inner)
 {
-  mftl_int_t count = 0;
+  int count = 0;
 
   // 1. Get Start
   MFTL_HalfEdge *start_he = MFTLVOutHe(obj, v);
@@ -315,7 +313,7 @@ static inline mftl_int_t MFTLGetVertexOneRingHalfedges(const MFTL_Object *obj, c
 
     // CALCULATE INDEX: Pointer Arithmetic (Safe within this function scope)
     // This converts the pointer 'curr' back to its integer index in the pool.
-    out_he_indices[count++] = (mftl_int_t) (curr - obj->half_edges);
+    out_he_indices[count++] = (int) (curr - obj->half_edges);
 
     // Advance
     MFTL_HalfEdge *twin = MFTLHeTwin(obj, curr);
@@ -380,7 +378,7 @@ void MFTLConvertGlobalToLocalIndices(MFTL_Object *obj);
  */
 void MFTLFlattenConnectivity(MFTL_Object *obj);
 
-mftl_int_t MFTLCheckMeshIntegrity(MFTL_Object *object);
+int MFTLCheckMeshIntegrity(MFTL_Object *object);
 
 /**
  * @struct MFTL_Neighborhood
@@ -389,13 +387,13 @@ mftl_int_t MFTLCheckMeshIntegrity(MFTL_Object *object);
  */
 typedef struct MFTL_Neighborhood
 {
-  mftl_int_t *vert_indices;  ///< Array of gathered vertex local indices
-  mftl_int_t n_verts;  ///< Number of vertices found
-  mftl_int_t cap_verts;  ///< Current capacity of the vertex array
+  int *vert_indices;  ///< Array of gathered vertex local indices
+  int n_verts;  ///< Number of vertices found
+  int cap_verts;  ///< Current capacity of the vertex array
 
-  mftl_int_t *tri_indices;  ///< Array of gathered triangle local indices
-  mftl_int_t n_tris;  ///< Number of triangles found
-  mftl_int_t cap_tris;  ///< Current capacity of the triangle array
+  int *tri_indices;  ///< Array of gathered triangle local indices
+  int n_tris;  ///< Number of triangles found
+  int cap_tris;  ///< Current capacity of the triangle array
 } MFTL_Neighborhood;
 
 /**
@@ -440,7 +438,7 @@ static inline void MFTLFreeNeighborhood(MFTL_Neighborhood *nb)
  * where the results will be stored. Arrays are allocated internally 
  * and must be freed by the user (or `MFTLFreeNeighborhood`).
  */
-void MFTLGetNeighborhood(MFTL_Object *restrict obj, mftl_int_t *restrict seed_indices, mftl_int_t n_seeds, bool use_vertex_seeds, int steps,
+void MFTLGetNeighborhood(MFTL_Object *restrict obj, int *restrict seed_indices, int n_seeds, bool use_vertex_seeds, int steps,
                          MFTL_Neighborhood *restrict out_result);
 
 #endif  // MFTL_TOPOLOGY_H

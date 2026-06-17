@@ -17,35 +17,13 @@
 #include <limits.h>
 #include "mftl_constants.h"
 #include "mftl_memory.h"
+#include "mftl_remeshing.h"
 #include "khash.h"
 
-#ifdef MFTL_USE_64BIT
-// Huge mode: supports > 4 billion items per MPI rank
-typedef int64_t mftl_int_t;
-#define MFTL_ID_MAX INT64_MAX
-#define MFTL_FMT "%lld"  // Printf format
-#define MFTL_VTK_TYPE "Int64"  // VTK XML type string
-#else
-// Standard mode: faster, uses 50% less RAM for topology
-typedef int32_t mftl_int_t;
-#define MFTL_ID_MAX INT32_MAX
-#define MFTL_FMT "%d"  // Printf format
-#define MFTL_VTK_TYPE "Int32"  // VTK XML type string
-#endif
-
-#ifdef MFTL_USE_64BIT
-// 64-bit Keys (GID), 64-bit Values (Local Index)
-KHASH_MAP_INIT_INT64(vertex_map, mftl_int_t)
-KHASH_MAP_INIT_INT64(halfedge_map, mftl_int_t)
-KHASH_MAP_INIT_INT64(triangle_map, mftl_int_t)
-KHASH_MAP_INIT_INT64(object_map, mftl_int_t)
-#else
-// 32-bit Keys (GID), 32-bit Values (Local Index)
-KHASH_MAP_INIT_INT(vertex_map, mftl_int_t)
-KHASH_MAP_INIT_INT(halfedge_map, mftl_int_t)
-KHASH_MAP_INIT_INT(triangle_map, mftl_int_t)
-KHASH_MAP_INIT_INT(object_map, mftl_int_t)
-#endif
+KHASH_MAP_INIT_INT(vertex_map, int)
+KHASH_MAP_INIT_INT(halfedge_map, int)
+KHASH_MAP_INIT_INT(triangle_map, int)
+KHASH_MAP_INIT_INT(object_map, int)
 
 extern MPI_Datatype MPI_MFTL_INT;
 
@@ -86,15 +64,15 @@ typedef struct MFTL_Vertex
   double area;  ///< Voronoi area associated with the vertex.
 
   // --- Parallelism & Domain Information ---
-  mftl_int_t owner_proc;  ///< The MPI rank that has primary authority over this vertex.
+  int owner_proc;  ///< The MPI rank that has primary authority over this vertex.
   bool is_ghost;  ///< True if this vertex is a ghost copy from another processor.
-  mftl_int_t global_id;  ///< A unique ID across all processors for tracking.
+  int global_id;  ///< A unique ID across all processors for tracking.
 
   // --- Topology ---
-  mftl_int_t out_he_idx;  ///< Index of the outgoing half-edge.
+  int out_he_idx;  ///< Index of the outgoing half-edge.
 
   // --- Application-Specific Data ---
-  mftl_int_t flags;  ///< Bit flags for marking (e.g., for remeshing).
+  int flags;  ///< Bit flags for marking (e.g., for remeshing).
 
 } MFTL_Vertex;
 
@@ -108,7 +86,7 @@ typedef struct MFTL_Vertex
 typedef struct MFTL_Triangle
 {
   // --- Topology ---
-  mftl_int_t he_idx;  ///< Index of one half-edge on the triangle's boundary.
+  int he_idx;  ///< Index of one half-edge on the triangle's boundary.
 
   // --- Geometric Properties ---
   double normal[3];  ///< The geometric normal of the triangle.
@@ -116,13 +94,13 @@ typedef struct MFTL_Triangle
   double center[3];  ///< The geometric center (centroid) of the triangle.
 
   // --- Parallelism & Domain Information ---
-  mftl_int_t owner_proc;  ///< The MPI rank that has primary authority over this triangle.
+  int owner_proc;  ///< The MPI rank that has primary authority over this triangle.
   bool is_ghost;  ///< True if this triangle is a ghost copy from another processor.
-  mftl_int_t global_id;  ///< A unique ID across all processors.
+  int global_id;  ///< A unique ID across all processors.
 
   // --- Application-Specific Data ---
   void *data;  ///< Pointer to user-defined data associated with this triangle. TO-DO: put this into a hash define for better cache performance!?
-  mftl_int_t flags;  ///< Bit flags for marking (e.g., for remeshing).
+  int flags;  ///< Bit flags for marking (e.g., for remeshing).
 } MFTL_Triangle;
 
 /**
@@ -137,16 +115,16 @@ typedef struct MFTL_Triangle
 typedef struct MFTL_HalfEdge
 {
   // --- Topology ---
-  mftl_int_t vertex_idx;  ///< Index of the vertex at the END of this directed edge.
-  mftl_int_t twin_idx;  ///< Index of the oppositely oriented half-edge. NULL if on a boundary.
-  mftl_int_t next_idx;  ///< Index of the next half-edge in the counter-clockwise direction.
-  mftl_int_t triangle_idx;  ///< Index of the triangle this half-edge belongs to.
+  int vertex_idx;  ///< Index of the vertex at the END of this directed edge.
+  int twin_idx;  ///< Index of the oppositely oriented half-edge. NULL if on a boundary.
+  int next_idx;  ///< Index of the next half-edge in the counter-clockwise direction.
+  int triangle_idx;  ///< Index of the triangle this half-edge belongs to.
 
   // --- Parallelism & Domain Information ---
-  mftl_int_t global_id;  ///< A unique ID across all processors.
+  int global_id;  ///< A unique ID across all processors.
 
   // --- Application-Specific Data ---
-  mftl_int_t flags;  ///< Bit flags for marking (e.g., for remeshing).
+  int flags;  ///< Bit flags for marking (e.g., for remeshing).
   bool boundary;  ///<  True if this halfedge is a boundary edge.
 } MFTL_HalfEdge;
 
@@ -166,21 +144,21 @@ typedef struct MFTL_Object
   MFTL_Triangle *triangles;  ///< Array of all triangles in this partition.
   MFTL_HalfEdge *half_edges;  ///< Array of all half-edges in this partition.
 
-  mftl_int_t n_vertices;  ///< Current number of active vertices.
-  mftl_int_t n_triangles;  ///< Current number of active triangles.
-  mftl_int_t n_half_edges;  ///< Current number of active half-edges.
+  int n_vertices;  ///< Current number of active vertices.
+  int n_triangles;  ///< Current number of active triangles.
+  int n_half_edges;  ///< Current number of active half-edges.
 
-  mftl_int_t capacity_vertices;  ///< Allocated capacity for the vertices array.
-  mftl_int_t capacity_triangles;  ///< Allocated capacity for the triangles array.
-  mftl_int_t capacity_half_edges;  ///< Allocated capacity for the half_edges array.
+  int capacity_vertices;  ///< Allocated capacity for the vertices array.
+  int capacity_triangles;  ///< Allocated capacity for the triangles array.
+  int capacity_half_edges;  ///< Allocated capacity for the half_edges array.
 
   // Global ID counters for new body creation or vertex insertion.
-  mftl_int_t next_vertex_gid;
-  mftl_int_t next_triangle_gid;
-  mftl_int_t next_halfedge_gid;
+  int next_vertex_gid;
+  int next_triangle_gid;
+  int next_halfedge_gid;
 
-  mftl_int_t global_n_triangles;  // Total across all ranks (excluding ghosts)
-  mftl_int_t global_n_vertices;  // Total across all ranks (excluding ghosts)
+  int global_n_triangles;  // Total across all ranks (excluding ghosts)
+  int global_n_vertices;  // Total across all ranks (excluding ghosts)
 
   // --- Hash maps for fast lookup ---
   khash_t(vertex_map) * vertex_lookup;
@@ -189,12 +167,12 @@ typedef struct MFTL_Object
 
   // --- Acceleration Structures (Flattened Topology) ---
   // These are allocated by MFTLFlattenConnectivity()
-  mftl_int_t *flat_tri_verts;  ///< Size: 3 * n_triangles. Vert indices for each tri.
-  mftl_int_t *flat_tri_neighbors;  ///< Size: 3 * n_triangles. Neighbor tri indices.
-  mftl_int_t *vert_offsets;  ///< Size: n_vertices + 1. CSR offsets for V2T map.
-  mftl_int_t *vert_tris;  ///< Size: 3 * n_triangles. CSR values for V2T map.
+  int *flat_tri_verts;  ///< Size: 3 * n_triangles. Vert indices for each tri.
+  int *flat_tri_neighbors;  ///< Size: 3 * n_triangles. Neighbor tri indices.
+  int *vert_offsets;  ///< Size: n_vertices + 1. CSR offsets for V2T map.
+  int *vert_tris;  ///< Size: 3 * n_triangles. CSR values for V2T map.
 
-  mftl_int_t global_id;  ///< A unique ID across all processors for tracking.
+  int global_id;  ///< A unique ID across all processors for tracking.
 
   // Pointer to the domain this object lives in.
   struct MFTL_Domain *domain;
@@ -240,6 +218,9 @@ typedef struct MFTL_Domain
   int *rank_map;  // Linear array: rank_map[i + j*nx + k*nx*ny] = rank
   double grid_factors[3];  // Pre-calculated: cuts[i] / domain_size[i]
 
+  // --- Parallel Remeshing ---
+  double decomp_shift[3];  // current shift: 0 or h_k/2 per axis
+
 } MFTL_Domain;
 
 //------------------------------------------------------------------------------
@@ -256,11 +237,15 @@ typedef struct MFTL_Ensemble
 
   // The Data (List of Objects)
   MFTL_Object **objects;
-  mftl_int_t num_objects;
-  mftl_int_t capacity_objects;  // If you add/remove objects dynamically
+  int num_objects;
+  int capacity_objects;  // If you add/remove objects dynamically
 
   // Global Statistics
-  mftl_int_t total_global_triangles;
+  int total_global_triangles;
+
+  // --- Parallel Remeshing ---
+  MFTL_EnsembleType type;
+  MFTL_RemeshAlgorithm last_algorithm;  // algorithm used in the last remesh
 
 } MFTL_Ensemble;
 
@@ -275,7 +260,7 @@ typedef struct MFTL_Ensemble
  * is passed, the function will use MPI_COMM_WORLD.
  * @return A pointer to the newly allocated mesh, or NULL on failure.
  */
-MFTL_Object *MFTLObjectCreate(mftl_int_t global_id);
+MFTL_Object *MFTLObjectCreate(int global_id);
 
 /**
  * @brief Frees all memory associated with an MFTL_Object mesh.
@@ -331,8 +316,7 @@ void MFTLObjectUpdateGlobalStats(MFTL_Object *object);
  *
  * @return A pointer to the newly created MFTL_Ensemble, or NULL if initialization fails.
  */
-MFTL_Ensemble *MFTLEnsembleCreate(MPI_Comm comm, int cuts[3], double global_min[3], double global_max[3], bool is_periodic[3],
-                                  mftl_int_t initial_object_capacity);
+MFTL_Ensemble *MFTLEnsembleCreate(MPI_Comm comm, int cuts[3], double global_min[3], double global_max[3], bool is_periodic[3], int initial_object_capacity);
 
 /**
  * @brief Adds an object to the ensemble and links the domain.
@@ -340,7 +324,7 @@ MFTL_Ensemble *MFTLEnsembleCreate(MPI_Comm comm, int cuts[3], double global_min[
  * @param object The object to add.
  * @return MFTL_SUCCESS on success.
  */
-mftl_int_t MFTLEnsembleAddObject(MFTL_Ensemble *ensemble, MFTL_Object *object);
+int MFTLEnsembleAddObject(MFTL_Ensemble *ensemble, MFTL_Object *object);
 
 /**
  * @brief Destroys an MFTL Ensemble and frees all associated resources.
@@ -365,6 +349,6 @@ void MFTLEnsembleDestroy(MFTL_Ensemble **p_ens);
  * @param radius The radius of the sphere.
  * @param refinements The number of refinements for the sphere.
  */
-mftl_int_t MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, mftl_int_t refinements);
+int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int refinements);
 
 #endif  // MFTL_CORE_H

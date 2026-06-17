@@ -9,7 +9,7 @@
  * High-level wrapper. 
  * Allocates temporary memory internally and sorts the data in-place.
  */
-void MFTLSortIds(mftl_int_t* data, mftl_int_t count);
+void MFTLSortIds(int* data, int count);
 
 /**
  * Sorts keys and moves associated values in parallel.
@@ -18,7 +18,7 @@ void MFTLSortIds(mftl_int_t* data, mftl_int_t count);
  * @param values Array of associated data (e.g. original indices) to move with keys.
  * @param count  Number of elements.
  */
-void MFTLSortPairs(mftl_int_t* keys, mftl_int_t* values, mftl_int_t count);
+void MFTLSortPairs(int* keys, int* values, int count);
 
 /**
  * Low-level core sort.
@@ -28,7 +28,7 @@ void MFTLSortPairs(mftl_int_t* keys, mftl_int_t* values, mftl_int_t count);
  * @param keys_temp Temporary buffer of same size as keys_in.
  * @param size      Number of elements.
  */
-void MFTLRadixSort(mftl_int_t* keys_in, mftl_int_t* keys_temp, mftl_int_t size);
+void MFTLRadixSort(int* keys_in, int* keys_temp, int size);
 
 /**
  * @brief Finds the unique integers in a given input array.
@@ -44,16 +44,16 @@ void MFTLRadixSort(mftl_int_t* keys_in, mftl_int_t* keys_temp, mftl_int_t size);
  * @param output_capacity The maximum number of elements the output array can hold.
  * @return The number of unique integers found and placed in the output array.
  */
-static inline mftl_int_t MFTLGetUniqueIntegers(const mftl_int_t* input_array, mftl_int_t input_count, mftl_int_t* output_array, mftl_int_t output_capacity)
+static inline int MFTLGetUniqueIntegers(const int* input_array, int input_count, int* output_array, int output_capacity)
 {
-  mftl_int_t num_unique = 0;
-  for (mftl_int_t j = 0; j < input_count; ++j)
+  int num_unique = 0;
+  for (int j = 0; j < input_count; ++j)
   {
-    mftl_int_t d = input_array[j];
-    mftl_int_t found = 0;
+    int d = input_array[j];
+    int found = 0;
 
     // Check if we've already added this integer to our output list.
-    for (mftl_int_t k = 0; k < num_unique; ++k)
+    for (int k = 0; k < num_unique; ++k)
     {
       if (output_array[k] == d)
       {
@@ -85,12 +85,12 @@ static inline mftl_int_t MFTLGetUniqueIntegers(const mftl_int_t* input_array, mf
  * @param n    The number of elements in the array.
  * @return     The new number of unique elements in the array.
  */
-static inline mftl_int_t MFTLUniqueIntArray(mftl_int_t* arr, mftl_int_t n)
+static inline int MFTLUniqueIntArray(int* arr, int n)
 {
   if (n == 0) return 0;
 
-  mftl_int_t dest = 0;
-  for (mftl_int_t src = 1; src < n; ++src)
+  int dest = 0;
+  for (int src = 1; src < n; ++src)
   {
     if (arr[src] != arr[dest])
     {
@@ -117,12 +117,12 @@ static inline mftl_int_t MFTLUniqueIntArray(mftl_int_t* arr, mftl_int_t n)
  * @param n      The number of elements in the arrays.
  * @return       The new number of unique elements.
  */
-static inline mftl_int_t MFTLUniquePairs(mftl_int_t* keys, mftl_int_t* values, mftl_int_t n)
+static inline int MFTLUniquePairs(int* keys, int* values, int n)
 {
   if (n <= 0) return 0;
 
-  mftl_int_t dest = 0;
-  for (mftl_int_t src = 1; src < n; ++src)
+  int dest = 0;
+  for (int src = 1; src < n; ++src)
   {
     // Check for unique key
     if (keys[src] != keys[dest])

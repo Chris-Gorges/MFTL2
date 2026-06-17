@@ -32,13 +32,13 @@ int test_sphere_generation()
   // Expected V = 10 * 4^3 + 2 = 642
 
   double center[3] = {0, 0, 0};
-  mftl_int_t ref = 3;
+  int ref = 3;
   MFTLGenerateSphere(obj, center, 1.0, ref);
 
   // 4. Verification
   // Count local entities (serial run)
-  mftl_int_t local_t = obj->n_triangles;
-  mftl_int_t local_v = obj->n_vertices;
+  int local_t = obj->n_triangles;
+  int local_v = obj->n_vertices;
 
   if (rank == 0)
   {
@@ -51,7 +51,7 @@ int test_sphere_generation()
   }
 
   // 5. Integrity
-  mftl_int_t integrity = MFTLCheckMeshIntegrity(obj);
+  int integrity = MFTLCheckMeshIntegrity(obj);
   TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, integrity);
 
   // Cleanup

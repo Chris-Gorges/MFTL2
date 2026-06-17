@@ -4,9 +4,9 @@
 #include <stdlib.h>
 #include <assert.h>
 
-mftl_int_t intersection_count = 0;
+int intersection_count = 0;
 
-void test_intersection_cb(MFTL_Object* objA, mftl_int_t triA_id, MFTL_Object* objB, mftl_int_t triB_id, void* user_data)
+void test_intersection_cb(MFTL_Object* objA, int triA_id, MFTL_Object* objB, int triB_id, void* user_data)
 {
   intersection_count++;
   printf("Hit: A[%lld] intersects B[%lld]\n", (long long) triA_id, (long long) triB_id);
@@ -28,7 +28,7 @@ int main(int argc, char** argv)
   MFTL_Object* objA = calloc(1, sizeof(MFTL_Object));
   objA->n_triangles = 1;
   objA->vertices = calloc(3, sizeof(MFTL_Vertex));
-  objA->flat_tri_verts = calloc(3, sizeof(mftl_int_t));
+  objA->flat_tri_verts = calloc(3, sizeof(int));
 
   // Triangle A0: flat on Z=0
   objA->vertices[0].pos[0] = 0.0;
@@ -47,7 +47,7 @@ int main(int argc, char** argv)
   MFTL_Object* objB = calloc(1, sizeof(MFTL_Object));
   objB->n_triangles = 2;
   objB->vertices = calloc(6, sizeof(MFTL_Vertex));
-  objB->flat_tri_verts = calloc(6, sizeof(mftl_int_t));
+  objB->flat_tri_verts = calloc(6, sizeof(int));
 
   // Triangle B0: intersects A0 (pierces it vertically at x=0.5, y=0.5)
   objB->vertices[0].pos[0] = 0.5;

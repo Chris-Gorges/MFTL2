@@ -23,7 +23,7 @@
  * is passed, the function will use MPI_COMM_WORLD.
  * @return A pointer to the newly allocated mesh, or NULL on failure.
  */
-MFTL_Object* MFTLObjectCreate(mftl_int_t global_id)
+MFTL_Object* MFTLObjectCreate(int global_id)
 {
   // Allocate zero-initialized struct
   MFTL_Object* object = (MFTL_Object*) calloc(1, sizeof(MFTL_Object));
@@ -107,29 +107,29 @@ void MFTLEnsembleUpdateGlobalCounts(MFTL_Ensemble* ensemble)
 {
   if (!ensemble) return;
 
-  mftl_int_t num_objects = ensemble->num_objects;
+  int num_objects = ensemble->num_objects;
   if (num_objects == 0) return;
 
   MPI_Comm comm = ensemble->domain.comm_world;
 
   // 1. Allocate buffers for batch reduction
   // Layout: [Obj0_Tris, Obj0_Verts, Obj1_Tris, Obj1_Verts, ... ]
-  mftl_int_t* local_counts = (mftl_int_t*) calloc(2 * num_objects, sizeof(mftl_int_t));
+  int* local_counts = (int*) calloc(2 * num_objects, sizeof(int));
   assert(local_counts);
 
-  mftl_int_t* global_counts = (mftl_int_t*) malloc(2 * num_objects * sizeof(mftl_int_t));
+  int* global_counts = (int*) malloc(2 * num_objects * sizeof(int));
   assert(global_counts);
 
   // 2. Count Local Non-Ghost Entities
-  for (mftl_int_t o = 0; o < num_objects; ++o)
+  for (int o = 0; o < num_objects; ++o)
   {
     // Access object via the ensemble array
     MFTL_Object* obj = ensemble->objects[o];
     assert(obj);
 
     // Count Owned Triangles
-    mftl_int_t t_count = 0;
-    for (mftl_int_t i = 0; i < obj->n_triangles; ++i)
+    int t_count = 0;
+    for (int i = 0; i < obj->n_triangles; ++i)
     {
       if (!obj->triangles[i].is_ghost)
       {
@@ -138,8 +138,8 @@ void MFTLEnsembleUpdateGlobalCounts(MFTL_Ensemble* ensemble)
     }
 
     // Count Owned Vertices
-    mftl_int_t v_count = 0;
-    for (mftl_int_t i = 0; i < obj->n_vertices; ++i)
+    int v_count = 0;
+    for (int i = 0; i < obj->n_vertices; ++i)
     {
       if (!obj->vertices[i].is_ghost)
       {
@@ -157,9 +157,9 @@ void MFTLEnsembleUpdateGlobalCounts(MFTL_Ensemble* ensemble)
   MPI_Allreduce(local_counts, global_counts, 2 * num_objects, MPI_MFTL_INT, MPI_SUM, comm);
 
   // 4. Unpack results back into the Objects
-  mftl_int_t total_ensemble_tris = 0;
+  int total_ensemble_tris = 0;
 
-  for (mftl_int_t o = 0; o < num_objects; ++o)
+  for (int o = 0; o < num_objects; ++o)
   {
     MFTL_Object* obj = ensemble->objects[o];
     assert(obj);
@@ -192,11 +192,11 @@ void MFTLObjectUpdateGlobalStats(MFTL_Object* object)
   assert(domain);
 
   // 1. Calculate Local Counts (Owned entities only)
-  mftl_int_t t_count = 0;
-  mftl_int_t v_count = 0;
+  int t_count = 0;
+  int v_count = 0;
 
   // Count Owned Triangles
-  for (mftl_int_t i = 0; i < object->n_triangles; ++i)
+  for (int i = 0; i < object->n_triangles; ++i)
   {
     if (!object->triangles[i].is_ghost)
     {
@@ -205,7 +205,7 @@ void MFTLObjectUpdateGlobalStats(MFTL_Object* object)
   }
 
   // Count Owned Vertices
-  for (mftl_int_t i = 0; i < object->n_vertices; ++i)
+  for (int i = 0; i < object->n_vertices; ++i)
   {
     if (!object->vertices[i].is_ghost)
     {
@@ -214,12 +214,12 @@ void MFTLObjectUpdateGlobalStats(MFTL_Object* object)
   }
 
   // Pack into buffer: [Triangles, Vertices]
-  mftl_int_t local_counts[2];
+  int local_counts[2];
   local_counts[0] = t_count;
   local_counts[1] = v_count;
 
   // 2. Global Reduction
-  mftl_int_t global_counts[2];
+  int global_counts[2];
   // We reduce 2 integers: one for tris, one for verts
   MPI_Allreduce(local_counts, global_counts, 2, MPI_MFTL_INT, MPI_SUM, domain->comm_world);
 

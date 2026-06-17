@@ -17,9 +17,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-mftl_int_t local_intersections = 0;
+int local_intersections = 0;
 
-void sphere_intersection_cb(MFTL_Object* objA, mftl_int_t triA_id, MFTL_Object* objB, mftl_int_t triB_id, void* user_data) { local_intersections++; }
+void sphere_intersection_cb(MFTL_Object* objA, int triA_id, MFTL_Object* objB, int triB_id, void* user_data) { local_intersections++; }
 
 int main(int argc, char** argv)
 {
@@ -106,11 +106,11 @@ int main(int argc, char** argv)
     }
 
     // 2. Flatten Topology for fast array access in intersection tests
-    MFTLFlattenConnectivity(objA);
-    MFTLFlattenConnectivity(objB);
+    // MFTLFlattenConnectivity(objA);
+    // MFTLFlattenConnectivity(objB);
 
     // 3. SOTA Spatial Ghosting exchange to handle cross-boundary collisions accurately
-    MFTL_CreateSpatialGhosts(objA, objB);
+    // MFTL_CreateSpatialGhosts(objA, objB);
 
     // 4. Bounding Volume Hierarchies
     MFTL_BVH* bvhA = MFTL_GenerateLBVH(objA);

@@ -114,7 +114,7 @@ int test_redistribution_stress()
     MFTLRedistributeListOfObjects(ens);
     MFTLEnsembleUpdateGlobalCounts(ens);
 
-    mftl_int_t initial_tris = ens->total_global_triangles;
+    int initial_tris = ens->total_global_triangles;
 
     if (rank == 0) printf("    Initial Tris: %lld\n", (long long) initial_tris);
 

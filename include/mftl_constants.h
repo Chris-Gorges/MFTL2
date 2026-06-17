@@ -9,6 +9,10 @@
 
 #include <stdbool.h>
 #include <math.h>
+#include <assert.h>
+#include <float.h> /* DBL_MAX   */
+
+#define MFTL_ASSERT(condition) assert(condition)
 
 #define MFTL_SUCCESS 0
 #define MFTL_ERROR -1
@@ -37,6 +41,9 @@
 #define MFTL_SIN(x) sin(x)
 
 #define MFTL_ONE_THIRD 0.33333333333333333333
+
+#define MFTL_DBL_MAX DBL_MAX
+#define MFTL_DBL_MIN DBL_MIN
 
 #define MFTL_MAX_VALENCE 32
 

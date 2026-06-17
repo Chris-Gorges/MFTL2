@@ -67,12 +67,12 @@ _Static_assert(sizeof(MFTL_BVHNode) == 32, "MFTL_BVHNode must be exactly 32 byte
 typedef struct MFTL_BVH
 {
   MFTL_BVHNode* nodes;  ///< Array of all BVH nodes
-  mftl_int_t* prim_indices;  ///< Reordered triangle indices from radix sort
+  int* prim_indices;  ///< Reordered triangle indices from radix sort
 
-  mftl_int_t nodes_used;  ///< Number of currently active nodes
-  mftl_int_t nodes_capacity;  ///< Total allocated capacity for nodes array
+  int nodes_used;  ///< Number of currently active nodes
+  int nodes_capacity;  ///< Total allocated capacity for nodes array
 
-  mftl_int_t root_index;  ///< Index of the root node (usually 0)
+  int root_index;  ///< Index of the root node (usually 0)
 } MFTL_BVH;
 
 /**
@@ -83,7 +83,7 @@ typedef struct MFTL_BVH
  * @param triB_id Index of the intersected triangle in objB.
  * @param user_data Pointer to an optional user-provided data structure.
  */
-typedef void (*IntersectionCallback)(MFTL_Object* objA, mftl_int_t triA_id, MFTL_Object* objB, mftl_int_t triB_id, void* user_data);
+typedef void (*IntersectionCallback)(MFTL_Object* objA, int triA_id, MFTL_Object* objB, int triB_id, void* user_data);
 
 /**
  * @brief Exchangers bounding box and intersecting triangles across MPI domains.
@@ -92,7 +92,7 @@ typedef void (*IntersectionCallback)(MFTL_Object* objA, mftl_int_t triA_id, MFTL
  * @param objB The second object.
  * @return MFTL_SUCCESS on success.
  */
-mftl_int_t MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB);
+int MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB);
 
 /**
  * @brief Generates a Linear Bounding Volume Hierarchy (LBVH) for a given object.
@@ -135,6 +135,6 @@ void MFTL_IntersectObjects(MFTL_Object* objA, MFTL_BVH* bvhA, MFTL_Object* objB,
  * @param triB_id Index of the second triangle.
  * @return 1 if they intersect, 0 if disjoint (or coplanar, if non-overlapping).
  */
-int MFTL_TriTriIntersect(MFTL_Object* objA, mftl_int_t triA_id, MFTL_Object* objB, mftl_int_t triB_id);
+int MFTL_TriTriIntersect(MFTL_Object* objA, int triA_id, MFTL_Object* objB, int triB_id);
 
 #endif  // MFTL_BVH_H

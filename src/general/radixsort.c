@@ -114,9 +114,9 @@ static inline void radixpass(uint32_t* __restrict hist, const uint32_t shift, co
 // Public Implementation
 // -----------------------------------------------------------------------------
 
-void MFTLRadixSort(mftl_int_t* keys_in, mftl_int_t* keys_temp, mftl_int_t size)
+void MFTLRadixSort(int* keys_in, int* keys_temp, int size)
 {
-  // Safety check for negative size (since mftl_int_t is signed)
+  // Safety check for negative size (since int is signed)
   if (size < 0) return;
 
   mftl_uint_t* __restrict keys_u_in = (mftl_uint_t*) keys_in;
@@ -144,13 +144,13 @@ void MFTLRadixSort(mftl_int_t* keys_in, mftl_int_t* keys_temp, mftl_int_t size)
   }
 }
 
-void MFTLSortIds(mftl_int_t* data, mftl_int_t count)
+void MFTLSortIds(int* data, int count)
 {
   // Safety check
   if (count < 2) return;
 
   // We must cast count to size_t for malloc to ensure correct allocation size
-  mftl_int_t* temp = (mftl_int_t*) malloc(sizeof(mftl_int_t) * (size_t) count);
+  int* temp = (int*) malloc(sizeof(int) * (size_t) count);
 
   if (temp)
   {
@@ -183,15 +183,15 @@ static inline void radixpass_soa(uint32_t* __restrict hist, const uint32_t shift
   }
 }
 
-void MFTLSortPairs(mftl_int_t* keys, mftl_int_t* values, mftl_int_t count)
+void MFTLSortPairs(int* keys, int* values, int count)
 {
   if (count < 2) return;
 
   // Explicit cast to size_t for malloc
   size_t u_count = (size_t) count;
 
-  mftl_int_t* temp_keys = (mftl_int_t*) malloc(sizeof(mftl_int_t) * u_count);
-  mftl_int_t* temp_vals = (mftl_int_t*) malloc(sizeof(mftl_int_t) * u_count);
+  int* temp_keys = (int*) malloc(sizeof(int) * u_count);
+  int* temp_vals = (int*) malloc(sizeof(int) * u_count);
 
   if (!temp_keys || !temp_vals)
   {

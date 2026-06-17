@@ -26,8 +26,8 @@
 typedef struct
 {
   // --- Identity & Ownership ---
-  mftl_int_t global_id;
-  mftl_int_t owner_proc;
+  int global_id;
+  int owner_proc;
 
   // --- Geometric Properties ---
   double pos[3];
@@ -38,12 +38,12 @@ typedef struct
 
   // --- State Information ---
   bool is_ghost;
-  mftl_int_t flags;
+  int flags;
 
   // --- Pointer Information ---
-  mftl_int_t id_he_out;
+  int id_he_out;
 
-  mftl_int_t body_id;
+  int body_id;
 
 } PackedVertex;
 
@@ -54,11 +54,11 @@ typedef struct
 typedef struct
 {
   // --- Identity & Ownership ---
-  mftl_int_t global_id;
-  mftl_int_t owner_proc;
+  int global_id;
+  int owner_proc;
 
   // --- Relational Data ---
-  mftl_int_t he_id;  // id of one halfedge belonging to this triangle
+  int he_id;  // id of one halfedge belonging to this triangle
 
   // --- Geometric Properties ---
   double normal[3];
@@ -67,9 +67,9 @@ typedef struct
 
   // --- State Information ---
   bool is_ghost;
-  mftl_int_t flags;
+  int flags;
 
-  mftl_int_t body_id;
+  int body_id;
 } PackedTriangle;
 
 /**
@@ -79,18 +79,18 @@ typedef struct
 typedef struct
 {
   // --- Identity & Ownership ---
-  mftl_int_t global_id;
-  mftl_int_t owner_proc;
+  int global_id;
+  int owner_proc;
 
   // --- Relational Data (was pointers) ---
-  mftl_int_t vertex_gid;  // ID of the vertex at the end of this edge
-  mftl_int_t twin_gid;  // ID of the opposite half-edge
-  mftl_int_t next_gid;  // ID of the next half-edge around the face
-  mftl_int_t triangle_gid;  // ID of the triangle this edge belongs to
+  int vertex_gid;  // ID of the vertex at the end of this edge
+  int twin_gid;  // ID of the opposite half-edge
+  int next_gid;  // ID of the next half-edge around the face
+  int triangle_gid;  // ID of the triangle this edge belongs to
 
   // --- State Information ---
   bool boundary;
-  mftl_int_t flags;
+  int flags;
 } PackedHalfEdge;
 
 /**
@@ -109,15 +109,15 @@ typedef struct
 // Define a struct to hold buffer info for the packing pass
 typedef struct
 {
-  mftl_int_t count;  // Will be used as the current packing index
-  mftl_int_t capacity;
+  int count;  // Will be used as the current packing index
+  int capacity;
   void* buffer;
 } MFTL_SendBuffer;
 
 // A lightweight struct to send just the necessary data.
 typedef struct
 {
-  mftl_int_t global_id;
+  int global_id;
   double pos[3];
   double normal[3];
   double meancurvature;
@@ -125,13 +125,13 @@ typedef struct
   double area;
 } GhostUpdatePayload;
 
-// A map from a neighbor rank (mftl_int_t) to a list of GIDs (int64_t*).
+// A map from a neighbor rank (int) to a list of GIDs (int64_t*).
 // We'll also need to store the count/capacity of that list.
 typedef struct
 {
-  mftl_int_t count;
-  mftl_int_t capacity;
-  mftl_int_t* gids;
+  int count;
+  int capacity;
+  int* gids;
 } MFTL_GidList;
 
 // --- Global MPI Datatype Handles ---
@@ -169,7 +169,7 @@ void MFTLFreeMpiTypes();
  *
  * MPI works with 32 bit int, so its safer to stay with int here.
  */
-static inline mftl_int_t MFTLGetOwnerProc(const MFTL_Domain* domain, const double pos[3])
+static inline int MFTLGetOwnerProc(const MFTL_Domain* domain, const double pos[3])
 {
   // Pre-check: Ensure the point is within the global domain.
   assert(pos[0] >= domain->global_min[0] && pos[0] <= domain->global_max[0] && pos[1] >= domain->global_min[1] && pos[1] <= domain->global_max[1] &&
@@ -224,11 +224,11 @@ static inline mftl_int_t MFTLGetOwnerProc(const MFTL_Domain* domain, const doubl
  * @param base The geometric basis for determining ownership (VERTEX_BASED or CENTER_BASED).
  * @return 0 on success, -1 on failure.
  */
-mftl_int_t MFTLRedistributeObject(MFTL_Object* object);
-mftl_int_t MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble);
+int MFTLRedistributeObject(MFTL_Object* object);
+int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble);
 
-void MFTLPackSingleVertex(MFTL_Object* obj, mftl_int_t vert_idx, PackedVertex* dst, bool is_ghost);
-void MFTLPackSingleTriangle(MFTL_Object* obj, mftl_int_t tri_idx, PackedTriangleComplex* dst, bool is_ghost);
+void MFTLPackSingleVertex(MFTL_Object* obj, int vert_idx, PackedVertex* dst, bool is_ghost);
+void MFTLPackSingleTriangle(MFTL_Object* obj, int tri_idx, PackedTriangleComplex* dst, bool is_ghost);
 
 void MFTLAppendGhostVertex(MFTL_Object* obj, PackedVertex* pv);
 void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc);
@@ -239,7 +239,7 @@ void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc);
  * @param object_lookup Optional hash map (BodyID -> Index). Pass MFTL_NULL to use linear search fallback.
  * @return MFTL_SUCCESS on success.
  */
-mftl_int_t MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lookup);
+int MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lookup);
 
 /**
  * @brief Extends the ghost layer by a specified number of topological steps.
@@ -247,6 +247,6 @@ mftl_int_t MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * ob
  * @param steps Number of steps to extend (e.g. 1 step = V->T->V).
  * @return MFTL_SUCCESS on success.
  */
-mftl_int_t MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps);
+int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps);
 
 #endif

@@ -35,7 +35,7 @@ int test_ghost_extension_accuracy()
 
   double center[3] = {0.0, 0.0, 0.0};
   double radius = 1.0;
-  mftl_int_t ref = 3;  // Enough to have good density
+  int ref = 3;  // Enough to have good density
 
   // All ranks participate in valid generation logic (collective inside)
   MFTLGenerateSphere(obj, center, radius, ref);
@@ -99,7 +99,7 @@ int test_ghost_extension_accuracy()
     {
       // Check Neighborhood
       MFTL_Neighborhood nb;
-      mftl_int_t seed = g_idx;
+      int seed = g_idx;
       MFTLGetNeighborhood(obj, &seed, 1, true, 1, &nb);  // V->T (1 step)
 
       if (nb.n_tris > 0)
@@ -128,7 +128,7 @@ int test_ghost_extension_accuracy()
   if (ghost_count > 0) TEST_ASSERT(valid_ghost_structure);
 
   // 6. Stress (Extend 5 more)
-  mftl_int_t old_ghosts = ghost_count;
+  int old_ghosts = ghost_count;
   MFTLExtendGhostLayer(ens, 5);
 
   int new_ghost_count = 0;
