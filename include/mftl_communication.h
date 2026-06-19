@@ -227,6 +227,34 @@ static inline int MFTLGetOwnerProc(const MFTL_Domain* domain, const double pos[3
 int MFTLRedistributeObject(MFTL_Object* object);
 int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble);
 
+/**
+ * @brief Intelligently redistributes mesh data, choosing the optimal
+ *        communication pattern based on the ensemble's object count.
+ *
+ * @details
+ *  - 0 objects : Early exit, no communication.
+ *  - 1 object  : Routes to MFTLRedistributeObject(), which avoids all
+ *                master-buffer management, hierarchical radix sorting,
+ *                body-ID tagging, and per-object grouping passes that
+ *                are only needed when multiple bodies coexist.
+ *  - N objects : Routes to MFTLRedistributeListOfObjects(), which handles
+ *                interleaved packing and hierarchical deduplication across
+ *                all bodies in a single communication round.
+ *
+ * @param ens The ensemble to redistribute. All ranks must call collectively.
+ * @return MFTL_SUCCESS on success, MFTL_ERROR on failure.
+ */
+static inline int MFTLRedistribute(MFTL_Ensemble* ens)
+{
+  MFTL_ASSERT(ens != NULL && "MFTLRedistribute: NULL ensemble");
+
+  if (ens->num_objects == 0 || ens->objects == MFTL_NULL) return MFTL_ERROR;
+
+  if (ens->num_objects == 1) return MFTLRedistributeObject(ens->objects[0]);
+
+  return MFTLRedistributeListOfObjects(ens);
+}
+
 void MFTLPackSingleVertex(MFTL_Object* obj, int vert_idx, PackedVertex* dst, bool is_ghost);
 void MFTLPackSingleTriangle(MFTL_Object* obj, int tri_idx, PackedTriangleComplex* dst, bool is_ghost);
 
