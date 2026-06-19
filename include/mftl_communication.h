@@ -172,8 +172,8 @@ void MFTLFreeMpiTypes();
 static inline int MFTLGetOwnerProc(const MFTL_Domain* domain, const double pos[3])
 {
   // Pre-check: Ensure the point is within the global domain.
-  assert(pos[0] >= domain->global_min[0] && pos[0] <= domain->global_max[0] && pos[1] >= domain->global_min[1] && pos[1] <= domain->global_max[1] &&
-         pos[2] >= domain->global_min[2] && pos[2] <= domain->global_max[2] && "Point is outside the global simulation box");
+  MFTL_ASSERT(pos[0] >= domain->global_min[0] && pos[0] <= domain->global_max[0] && pos[1] >= domain->global_min[1] && pos[1] <= domain->global_max[1] &&
+              pos[2] >= domain->global_min[2] && pos[2] <= domain->global_max[2] && "Point is outside the global simulation box");
 
   // 1. Math Optimization:
   // Use pre-calculated factors (multiplication is faster than division).

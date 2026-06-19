@@ -25,8 +25,6 @@ KHASH_MAP_INIT_INT(halfedge_map, int)
 KHASH_MAP_INIT_INT(triangle_map, int)
 KHASH_MAP_INIT_INT(object_map, int)
 
-extern MPI_Datatype MPI_MFTL_INT;
-
 //------------------------------------------------------------------------------
 // Forward Declarations
 //------------------------------------------------------------------------------
@@ -144,9 +142,15 @@ typedef struct MFTL_Object
   MFTL_Triangle *triangles;  ///< Array of all triangles in this partition.
   MFTL_HalfEdge *half_edges;  ///< Array of all half-edges in this partition.
 
-  int n_vertices;  ///< Current number of active vertices.
-  int n_triangles;  ///< Current number of active triangles.
-  int n_half_edges;  ///< Current number of active half-edges.
+  int n_vertices;  ///< Current number of active vertices (local + ghost).
+  int n_triangles;  ///< Current number of active triangles (local + ghost).
+  int n_half_edges;  ///< Current number of active half-edges (local + ghost).
+
+  /* These counts refer to the first n_local_* elements in the arrays.
+     Ghost entities are stored after the local entities. */
+  int n_local_triangles;  ///< Number of local (non-ghost) triangles.
+  int n_local_vertices;  ///< Same invariant for vertices[].
+  int n_local_half_edges;  ///< Same invariant for half_edges[].
 
   int capacity_vertices;  ///< Allocated capacity for the vertices array.
   int capacity_triangles;  ///< Allocated capacity for the triangles array.
@@ -300,7 +304,7 @@ void MFTLObjectUpdateGlobalStats(MFTL_Object *object);
  * - Validating that the process grid (cuts) matches the MPI size.
  * - Setting up global physical bounds and periodicity flags.
  * - Creating the complex 26-neighbor distributed graph topology for efficient communication.
- * 3. Registers custom MPI types (e.g., MPI_MFTL_INT) if this is the first active ensemble.
+ * 3. Registers custom MPI types if this is the first active ensemble.
  * 4. Allocates the initial capacity for the object list.
  *
  * @note This function must be called collectively by all ranks in the communicator.

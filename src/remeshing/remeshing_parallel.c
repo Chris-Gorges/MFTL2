@@ -165,172 +165,6 @@ MFTL_RemeshAlgorithm MFTLSelectRemeshAlgorithm(MFTL_Ensemble *ens, const MFTL_Re
 }
 
 /* ══════════════════════════════════════════════════════════════════════
- * MFTLEnsembleRebalance
- *
- * Moves MFTL_Object *pointers* (no triangle data) between ensembles:
- *
- *   dispersed → spanning if global max bbox width  ≥  PROMOTE * h_min
- *   spanning  → dispersed if global max bbox width  <  DEMOTE  * h_min
- *
- * Hysteresis (PROMOTE > DEMOTE) prevents oscillation near the boundary.
- *
- * Algorithm:
- *   1. Each rank packs (gid, partial_width) for every object in both
- *      ensembles that it has any live vertices for.
- *   2. MPI_Allgatherv shares all pairs globally.  Every rank independently
- *      computes the same global-max-width-per-GID → collective consistency
- *      is achieved without extra communication.
- *   3. Iterate backwards over each ensemble's local object list, comparing
- *      the global max against the thresholds.  Backwards iteration keeps
- *      array indices valid during in-place removal.
- *
- * Triangle migration:  NOT performed here.  After rebalance, the caller
- * must invoke MFTLRemeshEnsemble (or MFTLRedistributeListOfObjects) on
- * each ensemble so that newly promoted/demoted objects' triangles migrate
- * to ranks consistent with the receiving ensemble's decomposition.
- *
- * Complexity: O(N_local_verts) + O(N_total_pairs · log N_total_pairs)
- *             + two MPI_Allgather{v} calls.
- * ══════════════════════════════════════════════════════════════════════ */
-
-/* Threshold factors (tunable). */
-#define MFTL_REBALANCE_PROMOTE_FACTOR 0.40 /* promote if W ≥ factor*h_min */
-#define MFTL_REBALANCE_DEMOTE_FACTOR 0.20 /* demote  if W <  factor*h_min */
-
-void MFTLEnsembleRebalance(MFTL_Ensemble *dispersed, MFTL_Ensemble *spanning, const MFTL_RemeshParameters *params)
-{
-  assert(dispersed != NULL);
-  assert(spanning != NULL);
-  assert(params != NULL);
-
-  (void) params; /* thresholds derived from h_min; params reserved for
-                       future user-configurable threshold overrides */
-
-  MPI_Comm comm = dispersed->domain.comm_cart;
-  int rank, world_size;
-  MPI_Comm_rank(comm, &rank);
-  MPI_Comm_size(comm, &world_size);
-
-  double h_min = MFTLDomainGetHMin(&dispersed->domain);
-  double promote_thresh = MFTL_REBALANCE_PROMOTE_FACTOR * h_min;
-  double demote_thresh = MFTL_REBALANCE_DEMOTE_FACTOR * h_min;
-
-  /* ── Step 1: build local (gid, width) pairs ──────────────────────
-     * We include objects from BOTH ensembles so that the global max
-     * is correct regardless of which ensemble currently holds them.  */
-  int max_local = dispersed->num_objects + spanning->num_objects;
-  int64_t *local_gids = max_local ? (int64_t *) malloc((size_t) max_local * sizeof(int64_t)) : NULL;
-  double *local_widths = max_local ? (double *) malloc((size_t) max_local * sizeof(double)) : NULL;
-  int local_count = 0;
-
-  for (int o = 0; o < dispersed->num_objects; ++o)
-  {
-    MFTL_Object *obj = dispersed->objects[o];
-    if (!obj) continue;
-    local_gids[local_count] = obj->gid;
-    local_widths[local_count] = MFTLObjectComputeMaxBBoxWidth(obj, &dispersed->domain);
-    ++local_count;
-  }
-  for (int o = 0; o < spanning->num_objects; ++o)
-  {
-    MFTL_Object *obj = spanning->objects[o];
-    if (!obj) continue;
-    local_gids[local_count] = obj->gid;
-    local_widths[local_count] = MFTLObjectComputeMaxBBoxWidth(obj, &spanning->domain);
-    ++local_count;
-  }
-
-  /* ── Step 2: Allgatherv – exchange pair counts then data ─────────  */
-  int *all_counts = (int *) malloc((size_t) world_size * sizeof(int));
-  int *displs = (int *) malloc((size_t) world_size * sizeof(int));
-  assert(all_counts && displs);
-
-  MPI_Allgather(&local_count, 1, MPI_INT, all_counts, 1, MPI_INT, comm);
-
-  int total_count = 0;
-  for (int r = 0; r < world_size; ++r)
-  {
-    displs[r] = total_count;
-    total_count += all_counts[r];
-  }
-
-  int64_t *all_gids = total_count ? (int64_t *) malloc((size_t) total_count * sizeof(int64_t)) : NULL;
-  double *all_widths = total_count ? (double *) malloc((size_t) total_count * sizeof(double)) : NULL;
-
-  /* MPI_INT64_T requires MPI 3.0+ and <stdint.h>.
-     * Fallback: use MPI_LONG_LONG if MPI_INT64_T is unavailable.      */
-  MPI_Allgatherv(local_gids, local_count, MPI_INT64_T, all_gids, all_counts, displs, MPI_INT64_T, comm);
-  MPI_Allgatherv(local_widths, local_count, MPI_DOUBLE, all_widths, all_counts, displs, MPI_DOUBLE, comm);
-
-  free(local_gids);
-  free(local_widths);
-  free(all_counts);
-  free(displs);
-
-  /* ── Step 3: merge into sorted GidWidthPair array ────────────────  */
-  MFTL_GidWidthPair *all_pairs = total_count ? (MFTL_GidWidthPair *) malloc((size_t) total_count * sizeof(MFTL_GidWidthPair)) : NULL;
-
-  for (int i = 0; i < total_count; ++i)
-  {
-    all_pairs[i].gid = all_gids[i];
-    all_pairs[i].width = all_widths[i];
-  }
-  free(all_gids);
-  free(all_widths);
-
-  qsort(all_pairs, (size_t) total_count, sizeof(MFTL_GidWidthPair), mftl_cmp_gid_width);
-
-  /* ── Step 4: promote dispersed → spanning (iterate backwards) ────
-     * Backwards iteration keeps remaining indices valid after removal.  */
-  for (int o = dispersed->num_objects - 1; o >= 0; --o)
-  {
-    MFTL_Object *obj = dispersed->objects[o];
-    if (!obj) continue;
-
-    double gmax = MFTLFindGlobalMaxWidthForGid(all_pairs, total_count, obj->gid);
-
-    if (gmax >= promote_thresh)
-    {
-      MFTLEnsembleArrayAppend(spanning, obj);
-      MFTLEnsembleArrayRemoveAt(dispersed, o);
-
-#ifdef MFTL_VERBOSE
-      if (rank == 0)
-        fprintf(stderr,
-                "[MFTL] Rebalance: promoting object gid=%lld"
-                " (width=%.4g >= %.4g)\n",
-                (long long) obj->gid, gmax, promote_thresh);
-#endif
-    }
-  }
-
-  /* ── Step 5: demote spanning → dispersed ────────────────────────── */
-  for (int o = spanning->num_objects - 1; o >= 0; --o)
-  {
-    MFTL_Object *obj = spanning->objects[o];
-    if (!obj) continue;
-
-    double gmax = MFTLFindGlobalMaxWidthForGid(all_pairs, total_count, obj->gid);
-
-    if (gmax < demote_thresh)
-    {
-      MFTLEnsembleArrayAppend(dispersed, obj);
-      MFTLEnsembleArrayRemoveAt(spanning, o);
-
-#ifdef MFTL_VERBOSE
-      if (rank == 0)
-        fprintf(stderr,
-                "[MFTL] Rebalance: demoting object gid=%lld"
-                " (width=%.4g < %.4g)\n",
-                (long long) obj->gid, gmax, demote_thresh);
-#endif
-    }
-  }
-
-  free(all_pairs);
-}
-
-/* ══════════════════════════════════════════════════════════════════════
  * MFTLComputeCoarseningFactor
  *
  * Returns G = cbrt_G^3, the smallest perfect-cube coarsening factor such
@@ -343,7 +177,7 @@ void MFTLEnsembleRebalance(MFTL_Ensemble *dispersed, MFTL_Ensemble *spanning, co
  * [required_cbrt_G, min(cuts[k])].  This signals the caller to either
  * fall back to serial remeshing or abort with a configuration error.
  * ══════════════════════════════════════════════════════════════════════ */
-int MFTLComputeCoarseningFactor(const MFTL_Ensemble *ens, const MFTL_RemeshParameters *params)
+int MFTLComputeCoarseningFactor(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
 {
   MFTL_ASSERT(ens != MFTL_NULL);
   MFTL_ASSERT(params != MFTL_NULL);
@@ -362,8 +196,8 @@ int MFTLComputeCoarseningFactor(const MFTL_Ensemble *ens, const MFTL_RemeshParam
   int min_cuts = MFTL_MIN(ens->domain.cuts[0], MFTL_MIN(ens->domain.cuts[1], ens->domain.cuts[2]));
 
   /* Search upward for the smallest cbrt_G that divides all cuts[k].    *
-     * For well-configured decompositions (cuts[k] = power-of-2 or cube)  *
-     * this loop typically executes at most 2-3 iterations.               */
+   * For well-configured decompositions (cuts[k] = power-of-2 or cube)  *
+   * this loop typically executes at most 2-3 iterations.               */
   int valid = 0;
 
   while (!valid)
@@ -416,7 +250,7 @@ int MFTLComputeCoarseningFactor(const MFTL_Ensemble *ens, const MFTL_RemeshParam
  * The two MPI_Comm_split calls (group_comm, remesh_comm) are collective
  * on flow_comm, so all flow ranks call them in the same order.
  * ══════════════════════════════════════════════════════════════════════ */
-int MFTLRemeshWithCoarsening(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, int G)
+int MFTLRemeshWithCoarsening(MFTL_Ensemble *ens, MFTL_RemeshParameters *params, int G)
 {
   MFTL_ASSERT(ens != NULL);
   MFTL_ASSERT(params != NULL);
@@ -465,11 +299,11 @@ int MFTLRemeshWithCoarsening(MFTL_Ensemble *ens, const MFTL_RemeshParameters *pa
   MFTL_Domain fine_domain = ens->domain;
 
   /* ── Step 2: GATHER – migrate all objects to group master ────────
-     * Single-partition domain: every position maps to rank 0.
-     * MFTLRedistributeListOfObjects runs on group_comm (G ranks).       */
+   * Single-partition domain: every position maps to rank 0.
+   * MFTLRedistributeListOfObjects runs on group_comm (G ranks).       */
   {
     int *gather_map = (int *) calloc(1, sizeof(int)); /* {0} */
-    assert(gather_map != NULL);
+    MFTL_ASSERT(gather_map != NULL);
 
     ens->domain.cuts[0] = 1;
     ens->domain.cuts[1] = 1;
@@ -482,7 +316,7 @@ int MFTLRemeshWithCoarsening(MFTL_Ensemble *ens, const MFTL_RemeshParameters *pa
 
     MFTLRedistributeListOfObjects(ens);
     /* group master (group_pos==0): holds all group objects.
-         * other group members: num_objects == 0.                        */
+     * other group members: num_objects == 0.                        */
     free(gather_map);
   }
 
@@ -526,14 +360,14 @@ int MFTLRemeshWithCoarsening(MFTL_Ensemble *ens, const MFTL_RemeshParameters *pa
   }
 
   /* ── Step 5: SCATTER – distribute remeshed objects to fine-grid
-     *            owners within the group.
-     *
-     * scatter_rank_map maps each fine cell to the group_pos of its owner
-     * (rank within group_comm).  For a fine cell at Cartesian coords
-     * (ix, iy, iz), group_pos = (ix%cbrt_G) + (iy%cbrt_G)*cbrt_G + (iz%cbrt_G)*cbrt_G^2.
-     *
-     * All group members (master and non-masters) execute this step,
-     * making MFTLRedistributeListOfObjects a proper collective.          */
+   *            owners within the group.
+   *
+   * scatter_rank_map maps each fine cell to the group_pos of its owner
+   * (rank within group_comm).  For a fine cell at Cartesian coords
+   * (ix, iy, iz), group_pos = (ix%cbrt_G) + (iy%cbrt_G)*cbrt_G + (iz%cbrt_G)*cbrt_G^2.
+   *
+   * All group members (master and non-masters) execute this step,
+   * making MFTLRedistributeListOfObjects a proper collective.          */
   {
     int n_fine = fine_domain.cuts[0] * fine_domain.cuts[1] * fine_domain.cuts[2];
     int *scatter_map = (int *) malloc((size_t) n_fine * sizeof(int));
@@ -560,7 +394,7 @@ int MFTLRemeshWithCoarsening(MFTL_Ensemble *ens, const MFTL_RemeshParameters *pa
 
     MFTLRedistributeListOfObjects(ens);
     /* Each group member now holds exactly the fine-grid triangles
-         * belonging to its Cartesian sub-cell.                          */
+     * belonging to its Cartesian sub-cell.                          */
     free(scatter_map);
   }
 
@@ -596,13 +430,15 @@ int MFTLRemeshWithCoarsening(MFTL_Ensemble *ens, const MFTL_RemeshParameters *pa
  *
  * Collective: all ranks in ens->domain.comm_cart must call this.
  * ══════════════════════════════════════════════════════════════════════ */
-int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params)
+int MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
 {
-  assert(ens != NULL);
-  assert(params != NULL);
+  MFTL_ASSERT(ens != MFTL_NULL);
+  MFTL_ASSERT(params != MFTL_NULL);
 
-  /* ── Guard: verify max_edge_length is set ──────────────────────── */
-  assert(params->max_edge_length > 0.0 && "MFTLRemeshEnsemble: params->max_edge_length must be > 0");
+  /* HERE A FUNCTION SHOULD BE CALLED WHICH CHECKS IF REMESHING IS NEEDED AT ALL. IM UNSURE ABOUT A FAST IMPLEMENTATION HERE.
+  DOES THIS REALLY NEED TO LOOP OVER ALL OBJECTS UNTIL IT FINDS A EDGE THAT NEEDS REMESHING OR IS THERE SOMETHING FASTER? */
+
+  /* HERE A FUNCTION SHOULD BE CALLED THAT CHECKS IF ITS OPTIMAL TO MOVE OBJECTS TO DIFFERENT KIND OF ENSEMBLES */
 
   /* ── Step 1: check if coarsening is required ────────────────────── */
   int G = MFTLComputeCoarseningFactor(ens, params);
@@ -610,18 +446,19 @@ int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params)
   if (G == MFTL_ERROR)
   {
     /* No commensurate coarsening factor found.  This is a fatal   *
-         * configuration error: either cuts[k] must be chosen to be    *
-         * divisible by the required cbrt_G, or max_edge_length /       *
-         * k_ghost must be reduced.  We surface it as a return code    *
-         * so the caller can decide between abort and fall-back.        */
+     * configuration error: either cuts[k] must be chosen to be    *
+     * divisible by the required cbrt_G, or max_edge_length /      *
+     * k_ghost must be reduced.  We surface it as a return code    *
+     * so the caller can decide between abort and fall-back.       */
+    /* HERE SHOULD BE A FALLBACK IMPLEMENTED. FOR INSTANCE A COARSER 1D DECOMPOSITION INSTEAD OF THE CUBE ONE. */
     return MFTL_ERROR;
   }
 
   if (G > 1)
   {
     /* Coarsen: group G flow ranks → 1 remesh rank, remesh on the
-         * subcommunicator, scatter back.                               */
-    return MFTLRemeshWithCoarsening(ens, params, G);
+     * subcommunicator, scatter back.                               */
+    MFTLRemeshWithCoarsening(ens, params, G);
   }
 
   /* ── Step 2: select algorithm (collective; one MPI_Allreduce) ────── */
@@ -632,90 +469,17 @@ int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params)
   {
     case MFTL_ALGO_CENTERING:
       /* Objects are small (R < 0.5 * h_min): gather each object  *
-             * to its centroid rank, run ungated serial kernel, done in  *
-             * one pass.  MFTLRemeshEnsembleDispersedCentering issues    *
-             * its own MPI_Allreduce for convergence.                    */
+       * to its centroid rank, run ungated serial kernel, done in  *
+       * one pass.  MFTLRemeshEnsembleDispersedCentering issues    *
+       * its own MPI_Allreduce for convergence.                    */
       return MFTLRemeshEnsembleDispersedCentering(ens, params);
 
     case MFTL_ALGO_SHIFT_SCHEME:
       /* Universal path: shift scan planes through {0,h/2}^3,     *
-             * freeze band, gated serial kernel, convergence certificate.*
-             * Precondition h_min > 4*delta is guaranteed by G==1 above. */
+       * freeze band, gated serial kernel, convergence certificate.*
+       * Precondition h_min > 4*delta is guaranteed by G==1 above. */
       return MFTLRemeshEnsembleShiftScheme(ens, params);
 
     default: assert(0 && "MFTLRemeshEnsemble: unknown algorithm"); return MFTL_ERROR;
   }
-}
-
-/* ══════════════════════════════════════════════════════════════════════
- * MFTLRemeshAllEnsembles
- *
- * Convenience entry point for simulations with one dispersed and one
- * spanning ensemble sharing the same MFTL_Domain.
- *
- * Ordering:
- *   1. Rebalance – move object pointers between ensembles based on
- *      current measured sizes.  Must precede remeshing so that each
- *      ensemble's algorithm selection (which reads object sizes) sees
- *      the post-rebalance state.
- *
- *   2. Remesh dispersed ensemble.
- *
- *   3. Remesh spanning ensemble.
- *
- * Steps 2 and 3 are SEQUENTIAL on the same comm_cart.  Each call to
- * MFTLRemeshEnsemble is itself fully collective (all ranks participate),
- * so no rank can reach step 3 before all ranks finish step 2.
- *
- * The two calls are independent: they may invoke different algorithms
- * (CENTERING vs SHIFT_SCHEME), different coarsening factors, and even
- * different numbers of phases.  Neither call sees the other's objects.
- *
- * Return value:
- *   Sum of total operations from both ensembles (≥ 0 on success).
- *   MFTL_ERROR (-1) if either ensemble returns MFTL_ERROR.
- *
- * Collective: all ranks in dispersed->domain.comm_cart must call this.
- *   (Both ensembles must share the same communicator.)
- * ══════════════════════════════════════════════════════════════════════ */
-int MFTLRemeshAllEnsembles(MFTL_Ensemble *dispersed, MFTL_Ensemble *spanning, const MFTL_RemeshParameters *params)
-{
-  MFTL_ASSERT(dispersed != NULL);
-  MFTL_ASSERT(spanning != NULL);
-  MFTL_ASSERT(params != NULL);
-
-  /* Sanity-check that both ensembles live on the same communicator.  *
-   * MPI_Comm handles compare equal when they refer to the same       *
-   * underlying communicator object.                                  */
-  /* BRING THIS INTO MFTLENSEMBLEREBALANCE */
-  int result;
-  MPI_Comm_compare(dispersed->domain.comm_cart, spanning->domain.comm_cart, &result);
-  MFTL_ASSERT((result == MPI_IDENT || result == MPI_CONGRUENT) &&
-              "MFTLRemeshAllEnsembles: both ensembles must share a "
-              "communicator (MPI_IDENT or MPI_CONGRUENT)");
-
-  /* ── Step 1: rebalance object membership ─────────────────────────
-     * MFTLEnsembleRebalance issues two MPI_Allgatherv calls. It only
-     * moves MFTL_Object pointers; triangle data is not migrated here.
-     * Triangle migration for newly promoted/demoted objects happens
-     * implicitly in the MFTLRedistributeListOfObjects calls inside the
-     * subsequent MFTLRemeshEnsemble invocations.                        */
-  /* CHECK IF WE HAVE DIFFERENT TYPES OF ENSEMBLES AND WE WANT OBJECTS TO BE MOVED BETWEEN THEM */
-  MFTLEnsembleRebalance(dispersed, spanning, params);
-
-  /* ── Step 2: remesh dispersed ensemble ───────────────────────────  */
-  int ret_d = MFTLRemeshEnsemble(dispersed, params);
-  if (ret_d == MFTL_ERROR)
-  {
-    return MFTL_ERROR;
-  }
-
-  /* ── Step 3: remesh spanning ensemble ────────────────────────────  */
-  int ret_s = MFTLRemeshEnsemble(spanning, params);
-  if (ret_s == MFTL_ERROR)
-  {
-    return MFTL_ERROR;
-  }
-
-  return ret_d + ret_s; /* total ops across both ensembles */
 }

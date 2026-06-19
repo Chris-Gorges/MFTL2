@@ -154,7 +154,7 @@ void MFTLEnsembleUpdateGlobalCounts(MFTL_Ensemble* ensemble)
 
   // 3. Single Global Reduction (Sum)
   // Assumes every rank has the same list of objects in the same order.
-  MPI_Allreduce(local_counts, global_counts, 2 * num_objects, MPI_MFTL_INT, MPI_SUM, comm);
+  MPI_Allreduce(local_counts, global_counts, 2 * num_objects, MPI_INT, MPI_SUM, comm);
 
   // 4. Unpack results back into the Objects
   int total_ensemble_tris = 0;
@@ -221,7 +221,7 @@ void MFTLObjectUpdateGlobalStats(MFTL_Object* object)
   // 2. Global Reduction
   int global_counts[2];
   // We reduce 2 integers: one for tris, one for verts
-  MPI_Allreduce(local_counts, global_counts, 2, MPI_MFTL_INT, MPI_SUM, domain->comm_world);
+  MPI_Allreduce(local_counts, global_counts, 2, MPI_INT, MPI_SUM, domain->comm_world);
 
   // 3. Store Results
   object->global_n_triangles = global_counts[0];

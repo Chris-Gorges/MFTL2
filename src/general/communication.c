@@ -20,7 +20,6 @@
 #include "mftl_memory.h"
 
 // --- Global Variable Definitions ---
-MPI_Datatype MPI_MFTL_INT;
 MPI_Datatype MPI_PackedVertex;
 MPI_Datatype MPI_PackedTriangle;
 MPI_Datatype MPI_PackedHalfEdge;
@@ -29,29 +28,23 @@ MPI_Datatype MPI_GhostUpdatePayload;
 
 void MFTLRegisterMpiTypes()
 {
-#ifdef MFTL_USE_64BIT
-  MPI_MFTL_INT = MPI_INT64_T;
-#else
-  MPI_MFTL_INT = MPI_INT32_T;
-#endif
-
   // --- 1. Create MPI Datatype for PackedVertex ---
   {
 #define NITEMS_VERTEX 11
     int blocklengths[] = {1, 1, 3, 3, 1, 1, 1, 1, 1, 1, 1};
 
     MPI_Datatype types[] = {
-        MPI_MFTL_INT,  // global_id (was MPI_UINT64_T)
-        MPI_MFTL_INT,  // owner_proc (was MPI_INT - likely wrong if owner_proc > 2B or if int is 64bit)
+        MPI_INT,  // global_id (was MPI_UINT64_T)
+        MPI_INT,  // owner_proc (was MPI_INT - likely wrong if owner_proc > 2B or if int is 64bit)
         MPI_DOUBLE,  // pos[3]
         MPI_DOUBLE,  // normal[3]
         MPI_DOUBLE,  // meancurvature
         MPI_DOUBLE,  // gaussiancurvature
         MPI_DOUBLE,  // area
         MPI_C_BOOL,  // is_ghost
-        MPI_MFTL_INT,  // flags (was MPI_INT)
-        MPI_MFTL_INT,  // id_he_out (was MPI_UINT64_T)
-        MPI_MFTL_INT  // body_id (was MPI_UINT64_T)
+        MPI_INT,  // flags (was MPI_INT)
+        MPI_INT,  // id_he_out (was MPI_UINT64_T)
+        MPI_INT  // body_id (was MPI_UINT64_T)
     };
 
     MPI_Aint offsets[NITEMS_VERTEX];
@@ -77,15 +70,15 @@ void MFTLRegisterMpiTypes()
     int blocklengths[] = {1, 1, 1, 3, 1, 3, 1, 1, 1};
 
     MPI_Datatype types[] = {
-        MPI_MFTL_INT,  // global_id
-        MPI_MFTL_INT,  // owner_proc
-        MPI_MFTL_INT,  // he_id
+        MPI_INT,  // global_id
+        MPI_INT,  // owner_proc
+        MPI_INT,  // he_id
         MPI_DOUBLE,  // normal[3]
         MPI_DOUBLE,  // area
         MPI_DOUBLE,  // center[3]
         MPI_C_BOOL,  // is_ghost
-        MPI_MFTL_INT,  // flags
-        MPI_MFTL_INT  // body_id
+        MPI_INT,  // flags
+        MPI_INT  // body_id
     };
 
     MPI_Aint offsets[NITEMS_TRIANGLE];
@@ -109,13 +102,13 @@ void MFTLRegisterMpiTypes()
     int blocklengths[] = {1, 1, 1, 1, 1, 1, 1};
 
     MPI_Datatype types[] = {
-        MPI_MFTL_INT,  // global_id
-        MPI_MFTL_INT,  // vertex_gid
-        MPI_MFTL_INT,  // twin_gid
-        MPI_MFTL_INT,  // next_gid
-        MPI_MFTL_INT,  // triangle_gid
+        MPI_INT,  // global_id
+        MPI_INT,  // vertex_gid
+        MPI_INT,  // twin_gid
+        MPI_INT,  // next_gid
+        MPI_INT,  // triangle_gid
         MPI_C_BOOL,  // boundary
-        MPI_MFTL_INT  // flags
+        MPI_INT  // flags
     };
 
     MPI_Aint offsets[NITEMS_HALFEDGE];
@@ -160,7 +153,7 @@ void MFTLRegisterMpiTypes()
     int blocklengths[] = {1, 3, 3, 1, 1, 1};
 
     MPI_Datatype types[] = {
-        MPI_MFTL_INT,  // global_id
+        MPI_INT,  // global_id
         MPI_DOUBLE,  // pos[3]
         MPI_DOUBLE,  // normal[3]
         MPI_DOUBLE,  // meancurvature
@@ -345,7 +338,7 @@ static void MFTLMpiExchangeBuffers(MFTL_Domain* domain, MFTL_SendBuffer* send_bu
 
     // 2. Exchange Counts
     for (int r = 0; r < nproc; ++r) send_counts[r] = send_bufs[r].count;
-    MPI_Alltoall(send_counts, 1, MPI_MFTL_INT, recv_counts, 1, MPI_MFTL_INT, domain->comm_cart);
+    MPI_Alltoall(send_counts, 1, MPI_INT, recv_counts, 1, MPI_INT, domain->comm_cart);
 
     // 3. Calculate Displacements
     int total_send = 0;
@@ -396,7 +389,7 @@ static void MFTLMpiExchangeBuffers(MFTL_Domain* domain, MFTL_SendBuffer* send_bu
     {
       n_send[i] = send_bufs[domain->neighbors[i]].count;
     }
-    MPI_Neighbor_alltoall(n_send, 1, MPI_MFTL_INT, n_recv, 1, MPI_MFTL_INT, domain->comm_graph);
+    MPI_Neighbor_alltoall(n_send, 1, MPI_INT, n_recv, 1, MPI_INT, domain->comm_graph);
 
     // 3. Calculate Displacements
     int total_send = 0;
@@ -1012,6 +1005,7 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
         target_obj->half_edges = malloc(3 * n_unique * sizeof(MFTL_HalfEdge));
 
         // F. Fill Target Object (using the sorted indices)
+        // ── PASS 1: Locals ──────────────────────────────────────────────────
         int write_count = 0;
         for (int k = 0; k < range_len; ++k)
         {
@@ -1019,29 +1013,28 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
           int sorted_relative_idx = indices[k];
           PackedTriangleComplex* src = &all_tris[start_idx + sorted_relative_idx];
 
-          // Duplicate check
-          if (write_count > 0)
+          if (write_count > 0 && target_obj->triangles[write_count - 1].global_id == src->triangle.global_id)
           {
-            if (target_obj->triangles[write_count - 1].global_id == src->triangle.global_id)
-            {
-              continue;  // Skip Duplicate
-            }
+            continue;  // Skip Duplicate
           }
+
+          // Skip ghosts in pass 1 (Assume local if owner_proc matches my_rank)
+          if (src->triangle.owner_proc != my_rank) continue;
 
           // Copy Data
           MFTL_Triangle* dst = &target_obj->triangles[write_count];
           dst->global_id = src->triangle.global_id;
           dst->owner_proc = src->triangle.owner_proc;
           dst->flags = src->triangle.flags;
-          dst->is_ghost = (dst->owner_proc == my_rank) ? MFTL_FALSE : MFTL_TRUE;
+          dst->is_ghost = MFTL_FALSE;
           dst->area = src->triangle.area;
           memcpy(dst->center, src->triangle.center, sizeof(double) * 3);
           memcpy(dst->normal, src->triangle.normal, sizeof(double) * 3);
           dst->he_idx = write_count * 3;
 
           int ret;
-          khiter_t k = kh_put(triangle_map, target_obj->triangle_lookup, dst->global_id, &ret);
-          kh_value(target_obj->triangle_lookup, k) = write_count;  // local index
+          khiter_t k_tr = kh_put(triangle_map, target_obj->triangle_lookup, dst->global_id, &ret);
+          kh_value(target_obj->triangle_lookup, k_tr) = write_count;  // local index
 
           // Copy Half Edges
           for (int i = 0; i < 3; ++i)
@@ -1055,12 +1048,61 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
             he->vertex_idx = src->half_edges[i].vertex_gid;  // needs to be converted to local index
             he->boundary = MFTL_TRUE;  // set later
             int ret;
-            khiter_t k = kh_put(halfedge_map, target_obj->halfedge_lookup, he->global_id, &ret);
-            kh_value(target_obj->halfedge_lookup, k) = write_count * 3 + i;  // local index
+            khiter_t k_he = kh_put(halfedge_map, target_obj->halfedge_lookup, he->global_id, &ret);
+            kh_value(target_obj->halfedge_lookup, k_he) = write_count * 3 + i;  // local index
           }
 
           write_count++;
         }
+
+        target_obj->n_local_triangles = write_count;
+        target_obj->n_local_half_edges = write_count * 3;
+
+        // ── PASS 2: Ghosts ──────────────────────────────────────────────────
+        for (int k = 0; k < range_len; ++k)
+        {
+          int sorted_relative_idx = indices[k];
+          PackedTriangleComplex* src = &all_tris[start_idx + sorted_relative_idx];
+
+          if (write_count > 0 && target_obj->triangles[write_count - 1].global_id == src->triangle.global_id)
+          {
+            continue;  // Skip Duplicate
+          }
+
+          // Skip locals in pass 2
+          if (src->triangle.owner_proc == my_rank) continue;
+
+          // Copy Data
+          MFTL_Triangle* dst = &target_obj->triangles[write_count];
+          dst->global_id = src->triangle.global_id;
+          dst->owner_proc = src->triangle.owner_proc;
+          dst->flags = src->triangle.flags;
+          dst->is_ghost = MFTL_TRUE;
+          dst->area = src->triangle.area;
+          memcpy(dst->center, src->triangle.center, sizeof(double) * 3);
+          memcpy(dst->normal, src->triangle.normal, sizeof(double) * 3);
+          dst->he_idx = write_count * 3;
+
+          int ret;
+          khiter_t k_tr = kh_put(triangle_map, target_obj->triangle_lookup, dst->global_id, &ret);
+          kh_value(target_obj->triangle_lookup, k_tr) = write_count;
+
+          for (int i = 0; i < 3; ++i)
+          {
+            MFTL_HalfEdge* he = &target_obj->half_edges[write_count * 3 + i];
+            he->global_id = src->half_edges[i].global_id;
+            he->flags = src->half_edges[i].flags;
+            he->triangle_idx = write_count;
+            he->next_idx = write_count * 3 + (i + 1) % 3;
+            he->twin_idx = src->half_edges[i].twin_gid;
+            he->vertex_idx = src->half_edges[i].vertex_gid;
+            he->boundary = MFTL_TRUE;
+            khiter_t k_he = kh_put(halfedge_map, target_obj->halfedge_lookup, he->global_id, &ret);
+            kh_value(target_obj->halfedge_lookup, k_he) = write_count * 3 + i;
+          }
+          write_count++;
+        }
+        MFTL_ASSERT(write_count == n_unique && "Error: write_count != n_unique\n");
       }
     }
 
@@ -1179,27 +1221,26 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
         target_obj->vertices = malloc(n_unique * sizeof(MFTL_Vertex));
 
         // F. Fill Target Object
+        // ── PASS 1: Locals ──────────────────────────────────────────────────
         int write_count = 0;
         for (int k = 0; k < range_len; ++k)
         {
           int sorted_relative_idx = indices[k];
           PackedVertex* src = &all_verts[start_idx + sorted_relative_idx];
 
-          // Duplicate check
-          if (write_count > 0)
+          if (write_count > 0 && target_obj->vertices[write_count - 1].global_id == src->global_id)
           {
-            if (target_obj->vertices[write_count - 1].global_id == src->global_id)
-            {
-              continue;  // Skip Duplicate
-            }
+            continue;  // Skip Duplicate
           }
+
+          if (src->owner_proc != my_rank) continue;  // Skip ghosts in pass 1
 
           // Copy Data
           MFTL_Vertex* dst = &target_obj->vertices[write_count];
           dst->global_id = src->global_id;
           dst->owner_proc = src->owner_proc;
           dst->flags = src->flags;
-          dst->is_ghost = (dst->owner_proc == my_rank) ? MFTL_FALSE : MFTL_TRUE;
+          dst->is_ghost = MFTL_FALSE;
           dst->area = src->area;
           dst->meancurvature = src->meancurvature;
           dst->gaussiancurvature = src->gaussiancurvature;
@@ -1209,11 +1250,46 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
 
           dst->out_he_idx = src->id_he_out;  // needs to be converted to local index
           int ret;
-          khiter_t k = kh_put(vertex_map, target_obj->vertex_lookup, dst->global_id, &ret);
-          kh_value(target_obj->vertex_lookup, k) = write_count;  // local index
+          khiter_t k_v = kh_put(vertex_map, target_obj->vertex_lookup, dst->global_id, &ret);
+          kh_value(target_obj->vertex_lookup, k_v) = write_count;  // local index
 
           write_count++;
         }
+
+        target_obj->n_local_vertices = write_count;
+
+        // ── PASS 2: Ghosts ──────────────────────────────────────────────────
+        for (int k = 0; k < range_len; ++k)
+        {
+          int sorted_relative_idx = indices[k];
+          PackedVertex* src = &all_verts[start_idx + sorted_relative_idx];
+
+          if (write_count > 0 && target_obj->vertices[write_count - 1].global_id == src->global_id)
+          {
+            continue;  // Skip Duplicate
+          }
+
+          if (src->owner_proc == my_rank) continue;  // Skip locals in pass 2
+
+          MFTL_Vertex* dst = &target_obj->vertices[write_count];
+          dst->global_id = src->global_id;
+          dst->owner_proc = src->owner_proc;
+          dst->flags = src->flags;
+          dst->is_ghost = MFTL_TRUE;
+          dst->area = src->area;
+          dst->meancurvature = src->meancurvature;
+          dst->gaussiancurvature = src->gaussiancurvature;
+          memcpy(dst->pos, src->pos, 3 * sizeof(double));
+          memcpy(dst->normal, src->normal, 3 * sizeof(double));
+          dst->out_he_idx = src->id_he_out;
+
+          int ret;
+          khiter_t k_v = kh_put(vertex_map, target_obj->vertex_lookup, dst->global_id, &ret);
+          kh_value(target_obj->vertex_lookup, k_v) = write_count;
+
+          write_count++;
+        }
+        MFTL_ASSERT(write_count == n_unique && "Error: write_count != n_unique\n");
       }
     }
 
@@ -1429,7 +1505,7 @@ int MFTLRedistributeObject(MFTL_Object* object)
 
   // --- 5. Communication (Phase 2 & 3) ---
   int global_decision;
-  MPI_Allreduce(&requires_global_comm_local, &global_decision, 1, MPI_MFTL_INT, MPI_LOR, domain->comm_cart);
+  MPI_Allreduce(&requires_global_comm_local, &global_decision, 1, MPI_INT, MPI_LOR, domain->comm_cart);
 
   PackedTriangleComplex* recv_tris;
   PackedVertex* recv_verts;
@@ -1507,15 +1583,15 @@ int MFTLRedistributeObject(MFTL_Object* object)
       int sorted_idx = indices[k];
       PackedTriangleComplex* src = &all_tris[sorted_idx];
 
-      // Deduplicate
       if (write_idx > 0 && object->triangles[write_idx - 1].global_id == src->triangle.global_id) continue;
+      if (src->triangle.owner_proc != my_rank) continue;  // Skip ghosts in pass 1
 
       // Copy Triangle
       MFTL_Triangle* dst = &object->triangles[write_idx];
       dst->global_id = src->triangle.global_id;
       dst->owner_proc = src->triangle.owner_proc;
       dst->flags = src->triangle.flags;
-      dst->is_ghost = (dst->owner_proc == my_rank) ? MFTL_FALSE : MFTL_TRUE;
+      dst->is_ghost = MFTL_FALSE;
       dst->area = src->triangle.area;
       memcpy(dst->center, src->triangle.center, sizeof(double) * 3);
       memcpy(dst->normal, src->triangle.normal, sizeof(double) * 3);
@@ -1542,6 +1618,50 @@ int MFTLRedistributeObject(MFTL_Object* object)
       }
       write_idx++;
     }
+
+    object->n_local_triangles = write_idx;
+    object->n_local_half_edges = write_idx * 3;
+
+    // ── PASS 2: Ghosts ──────────────────────────────────────────────────
+    for (int k = 0; k < total_tris; ++k)
+    {
+      int sorted_idx = indices[k];
+      PackedTriangleComplex* src = &all_tris[sorted_idx];
+
+      if (write_idx > 0 && object->triangles[write_idx - 1].global_id == src->triangle.global_id) continue;
+      if (src->triangle.owner_proc == my_rank) continue;  // Skip locals in pass 2
+
+      MFTL_Triangle* dst = &object->triangles[write_idx];
+      dst->global_id = src->triangle.global_id;
+      dst->owner_proc = src->triangle.owner_proc;
+      dst->flags = src->triangle.flags;
+      dst->is_ghost = MFTL_TRUE;
+      dst->area = src->triangle.area;
+      memcpy(dst->center, src->triangle.center, sizeof(double) * 3);
+      memcpy(dst->normal, src->triangle.normal, sizeof(double) * 3);
+      dst->he_idx = write_idx * 3;
+
+      int ret;
+      khiter_t iter = kh_put(triangle_map, object->triangle_lookup, dst->global_id, &ret);
+      kh_value(object->triangle_lookup, iter) = write_idx;
+
+      for (int j = 0; j < 3; ++j)
+      {
+        MFTL_HalfEdge* he = &object->half_edges[write_idx * 3 + j];
+        he->global_id = src->half_edges[j].global_id;
+        he->flags = src->half_edges[j].flags;
+        he->triangle_idx = write_idx;
+        he->next_idx = write_idx * 3 + (j + 1) % 3;
+        he->twin_idx = src->half_edges[j].twin_gid;
+        he->vertex_idx = src->half_edges[j].vertex_gid;
+        he->boundary = MFTL_TRUE;
+
+        iter = kh_put(halfedge_map, object->halfedge_lookup, he->global_id, &ret);
+        kh_value(object->halfedge_lookup, iter) = write_idx * 3 + j;
+      }
+      write_idx++;
+    }
+    MFTL_ASSERT(write_idx == n_unique && "Error: write_count != n_unique\n");
     free(keys);
     free(indices);
     free(all_tris);
@@ -1574,12 +1694,13 @@ int MFTLRedistributeObject(MFTL_Object* object)
       PackedVertex* src = &all_verts[sorted_idx];
 
       if (write_idx > 0 && object->vertices[write_idx - 1].global_id == src->global_id) continue;
+      if (src->owner_proc != my_rank) continue;  // Skip ghosts in pass 1
 
       MFTL_Vertex* dst = &object->vertices[write_idx];
       dst->global_id = src->global_id;
       dst->owner_proc = src->owner_proc;
       dst->flags = src->flags;
-      dst->is_ghost = (dst->owner_proc == my_rank) ? MFTL_FALSE : MFTL_TRUE;
+      dst->is_ghost = MFTL_FALSE;
       dst->area = src->area;
       dst->meancurvature = src->meancurvature;
       dst->gaussiancurvature = src->gaussiancurvature;
@@ -1593,6 +1714,38 @@ int MFTLRedistributeObject(MFTL_Object* object)
 
       write_idx++;
     }
+
+    object->n_local_vertices = write_idx;
+
+    // ── PASS 2: Ghosts ──────────────────────────────────────────────────
+    for (int k = 0; k < total_verts; ++k)
+    {
+      int sorted_idx = indices[k];
+      PackedVertex* src = &all_verts[sorted_idx];
+
+      if (write_idx > 0 && object->vertices[write_idx - 1].global_id == src->global_id) continue;
+      if (src->owner_proc == my_rank) continue;  // Skip locals in pass 2
+
+      MFTL_Vertex* dst = &object->vertices[write_idx];
+      dst->global_id = src->global_id;
+      dst->owner_proc = src->owner_proc;
+      dst->flags = src->flags;
+      dst->is_ghost = MFTL_TRUE;
+      dst->area = src->area;
+      dst->meancurvature = src->meancurvature;
+      dst->gaussiancurvature = src->gaussiancurvature;
+      memcpy(dst->pos, src->pos, sizeof(double) * 3);
+      memcpy(dst->normal, src->normal, sizeof(double) * 3);
+      dst->out_he_idx = src->id_he_out;
+
+      int ret;
+      khiter_t iter = kh_put(vertex_map, object->vertex_lookup, dst->global_id, &ret);
+      kh_value(object->vertex_lookup, iter) = write_idx;
+
+      write_idx++;
+    }
+
+    MFTL_ASSERT(write_idx == n_unique && "Error: write_count != n_unique\n");
     free(keys);
     free(indices);
     free(all_verts);
@@ -1669,7 +1822,7 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lo
     n_send_reqs[i] = req_send_bufs[i].size;  // Actual count is size (2 * num_requests)
   }
 
-  MPI_Neighbor_alltoall(n_send_reqs, 1, MPI_MFTL_INT, n_recv_reqs, 1, MPI_MFTL_INT, domain->comm_graph);
+  MPI_Neighbor_alltoall(n_send_reqs, 1, MPI_INT, n_recv_reqs, 1, MPI_INT, domain->comm_graph);
 
   // --- 4. Exchange Requests ---
   int* s_displs = calloc(num_neighbors + 1, sizeof(int));
@@ -1696,7 +1849,7 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lo
 
   int* flat_recv_reqs = malloc(total_recv_ints * sizeof(int));
 
-  MPI_Neighbor_alltoallv(flat_send_reqs, n_send_reqs, s_displs, MPI_MFTL_INT, flat_recv_reqs, n_recv_reqs, r_displs, MPI_MFTL_INT, domain->comm_graph);
+  MPI_Neighbor_alltoallv(flat_send_reqs, n_send_reqs, s_displs, MPI_INT, flat_recv_reqs, n_recv_reqs, r_displs, MPI_INT, domain->comm_graph);
 
   free(flat_send_reqs);
 
@@ -2010,7 +2163,7 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
 
   for (int i = 0; i < num_neighbors; ++i) n_send_ints[i] = req_bufs[i].size;
 
-  MPI_Neighbor_alltoall(n_send_ints, 1, MPI_MFTL_INT, n_recv_ints, 1, MPI_MFTL_INT, domain->comm_graph);
+  MPI_Neighbor_alltoall(n_send_ints, 1, MPI_INT, n_recv_ints, 1, MPI_INT, domain->comm_graph);
 
   // Calc Displacements
   int* s_displs = calloc(num_neighbors + 1, sizeof(int));
@@ -2040,7 +2193,7 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
 
   // Exchange Requests
   int* flat_recv_req = malloc(total_recv * sizeof(int));
-  MPI_Neighbor_alltoallv(flat_send_req, n_send_ints, s_displs, MPI_MFTL_INT, flat_recv_req, n_recv_ints, r_displs, MPI_MFTL_INT, domain->comm_graph);
+  MPI_Neighbor_alltoallv(flat_send_req, n_send_ints, s_displs, MPI_INT, flat_recv_req, n_recv_ints, r_displs, MPI_INT, domain->comm_graph);
 
   free(flat_send_req);
   free(s_displs);
@@ -2156,8 +2309,8 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
   int* n_recv_tris = malloc(num_neighbors * sizeof(int));
   int* n_recv_verts = malloc(num_neighbors * sizeof(int));
 
-  MPI_Neighbor_alltoall(cnt_send_tris, 1, MPI_MFTL_INT, n_recv_tris, 1, MPI_MFTL_INT, domain->comm_graph);
-  MPI_Neighbor_alltoall(cnt_send_verts, 1, MPI_MFTL_INT, n_recv_verts, 1, MPI_MFTL_INT, domain->comm_graph);
+  MPI_Neighbor_alltoall(cnt_send_tris, 1, MPI_INT, n_recv_tris, 1, MPI_INT, domain->comm_graph);
+  MPI_Neighbor_alltoall(cnt_send_verts, 1, MPI_INT, n_recv_verts, 1, MPI_INT, domain->comm_graph);
 
   // --- Exchange Triangles ---
   int* s_disp_t = calloc(num_neighbors + 1, sizeof(int));

@@ -344,9 +344,9 @@ int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int
     }
   }
 
-  MPI_Bcast(&object->next_vertex_gid, 1, MPI_MFTL_INT, 0, domain->comm_world);
-  MPI_Bcast(&object->next_triangle_gid, 1, MPI_MFTL_INT, 0, domain->comm_world);
-  MPI_Bcast(&object->next_halfedge_gid, 1, MPI_MFTL_INT, 0, domain->comm_world);
+  MPI_Bcast(&object->next_vertex_gid, 1, MPI_INT, 0, domain->comm_world);
+  MPI_Bcast(&object->next_triangle_gid, 1, MPI_INT, 0, domain->comm_world);
+  MPI_Bcast(&object->next_halfedge_gid, 1, MPI_INT, 0, domain->comm_world);
 
   MFTLObjectUpdateGlobalStats(object);
 
