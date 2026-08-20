@@ -1,0 +1,659 @@
+/**
+ * @file groups.dox
+ * @brief Definition of the Doxygen module hierarchy.
+ *
+ * This file contains no code. It exists so that the @c \@defgroup commands live
+ * in exactly one place instead of being scattered over fifteen headers, which is
+ * the same reason every struct is defined in mftl_types.h.
+ *
+ * The hierarchy mirrors the HEADER LAYERING the library is built on: a header
+ * may only include headers from a strictly lower layer, so a group may only
+ * depend on groups above it in this file.
+ */
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Layer 0 -- Foundation
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @defgroup mftl_foundation Layer 0 &mdash; Foundation
+ *
+ * @brief Macros and plain-C helpers that know nothing about MFTL types.
+ *
+ * Everything here is a leaf of the include graph: these headers include only
+ * each other and the C standard library, so they can be pulled into any
+ * translation unit without dragging the mesh data model along.
+ *
+ * The layer answers four questions and nothing else:
+ *
+ * | Header | Question |
+ * |---|---|
+ * | @ref mftl_constants "mftl_constants.h" | What is a tolerance, what is a cache line, what does an assertion do in Release? |
+ * | @ref mftl_memory "mftl_memory.h" | How is memory obtained, and how does one allocation become many aligned sub-arrays? |
+ * | @ref mftl_vectorops "mftl_vectorops.h" | What is a normalised 3-vector? |
+ * | @ref mftl_arrayfunctions "mftl_arrayfunctions.h" | How is a flat integer array sorted and deduplicated? |
+ */
+
+/**
+ * @defgroup mftl_constants Constants, math macros and the assertion policy
+ * @ingroup mftl_foundation
+ *
+ * @brief Scalar constants, the geometric tolerance ladder, and MFTL_ASSERT.
+ *
+ * Three tolerances exist and they are not interchangeable:
+ *
+ * | Macro | Value | Meaning |
+ * |---|---|---|
+ * | #MFTL_EPSILON | \f$10^{-9}\f$ | "these two lengths are the same length" |
+ * | #MFTL_VERYSMALL | \f$10^{-12}\f$ | "this squared quantity is zero" |
+ * | #MFTL_VERYVERYSMALL | \f$10^{-15}\f$ | "this divisor is zero" |
+ *
+ * None of them is used to clamp the magnitude of a vector before normalisation.
+ * See MFTLNormalizeVector() for why that particular use is a trap.
+ */
+
+/**
+ * @defgroup mftl_memory Allocation policy and pool block layout
+ * @ingroup mftl_foundation
+ *
+ * @brief One pool is one allocation, cut into cache-line-aligned sub-arrays.
+ *
+ * ## Why the layout helper exists
+ *
+ * A mesh entity class needs an AoS record array and a family of SoA geometry
+ * arrays, and they must always have the same capacity. Expressing that as a rule
+ * ("every growth site must call three functions") makes a missed site a heap
+ * overflow rather than a wrong number.
+ *
+ * MFTLLayoutAdd() replaces the rule with a structure. Given a running byte
+ * cursor it hands out one cache-line-aligned offset per field:
+ *
+ * \f[
+ *   o_0 = 0, \qquad
+ *   o_{i+1} = \left\lceil \frac{o_i + n_i s_i}{L} \right\rceil L,
+ *   \qquad L = \texttt{MFTL\_CACHE\_LINE} = 64
+ * \f]
+ *
+ * so that after the last field the cursor holds the total block size. One
+ * malloc, one capacity, one pointer to free &mdash; "the AoS grew but the SoA
+ * did not" is not an error that can be made, because it is not expressible.
+ *
+ * Two properties of \f$L = 64\f$ are load-bearing rather than cosmetic:
+ * a streaming kernel over one component never shares a line with a neighbouring
+ * component (no false sharing between a write to `tri.area` and a read of
+ * `tri.normal`), and 64 bytes is a whole number of every element type in the
+ * pools, so an aligned sub-array start is also an aligned element start and the
+ * vectoriser never needs a peel loop.
+ *
+ * @note Allocation failure is fatal everywhere. In HPC code OOM is not
+ *       recoverable, and a caller that quietly carries on with a NULL buffer
+ *       corrupts data far away from the actual failure.
+ */
+
+/**
+ * @defgroup mftl_vectorops Fixed-size vector helpers
+ * @ingroup mftl_foundation
+ *
+ * @brief Scalar 3-vector arithmetic for one-at-a-time code paths.
+ *
+ * These are deliberately NOT used inside streaming kernels; a hot loop writes
+ * the arithmetic out inline so the compiler sees the whole loop body. See the
+ * `MFTL_FOREACH_*` iterators in @ref mftl_object.
+ */
+
+/**
+ * @defgroup mftl_arrayfunctions Radix sort and duplicate removal
+ * @ingroup mftl_foundation
+ *
+ * @brief Stable LSD radix sort over 8-bit digits, for keys and key/value pairs.
+ *
+ * ## The algorithm
+ *
+ * A least-significant-digit radix sort makes \f$\lceil b/r \rceil\f$ stable
+ * counting-sort passes over \f$n\f$ keys of \f$b\f$ bits, \f$r\f$ bits at a
+ * time, for a total cost of
+ *
+ * \f[
+ *   O\!\left(\frac{b}{r}\,(n + 2^{r})\right)
+ * \f]
+ *
+ * With \f$r = 8\f$ the histogram of one pass is \f$2^8\f$ counters, i.e. 1 KiB,
+ * and all \f$b/r\f$ histograms together are 4 KiB (32-bit keys) or 8 KiB
+ * (64-bit). Both fit in L1D, which is what makes the implementation's central
+ * trick worthwhile: **every digit of every key is counted in a single streaming
+ * pass over the data**, so the keys are read once for counting and once per
+ * scatter pass rather than \f$2b/r\f$ times.
+ *
+ * Two refinements matter in practice:
+ *
+ * - **Constant-digit passes are skipped.** If a digit position takes the same
+ *   value in all \f$n\f$ keys, its histogram has one non-zero bucket and the
+ *   pass is the identity. Mesh global IDs are dense in \f$[0,n)\f$, so the top
+ *   two bytes of a 32-bit ID are usually constant and half the passes vanish.
+ * - **Signed 32-bit ordering is free.** The most significant pass processes the
+ *   sign byte; running its prefix sum starting from bucket 128 and wrapping to
+ *   bucket 0 places negative keys first without ever flipping a bit.
+ *
+ * Below #INSERTION_CUTOFF elements the fixed costs (histogram clear, the
+ * 256-entry prefix sums, the temp allocation) outweigh the \f$O(n^2/4)\f$ moves
+ * of an array that never leaves L1, and a stable insertion sort takes over.
+ *
+ * @see src/arrayfunctions/README.md for the measured cutoff table.
+ */
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Layer 1 -- Data model
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @defgroup mftl_types Layer 1 &mdash; The data model
+ *
+ * @brief Every MFTL struct, defined in exactly one place.
+ *
+ * ## The one idea
+ *
+ * A mesh is described by two things that want opposite memory layouts, and each
+ * is stored in the layout it wants:
+ *
+ * - **Topology and identity → AoS.** #MFTL_Vertex (16 B), #MFTL_Triangle (12 B),
+ *   #MFTL_HalfEdge (16 B). A remesher edits one entity at a time and touches
+ *   most of its record when it does.
+ * - **Geometry → SoA.** Positions, normals, areas, centroids, curvatures and the
+ *   derived per-triangle frames. These are read and written by kernels that
+ *   touch one component of every entity, every timestep.
+ *
+ * Both live in **one allocation per entity class**. #MFTL_VertexPool and
+ * #MFTL_TrianglePool each hold a single `block` cut into cache-line-aligned
+ * sub-arrays by MFTLLayoutAdd(), and each has exactly one `capacity`.
+ *
+ * ## Three invariants every module may assume
+ *
+ * 1. **Half-edges are triangle-indexed.** Half-edge \f$3t+k\f$ belongs to
+ *    triangle \f$t\f$, and \f$\mathrm{next}(3t+k) = 3t + (k+1) \bmod 3\f$.
+ *    `he_idx`, `next_idx` and `triangle_idx` are therefore not stored &mdash;
+ *    they are arithmetic (MFTLTriFirstHe(), MFTLHeTriIdx(), MFTLHeNextIdx(),
+ *    MFTLHePrevIdx()).
+ * 2. **Ownership is a prefix.** Entities \f$[0, n_\mathrm{local})\f$ are owned by
+ *    this rank; \f$[n_\mathrm{local}, n)\f$ are ghosts. There is no `is_ghost`
+ *    field.
+ * 3. **Positions live in the SoA and only there.** `verts.pos[3*v+k]` is
+ *    authoritative. The Morton ordering is applied to the *pool*, not stored as
+ *    a permutation.
+ */
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Layer 2 -- Mesh access
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @defgroup mftl_mesh Layer 2 &mdash; Mesh access
+ *
+ * @brief Inline accessors over the layer-1 structs. No allocation, no MPI.
+ *
+ * Everything in this layer is a `static inline` function that reads the pools
+ * and returns an index or a number. Nothing here changes a size, and nothing
+ * here communicates.
+ */
+
+/**
+ * @defgroup mftl_topology Half-edge topology
+ * @ingroup mftl_mesh
+ *
+ * @brief Navigation over the half-edge structure, and connectivity maintenance.
+ *
+ * ## The half-edge data structure
+ *
+ * An oriented manifold triangle mesh is stored as a set of *half-edges*: each
+ * undirected edge is split into two oppositely directed halves, one belonging to
+ * each incident triangle. A half-edge \f$h\f$ carries
+ *
+ * \f[
+ *   \mathrm{target}(h), \qquad \mathrm{twin}(h)
+ * \f]
+ *
+ * and the classical structure adds \f$\mathrm{next}(h)\f$ and
+ * \f$\mathrm{face}(h)\f$. MFTL stores neither, because of
+ *
+ * ## Implicit indexing
+ *
+ * Half-edge \f$3t+k\f$ **is** corner \f$k\f$ of triangle \f$t\f$. Therefore
+ *
+ * \f[
+ *   \mathrm{face}(h) = \left\lfloor h/3 \right\rfloor, \qquad
+ *   \mathrm{next}(h) = 3\left\lfloor h/3 \right\rfloor + (h+1) \bmod 3, \qquad
+ *   \mathrm{prev}(h) = 3\left\lfloor h/3 \right\rfloor + (h+2) \bmod 3
+ * \f]
+ *
+ * and the origin follows from the target of the previous half-edge,
+ * \f$\mathrm{origin}(h) = \mathrm{target}(\mathrm{prev}(h))\f$. Three
+ * consequences:
+ *
+ * - a whole family of "the next-cycle is broken" corruptions cannot occur, which
+ *   is why MFTLCheckMeshIntegrity() is a third of its usual size;
+ * - the half-edge array needs no capacity of its own &mdash; it is \f$3\times\f$
+ *   the triangle capacity, in the same allocation;
+ * - the price is that the mesh is triangles-only, which it already was.
+ *
+ * ## Walking a vertex fan
+ *
+ * The one-ring of a vertex is generated by alternating the two involutions:
+ * from an outgoing half-edge \f$h\f$, the next outgoing half-edge around the
+ * same origin is
+ *
+ * \f[
+ *   h' = \mathrm{next}(\mathrm{twin}(h))
+ * \f]
+ *
+ * which closes into a cycle on an interior vertex and terminates at
+ * `MFTL_ERROR` on a boundary vertex. A boundary vertex therefore has **one more
+ * neighbour vertex than it has incident triangles**: the closing edge of an open
+ * fan is reachable only as an *incoming* half-edge. MFTLGetVertexOneRingVertices()
+ * handles that; MFTLGetVertexOneRingHalfedges() deliberately does not, because
+ * its contract is outgoing half-edges.
+ *
+ * ## Boundary is not the same as "no twin"
+ *
+ * `twin_idx == MFTL_ERROR` means "no partner in **this** partition" &mdash; true
+ * at the rim of an open surface *and* at the outer edge of a ghost halo.
+ * #MFTL_FLAG_BOUNDARY means "no partner anywhere in the mesh"; it is written
+ * once by MFTLMarkMeshBoundary() while the mesh is still complete, and from then
+ * on travels with the entity.
+ */
+
+/**
+ * @defgroup mftl_geometry Periodic-aware geometry
+ * @ingroup mftl_mesh
+ *
+ * @brief Positions, edge vectors, triangle frames and vertex normals.
+ *
+ * ## The minimum image convention
+ *
+ * On a periodic axis the domain is a torus, so the difference of two stored
+ * coordinates is not the vector between them. The shortest representative is
+ *
+ * \f[
+ *   \Delta_k = (p_2 - p_1)_k - L_k \,\mathrm{round}\!\left(\frac{(p_2-p_1)_k}{L_k}\right)
+ * \f]
+ *
+ * evaluated with `nearbyint`, which is one multiply, one round and one
+ * fused multiply-subtract per axis. `MFTL_Domain::inv_domain_size` is
+ * precomputed so the division never appears in a hot loop.
+ *
+ * Every geometric query in this module applies it. A triangle that straddles a
+ * seam has corners on both sides of the box, and a centroid built from the raw
+ * coordinates would land in the middle of the domain.
+ *
+ * ## Triangle area and normal
+ *
+ * With \f$\mathbf{e}_1 = \mathbf{p}_1 - \mathbf{p}_0\f$ and
+ * \f$\mathbf{e}_2 = \mathbf{p}_2 - \mathbf{p}_0\f$ both taken under the minimum
+ * image convention,
+ *
+ * \f[
+ *   \mathbf{n} = \mathbf{e}_1 \times \mathbf{e}_2, \qquad
+ *   A = \tfrac{1}{2}\lVert \mathbf{n} \rVert, \qquad
+ *   \hat{\mathbf{n}} = \frac{\mathbf{n}}{\lVert \mathbf{n} \rVert}
+ * \f]
+ *
+ * so one square root serves both the area and the normalisation.
+ *
+ * @warning **A normal is always a unit vector, at every scale.** Every kernel in
+ * MFTL computes \f$m = \lVert\mathbf{n}\rVert\f$ *unclamped* and then
+ * \f$\mathrm{inv} = (m > 0) \,?\, 1/m : 0\f$. Clamping \f$\lVert\mathbf{n}\rVert^2\f$
+ * before the square root floors the magnitude at \f$10^{-6}\f$; clamping the
+ * divisor merely moves the floor. A short normal is the most dangerous shape of
+ * wrong available here: it points the right way, so every sign test, winding
+ * check and picture still passes, while it silently scales surface tension and
+ * every other quantity built from it.
+ *
+ * ## The frame representation
+ *
+ * `tris.anchor` and `tris.edge` cache \f$(\mathbf{p}_0, \mathbf{e}_1,
+ * \mathbf{e}_2)\f$ per triangle, already seam-corrected. A kernel that streams
+ * them needs no gather through the half-edges and no periodic arithmetic at all;
+ * MFTLComputeTriangleGeometry() dispatches on #MFTL_DERIVED_FRAMES and the two
+ * paths are bit-identical.
+ *
+ * ## Area-weighted vertex normals
+ *
+ * \f[
+ *   \mathbf{N}_v = \frac{\sum_{t \ni v} A_t\, \hat{\mathbf{n}}_t}
+ *                       {\left\lVert \sum_{t \ni v} A_t\, \hat{\mathbf{n}}_t \right\rVert}
+ * \f]
+ *
+ * accumulated as a scatter over triangles. An owned vertex gets the exact answer
+ * **iff** every triangle incident to it is present locally &mdash; a
+ * vertex-complete halo. That is what buys the pass zero communication; see
+ * @ref mftl_communication.
+ */
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Layer 3 -- Module APIs
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @defgroup mftl_modules Layer 3 &mdash; Module APIs
+ *
+ * @brief One module = one `src/<module>/` directory = one `include/mftl_<module>.h`.
+ *
+ * Each of these owns a piece of behaviour and its own translation units. A
+ * module header may include layer 0&ndash;2 headers, never another module's.
+ */
+
+/**
+ * @defgroup mftl_object The mesh container
+ * @ingroup mftl_modules
+ *
+ * @brief Pool lifecycle, derived arrays, Morton ordering and the hot-loop iterators.
+ *
+ * `src/object/object.c` is the **only** file allowed to write a pool pointer, a
+ * `capacity` or a `block`. Everything else changes size through
+ * MFTLObjectReserve(), MFTLObjectReserveAdditional() or MFTLObjectSetCounts().
+ *
+ * ## Derived arrays and staleness
+ *
+ * `tris.verts`, `tris.neighbors`, `tris.anchor` and `tris.edge` are rebuildable
+ * caches, tracked by a two-bit word:
+ *
+ * | Bit | Arrays | Invalidated by |
+ * |---|---|---|
+ * | #MFTL_DERIVED_TOPOLOGY | `verts`, `neighbors` | any topology change |
+ * | #MFTL_DERIVED_FRAMES | `anchor`, `edge` | topology change **or** vertex motion |
+ *
+ * Every `MFTL_FOREACH_*` iterator asserts on the relevant bit in Debug, and
+ * #MFTL_FOREACH_OWNED_VERTEX clears the frame bit on the way out, so a motion
+ * pass cannot silently leave geometry a timestep stale.
+ *
+ * ## Morton (Z-order) renumbering
+ *
+ * MFTLObjectReorderMorton() sorts both pools along a space-filling curve. A
+ * position is quantised to 21 bits per axis and the bits are interleaved,
+ *
+ * \f[
+ *   Z(x,y,z) = \sum_{i=0}^{20} \Big( x_i\,2^{3i} + y_i\,2^{3i+1} + z_i\,2^{3i+2} \Big)
+ * \f]
+ *
+ * giving a 63-bit key that fits one `uint64_t`. The curve has the locality
+ * property that two points close in space have keys that agree in their high
+ * bits, so sorting by \f$Z\f$ puts spatial neighbours near each other in memory.
+ * This is also the ordering an LBVH build consumes directly &mdash; see
+ * @ref mftl_bvh.
+ */
+
+/**
+ * @defgroup mftl_ensemble The library handle
+ * @ingroup mftl_modules
+ *
+ * @brief One domain plus its objects, and the two collective per-timestep passes.
+ *
+ * ## Where a geometry function lives
+ *
+ * The split is by SCOPE, not by entity type:
+ *
+ * | | one object, LOCAL, no MPI | every object, COLLECTIVE |
+ * |---|---|---|
+ * | triangles | MFTLComputeTriangleGeometry() | MFTLEnsembleUpdate() |
+ * | vertices | MFTLComputeVertexNormals() | MFTLEnsembleUpdateVertexNormals() |
+ *
+ * An `MFTLEnsemble*` function is a loop over the object list plus exactly the
+ * collective its result needs. The two collectives are of different KINDS and
+ * that is the interesting part: the triangle statistics need a **reduction** (a
+ * minimum over one rank's partition is not the mesh's minimum), while the vertex
+ * normals need an **exchange** (owned normals are already exact; the ghosts are
+ * the half that is missing).
+ *
+ * @note One deliberate exception, and it is performance over tidiness.
+ *       MFTLEnsembleUpdate()'s kernel is a file-static function in
+ *       `src/ensemble/ensemble_update.c` rather than in `src/geometry/`, because
+ *       it carries nine live reduction accumulators. Moving it across a
+ *       translation-unit boundary would force them into an address-taken struct,
+ *       measured at 15 %.
+ */
+
+/**
+ * @defgroup mftl_meshgen Procedural mesh generation
+ * @ingroup mftl_modules
+ *
+ * @brief Indexed-list to half-edge conversion, and the icosphere generator.
+ *
+ * ## Icosahedron subdivision
+ *
+ * A geodesic sphere is built by \f$r\f$ rounds of 1-to-4 subdivision of a
+ * regular icosahedron, projecting every new vertex onto the unit sphere. The
+ * icosahedron's twelve vertices are the cyclic permutations of
+ * \f$(0, \pm 1, \pm \varphi)\f$ with \f$\varphi = (1+\sqrt5)/2\f$.
+ *
+ * Counts after \f$r\f$ refinements follow from Euler's formula
+ * \f$V - E + F = 2\f$ with \f$3F = 2E\f$:
+ *
+ * \f[
+ *   F_r = 20 \cdot 4^{\,r}, \qquad
+ *   E_r = 30 \cdot 4^{\,r}, \qquad
+ *   V_r = 10 \cdot 4^{\,r} + 2
+ * \f]
+ *
+ * Subdivision is uniform, so triangle quality does not degrade with \f$r\f$: the
+ * mean ratio stays within a few percent of the icosahedron's own.
+ *
+ * @note **Face normals point outward, everywhere.** The face table is wound
+ *       counter-clockwise as seen from outside, and the 1-to-4 subdivision emits
+ *       every sub-triangle in its parent's rotational order. This is what makes
+ *       the enclosed volume positive under the divergence theorem and fixes the
+ *       sign of surface tension and of the indicator function.
+ */
+
+/**
+ * @defgroup mftl_communication Distributed-memory communication
+ * @ingroup mftl_modules
+ *
+ * @brief Redistribution, ghost synchronisation, and the spatial halo.
+ *
+ * ## What redistribution is
+ *
+ * The domain is cut into a Cartesian grid of `cuts[0] x cuts[1] x cuts[2]` rank
+ * boxes. A vertex belongs to the rank whose box contains it; a triangle belongs
+ * to the rank whose box contains its centroid. Redistribution moves every entity
+ * to its owner and rebuilds the halo around what stayed.
+ *
+ * ## The halo rule, and why it is stronger than "one ring"
+ *
+ * A triangle is sent to the owner of each of its three corners **and** to the
+ * owner of each of its three edge neighbours. The corner clause is what makes
+ * the halo **vertex-complete**: for every owned vertex, every triangle incident
+ * to it is present locally. That is precisely the precondition
+ * MFTLComputeVertexNormals() needs to be communication-free, and it is a
+ * strictly stronger statement than "one layer of edge-adjacent ghost triangles".
+ *
+ * The same rule read backwards defines replication: an owned entity is
+ * replicated on another rank **iff** it has a ghost corner or a ghost edge
+ * neighbour, i.e.
+ *
+ *     corner >= verts.n_local  ||  neighbour >= tris.n_local
+ *
+ * Two streaming reads, six integer compares, no distance test and no message.
+ * That is what MFTLRemeshMarkFrozen() computes; see @ref mftl_remeshing.
+ *
+ * ## What survives a redistribution
+ *
+ * Redistribution invalidates all cached geometry **except the vertex positions**.
+ * It returns an object with valid topology, valid positions and both derived
+ * bits set; `tris.area/normal/center` and `verts.normal/area/mean_curv/gauss_curv`
+ * hold unspecified values until something recomputes them. That is what buys the
+ * 3&times; smaller wire format.
+ *
+ * ## The spatial halo is a different thing entirely
+ *
+ * The redistribution halo is TOPOLOGICAL: neighbouring triangles of the same
+ * body. The spatial halo (MFTLExtendSpatialHalo()) is GEOMETRIC: the triangles
+ * of body B that some other rank holds near this rank's share of body A. It is
+ * delivered as a standalone shadow #MFTL_Object per body, deliberately NOT in
+ * `ens->objects`, so redistribution and both ghost syncs never see it.
+ *
+ * @note **An extent is a centre plus a half-width, never a `(lo, hi)` box.** Two
+ *       shares meeting across a periodic seam are a domain length apart in
+ *       stored coordinates, so a min/max box says they do not touch; and a share
+ *       holding one seam-straddling triangle has a box spanning the whole domain.
+ *       "Near" is the minimum-image distance between centres against the sum of
+ *       half-widths.
+ */
+
+/**
+ * @defgroup mftl_io Mesh output
+ * @ingroup mftl_modules
+ *
+ * @brief VTK legacy debug dump and the parallel VTK XML (`.vtu` / `.pvtu`) writer.
+ *
+ * @note **Only OWNED entities go into a `.vtu`.** A ghost is a copy of a triangle
+ *       another rank owns, so writing the whole pool puts every halo triangle in
+ *       the merged dataset once per rank holding it. The picture is unchanged
+ *       (the copies are coincident) and every integral the visualisation tool
+ *       computes over the surface is wrong by the halo fraction, silently.
+ *
+ * @note **The periodic-wrap test has no tolerance, on purpose.** It asks whether
+ *       a reconstructed corner \f$\mathbf{p}_0 + \mathbf{e}\f$ left the domain
+ *       box. A false positive costs three extra points carrying correct
+ *       coordinates and renders identically; a false negative draws a triangle
+ *       across the whole domain.
+ */
+
+/**
+ * @defgroup mftl_remeshing Isotropic surface remeshing
+ * @ingroup mftl_modules
+ *
+ * @brief Split, collapse, flip, smooth &mdash; serial operators plus two
+ *        distributed schedules around them.
+ *
+ * ## The algorithm
+ *
+ * Botsch & Kobbelt's incremental isotropic remesher. One iteration is four
+ * sweeps against a target edge length \f$L\f$:
+ *
+ * 1. **Split** every edge longer than \f$\tfrac{4}{3}L\f$
+ * 2. **Collapse** every edge shorter than \f$\tfrac{4}{5}L\f$
+ * 3. **Flip** every edge whose flip lowers the total squared valence deviation
+ * 4. **Smooth** by tangential Laplacian relaxation
+ *
+ * The bounds \f$[\tfrac45 L, \tfrac43 L]\f$ are not tuning. Splitting an edge of
+ * length \f$\ell\f$ produces two of length \f$\ell/2\f$, so a split can only
+ * create a collapsible edge if \f$\ell/2 < \tfrac45 L\f$ while
+ * \f$\ell > \tfrac43 L\f$; the two conditions are incompatible because
+ * \f$\tfrac43 L / 2 = \tfrac23 L < \tfrac45 L\f$ fails to hold in the other
+ * direction. This is the widest pair for which the two sweeps cannot oscillate.
+ *
+ * ## Valence optimisation
+ *
+ * A flip is accepted when it lowers
+ *
+ * \f[
+ *   E = \sum_{v \in \{a,b,c,d\}} \big(\deg(v) - \deg^{*}(v)\big)^{2},
+ *   \qquad \deg^{*} = \begin{cases} 6 & \text{interior} \\ 4 & \text{boundary} \end{cases}
+ * \f]
+ *
+ * over the four vertices of the quad. \f$\deg^{*} = 6\f$ is the valence of a
+ * regular triangulation of the plane.
+ *
+ * ## Smoothing is a projection
+ *
+ * The feature class of a vertex chooses the subspace the Laplacian displacement
+ * is projected onto:
+ *
+ * | Class | Subspace | Update |
+ * |---|---|---|
+ * | free | 2D tangent plane | \f$\mathbf{d} \leftarrow (\mathbf{I} - \hat{\mathbf{n}}\hat{\mathbf{n}}^{\!\top})\,\mathbf{d}\f$ |
+ * | ridge | 1D curve tangent | \f$\mathbf{d} \leftarrow (\hat{\mathbf{t}}\hat{\mathbf{t}}^{\!\top})\,\mathbf{d}\f$ |
+ * | corner | 0D | \f$\mathbf{d} \leftarrow \mathbf{0}\f$ |
+ *
+ * Stated that way the three cases are one idea. Moving a ridge vertex *to* the
+ * midpoint of its two feature neighbours &mdash; the full displacement, no
+ * projection &mdash; is the 2D shrinkage problem reintroduced on a 1D curve: a
+ * regular 24-gon ridge collapses to 0.84 of its radius in 20 sweeps.
+ *
+ * ## Two distributed strategies, chosen by one ratio
+ *
+ * | | bodies larger than a rank box | bodies smaller than a rank box |
+ * |---|---|---|
+ * | what moves | the CUT PLANES, over the \f$\{0, h/2\}^3\f$ shift schedule | the BODIES, onto the rank owning their centroid |
+ * | driver | MFTLRemeshEnsembleParallel() | MFTLRemeshEnsembleDispersed() |
+ *
+ * They share no code past MFTLRemeshIterate(), which is what makes them each
+ * other's cross-check: agreeing on the answer is evidence about the ANSWER
+ * rather than about one implementation.
+ *
+ * @note **All of the module's MPI is in one file**, `src/remeshing/remesh_comm.c`,
+ *       enforced at configure time by a CMake source check. The operators, the
+ *       smoother, the compaction and both distributed drivers contain none.
+ */
+
+/**
+ * @defgroup mftl_bvh Bounding volume hierarchy and contact detection
+ * @ingroup mftl_modules
+ *
+ * @brief Linear BVH over triangle primitives, and exact triangle-triangle contact.
+ *
+ * ## Linear BVH construction
+ *
+ * Karras' construction: assign each primitive a 63-bit Morton code from its
+ * centroid, sort, then build the hierarchy by **radix splitting** &mdash; an
+ * internal node covering a sorted range \f$[i, j]\f$ splits at the position
+ * where the highest differing bit of the Morton codes changes. The split
+ * position is found by a binary search on the common prefix length
+ * \f$\delta(a,b) = \mathrm{clz}(Z_a \oplus Z_b)\f$, so the whole tree is a
+ * function of the sorted key array and needs no top-down partitioning pass.
+ *
+ * Bounding boxes are then fitted bottom-up. When only the geometry moved, the
+ * refit alone is valid and the sort and split are skipped &mdash; that is
+ * MFTL_RefitLBVH().
+ *
+ * ## Periodicity is two problems, and they need two different fixes
+ *
+ * - **Within an object**, a triangle straddling a seam has wrapped vertices, so a
+ *   centroid built from raw coordinates lands in the middle of the domain and
+ *   its AABB spans the box. Fixed by building every primitive from the
+ *   seam-consistent `tris.anchor` / `tris.edge` frame.
+ * - **Between objects**, two bodies on opposite faces are neighbours and no
+ *   per-triangle arithmetic can see it. Fixed by traversing the pair once per
+ *   periodic IMAGE (up to 27, each rejected by one root-AABB test).
+ *
+ * ## The contact envelope
+ *
+ * \f[
+ *   \tau = \max\big(\texttt{proximity\_floor},\;
+ *                   \texttt{proximity\_factor} \cdot R\big)
+ * \f]
+ *
+ * where \f$R\f$ is half the **longest side** of the root box, not half its
+ * diagonal, so \f$R\f$ equals the radius for a sphere and the factor means what
+ * it says. \f$R\f$ is measured over one rank's partition, so the distributed
+ * pipeline overwrites it with the body's global radius from one reduction &mdash;
+ * otherwise splitting a droplet over eight ranks would change the separation at
+ * which contact is detected.
+ *
+ * ## The narrow phase
+ *
+ * Guigue &amp; Devillers' triangle-triangle overlap test, which decides the
+ * question with a sequence of orientation predicates
+ *
+ * \f[
+ *   \mathrm{orient3d}(\mathbf{a},\mathbf{b},\mathbf{c},\mathbf{d}) =
+ *   \operatorname{sign} \det
+ *   \begin{pmatrix}
+ *     a_x - d_x & a_y - d_y & a_z - d_z \\
+ *     b_x - d_x & b_y - d_y & b_z - d_z \\
+ *     c_x - d_x & c_y - d_y & c_z - d_z
+ *   \end{pmatrix}
+ * \f]
+ *
+ * MFTL_Orient3D() is Shewchuk-adaptive: it evaluates the determinant in floating
+ * point together with a running error bound, and only escalates to exact
+ * expansion arithmetic when the bound does not separate the result from zero.
+ *
+ * @warning `src/bvh/bvh_predicates.c` **must** be compiled with
+ *          `-ffp-contract=off`. An FMA contracts \f$x - ab\f$ into one rounding,
+ *          `Two_Product`'s residue comes out zero, and every exactness guarantee
+ *          evaporates while the numbers still look plausible.
+ *
+ * @note **A distributed contact is reported by the rank that owns the A-side
+ *       primitive, and only that rank.** So a BVH is built over owned triangles
+ *       only, only object B's triangles travel, and the traversal skips any leaf
+ *       pair whose A side is remote.
+ */

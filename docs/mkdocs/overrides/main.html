@@ -1,0 +1,15 @@
+{#-
+  Theme override for the MFTL manual.
+
+  Only the announcement bar is customised. Everything else is Material's own
+  template, so a theme upgrade cannot silently drop a block this file forgot to
+  re-emit.
+-#}
+{% extends "base.html" %}
+
+{% block announce %}
+  <div class="mftl-announce">
+    MFTL 6 is a ground-up rewrite of MFTL 5 &mdash; the architecture changed, the algorithms mostly did not.
+    <a href="{{ 'guide/architecture/' | url }}">Read the one idea</a> before changing anything structural.
+  </div>
+{% endblock %}

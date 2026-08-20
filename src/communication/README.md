@@ -1,0 +1,335 @@
+`src/communication/` — Distributed memory {#mftl_mod_communication}
+=========================================
+
+**Public header:** `include/mftl_communication.h` · **Layer:** 3 ·
+**Module group:** @ref mftl_communication
+
+Four translation units, four distinct jobs:
+
+| File | Job |
+|---|---|
+| `exchange.c` | the MPI datatypes, and a non-blocking all-to-all-v of up to four independent payloads |
+| `redistribute.c` | *"the mesh has moved — who owns what now?"* Re-partition, and rebuild the halo. |
+| `ghost_sync.c` | *"the mesh has deformed — refresh my ghosts."* Topology untouched; one per-vertex 3-vector travels. |
+| `spatial_halo.c` | *"fetch me the parts of body B near my share of body A."* A geometric halo, delivered as a shadow object. |
+
+Plus `comm_internal.h`, holding the two data structures all four share: a lazy
+`int` buffer, and the epoch-stamped global-id table that replaced the hash maps.
+
+---
+
+## What the wire carries, and what it deliberately does not {#comm_wire}
+
+**Only topology and identity travel.** Everything geometric except the vertex
+position is left behind and recomputed at the receiver, because recomputing it is
+a streaming pass over contiguous arrays while shipping it is bytes on a wire, per
+entity, per timestep:
+
+| Payload | MFTL 5 | here |
+|---|---|---|
+| #MFTL_PackedVertex | 96 B | **40 B** (position + 4 ints) |
+| #MFTL_PackedTriangleComplex | 120 B | **40 B** (10 ints) |
+
+A vertex **position** is the one geometric quantity that is authoritative
+(@ref arch_inv_positions) — nothing can recompute it — so it travels. The vertex
+normal, area and curvatures, and the triangle area/normal/centre, are all
+functions of the positions and the topology, so they do not.
+
+Three further fields MFTL 5 transmitted are not sent, because implicit indexing
+already determines them:
+
+- **A half-edge's global ID.** Half-edge $3t+k$ carries $3\,t_{\mathrm{gid}} + k$
+  mesh-wide. The receiver reconstructs it.
+- **A vertex's outgoing half-edge.** Re-derived at the receiver in the same pass
+  that writes the half-edges.
+- **`next`, `triangle` and `twin`.** The first two are arithmetic; the third is
+  re-derived from the vertex ids that arrive anyway.
+
+@warning `vertex_gid[k]` on the wire is the global id of the **target** of
+         half-edge $3t+k$, i.e. `verts.rec[he[3t+k].vertex_idx].global_id`. It is
+         **not** `tris.verts[3t+k]`, which is the *origin* of that half-edge. The
+         two differ by a rotation, and mixing them silently rotates every triangle.
+
+### Layout is pinned by static assertion
+
+Both packed types are laid out as one run of doubles followed by one run of ints,
+so the MPI datatype is two contiguous blocks rather than one block per field —
+and both come to exactly 40 bytes with no padding. `_Static_assert` pins that,
+because the datatype descriptions are only valid while it holds.
+
+`commit_struct` additionally calls `MPI_Type_create_resized` to pin the extent to
+the C `sizeof`. `MPI_Type_create_struct` derives the extent from the members it
+was told about; that happens to match here, but only because of how the trailing
+padding falls — and an array of a type whose extent disagrees with the C stride
+reads **shifted garbage, silently**.
+
+---
+
+## Redistribution {#comm_redistribute}
+
+### The ownership rule, and the halo rule
+
+A vertex belongs to the rank whose Cartesian cell contains it. A triangle belongs
+to the rank whose cell contains its **cached centre**.
+
+A triangle is then *additionally* sent to the owner of each of its three
+**corners** and each of its three **edge neighbours**. That surplus **is** the
+ghost layer.
+
+The corner clause is what makes the halo **vertex-complete**: for every owned
+vertex, every triangle incident to it is present locally. That is a strictly
+stronger statement than "one layer of edge-adjacent ghost triangles", and it is
+exactly the precondition `MFTLComputeVertexNormals` needs to be
+communication-free.
+
+Read backwards, the same rule defines replication:
+
+$$
+  \text{replicated} \iff
+  \text{corner} \ge \texttt{verts.n\_local} \ \lor\ \text{neighbour} \ge \texttt{tris.n\_local}
+$$
+
+Two streaming reads, six integer compares, no distance test and **no message**.
+That is what `MFTLRemeshMarkFrozen` computes — see @ref mftl_mod_remeshing.
+
+### Entities that stay never leave the pool
+
+MFTL 5 routed **every** entity through the wire format, including the ~90 % of a
+partition that stays put: pack into an `MFTL_Packed*`, radix-sort the merged
+(kept + received) stream by global id, de-duplicate, unpack, insert four hash-map
+entries per triangle. That round trip was the single most expensive part of a
+redistribution and **none of it moved any data anywhere**.
+
+Here the kept entities are identified during the same destination analysis that
+decides what to send — this rank is simply one more destination — and are then
+**compacted in the pool** by a permutation. Concretely, per redistribution:
+
+- **no pack/unpack of kept entities, and no global sort.** The merged sort is
+  replaced by an $O(\text{kept})$ gather plus an $O(\text{received})$
+  classification.
+- **no hash maps.** Global ids are dense per entity class, so *"have I already got
+  global id $g$"* is an epoch-stamped array probe.
+- **no full twin rebuild.** A twin between two kept triangles survives as an index
+  remap; only half-edges that actually lost their partner are re-paired, and they
+  are collected for free while the remap runs.
+
+### The epoch-stamped id table {#comm_gid_table}
+
+`mftl_gid_table` in `comm_internal.h` is what replaced `khash`. The question every
+rebuild answers is *"do I already hold global id $g$, and where?"* — and since ids
+are dense, the answer is an **array index**.
+
+Two things make a plain array practical:
+
+- the id range is the **object's**, not the ensemble's, so a thousand droplets get
+  a thousand small ranges rather than one huge one;
+- the table is **never cleared**. `stamp[g] == epoch` is what makes an entry valid,
+  and bumping the epoch retires every entry at once. Clearing a table sized by the
+  id range once per object per timestep would cost more than the lookups it serves.
+
+Epochs start at 1, so a zeroed slot is always *absent*. The one case where "never
+cleared" cannot hold is after $2^{32}$ epochs, when the counter wraps to a value
+some ancient stamp still carries — unsigned wraparound is defined, so it is
+detectable, and the table is wiped exactly once every four billion objects.
+
+### The vertex de-duplication bitmask
+
+A vertex is a candidate for a destination once per incident triangle bound there,
+so its list would arrive `valence` times over and have to be fixed afterwards with
+a sort plus a unique pass — work to remove duplicates that never had to be created.
+
+One bit per (vertex, destination) replaces it: `mask[v] & (1 << b)` is *"v is
+already queued for the destination holding bit slot b"*, so the test-and-set is
+$O(1)$ and nothing is sorted.
+
+Bit slots are handed out on first contact. A remote destination set is bounded by
+the 26-neighbourhood on the local path, so 32 bits suffice there by construction;
+the global path (the initial scatter, or an object spanning more than 32 cells)
+can exceed it, and those ranks get `NO_BIT` and fall back to the sort.
+**Correctness never depends on the bound.**
+
+### Two paths, one exchange engine
+
+`MFTLExchangeStart` posts **two collectives regardless of the payload count**: one
+`MPI_Alltoall` carrying `n_payloads` counts per target, then one non-blocking
+`*alltoallv` per payload, all posted back to back.
+
+Merging the count exchange matters at scale — a 1-int `Alltoall` is pure latency
+and does not get cheaper with fewer bytes, so paying it once instead of once per
+payload is what keeps the small-message cost of a redistribution flat.
+
+| Path | Primitive | When |
+|---|---|---|
+| graph | `MPI_Neighbor_alltoallv` over `comm_graph` | every destination is inside the 26-neighbourhood — the production case |
+| global | `MPI_Alltoallv` over `comm_cart` | some destination is not, e.g. the initial scatter from rank 0 |
+
+The choice is reduced across ranks, never taken locally.
+
+### Postcondition
+
+@warning A redistributed object comes back with valid topology, valid **positions**
+         and both derived bits set. Its `tris.area/normal/center` and
+         `verts.normal/area/mean_curv/gauss_curv` hold **unspecified** values.
+
+That is what buys the 3× smaller wire format. The loop that satisfies it with
+exactly one geometry pass is in @ref mftl_page_timestep, and the three things in
+it that are silent when wrong are spelled out there.
+
+---
+
+## Ghost synchronisation {#comm_ghost}
+
+`ghost_sync.c` implements one request/reply round:
+
+1. every rank lists the global ids of its ghost vertices, grouped by owning rank;
+2. one exchange sends the requests;
+3. each owner scatters its **owned** vertices into the epoch-stamped table and
+   answers with one #MFTL_GhostUpdatePayload per request;
+4. one exchange returns the replies, which are applied by id.
+
+### One vector per message, never a bundle
+
+MFTL 5 shipped position, normal, both curvatures and the area together: **80 B
+against 32 B**, of which everything but the position is a function of the
+positions and the topology — so four fifths of it was recomputable at the receiver
+for less than it cost to send.
+
+#MFTL_GhostUpdatePayload is therefore deliberately **generic** rather than named
+after the position. The same 32 bytes, the same datatype and the same schedule
+carry whichever per-vertex vector is being synchronised; the two callers differ
+only in which array they read from and write into. Anything that genuinely needs
+a second field sends a second exchange and pays only for that field.
+
+The scatter is $O(\text{owned})$ and the requests are $O(\text{halo})$, so it is
+only worth doing per object that actually received a request — which is why the
+caller groups the requests by object first. In the many-body case that skips
+almost everything.
+
+@note **The schedule is rebuilt from scratch every timestep, and could be cached.**
+      Only the holder of a ghost knows that it holds it, so the request phase
+      cannot be removed — but after a redistribution the schedule is fixed until
+      the next one, so the owner side could keep its resolved slot list and every
+      subsequent sync would be a single `MPI_Neighbor_alltoallv` with no lookup.
+      Not done, because the loop this library is built around redistributes every
+      step and there would be nothing to amortise over.
+
+---
+
+## The spatial halo {#comm_spatial}
+
+A **different thing entirely** from the redistribution halo:
+
+| | Redistribution halo | Spatial halo |
+|---|---|---|
+| kind | topological | geometric |
+| contents | neighbouring triangles of the **same** body | triangles of body **B** near this rank's share of body **A** |
+| lives in | the body's own pools, past `n_local` | a standalone shadow #MFTL_Object per body |
+| rebuilt by | `MFTLRedistribute` | `MFTLExtendSpatialHalo` |
+
+The patch is an ordinary object with `n_local == 0`, twins linked within the
+patch, derived arrays built. It is deliberately **not** in `ens->objects`, so
+redistribution and both ghost syncs never see it.
+
+### Why not append to the body's ghost suffix
+
+That is what MFTL 2 did, and it looks free because the ownership prefix is
+untouched. It fails for two reasons that are invisible until they bite:
+
+1. **Four passes bounded by `tris.n` rather than `n_local` change silently:** the
+   Morton bounding box in `reorder_vertices` (a partner body across the domain
+   coarsens the cells for the *owned* mesh), `MFTLMeanEdgeLength` (each appended
+   triangle contributes three twin-less half-edges, so the remeshing target length
+   is set partly by another body — and it carries no ghost assertion), the
+   vertex-normal scatter, and `MFTLRebuildTwins`, which re-pairs by vertex **slot**
+   and can **weld two bodies together**.
+2. **There is no good answer for the arriving vertex GIDs.** De-duplicate them onto
+   existing slots and `inv_halo_is_vertex_complete` breaks; give them fresh slots
+   and `inv_local_global_ids_are_unique` breaks. Both are in
+   `inv_partition_is_sound`.
+
+Doing it properly needs the two-way ownership split to become three-way, i.e. a
+change to @ref arch_inv_prefix.
+
+### An extent is a centre plus a half-width {#comm_extent}
+
+Everything geometric in `spatial_halo.c` is a question of the form *"is this near
+that"*, asked across a domain that **wraps**. A `(lo, hi)` box cannot express the
+answer, and it gets it wrong in **both directions at once**:
+
+- **It misses contacts.** Two shares meeting across the seam are a domain length
+  apart in stored coordinates. Rank $p$ reports its part of A at $x \approx 9.9$
+  and rank $q$ reports its part of B at $x \approx 0.1$, so a min/max comparison
+  reports no overlap for two surfaces that are touching. The traversal tries every
+  periodic image of B, but only for triangles it **has**, and this test decides
+  whether they are sent at all. The miss lands one stage before anything the BVH
+  can see.
+- **It over-sends enormously.** A share containing even one seam-straddling
+  triangle has a min/max box spanning the **whole domain**, because
+  `MFTLGetTriangleBounds` is correctly seam-consistent and puts that triangle's
+  corners just outside the box on one side. Such a share overlaps everything, and
+  every neighbour ships its entire share of every partner body — a droplet on the
+  seam turns the halo into an all-to-all broadcast of the mesh, every timestep,
+  silently.
+
+So an extent is a **centre on the circle plus a half-width**, and "near" is the
+minimum-image distance between centres against the sum of half-widths:
+
+$$
+  \text{near} \iff \forall k:\;
+  \big| \Delta_k(c^A_k, c^B_k) \big| \le h^A_k + h^B_k + \text{margin}
+$$
+
+A rank's own extent is measured **in two frames** — raw, and shifted by half a
+domain — keeping the tighter per axis. That is what makes a straddling share
+report its true size, and it is the same trick `MFTLSpatialHaloResolveRadii`
+needs so a droplet on the seam does not report a bounding radius of half the box.
+
+**Measured** at $P = 27$ on a seam contact: **314 triangles ghosted with boxes
+against 56 with intervals**, and **320 against 0** for a placement with no
+cross-rank contact at all. Payload is six doubles per body per rank either way.
+
+### A pre-filter must be strictly MORE permissive than what it short-cuts
+
+The per-triangle intervals are widened by the contact margin. An **un-widened**
+macro extent is therefore *stricter* than what it stands in for, and rejects the
+whole neighbour in exactly the regime the margin exists for: two shares that do
+not overlap but are within contact range of each other.
+
+Overlapping bodies hide it completely — their raw extents intersect anyway — so
+only a **proximity** contact at a rank boundary reveals it, which is what
+`test_the_tolerance_threshold_is_exact_from_both_sides` is.
+
+### The halo is transient and cannot be otherwise
+
+`collect_destinations` keeps only owned triangles, so a halo cannot survive a
+repartition **even in principle**, and the documented loop redistributes every
+step. Each `MFTLExtendSpatialHalo` **replaces** the previous patches rather than
+accumulating.
+
+@note The overlap list is rebuilt from scratch every call and could be cached when
+      the decomposition is static — but every rank's extent for every body changes
+      every step, so the cache would be invalidated exactly as often as it was
+      built. If a solver appears that redistributes every $N$ steps, it belongs on
+      #MFTL_SpatialHalo, which the caller already owns — **not** on #MFTL_Domain,
+      which is read-only during a redistribution.
+
+---
+
+## Deferred {#comm_deferred}
+
+1. **Per-destination send buffers are allocated and freed on every call.** At the
+   density-derived hint they are ~128 KB each, so a redistribution `malloc`s and
+   frees a few megabytes per timestep and pays the first-touch faults again each
+   time. Keeping them as scratch on the domain would remove it; not done because
+   it puts mutable per-call state on a struct that is otherwise read-only during a
+   redistribution.
+2. **Step 5 of the per-timestep loop is bound by first touch, not by its kernel.**
+   The geometry pass that restores what redistribution drops runs on pools the
+   redistribution has just rewritten, and costs **6.4 ns/triangle against 2.9 ns**
+   for the same function on a resident mesh. The remaining lever is fusing the
+   recompute *into* the rebuild, where the arrays are already in registers — not
+   attempted, because it would put geometry into a module that deliberately
+   transmits none.
+3. **Nothing has been measured above 4 ranks on real hardware.** The scaling of
+   the exchange — graph path versus global path, and the behaviour at $P$ in the
+   hundreds — is entirely unmeasured.

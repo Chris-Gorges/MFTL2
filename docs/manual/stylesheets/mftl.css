@@ -1,0 +1,249 @@
+/* ═══════════════════════════════════════════════════════════════════════════
+ *  MFTL manual -- Material theme extensions
+ *
+ *  Everything here is expressed against Material's CSS custom properties, so
+ *  the light scheme, the dark scheme and the "follow the system" state all pick
+ *  it up from one definition. Nothing overrides a Material component wholesale;
+ *  a theme upgrade should not need this file to be rewritten.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/* ── Brand palette ──────────────────────────────────────────────────────────
+ *
+ *  Hue 209, the same blue the Doxygen manual is generated with
+ *  (HTML_COLORSTYLE_HUE in docs/doxygen/Doxyfile.in), so the two halves of the
+ *  site do not change identity when a reader crosses from one to the other.
+ *  The accent is a cyan pulled off the same wheel a third of a turn away: it is
+ *  reserved for interaction (links, focus, the active nav item) and never used
+ *  to carry meaning on its own.
+ * ------------------------------------------------------------------------- */
+
+:root {
+  --md-primary-fg-color:        #12507e;
+  --md-primary-fg-color--light: #2c74ab;
+  --md-primary-fg-color--dark:  #0a3a5e;
+  --md-primary-bg-color:        #ffffff;
+  --md-primary-bg-color--light: #ffffffb3;
+
+  --md-accent-fg-color:         #0091a7;
+  --md-accent-fg-color--transparent: #0091a71a;
+
+  --md-typeset-a-color:         #0f5b93;
+
+  --mftl-rule:                  #0000001f;
+  --mftl-card-bg:               #ffffff;
+  --mftl-card-shadow:           0 1px 2px #0000000f, 0 4px 14px #00000008;
+  --mftl-card-shadow-hover:     0 2px 6px #0000001a, 0 12px 28px #0000000f;
+  --mftl-code-bg:               #f4f6f9;
+}
+
+[data-md-color-scheme="slate"] {
+  --md-hue: 212;
+
+  --md-primary-fg-color:        #123249;
+  --md-primary-fg-color--light: #2c74ab;
+  --md-primary-fg-color--dark:  #0a2233;
+  --md-primary-bg-color:        #e9f0f6;
+
+  --md-accent-fg-color:         #35c8dc;
+  --md-accent-fg-color--transparent: #35c8dc1f;
+
+  --md-typeset-a-color:         #74b8e8;
+
+  --mftl-rule:                  #ffffff24;
+  --mftl-card-bg:               #ffffff06;
+  --mftl-card-shadow:           none;
+  --mftl-card-shadow-hover:     0 8px 24px #00000040;
+  --mftl-code-bg:               #ffffff0a;
+}
+
+/* ── Typography ─────────────────────────────────────────────────────────────
+ *
+ *  The prose in this library runs to 160 columns in the source and reads badly
+ *  reflowed narrow, but it is also dense: the measure is widened only modestly
+ *  and the line height raised to compensate.
+ * ------------------------------------------------------------------------- */
+
+.md-grid {
+  max-width: 68rem;
+}
+
+.md-typeset {
+  font-size: 0.78rem;
+  line-height: 1.72;
+}
+
+.md-typeset h1 {
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: var(--md-default-fg-color);
+}
+
+.md-typeset h2 {
+  font-weight: 650;
+  letter-spacing: -0.012em;
+  margin-top: 2.2em;
+  padding-top: 0.4em;
+  border-top: 1px solid var(--mftl-rule);
+}
+
+.md-typeset h3 {
+  font-weight: 600;
+  letter-spacing: -0.006em;
+}
+
+.md-typeset h2 + h3 {
+  margin-top: 1.2em;
+}
+
+/* Members of the generated API reference are `### function MFTLFoo` headings.
+   Setting them in the code face is what makes an index page scannable. */
+.md-typeset h3 code,
+.md-typeset h4 code,
+.md-typeset h5 code {
+  font-size: 1em;
+  background: transparent;
+  padding: 0;
+}
+
+/* ── Inline code and code blocks ────────────────────────────────────────── */
+
+.md-typeset code {
+  background-color: var(--mftl-code-bg);
+  border-radius: 0.15rem;
+}
+
+.md-typeset pre > code {
+  line-height: 1.6;
+}
+
+.md-typeset .highlight {
+  border: 1px solid var(--mftl-rule);
+  border-radius: 0.25rem;
+}
+
+.md-typeset .highlight > pre > code {
+  border-radius: 0.25rem;
+}
+
+/* ── Tables ─────────────────────────────────────────────────────────────────
+ *
+ *  This manual argues in tables -- entity sizes, tolerance ladders, benchmark
+ *  results. They are wide, so they scroll inside their own container rather
+ *  than forcing the page to.
+ * ------------------------------------------------------------------------- */
+
+.md-typeset__table {
+  width: 100%;
+}
+
+.md-typeset table:not([class]) {
+  border: 1px solid var(--mftl-rule);
+  border-radius: 0.25rem;
+  font-size: 0.72rem;
+}
+
+.md-typeset table:not([class]) th {
+  background-color: var(--md-default-fg-color--lightest);
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.md-typeset table:not([class]) tr:hover {
+  background-color: var(--md-accent-fg-color--transparent);
+}
+
+/* ── Admonitions ────────────────────────────────────────────────────────────
+ *
+ *  The `!!! warning` blocks in this corpus mark the failures that are SILENT
+ *  when wrong, which is the single most important signal in the manual. They
+ *  get a heavier left rule than Material's default so they survive skimming.
+ * ------------------------------------------------------------------------- */
+
+.md-typeset .admonition,
+.md-typeset details {
+  border-width: 0 0 0 0.15rem;
+  border-radius: 0.2rem;
+  box-shadow: none;
+  background-color: var(--md-default-fg-color--lightest);
+  font-size: 0.74rem;
+}
+
+.md-typeset .admonition.warning,
+.md-typeset details.warning {
+  border-left-width: 0.24rem;
+}
+
+/* ── Cards ──────────────────────────────────────────────────────────────── */
+
+.md-typeset .grid.cards > ul > li {
+  border: 1px solid var(--mftl-rule);
+  border-radius: 0.35rem;
+  background: var(--mftl-card-bg);
+  box-shadow: var(--mftl-card-shadow);
+  transition: transform 160ms, box-shadow 160ms, border-color 160ms;
+}
+
+.md-typeset .grid.cards > ul > li:hover {
+  transform: translateY(-2px);
+  border-color: var(--md-accent-fg-color);
+  box-shadow: var(--mftl-card-shadow-hover);
+}
+
+.md-typeset .grid.cards > ul > li > hr {
+  margin: 0.6em 0;
+  border-color: var(--mftl-rule);
+}
+
+/* ── The landing page hero ──────────────────────────────────────────────── */
+
+.mftl-hero-tagline {
+  font-size: 1.05rem;
+  line-height: 1.5;
+  font-weight: 300;
+  letter-spacing: -0.01em;
+  color: var(--md-default-fg-color--light);
+  max-width: 36em;
+  margin-top: -0.4em;
+}
+
+.mftl-hero-actions {
+  margin-top: 1.4em;
+}
+
+.mftl-hero-actions .md-button {
+  margin-right: 0.4rem;
+  margin-bottom: 0.4rem;
+}
+
+/* The landing page hides the navigation, so its H1 can carry the brand. */
+body[data-md-color-primary] .md-typeset h1#mftl {
+  font-size: 2.6rem;
+  line-height: 1.1;
+  margin-bottom: 0.2em;
+}
+
+/* ── Mermaid ────────────────────────────────────────────────────────────── */
+
+.md-typeset .mermaid {
+  margin: 1.4em 0;
+}
+
+/* ── Footer note on generated pages ─────────────────────────────────────── */
+
+.md-typeset .admonition.abstract:last-child {
+  opacity: 0.82;
+  font-size: 0.68rem;
+}
+
+/* ── Announcement bar ───────────────────────────────────────────────────── */
+
+.mftl-announce {
+  font-size: 0.68rem;
+  text-align: center;
+}
+
+.mftl-announce a {
+  color: inherit;
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+}

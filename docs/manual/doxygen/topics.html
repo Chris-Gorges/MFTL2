@@ -1,0 +1,45 @@
+<!doctype html>
+<!--
+  Placeholder for the Doxygen manual.
+
+  docs/mkdocs/hooks.py replaces this entire directory with build/docs/html at
+  the end of every MkDocs build. The files exist in the source tree only so that
+  the Material pages linking into /doxygen/ resolve during link validation, and
+  so that a site built without a Doxygen pass explains itself instead of 404ing.
+-->
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>MFTL &mdash; the Doxygen manual has not been built</title>
+    <style>
+      :root { color-scheme: light dark; }
+      body {
+        font-family: ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif;
+        line-height: 1.65; max-width: 42rem; margin: 12vh auto 0; padding: 0 1.5rem;
+      }
+      h1 { font-size: 1.5rem; letter-spacing: -0.02em; }
+      code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+      pre { background: #8881; padding: 0.9rem 1rem; border-radius: 0.35rem; overflow-x: auto; }
+      a { color: #0f5b93; }
+      @media (prefers-color-scheme: dark) { a { color: #74b8e8; } }
+      p.small { opacity: 0.75; font-size: 0.9rem; }
+    </style>
+  </head>
+  <body>
+    <h1>The Doxygen manual has not been built in this tree</h1>
+    <p>
+      This site embeds the full Doxygen manual &mdash; call graphs, caller graphs,
+      <code>#include</code> dependency graphs and the annotated source browser &mdash;
+      under <code>/doxygen/</code>. That content is copied in from
+      <code>build/docs/html</code>, which does not exist yet.
+    </p>
+    <pre>python3 build_docs.py     # generate build/docs/html
+python3 build_mkdocs.py   # rebuild this site with the manual inside it</pre>
+    <p class="small">
+      <code>python3 build_mkdocs.py</code> runs both steps in the right order, so the
+      second command alone is enough from a clean tree.
+    </p>
+    <p><a href="../">&larr; Back to the MFTL manual</a></p>
+  </body>
+</html>

@@ -1,0 +1,982 @@
+/*
+ * @Author: Christian Gorges
+ * @Date: 2026-08-14
+ *
+ * @brief Unit tests for redistribution and ghost synchronisation.
+ *
+ * Registered at several process counts (see tests/CMakeLists.txt), because the
+ * rank count changes which code path is reachable:
+ *
+ *   np = 1   the no-op path, and the guarantee that a single-rank mesh survives
+ *            a redistribution untouched
+ *   np = 2   a thin 2x1x1 grid, where periodic wrap-around maps several of the
+ *            26 neighbour offsets onto the same rank
+ *   np = 4   2x2x1: the first grid with a genuine diagonal neighbour
+ *   np = 8   2x2x2: every one of the 26 offsets is populated
+ *
+ * EVERY assertion goes through agreed(): TEST_ASSERT returns immediately, so an
+ * assertion failing on only some ranks would leave the rest blocked in the next
+ * collective -- a hang instead of a clean failure.
+ *
+ * ── One path no rank count here can reach ──────────────────────────────────
+ *
+ * The vertex de-duplication in src/communication/redistribute.c hands out one bit
+ * per remote destination and falls back to a sort-and-unique for destinations
+ * beyond MFTL_DEDUP_BITS. Reaching that needs an object with more than 32 remote
+ * destinations, i.e. more ranks than a test machine has. To exercise it, set
+ * MFTL_DEDUP_BITS to 1 and run this suite -- every test must still pass, because
+ * correctness never depends on the bound. Done, and it does; the define is back
+ * at 32 because the fallback is the slow path, not the wrong one.
+ */
+
+#include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#include <mpi.h>
+
+#include "mftl_core.h"
+#include "test_mesh_invariants.h"
+#include "test_utils.h"
+
+static int g_rank = 0;
+static int g_nproc = 1;
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Fixtures
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+static void grid_for(int nproc, int cuts[3])
+{
+  cuts[0] = nproc;
+  cuts[1] = 1;
+  cuts[2] = 1;
+  if (nproc == 4)
+  {
+    cuts[0] = 2;
+    cuts[1] = 2;
+    cuts[2] = 1;
+  }
+  else if (nproc == 6)
+  {
+    cuts[0] = 3;
+    cuts[1] = 2;
+    cuts[2] = 1;
+  }
+  else if (nproc == 8)
+  {
+    cuts[0] = 2;
+    cuts[1] = 2;
+    cuts[2] = 2;
+  }
+}
+
+static MFTL_Ensemble *make_ensemble(bool periodic, int capacity)
+{
+  int cuts[3];
+  grid_for(g_nproc, cuts);
+
+  double lo[3] = {-1.0, -1.0, -1.0};
+  double hi[3] = {1.0, 1.0, 1.0};
+  bool per[3] = {periodic, periodic, periodic};
+
+  return MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, lo, hi, per, capacity);
+}
+
+/**
+ * @brief Adds a generated sphere with its triangle geometry already computed.
+ *
+ * The centres must exist before the first redistribution: ownership is decided
+ * from them, and a freshly generated mesh has none.
+ */
+static MFTL_Object *add_sphere(MFTL_Ensemble *ens, int id, double cx, double cy, double cz, double r, int refine)
+{
+  MFTL_Object *obj = MFTLObjectCreate(id);
+  MFTLEnsembleAddObject(ens, obj);
+
+  double centre[3] = {cx, cy, cz};
+  MFTLGenerateSphere(obj, centre, r, refine);
+  MFTLComputeTriangleGeometry(obj, obj->tris.n);
+  return obj;
+}
+
+/** @brief Steps 3 and 4 of the per-timestep loop: frames, then ALL centres. */
+static void refresh_geometry(MFTL_Ensemble *ens)
+{
+  for (int o = 0; o < ens->num_objects; ++o)
+  {
+    MFTL_Object *obj = ens->objects[o];
+    MFTLObjectRefreshFrames(obj);
+    MFTLComputeTriangleGeometry(obj, obj->tris.n);
+  }
+}
+
+/** @brief Owned triangle count, owned vertex count, owned surface area. */
+static void owned_totals(const MFTL_Ensemble *ens, double out[3])
+{
+  out[0] = out[1] = out[2] = 0.0;
+  for (int o = 0; o < ens->num_objects; ++o)
+  {
+    const MFTL_Object *obj = ens->objects[o];
+    out[0] += (double) obj->tris.n_local;
+    out[1] += (double) obj->verts.n_local;
+    for (int t = 0; t < obj->tris.n_local; ++t) out[2] += obj->tris.area[t];
+  }
+}
+
+static void global_totals(const MFTL_Ensemble *ens, double out[3])
+{
+  double local[3];
+  owned_totals(ens, local);
+  MPI_Allreduce(local, out, 3, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+}
+
+/** @brief 1 if every object of the ensemble satisfies inv_partition_is_sound. */
+static int ensemble_is_sound(const MFTL_Ensemble *ens)
+{
+  for (int o = 0; o < ens->num_objects; ++o)
+  {
+    if (!inv_partition_is_sound(ens->objects[o], g_rank)) return 0;
+  }
+  return 1;
+}
+
+/**
+ * @brief Every global id is owned by EXACTLY one rank, for both entity classes.
+ *
+ * The property that makes "sum the owned entities" a correct global reduction,
+ * and the one a de-duplication bug destroys without breaking any local check:
+ * two ranks both owning a triangle, or nobody owning it, are both invisible from
+ * inside a single partition.
+ *
+ * @note Collective.
+ */
+static int ownership_is_exclusive(const MFTL_Object *obj)
+{
+  const int nt = obj->next_triangle_gid;
+  const int nv = obj->next_vertex_gid;
+  const int n = (nt > nv) ? nt : nv;
+  if (n <= 0) return 1;
+
+  int *mine = (int *) calloc((size_t) n, sizeof(int));
+  int *total = (int *) malloc((size_t) n * sizeof(int));
+  if (!mine || !total)
+  {
+    free(mine);
+    free(total);
+    return 0;
+  }
+
+  int ok = 1;
+
+  for (int t = 0; t < obj->tris.n_local; ++t)
+  {
+    const int g = obj->tris.rec[t].global_id;
+    if (g < 0 || g >= nt) ok = 0;
+    else mine[g]++;
+  }
+  MPI_Allreduce(mine, total, nt, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+  for (int g = 0; g < nt; ++g)
+    if (total[g] != 1) ok = 0;
+
+  memset(mine, 0, (size_t) n * sizeof(int));
+  for (int v = 0; v < obj->verts.n_local; ++v)
+  {
+    const int g = obj->verts.rec[v].global_id;
+    if (g < 0 || g >= nv) ok = 0;
+    else mine[g]++;
+  }
+  MPI_Allreduce(mine, total, nv, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+  for (int g = 0; g < nv; ++g)
+    if (total[g] != 1) ok = 0;
+
+  free(mine);
+  free(total);
+  return ok;
+}
+
+/** @brief Sorted list of the global ids this rank OWNS. Caller frees. */
+static int *owned_triangle_gids(const MFTL_Object *obj, int *count)
+{
+  const int n = obj->tris.n_local;
+  *count = n;
+  int *ids = (int *) malloc((size_t) (n > 0 ? n : 1) * sizeof(int));
+  for (int t = 0; t < n; ++t) ids[t] = obj->tris.rec[t].global_id;
+  MFTLSortIds(ids, n);
+  return ids;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * 1. Wire format and MPI types
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * @brief The wire format is what the header claims, and it is compact.
+ *
+ * The sizes are pinned by _Static_assert in the header as well; this states the
+ * COMPARISON, because the whole point of dropping the geometry was the ratio and
+ * a silent regression to a fatter format would still compile.
+ */
+static int test_wire_format_is_compact(void)
+{
+  TEST_ASSERT_EQUAL_INT(40, (int) sizeof(MFTL_PackedVertex));
+  TEST_ASSERT_EQUAL_INT(40, (int) sizeof(MFTL_PackedTriangleComplex));
+  TEST_ASSERT_EQUAL_INT(32, (int) sizeof(MFTL_GhostUpdatePayload));
+
+  /* A vertex carries 3 doubles and 4 ints with no padding at all; a triangle
+   * complex is exactly ten ints. */
+  TEST_ASSERT_EQUAL_INT(3 * (int) sizeof(double) + 4 * (int) sizeof(int), (int) sizeof(MFTL_PackedVertex));
+  TEST_ASSERT_EQUAL_INT(10 * (int) sizeof(int), (int) sizeof(MFTL_PackedTriangleComplex));
+
+  /* The MPI datatypes must agree with the C stride, or an array of them reads
+   * shifted garbage. */
+  MPI_Aint lb = 0, extent = 0;
+  MPI_Type_get_extent(MFTL_MPI_PackedVertex, &lb, &extent);
+  TEST_ASSERT_EQUAL_INT((int) sizeof(MFTL_PackedVertex), (int) extent);
+  MPI_Type_get_extent(MFTL_MPI_PackedTriangleComplex, &lb, &extent);
+  TEST_ASSERT_EQUAL_INT((int) sizeof(MFTL_PackedTriangleComplex), (int) extent);
+  MPI_Type_get_extent(MFTL_MPI_GhostUpdatePayload, &lb, &extent);
+  TEST_ASSERT_EQUAL_INT((int) sizeof(MFTL_GhostUpdatePayload), (int) extent);
+
+  return 0;
+}
+
+/** @brief Registering twice is a no-op, so a library and its user may both call it. */
+static int test_mpi_types_register_is_idempotent(void)
+{
+  const MPI_Datatype before = MFTL_MPI_PackedVertex;
+  MFTLRegisterMpiTypes();
+  TEST_ASSERT(MFTL_MPI_PackedVertex == before);
+  return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * 2. The initial scatter
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * @brief Generation puts everything on rank 0; redistribution spreads it.
+ *
+ * This is the case that forces the GLOBAL communication path: rank 0's
+ * destination set is every rank that holds part of the sphere, which at nproc > 27
+ * exceeds the neighbourhood and at any nproc includes ranks that are not
+ * neighbours of rank 0.
+ */
+static int test_scatter_from_rank0(void)
+{
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 1);
+  TEST_ASSERT(ens != MFTL_NULL);
+
+  MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
+
+  const int global_t = obj->global_n_triangles;
+  const int global_v = obj->global_n_vertices;
+
+  TEST_ASSERT(agreed(MFTLRedistribute(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ownership_is_exclusive(obj), MPI_COMM_WORLD));
+
+  double totals[3];
+  refresh_geometry(ens);
+  global_totals(ens, totals);
+  TEST_ASSERT_EQUAL_INT(global_t, (int) totals[0]);
+  TEST_ASSERT_EQUAL_INT(global_v, (int) totals[1]);
+
+  /* Every rank that holds part of a sphere spanning the whole box must hold
+   * something -- otherwise the partitioning is not doing anything and the rest of
+   * the suite would be testing a serial code path. */
+  int nonempty = (obj->tris.n_local > 0) ? 1 : 0;
+  int total_nonempty = 0;
+  MPI_Allreduce(&nonempty, &total_nonempty, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+  TEST_ASSERT_EQUAL_INT(g_nproc, total_nonempty);
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/**
+ * @brief Redistributing an already-distributed mesh changes nothing.
+ *
+ * The kept-entity path is what makes this the CHEAP case, and it is also where a
+ * de-duplication bug shows up first: a second pass re-receives every ghost the
+ * partition already holds, so anything that fails to recognise an arrival as a
+ * duplicate grows the pool on every call.
+ */
+static int test_redistribute_is_idempotent(void)
+{
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 1);
+  MFTL_Object *obj = add_sphere(ens, 0, 0.05, -0.05, 0.1, 0.6, 3);
+
+  MFTLRedistribute(ens);
+  refresh_geometry(ens);
+
+  const int n_v = obj->verts.n, n_vl = obj->verts.n_local;
+  const int n_t = obj->tris.n, n_tl = obj->tris.n_local;
+  int n_before = 0;
+  int *before = owned_triangle_gids(obj, &n_before);
+
+  MFTLRedistribute(ens);
+
+  int n_after = 0;
+  int *after = owned_triangle_gids(obj, &n_after);
+
+  int same = (n_v == obj->verts.n) && (n_vl == obj->verts.n_local) && (n_t == obj->tris.n) && (n_tl == obj->tris.n_local) && (n_before == n_after);
+  for (int i = 0; same && i < n_before; ++i) same = (before[i] == after[i]);
+
+  free(before);
+  free(after);
+
+  TEST_ASSERT(agreed(same, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * 3. The incremental twin repair
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * @brief The repaired twins are exactly the twins a full rebuild would produce.
+ *
+ * Redistribution never runs MFTLRebuildTwins: a twin between two kept triangles
+ * survives as an index remap, and only half-edges that actually lost their
+ * partner are re-paired. That is the single most delicate optimisation in the
+ * module, so it is checked against the reference implementation directly.
+ */
+static int test_twin_repair_matches_full_rebuild(void)
+{
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 1);
+  MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.65, 3);
+
+  MFTLRedistribute(ens);
+
+  /* A second round after motion, so the repair set contains both "my twin left"
+   * and "a new neighbour arrived" rather than only freshly received triangles. */
+  MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += 0.11; pos[1] += 0.07; pos[2] -= 0.05; MFTLApplyPeriodicity(&ens->domain, pos););
+  MFTLUpdateGhostPositions(ens);
+  refresh_geometry(ens);
+  MFTLRedistribute(ens);
+
+  const int n_he = 3 * obj->tris.n;
+  int *repaired = (int *) malloc((size_t) (n_he > 0 ? n_he : 1) * sizeof(int));
+  for (int h = 0; h < n_he; ++h) repaired[h] = obj->tris.he[h].twin_idx;
+
+  MFTLRebuildTwins(obj);
+
+  int same = 1;
+  for (int h = 0; h < n_he; ++h)
+    if (repaired[h] != obj->tris.he[h].twin_idx) same = 0;
+  free(repaired);
+
+  MFTLObjectBuildDerived(obj);  // MFTLRebuildTwins invalidated them
+
+  TEST_ASSERT(agreed(same, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * 4. The per-timestep loop
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * @brief Rigid advection across rank and periodic boundaries conserves everything.
+ *
+ * A rigid translation conserves surface area exactly and redistribution conserves
+ * entities exactly, so any drift in either means an entity was lost, duplicated,
+ * or measured across the periodic seam instead of through it. The velocity is
+ * chosen irrational-ish per axis so that vertices land ON cell faces at
+ * unpredictable times -- the tie-breaking rule in MFTLGetOwnerProc is what makes
+ * two ranks agree there, and a run that never hits a face would not test it.
+ */
+static int test_advection_conserves_entities(void)
+{
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 1);
+  MFTL_Object *obj = add_sphere(ens, 0, -0.3, 0.2, 0.1, 0.45, 3);
+
+  MFTLRedistribute(ens);
+  refresh_geometry(ens);
+
+  double reference[3];
+  global_totals(ens, reference);
+
+  const double vel[3] = {0.25, 0.13, -0.07};
+  const double dt = 1.0;
+
+  int ok = 1;
+  for (int step = 0; step < 12; ++step)
+  {
+    MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += vel[0] * dt; pos[1] += vel[1] * dt; pos[2] += vel[2] * dt; MFTLApplyPeriodicity(&ens->domain, pos););
+
+    if (MFTLUpdateGhostPositions(ens) != MFTL_SUCCESS) ok = 0;
+    refresh_geometry(ens);
+
+    double totals[3];
+    global_totals(ens, totals);
+    if ((int) totals[0] != (int) reference[0]) ok = 0;
+    if ((int) totals[1] != (int) reference[1]) ok = 0;
+    if (fabs(totals[2] - reference[2]) > 1e-9 * reference[2]) ok = 0;
+
+    if (!ensemble_is_sound(ens)) ok = 0;
+    if (!ownership_is_exclusive(obj)) ok = 0;
+
+    if (MFTLRedistribute(ens) != MFTL_SUCCESS) ok = 0;
+  }
+
+  refresh_geometry(ens);
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/**
+ * @brief Ghost positions really are the owner's positions after a sync.
+ *
+ * Every owned vertex is moved to a position that is a pure function of its global
+ * id, so the check needs no cross-rank comparison at all: a ghost is correct iff
+ * its position is that function of ITS id. A sync that dropped a request, or that
+ * mismatched replies against requests, fails immediately.
+ */
+static void positions_from_gid(int gid, double out[3])
+{
+  out[0] = 0.9 * sin(0.7 * (double) gid);
+  out[1] = 0.9 * sin(1.3 * (double) gid + 0.4);
+  out[2] = 0.9 * sin(2.1 * (double) gid + 1.1);
+}
+
+static int test_ghost_positions_are_synced(void)
+{
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 1);
+  MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.6, 3);
+
+  MFTLRedistribute(ens);
+
+  MFTL_FOREACH_OWNED_VERTEX(obj, positions_from_gid(rec->global_id, pos););
+
+  const int rc = MFTLUpdateGhostPositions(ens);
+
+  int ok = (rc == MFTL_SUCCESS);
+  int n_ghosts = 0;
+  for (int v = obj->verts.n_local; v < obj->verts.n; ++v)
+  {
+    double expect[3];
+    positions_from_gid(obj->verts.rec[v].global_id, expect);
+    for (int k = 0; k < 3; ++k)
+      if (fabs(obj->verts.pos[3 * v + k] - expect[k]) > 1e-15) ok = 0;
+    n_ghosts++;
+  }
+
+  /* At more than one rank the halo is not allowed to be empty everywhere, or the
+   * test would pass vacuously. */
+  int total_ghosts = 0;
+  MPI_Allreduce(&n_ghosts, &total_ghosts, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  if (g_nproc > 1) TEST_ASSERT(total_ghosts > 0);
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * 5. What the halo is FOR
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * @brief Distributed vertex normals equal the ones computed on the whole mesh.
+ *
+ * The end-to-end statement of vertex completeness. MFTLComputeVertexNormals
+ * accumulates over ghost triangles as well and communicates nothing, so an owned
+ * vertex gets the exact answer iff EVERY triangle incident to it is present
+ * locally. A halo that is one triangle short produces a normal that is merely
+ * slightly wrong -- no crash, no assertion, and no other check notices.
+ *
+ * Compared with the chord |a - b|, never with acos(a.b): the arc cosine has
+ * infinite derivative at 1, so it reports ~1e-8 rad of "error" for two vectors
+ * that differ by one ulp (see tests/test_vertex_normals.c).
+ */
+static int test_vertex_normals_match_serial_reference(void)
+{
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 1);
+  MFTL_Object *obj = add_sphere(ens, 0, 0.1, -0.2, 0.05, 0.55, 3);
+
+  const int n_global_v = obj->global_n_vertices;
+  double *reference = (double *) calloc((size_t) (n_global_v > 0 ? 3 * n_global_v : 3), sizeof(double));
+
+  /* Rank 0 still holds the complete mesh, so its answer is the ground truth. */
+  if (g_rank == 0)
+  {
+    MFTLComputeVertexNormals(obj);
+    for (int v = 0; v < obj->verts.n; ++v)
+    {
+      const int g = obj->verts.rec[v].global_id;
+      for (int k = 0; k < 3; ++k) reference[3 * g + k] = obj->verts.normal[3 * v + k];
+    }
+  }
+  MPI_Bcast(reference, 3 * n_global_v, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+  MFTLRedistribute(ens);
+  refresh_geometry(ens);
+  MFTLComputeVertexNormals(obj);
+
+  int ok = 1;
+  for (int v = 0; v < obj->verts.n_local; ++v)
+  {
+    const int g = obj->verts.rec[v].global_id;
+    double d = 0.0;
+    for (int k = 0; k < 3; ++k)
+    {
+      const double e = obj->verts.normal[3 * v + k] - reference[3 * g + k];
+      d += e * e;
+    }
+    if (sqrt(d) > 1e-12) ok = 0;
+  }
+
+  free(reference);
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * 6. Several bodies in one communication round
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * @brief The multi-body path keeps the bodies apart and conserves each of them.
+ *
+ * Every body is interleaved into the same pair of messages and separated again
+ * from the per-body count payload. The failure mode being tested for is not a
+ * crash: entities merged into the wrong body still form a valid-looking mesh, so
+ * the check is per-body conservation and per-body soundness.
+ */
+/**
+ * @brief Distance between vertex @p v's normal and the serial reference for it.
+ *
+ * The CHORD |a - b|, never acos(a.b): the arc cosine has infinite derivative at
+ * 1, so two unit vectors agreeing to one ulp measure ~1.5e-8 rad apart and look
+ * like a bug. tests/test_vertex_normals.c records the false failure that
+ * produced, and CLAUDE.md makes it a rule.
+ */
+static double normal_chord(const MFTL_Object *obj, const double *reference, int v)
+{
+  const int g = obj->verts.rec[v].global_id;
+  double d = 0.0;
+  for (int k = 0; k < 3; ++k)
+  {
+    const double e = obj->verts.normal[3 * v + k] - reference[3 * g + k];
+    d += e * e;
+  }
+  return sqrt(d);
+}
+
+/**
+ * @brief After MFTLEnsembleUpdateVertexNormals every vertex is exact -- GHOSTS TOO.
+ *
+ * The sibling test above checks the owned prefix, which MFTLComputeVertexNormals
+ * gets right on its own. This one checks the half it cannot: a ghost vertex's
+ * far-side faces live on another rank, so the local accumulation leaves it
+ * holding a partial sum -- correctly normalised, and quietly wrong. Only the
+ * exchange fixes that.
+ *
+ * The test is written so it cannot pass vacuously. It asserts first that this
+ * partition actually HAS ghost vertices (at nproc > 1), and second that the
+ * un-exchanged normals really are wrong -- otherwise a no-op implementation of
+ * the exchange would pass and the trap would still be open.
+ */
+static int test_ghost_vertex_normals_are_exact(void)
+{
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 1);
+  MFTL_Object *obj = add_sphere(ens, 0, -0.15, 0.25, -0.05, 0.6, 3);
+
+  const int n_global_v = obj->global_n_vertices;
+  double *reference = (double *) calloc((size_t) (n_global_v > 0 ? 3 * n_global_v : 3), sizeof(double));
+
+  /* Rank 0 still holds the complete mesh, so its answer is the ground truth. */
+  if (g_rank == 0)
+  {
+    MFTLComputeVertexNormals(obj);
+    for (int v = 0; v < obj->verts.n; ++v)
+    {
+      const int g = obj->verts.rec[v].global_id;
+      for (int k = 0; k < 3; ++k) reference[3 * g + k] = obj->verts.normal[3 * v + k];
+    }
+  }
+  MPI_Bcast(reference, 3 * n_global_v, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+  MFTLRedistribute(ens);
+  refresh_geometry(ens);
+
+  const int n_ghosts = obj->verts.n - obj->verts.n_local;
+
+  /* 1. Without the exchange, the ghosts hold partial sums. If this rank has any
+   *    ghost at all, at least one of them must DISAGREE -- if they all agreed,
+   *    the test below would be proving nothing. */
+  MFTLComputeVertexNormals(obj);
+  int local_ghost_wrong = 0;
+  for (int v = obj->verts.n_local; v < obj->verts.n; ++v)
+  {
+    if (normal_chord(obj, reference, v) > 1e-12) local_ghost_wrong = 1;
+  }
+
+  int any_ghosts = (n_ghosts > 0) ? 1 : 0;
+  int total_ghosts = 0, total_wrong = 0;
+  MPI_Allreduce(&any_ghosts, &total_ghosts, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+  MPI_Allreduce(&local_ghost_wrong, &total_wrong, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+
+  if (g_nproc > 1)
+  {
+    TEST_ASSERT(total_ghosts > 0);  // the partition must actually have a halo
+    TEST_ASSERT(total_wrong > 0);  // ... and the halo must actually be wrong
+  }
+
+  /* 2. With the exchange, every vertex in the pool is exact. */
+  TEST_ASSERT(agreed(MFTLEnsembleUpdateVertexNormals(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+
+  int ok = 1;
+  for (int v = 0; v < obj->verts.n; ++v)
+  {
+    if (normal_chord(obj, reference, v) > 1e-12) ok = 0;
+  }
+
+  free(reference);
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/**
+ * @brief The normal exchange must NOT invalidate the derived frames.
+ *
+ * MFTLUpdateGhostPositions clears the frame bit, because moving a ghost changes
+ * the geometry of every triangle incident to it. A normal is an OUTPUT of that
+ * geometry and nothing derived depends on it, so clearing the bit here would
+ * force every downstream consumer into a needless frame rebuild -- silently, and
+ * only in the distributed case.
+ */
+static int test_normal_sync_leaves_the_frames_alone(void)
+{
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 1);
+  MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.6, 2);
+
+  MFTLRedistribute(ens);
+  refresh_geometry(ens);
+  MFTLObjectRefreshFrames(obj);
+
+  TEST_ASSERT(agreed(MFTLObjectHasFrames(obj) && MFTLObjectHasTopology(obj), MPI_COMM_WORLD));
+
+  TEST_ASSERT(agreed(MFTLEnsembleUpdateVertexNormals(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLObjectHasFrames(obj), MPI_COMM_WORLD));
+
+  /* The position sync is the contrast, and it must still clear it. */
+  TEST_ASSERT(agreed(MFTLUpdateGhostPositions(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  if (g_nproc > 1) TEST_ASSERT(agreed(!MFTLObjectHasFrames(obj), MPI_COMM_WORLD));
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+static int test_multibody_round(void)
+{
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 4);
+
+  const double c[5][3] = {{-0.6, -0.6, -0.6}, {0.6, 0.6, 0.6}, {-0.6, 0.6, 0.0}, {0.6, -0.6, 0.2}, {0.0, 0.0, 0.0}};
+  const int refine[5] = {0, 1, 2, 1, 2};
+
+  int expect_t[5], expect_v[5];
+  for (int o = 0; o < 5; ++o)
+  {
+    MFTL_Object *obj = add_sphere(ens, 100 + o, c[o][0], c[o][1], c[o][2], 0.25, refine[o]);
+    expect_t[o] = obj->global_n_triangles;
+    expect_v[o] = obj->global_n_vertices;
+  }
+
+  TEST_ASSERT_EQUAL_INT(5, ens->num_objects);
+  TEST_ASSERT(agreed(MFTLRedistribute(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+
+  int ok = 1;
+  for (int o = 0; o < 5; ++o)
+  {
+    MFTL_Object *obj = ens->objects[o];
+    int local[2] = {obj->tris.n_local, obj->verts.n_local};
+    int total[2] = {0, 0};
+    MPI_Allreduce(local, total, 2, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    if (total[0] != expect_t[o] || total[1] != expect_v[o]) ok = 0;
+    if (!ownership_is_exclusive(obj)) ok = 0;
+
+    /* The body id must survive the round trip -- it is what identifies the body
+     * to the application, and the wire names bodies by list INDEX instead. */
+    if (obj->global_id != 100 + o) ok = 0;
+  }
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+
+  /* A second round after motion: now every body has kept entities AND arrivals,
+   * which is the state the run reconstruction actually has to get right. */
+  for (int o = 0; o < ens->num_objects; ++o)
+  {
+    MFTL_Object *obj = ens->objects[o];
+    MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += 0.31; pos[1] -= 0.23; MFTLApplyPeriodicity(&ens->domain, pos););
+  }
+  TEST_ASSERT(agreed(MFTLUpdateGhostPositions(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  refresh_geometry(ens);
+  TEST_ASSERT(agreed(MFTLRedistribute(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+
+  ok = 1;
+  for (int o = 0; o < 5; ++o)
+  {
+    int local[2] = {ens->objects[o]->tris.n_local, ens->objects[o]->verts.n_local};
+    int total[2] = {0, 0};
+    MPI_Allreduce(local, total, 2, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    if (total[0] != expect_t[o] || total[1] != expect_v[o]) ok = 0;
+  }
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * 7. Edge cases
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * @brief A body that moves out of a rank entirely leaves nothing behind.
+ *
+ * The degenerate end of the kept path: the kept set is EMPTY, so the compaction
+ * has to produce a pool of size zero rather than the previous contents, and the
+ * receiving rank has to build a partition from arrivals alone with nothing to
+ * de-duplicate against.
+ */
+static int test_body_can_leave_a_rank_entirely(void)
+{
+  if (g_nproc < 2) return 0;  // nothing to move to
+
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 1);
+
+  /* Centred in cell (0,0,0) and small enough to stay inside it on every axis, so
+   * that before the move exactly one rank holds the body and nobody holds a
+   * ghost of it. */
+  double cell[3];
+  for (int d = 0; d < 3; ++d) cell[d] = 2.0 / (double) ens->domain.cuts[d];
+  const double smallest = MFTL_MIN(cell[0], MFTL_MIN(cell[1], cell[2]));
+
+  const double x0 = -1.0 + 0.5 * cell[0];
+  const double y0 = -1.0 + 0.5 * cell[1];
+  const double z0 = -1.0 + 0.5 * cell[2];
+  MFTL_Object *obj = add_sphere(ens, 7, x0, y0, z0, 0.3 * smallest, 2);
+
+  MFTLRedistribute(ens);
+  refresh_geometry(ens);
+
+  const int home = ens->domain.rank_map[0];
+  int ok = 1;
+  if (g_rank == home)
+  {
+    if (obj->tris.n_local != obj->global_n_triangles) ok = 0;
+    if (obj->tris.n != obj->tris.n_local) ok = 0;  // no halo: nothing else holds any of it
+  }
+  else if (obj->tris.n != 0)
+  {
+    ok = 0;
+  }
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+
+  /* One cell to the right, in one step. */
+  MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += cell[0]; MFTLApplyPeriodicity(&ens->domain, pos););
+  refresh_geometry(ens);
+
+  double probe[3] = {x0 + cell[0], y0, z0};
+  MFTLApplyPeriodicity(&ens->domain, probe);
+  const int dest = MFTLGetOwnerProc(&ens->domain, probe);
+
+  TEST_ASSERT(agreed(MFTLRedistribute(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+
+  ok = 1;
+  if (g_rank == dest)
+  {
+    if (obj->tris.n_local != obj->global_n_triangles) ok = 0;
+  }
+  else if (obj->tris.n != 0)
+  {
+    ok = 0;
+  }
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/**
+ * @brief A body straddling a periodic seam is partitioned correctly.
+ *
+ * The seam is where an "obvious" implementation goes wrong twice: a centroid
+ * computed without the minimum image lands in the middle of the box rather than
+ * at the seam, and a position that is not wrapped clamps to the boundary cell
+ * instead of wrapping into it.
+ */
+static int test_body_straddling_a_periodic_seam(void)
+{
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 1);
+  MFTL_Object *obj = add_sphere(ens, 0, -1.0, 0.0, 0.0, 0.4, 3);  // centred exactly on the seam
+
+  const int global_t = obj->global_n_triangles;
+
+  TEST_ASSERT(agreed(MFTLRedistribute(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ownership_is_exclusive(obj), MPI_COMM_WORLD));
+
+  refresh_geometry(ens);
+  double totals[3];
+  global_totals(ens, totals);
+  TEST_ASSERT_EQUAL_INT(global_t, (int) totals[0]);
+
+  /* The sphere is centred on the seam, so both sides of the box must hold part
+   * of it -- otherwise the wrap silently pushed everything to one side. */
+  int has_low = 0, has_high = 0;
+  for (int v = 0; v < obj->verts.n_local; ++v)
+  {
+    if (obj->verts.pos[3 * v] < -0.5) has_low = 1;
+    if (obj->verts.pos[3 * v] > 0.5) has_high = 1;
+  }
+  int flags[2] = {has_low, has_high};
+  int any[2] = {0, 0};
+  MPI_Allreduce(flags, any, 2, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+  TEST_ASSERT(any[0] == 1 && any[1] == 1);
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/** @brief A non-periodic domain: no wrap, and the outer cells are walls. */
+static int test_non_periodic_domain(void)
+{
+  MFTL_Ensemble *ens = make_ensemble(MFTL_FALSE, 1);
+  MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
+
+  const int global_t = obj->global_n_triangles;
+
+  TEST_ASSERT(agreed(MFTLRedistribute(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ownership_is_exclusive(obj), MPI_COMM_WORLD));
+
+  refresh_geometry(ens);
+  double totals[3];
+  global_totals(ens, totals);
+  TEST_ASSERT_EQUAL_INT(global_t, (int) totals[0]);
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/**
+ * @brief An object with no entities anywhere survives a redistribution.
+ *
+ * It is not a contrived case: MFTLGenerateSphere leaves every rank but 0 exactly
+ * like this, so the empty path runs on nproc-1 ranks of every single call.
+ */
+static int test_empty_object_is_a_no_op(void)
+{
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 2);
+
+  MFTL_Object *empty = MFTLObjectCreate(0);
+  MFTLEnsembleAddObject(ens, empty);
+  MFTL_Object *real = add_sphere(ens, 1, 0.0, 0.0, 0.0, 0.4, 2);
+
+  TEST_ASSERT(agreed(MFTLRedistribute(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+
+  TEST_ASSERT_EQUAL_INT(0, empty->verts.n);
+  TEST_ASSERT_EQUAL_INT(0, empty->tris.n);
+  TEST_ASSERT(MFTLObjectHasTopology(empty) && MFTLObjectHasFrames(empty));
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ownership_is_exclusive(real), MPI_COMM_WORLD));
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/** @brief An ensemble with no objects at all is a no-op, not an error. */
+static int test_empty_ensemble_is_a_no_op(void)
+{
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 1);
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLRedistribute(ens));
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLUpdateGhostPositions(ens));
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/**
+ * @brief Invalid arguments are rejected without communicating.
+ *
+ * Rejection has to be LOCAL: a collective that some ranks enter and others reject
+ * would hang, so an argument check that communicated would be worse than no check.
+ */
+static int test_invalid_arguments(void)
+{
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLRedistributeObject(MFTL_NULL));
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLRedistributeListOfObjects(MFTL_NULL));
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLUpdateGhostPositions(MFTL_NULL));
+
+  /* An object that was never added to an ensemble has no domain. */
+  MFTL_Object *orphan = MFTLObjectCreate(0);
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLRedistributeObject(orphan));
+  MFTLObjectDestroy(&orphan);
+
+  return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * main
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+int main(int argc, char **argv)
+{
+  MPI_Init(&argc, &argv);
+  MPI_Comm_rank(MPI_COMM_WORLD, &g_rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &g_nproc);
+
+  MFTLRegisterMpiTypes();
+
+  if (g_rank == 0) printf("\n=== test_redistribution (%d ranks) ===\n", g_nproc);
+
+  RUN_TEST(test_wire_format_is_compact);
+  RUN_TEST(test_mpi_types_register_is_idempotent);
+  RUN_TEST(test_scatter_from_rank0);
+  RUN_TEST(test_redistribute_is_idempotent);
+  RUN_TEST(test_twin_repair_matches_full_rebuild);
+  RUN_TEST(test_advection_conserves_entities);
+  RUN_TEST(test_ghost_positions_are_synced);
+  RUN_TEST(test_vertex_normals_match_serial_reference);
+  RUN_TEST(test_ghost_vertex_normals_are_exact);
+  RUN_TEST(test_normal_sync_leaves_the_frames_alone);
+  RUN_TEST(test_multibody_round);
+  RUN_TEST(test_body_can_leave_a_rank_entirely);
+  RUN_TEST(test_body_straddling_a_periodic_seam);
+  RUN_TEST(test_non_periodic_domain);
+  RUN_TEST(test_empty_object_is_a_no_op);
+  RUN_TEST(test_empty_ensemble_is_a_no_op);
+  RUN_TEST(test_invalid_arguments);
+
+  if (g_rank == 0) TEST_REPORT();
+
+  /* A failure on ANY rank fails the run: the per-rank counters are local, and a
+   * bug that only shows up on rank 3 is exactly the bug worth catching. */
+  int local_failed = g_tests_failed;
+  int total_failed = 0;
+  MPI_Allreduce(&local_failed, &total_failed, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+
+  MFTLFreeMpiTypes();
+  MPI_Finalize();
+  return (total_failed > 0) ? 1 : 0;
+}
