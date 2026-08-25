@@ -92,11 +92,16 @@ spatial halo. Four files, four distinct jobs.
 ### @ref mftl_mod_remeshing "remeshing"
 Split/collapse/flip/smooth, feature detection, compaction, and **two** distributed
 schedules around the same serial kernel. The largest module, and the only one
-whose MPI is confined to a single file by a build-time check.
+whose MPI is confined to a single file by a build-time check. Its theory page
+carries the call graph of each distributed driver, with the decision each one
+takes at every branch.
 
 ### @ref mftl_mod_bvh "bvh"
 Linear BVH build and refit, dual-tree traversal, and the exact triangle–triangle
-predicates.
+predicates. Its theory page carries the call graph of the build, of the query and
+of the narrow-phase decision tree, the derivations behind the Morton key, the
+radix split and the Shewchuk error bounds, and a table of every decision the
+module takes with the failure each one produces when it goes the wrong way.
 
 ### @ref mftl_mod_io "io"
 VTK legacy dump, and the parallel VTK XML writer in four combinations of encoding

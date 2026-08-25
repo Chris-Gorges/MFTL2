@@ -5,13 +5,13 @@ that example; re-run it rather than trusting the tables.
 
 ```bash
 build/leveque_remeshing_singleproc -refine 4 -feature 180      # the recommended configuration
-build/leveque_remeshing_singleproc -refine 4 -feature 45       # what version 5 did
+build/leveque_remeshing_singleproc -refine 4 -feature 45       # a typical "safe" threshold
 ```
 
 ## The question
 
-Version 5's LeVeque run finished with a visibly bad mesh, and the suspicion was that tangential smoothing
-was mishandling feature edges and feature vertices.
+A LeVeque run with feature detection at 45° finishes with a visibly bad mesh, and the natural suspicion is
+that tangential smoothing mishandles feature edges and feature vertices.
 
 **That suspicion is correct, and the measurements below locate it precisely.** But the mechanism is one
 step further back than "smoothing at features is buggy": on this test case *there are no features*. The
@@ -56,7 +56,7 @@ Sweeping only the dihedral threshold, everything else held fixed:
 | 120° | 4884 | 0.00188 | 0.97271 | 22 | 0.9644 | 0.9971 |
 | 90° | 4996 | 0.02880 | 0.96545 | 82 | 0.9620 | 0.9969 |
 | 60° | 8770 | 0.00110 | 0.66513 | 908 | 0.9579 | 1.0636 |
-| 45° (version 5's setting) | 16702 | 0.00019 | 0.46389 | 1995 | 0.9537 | 1.1873 |
+| 45° (a typical default) | 16702 | 0.00019 | 0.46389 | 1995 | 0.9537 | 1.1873 |
 | 30° | 27128 | 0.00022 | 0.35944 | 2845 | 0.9573 | 1.2828 |
 
 Triangle count, `avgQ` and the fold count are monotone across all five thresholds. `minQ` is not, and
@@ -65,7 +65,7 @@ frozen the value reports which sliver happened to be worst rather than how much 
 it does say is categorical — 0.76 with detection off, and two to four orders of magnitude below that at
 every threshold that flags anything.
 
-The damage is not subtle: at version 5's 45° the mesh finishes with 3.5× the triangles it should have, an
+The damage is not subtle: at 45° the mesh finishes with 3.5× the triangles it should have, an
 average quality of 0.46, and 1995 folded triangles. With detection off it returns to 4784 triangles —
 93 % of the 5120 it started with — with no folds at all.
 
@@ -150,7 +150,7 @@ conservative choice.
 ## Finding 3 — the fold guard is a brake, not a cause
 
 `MFTLCollapseApproved` now rejects any collapse that would turn a surviving triangle's normal by more than
-`max_normal_deviation_cos`. Version 5 had no such test. Measured both ways:
+`max_normal_deviation_cos`. Measured with the test and without it:
 
 | configuration | triangles | minQ | avgQ | folds |
 |---|---|---|---|---|
@@ -168,11 +168,11 @@ to describe it and not the way I first guessed.
 
 ## Finding 4 — the ridge chord-cut, which this test cannot see
 
-Version 5 moved a vertex with exactly two feature edges **to the midpoint of its two feature
-neighbours**: the full Laplacian displacement, at full strength, ignoring its own relaxation parameter and
-with no projection. That pulls the vertex off its curve and onto the chord between its neighbours, so a
-feature curve erodes every time it is smoothed — the 2D shrinkage problem that tangential projection
-exists to solve, reintroduced on a 1D curve.
+The obvious rule for a vertex with exactly two feature edges is to move it **to the midpoint of its two
+feature neighbours**: the full Laplacian displacement, at full strength, with no projection. That pulls the
+vertex off its curve and onto the chord between its neighbours, so a feature curve erodes every time it is
+smoothed — the 2D shrinkage problem that tangential projection exists to solve, reintroduced on a 1D
+curve.
 
 `MFTLSmoothTangential` instead projects the displacement onto the ridge **tangent**, which redistributes
 the vertex along the curve while leaving the curve where it is.
@@ -182,7 +182,7 @@ ring for 20 sweeps:
 
 ```
 projection onto the tangent:  max drift 5.551e-16, min radius 1.000000000000
-version 5's chord midpoint:   would give radius cos(pi/24)^20 = 0.8421
+moving to the chord midpoint: would give radius cos(pi/24)^20 = 0.8421
 ```
 
 A 16 % collapse of a feature curve the caller explicitly asked to preserve, and nothing reports it.
@@ -193,9 +193,10 @@ line, a wedge — and `test_remesh_preserves_a_cube` is the end-to-end guard for
 
 ## Finding 5 — the missing area weighting, which is not a quality bug
 
-Version 5's `MFTL_SMOOTH_TRIANGLE_BASED` averaged the incident triangle centroids **unweighted**. Botsch &
-Kobbelt specify the area-weighted mean `q = Σ Aᵢcᵢ / Σ Aᵢ`, and the weight is the mechanism that equalises
-triangle *size*. I expected removing it to cost triangle quality. It does not:
+A "triangle-based" smoother that averages the incident triangle centroids **unweighted** is the easy
+mistake here. Botsch & Kobbelt specify the area-weighted mean `q = Σ Aᵢcᵢ / Σ Aᵢ`, and the weight is the
+mechanism that equalises triangle *size*. The expectation is that removing it costs triangle quality. It
+does not:
 
 | configuration | triangles | minQ | avgQ | V/V₀ |
 |---|---|---|---|---|

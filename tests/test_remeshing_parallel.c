@@ -962,6 +962,16 @@ static int test_a_permanently_frozen_band_is_not_certified(void)
   MFTL_RemeshParameters params;
   standard_params(&params, 0.40);
 
+  /* DISARMED, and this is the whole reason the parameter still accepts 0.
+   *
+   * This test pins the DEGRADATION -- what the shift schedule does on a
+   * partition too fine for its band. The fallback exists to repair exactly that,
+   * and it is armed by default, so leaving it armed here would make the test
+   * assert that the repair fails. It is also the control for
+   * test_a_coarsened_pass_rescues_a_partition_that_is_too_fine below, and a
+   * control that has the treatment applied to it is not a control. */
+  params.parallel_coarsen = 0;
+
   /* The library's own precondition test, restated rather than trusted. It is the
    * ESTIMATE, and the table above says the estimate fires long before the scheme
    * actually degrades -- so this is a necessary condition for the test to mean
@@ -1760,6 +1770,304 @@ static int test_only_the_distinct_placements_are_visited(void)
   return 0;
 }
 
+/**
+ * @brief ARMED IS NOT ACTIVE: on a healthy partition the fallback changes nothing.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * WHY THIS IS THE FIRST TEST OF THE COARSENING PATH AND NOT THE LAST
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * `parallel_coarsen` defaults to 1, so EVERY parallel remesh in this library now
+ * runs the fallback's decision code. The claim that makes that acceptable is not
+ * "it usually decides not to coarsen" -- it is that when it decides not to, the
+ * pass is the one that ran before, to the bit. MFTLRemeshCoarseningFactors
+ * returns {1,1,1} and MFTLRemeshCoarseOwnerProc at {1,1,1} is documented as
+ * bit-for-bit MFTLRemeshOwnerProc, and this is where that stops being a comment.
+ *
+ * A weaker version of this test -- assert `n_coarse_groups == 1` and stop --
+ * would pass even if the armed path perturbed the mesh, because a remesher's
+ * output is a valid mesh either way. So the fixture is remeshed TWICE, armed and
+ * disarmed, and the digests must be equal. `mesh_digest` folds every global id
+ * and the raw bits of every coordinate, so a single vertex a half-ulp out fails
+ * it.
+ *
+ * ── Non-vacuity, in both directions ──────────────────────────────────────
+ *
+ * The trivial way to pass is for the fixture to be one the fallback would never
+ * consider, so the test asserts the pass was a real distributed one: cross-rank
+ * edges exist and the digest is non-zero. And the frozen fraction is printed
+ * rather than asserted, because it is the number that says how close this
+ * fixture sits to the trigger -- a later edit that widens the boxes would leave
+ * this passing while testing less.
+ */
+static int test_the_fallback_stays_off_on_a_healthy_partition(void)
+{
+  unsigned long long digest[2] = {0, 0};
+  MFTL_RemeshStats stats[2];
+
+  for (int armed = 0; armed < 2; ++armed)
+  {
+    MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE);
+    TEST_ASSERT(ens != MFTL_NULL);
+
+    MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
+    TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+
+    /* Target 0.10 on a refine-3 sphere: the mesh is near its target, so the band
+     * is small against the rank box on every grid this suite runs. Measured
+     * frozen share 8.6 / 16.7 / 24.4 / 36.6 % at np = 2 / 4 / 8 / 27, all of them
+     * comfortably under what the correctness trigger reacts to. */
+    MFTL_RemeshParameters params;
+    standard_params(&params, 0.10);
+    params.parallel_phase_budget = 4;
+    params.parallel_coarsen = armed ? 1 : 0;
+
+    if (g_nproc > 1)
+    {
+      mesh_measure before;
+      measure(ens, &params, &before);
+      TEST_ASSERT(before.n_cross_rank_edges > 0.0);
+    }
+
+    TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &params, &stats[armed]) == MFTL_SUCCESS, MPI_COMM_WORLD));
+
+    digest[armed] = mesh_digest(obj);
+    MFTLEnsembleDestroy(&ens);
+  }
+
+  /* THE CLAIM. Armed, it declined to coarsen -- and the mesh is the same one the
+   * disarmed pass produced, not merely an equally valid one. */
+  TEST_ASSERT(agreed(stats[1].n_coarse_groups == 1, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(stats[1].coarsen_trigger == MFTL_REMESH_COARSEN_NONE, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(digest[0] != 0, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(digest[0] == digest[1], MPI_COMM_WORLD));
+
+  /* And the pass really was the same pass, not just the same mesh reached two
+   * ways: the phase count is what the placements and the budget decide, so a
+   * different decomposition would almost certainly change it. */
+  TEST_ASSERT(agreed(stats[0].n_phases == stats[1].n_phases, MPI_COMM_WORLD));
+
+  /* The armed run measured the frozen share; the disarmed one had no reason to
+   * and must report zero rather than a stale or invented number. */
+  TEST_ASSERT(agreed(stats[0].frozen_fraction == 0.0, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(stats[1].frozen_fraction >= 0.0 && stats[1].frozen_fraction <= 1.0, MPI_COMM_WORLD));
+
+  if (g_rank == 0)
+  {
+    printf("\n    np=%d: armed -> %d ranks/group, frozen %.1f %%, %d phases; digest %016llx matches disarmed\n    ", g_nproc, stats[1].n_coarse_groups,
+           100.0 * stats[1].frozen_fraction, stats[1].n_phases, digest[1]);
+  }
+
+  return 0;
+}
+
+/**
+ * @brief The EFFICIENCY trigger fires where the correctness one does not.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * THE TWO TRIGGERS HAVE TO BE SEPARABLE, OR ONE OF THEM IS DECORATION
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * `coarsen_frozen_fraction` exists because `h > 4*delta` permits a partition in
+ * which 87 % of the mesh is frozen. If every configuration that trips the
+ * frozen threshold also tripped the band condition, the second trigger would be
+ * reporting the first one's decision under a different name and could be deleted
+ * without changing any outcome.
+ *
+ * So this test does not merely show that a low threshold coarsens. It shows the
+ * BAND CONDITION HOLDING while it does -- by computing the band factors itself,
+ * from the same measured band the driver used, and asserting they are {1,1,1}.
+ * That is the whole claim, and it is why the test carries an arithmetic check
+ * rather than only a set of stats assertions.
+ *
+ * The threshold is set here rather than taken from the default, because the
+ * default is 1.0: the measurement said this trigger does not pay in general (see
+ * the field, and docs/parallel-remeshing-analysis.md). A disabled-by-default
+ * feature still has to work when enabled, and that is what is being pinned.
+ */
+static int test_a_frozen_majority_triggers_the_fallback(void)
+{
+  if (g_nproc == 1) return 0;  // no interior plane, nothing frozen, nothing to trigger
+
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE);
+  TEST_ASSERT(ens != MFTL_NULL);
+
+  MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
+  TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+
+  MFTL_RemeshParameters params;
+  standard_params(&params, 0.10);
+  params.parallel_phase_budget = 4;
+  params.parallel_coarsen = 1;
+
+  /* Below every frozen share this fixture produces (8.6 % at np = 2 is the
+   * smallest), so the trigger fires on every grid the suite runs -- including
+   * the ones where the band condition is satisfied with room to spare. */
+  params.coarsen_frozen_fraction = 0.05;
+
+  MFTL_RemeshStats stats;
+  TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &params, &stats) == MFTL_SUCCESS, MPI_COMM_WORLD));
+
+  /* ── THE CLAIM: it fired, and the correctness trigger did not ──────────── */
+  TEST_ASSERT(agreed((stats.coarsen_trigger & MFTL_REMESH_COARSEN_FROZEN) != 0, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed((stats.coarsen_trigger & MFTL_REMESH_COARSEN_BAND) == 0, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(stats.n_coarse_groups > 1, MPI_COMM_WORLD));
+
+  /* Restated from the outside, against the band the driver actually measured.
+   * `band_measured` is the observed reach and `max_edge_length` is what the
+   * driver predicts a converging pass will grow it to -- the same MAX the
+   * decision uses, so this is the driver's own correctness input, recomputed. */
+  {
+    const double delta = MFTL_MAX(stats.band_measured, params.max_edge_length);
+    int band_group[3];
+    MFTLRemeshCoarseningFactors(&ens->domain, &params, delta, band_group);
+    TEST_ASSERT(agreed(band_group[0] * band_group[1] * band_group[2] == 1, MPI_COMM_WORLD));
+  }
+
+  /* ── And the mesh is a mesh ─────────────────────────────────────────────── */
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLCheckMeshIntegrity(obj) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ghosts_agree_with_owners(ens), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(partition_matches_canonical_planes(ens), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(global_ids_are_dense(ens->objects[0]), MPI_COMM_WORLD));
+
+  mesh_measure after;
+  measure(ens, &params, &after);
+  const double chi = after.n_vertices - after.n_edges + after.n_triangles;
+  TEST_ASSERT(agreed(fabs(chi - 2.0) < 0.5, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(after.volume > 0.0, MPI_COMM_WORLD));
+
+  if (g_rank == 0)
+  {
+    printf("\n    np=%d: frozen %.1f %% > 5 %% -> %d ranks/group, band condition held (trigger mask %d)\n    ", g_nproc, 100.0 * stats.frozen_fraction,
+           stats.n_coarse_groups, stats.coarsen_trigger);
+  }
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/**
+ * @brief A gathered pass is one placement, two migrations, and the same answer.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * THE GATHER IS NOT A SPECIAL CASE, AND THIS IS HOW THAT IS CHECKED
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * `serial_gather_max_triangles` adds no communication code at all. It sets
+ * `group[k] = cuts[k]`, which the coarsening machinery already clamps to and
+ * already maps to a single representative cell. Everything else is supposed to
+ * follow: nothing replicated, so nothing frozen; no axis with an interior plane,
+ * so one distinct placement; one migration out and the closing MFTLRedistribute
+ * back.
+ *
+ * Each of those is asserted separately, because they are separate claims and a
+ * single "it produced a mesh" would not distinguish a gather from an ordinary
+ * pass that happened to converge.
+ *
+ * ── Why the comparison is a TOLERANCE and not equality ───────────────────
+ *
+ * The gathered pass runs the serial kernel over the whole mesh in one sweep; the
+ * distributed one runs gated sweeps over several placements. Split and collapse
+ * are order-dependent, so the two legitimately choose different edges and land
+ * on different triangulations OF THE SAME SURFACE at the same resolution. The
+ * bounds are the ones test_the_two_strategies_reach_the_same_mesh uses for the
+ * same reason and must not be tightened to equality.
+ */
+static int test_a_gathered_pass_matches_the_distributed_answer(void)
+{
+  if (g_nproc == 1) return 0;  // one rank IS the gather; there is nothing to compare
+
+  mesh_measure result[2];
+  MFTL_RemeshStats stats[2];
+
+  for (int gather = 0; gather < 2; ++gather)
+  {
+    MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE);
+    TEST_ASSERT(ens != MFTL_NULL);
+
+    MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
+    TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+
+    /* 0.06 on a refine-3 sphere, so the pass REFINES 1280 -> about 3800. At the
+     * mesh's own resolution both runs would return it unchanged and the
+     * comparison below would hold for a reason that has nothing to do with
+     * either path. */
+    MFTL_RemeshParameters params;
+    standard_params(&params, 0.06);
+    params.parallel_phase_budget = 8;
+
+    /* Comfortably above the refined mesh so the trigger is certain to fire, and
+     * 0 for the control. */
+    params.serial_gather_max_triangles = 100000 * (gather ? 1 : 0);
+
+    if (g_nproc > 1)
+    {
+      mesh_measure before;
+      measure(ens, &params, &before);
+      TEST_ASSERT(before.n_cross_rank_edges > 0.0);
+    }
+
+    TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &params, &stats[gather]) == MFTL_SUCCESS, MPI_COMM_WORLD));
+
+    /* The postconditions are the driver's, gathered or not -- in particular the
+     * partition that comes back is the canonical one, because the closing
+     * migration is a plain MFTLRedistribute in both cases. */
+    TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(MFTLCheckMeshIntegrity(obj) == MFTL_SUCCESS, MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(ghosts_agree_with_owners(ens), MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(partition_matches_canonical_planes(ens), MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(global_ids_are_dense(obj), MPI_COMM_WORLD));
+
+    measure(ens, &params, &result[gather]);
+    MFTLEnsembleDestroy(&ens);
+  }
+
+  /* ── The mechanism, claim by claim ─────────────────────────────────────── */
+  TEST_ASSERT(agreed(stats[1].coarsen_trigger == MFTL_REMESH_COARSEN_GATHER, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(stats[1].n_coarse_groups == g_nproc, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(stats[1].n_distinct_placements == 1, MPI_COMM_WORLD));
+
+  /* ── TWO MIGRATIONS, WHATEVER THE PHASE COUNT, and that is the point ────
+   *
+   * One coarse box has no interior plane, so every phase asks for the same
+   * placement and every phase after the first is detected as the identity and
+   * skipped. So a mesh far enough from its target to need several phases of
+   * sweeping still moves exactly twice: the gather out, and the closing
+   * redistribute.
+   *
+   * Exactly 2 and not 1. One would mean the gather itself was the identity --
+   * that nothing was gathered -- which is how this assertion would catch a
+   * `group` that silently came back as {1,1,1}. */
+  TEST_ASSERT(agreed(stats[1].n_migrations == 2, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(stats[1].n_migrations_skipped == stats[1].n_phases - 1, MPI_COMM_WORLD));
+
+  /* Nothing is replicated on one rank, so the certificate has nothing to hide. */
+  TEST_ASSERT(agreed(stats[1].converged, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(stats[1].n_edges_hidden_long == 0, MPI_COMM_WORLD));
+
+  /* Non-vacuity: the control really did take the distributed path. */
+  TEST_ASSERT(agreed(stats[0].coarsen_trigger == MFTL_REMESH_COARSEN_NONE, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(stats[0].n_coarse_groups == 1, MPI_COMM_WORLD));
+
+  /* ── And it is the same surface at the same resolution ─────────────────── */
+  TEST_ASSERT(agreed(result[1].n_triangles > 0.0, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(fabs(result[1].n_triangles - result[0].n_triangles) <= 0.04 * result[0].n_triangles, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(fabs(result[1].volume - result[0].volume) <= 0.01 * fabs(result[0].volume), MPI_COMM_WORLD));
+
+  const double chi = result[1].n_vertices - result[1].n_edges + result[1].n_triangles;
+  TEST_ASSERT(agreed(fabs(chi - 2.0) < 0.5, MPI_COMM_WORLD));
+
+  if (g_rank == 0)
+  {
+    printf("\n    np=%d: gathered -> %d ranks/group, %d phases, %d migrations, %.0f tris | distributed -> %d phases, %.0f tris", g_nproc,
+           stats[1].n_coarse_groups, stats[1].n_phases, stats[1].n_migrations, result[1].n_triangles, stats[0].n_phases, result[0].n_triangles);
+    printf("  (both refined from 1280)\n    ");
+  }
+
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
@@ -1774,6 +2082,9 @@ int main(int argc, char **argv)
   RUN_TEST(test_compaction_restores_the_ownership_prefix);
   RUN_TEST(test_a_permanently_frozen_band_is_not_certified);
   RUN_TEST(test_a_coarsened_pass_rescues_a_partition_that_is_too_fine);
+  RUN_TEST(test_the_fallback_stays_off_on_a_healthy_partition);
+  RUN_TEST(test_a_frozen_majority_triggers_the_fallback);
+  RUN_TEST(test_a_gathered_pass_matches_the_distributed_answer);
   RUN_TEST(test_a_partitioned_sphere_remeshes_on_a_periodic_domain);
   RUN_TEST(test_a_sphere_on_the_periodic_seam_remeshes_everywhere);
   RUN_TEST(test_a_partitioned_sphere_remeshes_with_walls);

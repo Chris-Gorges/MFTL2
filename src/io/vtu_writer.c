@@ -25,8 +25,8 @@
  *
  * ## WHAT COSTS WHAT, MEASURED RATHER THAN ASSUMED
  *
- * The previous version's writer spent its time in printf, not in the kernel or
- * the disk. Formatting one double as "%.10e" is ~100 ns and 17 bytes for an
+ * A VTK writer spends its time in printf, not in the kernel and not on the disk.
+ * Formatting one double as "%.10e" is ~100 ns and 17 bytes for an
  * 8-byte value; ASSEMBLE for the binary path is a memcpy. That is the single
  * biggest factor and it is entirely independent of MPI.
  *
@@ -193,9 +193,9 @@ static void sb_addf(sbuf *b, const char *fmt, ...)
  * ── Cell selection ─────────────────────────────────────────────────────────
  *
  * Owned triangles only, by default. Ownership is an array PREFIX, so "owned
- * only" is the loop bound `tris.n_local` and costs nothing. The previous version
- * wrote all `n_triangles`, ghosts included, so a triangle owned by rank A and
- * held as a ghost by ranks B and C appeared THREE times in the merged dataset.
+ * only" is the loop bound `tris.n_local` and costs nothing. Writing all
+ * `n_triangles`, ghosts included, puts a triangle owned by rank A and held as a
+ * ghost by ranks B and C THREE times into the merged dataset.
  * Nothing about the picture changes -- the copies are coincident -- but every
  * integral the visualisation tool computes over the surface is then wrong by the
  * halo fraction, silently, and the halo fraction is 10-30 % in a normal run.
@@ -223,8 +223,8 @@ static void sb_addf(sbuf *b, const char *fmt, ...)
  * triangle's connectivity at them. Other triangles sharing those vertices are
  * unaffected, and the mesh in memory is never touched.
  *
- * The previous version computed the unwrapped corners with two
- * MFTLGetMinimumImageVector calls inside a helper it then invoked FOUR TIMES per
+ * Computed from scratch, the unwrapped corners take two
+ * MFTLGetMinimumImageVector calls inside a helper the writer needs FOUR TIMES per
  * triangle per file (once to size the point list, once per data block). Here
  * `tris.anchor` and `tris.edge` ALREADY hold corner 0 and the two
  * seam-consistent edge vectors -- that is what the frames are -- so:
@@ -249,10 +249,10 @@ static void sb_addf(sbuf *b, const char *fmt, ...)
  * NO tolerance: any slack traded for fewer false positives buys them at the
  * price of false negatives, which is the wrong direction.
  *
- * (The previous version compared the edge vector against a freshly recomputed
- * raw difference instead, which is exact in both directions -- but needs the two
- * far corner positions, i.e. a gather per triangle. That form survives here as
- * the fallback for a mesh whose frames were never built.)
+ * (Comparing the edge vector against a freshly recomputed raw difference is
+ * exact in both directions too -- but it needs the two far corner positions,
+ * i.e. a gather per triangle. That form is kept as the fallback for a mesh whose
+ * frames were never built.)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /** @brief Growable double buffer for the unwrapped corner coordinates. */
@@ -324,7 +324,7 @@ typedef struct
  *
  *   (a) non-periodic          mark only; nothing can straddle
  *   (b) periodic + frames     streaming: tris.verts + anchor + edge, no gather
- *   (c) periodic, no frames   gathering: the previous version's exact test
+ *   (c) periodic, no frames   gathering: the exact test, two corners per edge
  *
  * @param      obj            The mesh.
  * @param      include_ghosts Count ghost triangles too. Off in production.

@@ -79,7 +79,8 @@ INPUT                  = @MFTL_DOCS_SOURCE_DIR@/include \
                          @MFTL_DOCS_SOURCE_DIR@/docs/pages \
                          @MFTL_DOCS_SOURCE_DIR@/docs/performance-analysis.md \
                          @MFTL_DOCS_SOURCE_DIR@/docs/remeshing-quality-analysis.md \
-                         @MFTL_DOCS_SOURCE_DIR@/docs/parallel-remeshing-analysis.md
+                         @MFTL_DOCS_SOURCE_DIR@/docs/parallel-remeshing-analysis.md \
+                         @MFTL_DOCS_SOURCE_DIR@/docs/scaling-analysis.md
 
 INPUT_ENCODING         = UTF-8
 RECURSIVE              = YES

@@ -143,11 +143,12 @@ the reduction it feeds.
 
 ### The statistics are not nearly free
 
-MFTL 5 measured them at **+5 %** on top of geometry. Here they are **+90 %**
-(1.64 → 3.11 ns/triangle).
+They cost **+90 %** on top of the geometry (1.64 → 3.11 ns/triangle), which is an
+order of magnitude more than the "a few extra flops on data already in registers"
+estimate the fusion argument suggests.
 
-The statistics did not get slower — the streaming geometry baseline got *fast*,
-and $q$ adds a **second divide** to a loop already limited by one. Fusing is still
+The reason is that the streaming geometry baseline is *fast*, and $q$ adds a
+**second divide** to a loop already limited by one. Fusing is still
 right (two passes cost 2.20 ns against 1.47 fused), but:
 
 @warning `MFTLEnsembleUpdate` is **slower than `MFTLComputeTriangleGeometry` on a

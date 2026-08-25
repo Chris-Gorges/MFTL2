@@ -26,7 +26,7 @@ built to carry a front through a flow solver.
 
     ---
 
-    What the library does today, what is not ported yet, and the shortest
+    What the library does today, what it deliberately does not, and the shortest
     complete program that creates a sphere and writes it out.
 
     [:octicons-arrow-right-24: Read the overview](overview.md)

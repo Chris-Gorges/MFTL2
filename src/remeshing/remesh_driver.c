@@ -29,9 +29,9 @@
  * iteration.
  *
  * DETECT at the top of every iteration rather than once per call, because splits
- * and collapses change which edges exist. The previous version detected once, so
- * from the first split onwards the smoother was classifying vertices against a
- * feature set describing a mesh that no longer existed.
+ * and collapses change which edges exist. Detecting once per call means that from
+ * the first split onwards the smoother classifies vertices against a feature set
+ * describing a mesh that no longer exists.
  *
  * ## WHY EVERY SWEEP TAKES A FRESH SNAPSHOT OF THE HALF-EDGE COUNT
  *
@@ -295,8 +295,8 @@ int MFTLRemeshIterate(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFT
      *
      * The cost is one geometry pass and two linear passes per iteration. Handing
      * the classification forward from the first call instead would mean every
-     * operator maintaining it incrementally, which is the arrangement that put the
-     * previous version's smoother three sweeps out of date. */
+     * operator maintaining it incrementally, which is the arrangement that leaves
+     * a smoother three sweeps out of date. */
     MFTLDetectFeatures(obj, params->feature_angle_threshold, params->feature_corner_angle, st);
 
     MFTLSmoothTangential(obj, params, params->smooth_iterations);
@@ -375,13 +375,14 @@ int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, 
     const int n_bodies = ens->num_objects;
     if (n_bodies < 1) return MFTLRemeshEnsembleParallel(ens, params, stats);
 
-    double *const measure = (double *) MFTLMallocOrDie((size_t) (4 * n_bodies) * sizeof(double), "remesh strategy measurement");
+    double *const measure = (double *) MFTLMallocOrDie((size_t) (5 * n_bodies) * sizeof(double), "remesh strategy measurement");
     double *const centroid = measure;
     double *const radius = measure + 3 * n_bodies;
+    double *const weight = measure + 4 * n_bodies;
 
-    strategy = MFTLRemeshChooseStrategyMeasured(ens, params, centroid, radius);
+    strategy = MFTLRemeshChooseStrategyMeasured(ens, params, centroid, radius, weight);
 
-    const int rc = (strategy == MFTL_REMESH_PARALLEL_DISPERSED) ? MFTLRemeshEnsembleDispersedMeasured(ens, params, stats, centroid, radius)
+    const int rc = (strategy == MFTL_REMESH_PARALLEL_DISPERSED) ? MFTLRemeshEnsembleDispersedMeasured(ens, params, stats, centroid, radius, weight)
                                                                 : MFTLRemeshEnsembleParallel(ens, params, stats);
     free(measure);
     return rc;

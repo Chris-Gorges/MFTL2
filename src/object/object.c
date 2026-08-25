@@ -16,12 +16,12 @@
  *     THE AoS RECORDS AND EVERY SoA ARRAY OF A POOL HAVE THE SAME CAPACITY,
  *     ALWAYS, BECAUSE THEY ARE THE SAME malloc.
  *
- * The previous version tried to achieve this with three capacity fields
- * (`capacity_*`, `geom_cap_*`, `flat_cap_*`), three reserve functions and a rule
- * written in a comment: "every site that raises capacity_triangles must call
+ * The arrangement this replaces is three capacity fields (`capacity_*`,
+ * `geom_cap_*`, `flat_cap_*`), three reserve functions and a rule written in a
+ * comment: "every site that raises capacity_triangles must call
  * MFTLObjectReserveTriangleGeometry, and a site that forgets does not produce a
  * wrong number -- it produces a heap overflow the next time the geometry pass
- * runs". That is an accurate description of a design that depends on everyone
+ * runs". That is an accurate description of any design that depends on everyone
  * remembering something. Here there is nothing to remember: growing the block
  * grows all of it, and a caller cannot reach the individual arrays' sizes
  * because there are none.
@@ -106,11 +106,11 @@ static void vertex_pool_bind(MFTL_VertexPool *p, unsigned char *blk, const verte
  * @brief Grows the vertex pool to @p capacity entities. Never shrinks.
  *
  * Contents are preserved: the live prefix of every array is copied into the new
- * block. The previous version deliberately discarded the geometry on resize,
- * arguing the caller was about to recompute it; that is true of the callers that
- * existed and false in general, and the failure mode was a silent 0.0 rather
- * than a crash. A memcpy at memory bandwidth, O(log n) times over the mesh's
- * life, is not worth that class of bug.
+ * block. Discarding the geometry on resize -- on the argument that the caller is
+ * about to recompute it -- is true of the callers that exist and false in
+ * general, and its failure mode is a silent 0.0 rather than a crash. A memcpy at
+ * memory bandwidth, O(log n) times over the mesh's life, is not worth that class
+ * of bug.
  *
  * @param p        The pool. Its `block` is replaced and the old one freed.
  * @param capacity Vertices the pool must hold afterwards.
@@ -168,8 +168,8 @@ typedef struct
  * @brief Lays out a triangle block for @p cap triangles and 3*@p cap half-edges.
  *
  * The half-edge array being here, rather than in a pool of its own, is what
- * removes the third independent capacity the previous version carried. It is not
- * a packaging choice: a triangle has exactly three half-edges at 3t..3t+2
+ * removes the third independent capacity a separate half-edge pool would need.
+ * It is not a packaging choice: a triangle has exactly three half-edges at 3t..3t+2
  * (mftl_topology.h), so a half-edge capacity that could differ from 3x the
  * triangle capacity would describe a mesh that cannot exist.
  *
@@ -415,7 +415,7 @@ void MFTLObjectUpdateGlobalStats(MFTL_Object *object)
   MFTL_ASSERT(object->domain != MFTL_NULL && "MFTLObjectUpdateGlobalStats: object has no domain -- add it to an ensemble first");
 
   /* Ownership is a prefix, so the local counts ARE the answer -- no scan over
-   * the entities testing a flag, which is what the previous version needed.
+   * the entities testing a flag, which is what an `is_ghost` field would need.
    *
    * Blocking rather than non-blocking: two integers, latency-bound, and the
    * caller wants the result immediately. There is nothing to overlap it with. */

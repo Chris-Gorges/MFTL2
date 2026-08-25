@@ -25,8 +25,9 @@ measured body radius. Tested at np = 1, 2, 4, 8 by `tests/test_remeshing_paralle
 | `MFTL_WorkList` | **Not implemented.** Measured instead: on the LeVeque case the remesh is 96–99 % of the timestep, but the phase count (i.e. migrations) is what varies with the budget and the rank count, not the sweep cost. A work list shortens each sweep; nothing measured says the sweeps are the problem. Revisit with a profile that isolates them. |
 | Replace `calloc(nproc, …)` in redistribution | **Not done, deliberately.** Pre-existing property of the production redistribution; rewriting a 1500-line function's indexing to fix a memory constant is the change most likely to break what this work was asked to protect. Belongs on redistribution's own schedule with a measurement at P in the thousands. |
 | `MFTLEnsembleCenterObjects` | Done, as `MFTLRemeshMigrateToRanks`. |
-| `MFTLEnsembleRebalance` with hysteresis | **Not implemented; superseded.** It exists to stop one large body forcing the expensive strategy on many small ones, by keeping two ensembles. Nothing else in MFTL_6 supports a two-ensemble pattern (one spatial halo, one BVH, one object list on the wire), and AUTO already re-measures every call so there is no state to thrash. What a caller genuinely needs to do this themselves is the per-body measurement, and that is now public: `MFTLRemeshMeasureBodies`. The remaining gap is a MIXED ensemble, which resolves to SPANNING — correct, not optimal. |
-| `MFTLComputeCoarseningFactor` + coarsening path | **Formula done** as `MFTLRemeshCoarseningFactor`, and the driver now prints it in the `h <= 4*delta` warning so the diagnostic §9 asks for is actionable. The sub-communicator path is NOT implemented. |
+| §4.4's `N_obj << P` load-balance motivation | **Done for the half that is fixable**, as `MFTL_RemeshParameters.dispersed_balance_slack`. The plan filed coarsening under the dispersed chapter and triggered it on idle ranks, but gave it the *spanning* formula $G > (4\delta/h)^3$ — the two do not belong together, and what got built follows the mathematics. Idleness splits: with $N_\text{bodies} \ge P$ it is clustered centroids and the balancer fixes it (measured 2.5–5.2×); below that no assignment can, because a body is the smallest unit of work this strategy has. |
+| `MFTLEnsembleRebalance` with hysteresis | **Not implemented; superseded.** It exists to stop one large body forcing the expensive strategy on many small ones, by keeping two ensembles. Nothing else in the library supports a two-ensemble pattern (one spatial halo, one BVH, one object list on the wire), and AUTO already re-measures every call so there is no state to thrash. What a caller genuinely needs to do this themselves is the per-body measurement, and that is now public: `MFTLRemeshMeasureBodies`. The remaining gap is a MIXED ensemble, which resolves to SPANNING — correct, not optimal. |
+| `MFTLComputeCoarseningFactor` + coarsening path | **Done, and not the way the plan proposed.** The formula is `MFTLRemeshCoarseningFactor` (scalar, quoted by the `h <= 4*delta` warning) and `MFTLRemeshCoarseningFactors` (per axis, from a MEASURED band, which the driver acts on). The *path* is `MFTL_RemeshParameters.parallel_coarsen`, armed by default. **No sub-communicator, no gather onto a group master, no scatter back** — a coarsened decomposition is an OWNER FUNCTION (`MFTLRemeshCoarseOwnerProc`), and redistribution has taken an arbitrary owner map since the dispersed strategy landed. §4.4's gather-to-root escape is `serial_gather_max_triangles`, which is the same mechanism with `group[k] = cuts[k]`. |
 | Assertions of §9 | Done as warnings plus `MFTL_RemeshStats.converged`; row 9 below. Two NOT in the plan were added after they bit: a refusal on a degenerate length band, and a Debug check that all ranks were handed the same band. |
 | Compaction before redistribution | Done. |
 | Geometry (incl. centres) before migration | Done, over the FULL triangle count, with a Debug check in `MFTLRemeshMigrateShifted`. |
@@ -34,9 +35,19 @@ measured body radius. Tested at np = 1, 2, 4, 8 by `tests/test_remeshing_paralle
 | Periodic / non-periodic handling for shifted planes | Done, and it is the one place a plain `(int)` cast is wrong; `test_a_sphere_on_the_periodic_seam_remeshes_everywhere`. |
 | Unit test: Euler characteristic **and edge-length histogram** vs serial | Done. Euler was already there; the histogram is `test_the_edge_length_distribution_matches_the_serial_answer`. Measured total variation against a CONVERGED serial reference: 0.0000 at np = 1, then 0.028, 0.027, 0.044 at np = 2, 4, 8. |
 
-**Still NOT implemented, deliberately:** §4.4 Regime C sub-communicator coarsening (a second communication
-subsystem, judged the riskiest part for the least certain benefit), §6 ensemble promotion/demotion
-(superseded — see the table), and §7 work lists (no measurement says the sweeps are the bottleneck).
+**Still NOT implemented, deliberately:** §4.4's *sub-communicator* machinery — `MPI_Comm_split`, a group
+master, gather/scatter, `MFTLDomainCoarsen`. Regime C itself is handled; that second communication subsystem
+turned out not to be needed for it. Also §6 ensemble promotion/demotion (superseded — see the table), and
+§7 work lists (no measurement says the sweeps are the bottleneck).
+
+**Where §4.4 was internally inconsistent, and how it was resolved.** The section is titled *"Coarsening
+Before Dispersed Remeshing"*, sits in the dispersed chapter, and triggers on $N_\text{obj} \ll P$ — i.e. on
+idle ranks. But the formula it gives, $G > (4\delta/h_\text{min})^3$, is the *spanning* band precondition,
+and §2's creation contract, §9's assertion and §10's strong-scaling argument all invoke coarsening for that.
+The heading says load balance; the mathematics says precondition. They are now two features:
+`parallel_coarsen` follows the mathematics and belongs to the spanning path, and
+`dispersed_balance_slack` answers the load-balance question the heading was about. Measurements for both are
+in `docs/parallel-remeshing-analysis.md` §7.
 
 ### One thing the plan does not mention and should have
 
@@ -71,10 +82,10 @@ this plan's earlier note called it "an owner-override hook in `compute_owners`" 
 ownership ARRAY rather than a smarter ownership function, because the dispersed rule is not a plane test at
 all.
 
-### Where the plan is wrong for MFTL_6
+### Where the plan is wrong
 
-Nine things, wrong because MFTL_6 is a rewrite of MFTL_5 rather than a refactor, so the hooks assumed here
-do not exist:
+Nine things. Each of them assumes a hook that this library does not have, and in every case the reason it
+does not have one is an invariant that would have to be given up first:
 
 | § | The plan says | What was built, and why |
 |---|---|---|
@@ -940,7 +951,7 @@ int MFTLComputeCoarseningFactor(const MFTL_Ensemble *ens,
 - [ ] Replace `calloc(nproc,...)` send buffers in redistribution with 26-slot neighbor-indexed buffers
 - [ ] Implement `MFTLEnsembleCenterObjects` for dispersed remeshing
 - [ ] Implement `MFTLEnsembleRebalance` with hysteresis radii
-- [ ] Implement `MFTLComputeCoarseningFactor` and the subcommunicator coarsening path
+- [x] Implement `MFTLComputeCoarseningFactor` — done as `MFTLRemeshCoarseningFactor(s)`. The subcommunicator path was **not needed**: see §0.
 - [ ] Add all required assertions (Section 9) with diagnostic messages
 - [ ] Ensure `MFTLFinalizeRemeshing` is called at end of each pass before redistribution
 - [ ] Ensure `MFTLEnsembleUpdateGeometry` (including triangle centers) is called after topology ops and before migration

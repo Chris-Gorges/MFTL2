@@ -7,9 +7,9 @@
  * @brief Building, refitting and destroying the hierarchy.
  *
  * The pipeline is the classic linear BVH -- Morton codes, radix sort, top-down
- * split at the highest differing bit, bottom-up AABB fit -- with two changes
- * against the previous version, both of which are about periodicity or scale
- * rather than about the tree.
+ * split at the highest differing bit, bottom-up AABB fit -- with two departures
+ * from the textbook form, both of which are about periodicity or scale rather
+ * than about the tree.
  */
 
 #include "mftl_bvh.h"
@@ -97,13 +97,13 @@ int MFTL_BVHPrimOwner(const MFTL_BVH *bvh, int p)
  * A radix split needs every primitive to have a UNIQUE key: two primitives
  * sharing one code have a common prefix of the full key length, the search for
  * the highest differing bit finds nothing, and the node fails to split -- which
- * in the recursive builder is an infinite descent, and in the previous version's
- * guarded form was a leaf containing an unbounded number of primitives.
+ * in a recursive builder is an infinite descent, and in its guarded form is a
+ * leaf containing an unbounded number of primitives.
  *
  * Duplicate codes are not exotic. Two triangles smaller than one Morton cell
  * share a code, which for a resolved interface mesh is most of the mesh at low
- * bit counts -- the previous version's 10 bits per axis put a 1024^3 grid over
- * the object, and any mesh finer than that in any region collides.
+ * bit counts -- the customary 10 bits per axis put a 1024^3 grid over the object,
+ * and any mesh finer than that in any region collides.
  *
  * Extending the key with the primitive's INDEX makes it unique by construction
  * without another sort: the array is already sorted, so indices are ascending,
@@ -429,8 +429,8 @@ void MFTLBVHBuildFromPrims(MFTL_BVH *bvh)
   /* ── Morton codes ────────────────────────────────────────────────────────
    *
    * MFTLMorton3D from mftl_object.h -- the same 63-bit, 21-bit-per-axis key the
-   * pool renumbering uses, rather than the previous version's separate 30-bit
-   * implementation. Two reasons to share it: a 1024^3 grid puts many triangles
+   * pool renumbering uses, rather than a separate 30-bit implementation. Two
+   * reasons to share it: a 1024^3 grid puts many triangles
    * of any resolved interface into one cell (see prefix_len), and a module that
    * carries its own copy of a spatial key will eventually disagree with the one
    * the pools are ordered by.

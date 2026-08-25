@@ -139,8 +139,8 @@ static inline void ib_free(mftl_int_buffer *b)
  * 2. Epoch-stamped global-id table -- what replaced khash
  *
  * The question every rebuild has to answer is "do I already hold global id g, and
- * where?". The previous version answered it with a hash map per entity class, and
- * paid a hash insert per received entity plus a rehash per redistribution.
+ * where?". A hash map per entity class answers it, and pays a hash insert per
+ * received entity plus a rehash per redistribution.
  *
  * Global ids are DENSE per entity class (inv_global_ids_are_dense), so the answer
  * is an array index. Two things make a plain array practical here:

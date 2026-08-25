@@ -29,12 +29,12 @@
  *   component of EVERY entity, every timestep. That is the access pattern AoS is
  *   worst at, and it is where all the time goes.
  *
- * The previous version arrived at the same split, but got there incrementally:
- * the geometry arrays were bolted onto the object with their own capacity
- * (`geom_cap_*`), and a third family of "flattened" arrays was bolted on next to
- * those with a third capacity (`flat_cap_*`) and a fourth staleness counter
- * (`flat_n_*`). Three capacities for one set of entities, kept in step by a
- * comment that said every growth site must remember to call three functions.
+ * The split is easy to arrive at incrementally and hard to arrive at safely. Bolt
+ * the geometry arrays onto the object with their own capacity (`geom_cap_*`),
+ * then bolt a family of "flattened" arrays next to those with a third capacity
+ * (`flat_cap_*`) and a fourth staleness counter (`flat_n_*`), and the result is
+ * three capacities for one set of entities, kept in step by a comment that says
+ * every growth site must remember to call three functions.
  *
  * Here there is ONE capacity per entity class, because a pool is ONE allocation:
  *
@@ -56,19 +56,19 @@
  *
  * 2. OWNERSHIP IS A PREFIX. Entities [0, n_local) are owned by this rank;
  *    [n_local, n) are ghosts. There is no `is_ghost` field: it would be a second
- *    copy of a fact the index already carries, and the previous version records
- *    "three competing notions of ownership" as a known deferred issue precisely
- *    because it had one. `owner_proc` survives on the records, because for a
+ *    copy of a fact the index already carries -- and an index test, a flag and an
+ *    `owner_proc == rank` comparison are three competing notions of ownership
+ *    that can disagree. `owner_proc` survives on the records, because for a
  *    GHOST the interesting question is not "is it mine" (the index answers that)
  *    but "whose is it" (only the field answers that).
  *
  * 3. POSITIONS LIVE IN THE SoA, AND ONLY THERE. `verts.pos[3*v+k]` is the
- *    authoritative position of vertex v. The previous version stored it in the
- *    entity struct AND in a second, Morton-ordered `flat_vert_pos` array, which
- *    forced a second index space, a sync function, a staleness flag and an
- *    "unwrapped or not" mode flag onto every consumer. All four are gone: the
- *    Morton order is applied to the POOL (MFTLObjectReorderMorton), so there is
- *    exactly one index space and exactly one copy of every coordinate.
+ *    authoritative position of vertex v. Storing it in the entity struct AND in a
+ *    second, Morton-ordered `flat_vert_pos` array forces a second index space, a
+ *    sync function, a staleness flag and an "unwrapped or not" mode flag onto
+ *    every consumer, and every one of those four is silent when it is wrong.
+ *    Here the Morton order is applied to the POOL (MFTLObjectReorderMorton), so
+ *    there is exactly one index space and exactly one copy of every coordinate.
  */
 
 #ifndef MFTL_TYPES_H

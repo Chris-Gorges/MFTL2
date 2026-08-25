@@ -39,9 +39,9 @@
  *
  * ### The CSR question, settled
  *
- * src/object/derived.c records that the previous version's vertex->triangle CSR
- * (`vert_offsets` / `vert_tris`) was deleted for want of a consumer, and asks
- * for it to be reconsidered when one appears. This is that consumer, so it was
+ * src/object/derived.c records the vertex->triangle CSR (`vert_offsets` /
+ * `vert_tris`) as deleted for want of a consumer, and asks for it to be
+ * reconsidered when one appears. This is that consumer, so it was
  * measured rather than assumed: a CSR gather removes the fan walk's dependent
  * loads entirely and lands at 5.2 - 5.7 ns per vertex -- a dead heat with the
  * scatter, not a win.

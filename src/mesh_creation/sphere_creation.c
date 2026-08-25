@@ -6,15 +6,15 @@
  *
  * @brief The icosphere: an icosahedron plus N rounds of 1-to-4 subdivision.
  *
- * Restructured against the previous version around one observation: subdivision
- * naturally PRODUCES an indexed triangle list, so it does not need its own
- * half-edge construction at all. The previous version hand-built 4 triangles and
- * 12 half-edges per old triangle, duplicating (slightly differently) the loop in
- * mesh_builder.c -- which is exactly how two code paths drift apart. Here
- * subdivision computes midpoints and emits the sub-triangles as vertex indices,
- * and MFTLBuildTopologyFromIndexList turns them into topology.
+ * Structured around one observation: subdivision naturally PRODUCES an indexed
+ * triangle list, so it does not need half-edge construction of its own at all.
+ * Hand-building the 4 triangles and 12 half-edges per old triangle would
+ * duplicate -- slightly differently -- the loop in mesh_builder.c, which is
+ * exactly how two code paths drift apart. Here subdivision computes midpoints and
+ * emits the sub-triangles as vertex indices, and MFTLBuildTopologyFromIndexList
+ * turns them into topology.
  *
- * It also no longer allocates and swaps three parallel arrays per level. Old
+ * Nor does it allocate and swap three parallel arrays per level. Old
  * vertices keep their indices under subdivision (midpoints are appended), so the
  * vertex pool is simply grown in place, and the triangle pool is rewritten.
  */

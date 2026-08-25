@@ -214,3 +214,20 @@ mftl_add_mpi_test_at(test_io_np4 test_io 4)
 # on a pool with no allocation at all, and any collective accidentally introduced
 # into it would deadlock here rather than in production.
 mftl_add_mpi_test_at(test_vertex_normals_np3 test_vertex_normals 3)
+
+# The scaling benchmark is an EXAMPLE, and no scaling sweep belongs in this
+# suite -- docs/pages/building.md states the rule: "The rank count is not a
+# scaling knob in this suite; it changes which code path is reachable."
+#
+# What is registered is a CORRECTNESS check of that example, because a program
+# whose whole purpose is to report timings has to be right before its numbers
+# mean anything. Rigid per-body translation conserves surface area exactly and
+# redistribution conserves entities exactly, so --verify needs no tolerance
+# beyond round-off, and the example exits non-zero when it drifts. np = 4 is the
+# smallest grid with a real diagonal neighbour.
+if(BUILD_EXAMPLES)
+  add_test(NAME test_advection_scaling_conserves
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:parallel_advection_scaling>
+                   --spheres 8 --refine 1 --steps 3 --warmup 1 --verify ${MPIEXEC_POSTFLAGS})
+endif()

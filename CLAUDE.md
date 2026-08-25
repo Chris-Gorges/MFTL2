@@ -7,9 +7,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 MFTL (MultiFlow Triangulation Library) is a HPC C11 library for distributed-memory (MPI) manipulation of closed and
 open triangulated surface meshes, for front tracking and IBM CFD simulations.
 
-**MFTL_6 is a ground-up rewrite of `../MFTL_5`, not a refactor of it.** The architecture changed; the algorithms
-mostly did not. Read "The one idea" below before changing anything structural — most of the file layout follows
-from it.
+Read "The one idea" below before changing anything structural — most of the file layout follows from it, and a
+change that ignores it will look local and will not be.
 
 What exists today:
 
@@ -35,20 +34,23 @@ What exists today:
   shift/freeze schedule, for bodies larger than a rank box; `src/remeshing/remesh_dispersed.c`
   (`MFTLRemeshEnsembleDispersed`) moves the BODIES onto the rank owning their centroid, for bodies smaller
   than one. `MFTLRemeshEnsemble` dispatches on `nproc` and then on `MFTLRemeshChooseStrategy`
+- **an armed coarsening fallback for the spanning path** (`parallel_coarsen`, default on), which merges rank
+  boxes through the owner map when the frozen band no longer fits — plus a single-rank gather
+  (`serial_gather_max_triangles`) that is the same mechanism at `group = cuts`, and a frozen-share
+  diagnostic (`MFTL_RemeshStats.frozen_fraction`). Both extra triggers ship off; see the invariants below
+- **a deterministic, collective-free load balancer for the dispersed path** (`dispersed_balance_slack`,
+  default on), which spreads clustered bodies over ranks from replicated data alone
 - **all the remeshing module's MPI in one file** (`src/remeshing/remesh_comm.c`): migration, the id
   collectives and the ghost id exchange. Enforced by `test_remeshing_mpi_is_confined`
 - LBVH and object–object contact detection (`src/bvh/`, `MFTL_GenerateLBVH` / `MFTL_RefitLBVH` /
-  `MFTL_IntersectObjects`), ported from `../MFTL2`: Morton radix-split tree, explicit-stack dual
-  traversal, Shewchuk-adaptive orientation and an exact Guigue–Devillers narrow phase
+  `MFTL_IntersectObjects`): Morton radix-split tree, explicit-stack dual traversal,
+  Shewchuk-adaptive orientation and an exact Guigue–Devillers narrow phase
 - the spatial halo (`src/communication/spatial_halo.c`, `MFTLExtendSpatialHalo`): the triangles of one
   body that neighbouring ranks hold near this rank's share of another, delivered as a standalone
   shadow `MFTL_Object` per body
 
-**Not yet ported** (all present at `../MFTL_5`): open-surface generators, GTS I/O, and topological ghost-layer
-growth. There is no mesh READER of any format in either version. Do not add references to these from the
-current modules — port the module first. (The dispersed remeshing strategy was on this list and is not: it
-is `src/remeshing/remesh_dispersed.c`, dispatched to by `MFTLRemeshChooseStrategy` and tested at
-np = 1, 2, 4, 8.)
+**Absent**: open-surface generators, GTS I/O, topological ghost-layer growth, and a mesh READER of any
+format. Do not add references to these from the current modules — build the module first.
 
 ## The one idea
 
@@ -61,9 +63,9 @@ A mesh is described by two things that want opposite memory layouts, and each is
 
 **Both live in ONE allocation per entity class.** `MFTL_VertexPool` and `MFTL_TrianglePool` each hold a single
 `block` cut into cache-line-aligned sub-arrays by `MFTLLayoutAdd` (`mftl_memory.h`), and each has exactly one
-`capacity`. The previous version had three capacities per object (`capacity_*`, `geom_cap_*`, `flat_cap_*`) kept in
-step by a rule written in a comment; a growth site that forgot one produced a heap overflow. Here the AoS and every
-SoA array are the same `malloc`, so that class of bug is not expressible.
+`capacity`. Three capacities per object (`capacity_*`, `geom_cap_*`, `flat_cap_*`) kept in step by a rule written
+in a comment is the arrangement this replaces; a growth site that forgets one produces a heap overflow. Here the
+AoS and every SoA array are the same `malloc`, so that class of bug is not expressible.
 
 `src/object/object.c` is the **only** file allowed to write a pool pointer, a `capacity`, or a `block`. Everything
 else changes size through `MFTLObjectReserve` / `MFTLObjectReserveAdditional` / `MFTLObjectSetCounts`.
@@ -75,11 +77,13 @@ else changes size through `MFTLObjectReserve` / `MFTLObjectReserveAdditional` / 
    `MFTLHeTriIdx`, `MFTLHeNextIdx`, `MFTLHePrevIdx`). The half-edge array lives inside the triangle pool at 3× its
    capacity. **Anything that creates a triangle must create its three half-edges at `3t`, `3t+1`, `3t+2`.**
 2. **Ownership is a prefix.** Entities `[0, n_local)` are owned by this rank; `[n_local, n)` are ghosts. There is no
-   `is_ghost` field. `owner_proc` survives only to answer "whose is it" for a ghost. The previous version carried
-   three competing notions of ownership and recorded "pick one as canonical" as a deferred issue.
+   `is_ghost` field. `owner_proc` survives only to answer "whose is it" for a ghost. An index test, a flag and an
+   `owner_proc == rank` comparison are three competing notions of ownership that can disagree; the prefix is the
+   only one that cannot go stale, because it IS the storage order.
 3. **Positions live in the SoA and only there.** `verts.pos[3*v+k]` is authoritative. There is no second copy and no
    second index space: the Morton ordering is applied to the *pool* (`MFTLObjectReorderMorton`), not stored as a
-   permutation. This is what removed the previous version's `sfc_perm`/`sfc_inv` trap.
+   permutation. Storing it as a permutation (`sfc_perm`/`sfc_inv`) is the trap this avoids: a second index space
+   forces a sync function, a staleness flag and an "unwrapped or not" mode flag onto every consumer.
 
 ### Derived arrays and staleness
 
@@ -96,7 +100,8 @@ so a motion pass cannot silently leave geometry a timestep stale.
 
 `tris.verts` and `tris.neighbors` are *redundant* with the half-edge records (a rotation of `he.vertex_idx`, and
 `he.twin_idx / 3`). They are stored for traffic — 12 B/triangle instead of 48 — not for instructions. See
-`src/object/derived.c`, which also records which of the previous version's ten flattened arrays were deleted and why.
+`src/object/derived.c`, which also records which of the ten arrays a flattened representation grows to were
+deleted, and why.
 
 **There are no hash maps.** Global IDs are dense per entity class, and "the other side of this edge" is already an
 index — that is what `khash` was doing work for. Do not reintroduce one without saying which lookup genuinely
@@ -363,8 +368,7 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   topology, valid positions and both derived bits set; `tris.area/normal/center` and
   `verts.normal/area/mean_curv/gauss_curv` hold unspecified values until something recomputes them. That is what
   buys the 3× smaller wire format — see `include/mftl_communication.h`. A solver that consumes triangle geometry
-  AFTER the redistribution therefore owes one more pass, which version 5 did not (it shipped the geometry on the
-  wire). `parallel_advection_redistribute_list` runs it as step 5 and times it separately, because comparing the
+  AFTER the redistribution therefore owes one more pass — the price of not shipping the geometry on the wire. `parallel_advection_redistribute_list` runs it as step 5 and times it separately, because comparing the
   two versions' redistribute timings alone credits this one with a saving it has not finished paying for.
 - Bodies are identified on the wire by their INDEX in the ensemble's object list, not by `global_id`. Every rank
   must therefore hold the same object list in the same order; a Debug-only checksum reduction inside the
@@ -379,7 +383,7 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
 ## Invariants worth preserving
 
 - **Only OWNED entities go into a `.vtu`.** A ghost is a copy of a triangle another rank owns, so writing the whole
-  pool — which version 5 did — puts every halo triangle in the merged dataset once per rank holding it. The picture
+  pool puts every halo triangle in the merged dataset once per rank holding it. The picture
   is unchanged (the copies are coincident) and every integral the visualisation tool computes over the surface is
   wrong by the halo fraction, silently. `include_ghosts` restores the old behaviour for looking AT the halo.
   Guarded by `test_ghost_inclusion` and `test_cell_count_is_the_owned_count`.
@@ -411,6 +415,69 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   `test_a_partitioned_sphere_remeshes_on_a_periodic_domain` checks that to the bit, and
   `frozen_matches_replication` checks the equivalence itself in both directions — the "replicated but not
   frozen" direction is the fatal one, and its symptoms appear one or two migrations after the cause.
+
+- **COARSENING IS AN ARMED FALLBACK, NOT A DEFAULT ACTION, AND THE DIFFERENCE IS CHECKED BY DIGEST.**
+  `parallel_coarsen` defaults to 1, so every parallel pass runs the decision — but
+  `MFTLRemeshCoarseningFactors` returns `{1,1,1}` on any axis already wide enough and
+  `MFTLRemeshCoarseOwnerProc` at `{1,1,1}` is bit-for-bit `MFTLRemeshOwnerProc`, so a healthy partition
+  produces the IDENTICAL mesh. `test_the_fallback_stays_off_on_a_healthy_partition` remeshes one fixture
+  armed and disarmed and compares `mesh_digest`, not triangle counts — a weaker test would pass while the
+  armed path perturbed the mesh, because a remesher's output is a valid mesh either way. Cost of arming: one
+  pre-pass (geometry refresh, one freeze classification, two small Allreduces), about +0.5 % of a timestep.
+
+  **Three triggers, and `coarsen_trigger` exists because they call for opposite responses.** BAND
+  (`h <= 4*delta`) is not negotiable — the alternative is an un-remeshed lattice. FROZEN
+  (`coarsen_frozen_fraction`) and GATHER (`serial_gather_max_triangles`) are trades with cheaper
+  alternatives the library cannot take on its own. Both ship DISABLED, and both defaults are measured
+  rather than assumed — see `docs/parallel-remeshing-analysis.md` §7.
+
+- **THE FROZEN SHARE IS THE SHARE OF EVERY MIGRATION THAT BUYS NOTHING, AND `h > 4*delta` PERMITS 87.5 % OF
+  IT.** A frozen entity travels with the mesh and is then not touched, so `MFTL_RemeshStats.frozen_fraction`
+  is the most useful single number about a spanning pass — it is free whenever the fallback is armed, and it
+  is worth logging even with its trigger off. Two traps. The obvious model `1-(1-2*delta/h)^3`
+  **over-predicts by about two** (71 % predicted, 36.6 % measured at np = 27) because a sphere in a box does
+  not sample the cut planes uniformly, so set `coarsen_frozen_fraction` from the MEASURED field and never
+  from the geometry. And the remedy is priced in ranks: at 36.6 % frozen the trigger converts a pass that did
+  not converge and hid 32 edges into one that converged and hid none, **for twice the wall clock**. Useful
+  window roughly 30–60 %; above it the band trigger has already fired, below it the real complaint is
+  `parallel_phase_budget`.
+
+- **THE SINGLE-RANK GATHER IS MAXIMAL COARSENING, AND IT IS THE SAFEST COARSE MAP, NOT THE MOST EXTREME.**
+  `serial_gather_max_triangles` sets `group[k] = cuts[k]`; nothing is replicated so nothing is frozen, no
+  axis keeps an interior plane so `n_distinct_placements` is 1, and every later phase is an identity
+  migration that is skipped — **exactly two migrations however many phases it sweeps**. No new communication
+  code. Every rank sends to ONE destination, so redistribution's 32-bit `MFTL_DEDUP_BITS` is never stressed;
+  intermediate coarsening is what can reach that (untested — np <= 27 cannot produce 32 distinct
+  destinations). The measured crossover is **50–100 triangles per rank**, which an absolute count cannot
+  express, so it defaults to 0; it is a count and not a ratio because one rank holds the whole ensemble and a
+  count is the only form of the question that bounds the memory. A gathered pass converges and hides nothing
+  in every row measured.
+
+- **DISPERSED IDLENESS SPLITS IN TWO, AND ONLY ONE HALF IS FIXABLE.** With `N_bodies >= P` a pile-up is
+  clustered centroids and `dispersed_balance_slack` fixes it (default 1.25, ON): measured imbalance
+  4.00/8.00/27.00 -> 1.25 at np = 4/8/27, **2.5–5.2× less wall clock**, idle ranks to zero. Below
+  `N_bodies == P` nothing can, because a body is the smallest unit of work this strategy has;
+  `n_ranks_idle` versus `load_imbalance` is how to tell which you have. The assignment **costs no
+  collective** — the per-body weights ride the reduction `MFTLRemeshMeasureBodies` already takes (its stride
+  went 7 -> 8 for exactly this) — and that is a constraint, not a bonus: `MFTL_OwnerMap` is undefined if two
+  ranks name different destinations, so every tie-break is total (ranks by id, bodies by index) and
+  **`domain->neighbors` must never be used** to find the 26 candidates, because it is this rank's list and
+  differs on every rank. The cells are re-derived from the body's own centroid. The balancer decides who
+  REMESHES, not who holds the mesh afterwards — the closing `MFTLRedistribute` restores the geometric
+  partition.
+
+- **COARSENING REACHES THE DISPERSED PATH ONLY AS A YARDSTICK, AND THE RELAXATION IS BOUNDED BY BODY COUNT,
+  NOT BY GEOMETRY.** `r_max > 0.4*h_min` sends a spray to the spanning driver purely because the boxes
+  shrank, so with the fallback armed the test is taken against the coarsened box. The destinations do NOT
+  move — coarse routing would restrict them to `P/G` ranks and undo the balancer. Unbounded, this is worse
+  than useless: the factors clamp at `cuts[k]`, so on a 2x1x1 grid the coarse box is the WHOLE DOMAIN, every
+  body fits, SPANNING becomes unreachable, and a jet is serialised onto one rank while reporting itself
+  perfectly centred. So it requires `N_bodies >= nproc` (below it, dispersed is already leaving ranks idle
+  and relaxing buys no parallelism) and refuses to merge the entire grid (that is the gather, and it belongs
+  to the spanning path where a triangle count bounds the memory). Guarded by
+  `test_small_bodies_at_a_fine_grid_stay_dispersed`, which asserts BOTH directions on a `{nproc,1,1}` grid —
+  the suite's cubic grids have two cells per axis up to np = 8, where every merge is the whole grid and the
+  refusal is correct.
 
 - **A SHIFTED CUT PLANE NEEDS A FLOOR, NOT A TRUNCATION, AND ONLY A BODY ON THE SEAM CAN SEE IT.**
   `MFTLRemeshOwnerProc` biases by `cuts` before the `(int)` cast on a periodic axis. Without the shift the
@@ -483,9 +550,9 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   tangent-plane treatment and slides straight off it — after which the surface has a serrated notch that no
   structural check can see, because the result is a perfectly valid manifold with a perfectly valid boundary.
 - **Smoothing is a PROJECTION, and the feature class chooses the subspace: 2D tangent plane, 1D ridge tangent,
-  0D locked.** Stated that way the three cases are one idea. Version 5 moved a ridge vertex TO the midpoint of
-  its two feature neighbours — the full displacement, no projection — which is the 2D shrinkage problem
-  reintroduced on a 1D curve: a regular 24-gon ridge collapses to 0.84 of its radius in 20 sweeps. Guarded by
+  0D locked.** Stated that way the three cases are one idea. Moving a ridge vertex TO the midpoint of its two
+  feature neighbours — the full displacement, no projection — is the 2D shrinkage problem reintroduced on a 1D
+  curve: a regular 24-gon ridge collapses to 0.84 of its radius in 20 sweeps. Guarded by
   `test_a_regular_ridge_is_a_fixed_point`, which asserts drift below 1e-12.
 - **A vertex with exactly two feature edges is a ridge point only if the curve runs roughly STRAIGHT through
   it.** Counting alone makes the four corners of an open patch ridge points, free to slide along the diagonal
@@ -533,8 +600,8 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   `MFTL_BVHPrimVerts` resolves a primitive to (object, triangle) and both kinds go through
   `MFTLGetTriangleCorners`.
 
-  Appending them to the body's own ghost suffix instead — which is what `MFTL2` did, and which looks free
-  because the ownership prefix is untouched — fails for two reasons that are invisible until they bite.
+  Appending them to the body's own ghost suffix instead — which looks free, because the ownership prefix is
+  untouched — fails for two reasons that are invisible until they bite.
   First, four passes bounded by `tris.n` rather than `n_local` change SILENTLY: the Morton bounding box in
   `reorder_vertices` (a partner body across the domain coarsens the cells for the *owned* mesh),
   `MFTLMeanEdgeLength` (each appended triangle contributes three twin-less half-edges, so the remeshing
@@ -546,8 +613,7 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   become three-way, i.e. a change to invariant 2 of `mftl_types.h`. Guarded by
   `test_halo_does_not_touch_the_bodies` and `test_halo_patch_is_a_valid_object`.
 
-  `MFTL_5` had `MFTLEnsembleCreateSpatialGhosts` + `MFTLAppendGhost*` and dropped them for lack of a
-  consumer, not on architectural grounds — see `../MFTL_5/src/communication/README.md`.
+  Guarded by `test_halo_does_not_touch_the_bodies` and `test_halo_patch_is_a_valid_object`.
 - **The spatial halo is TRANSIENT and cannot be otherwise.** Redistribution keeps only owned triangles
   (`collect_destinations` scans `[0, tris.n_local)`), so a halo cannot survive a repartition even in
   principle, and the documented loop redistributes every step. Each `MFTLExtendSpatialHalo` REPLACES the
@@ -577,17 +643,17 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   a rank boundary reveals it, which is what `test_the_tolerance_threshold_is_exact_from_both_sides` is.
 - **Periodicity is TWO problems in the BVH and they need two different fixes.** Within an object, a
   triangle straddling a seam has wrapped vertices, so a centroid built from the raw coordinates lands in
-  the middle of the domain and its AABB spans the box — that is the corruption `MFTL2`'s
-  `/* ATTENTION: IS THIS CORRECT FOR PERIODIC DOMAINS? */` was about, and it is fixed by building every
-  primitive from the seam-consistent `tris.anchor`/`tris.edge` frame. Between objects, two bodies on
+  the middle of the domain and its AABB spans the box — the corruption a centroid normalisation on a periodic
+  domain always invites, fixed by building every primitive from the seam-consistent `tris.anchor`/`tris.edge`
+  frame. Between objects, two bodies on
   opposite faces are neighbours and no per-triangle arithmetic can see it; that is fixed by traversing
   the pair once per periodic IMAGE (up to 27, each rejected by one root-AABB test). A straddling object's
   ROOT box legitimately spans the domain and is not a bug — same accepted cost, for the same reason, as
   `MFTLObjectReorderMorton`. Guarded by `test_periodic_morton_of_a_straddling_object` and
   `test_contact_across_a_periodic_face`.
 - **The contact envelope scales with the body and must not depend on the process count.**
-  `tol = MAX(proximity_floor, proximity_factor * bounding_radius)` replaces `MFTL2`'s hardcoded 1e-4
-  (AABB inflation) and 1e-6 (proximity), both absolute and therefore correct at exactly one length scale:
+  `tol = MAX(proximity_floor, proximity_factor * bounding_radius)` replaces a hardcoded 1e-4 (AABB inflation)
+  and 1e-6 (proximity), both absolute and therefore correct at exactly one length scale:
   1e-4 is a tenth of a 1 mm droplet's radius, and 1e-6 is 1e-6 of a 1 m body's. `bounding_radius` is half
   the LONGEST SIDE of the root box, not half its diagonal, so it equals `R` for a sphere and `factor`
   means what it says. It is measured over one rank's partition, so `MFTL_CreateSpatialGhosts` overwrites
@@ -603,8 +669,10 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   the answer computed on one rank while it still held the whole mesh, which is the only check that rules
   out both at once.
 - **`MFTL_Orient3D` is adaptive; nothing else in `src/bvh/` is, and that is deliberate.** It is the only
-  predicate whose SIGN decides the answer — Guigue–Devillers branches on it up to twelve times per pair,
-  and a wrong sign gives a clean "no intersection" for two triangles that cross. Everything else there
+  predicate whose SIGN decides the answer — Guigue–Devillers branches on it up to EIGHT times per pair
+  (six to classify the corners against the two planes, two in `check_min_max`; the permutation cascade
+  evaluates none, it branches on signs already computed), and a wrong sign gives a clean "no
+  intersection" for two triangles that cross. Everything else there
   degrades continuously. `examples/orient3d_predicate_profile.c` measures the trade both ways and the
   answer is not one-sided: the plain determinant did not misclassify once in 20 000 samples at gaps down
   to 1e-12 of the body size (three orders below where a lubrication model works), and only fails at
@@ -640,12 +708,13 @@ benchmarks rather than trusting the tables — there are four, and each answers 
 | `parallel_advection_redistribute_list.c` | what a whole timestep costs, and how much of it is communication |
 | `orient3d_predicate_profile.c` | does the plain orientation determinant misclassify thin-film contact, and what does the adaptive one cost |
 | `leveque_remeshing_parallel.c` | over 150 remeshed timesteps, does the distributed answer track the serial one, is it reproducible to the bit, and what does a phase cost |
+| `parallel_advection_scaling.c` | strong, weak and granularity scaling of the timestep; `run_scaling.py` sweeps the rank counts and renders the curves |
 
 **Six results contradict what the design predicted, and are the reason to read the doc rather than the code
 comments:**
 
-1. The frame kernel is worth **1.25–1.57× non-periodic and 1.94–2.00× periodic**, not the previous version's 3×,
-   because the general path got fast — not because the frames got slow. The figure this file carried before
+1. The frame kernel is worth **1.25–1.57× non-periodic and 1.94–2.00× periodic**, not the 3× a pointer-chasing
+   baseline suggests — the margin is set by how fast the GENERAL path is. The figure this file carried before
    (1.03–1.24×) was two thirds harness: `geometry_update_benchmark.c` timed the variants in blocks and averaged
    within each. Interleaving and taking minima moved it. `MFTLComputeTriangleGeometry` now DISPATCHES between the
    two on `MFTL_DERIVED_FRAMES`, and they are bit-identical — but see performance doc §9 for why that is worth
@@ -655,12 +724,12 @@ comments:**
 3. Splitting `verts.pos` into three component arrays is faster for gathers and *slower* for scatters, by similar
    amounts. It is a wash, so the layout is decided on the API instead. The mechanism is address generation
    (a 24-byte stride needs a multiply; an 8-byte stride does not), not cache lines.
-4. **The update kernel does not fail to vectorise because of the nine-way reduction** — the previous version's note
-   said so and was wrong. Splitting the reduction makes it slightly *worse*, and clang refuses the transformation
+4. **The update kernel does not fail to vectorise because of the nine-way reduction** — the obvious diagnosis,
+   and the wrong one. Splitting the reduction makes it slightly *worse*, and clang refuses the transformation
    even when a pragma forces it. 26 % of the pass is one `sqrt` plus one divide, which is irreducible.
-5. **The quality statistics are not nearly free.** The previous version measured them at +5 % on top of geometry;
-   here they are **+90 %** (1.64 → 3.11 ns/triangle). The statistics did not get slower — the streaming geometry
-   baseline got fast, and `q = 4√3·A/(a²+b²+c²)` adds a *second* divide to a loop already limited by one (§4).
+5. **The quality statistics are not nearly free.** "A few extra flops on data already in registers" predicts a
+   few per cent; they cost **+90 %** (1.64 → 3.11 ns/triangle). The streaming geometry baseline is fast, and
+   `q = 4√3·A/(a²+b²+c²)` adds a *second* divide to a loop already limited by one (§4).
    Fusing is still right (two passes cost 2.20 ns against 1.47 fused), but `MFTLEnsembleUpdate` is **slower than
    `MFTLComputeTriangleGeometry` on a non-periodic domain** while computing strictly more. Call it for the
    statistics, not as a free upgrade. On a periodic domain — what a real run has — it wins at 1.19×.
@@ -711,8 +780,8 @@ comments:**
 
 6. **The per-destination send buffers are allocated and freed on every call.** At the density-derived hint they
    are ~128 KB each, so a redistribution mallocs and frees a few megabytes per timestep and pays the first-touch
-   faults again each time. That churn is what makes the PREVIOUS version's timings so noisy (performance doc §7),
-   and this version inherits a smaller share of it. Keeping them as scratch on the domain would remove it; not
+   faults again each time. That churn is what makes a first benchmark run slower than every repeat of it
+   (performance doc §7). Keeping them as scratch on the domain would remove it; not
    done because it puts mutable per-call state on a struct that is otherwise read-only during a redistribution.
 
 7. **Step 5 of the per-timestep loop is bound by first touch, not by its kernel.** The geometry pass that restores
@@ -730,8 +799,8 @@ comments:**
 
 10. **Nothing has been measured above 4 ranks on real hardware.** The development machine has 4 performance cores,
    so an 8-rank run puts half the ranks on efficiency cores and the absolute per-triangle costs roughly triple.
-   The version-5 comparison ratios survive that, but the SCALING of the exchange — global path versus graph path,
-   and the behaviour at P in the hundreds — is entirely unmeasured.
+   Ratios measured within one rank count survive that, but the SCALING of the exchange — global path versus graph
+   path, and the behaviour at P in the hundreds — is entirely unmeasured.
 
 11. **The phase count is now measured on a real deforming case, and the open question moved.**
    `docs/parallel-remeshing-analysis.md` measures the LeVeque deformation with per-timestep distributed
@@ -753,6 +822,21 @@ comments:**
    np = 8 is oversubscribed and every absolute time above np = 4 is a lower bound. Whether migration cost
    stays proportional to the band at P in the hundreds needs a cluster and a mesh where a rank holds tens
    of thousands of triangles rather than a few thousand.
+
+18. **Two consequences of coarsening are argued rather than measured, and both need P in the hundreds.** A
+   coarse destination is `group[k]` cells away, so it is outside the 26-neighbourhood and BOTH
+   `MFTLRedistributeWithOwners` and `MFTLRemeshSyncGhostIds` fall back to their global paths — `O(nproc)`
+   allocations and an `Alltoall`, which is deferred issue 6 above, now reachable once per remesh rather
+   than never. And redistribution's 32-bit destination de-duplication (`MFTL_DEDUP_BITS`) reverts to a sort
+   above 32 distinct remote destinations, a path np <= 27 cannot reach and nothing therefore tests. The
+   GATHER is exempt from the second — every rank sends to exactly one destination.
+
+19. **`MFTLUpdateGhostPositions` has no global fallback and drops silently, so a coarsened partition must
+   never outlive a remeshing call.** `src/communication/ghost_sync.c` counts a ghost whose owner is not a
+   graph neighbour as `orphaned` and skips it; the file records that the fix is not done because that
+   function runs once per TIMESTEP rather than once per remesh and may not grow an O(nproc) path without a
+   measurement. It is safe today only because both drivers close with a plain `MFTLRedistribute` back to
+   the canonical fine partition. Anything that makes a coarse partition persist has to fix this first.
 
 12. **The BVH's leaf-leaf narrow phase is batched but NOT vectorised.** `flush_batch` in
    `src/bvh/bvh_traverse.c` receives a contiguous run of up to 64 independent (primA, primB) tests, which
@@ -776,11 +860,10 @@ comments:**
    `centres_are_current` for it — and the halo is stale exactly when ownership changed, which is the
    moment it would have to be right.
 
-14. **Nothing in `src/bvh/` has been benchmarked against `MFTL2`, or profiled at all beyond
-   `orient3d_predicate_profile.c`.** The explicit-stack traversal, the refit-only fast path and the
-   batched leaf phase are all argued from structure rather than measured; there is no BVH entry in
-   `docs/performance-analysis.md`. Build/refit/traverse timings versus the recursive original are the
-   first thing to measure before optimising any of it.
+14. **Nothing in `src/bvh/` has been profiled at all beyond `orient3d_predicate_profile.c`.** The
+   explicit-stack traversal, the refit-only fast path and the batched leaf phase are all argued from
+   structure rather than measured; there is no BVH entry in `docs/performance-analysis.md`.
+   Build/refit/traverse timings are the first thing to measure before optimising any of it.
 
 15. **Remeshing renumbers global ids at the end of every pass, and it has to.** Splits hand out fresh ids and
    collapses retire them, so ids stay unique but stop being dense. Density is not cosmetic here:
@@ -808,6 +891,26 @@ comments:**
    and state the physical gap as `proximity_floor`. Characterised, not asserted away, by
    `test_two_length_scales_share_the_larger_envelope`. Whether a per-pair rule that is neither the max nor
    the min is wanted is a physics question, not a code one, and has not been asked.
+
+20. **`MFTLGenerateSphere` builds on rank 0 and POOLS NEVER SHRINK, so a generated ensemble's
+   footprint is RESIDENT on rank 0 for the whole run.** `vertex_pool_reserve`/`triangle_pool_reserve`
+   (`src/object/object.c`) return early when `capacity <= p->capacity`, which is deliberate and
+   documented (`mftl_object.h`: a mesh of stable size must not re-fault its pages every timestep). But
+   it means a redistribution lowers `tris.n` and never `tris.capacity`, so every body keeps its full
+   generation capacity where it was built. Cost is `5120 * 4^refine + 176` bytes per body on rank 0 --
+   671 MB for 512 bodies at refine 4.
+
+   **Generating in batches with a `MFTLRedistribute` between them does NOT fix it**, which is the part
+   worth recording, because it looks like it should: it shaves only the packed-buffer transient on top
+   of a base it cannot touch, and costs `O(N^2/K)` setup work because `collect_destinations` re-derives
+   the whole halo on every call. Measured trade at 512 bodies, K = 32: ~8x the setup work for a ~30 %
+   cut in a peak dominated by the base. The real fix is an `MFTLObjectShrinkToFit`, or letting
+   `MFTLObjectReserve` shrink when `capacity > 2*n`; it belongs in `src/object/object.c`, the only file
+   allowed to touch `capacity`/`block`, and it does not exist. `examples/parallel_advection_scaling.c`
+   prints the footprint and refuses above `--max-gen-mb` instead. It is also this benchmark's Amdahl
+   ceiling: generation is rank-0 serial, so in a WEAK scaling sweep the setup time grows linearly with
+   `nproc` while the timed loop does not, and it must never be folded into a scaling total. Full
+   reasoning in `docs/scaling-analysis.md`.
 
 ### Settled, so nobody re-opens them
 

@@ -127,13 +127,14 @@ hashing — which is why remeshing must renumber at the end of every pass.
 
 ## Only OWNED entities go into a `.vtu` {#inv_owned_only}
 
-A ghost is a copy of a triangle another rank owns, so writing the whole pool —
-which MFTL 5 did — puts every halo triangle in the merged dataset once per rank
-holding it. The picture is unchanged (the copies are coincident) and **every
-integral the visualisation tool computes over the surface is wrong by the halo
-fraction, silently.**
+A ghost is a copy of a triangle another rank owns, so writing the whole pool
+puts every halo triangle in the merged dataset once per rank holding it. The
+picture is unchanged (the copies are coincident) and **every integral the
+visualisation tool computes over the surface is wrong by the halo fraction,
+silently.**
 
-`include_ghosts` restores the old behaviour for looking *at* the halo.
+`include_ghosts` asks for the whole pool deliberately, for looking *at* the
+halo.
 
 **Guarded by** `test_ghost_inclusion`, `test_cell_count_is_the_owned_count`.
 
@@ -260,6 +261,12 @@ Three things follow, and all three are load-bearing:
 `frozen_matches_replication` — the "replicated but not frozen" direction is the
 fatal one, and its symptoms appear one or two migrations after the cause.
 
+@note The precondition this rests on is \f$h_k > 4\delta\f$ per cut axis, and
+      what it buys is that each axis then has at most **one** bad shift value —
+      which is what makes eight placements a covering set rather than a heuristic.
+      The derivation, the orthogonal-array argument behind the phase table, and
+      what happens when the condition fails are in @ref rem_covering.
+
 ## A shifted cut plane needs a FLOOR, not a truncation {#inv_shifted_floor}
 
 MFTLRemeshOwnerProc() biases by `cuts` before the `(int)` cast on a periodic
@@ -357,10 +364,11 @@ valid boundary.
 The feature class chooses the subspace: 2D tangent plane, 1D ridge tangent, 0D
 locked. Stated that way the three cases are one idea.
 
-MFTL 5 moved a ridge vertex **to** the midpoint of its two feature neighbours —
-the full displacement, no projection — which is the 2D shrinkage problem
-reintroduced on a 1D curve: a regular 24-gon ridge collapses to 0.84 of its
-radius in 20 sweeps.
+Moving a ridge vertex **to** the midpoint of its two feature neighbours — the
+full displacement, no projection — is the 2D shrinkage problem reintroduced on a
+1D curve: a regular 24-gon ridge collapses to 0.84 of its radius in 20 sweeps,
+which is a large systematic error applied precisely where the geometry was
+supposed to be *preserved*.
 
 **Guarded by** `test_a_regular_ridge_is_a_fixed_point`, which asserts drift below
 \f$10^{-12}\f$.
@@ -427,8 +435,10 @@ is the only check that rules out both at once.
 ## MFTL_Orient3D is adaptive; nothing else in src/bvh/ is {#inv_adaptive}
 
 It is the only predicate whose **sign** decides the answer — Guigue–Devillers
-branches on it up to twelve times per pair, and a wrong sign gives a clean "no
-intersection" for two triangles that cross. Everything else there degrades
+branches on it up to **eight** times per pair (six classify the corners against
+the two planes, two more in `check_min_max`; the permutation cascade evaluates
+none of its own, branching on signs already computed), and a wrong sign gives a
+clean "no intersection" for two triangles that cross. Everything else there degrades
 continuously.
 
 `examples/orient3d_predicate_profile.c` measures the trade both ways and the

@@ -8,11 +8,11 @@
  *
  * ## EVERYTHING IS AN INDEX
  *
- * The previous version's accessors returned `MFTL_Vertex*` / `MFTL_Triangle*`,
- * which worked because those structs also carried the geometry. They no longer
- * do: a vertex's position lives at `obj->verts.pos[3*v]`, so a caller that has
- * been handed a pointer to the record has to reverse-engineer the index before
- * it can ask anything geometric. Every accessor here therefore takes and returns
+ * Accessors that return `MFTL_Vertex*` / `MFTL_Triangle*` only work while those
+ * structs also carry the geometry. They do not: a vertex's position lives at
+ * `obj->verts.pos[3*v]`, so a caller handed a pointer to the record has to
+ * reverse-engineer the index before it can ask anything geometric. Every
+ * accessor here therefore takes and returns
  * INDICES, and the records are reached with MFTLVertexRec / MFTLTriRec /
  * MFTLHeRec when the identity fields are actually wanted.
  *
@@ -35,7 +35,7 @@
  *   - the half-edge array needs no capacity of its own: it is 3x the triangle
  *     capacity, in the same allocation.
  *   - `origin(h) == target(prev(h))` costs one arithmetic op and one load, where
- *     the previous version needed two dependent loads.
+ *     a stored `prev` pointer would need two dependent loads.
  *
  * The price is that the mesh is triangles-only. It already was, everywhere.
  */
@@ -708,8 +708,9 @@ int MFTLMarkMeshBoundary(MFTL_Object *obj);
  *
  * Notably absent, because implicit indexing makes them unrepresentable: the
  * next-cycle check, the triangle <-> half-edge back-reference check, and the
- * "triangle has no half-edge" check. Those were three of the six failure modes
- * the previous version had to test for.
+ * "triangle has no half-edge" check. Those are three of the six failure modes an
+ * explicitly-indexed half-edge mesh has to test for, and here they are not
+ * expressible.
  *
  * A half-edge without a twin is accepted -- an open surface is a legitimate
  * mesh -- and the count is reported instead, which is the cheapest way to notice

@@ -55,7 +55,7 @@
  *                               the GLOBAL communicator when any ghost's owner
  *                               is not a graph neighbour -- which is what the
  *                               coarsened placement makes normal.
- *   MFTLRemeshMeasureBodies     1 Allreduce of 7*n_bodies doubles, then 1 of
+ *   MFTLRemeshMeasureBodies     1 Allreduce of 8*n_bodies doubles, then 1 of
  *                               n_bodies. ONCE per pass, not once per driver:
  *                               MFTLRemeshEnsemble threads the measurement from
  *                               the strategy choice into the dispersed driver.
@@ -288,6 +288,40 @@ static inline int MFTLRemeshCoarseOwnerProc(const MFTL_Domain *domain, const int
     c[k] = grp * g;
   }
   return domain->rank_map[c[0] + c[1] * domain->cuts[0] + c[2] * domain->cuts[0] * domain->cuts[1]];
+}
+
+/**
+ * @brief Shrinks @p group until it merges at most @p cap ranks per group.
+ *
+ * Shared rather than duplicated because BOTH paths that coarsen have to apply
+ * the same cap: the spanning driver caps the factors it partitions by, and the
+ * dispersed strategy caps the factors it uses as a yardstick for "is a body
+ * small enough for one rank". Two copies of this loop would eventually differ,
+ * and the symptom would be the chooser electing DISPERSED on a body the driver
+ * then rejects -- one wasted migration and a fall back to the spanning path,
+ * reported only as `n_bodies_not_centred`.
+ *
+ * The largest factor is shrunk first, which keeps the merged boxes as close to
+ * cubic as the cap allows. A cap below 1 is ignored; @p cap <= 1 means no cap.
+ *
+ * @param[in,out] group [3] per-axis factors, each >= 1.
+ * @param         cap   Maximum `group[0]*group[1]*group[2]`. <= 1 is a no-op.
+ * @rank_local Pure arithmetic; every rank must call it with the same inputs.
+ */
+static inline void MFTLRemeshCapGroups(int group[3], int cap)
+{
+  if (cap <= 1) return;
+
+  while (group[0] * group[1] * group[2] > cap)
+  {
+    int worst = 0;
+    for (int k = 1; k < 3; ++k)
+    {
+      if (group[k] > group[worst]) worst = k;
+    }
+    if (group[worst] <= 1) break;
+    group[worst]--;
+  }
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

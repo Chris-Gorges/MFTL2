@@ -4,8 +4,8 @@
  *
  * @brief Unit tests for the derived per-triangle arrays and the Morton reorder.
  *
- * These two are what replaced the previous version's "flatten" module, and the
- * properties worth pinning are the ones that module got wrong or made hard:
+ * These two are what a "flatten" module would otherwise grow into, and the
+ * properties worth pinning are the ones such a module gets wrong or makes hard:
  *
  *   - the derived arrays say EXACTLY what a half-edge walk says (they are an
  *     optimisation, and the moment they disagree they are a second, wrong mesh);
@@ -131,11 +131,11 @@ static int test_frames_are_seam_consistent(void)
 {
   MFTL_Object *obj = make_seam_triangle();
 
-  /* The naive difference across the seam is -0.90; the true edge is +0.10. The
-   * previous version solved this by unwrapping all POSITIONS, which only worked
-   * while the object fitted in half a domain and needed a flag telling consumers
-   * whether it had. The edge vectors carry the correction instead, which is
-   * exact for every object of any size, because a single triangle always is. */
+  /* The naive difference across the seam is -0.90; the true edge is +0.10.
+   * Unwrapping all POSITIONS solves it only while the object fits in half a
+   * domain, and needs a flag telling consumers whether it did. The edge vectors
+   * carry the correction instead, which is exact for every object of any size,
+   * because a single triangle always is. */
   const double *e = &obj->tris.edge[0];
   TEST_ASSERT_EQUAL_DOUBLE(0.10, e[0], 1e-12);
   TEST_ASSERT_EQUAL_DOUBLE(0.00, e[1], 1e-12);
@@ -168,9 +168,9 @@ static int test_moving_vertices_invalidates_the_frames(void)
   TEST_ASSERT(MFTLObjectHasFrames(obj));
 
   /* The motion iterator clears the frame bit on the way out, so a subsequent
-   * frame loop asserts in Debug. The previous version left this to the caller's
-   * memory, and a forgotten MFTLSyncFlatPositions produced geometry one timestep
-   * stale -- silently, and only where the mesh had actually moved. */
+   * frame loop asserts in Debug. Leaving it to the caller's memory is what makes
+   * a forgotten refresh produce geometry one timestep stale -- silently, and only
+   * where the mesh had actually moved. */
   MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += 0.25;);
 
   TEST_ASSERT(!MFTLObjectHasFrames(obj));

@@ -44,11 +44,10 @@ void MFTLRebuildTwins(MFTL_Object *obj)
    * One allocation for both arrays: same lifetime, and two separate multi-MB
    * mallocs would be two mmap/first-touch fault storms per call.
    *
-   * The previous version also cached each half-edge's origin in a third array,
-   * because reaching it cost two dependent pointer hops. With implicit indexing
-   * it is one arithmetic op and one load from a record in the same 64-byte
-   * neighbourhood, so the cache array is now more expensive than the thing it
-   * was avoiding. */
+   * A third array caching each half-edge's ORIGIN would pay for itself if
+   * reaching it cost two dependent pointer hops. With implicit indexing it is one
+   * arithmetic op and one load from a record in the same 64-byte neighbourhood,
+   * so the cache array is more expensive than the thing it avoids. */
   int *scratch = (int *) MFTLMallocOrDie(sizeof(int) * ((size_t) n_vert + (size_t) n_he), "MFTLRebuildTwins");
 
   int *const v_heads = scratch;
@@ -156,12 +155,12 @@ int MFTLCheckMeshIntegrity(const MFTL_Object *obj)
 
   /* ── What is NOT checked here, because it cannot be wrong ─────────────────
    *
-   * The previous version validated the next-cycle of every triangle, the
-   * triangle <-> half-edge back-reference, and that every triangle had a
-   * half-edge at all. Implicit indexing (mftl_topology.h) makes all three
+   * An explicitly-indexed half-edge mesh has to validate the next-cycle of every
+   * triangle, the triangle <-> half-edge back-reference, and that every triangle
+   * has a half-edge at all. Implicit indexing (mftl_topology.h) makes all three
    * tautologies: next(3t+k) is computed, not stored, and half-edge h belongs to
-   * triangle h/3 by definition. Three of the six failure modes this function
-   * used to look for are no longer expressible. */
+   * triangle h/3 by definition. Three of the six failure modes such a checker
+   * looks for are not expressible here. */
 
   /* ── Vertices ─────────────────────────────────────────────────────────── */
   for (int v = 0; v < n_verts; ++v)

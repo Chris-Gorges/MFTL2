@@ -4,11 +4,11 @@
  *
  * @brief Unit tests for the object pools -- the AoS/SoA synchronisation guarantee.
  *
- * This file is the regression test for the single thing the rewrite exists to
- * fix: in the previous version the AoS entity pools, the geometry arrays and the
- * flattened arrays each had their own capacity and could be grown independently,
- * and a growth site that forgot one of the three produced a heap overflow rather
- * than a wrong number.
+ * This file is the regression test for the single guarantee the pool layout
+ * exists to provide. If the AoS entity pools, the geometry arrays and the derived
+ * arrays each had their own capacity and could be grown independently, a growth
+ * site that forgot one of the three would produce a heap overflow rather than a
+ * wrong number.
  *
  * The tests below therefore do not just check that the counts look right. They
  * WRITE THE LAST ADDRESSABLE ELEMENT OF EVERY ARRAY at the reported capacity, so

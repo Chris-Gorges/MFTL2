@@ -25,7 +25,7 @@ position is left behind and recomputed at the receiver, because recomputing it i
 a streaming pass over contiguous arrays while shipping it is bytes on a wire, per
 entity, per timestep:
 
-| Payload | MFTL 5 | here |
+| Payload | everything on the wire | here |
 |---|---|---|
 | #MFTL_PackedVertex | 96 B | **40 B** (position + 4 ints) |
 | #MFTL_PackedTriangleComplex | 120 B | **40 B** (10 ints) |
@@ -35,8 +35,8 @@ A vertex **position** is the one geometric quantity that is authoritative
 normal, area and curvatures, and the triangle area/normal/centre, are all
 functions of the positions and the topology, so they do not.
 
-Three further fields MFTL 5 transmitted are not sent, because implicit indexing
-already determines them:
+Three further fields that a general half-edge wire format would have to carry are
+not sent, because implicit indexing already determines them:
 
 - **A half-edge's global ID.** Half-edge $3t+k$ carries $3\,t_{\mathrm{gid}} + k$
   mesh-wide. The receiver reconstructs it.
@@ -94,11 +94,12 @@ That is what `MFTLRemeshMarkFrozen` computes — see @ref mftl_mod_remeshing.
 
 ### Entities that stay never leave the pool
 
-MFTL 5 routed **every** entity through the wire format, including the ~90 % of a
-partition that stays put: pack into an `MFTL_Packed*`, radix-sort the merged
-(kept + received) stream by global id, de-duplicate, unpack, insert four hash-map
-entries per triangle. That round trip was the single most expensive part of a
-redistribution and **none of it moved any data anywhere**.
+Treating "stays here" as just another destination routes **every** entity through
+the wire format, including the ~90 % of a partition that does not move: pack into
+an `MFTL_Packed*`, radix-sort the merged (kept + received) stream by global id,
+de-duplicate, unpack, insert four hash-map entries per triangle. That round trip
+is the single most expensive part of a redistribution and **none of it moves any
+data anywhere**.
 
 Here the kept entities are identified during the same destination analysis that
 decides what to send — this rank is simply one more destination — and are then
@@ -189,10 +190,10 @@ it that are silent when wrong are spelled out there.
 
 ### One vector per message, never a bundle
 
-MFTL 5 shipped position, normal, both curvatures and the area together: **80 B
+Shipping position, normal, both curvatures and the area together costs **80 B
 against 32 B**, of which everything but the position is a function of the
-positions and the topology — so four fifths of it was recomputable at the receiver
-for less than it cost to send.
+positions and the topology — so four fifths of it is recomputable at the receiver
+for less than it costs to send.
 
 #MFTL_GhostUpdatePayload is therefore deliberately **generic** rather than named
 after the position. The same 32 bytes, the same datatype and the same schedule

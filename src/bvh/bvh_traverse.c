@@ -9,8 +9,8 @@
  *
  * ## WHY THE RECURSION WENT
  *
- * The previous version descended with a four-argument recursive call. Replacing
- * it with an explicit stack buys three things, and only the third one is really
+ * The natural way to write a dual-tree descent is a four-argument recursive call.
+ * An explicit stack buys three things over it, and only the third one is really
  * about speed:
  *
  *   1. THE HOT STATE STAYS IN REGISTERS. Both objects, both node arrays, the
@@ -205,8 +205,8 @@ static inline void batch_add(narrow_ctx *ctx, int pa, int pb)
 /**
  * @brief Traverses one periodic image of the pair, reporting every contact.
  *
- * The descent rule is the previous version's and is kept: when both nodes are
- * internal, split the one whose box is LARGER. Splitting the smaller one makes
+ * The descent rule: when both nodes are internal, split the one whose box is
+ * LARGER. Splitting the smaller one makes
  * the pair of boxes converge more slowly, so the traversal visits more pairs for
  * the same set of leaf tests.
  *

@@ -129,11 +129,11 @@ have no twin to record the shared midpoint through.
 Subdivision computes midpoints and emits the sub-triangles as vertex indices;
 `MFTLBuildTopologyFromIndexList` turns them into topology.
 
-MFTL 5 hand-built 4 triangles and 12 half-edges per old triangle, duplicating
-(slightly differently) the loop in `mesh_builder.c` — which is exactly how two
+Hand-building the 4 triangles and 12 half-edges per old triangle would duplicate
+— slightly differently — the loop in `mesh_builder.c`, which is exactly how two
 code paths drift apart.
 
-It also no longer allocates and swaps three parallel arrays per level. Old
+Nor does it allocate and swap three parallel arrays per level. Old
 vertices keep their indices under subdivision (midpoints are **appended**), so the
 vertex pool is grown in place and only the triangle pool is rewritten.
 

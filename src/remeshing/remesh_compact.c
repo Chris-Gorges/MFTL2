@@ -13,13 +13,13 @@
  * operator that removes a triangle cannot hand anything back -- it can only mark
  * it. Compaction is therefore not an optimisation here, it is the deallocator.
  *
- * Two properties make the pass simpler than the previous version's:
+ * Two properties of this library make the pass simpler than a general compaction:
  *
  *   HALF-EDGES MOVE AS TRIPLES. `he[3*t_new + k] = he[3*t_old + k]`, so the
  *   implicit indexing invariant survives by construction and so do the implicit
  *   half-edge global ids (3 * triangle gid + k) -- neither needs a fix-up pass.
- *   The previous version compacted half-edges as an independent array with its
- *   own map, which is why it needed `next_idx` and `triangle_idx` remapped too.
+ *   Compacting half-edges as an independent array with a map of their own is
+ *   what forces `next_idx` and `triangle_idx` to be remapped as well.
  *
  *   ONE ALLOCATION PER POOL. Compacting a pool is a loop over its sub-arrays,
  *   and a sub-array that someone forgot cannot exist -- it would have to have

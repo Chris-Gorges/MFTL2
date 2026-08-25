@@ -37,10 +37,11 @@ MFTL_TrianglePool = one block  ->  rec[] he[] area[] normal[] center[]
                                    verts[] neighbors[] anchor[] edge[]
 ```
 
-MFTL 5 had three capacities per object (`capacity_*`, `geom_cap_*`, `flat_cap_*`)
-kept in step by a rule written in a comment; a growth site that forgot one
-produced a heap overflow. Here the AoS and every SoA array are the same `malloc`,
-so **that class of bug is not expressible**.
+The alternative — one capacity for the AoS records, a second for the geometry
+arrays and a third for the derived ones, kept in step by a rule written in a
+comment — fails at the first growth site that updates two of the three, and it
+fails as a heap overflow rather than as an error. Here the AoS and every SoA
+array are the same `malloc`, so **that class of bug is not expressible**.
 
 @warning `src/object/object.c` is the **only** file allowed to write a pool
          pointer, a `capacity`, or a `block`. Everything else changes size
@@ -73,16 +74,19 @@ ghosts. There is no `is_ghost` field — it would be a second copy of a fact the
 index already carries. `owner_proc` survives only to answer *"whose is it"* for a
 ghost, which the index cannot.
 
-MFTL 5 carried three competing notions of ownership and recorded "pick one as
-canonical" as a deferred issue.
+One notion of ownership, not three. An index test, an `is_ghost` flag and an
+`owner_proc == rank` comparison can all be made to answer the question, and any
+two of them can disagree; the prefix is the only one that cannot go stale,
+because it *is* the storage order.
 
 ## 3. Positions live in the SoA and only there {#arch_inv_positions}
 
 `verts.pos[3*v+k]` is authoritative. There is no second copy and no second index
 space: the Morton ordering is applied to the *pool* (MFTLObjectReorderMorton()),
-not stored as a permutation. This is what removed MFTL 5's `sfc_perm`/`sfc_inv`
-trap — a second index space that forced a sync function, a staleness flag and an
-"unwrapped or not" mode flag onto every consumer.
+not stored as a permutation. Storing it as a permutation (`sfc_perm` /
+`sfc_inv`) is the trap this avoids: a second index space forces a sync function,
+a staleness flag and an "unwrapped or not" mode flag onto every consumer, and
+every one of those is silent when it is wrong.
 
 ---
 

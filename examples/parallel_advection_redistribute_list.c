@@ -38,18 +38,18 @@
  *
  * ── Step 5, and why the benchmark would lie without it ─────────────────────
  *
- * Version 5's redistribution PACKED the area, the normal and the centroid onto
- * the wire, so a timestep ended with valid triangle geometry. This version
- * deliberately does not: geometry is recomputable from positions, so dropping it
- * is what buys the 3x smaller messages (see include/mftl_communication.h). The
- * object that comes out of MFTLRedistribute has valid topology and valid
- * positions, and `tris.area/normal/center` hold unspecified values.
+ * A redistribution that PACKS the area, the normal and the centroid onto the wire
+ * ends a timestep with valid triangle geometry. This one deliberately does not:
+ * geometry is recomputable from positions, so dropping it is what buys the 3x
+ * smaller messages (see include/mftl_communication.h). The object that comes out
+ * of MFTLRedistribute has valid topology and valid positions, and
+ * `tris.area/normal/center` hold unspecified values.
  *
- * Comparing the two versions' redistribute timings alone therefore credits this
- * one with a saving it has not finished paying for. Step 5 pays it: one geometry
- * pass over all triangles, restoring exactly the post-step state version 5
- * delivered. It is timed as its own phase so the two readings are both
- * available -- redistribute alone, and redistribute plus the recompute it defers.
+ * Timing the redistribution alone therefore credits it with a saving it has not
+ * finished paying for. Step 5 pays it: one geometry pass over all triangles,
+ * restoring the end-of-step state a geometry-carrying wire format would have
+ * delivered. It is timed as its own phase so both readings are available --
+ * redistribute alone, and redistribute plus the recompute it defers.
  *
  * `--no-post-geom` removes it, which is legitimate for a solver that consumes
  * triangle geometry between steps 3 and 4 (the natural place: that is the
@@ -57,8 +57,8 @@
  * solver genuinely owes nothing, because step 3 of the next timestep recomputes
  * from the moved positions regardless.
  *
- * The pass used is MFTLComputeTriangleGeometry rather than MFTLEnsembleUpdate
- * because that is version 5's semantics: geometry only, ALL triangles, no
+ * The pass used is MFTLComputeTriangleGeometry rather than MFTLEnsembleUpdate,
+ * because restoring what the wire dropped is geometry only: ALL triangles, no
  * quality statistics and no reduction. examples/ensemble_update_benchmark.c
  * measures what the fused alternative would cost instead.
  *
@@ -410,9 +410,8 @@ int main(int argc, char **argv)
 
     /* 5. Restore what the redistribution deliberately did not send. The object
      *    now has valid topology and valid positions; its areas, normals and
-     *    centres hold unspecified values until this runs. Version 5 shipped
-     *    them on the wire, so this is the phase that makes the two versions'
-     *    per-step totals describe the same end state. */
+     *    centres hold unspecified values until this runs. This is the phase
+     *    that makes the per-step total describe a complete end state. */
     if (cfg.post_geom)
     {
       t0 = MPI_Wtime();
@@ -505,11 +504,11 @@ int main(int argc, char **argv)
     printf("  verify + rest       %8.3f s   %5.1f %%\n", rest, 100.0 * rest / mean_total);
     printf("  redistribute cost   %8.1f ns per owned triangle per step\n", 1e9 * sum[4] / (per_step * (owned_mean > 0.0 ? owned_mean : 1.0)));
 
-    /* The number to compare against version 5, which shipped the geometry on the
-     * wire and therefore ended a step with it already valid. */
+    /* The honest per-step total: the redistribution plus the geometry pass it
+     * defers, i.e. the cost of reaching a state with valid triangle geometry. */
     if (cfg.post_geom)
     {
-      printf("  redistribute + post %8.3f s              (%.3f ms/step)  <- comparable with version 5\n", sum[4] + sum[6],
+      printf("  redistribute + post %8.3f s              (%.3f ms/step)  <- the honest total\n", sum[4] + sum[6],
              1000.0 * (sum[4] + sum[6]) / per_step);
     }
     printf("==============================================\n");

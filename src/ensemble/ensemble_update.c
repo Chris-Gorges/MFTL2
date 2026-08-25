@@ -86,8 +86,8 @@ typedef struct
  *
  * The accumulators use fmin/fmax rather than the obvious `if (a < lo) lo = a;`,
  * and that is a measured choice. Checked with -Rpass-analysis=loop-vectorize on
- * the identical kernel in the previous version: with the if-form (and with a
- * ternary) clang reports "value that could not be identified as reduction", i.e.
+ * the identical kernel: with the if-form (and with a ternary) clang reports
+ * "value that could not be identified as reduction", i.e.
  * the loop is disqualified before anything else is considered. With fmin/fmax
  * that objection disappears.
  *
@@ -105,9 +105,9 @@ static void update_kernel(MFTL_Object *obj, int n_tris, update_accumulators *acc
   MFTL_ASSERT(MFTLObjectHasFrames(obj) && "MFTLEnsembleUpdate: stale frames -- MFTLObjectBuildDerived or MFTLObjectRefreshFrames first");
   MFTL_ASSERT(n_tris <= obj->tris.n && "MFTLEnsembleUpdate: count exceeds the triangle pool");
 
-  /* Three contiguous output streams. In the previous version these were fields
-   * of MFTL_Triangle and the loop was a 96-byte-stride scatter that clang
-   * refused to vectorise with "cannot identify array bounds". */
+  /* Three contiguous output streams. As fields of MFTL_Triangle they would make
+   * this loop a 96-byte-stride scatter, which clang refuses to vectorise with
+   * "cannot identify array bounds". */
   double *const restrict out_area = obj->tris.area;
   double *const restrict out_normal = obj->tris.normal;
   double *const restrict out_center = obj->tris.center;
@@ -243,8 +243,8 @@ void MFTLEnsembleUpdate(MFTL_Ensemble *ensemble)
    * that decides how this scales; the volume (11 doubles per object) is
    * negligible next to the latency at any realistic P.
    *
-   * Non-blocking, and this is the one place the previous version left something
-   * on the table. The three reductions are independent -- different operators
+   * Non-blocking, and that is the whole point of this block. The three
+   * reductions are independent -- different operators
    * over disjoint buffers -- so issuing them back to back as blocking calls puts
    * three O(log P) latencies in series for no reason. MPI_Iallreduce lets the
    * progress engine pipeline them, so the cost tends towards one collective's
@@ -356,9 +356,8 @@ int MFTLEnsembleUpdateVertexNormals(MFTL_Ensemble *ensemble)
  * MFTLEnsembleUpdate, which is easy to misread as "no diagnostic, so it
  * vectorised".
  *
- * The previous version's note attributed that verdict to the nine-way statistics
- * reduction. THAT ATTRIBUTION WAS WRONG, and two independent measurements say
- * so:
+ * The obvious diagnosis is the nine-way statistics reduction. THAT ATTRIBUTION IS
+ * WRONG, and two independent measurements say so:
  *
  *   - splitting the reduction into 2 independent accumulator sets -- the
  *     standard fix, written out with eighteen plain scalars so nothing is hidden

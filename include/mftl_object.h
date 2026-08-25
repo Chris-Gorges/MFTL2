@@ -18,11 +18,11 @@
  * leave a count above a capacity. Capacity changes through MFTLObjectReserve()
  * or MFTLObjectReserveAdditional().
  *
- * The previous version had three capacities per object (`capacity_*`,
- * `geom_cap_*`, `flat_cap_*`) and a rule in a comment saying that every site
- * which grew a pool had to remember to call two other functions. Here there is
- * one capacity per pool, because a pool is one allocation. A growth that forgets
- * an array is not a bug you can make.
+ * Three capacities per object (`capacity_*`, `geom_cap_*`, `flat_cap_*`) plus a
+ * rule in a comment saying that every site which grows a pool must remember to
+ * call two other functions is the arrangement this replaces. Here there is one
+ * capacity per pool, because a pool is one allocation. A growth that forgets an
+ * array is not a bug you can make.
  *
  * ## THE DERIVED ARRAYS AND WHEN THEY GO STALE
  *
@@ -85,12 +85,11 @@ void MFTLObjectDestroy(MFTL_Object **p_object);
  * capacity is a no-op: pools never shrink, so a mesh of stable size does not
  * re-fault its pages every timestep.
  *
- * Growth PRESERVES contents -- every array, including the derived ones. That is
- * a deliberate difference from the previous version, which discarded the
- * geometry on every resize on the grounds that the caller was about to
- * recompute it. It usually was; when it was not, the result was a silent zero.
- * The copy happens O(log n) times over a mesh's life and is a memcpy at memory
- * bandwidth, which is not where any measurable time goes.
+ * Growth PRESERVES contents -- every array, including the derived ones. The
+ * alternative is to discard the geometry on every resize on the grounds that the
+ * caller is about to recompute it. It usually is; when it is not, the result is a
+ * silent zero. The copy happens O(log n) times over a mesh's life and is a memcpy
+ * at memory bandwidth, which is not where any measurable time goes.
  *
  * @param obj        Object to grow.
  * @param n_vertices Vertices the pool must hold.
@@ -273,13 +272,12 @@ static inline uint64_t MFTLMorton3D(uint64_t x, uint64_t y, uint64_t z)
  * @brief Renumbers the mesh along a Morton curve so that neighbours in space are
  *        neighbours in memory.
  *
- * This is where the previous version's `sfc_perm` / `sfc_inv` went. Rather than
- * storing a permutation and a second, SFC-ordered copy of every position -- two
- * index spaces that the previous version's own notes record as having caused a
- * live silent-corruption bug -- the permutation is APPLIED to the pools. Both
- * the AoS records and every SoA array move together, and all indices are
- * remapped, so afterwards there is still exactly one index space and exactly one
- * copy of every coordinate.
+ * This is what replaces an `sfc_perm` / `sfc_inv` pair. Rather than storing a
+ * permutation and a second, SFC-ordered copy of every position -- two index
+ * spaces, which is the arrangement silent corruption lives in -- the permutation
+ * is APPLIED to the pools. Both the AoS records and every SoA array move
+ * together, and all indices are remapped, so afterwards there is still exactly
+ * one index space and exactly one copy of every coordinate.
  *
  * What it does, in order:
  *   1. Morton key per vertex from `verts.pos`, quantised against the object's
@@ -357,8 +355,8 @@ void MFTLObjectUpdateGlobalStats(MFTL_Object *object);
  * They deliberately do NOT force it with a pragma: the caller's body may
  * legitimately carry a dependency the macro cannot see.
  *
- * Whether a given use vectorises is therefore decided by the BODY. Measured on
- * the previous version's identical kernels:
+ * Whether a given use vectorises is therefore decided by the BODY. Measured over
+ * four kernels that differ only in how the body writes its result:
  *
  *   body writes contiguous arrays, no reduction   -> vectorises
  *   body reduces with fmin/fmax                   -> vectorises
@@ -411,13 +409,13 @@ void MFTLObjectUpdateGlobalStats(MFTL_Object *object);
  * The anchor is a per-triangle copy of corner 0, written at build time where it
  * is already in a register because both edge vectors are differences against it.
  * That deletes the last indirection from the loop: no gather at all, two
- * contiguous arrays in, whatever the body writes out. The previous version
- * measured this as free while the positions fit in cache and worth 13 % once
- * they do not, which is the shape you expect from deleting a random read. That
- * second half has NOT been reproduced on this version's hardware -- see
- * docs/performance-analysis.md, where the gather this removes turns out not to
- * cost anything measurable on a machine with a large L2. It is kept because
- * 24 B per triangle is cheap insurance on a cluster node where it will.
+ * contiguous arrays in, whatever the body writes out. The expected shape of the
+ * payoff is "free while the positions fit in cache, worth about 13 % once they do
+ * not", which is what deleting a random read looks like. The second half has NOT
+ * been reproduced on this machine -- see docs/performance-analysis.md, where the
+ * gather this removes turns out not to cost anything measurable on a part with a
+ * large L2. It is kept because 24 B per triangle is cheap insurance on a cluster
+ * node where it will.
  *
  * Corner positions are p0, p0 + e1, p0 + e2. p0 is a WRAPPED position, so a
  * centroid derived from it must be wrapped back into the box before it is used
@@ -475,9 +473,9 @@ void MFTLObjectUpdateGlobalStats(MFTL_Object *object);
  * it is pure waste on a correctly partitioned mesh.
  *
  * It CLEARS the frame bit on the way out, so a subsequent frame loop asserts in
- * Debug unless MFTLObjectRefreshFrames() has run. The previous version left that
- * to the caller's memory and a forgotten call produced geometry one timestep
- * stale -- silently, and only where the mesh actually moved.
+ * Debug unless MFTLObjectRefreshFrames() has run. Leaving that to the caller's
+ * memory is what makes a forgotten call produce geometry one timestep stale --
+ * silently, and only where the mesh actually moved.
  *
  * In scope:
  *   int      v               vertex pool index

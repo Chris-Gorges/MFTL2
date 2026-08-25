@@ -288,8 +288,8 @@ static void run_cost(void)
 
   printf("  exactly coplanar   fast %6.2f ns   adaptive %6.2f ns   (%.2fx)\n", 1e9 * best_fast / N, 1e9 * best_exact / N, best_exact / best_fast);
 
-  /* The accumulator has to be OBSERVED, not merely computed. An earlier version
-   * guarded it with `if (sink == <constant>) printf("")`, and with LTO on the
+  /* The accumulator has to be OBSERVED, not merely computed. Guarding it with
+   * `if (sink == <constant>) printf("")` is not enough: with LTO on the
    * compiler proved the printf was a no-op, hence the branch dead, hence `sink`
    * dead, hence both timing loops dead -- and duly reported the plain
    * determinant at 0.00 ns. Printing it is the cheapest thing that cannot be

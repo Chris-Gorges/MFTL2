@@ -285,10 +285,9 @@ void MFTLEnsembleUpdateGlobalCounts(MFTL_Ensemble *ensemble)
    * Blocking: the buffer is 2 ints per object, so this is pure latency, and the
    * caller has nothing to overlap it with (the counts are what it asked for).
    *
-   * The local half is now two array reads per object. The previous version
-   * scanned every vertex and every triangle testing an `is_ghost` flag first,
-   * which is O(V + T) of pure memory traffic to recover a number the ownership
-   * prefix already carries. */
+   * The local half is two array reads per object. Scanning every vertex and
+   * every triangle for an `is_ghost` flag first is O(V + T) of pure memory
+   * traffic to recover a number the ownership prefix already carries. */
   int *local_counts = (int *) MFTLMallocOrDie(2 * (size_t) num_objects * sizeof(int), "MFTLEnsembleUpdateGlobalCounts");
   int *global_counts = (int *) MFTLMallocOrDie(2 * (size_t) num_objects * sizeof(int), "MFTLEnsembleUpdateGlobalCounts");
 

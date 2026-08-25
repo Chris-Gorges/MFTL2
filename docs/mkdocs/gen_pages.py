@@ -62,6 +62,7 @@ ANALYSIS_PAGES: list[tuple[str, str]] = [
     ("docs/performance-analysis.md", "analysis/performance.md"),
     ("docs/remeshing-quality-analysis.md", "analysis/remeshing-quality.md"),
     ("docs/parallel-remeshing-analysis.md", "analysis/parallel-remeshing.md"),
+    ("docs/scaling-analysis.md", "analysis/scaling.md"),
 ]
 
 #: Where mkdoxy's Doxygen XML may be found, most likely location first.  The

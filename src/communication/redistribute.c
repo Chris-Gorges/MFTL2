@@ -15,8 +15,8 @@
  * MOST OF A PARTITION DOES NOT MOVE, SO MOST OF A PARTITION MUST NOT BE TOUCHED
  * BY THE WIRE FORMAT.
  *
- * The previous version treated "stays here" as just another destination and ran
- * it through the full protocol: pack every kept entity into an MFTL_Packed*,
+ * Treating "stays here" as just another destination runs it through the full
+ * protocol: pack every kept entity into an MFTL_Packed*,
  * concatenate kept and received, radix-sort the whole thing by global id,
  * de-duplicate, unpack, and insert one hash entry per vertex and four per
  * triangle. On a steadily advecting mesh that is O(V + T) of pure round trip for
@@ -1091,10 +1091,10 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
  * @brief One contiguous run of one body's entities inside the arrival sequence.
  *
  * The multi-body rebuild has to separate the interleaved stream back into one
- * group per object. The previous version derived the groups by extracting the
- * body id from every arrival (a strided read over the packed complexes),
- * radix-sorting all of them, and gathering again -- work to recover information
- * the SENDER already had.
+ * group per object. Deriving the groups at the receiver means extracting the body
+ * id from every arrival (a strided read over the packed complexes), radix-sorting
+ * all of them, and gathering again -- work to recover information the SENDER
+ * already had.
  *
  * It is recoverable for free. Every rank packs body by body in the same object
  * order, and MPI_(Neighbor_)alltoallv concatenates the received blocks in target
@@ -1166,8 +1166,8 @@ static int group_runs_by_object(const body_run *runs, int n_runs, int num_object
 /**
  * @brief Debug check: every rank holds the same object list in the same order.
  *
- * Bodies are named on the wire by their INDEX in that list, which is what removed
- * the previous version's body-id hash map. If the lists disagree, entities are
+ * Bodies are named on the wire by their INDEX in that list, which is what removes
+ * the need for a body-id hash map. If the lists disagree, entities are
  * merged into the wrong object and nothing crashes -- so the precondition is
  * verified rather than merely documented.
  *
@@ -1366,9 +1366,9 @@ static int redistribute_core(MFTL_Domain *domain, MFTL_Object **objects, int num
    *
    * BLOCKING, deliberately. It is one int, so the cost is pure latency, and there
    * is nothing left to overlap it with -- the send buffers are already packed and
-   * the rebuild cannot begin before the data arrives. The previous version hid it
-   * behind tearing the old pools down; nothing is torn down here, which is the
-   * whole point of section 5. */
+   * the rebuild cannot begin before the data arrives. Tearing the old pools down
+   * would give it something to hide behind; nothing is torn down here, which is
+   * the whole point of section 5. */
   int global_decision = 0;
   MPI_Allreduce(&requires_global, &global_decision, 1, MPI_INT, MPI_LOR, domain->comm_cart);
 

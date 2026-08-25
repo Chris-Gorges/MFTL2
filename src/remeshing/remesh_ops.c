@@ -496,8 +496,8 @@ bool MFTLCollapseApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParame
    * threshold. The two triangles being removed are skipped -- they degenerate to
    * a line by construction, which is the point of removing them.
    *
-   * This clause has no counterpart in the previous version, and its absence there
-   * is not a missing nicety but the head of a feedback loop: the inverted
+   * Omitting this clause is not a missing nicety, it is the head of a feedback
+   * loop: the inverted
    * triangle a collapse produces presents a ~180 degree dihedral angle, the
    * feature detector reads that as a sharp edge, and the smoother then LOCKS
    * every vertex of it. The inversion becomes permanent, and it seeds more of

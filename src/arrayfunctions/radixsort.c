@@ -444,9 +444,9 @@ static inline void radixpass_soa64(uint32_t *restrict hist, uint32_t shift, cons
 }
 
 /* Allocation is via MFTLMallocOrDie (mftl_memory.h): returning quietly on a
- * failed malloc (as an earlier version did) leaves the caller with an array it
- * believes is sorted, after which MFTLUniqueIntArray drops the wrong elements.
- * In HPC code OOM is not considered recoverable. */
+ * failed malloc leaves the caller with an array it believes is sorted, after
+ * which MFTLUniqueIntArray drops the wrong elements. In HPC code OOM is not
+ * considered recoverable. */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Public: key-only sorts

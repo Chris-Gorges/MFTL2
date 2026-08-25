@@ -37,9 +37,9 @@ what the rest produced.
 
 ## Only owned entities are written {#io_owned}
 
-MFTL 5 wrote every triangle a rank held, ghosts included. A ghost is a **copy** of
-a triangle another rank owns, so the merged dataset contained every halo triangle
-two or more times.
+Writing every triangle a rank holds, ghosts included, is the obvious loop and it
+is wrong. A ghost is a **copy** of a triangle another rank owns, so the merged
+dataset then contains every halo triangle two or more times.
 
 Invisible when you look at the surface — the copies are coincident — but **any
 integral the visualisation tool computes over it is silently wrong by the halo
@@ -58,13 +58,12 @@ Guarded by `test_ghost_inclusion` and `test_cell_count_is_the_owned_count`.
 A triangle straddling a periodic face has corners stored at opposite ends of the
 box; drawn naively it stretches across the whole domain.
 
-MFTL 5 detected this by calling `MFTLGetMinimumImageVector` twice per triangle
-inside a helper it then called **four times per triangle per file** — its own
-`src/io/README.md` §3.3 records the redundancy.
+Detecting it from scratch means two `MFTLGetMinimumImageVector` calls per
+triangle, inside a helper the writer needs four times per triangle per file.
 
-Here `tris.anchor` and `tris.edge` already hold exactly what that helper computed
-— corner 0 and the two seam-consistent edge vectors — so the unwrapped corners
-are
+None of that is necessary here: `tris.anchor` and `tris.edge` already hold what
+that helper would compute — corner 0 and the two seam-consistent edge vectors —
+so the unwrapped corners are
 
 $$
   \mathbf{p}_0, \quad \mathbf{p}_0 + \mathbf{e}_1, \quad \mathbf{p}_0 + \mathbf{e}_2
@@ -101,10 +100,10 @@ when the frames are stale.
 
 ## Encoding: raw binary by default {#io_encoding}
 
-MFTL 5 emitted one `fprintf("%.10e %.10e %.10e\n")` per point and one per cell
-record. Decimal formatting of a `double` costs on the order of a hundred
-nanoseconds and produces ~25 bytes where the value occupies 8 — so an ASCII
-writer is CPU-bound on `printf` long before it is bound by the disk.
+The straightforward writer emits one `fprintf("%.10e %.10e %.10e\n")` per point
+and one per cell record. Decimal formatting of a `double` costs on the order of a
+hundred nanoseconds and produces ~25 bytes where the value occupies 8 — so an
+ASCII writer is CPU-bound on `printf` long before it is bound by the disk.
 
 VTK's XML format has carried a **raw appended-binary** section since 2003
 precisely for this. Using it turns the emit phase into a `memcpy`.

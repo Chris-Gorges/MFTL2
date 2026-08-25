@@ -10,12 +10,12 @@
  * module's correctness is ultimately JUDGED through, because it is how a human
  * looks at what the rest of the library produced.
  *
- * ## WHAT CHANGED AGAINST THE PREVIOUS VERSION, AND WHY
+ * ## THREE DECISIONS THAT DECIDE WHAT THIS MODULE COSTS AND WHAT IT MEANS
  *
  * 1. THE DEFAULT ENCODING IS RAW BINARY, NOT ASCII.
  *
- *    The previous version emitted one `fprintf("%.10e %.10e %.10e\n")` per point
- *    and one per cell record. Decimal formatting of a double costs on the order
+ *    The straightforward writer emits one `fprintf("%.10e %.10e %.10e\n")` per
+ *    point and one per cell record. Decimal formatting of a double costs on the order
  *    of a hundred nanoseconds and produces ~25 bytes where the value occupies 8,
  *    so an ASCII writer is CPU-bound on `printf` long before it is bound by the
  *    disk. VTK's XML format has carried a raw appended-binary section since 2003
@@ -31,7 +31,7 @@
  *                           ranks never contend; but it creates P+1 files per
  *                           dump, and on a parallel filesystem the metadata
  *                           server -- not the bandwidth -- is what falls over
- *                           first. This is the previous version's layout.
+ *                           first.
  *
  *    MFTL_IO_SINGLE_FILE    ONE .vtu written collectively with MPI-IO. Every
  *                           rank contributes a slice of each data array at an
@@ -51,14 +51,15 @@
  *
  * 3. ONLY OWNED ENTITIES ARE WRITTEN.
  *
- *    The previous version wrote every triangle the rank held, ghosts included.
- *    A ghost is a COPY of a triangle another rank owns, so the merged dataset
- *    contained every halo triangle two or more times: invisible when you look at
- *    the surface, but any integral ParaView computes over it (total area,
- *    enclosed volume) is silently wrong by the halo fraction -- 10-30 % in a
- *    typical run. Ownership is an array prefix here, so writing owned-only costs
- *    nothing but a loop bound. `include_ghosts` restores the old behaviour for
- *    when the halo itself is what you want to look at.
+    Writing every triangle the rank holds, ghosts included, is the obvious loop
+ *    and it is wrong. A ghost is a COPY of a triangle another rank owns, so the
+ *    merged dataset then contains every halo triangle two or more times:
+ *    invisible when you look at the surface, but any integral ParaView computes
+ *    over it (total area, enclosed volume) is silently wrong by the halo fraction
+ *    -- 10-30 % in a typical run. Ownership is an array prefix here, so writing
+ *    owned-only costs nothing but a loop bound. `include_ghosts` asks for the
+ *    whole pool deliberately, for when the halo itself is what you want to look
+ *    at.
  *
  * 4. THE PERIODIC UNWRAPPING IS FREE.
  *

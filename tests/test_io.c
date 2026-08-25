@@ -356,9 +356,9 @@ static int test_defaults_are_conservative(void)
   const MFTL_VtkOptions o = MFTLVtkDefaults();
 
   /* Binary because ascii is ten times slower for no benefit a tool can see, and
-   * owned-only because writing ghosts double-counts the halo in every integral
-   * a visualisation computes. Both are the previous version's behaviour
-   * reversed, so they are worth pinning. */
+   * owned-only because writing ghosts double-counts the halo in every integral a
+   * visualisation computes. Both are the opposite of the easy default, so they
+   * are worth pinning. */
   TEST_ASSERT(o.encoding == MFTL_VTK_BINARY);
   TEST_ASSERT(o.layout == MFTL_IO_FILE_PER_RANK);
   TEST_ASSERT(o.include_ghosts == false);

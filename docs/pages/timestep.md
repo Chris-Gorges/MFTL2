@@ -79,13 +79,14 @@ bits set. But:
 | `tris.area`, `tris.normal`, `tris.center` | **unspecified** |
 | `verts.normal`, `verts.area`, `verts.mean_curv`, `verts.gauss_curv` | **unspecified** |
 
-That is what buys the 3× smaller wire format. A solver that consumes triangle
-geometry *after* the redistribution therefore owes one more pass — which MFTL 5
-did not, because it shipped the geometry on the wire.
+That is what buys the 3× smaller wire format: the alternative is to pack the
+areas, normals and centres onto the wire so that a timestep ends with valid
+triangle geometry. A solver that consumes triangle geometry *after* the
+redistribution therefore owes one more pass.
 
 `examples/parallel_advection_redistribute_list.c` runs it as step 5 and times it
-separately, because comparing the two versions' redistribute timings alone
-credits this one with a saving it has not finished paying for.
+**separately**, because a redistribute timing that excludes the pass it defers
+credits the redistribution with a saving it has not finished paying for.
 
 @note Step 5 is bound by **first touch**, not by its kernel. The geometry pass
       that restores what redistribution drops runs on pools the redistribution

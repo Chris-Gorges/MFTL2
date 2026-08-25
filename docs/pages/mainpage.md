@@ -10,10 +10,9 @@ Cartesian process grid, keeps a halo consistent, computes the per-timestep
 geometry, remeshes the surface as it deforms, detects contact between bodies,
 and writes the result to VTK.
 
-@note This is **MFTL 6**, a ground-up rewrite of MFTL 5. The architecture
-      changed; the algorithms mostly did not. Read @ref mftl_page_architecture
-      before changing anything structural — most of the file layout follows from
-      the one idea described there.
+@note Read @ref mftl_page_architecture before changing anything structural.
+      Most of the file layout follows from the one idea described there, and a
+      change that ignores it will look local and will not be.
 
 ---
 
@@ -57,8 +56,8 @@ the API by architectural layer, **Data Structures** lists every struct, and
 - **The spatial halo** — the triangles of one body that neighbouring ranks hold
   near this rank's share of another
 
-**Not yet ported** from MFTL 5: open-surface generators, GTS I/O, and topological
-ghost-layer growth. There is no mesh *reader* of any format in either version.
+**Absent:** open-surface generators, GTS I/O, topological ghost-layer growth,
+and a mesh *reader* of any format.
 
 ---
 

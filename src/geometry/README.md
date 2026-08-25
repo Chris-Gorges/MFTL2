@@ -191,8 +191,8 @@ serialises six round trips the scatter never makes.
 
 ### The CSR question, settled
 
-`src/object/derived.c` deleted MFTL 5's vertex→triangle CSR for want of a
-consumer and asked for it to be reconsidered when one appeared. **This is that
+`src/object/derived.c` records the vertex→triangle CSR as deleted for want of a
+consumer, and asks for it to be reconsidered when one appears. **This is that
 consumer**, so it was measured rather than assumed: a CSR gather removes the
 dependent loads entirely and lands at **5.2 – 5.7 ns/vertex — a dead heat**, not
 a win.

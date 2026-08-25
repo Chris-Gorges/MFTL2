@@ -6,10 +6,11 @@
  *
  * @brief The derived per-triangle arrays, and the Morton renumbering of the pools.
  *
- * ## WHAT SURVIVED FROM THE PREVIOUS VERSION'S "FLATTEN" MODULE, AND WHY
+ * ## FOUR DERIVED ARRAYS, AND THE SIX THAT ARE DELIBERATELY ABSENT
  *
- * That module produced ten arrays. Four are here. The other six were removed
- * after counting their consumers, which is the only honest way to decide:
+ * A "flattened" representation of a half-edge mesh naturally grows to about ten
+ * arrays. Four are here. The other six were removed after counting their
+ * consumers, which is the only honest way to decide:
  *
  *   flat_vert_pos + flat_pos_unwrapped   DELETED. It was a second copy of every
  *     position, kept in a second index space, sometimes unwrapped and sometimes
@@ -22,9 +23,8 @@
  *
  *   sfc_perm + sfc_inv                   DELETED. The permutation is applied to
  *     the pools (MFTLObjectReorderMorton below), so there is nothing to store
- *     and no second index space to confuse with the first. The previous
- *     version's notes record a live silent-corruption bug from exactly that
- *     confusion; it is now unrepresentable.
+ *     and no second index space to confuse with the first. Silent corruption
+ *     lives in exactly that confusion, and it is now unrepresentable.
  *
  *   vert_offsets + vert_tris (CSR)       DELETED. Zero consumers outside its own
  *     unit test. Every vertex-neighbourhood operation in the library goes

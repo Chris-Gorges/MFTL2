@@ -14,8 +14,10 @@
  * ## WHY THE ORIENTATION TEST IS ADAPTIVE AND NOTHING ELSE HERE IS
  *
  * MFTL_Orient3D is the only predicate in the module whose SIGN decides the
- * answer. Guigue-Devillers evaluates it up to twelve times per triangle pair and
- * branches on each result; every other quantity here -- distances, areas,
+ * answer. Guigue-Devillers evaluates it up to EIGHT times per triangle pair and
+ * branches on each result -- six for the plane classification, two in
+ * check_min_max, and none at all in the permutation cascade, which branches on
+ * signs it already has; every other quantity here -- distances, areas,
  * interval endpoints -- degrades continuously, so a last-ulp error moves a
  * contact decision only for pairs sitting exactly on the tolerance, which is a
  * tie the caller accepted when it chose a tolerance.
@@ -817,11 +819,12 @@ double MFTL_Orient3D(const double pa[3], const double pb[3], const double pc[3],
  * 3. Guigue-Devillers triangle-triangle intersection
  *
  * The published decision tree, expressed over MFTL_Orient3D so that every branch
- * it takes is one the exact predicate agreed to. The previous version's
- * hand-rolled interval permutation is replaced by it for two reasons: the
- * permutation there did not normalise the ORIENTATION of the second triangle
- * (only which vertex was isolated), and its coplanar case returned "intersect"
- * unconditionally -- so two coplanar triangles a metre apart reported contact.
+ * it takes is one the exact predicate agreed to. The tempting shortcut is a
+ * hand-rolled interval permutation, and it fails in two ways that are easy to
+ * miss: a permutation that normalises only WHICH vertex is isolated, and not the
+ * ORIENTATION of the second triangle, gets the sign of the interval test wrong on
+ * half its inputs, and a coplanar case that returns "intersect" unconditionally
+ * reports contact for two coplanar triangles a metre apart.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -1151,11 +1154,11 @@ static int coplanar_tri_tri(const double *p1, const double *q1, const double *r1
  * Nine edge pairs and six point-face projections is a complete cover of both, so
  * the minimum over the fifteen is exact -- no iteration, no tolerance.
  *
- * ── The scale bug this replaces ────────────────────────────────────────────
+ * ── Why every test here is DIMENSIONLESS ───────────────────────────────────
  *
- * The previous version guarded both routines with ABSOLUTE thresholds on
- * quantities that do not have units of length. `det < 1e-12` in the point-face
- * routine tests a Gram determinant, which has units of length^4: for a droplet
+ * Guarding either routine with an ABSOLUTE threshold puts it on a quantity that
+ * does not have units of length. `det < 1e-12` in the point-face routine tests a
+ * Gram determinant, which has units of length^4: for a droplet
  * meshed at 20 um the determinant of a healthy triangle is around 1e-19, so the
  * guard fired on EVERY triangle and the point-face branch returned "no
  * contribution" every time. The distance was then whatever the edge-edge tests

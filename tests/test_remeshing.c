@@ -869,8 +869,8 @@ static int test_a_regular_ridge_is_a_fixed_point(void)
    * tangent gives exactly zero by symmetry: the displacement towards the chord
    * midpoint is purely radial, the tangent is perpendicular to it.
    *
-   * Moving the vertex TO that chord midpoint instead -- the previous version's
-   * rule -- shrinks the ring by cos(pi/n) per sweep. For n = 24 and 20 sweeps that
+   * Moving the vertex TO that chord midpoint instead -- the un-projected rule --
+   * shrinks the ring by cos(pi/n) per sweep. For n = 24 and 20 sweeps that
    * is a 16 % collapse of a feature curve the caller asked to have PRESERVED, and
    * nothing reports it.
    */
@@ -1010,8 +1010,8 @@ static int test_area_weighting_is_actually_applied(void)
 {
   /*
    * MFTL_SMOOTH_TRIANGLE_BASED must be the AREA-WEIGHTED centroid mean. Dropping
-   * the weight -- which is what the previous version did under this name -- leaves
-   * a smoother that is very nearly MFTL_SMOOTH_VERTEX_BASED, so a caller choosing
+   * the weight leaves a smoother that is very nearly MFTL_SMOOTH_VERTEX_BASED,
+   * so a caller choosing
    * it for isotropy silently got the umbrella operator. The two modes must
    * therefore differ on a fan with unequal triangle areas.
    */

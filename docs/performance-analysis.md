@@ -14,21 +14,24 @@ They are marked.
 
 ## 1. Struct sizes
 
-| type | previous version | this version |
+| type | size | what is *not* in it |
 |---|---|---|
-| `MFTL_Vertex` | 96 B → 48 B | **16 B** |
-| `MFTL_Triangle` | 96 B → 32 B | **12 B** |
-| `MFTL_HalfEdge` | 24 B | **16 B** |
+| `MFTL_Vertex` | **16 B** | `pos` (SoA), `is_ghost` (the prefix), the per-vertex geometry (SoA) |
+| `MFTL_Triangle` | **12 B** | `area`, `normal`, `center` (SoA), the three corner indices (derived) |
+| `MFTL_HalfEdge` | **16 B** | `he_idx`, `next_idx`, `triangle_idx` (arithmetic), `boundary` (a flag bit) |
 
-The previous version had already moved geometry out of the entity structs. What
-this version removes on top of that is the *redundant topology*: `he_idx`,
-`next_idx` and `triangle_idx` are arithmetic on the half-edge index (implicit
-indexing, see `mftl_topology.h`), `pos` moved into the vertex SoA, `is_ghost`
-became the array prefix, and `boundary` was an exact mirror of
-`twin_idx == MFTL_ERROR`.
+Every omission in the third column is a field that would otherwise be a *second
+copy of a fact the record already determines*. `he_idx`, `next_idx` and
+`triangle_idx` are arithmetic on the half-edge index (implicit indexing, see
+`mftl_topology.h`); `pos` is authoritative in the vertex SoA and nowhere else;
+`is_ghost` is the array prefix; and `boundary` would be an exact mirror of
+`twin_idx == MFTL_ERROR` inside one partition, which is the wrong statement
+anyway (@ref inv_boundary).
 
-Per triangle the AoS footprint is now `12 + 3*16 = 60 B`, against `32 + 3*24 =
-104 B` before, and against `96 + 3*24 = 168 B` in the version before that.
+Per triangle the AoS footprint is therefore `12 + 3*16 = 60 B`. A half-edge
+record carrying its own index, next, triangle and boundary flag is 24 B, which
+would make the same triangle `32 + 3*24 = 104 B` — 1.7× the traffic for the same
+mesh, in the loops that stream it every timestep.
 
 ## 2. Geometry: half-edge walk vs. streaming frames
 
@@ -63,8 +66,8 @@ gets automatically whenever the frames happen to be current.
 ### This table said 1.03–1.24× until the harness was fixed
 
 The earlier revision of this section reported 1.03×, 1.07×, 1.24×, 1.16× and drew
-the conclusion that "the previous version measured about 3×, so the frames are
-worth much less here". Two thirds of that was the measurement.
+a conclusion about the frames being worth much less than expected. Two thirds of
+that was the measurement.
 
 `examples/geometry_update_benchmark.c` timed the two variants in BLOCKS — twenty
 consecutive passes of the walk, then twenty of the frame kernel — and averaged
@@ -82,10 +85,10 @@ the only signal that anything was wrong — the wrong number was entirely
 plausible, and it had a ready-made explanation attached to it.
 
 What survives from that earlier conclusion is the half that was never about the
-harness: the previous version's ~3× was measured against a baseline that chased
-pointers and strode 96-byte records. This version's walk does neither, so the
-general path really did get fast — just not fast enough to close the gap to
-within a few percent.
+harness: the size of this margin is set by how fast the *general* path is, not by
+how fast the frames are. A walk that chases pointers through 96-byte records
+makes the frames look worth 3×; the walk here dereferences nothing and strides
+12-byte records, so it closes most of that gap on its own — just not all of it.
 
 ## 3. Morton renumbering — a negative result
 
@@ -114,10 +117,10 @@ it from the library.
 
 What the reorder is worth independently of this measurement:
 
-- it is what lets the SFC ordering be the *pool* ordering, which removes the
-  second index space (`sfc_perm` / `sfc_inv`) and the duplicated position array
-  that the previous version needed. That simplification stands regardless of the
-  timing.
+- it is what lets the SFC ordering be the *pool* ordering, which is what removes
+  the second index space (`sfc_perm` / `sfc_inv`) and the duplicated position
+  array a stored permutation would need. That simplification stands regardless of
+  the timing.
 - it is a prerequisite for a linear BVH build, where the Morton codes are the
   input rather than a locality hint.
 
@@ -246,9 +249,9 @@ size, so this loop is not memory bound at any size that fits in RAM**:
 
 ### Vectorisation: asked, forced, and priced
 
-The previous version's note said the loop fails to vectorise because of the
-nine-way statistics reduction. **That attribution was wrong.** Three separate
-results say so:
+The obvious diagnosis is that the loop fails to vectorise because of the nine-way
+statistics reduction. **That attribution is wrong.** Three separate results say
+so:
 
 1. Asked directly — and note `-Rpass-missed`, without which clang says *nothing*
    about this loop and only remarks on the unpack loop at the bottom of the
@@ -281,42 +284,32 @@ though* the second pass re-reads data the first left in cache. The statistics
 ride along on vectors already in registers; separating them means recomputing the
 cross product and the three edge lengths from scratch.
 
-## 7. Redistribution: 4.7–5.2× against version 5 — 3.9–4.2× counting what it defers
+## 7. Redistribution: what a distributed timestep costs, and what it defers
 
-Measured with `examples/parallel_advection_redistribute_list.c`, which exists in
-both versions with the same options and the same physics, so this is a direct
-comparison of the same benchmark against the same problem. Four ranks on a 2×2×1
-grid of a fully periodic 8×4×4 box, spheres of radius 0.1 translating rigidly,
-Release + LTO. **Minimum of three runs** — see the trap at the end of this
-section, because the first number produced here was wrong by a factor of two.
+Measured with `examples/parallel_advection_redistribute_list.c`. Four ranks on a
+2×2×1 grid of a fully periodic 8×4×4 box, spheres of radius 0.1 translating
+rigidly, Release + LTO. **Minimum of three runs** — see the trap at the end of
+this section, because the first number produced here was wrong by a factor of
+two.
 
-| per step, 4 ranks | version 5 | version 6 | ratio |
-|---|---|---|---|
-| **256 bodies, 327 680 triangles, 100 steps** | | | |
-| redistribute | 12.60 ms | **2.71 ms** | 4.7× |
-| redistribute + the geometry it defers | 12.60 ms | **3.25 ms** | 3.9× |
-| ghost sync | 0.99 ms | **0.32 ms** | 3.1× |
-| wall clock (whole run) | 1.48 s | **0.42 s** | 3.5× |
-| **1000 bodies, 1 280 000 triangles, 60 steps** | | | |
-| redistribute | 55.68 ms | **10.67 ms** | 5.2× |
-| redistribute + the geometry it defers | 55.68 ms | **13.19 ms** | 4.2× |
-| ghost sync | 3.25 ms | **0.83 ms** | 3.9× |
-| wall clock (whole run) | 3.83 s | **1.03 s** | 3.7× |
-
-Every version-6 row is from the run **with** step 5 enabled, so both columns
-describe the same end-of-step state (see the next paragraph).
+| per step, 4 ranks | 256 bodies, 327 680 tris | 1000 bodies, 1 280 000 tris |
+|---|---|---|
+| redistribute | **2.71 ms** | **10.67 ms** |
+| redistribute + the geometry it defers | **3.25 ms** | **13.19 ms** |
+| ghost sync | **0.32 ms** | **0.83 ms** |
+| wall clock (whole run) | **0.42 s** (100 steps) | **1.03 s** (60 steps) |
 
 ### The second row is the one to quote, and it was missing at first
 
-Version 5's redistribution packed `area`, `normal` and `center` onto the wire, so
-a timestep ended with valid triangle geometry. Version 6 deliberately does not —
-that is what buys point 2 below — and hands back an object whose geometry is
-undefined. Comparing the `redistribute` rows alone therefore credits version 6
-with a saving it has not finished paying for.
+Redistribution deliberately does not put `area`, `normal` and `center` on the
+wire — that is what buys point 2 below — and hands back an object whose triangle
+geometry is undefined (`include/mftl_communication.h`). A timing of the
+`redistribute` row alone therefore credits it with a saving it has not finished
+paying for.
 
-`parallel_advection_redistribute_list` now runs that pass as step 5 and times it
-separately (0.54 ms and 2.52 ms per step in the two cases, 13–15 % of the
-timestep). The honest headline against version 5 is **3.9–4.2×**, not 4.7–5.2×.
+`parallel_advection_redistribute_list` runs that pass as step 5 and times it
+separately: **0.54 ms and 2.52 ms per step in the two cases, 13–15 % of the
+timestep**. The honest headline is the second row.
 
 Both readings are kept because both are real. A solver that consumes triangle
 geometry between the ghost sync and the redistribution — the natural place, since
@@ -325,22 +318,24 @@ genuinely owes nothing; the next timestep recomputes from the moved positions
 regardless. `--no-post-geom` measures that case, and it comes out at 2.62 ms
 against 2.71, i.e. the redistribution phase itself does not care either way.
 
-Three changes produce that, and they are worth separating because only one of
-them is about bytes on the wire.
+### Where the time is not spent, and why
 
-**1. Entities that stay never enter the wire format.** Version 5 treated "stays
-here" as just another destination: pack into an `MFTL_Packed*`, concatenate kept
-with received, radix-sort the whole merged stream by global id, de-duplicate,
-unpack, and insert one hash entry per vertex and four per triangle. On a steadily
-advecting mesh the kept set is ~99 % of the partition and the arriving set is a
-one-dimensional rim, so almost all of that work was a round trip that moved
-nothing. Version 6 marks the kept entities during the same destination analysis
-that decides what to send, and rebuilds them with a permutation: a gather into
-scratch and two `memcpy`s. This is the largest of the three.
+Three design decisions dominate this number, and only one of them is about bytes
+on the wire.
 
-**2. Only topology travels.** Dropping every recomputable quantity from the wire:
+**1. Entities that stay never enter the wire format — the largest of the three.**
+Treating "stays here" as just another destination means packing into an
+`MFTL_Packed*`, concatenating kept with received, radix-sorting the whole merged
+stream by global id, de-duplicating, unpacking, and inserting one hash entry per
+vertex and four per triangle. On a steadily advecting mesh the kept set is ~99 %
+of the partition and the arriving set is a one-dimensional rim, so almost all of
+that work is a round trip that moves nothing. Here the kept entities are marked
+during the same destination analysis that decides what to send, and rebuilt with
+a permutation: a gather into scratch and two `memcpy`s.
 
-| | version 5 | version 6 |
+**2. Only topology travels.** Every recomputable quantity is off the wire:
+
+| | with geometry on the wire | here |
 |---|---|---|
 | `MFTL_PackedVertex` | 96 B | **40 B** (2.4×) |
 | `MFTL_PackedTriangleComplex` | 120 B | **40 B** (3.0×) |
@@ -348,8 +343,8 @@ scratch and two `memcpy`s. This is the largest of the three.
 
 A vertex position is the only geometric quantity that is authoritative, so it
 travels; areas, normals, centres and curvatures are recomputed at the receiver.
-What that recompute actually costs is no longer an estimate — it is the second
-row of the table above: **6.4 ns per triangle at 256 bodies and 7.9 ns at 1000**,
+What that recompute actually costs is not an estimate — it is the second row of
+the table above: **6.4 ns per triangle at 256 bodies and 7.9 ns at 1000**,
 against the 2.9 ns §9 measures for the same function on a single hot mesh. The
 factor of ~2.5 is the difference between one large object in cache and a thousand
 small ones walked in sequence, and it is the honest number for this trade,
@@ -369,64 +364,60 @@ touch them anyway. `MFTLRebuildTwins` does not run during a redistribution at
 all. `test_twin_repair_matches_full_rebuild` re-runs it afterwards and asserts
 that it changes nothing.
 
-### What did NOT get faster, and why
+### What did NOT get fast, and why
 
 Ghost synchronisation improves by roughly its 2.5× payload reduction and no more,
 because at these sizes it is not bandwidth-bound: it is three neighbourhood
-collectives and the volume is well under a megabyte per step. Version 5 answered
-a request with a hash lookup into a map that redistribution maintained for it;
-version 6 has no map to inherit, so the owner scatters its owned vertices into a
-dense id table on demand, once per object that actually received a request. That
-trades a per-timestep `O(owned)` scatter for never maintaining a map — a good
-trade here, and it would stop being one if the ghost sync ran many times per
-redistribution. See the deferred issue in `CLAUDE.md`: the schedule could be
-cached at the end of a redistribution, which would remove the lookup entirely.
+collectives and the volume is well under a megabyte per step. Nothing maintains a
+global-id → slot map for it to inherit, so the owner scatters its owned vertices
+into a dense id table on demand, once per object that actually received a
+request. That trades a per-timestep `O(owned)` scatter for never
+maintaining a map — a good trade here, and it would stop being one if the ghost
+sync ran many times per redistribution. See the deferred issue in `CLAUDE.md`:
+the schedule could be cached at the end of a redistribution, which would remove
+the lookup entirely.
 
 ### These absolute numbers are not the ones this section first carried
 
-An earlier revision reported 30.79 ms against 6.06 ms for the 256-body case —
-2.3× slower on both sides than the table above, measured on the same machine with
-the same binaries. The whole machine was in a different state (thermal, or
-background load; it was not established which). **Both versions moved together,
-so the ratio survived**: 5.1× then, 4.7× now, on numbers that individually halved.
+An earlier revision reported 6.06 ms for the 256-body case, 2.3× faster than the
+table above, measured on the same machine with the same binary. The whole machine
+was in a different state (thermal, or background load; it was not established
+which).
 
-That is the argument for the back-to-back protocol rather than a caveat about it.
-Any single-version measurement taken on a different day than its baseline would
-have been wrong by a factor of two here, in whichever direction the day happened
-to fall.
+That is the argument for a back-to-back A/B protocol rather than a caveat about
+it. **Any measurement taken on a different day than the thing it is compared
+against would have been wrong by a factor of two here**, in whichever direction
+the day happened to fall — which is why every comparison in this document
+interleaves its variants and reports minima, and why none of them are quoted from
+runs taken in blocks.
 
 ### The measurement trap in this section
 
-The **first** version-5 run measured 64.6 ms/step, and three repeats of the same
-command measured 30.8 ms. Reporting the first would have claimed 9.7× instead of
-5.1×. Version 5 allocates and frees tens of megabytes per redistribution, so its
-first run pays first-touch page faults that the later ones do not — which is
-exactly the shape of an "improvement" that evaporates under repetition. Both
-versions are quoted as the minimum of three consecutive runs on a quiescent
-machine, ALTERNATING between the versions rather than in blocks, and version 5's
-spread is much wider than version 6's (55.7–63.0 ms against 10.7–11.1 ms on the
-1000-body case), which is itself a consequence of the allocation churn.
+A benchmark run immediately after `run_local_tests.py` measured **9.4 ms/step
+against 6.1 ms on an idle machine** — 50 % of thermal state and background load,
+on the identical binary and the identical mesh. Nothing was re-measured until the
+machine was quiescent and every variant could be run consecutively.
 
-The same trap in the other direction: a benchmark run immediately after
-`run_local_tests.py` measured version 6 at 9.4 ms/step against 6.1 ms on an idle
-machine — 50 % of thermal state and background load. Neither version was
-re-measured until both could be run back to back.
+The related trap is first touch. A redistribution allocates and frees its
+per-destination send buffers on every call (deferred issue 6 in `CLAUDE.md`), so
+the *first* run of a benchmark pays page faults the later ones do not — which is
+exactly the shape of an "improvement" that evaporates under repetition. Every
+figure here is the minimum of three consecutive runs.
 
-## 8. I/O: 28–38× against version 5 — and MPI-IO is not the reason
+## 8. I/O: 23–32× from dropping ASCII — and MPI-IO is not the reason
 
-Source: a pair of standalone harnesses that generate the same mesh under each
-library version and time `MFTLWriteVtu` alone. 256 spheres at refinement 3 in a
-periodic box, 327 680 owned triangles, `include_ghosts` on so that both versions
-write the same entities. Best of five, barriers around each write.
+Source: a standalone harness that generates the mesh and times `MFTLWriteVtu`
+alone. 256 spheres at refinement 3 in a periodic box, 327 680 owned triangles.
+Best of five, barriers around each write.
 
-| ranks | v5 ascii, N files | **v6 ascii, N files** | **v6 binary, N files** | **v6 binary, 1 file (MPI-IO)** |
-|---|---|---|---|---|
-| 1 | 150.5 ms | 125.6 ms | **3.96 ms** | 4.05 ms |
-| 2 | 88.8 ms | 69.7 ms | **2.68 ms** | 3.27 ms |
-| 4 | 52.4 ms | 41.6 ms | **1.84 ms** | 4.11 ms |
+| ranks | ascii, N files | **binary, N files** | binary, 1 file (MPI-IO) |
+|---|---|---|---|
+| 1 | 125.6 ms | **3.96 ms** | 4.05 ms |
+| 2 | 69.7 ms | **2.68 ms** | 3.27 ms |
+| 4 | 41.6 ms | **1.84 ms** | 4.11 ms |
 
-Piece file on rank 0, 4 ranks: 10.25 MB (v5) → 5.15 MB (v6 ascii) → 3.37 MB
-(v6 binary), and 3.30 MB with the owned-only default.
+Piece file on rank 0, 4 ranks: 5.15 MB (ascii) → 3.37 MB (binary), and 3.30 MB
+with the owned-only default.
 
 ### The win is the encoding, and almost nothing else
 
@@ -436,12 +427,12 @@ Three effects are separable in that table, and they are wildly different sizes.
    the order of a hundred nanoseconds and 17 bytes for a value that occupies 8;
    the binary assemble phase is a `memcpy`. The writer was never disk-bound —
    it was bound by `printf`.
-2. **Implementation, at the same encoding: 1.20–1.27×.** v6's ascii path is the
-   same format as v5's, so this is what block assembly plus buffered `fwrite`
-   buys over one `fprintf` per line, together with computing each triangle's
-   periodic-wrap decision once instead of four times. Modest, because both are
-   still dominated by decimal formatting. It is the honest ceiling on "optimise
-   the writer without changing the format".
+2. **Implementation, at the same encoding: 1.20–1.27×.** Measured against a
+   writer emitting the identical ASCII format one `fprintf` per line: this is
+   what block assembly plus buffered `fwrite` buys, together with computing each
+   triangle's periodic-wrap decision once instead of four times. Modest, because
+   both are still dominated by decimal formatting. It is the honest ceiling on
+   "optimise the writer without changing the format".
 3. **MPI-IO shared file: 1.0× at one rank, 0.82× at two, 0.45× at four.** It is
    *slower*, and it gets worse with rank count.
 
@@ -474,10 +465,10 @@ table above, which says only that a laptop is not a cluster.
 The analysis pass is a consequence of §2 rather than of anything I/O-specific.
 `tris.anchor` and `tris.edge` already hold corner 0 and the two seam-consistent
 edge vectors, so the unwrapped corners of a triangle straddling a periodic face
-are `p0`, `p0+e1`, `p0+e2` — already computed. Version 5 recovered them with two
-`MFTLGetMinimumImageVector` calls inside a helper it invoked four times per
-triangle per file. Here the whole pass streams `tris.verts`, `tris.anchor` and
-`tris.edge` — 84 contiguous bytes per triangle, no gather, no periodic
+are `p0`, `p0+e1`, `p0+e2` — already computed. Recovering them from scratch takes
+two `MFTLGetMinimumImageVector` calls inside a helper the writer needs four times
+per triangle per file. Here the whole pass streams `tris.verts`, `tris.anchor`
+and `tris.edge` — 84 contiguous bytes per triangle, no gather, no periodic
 arithmetic.
 
 ## 9. The fused update against the naive loop — 1.6× flat, 2.3× periodic
@@ -497,18 +488,18 @@ geometry *and* the nine quality statistics, B and C produce geometry only.
 Stable to ±5 % across three consecutive runs; A and D agree to 0.0 absolute on
 every area, normal and centroid and to 3e-16 relative on the nine statistics.
 
-### Two results here contradict what version 5 recorded
+### Two results here contradict the obvious expectation
 
-**The statistics are not nearly free.** Version 5's equivalent benchmark reported
-them costing about +5 % on the flat path against +190 % the naive way. Here they
-cost **+90 % on the fused path** (C → D: 1.64 → 3.11 ns) and +77 % the naive way
-(B → A). The conclusion reverses because the *baseline* changed, not the
-statistics: C is a pure streaming loop at 1.64 ns/triangle, and against something
-that fast, three subtractions, three dot products, a second divide and nine
-min/max reductions are simply a lot of arithmetic. In version 5 the geometry
-baseline was slow enough to hide them. §6's finding that this kernel sits on the
-divide/sqrt unit is the same observation from the other side — the quality ratio
-`q = 4√3·A/(a²+b²+c²)` adds a *second* divide to a loop already limited by one.
+**The statistics are not nearly free.** The estimate that follows from "they ride
+on vectors already in registers" is a few per cent. They cost **+90 % on the
+fused path** (C → D: 1.64 → 3.11 ns) and +77 % the naive way (B → A). What makes
+the estimate wrong is the *baseline*, not the statistics: C is a pure streaming
+loop at 1.64 ns/triangle, and against something that fast, three subtractions,
+three dot products, a second divide and nine min/max reductions are simply a lot
+of arithmetic. A geometry baseline slow enough to be gather-bound hides all of
+it. §6's finding that this kernel sits on the divide/sqrt unit is the same
+observation from the other side — the quality ratio `q = 4√3·A/(a²+b²+c²)` adds a
+*second* divide to a loop already limited by one.
 
 Fusing is still the right call, and that is unchanged: doing the same work in two
 passes (A − B = 2.20 ns) costs more than doing it fused (D − C = 1.47 ns), which

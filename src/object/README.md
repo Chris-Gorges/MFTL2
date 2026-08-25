@@ -19,10 +19,10 @@ A mesh entity class needs an AoS record array *and* a family of SoA geometry
 arrays, and they describe the same entities, so they must always have the same
 capacity.
 
-MFTL 5 expressed that as a **rule**: three capacity fields (`capacity_*`,
-`geom_cap_*`, `flat_cap_*`) and a comment saying every growth site must update
-all three. A growth site that forgot one produced a heap overflow — not a wrong
-number, a corruption somewhere else entirely.
+Expressed as a **rule** — three capacity fields (`capacity_*`, `geom_cap_*`,
+`flat_cap_*`) and a comment saying every growth site must update all three — that
+requirement fails at the first site that updates two of them, and it fails as a
+heap overflow: not a wrong number, a corruption somewhere else entirely.
 
 Here the rule is replaced by a **structure**. `vertex_layout_compute` and
 `triangle_layout_compute` walk one cursor through every field:
@@ -131,9 +131,9 @@ build time, and never again downstream. That is what lets
 
 ### What was deleted, and why it stays deleted
 
-MFTL 5 carried ten flattened arrays. The vertex→triangle **CSR** is the one worth
-naming: `derived.c` originally asked for it to be reconsidered when a consumer
-appeared. Vertex normals are that consumer, and §5 of
+Four derived arrays are kept, and the ones that are not are listed in
+`derived.c` with the reason. The vertex→triangle **CSR** is the one worth naming:
+`derived.c` asked for it to be reconsidered when a consumer appeared. Vertex normals are that consumer, and §5 of
 `docs/performance-analysis.md` measures a CSR gather as a **dead heat** with the
 triangle scatter while costing 16 B/triangle of permanent state and a rebuild per
 topology change. It stays deleted.
@@ -173,10 +173,10 @@ bit spread — $O(\log b)$ instead of the 21 iterations a bit-by-bit loop takes.
 
 ### This is where `sfc_perm` went
 
-MFTL 5 stored a permutation *and* a second, SFC-ordered copy of every position.
-That forced a second index space, a sync function, a staleness flag and an
-"unwrapped or not" mode flag onto every consumer — and its own notes record it as
-having caused a live silent-corruption bug.
+The alternative is to store the permutation *and* a second, SFC-ordered copy of
+every position. That forces a second index space, a sync function, a staleness
+flag and an "unwrapped or not" mode flag onto every consumer, and every one of
+those four is silent when it is wrong.
 
 Here the permutation is **applied to the pools**. Both the AoS records and every
 SoA array move together and all indices are remapped, so afterwards there is

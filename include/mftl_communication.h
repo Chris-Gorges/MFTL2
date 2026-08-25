@@ -25,17 +25,17 @@
  * is a streaming pass over contiguous arrays (docs/performance-analysis.md) while
  * shipping it is bytes on a wire, per entity, per timestep:
  *
- *                              previous version   here
- *   MFTL_PackedVertex               96 B          40 B    (pos + 4 ints)
- *   MFTL_PackedTriangleComplex     120 B          40 B    (10 ints)
+ *                            geometry on the wire   here
+ *   MFTL_PackedVertex                 96 B            40 B    (pos + 4 ints)
+ *   MFTL_PackedTriangleComplex       120 B            40 B    (10 ints)
  *
  * A vertex POSITION is the one geometric quantity that is authoritative
  * (mftl_types.h, invariant 3) -- nothing can recompute it -- so it travels. The
  * vertex normal, area and curvatures, and the triangle area/normal/centre, are
  * all functions of the positions and of the topology, so they do not.
  *
- * Three fields the previous version transmitted are not sent because implicit
- * indexing already determines them:
+ * Three fields a general half-edge wire format would carry are not sent, because
+ * implicit indexing already determines them:
  *
  *   - a half-edge's GLOBAL ID. Half-edge 3t+k of triangle t carries
  *     `3 * triangle_gid + k`, mesh-wide, established by
@@ -82,19 +82,20 @@
  * step 3 of the next iteration recomputes it from the moved positions anyway.
  * A solver that reads `tris.area` or `tris.normal` AFTER the redistribution --
  * rather than between steps 3 and 4, where the values describe the configuration
- * the forces belong to -- owes one more pass, which the previous version did not
- * (it packed the geometry onto the wire). That pass is 13-15 % of a timestep;
+ * the forces belong to -- owes one more pass, which is the price of not packing
+ * the geometry onto the wire. That pass is 13-15 % of a timestep;
  * examples/parallel_advection_redistribute_list.c runs it as step 5 and times it
  * separately, and docs/performance-analysis.md §7 quotes the comparison both
  * ways because both are honest answers to different questions.
  *
  * ## ENTITIES THAT STAY NEVER LEAVE THE POOL
  *
- * The previous version routed EVERY entity through the wire format, including the
- * ~90 % of a partition that stays put: pack into an MFTL_Packed*, radix-sort the
- * merged (kept + received) stream by global id, de-duplicate, unpack, and insert
- * four hash-map entries per triangle. That round trip was the single most
- * expensive part of a redistribution and none of it moved any data anywhere.
+ * Treating "stays here" as just another destination routes EVERY entity through
+ * the wire format, including the ~90 % of a partition that does not move: pack
+ * into an MFTL_Packed*, radix-sort the merged (kept + received) stream by global
+ * id, de-duplicate, unpack, and insert four hash-map entries per triangle. That
+ * round trip is the single most expensive part of a redistribution and none of it
+ * moves any data anywhere.
  *
  * Here the kept entities are identified during the same destination analysis that
  * decides what to send (this rank is simply one more destination), and are then
@@ -116,7 +117,7 @@
  *   - `tris.center` is current for ALL triangles, ghosts included (see above).
  *   - Every rank holds the SAME object list in the SAME order. Bodies are
  *     identified on the wire by their INDEX in that list, which is what removes
- *     the previous version's body-id hash map. A Debug-only checksum reduction
+ *     the need for a body-id hash map. A Debug-only checksum reduction
  *     inside the redistribution reports a violation instead of corrupting.
  */
 
@@ -187,11 +188,11 @@ typedef struct
  * MFTLUpdateGhostPositions and MFTLUpdateGhostVertexNormals -- and they differ
  * only in which array they read from and write into.
  *
- * ONE vector per message, never a bundle. The previous version shipped position,
- * normal, both curvatures and the area together: 80 B against 32 B, of which
- * everything but the position is a function of the positions and the topology,
- * so four fifths of it was recomputable at the receiver for less than it cost to
- * send. Anything that genuinely does need a second field sends a second exchange
+ * ONE vector per message, never a bundle. Shipping position, normal, both
+ * curvatures and the area together costs 80 B against 32 B, of which everything
+ * but the position is a function of the positions and the topology, so four
+ * fifths of it is recomputable at the receiver for less than it costs to send.
+ * Anything that genuinely does need a second field sends a second exchange
  * and pays only for that field.
  */
 typedef struct
@@ -479,8 +480,8 @@ int MFTLRedistributeWithOwners(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps);
  * when ownership can actually have changed.
  *
  * Requests carry the OBJECT INDEX rather than the object's global id, which is
- * what lets the reply phase be an array index instead of the previous version's
- * hash lookup. It therefore requires the same "same object list, same order on
+ * what lets the reply phase be an array index instead of a hash lookup. It
+ * therefore requires the same "same object list, same order on
  * every rank" precondition as redistribution.
  *
  * @param ens The ensemble. All ranks must call collectively.

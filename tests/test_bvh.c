@@ -277,10 +277,9 @@ static int test_tri_tri_intersect_basic_cases(void)
   const double copl_hit[3][3] = {{0.2, 0.2, 0.0}, {0.8, 0.2, 0.0}, {0.2, 0.8, 0.0}};
   TEST_ASSERT_EQUAL_INT(1, MFTL_TriTriIntersect(flat, copl_hit));
 
-  /* Coplanar and disjoint. The previous version returned 1 here
-   * UNCONDITIONALLY -- its coplanar branch was a comment saying a real test
-   * should go there -- so two triangles in the same plane a metre apart reported
-   * contact. */
+  /* Coplanar and disjoint. A coplanar branch that returns 1 UNCONDITIONALLY --
+   * the shape it takes when the real test is left as a comment -- reports contact
+   * for two triangles in the same plane a metre apart. */
   const double copl_miss[3][3] = {{5.0, 5.0, 0.0}, {6.0, 5.0, 0.0}, {5.0, 6.0, 0.0}};
   TEST_ASSERT_EQUAL_INT(0, MFTL_TriTriIntersect(flat, copl_miss));
 
@@ -310,11 +309,11 @@ static int test_tri_tri_distance_is_exact(void)
 /**
  * @brief The point-face branch must work at millimetre scale.
  *
- * The previous version guarded it with `det < 1e-12` on a Gram determinant,
- * which has units of length^4. At an edge length of 1e-5 m that determinant is
- * around 1e-20, so the guard fired on every triangle in a droplet mesh and the
- * branch returned "no contribution" -- silently dropping exactly the
- * vertex-above-face configuration a resolved contact is made of.
+ * Guarding it with `det < 1e-12` on a Gram determinant, which has units of
+ * length^4, fires on every triangle in a droplet mesh: at an edge length of
+ * 1e-5 m that determinant is around 1e-20, so the branch returns "no
+ * contribution" -- silently dropping exactly the vertex-above-face configuration
+ * a resolved contact is made of.
  */
 static int test_point_face_distance_works_at_millimetre_scale(void)
 {
@@ -594,8 +593,8 @@ static int test_separated_bodies_report_nothing(void)
 /**
  * @brief An object straddling a periodic face must not get a domain-wide AABB.
  *
- * This is the TODO. The previous version built each Morton centroid from the raw
- * stored vertex coordinates, and those are WRAPPED: a triangle with one vertex
+ * Building each Morton centroid from the raw stored vertex coordinates is the
+ * trap, because those are WRAPPED: a triangle with one vertex
  * at x = 9.99 and two at x = 0.01 in a [0, 10] box gets a centroid at x = 3.3 --
  * the middle of the domain, where the triangle is not. Its Morton code sorts it
  * into a cell it is nowhere near, and its AABB spans the whole box and overlaps
@@ -642,13 +641,13 @@ static int test_periodic_morton_of_a_straddling_object(void)
   TEST_ASSERT(ref_widest > 0.0 && ref_widest < 0.5 * R);
 
   /* THE ASSERTION. Every primitive of the straddling sphere must be as small as
-   * the ones of the interior sphere. Under the previous version's arithmetic the
+   * the ones of the interior sphere. Built from the RAW WRAPPED coordinates, the
    * triangles sitting on the seam have one vertex at x ~ 9.99 and two at
-   * x ~ 0.01 taken from the RAW WRAPPED coordinates, so their AABB is about L
-   * wide and their centroid lands at x ~ 3.3 -- in the middle of the domain,
-   * where the triangle is not. That is the corrupted spatial ordering the TODO
-   * was about: the code sorts the triangle into a cell it is nowhere near, and
-   * its box then overlaps everything in the mesh.
+   * x ~ 0.01, so their AABB is about L wide and their centroid lands at x ~ 3.3
+   * -- in the middle of the domain, where the triangle is not. That is the
+   * corrupted spatial ordering this test exists to catch: the code sorts the
+   * triangle into a cell it is nowhere near, and its box then overlaps everything
+   * in the mesh.
    *
    * A factor of two over the control absorbs the mesh's own size variation while
    * still being a hundred times smaller than the failure it is watching for. */

@@ -6,21 +6,20 @@
  *
  * @brief Periodic-aware geometric queries over the SoA geometry arrays.
  *
- * Two things changed against the previous version, both consequences of the
- * layout in mftl_types.h:
+ * Two properties of this module follow from the layout in mftl_types.h rather
+ * than from anything geometric:
  *
  *   1. POSITIONS ARE REACHED BY INDEX, NOT THROUGH A RECORD. `MFTLVertexPos(obj,
  *      v)` returns a pointer into `verts.pos`, three contiguous doubles. There is
  *      no `MFTL_Vertex.pos` any more, and therefore no second copy of any
  *      coordinate anywhere in the library.
  *
- *   2. THE Load/Store HELPERS ARE GONE. The previous version needed
- *      MFTLLoadTriNormal / MFTLStoreTriNormal because the arrays were a bolted-on
- *      side channel that call sites were not supposed to know about. They are the
- *      primary storage now, so `obj->tris.normal[3*t+k]` is the normal way to
- *      write it and a helper that copies three doubles onto the stack only gets
- *      in the way -- the previous version measured routing the geometry kernel
- *      through the store helper at 25 % slower.
+ *   2. THERE ARE NO Load/Store HELPERS. MFTLLoadTriNormal / MFTLStoreTriNormal
+ *      are what a geometry array needs when it is a bolted-on side channel that
+ *      call sites are not supposed to know about. It is the primary storage here,
+ *      so `obj->tris.normal[3*t+k]` is the normal way to write it and a helper
+ *      that copies three doubles onto the stack only gets in the way -- routing
+ *      the geometry kernel through a store helper measures 25 % slower.
  *
  * Everything here is inline and, apart from the two Compute* passes, side-effect
  * free. All distance and vector computations honour the domain's periodicity via
@@ -111,9 +110,9 @@ static inline void MFTLGetMinimumImageVector(const MFTL_Domain *domain, double v
  *
  * Assumes the displacement since the last wrap is smaller than the domain, which
  * holds for any stable simulation. Comparisons rather than fmod(): the branches
- * are perfectly predicted, and the previous version measured the "branchless"
- * alternative 1.34-1.37x SLOWER in the per-timestep kernel because it does
- * unconditional work on non-periodic axes too.
+ * are perfectly predicted, and the "branchless" alternative measures 1.34-1.37x
+ * SLOWER in the per-timestep kernel because it does unconditional work on
+ * non-periodic axes too.
  *
  * @param domain Supplies the per-axis periodicity and bounds.
  * @param pos    Position, wrapped in place. Non-periodic axes are untouched.
@@ -148,14 +147,14 @@ static inline void MFTLApplyPeriodicity(const MFTL_Domain *domain, double pos[3]
  * ── Why there is no cut-plane offset here ─────────────────────────────────
  *
  * The distributed remesher moves the cut planes (src/remeshing/remesh_comm.c),
- * and an earlier version of it expressed that by subtracting a per-axis shift
- * from `pos` right here. That put a subtract and a periodicity branch per axis
- * into the production ownership loop to serve a routine that runs a few times
- * per hundred timesteps. The shifted rule now lives with the remesher as
- * `remesh_owner_proc()`, and reaches redistribution through the owner-map
- * override (MFTL_OwnerMap, mftl_communication.h) rather than through this
- * function -- which is also what the DISPERSED strategy needs, and it needs a
- * rule that is not a plane test at all.
+ * and the tempting way to express that is to subtract a per-axis shift from `pos`
+ * right here. That puts a subtract and a periodicity branch per axis into the
+ * production ownership loop to serve a routine that runs a few times per hundred
+ * timesteps -- measured at 1.70x on this function alone. The shifted rule lives
+ * with the remesher as MFTLRemeshOwnerProc() instead, and reaches redistribution
+ * through the owner-map override (MFTL_OwnerMap, mftl_communication.h) rather
+ * than through this function -- which is also what the DISPERSED strategy needs,
+ * and it needs a rule that is not a plane test at all.
  *
  * @param domain The MPI/physical world.
  * @param pos    A position, ALREADY WRAPPED into the domain box.
@@ -228,10 +227,11 @@ static inline double MFTLGetEdgeLength(const MFTL_Object *obj, int h) { return M
  *
  * A loop over many triangles should prefer MFTL_FOREACH_TRIANGLE_* (mftl_object.h),
  * which streams the precomputed frames and needs no minimum-image work at all.
- * The margin is smaller than the previous version's 3x: this function no longer
- * chases pointers, no longer strides 96-byte records and reads positions from
- * one contiguous array, so the BASELINE itself got fast rather than the frames
- * getting slow. Use whichever is clearer unless the loop is hot.
+ * The margin is 1.25-1.57x on a walled domain and 1.94-2.00x on a periodic one,
+ * rather than the 3x a pointer-chasing baseline would show: this function chases
+ * no pointers, strides 12-byte records and reads positions from one contiguous
+ * array, so the BASELINE is itself fast. Use whichever is clearer unless the loop
+ * is hot.
  *
  * @param      obj        The mesh.
  * @param      t          Triangle index.

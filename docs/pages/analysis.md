@@ -1,7 +1,7 @@
 Measurements {#mftl_page_analysis}
 ============
 
-Three analysis documents, each answering a question the code comments can only
+Four analysis documents, each answering a question the code comments can only
 assert. Every number in them was produced by a program in `examples/` in a
 Release build, and every one is reproducible by re-running it.
 
@@ -10,6 +10,7 @@ Release build, and every one is reproducible by re-running it.
 | @subpage mftl_page_perf | What does a timestep cost, where does the time go, and which design decisions did **not** pay off? |
 | @subpage mftl_page_remesh_quality | Why did the LeVeque remeshing test end with a bad mesh? |
 | @subpage mftl_page_parallel_remesh | Does the distributed remesher track the serial one, is it reproducible to the bit, and what does a phase cost? |
+| @subpage mftl_page_scaling | What happens to the cost of a timestep as the rank count grows -- and why is "many small bodies vs. few large ones" neither strong nor weak scaling? |
 
 ---
 
@@ -36,6 +37,9 @@ python3 build_all.py            # Release; the benchmarks are meaningless otherw
 ./build/ensemble_update_benchmark
 mpirun -n 4 ./build/parallel_advection_redistribute_list
 mpirun -n 4 ./build/leveque_remeshing_parallel
+
+# and the scaling sweep, which runs the benchmark at several rank counts itself
+python3 run_scaling.py --preset laptop --all
 ```
 
 ---
@@ -54,6 +58,7 @@ mpirun -n 4 ./build/leveque_remeshing_parallel
 | `leveque_remeshing_parallel.c` | over 150 remeshed timesteps, does the distributed answer track the serial one, is it reproducible to the bit, and what does a phase cost |
 | `remesh_phase_profile.c` | where the time goes inside one distributed remeshing phase |
 | `remesh_regime_sweep.c` | where the spanning/dispersed crossover actually lies |
+| `parallel_advection_scaling.c` | strong, weak and granularity scaling of the timestep; swept over rank counts by `run_scaling.py` |
 
 ---
 
@@ -61,11 +66,12 @@ mpirun -n 4 ./build/leveque_remeshing_parallel
 
 These are the reason to read the documents rather than the code comments.
 
-1. **The frame kernel is worth 1.25–1.57× non-periodic and 1.94–2.00× periodic**,
-   not the 3× the previous version measured — because the general path got fast,
-   not because the frames got slow. The figure the project carried before
-   (1.03–1.24×) was **two thirds harness**: the benchmark timed the variants in
-   blocks and averaged within each. Interleaving and taking minima moved it.
+1. **The frame kernel is worth 1.25–1.57× non-periodic and 1.94–2.00× periodic**
+   — a margin that is the gather on a walled domain and the gather *plus* the
+   minimum-image correction on a periodic one. The figure the project carried
+   before (1.03–1.24×) was **two thirds harness**: the benchmark timed the
+   variants in blocks and averaged within each. Interleaving and taking minima
+   moved it.
 2. **Morton renumbering buys no measurable time on Apple silicon**, despite
    cutting mean edge index distance 160×.
 3. **Splitting `verts.pos` into three component arrays is faster for gathers and
@@ -73,13 +79,14 @@ These are the reason to read the documents rather than the code comments.
    the API instead. The mechanism is address generation (a 24-byte stride needs a
    multiply; an 8-byte stride does not), not cache lines.
 4. **The update kernel does not fail to vectorise because of the nine-way
-   reduction.** The previous version's note said so and was wrong: splitting the
+   reduction** — the obvious diagnosis, and the wrong one. Splitting the
    reduction makes it slightly *worse*, and clang refuses the transformation even
    when a pragma forces it. 26 % of the pass is one `sqrt` plus one divide, which
    is irreducible.
-5. **The quality statistics are not nearly free.** +5 % in the previous version,
-   **+90 %** here (1.64 → 3.11 ns/triangle) — the statistics did not get slower,
-   the streaming baseline got fast.
+5. **The quality statistics are not nearly free** — **+90 %** on top of the
+   geometry (1.64 → 3.11 ns/triangle), because \f$q = 4\sqrt{3}A/(a^2+b^2+c^2)\f$
+   adds a *second* divide to a loop already limited by one. Fusing is still
+   right; a free upgrade it is not.
 6. **MPI-IO did not make output faster; dropping ASCII did.** The 23–32× came
    entirely from raw binary replacing `printf`.
 7. **The LeVeque test's poor final mesh was caused by feature detection on a

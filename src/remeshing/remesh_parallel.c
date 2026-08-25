@@ -758,6 +758,97 @@ static void local_band_probe(const MFTL_Object *obj, const MFTL_Domain *dom, con
 }
 
 /**
+ * @brief Accumulates this rank's owned and frozen-owned triangle counts.
+ *
+ * ── Why TRIANGLES and not vertices ─────────────────────────────────────────
+ *
+ * Because the quantity being estimated is the share of a MIGRATION that buys
+ * nothing, and the migration's payload is dominated by triangles: a closed mesh
+ * has twice as many of them as vertices, and each carries three half-edges. A
+ * vertex-based share would be measuring a different, smaller thing and comparing
+ * it against a threshold calibrated on this one.
+ *
+ * ── Why it is a running sum and not a fraction ─────────────────────────────
+ *
+ * The ratio has to be taken AFTER the reduction. Averaging per-rank fractions
+ * weights a rank holding four triangles the same as one holding forty thousand,
+ * and at the partition boundary those are the ranks that differ most -- which is
+ * precisely the population the measurement is about.
+ *
+ * LOCAL, no MPI. The caller reduces both with one MFTLRemeshAgreeDouble (SUM).
+ *
+ * @param      obj The mesh, with #MFTL_FLAG_FROZEN already current.
+ * @param[out] out {owned triangles, frozen owned triangles}, accumulated into.
+ */
+static void local_frozen_count(const MFTL_Object *obj, double out[2])
+{
+  const int nt = obj->tris.n_local;
+  int frozen = 0;
+
+  for (int t = 0; t < nt; ++t)
+  {
+    if (MFTLTriangleIsFrozen(obj, t)) frozen++;
+  }
+
+  out[0] += (double) nt;
+  out[1] += (double) frozen;
+}
+
+/**
+ * @brief The band that would hold the frozen share at or under @p f_target.
+ *
+ * ── One formula, two constants ─────────────────────────────────────────────
+ *
+ * The correctness rule is `g[k] = ceil(4*delta / h_k)` and the efficiency rule
+ * is `g[k] = ceil(2*delta / ((1-u) * h_k))`, so they differ only by a constant
+ * and the second can be expressed as the first applied to an INFLATED BAND.
+ * That is why this returns a band rather than a factor: it lets both triggers go
+ * through the one published MFTLRemeshCoarseningFactors, which is tested, clamps
+ * to `cuts[k]`, and skips uncut axes -- three behaviours a second implementation
+ * would have to reproduce and would eventually stop reproducing.
+ *
+ * ── Where u comes from ─────────────────────────────────────────────────────
+ *
+ * A box loses `2*delta` per cut axis, so the unfrozen share is the product over
+ * cut axes of `(1 - 2*delta/h_k)`. Requiring each axis to contribute at least
+ * `u = (1 - f_target)^(1/n_cut)` makes the product at least `1 - f_target`, and
+ * is the only split of the requirement across axes that does not privilege one.
+ * Solving `1 - 2*delta/(g*h) >= u` for g gives the rule above.
+ *
+ * Check it against the degenerate case: with ONE cut axis, `u = 1 - f_target`,
+ * so the band inflates by `1/(2*f_target)` and at a third that is `h >= 6*delta`
+ * -- which is `f = 2*delta/h <= 1/3` read straight off, with no model in between.
+ *
+ * @param dom      The MPI/physical world; supplies which axes are cut.
+ * @param delta    The measured band half-width.
+ * @param f_target The frozen share the caller is willing to accept, in (0, 1).
+ * @return The band to hand MFTLRemeshCoarseningFactors, or @p delta unchanged
+ *         when the target is not a constraint.
+ * @rank_local Pure arithmetic on replicated data.
+ */
+static double band_for_frozen_target(const MFTL_Domain *dom, double delta, double f_target)
+{
+  if (!(f_target > 0.0) || f_target >= 1.0 || !(delta > 0.0)) return delta;
+
+  int n_cut = 0;
+  for (int k = 0; k < 3; ++k)
+  {
+    if (dom->cuts[k] >= 2 && dom->domain_size[k] > 0.0) n_cut++;
+  }
+  if (n_cut == 0) return delta;
+
+  const double u = pow(1.0 - f_target, 1.0 / (double) n_cut);
+
+  /* u == 1 is unreachable for f_target in (0,1), but the division is guarded
+   * anyway: the alternative to a guard here is an infinity propagating into a
+   * ceil() and out as a coarsening factor of INT_MIN. */
+  if (!(u < 1.0)) return delta;
+
+  const double inflated = delta / (2.0 * (1.0 - u));
+  return MFTL_MAX(delta, inflated);
+}
+
+/**
  * @brief The geometric half-width of the frozen band, in domain length units.
  *
  * The band is "one triangle plus one adjacency hop" either side of a cut plane:
@@ -893,6 +984,103 @@ static void check_band_fits(const MFTL_Domain *dom, const MFTL_RemeshParameters 
           "%dx%dx%d = %d ranks per group here; or remesh to a longer target length. Reported once.\n",
           h_min, 4.0 * band_measured, band_measured, MFTL_REMESH_BAND_EDGES + (double) MFTL_MAX(params->freeze_dilation_rings, 0), band_bound,
           group[0], group[1], group[2], group[0] * group[1] * group[2]);
+}
+
+/**
+ * @brief Reports, ONCE per process, that the fallback merged rank boxes.
+ *
+ * ── Why this is announced at all ───────────────────────────────────────────
+ *
+ * Because arming the fallback by default converts one silent failure into
+ * another. Before, a too-fine partition quietly produced un-remeshed bands.
+ * Armed, it quietly produces a run in which `1/(g0*g1*g2)` of the ranks do all
+ * of the sweeping and the timestep grows by the same factor -- correct, and
+ * mystifying if the first you hear of it is a profile. `n_coarse_groups` and
+ * `coarsen_trigger` carry the same information for a caller that reads the
+ * stats; this is for the one that does not.
+ *
+ * The one-shot latch is the same discipline as check_band_fits, for the same
+ * reason: a solver remeshes thousands of times, and the reliable effect of
+ * thousands of identical lines is that nobody reads any of them.
+ *
+ * @param dom   The MPI/physical world.
+ * @param st    Supplies the trigger bitmask and the measured frozen share.
+ * @param group The per-axis factors actually adopted.
+ */
+static void report_fallback(const MFTL_Domain *dom, const MFTL_RemeshStats *st, const int group[3])
+{
+  static bool announced = MFTL_FALSE;
+
+  if (announced || dom->rank != 0) return;
+  announced = MFTL_TRUE;
+
+  const int ranks_per_group = group[0] * group[1] * group[2];
+
+  if (st->coarsen_trigger & MFTL_REMESH_COARSEN_GATHER)
+  {
+    fprintf(stderr,
+            "[MFTL] parallel remeshing: the ensemble fits under serial_gather_max_triangles, so the whole of it "
+            "is being remeshed on ONE rank (%d ranks per group, one placement, two migrations). This is a "
+            "deliberate trade -- the phase driver does about 3.9x the remeshing work and produces a measurably "
+            "better mesh on an adequately resolved surface. Reported once.\n",
+            ranks_per_group);
+    return;
+  }
+
+  /* BAND and FROZEN are reported differently on purpose. One is the price of a
+   * correct answer and the other is a trade with two cheaper alternatives the
+   * library cannot take on its own, and a message that treated them alike would
+   * be wrong for whichever one it was not written for. */
+  if (st->coarsen_trigger & MFTL_REMESH_COARSEN_BAND)
+  {
+    fprintf(stderr,
+            "[MFTL] parallel remeshing: the rank boxes are narrower than four frozen bands, so the coarsening "
+            "fallback merged %dx%dx%d = %d ranks per group. Without it this pass would have left a lattice of "
+            "bands that no placement ever offers to any rank. The cost is that 1/%d of the ranks do all the "
+            "sweep work; remeshing to a longer target length, or the DISPERSED strategy if the bodies fit in a "
+            "rank box, avoids it. Reported once.\n",
+            group[0], group[1], group[2], ranks_per_group, ranks_per_group);
+    return;
+  }
+
+  fprintf(stderr,
+          "[MFTL] parallel remeshing: %.0f %% of the mesh was frozen at the start of the pass, above "
+          "coarsen_frozen_fraction, so the fallback merged %dx%dx%d = %d ranks per group. THIS ONE IS OPTIONAL: "
+          "the pass would have converged without it, just spending that share of every migration on entities it "
+          "could not touch. It costs 1/%d of the parallelism to buy it back. Set coarsen_frozen_fraction to 1.0 "
+          "to disable this trigger and keep the correctness one. Reported once.\n",
+          100.0 * st->frozen_fraction, group[0], group[1], group[2], ranks_per_group, ranks_per_group);
+}
+
+/**
+ * @brief Reports, ONCE per process, that `parallel_coarsen`'s cap bound below
+ *        what the band precondition required.
+ *
+ * The failure this makes visible has no other symptom at all. A caller who set
+ * `parallel_coarsen = 4` to bound the parallelism loss, on a partition that
+ * needed 8, gets a pass that coarsens, costs the parallelism, AND still leaves
+ * permanently frozen bands -- the worst of both, reported by `converged` coming
+ * back false exactly as it would have with the fallback disarmed.
+ *
+ * @param dom      The MPI/physical world.
+ * @param params   Supplies the cap that bound.
+ * @param required The factors the band precondition asked for.
+ * @param adopted  The factors the cap allowed.
+ */
+static void report_cap_bound(const MFTL_Domain *dom, const MFTL_RemeshParameters *params, const int required[3], const int adopted[3])
+{
+  static bool announced = MFTL_FALSE;
+
+  if (announced || dom->rank != 0) return;
+  announced = MFTL_TRUE;
+
+  fprintf(stderr,
+          "[MFTL] parallel remeshing: parallel_coarsen = %d capped the fallback at %dx%dx%d = %d ranks per group, "
+          "but the measured band needs %dx%dx%d = %d. The pass is paying for coarsening AND keeping permanently "
+          "frozen bands; MFTL_RemeshStats.converged and n_edges_hidden_long will report the second half. Raise the "
+          "cap, or set parallel_coarsen = 1 to let it choose. Reported once.\n",
+          params->parallel_coarsen, adopted[0], adopted[1], adopted[2], adopted[0] * adopted[1] * adopted[2], required[0], required[1], required[2],
+          required[0] * required[1] * required[2]);
 }
 
 #ifndef NDEBUG
@@ -1046,19 +1234,30 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
    * edges -- the group is then slightly under-conservative. That is not silent:
    * it is exactly what `n_edges_hidden_long` and `converged` report. */
   int group[3] = {1, 1, 1};
-  if (params->parallel_coarsen != 0 && dom->nproc > 1)
+  if ((params->parallel_coarsen != 0 || params->serial_gather_max_triangles > 0) && dom->nproc > 1)
   {
     prepare_for_migration(ens);
 
     double probe[2] = {0.0, 0.0};
+    double counts[2] = {0.0, 0.0};
     const double no_shift[3] = {0.0, 0.0, 0.0};
     for (int o = 0; o < ens->num_objects; ++o)
     {
       MFTLRemeshMarkFrozen(ens->objects[o]);
       MFTLDilateFrozenBand(ens->objects[o], params->freeze_dilation_rings);
       local_band_probe(ens->objects[o], dom, no_shift, probe);
+      local_frozen_count(ens->objects[o], counts);
     }
     MFTLRemeshAgreeDoubleMax(dom, probe, 2);
+
+    /* A SECOND reduction, and a different OPERATOR -- which is why it is a
+     * second one and not two more slots on the first. The band is a maximum
+     * (the worst place any rank found) and the counts are sums (how much mesh
+     * there is, and how much of it is frozen). Two doubles through an
+     * MPI_SUM, once per pass, against several migrations. */
+    MFTLRemeshAgreeDouble(dom, counts, 2);
+
+    st->frozen_fraction = (counts[0] > 0.0) ? (counts[1] / counts[0]) : 0.0;
 
     /* THE BAND THIS PASS WILL HAVE, not the one it starts with. The pre-pass
      * measures the input mesh, and for a REFINING pass that is the worst case --
@@ -1074,23 +1273,69 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
      * Using the 3-edge bound here would coarsen by 3x per axis, i.e. 27x in
      * ranks per group, to buy margin the measurement says is not needed. */
     const double delta_predicted = MFTL_MAX(probe[0], params->max_edge_length);
-    MFTLRemeshCoarseningFactors(dom, params, delta_predicted, group);
 
-    /* A positive value is a CAP on the ranks per group, so a caller who knows
-     * how much parallelism they are willing to lose can say so. Applied by
-     * shrinking the largest factor first, which keeps the boxes as close to
-     * cubic as the cap allows. */
-    if (params->parallel_coarsen > 1)
+    /* ── THE SIZE TRIGGER SHORT-CIRCUITS BOTH OTHERS, AND HAS TO ────────────
+     *
+     * A gather is `group == cuts`, which is the LARGEST factor either of the
+     * other triggers could ever ask for -- MFTLRemeshCoarseningFactors clamps
+     * there. So there is nothing for them to add, and evaluating them anyway
+     * would only produce a `coarsen_trigger` naming three reasons for one
+     * decision. The threshold is a triangle count because ONE RANK HOLDS THE
+     * WHOLE ENSEMBLE for the duration of the sweep, and a count is the only
+     * form of the question that bounds that. */
+    const int gather_limit = params->serial_gather_max_triangles;
+    if (gather_limit > 0 && counts[0] <= (double) gather_limit)
     {
-      while (group[0] * group[1] * group[2] > params->parallel_coarsen)
+      for (int k = 0; k < 3; ++k) group[k] = dom->cuts[k];
+      st->coarsen_trigger |= MFTL_REMESH_COARSEN_GATHER;
+    }
+    else if (params->parallel_coarsen != 0)
+    {
+      /* ── The two triggers, evaluated as one call on the larger band ───────
+       *
+       * They are asked separately because `coarsen_trigger` has to report which
+       * one fired, and they are ACTED on together because the answer is the
+       * larger of the two factors and MFTLRemeshCoarseningFactors is monotone
+       * in its band. Running it twice and taking a per-axis maximum would give
+       * the same numbers for twice the code. */
+      int band_group[3];
+      MFTLRemeshCoarseningFactors(dom, params, delta_predicted, band_group);
+      if (band_group[0] * band_group[1] * band_group[2] > 1) st->coarsen_trigger |= MFTL_REMESH_COARSEN_BAND;
+
+      double band_used = delta_predicted;
+      if (st->frozen_fraction > params->coarsen_frozen_fraction)
       {
-        int worst = 0;
-        for (int k = 1; k < 3; ++k)
-          if (group[k] > group[worst]) worst = k;
-        if (group[worst] <= 1) break;
-        group[worst]--;
+        const double band_eff = band_for_frozen_target(dom, delta_predicted, params->coarsen_frozen_fraction);
+        if (band_eff > band_used) band_used = band_eff;
+      }
+
+      MFTLRemeshCoarseningFactors(dom, params, band_used, group);
+      if (group[0] * group[1] * group[2] > band_group[0] * band_group[1] * band_group[2])
+      {
+        st->coarsen_trigger |= MFTL_REMESH_COARSEN_FROZEN;
+      }
+
+      /* A positive value is a CAP on the ranks per group, so a caller who knows
+       * how much parallelism they are willing to lose can say so. Applied by
+       * shrinking the largest factor first, which keeps the boxes as close to
+       * cubic as the cap allows. */
+      if (params->parallel_coarsen > 1)
+      {
+        MFTLRemeshCapGroups(group, params->parallel_coarsen);
+
+        /* THE CAP CAN BIND BELOW WHAT CORRECTNESS NEEDED, and that outcome is
+         * indistinguishable from a healthy partition in every other field: the
+         * pass simply fails to certify, exactly as it would have with the
+         * fallback disarmed. Say so once, or the caller reads `parallel_coarsen
+         * = 4` as a guarantee it never was. */
+        if (group[0] * group[1] * group[2] < band_group[0] * band_group[1] * band_group[2])
+        {
+          report_cap_bound(dom, params, band_group, group);
+        }
       }
     }
+
+    if (group[0] * group[1] * group[2] > 1) report_fallback(dom, st, group);
   }
   st->n_coarse_groups = group[0] * group[1] * group[2];
 
@@ -1421,7 +1666,13 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
    * only exists now; and the verdict a caller acts on is `converged` plus
    * `n_edges_hidden_long`, which this call cannot change. Warning early from an
    * estimate is what produced a message that was wrong two times in three. */
-  check_band_fits(dom, params, st->band_measured, st->band_bound);
+  /* NOT when the fallback already handled it. check_band_fits compares against
+   * the FINE box, which is by construction still too narrow on a pass that
+   * coarsened precisely because it was -- so leaving it unguarded makes the
+   * successful repair announce itself as the failure it repaired. The band
+   * argument holds against `group[k] * h_k` after coarsening, and
+   * report_fallback has already said so with the factors quoted. */
+  if (st->n_coarse_groups <= 1) check_band_fits(dom, params, st->band_measured, st->band_bound);
 
   gid_scratch_free(&gid);
   MFTLRemeshMigratorFree(&mig);

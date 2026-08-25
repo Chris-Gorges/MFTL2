@@ -90,7 +90,7 @@ extra:
   generator: false
   status:
     new: Recently added
-    deprecated: Not yet ported from MFTL 5
+    deprecated: Not implemented yet
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Markdown
@@ -188,6 +188,7 @@ watch:
   - docs/performance-analysis.md
   - docs/remeshing-quality-analysis.md
   - docs/parallel-remeshing-analysis.md
+  - docs/scaling-analysis.md
 
 # ──────────────────────────────────────────────────────────────────────────────
 #  Validation
@@ -237,6 +238,7 @@ nav:
       - Performance: analysis/performance.md
       - Remeshing quality: analysis/remeshing-quality.md
       - Parallel remeshing: analysis/parallel-remeshing.md
+      - Scaling: analysis/scaling.md
   - API:
       - api/index.md
       - Topics: api/modules.md

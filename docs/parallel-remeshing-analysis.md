@@ -14,6 +14,10 @@ comparable at all.
 every absolute time above np = 4 is a lower bound on the hardware's real capability. Ratios survive that;
 absolute nanoseconds do not. Nothing here has been run on a cluster.
 
+This document measures. **What the two drivers actually do — the call graph of each, the covering argument
+behind the eight-placement schedule, the freeze rule, the id scheme and the convergence certificate — is in
+@ref mftl_mod_remeshing**, and the fields quoted below are indexed by symptom at @ref rem_diagnostics.
+
 ---
 
 ## 1. The headline: the phase budget is the parameter that matters
@@ -231,7 +235,146 @@ guard and no reason for the collective form to exist.
 
 ---
 
-## 7. What this does and does not settle
+## 7. The coarsening fallback, the gather, and the balancer
+
+Three features share one mechanism — a coarsened *owner function* over the existing `MFTL_OwnerMap` — and
+they answer three different questions. All of the numbers below come from `examples/remesh_regime_sweep.c`
+(`-only f`, `-only g`, `-only l`), one body of radius 0.7 in $[-1,1]^3$ periodic unless stated, budget 8,
+target $0.7 \times$ the mesh's own mean edge.
+
+### 7.1 The frozen share is the diagnostic worth having
+
+A frozen entity is migrated with everything else and then not touched, so **the frozen share is the share of
+every migration that buys nothing**. `MFTL_RemeshStats::frozen_fraction` reports it, and it is free whenever
+`parallel_coarsen` is armed — which is now the default.
+
+Measured on a sphere of radius 0.7, trigger disabled so the number is only observed:
+
+| grid | refine 2 (320 tri) | refine 3 (1280 tri) | refine 4 (5120 tri) |
+|---|---:|---:|---:|
+| 2×2×2 (np = 8) | 45.0 % | 24.4 % | — |
+| 3×3×3 (np = 27) | 66.2 % | 36.6 % | 20.2 % |
+
+**The obvious model over-predicts by about two.** The band is $\delta$ either side of every plane, so
+$1-(1-2\delta/h)^3$ looks like the answer; it gives 71 % where 36.6 % was measured. A sphere of radius 0.7
+in a box of side 2 does not sample the cut planes uniformly. Anyone setting `coarsen_frozen_fraction` from
+the geometry rather than from the measured field will coarsen roughly twice as far as they intended.
+
+Note also what the correctness condition permits. $h = 4\delta$ **is** 87.5 % frozen, so the band trigger
+tolerates a partition in which the pass migrates the whole mesh, every phase, to remesh a seventh of it.
+
+### 7.2 Does the frozen trigger pay? Sometimes, and it buys convergence rather than time
+
+np = 27, 3×3×3, one body of radius 0.7. The `trg` column separates the triggers, which is the whole point of
+the experiment: a row where the band trigger also fired is not evidence about this one.
+
+| refine | frozen | threshold | trigger | ranks/group | phases | migrations | hidden L/S | wall | verdict |
+|---:|---:|---:|---|---:|---:|---:|---:|---:|---|
+| 2 | 66.2 % | off | band | 8 | 5 | 2 | 0 / 0 | 0.0095 | converged |
+| 2 | 66.2 % | 0.33 | band+frozen | 27 | 5 | 2 | 0 / 0 | 0.0088 | converged |
+| **3** | **36.6 %** | **off** | **none** | **1** | **8** | **8** | **1 / 31** | **0.0251** | **NOT converged** |
+| **3** | **36.6 %** | **0.33** | **frozen** | **27** | **7** | **2** | **0 / 0** | **0.0561** | **converged** |
+| 4 | 20.2 % | 0.25 | none | 1 | 8 | 8 | 2 / 37 | 0.0435 | NOT converged |
+
+The refine-3 pair is the measurement. The trigger fires **alone**, and it converts a pass that did not
+converge and hid 32 edges into one that converged and hid none — **for twice the wall clock.** That is the
+trade in its clearest form: migrations fall from 8 to 2, but one rank in twenty-seven does all the sweeping.
+
+Above and below that window it says nothing. At 66 % the band trigger has already fired and the frozen one
+only escalates the factor from 8 to 27 ranks per group with no change in outcome or time. At 20 % it never
+fires, and the pass's actual complaint is `parallel_phase_budget`.
+
+**So `coarsen_frozen_fraction` defaults to 1.0, disabled.** The useful window is roughly 30–60 % frozen, the
+payment is wall clock, and whether that is worth it is a property of the run rather than of the library.
+`frozen_fraction` is reported either way, which is the half that is unconditionally worth having.
+
+### 7.3 The single-rank gather: the crossover is per rank, not per mesh
+
+`serial_gather_max_triangles` sets `group[k] = cuts[k]`, so every entity lands on one rank. Nothing is
+replicated, so nothing is frozen; no axis keeps an interior plane, so there is one distinct placement and
+**every phase after the first is the identity and is skipped.** The pass moves exactly twice however many
+phases it sweeps.
+
+| np | mesh | distributed wall / verdict | gathered wall / verdict | tri/rank | gather wins? |
+|---:|---:|---|---|---:|---|
+| 4 | 80 | 0.0008, NOT conv, 36 hidden | 0.0006, **converged**, 0 | 20 | yes |
+| 4 | 320 | 0.0023, NOT conv, 1 hidden | 0.0078 (3.4×), NOT conv | 80 | no |
+| 4 | 1280 | 0.0124, NOT conv, 7 hidden | 0.0189 (1.5×), **converged** | 320 | time no, mesh yes |
+| 8 | 80 | 0.0014, NOT conv, 83 hidden | 0.0013, **converged**, 0 | 10 | yes |
+| 8 | 320 | 0.0034, NOT conv, 32 hidden | 0.0052 (1.5×), **converged** | 40 | time no, mesh yes |
+| 8 | 1280 | 0.0171, NOT conv, 21 hidden | 0.0380 (2.2×), NOT conv | 160 | no |
+| 27 | 80 | 0.0102, NOT conv, 146 hidden | 0.0037 (**2.8× faster**), **converged** | 3 | yes |
+| 27 | 320 | 0.0091, NOT conv, 200 hidden | 0.0086, **converged**, 0 | 12 | yes |
+| 27 | 1280 | 0.0141, NOT conv, 32 hidden | 0.0284 (2×), **converged** | 47 | time no, mesh yes |
+
+**The crossover is at roughly 50–100 triangles per rank**, and it moves with the rank count — which the
+parameter cannot express, because it is an absolute count. That is deliberate: one rank holds the entire
+ensemble for the duration of the sweep, and a count is the only form of the question that bounds the memory.
+A caller wanting the performance crossover should set it to about $50 \times \texttt{nproc}$, capped by what
+one rank can hold.
+
+**It defaults to 0, disabled**, because no single absolute number is right across rank counts.
+
+The secondary result is the more reliable one and holds in every row: **the gathered pass converges and hides
+nothing.** With no frozen entities there is no band for work to hide behind, so the certificate is
+unconditional. Where the distributed pass hid 146 edges (np = 27, 80 triangles), the gather hid none — and
+was 2.8× faster while doing it.
+
+### 7.4 The dispersed load balancer: 2.5–5.2× on a clustered ensemble
+
+Bodies go where their centroids are, and centroids cluster — an emulsion is not a uniform distribution over
+a process grid. The balancer keeps each body on its centroid's owner unless that rank exceeds
+`mean × dispersed_balance_slack`, then prefers the least-loaded of the 26 cells around it, then anywhere.
+It is a pure function of the replicated centroids and per-body triangle counts, so it costs **no collective
+at all** — the weights ride the reduction `MFTLRemeshMeasureBodies` already takes.
+
+$4P$ droplets, all packed into one rank's box:
+
+| np | balancer | imbalance | ranks idle | busiest-rank ops | wall |
+|---:|---|---:|---:|---:|---:|
+| 4 | off | 4.00 | 3 / 4 | 12 608 | 0.0162 |
+| 4 | **on** | **1.25** | **0 / 4** | **3 940** | **0.0064 (2.5×)** |
+| 8 | off | 8.00 | 7 / 8 | 25 216 | 0.0519 |
+| 8 | **on** | **1.25** | **0 / 8** | **3 940** | **0.0100 (5.2×)** |
+| 27 | off | 27.00 | 26 / 27 | 85 104 | 0.1081 |
+| 27 | **on** | **1.25** | **1 / 27** | **3 940** | **0.0317 (3.4×)** |
+
+The same droplets on a lattice across the domain, i.e. the case the balancer should leave alone:
+
+| np | balancer | imbalance | ranks idle | wall |
+|---:|---|---:|---:|---:|
+| 4 | off → on | 1.50 → 1.25 | 0 → 0 | 0.0077 → 0.0059 |
+| 8 | off → on | 2.00 → 1.25 | **4 / 8 → 0** | 0.0175 → 0.0128 |
+| 27 | off → on | 2.00 → 1.25 | 0 → 0 | 0.0263 → 0.0271 |
+
+Even the lattice benefits at np = 8, where four of eight ranks were idle because a cubic lattice of bodies
+does not align with a 2×2×2 process grid. At np = 27 it is a wash, which is the right outcome: there was
+nothing to fix and it cost nothing to check.
+
+**So `dispersed_balance_slack` defaults to 1.25, enabled** — the one of the three that the measurement says
+to turn on.
+
+Two things the table does *not* say. The `imbal` column of the sweep — max/mean owned triangles per rank
+*after* the pass — still reads 4.00 / 8.00 / 27.00 on the clustered rows with the balancer on, and that is
+correct: the closing `MFTLRedistribute` restores the canonical geometric partition, so one rank holds those
+bodies again. The balancer decides who does the *remeshing*, not who holds the mesh afterwards. And
+`n_bodies_reassigned` is simultaneously the benefit and the cost: 103 of 108 bodies moved at np = 27, and
+each one is a body that left the 26-neighbourhood, so redistribution takes its global exchange path.
+
+### 7.5 What arming the fallback by default costs
+
+`parallel_coarsen` now defaults to 1. On a healthy partition it decides not to coarsen, and the pass is then
+**bit-for-bit** the one that ran before — `test_the_fallback_stays_off_on_a_healthy_partition` remeshes the
+same fixture armed and disarmed and compares mesh digests, not merely triangle counts.
+
+The cost of asking is one pre-pass before the phase loop: a geometry refresh, one freeze classification, and
+two small Allreduces (a `MAX` of two doubles for the band, a `SUM` of two for the counts). No migration and
+no sweeps. Against §5's finding that advection and the pre-migration geometry pass together are under 2 % of
+a timestep, one more geometry pass on top of the four-odd a pass already takes is about +0.5 %.
+
+---
+
+## 8. What this does and does not settle
 
 **Settled.** Determinism, to the bit, at every rank count tested. Correctness against the serial answer,
 both as integral quantities and as an edge-length distribution — and at an adequate resolution the
@@ -240,12 +383,35 @@ rather than growing with P at a fixed budget (3.83 → 3.96 from np = 2 to np = 
 problem is +33 % for 4× the ranks. Ghost synchronisation, advection and the pre-migration geometry pass
 together are under 3 % of a timestep.
 
+Of the three features in §7: the **balancer** is settled and on by default (2.5–5.2× on a clustered
+ensemble, neutral where there is nothing to fix). The **gather** works exactly as its mechanism predicts —
+two migrations whatever the phase count, and a certificate that cannot hide anything — but its crossover is
+per rank and its parameter is absolute, so it ships disabled with a documented rule of thumb. The **frozen
+trigger** has a real but narrow window (about 30–60 % frozen) in which it buys convergence for roughly twice
+the wall clock, and ships disabled; the `frozen_fraction` diagnostic it was built around is the part worth
+keeping and is always reported.
+
 **Not settled.** Everything above np = 8 and everything on real hardware — the development machine has four
-performance cores, so np = 8 is oversubscribed and the absolute times above np = 4 are lower bounds. The
-strong-scaling question (does the migration cost stay proportional to the band as P reaches the hundreds?)
-needs a cluster and a mesh large enough that a rank holds tens of thousands of triangles, not hundreds.
+performance cores, so np = 8 and np = 27 are oversubscribed and the absolute times there are lower bounds.
+The §7 tables are *ratios within a rank count*, which survives that; the wall-clock columns across rank
+counts do not. The strong-scaling question (does the migration cost stay proportional to the band as P
+reaches the hundreds?) needs a cluster and a mesh large enough that a rank holds tens of thousands of
+triangles, not hundreds.
+
+Two consequences of coarsening are argued rather than measured, and both need P in the hundreds to see. A
+coarse destination is `group[k]` cells away, so it is outside the 26-neighbourhood and both
+`MFTLRedistributeWithOwners` and `MFTLRemeshSyncGhostIds` fall back to their global paths — `O(nproc)`
+allocations and an `Alltoall`, which is CLAUDE.md's deferred issue 6. And redistribution's 32-bit
+destination de-duplication (`MFTL_DEDUP_BITS`) reverts to a sort above 32 distinct remote destinations, a
+path np ≤ 27 cannot reach. The **gather** is exempt from the second: every rank sends to exactly one
+destination, which is why it is the safest coarse map rather than the most extreme one.
 
 **Deliberately not attempted.** The work-list architecture of the plan's §7 shortens each sweep. Nothing
 measured here says the sweeps are the problem: the remesh is 96–99 % of the timestep, but what varies with
-the budget and the rank count is the *phase count*, i.e. the migrations. A profile that separates sweep
-time from migration time inside `MFTLRemeshEnsembleParallel` is the prerequisite, and it does not exist yet.
+the budget and the rank count is the *phase count*, i.e. the migrations. The prerequisite for deciding it
+is a profile that separates sweep time from migration time inside `MFTLRemeshEnsembleParallel`, and that
+now exists in two forms: the six per-section timers on `MFTL_RemeshStats` (`t_migrate`, `t_geometry`,
+`t_freeze`, `t_sweep`, `t_reduce`, `t_total` — each a MAXIMUM over ranks, so an idle rank shows up rather
+than being averaged away), and `examples/remesh_phase_profile.c`, which prints them per placement together
+with how many entities that placement actually moved. **Run it on the target machine before building a work
+list**: if `t_migrate` dominates `t_sweep` there, a shorter sweep buys nothing.

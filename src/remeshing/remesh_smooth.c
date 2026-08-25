@@ -21,14 +21,14 @@
  *                  ridge tangent.
  *   CORNER vertex  0D -- locked.
  *
- * Stated that way the three cases are one idea, and the middle one is where the
- * previous version went wrong. It moved a ridge vertex TO the midpoint of its two
- * feature neighbours: the full displacement, no projection, at full strength, and
- * ignoring its own relaxation parameter. That is the 2D-shrinkage failure applied
- * to a 1D curve -- it cuts the corner of the ridge, pulling the vertex towards the
- * chord between its neighbours. Repeated over the tens of sweeps a remeshing pass
- * performs, a preserved feature curve is systematically eroded, which is the
- * opposite of what marking it a feature was for.
+ * Stated that way the three cases are one idea, and the middle one is the easy
+ * one to get wrong. Moving a ridge vertex TO the midpoint of its two feature
+ * neighbours -- the full displacement, no projection, at full strength -- is the
+ * 2D-shrinkage failure applied to a 1D curve: it cuts the corner of the ridge,
+ * pulling the vertex towards the chord between its neighbours. Repeated over the
+ * tens of sweeps a remeshing pass performs, a preserved feature curve is
+ * systematically eroded, which is the opposite of what marking it a feature was
+ * for.
  *
  * ## WHERE THE TARGET POINT COMES FROM
  *
@@ -40,24 +40,23 @@
  * and the weight is the mechanism, not a refinement. It is what makes the
  * smoother equalise triangle AREA: a vertex with one large and one small incident
  * triangle is pulled towards the large one, which shrinks it and grows the small
- * one. The previous version computed the UNWEIGHTED mean of the same centroids
- * under the same name. That is very nearly the umbrella operator again -- it
- * equalises edge lengths and does nothing about area -- so a caller selecting
- * "triangle based" for its isotropy got a slightly more expensive
- * MFTL_SMOOTH_VERTEX_BASED instead. Measured in
- * docs/remeshing-quality-analysis.md.
+ * one. The UNWEIGHTED mean of the same centroids is very nearly the umbrella
+ * operator again -- it equalises edge lengths and does nothing about area -- so a
+ * caller selecting "triangle based" for its isotropy would get a slightly more
+ * expensive MFTL_SMOOTH_VERTEX_BASED instead. Measured in
+ * docs/remeshing-quality-analysis.md, where dropping the weight costs volume
+ * conservation (6.0 % against 3.5 %) rather than triangle quality.
  *
  * ## WHY THE NORMAL IS NOT COMPUTED HERE
  *
  * MFTLComputeVertexNormals() gives the exact area-weighted normal for every
  * vertex in one streaming pass over `tris.edge` -- no fan walk, no dependent
  * loads, and correct across a periodic seam without a branch. Accumulating a
- * cross product per vertex over its own one-ring, as the previous version did
- * inside this loop, is the same arithmetic done 3.4x slower
- * (src/geometry/vertex_geometry.c) and gets the boundary case wrong on top: it
- * walked the ring with is_inner = true, so at an open fan the (k+1) % degree wrap
- * closes a fan that is not closed and adds a cross product between two edges that
- * are not adjacent.
+ * cross product per vertex over its own one-ring, inside this loop, is the same
+ * arithmetic done 3.4x slower (src/geometry/vertex_geometry.c) and invites the
+ * boundary bug on top: walking the ring with is_inner = true means the
+ * (k+1) % degree wrap closes a fan that is not closed, and adds a cross product
+ * between two edges that are not adjacent.
  */
 
 #include "mftl_remeshing.h"
@@ -84,8 +83,8 @@
  * fan closed, and every caller here needs to know: on an OPEN fan there is one
  * more incident EDGE than there are outgoing half-edges, and it is reachable only
  * as the incoming half-edge prev(first). A consumer that iterates edges and does
- * not account for it silently drops one -- which is precisely what made the
- * previous version misclassify every boundary vertex.
+ * not account for it silently drops one, and then misclassifies every boundary
+ * vertex.
  *
  * @param      obj  The mesh.
  * @param      v    Vertex index.
@@ -238,9 +237,8 @@ int MFTLDetectFeatures(MFTL_Object *obj, double angle_degrees, double corner_ang
    * each vertex's fan. The fan walk visits outgoing half-edges, and the closing
    * edge of an OPEN fan has no outgoing direction -- so every boundary vertex
    * comes out one short and lands in the wrong class. mftl_topology.h documents
-   * that trap on MFTLGetVertexOneRingHalfedges; the previous version's smoother
-   * walked into it. This pass cannot: it never asks a vertex anything, it asks
-   * the edges and tells the vertices. */
+   * that trap on MFTLGetVertexOneRingHalfedges. This pass cannot walk into it: it
+   * never asks a vertex anything, it asks the edges and tells the vertices. */
   const size_t nv_alloc = (size_t) (n_v > 0 ? n_v : 1);
   int *const feat_count = (int *) MFTLCallocOrDie(nv_alloc, sizeof(int), "remesh feature counts");
 
@@ -386,8 +384,8 @@ static bool ridge_displacement(const MFTL_Object *obj, int v, const int *fan, in
    * Keeping only delta's component along tau redistributes the vertex BETWEEN its
    * neighbours -- equalising the two edge lengths -- while the component that
    * would have pulled it off the curve and onto the chord is discarded. That
-   * discarded component is the whole difference from the previous version, and it
-   * is the one that erodes ridges. */
+   * discarded component is the whole difference between this and a chord cut, and
+   * it is the one that erodes ridges. */
   const double tau[3] = {d2[0] - d1[0], d2[1] - d1[1], d2[2] - d1[2]};
   const double tau_len_sq = tau[0] * tau[0] + tau[1] * tau[1] + tau[2] * tau[2];
   if (tau_len_sq < MFTL_VERYVERYSMALL) return MFTL_FALSE;

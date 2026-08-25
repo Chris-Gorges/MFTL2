@@ -708,6 +708,296 @@ static int test_the_strategy_costs_one_measurement_not_two(void)
   return 0;
 }
 
+/**
+ * @brief A pile-up of droplets is spread, and the answer does not change.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * THE FIXTURE IS THE TEST, AND IT HAS TO BE BUILT AGAINST THE REAL GRID
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Bodies go where their centroids are, so an imbalance is a statement about
+ * WHERE the bodies are and nothing else. Sixteen droplets spread over the domain
+ * would be roughly balanced already and the balancer would correctly do nothing
+ * -- which is a passing test that measures nothing.
+ *
+ * So the droplets are packed into ONE rank's box, resolved against the actual
+ * process grid at run time rather than at a hardcoded coordinate: the box of the
+ * rank owning the domain's lower corner is found from `cuts`, and every droplet
+ * is placed inside it. That is the same discipline test_bvh_ghosting.c uses for
+ * its thirty placements, and for the same reason -- the grid is 2x1x1, 2x2x1,
+ * 2x2x2 or 3x3x3 depending on np, and a coordinate that piles up on one of them
+ * is spread across another.
+ *
+ * ── The four claims, and why each is separately necessary ────────────────
+ *
+ * BALANCED     `load_imbalance` falls to within the slack. The headline.
+ * NON-VACUOUS  `n_bodies_reassigned > 0`. Without it, an imbalance that fixed
+ *              itself -- or a fixture that was never piled up -- reads as
+ *              success. This is the assertion a future edit to the fixture
+ *              would trip.
+ * CONTROLLED   the unbalanced run really is imbalanced. A control that is not
+ *              measured is an assumption.
+ * UNCHANGED    the mesh matches the unbalanced run's within the suite's
+ *              tolerance. Which rank remeshes a body must not change what the
+ *              body becomes -- and it very nearly does not: the serial kernel is
+ *              deterministic and the body arrives complete, so the only freedom
+ *              is pool order.
+ */
+static int test_the_balancer_evens_out_a_pile_up(void)
+{
+  if (g_nproc == 1) return 0;  // one rank holds everything; there is no imbalance to fix
+
+  mesh_measure result[2];
+  MFTL_RemeshStats stats[2];
+
+  for (int balanced = 0; balanced < 2; ++balanced)
+  {
+    MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE);
+    TEST_ASSERT(ens != MFTL_NULL);
+
+    /* One rank's box, from the grid this run actually has. The lower-corner cell
+     * spans [-1, -1 + 2/cuts[k]) on each axis; the droplets sit inside it with
+     * room for their radius. */
+    double box[3];
+    for (int k = 0; k < 3; ++k) box[k] = 2.0 / (double) ens->domain.cuts[k];
+
+    /* Sixteen bodies so that N_bodies >= nproc at every rank count this suite
+     * runs (2, 4, 8), which is the regime where an imbalance is fixable at all
+     * -- below it some rank must idle whatever the assignment. */
+    const int n_bodies = 16;
+    for (int b = 0; b < n_bodies; ++b)
+    {
+      /* A deterministic scatter INSIDE the single box: a 4x2x2 lattice of
+       * positions, inset so no droplet reaches the box's faces. */
+      const double u[3] = {(double) ((b % 4) + 1) / 5.0, (double) (((b / 4) % 2) + 1) / 3.0, (double) ((b / 8) + 1) / 3.0};
+
+      const double c[3] = {-1.0 + u[0] * box[0], -1.0 + u[1] * box[1], -1.0 + u[2] * box[2]};
+
+      /* Radii deliberately UNEQUAL, so that equalising body COUNT and equalising
+       * TRIANGLE COUNT are different answers and the weighted one is the one
+       * being tested. Refine 1 and 2 differ by 4x in triangles. */
+      add_sphere(ens, b, c[0], c[1], c[2], 0.02 * box[0], (b % 3 == 0) ? 2 : 1);
+    }
+
+    TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+
+    MFTL_RemeshParameters params;
+    standard_params(&params, 0.02 * box[0]);
+    params.dispersed_balance_slack = balanced ? 1.25 : 0.0;
+
+    TEST_ASSERT(agreed(MFTLRemeshEnsembleDispersed(ens, &params, &stats[balanced]) == MFTL_SUCCESS, MPI_COMM_WORLD));
+
+    TEST_ASSERT(agreed(stats[balanced].strategy == MFTL_REMESH_PARALLEL_DISPERSED, MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(stats[balanced].n_bodies_not_centred == 0, MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(count_split_bodies(ens) == 0, MPI_COMM_WORLD));
+
+    measure(ens, &params, &result[balanced]);
+    MFTLEnsembleDestroy(&ens);
+  }
+
+  /* CONTROLLED: the unbalanced assignment really did pile up. Every droplet is
+   * inside one rank's box, so its imbalance is nproc -- one rank holds all the
+   * weight -- and anything at all below that would mean the fixture leaked. */
+  TEST_ASSERT(agreed(stats[0].n_bodies_reassigned == 0, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(stats[0].load_imbalance > 1.5, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(stats[0].n_ranks_idle == g_nproc - 1, MPI_COMM_WORLD));
+
+  /* NON-VACUOUS and BALANCED. */
+  TEST_ASSERT(agreed(stats[1].n_bodies_reassigned > 0, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(stats[1].load_imbalance < stats[0].load_imbalance, MPI_COMM_WORLD));
+  /* Sixteen bodies over at most eight ranks, so every rank can be given one and
+   * "no rank idle" is a reachable claim rather than an aspiration. Below
+   * N_bodies == nproc it would not be: a body is the smallest unit of work this
+   * strategy has, so some rank must idle and no assignment can fix it. */
+  TEST_ASSERT(agreed(16 >= g_nproc, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(stats[1].n_ranks_idle == 0, MPI_COMM_WORLD));
+
+  /* The cap is `MAX(mean * slack, heaviest body)`, so the reachable imbalance is
+   * bounded by the heaviest body rather than by the slack alone -- asserting
+   * `<= 1.25` would be asserting that the bodies happen to be divisible, which
+   * they are not. Both bounds are checked, which is the honest statement. */
+  {
+    const double heaviest_share = (double) g_nproc / 16.0;  // 16 bodies, weights within 4x
+    const double reachable = MFTL_MAX(1.25, 4.0 * heaviest_share);
+    TEST_ASSERT(agreed(stats[1].load_imbalance <= reachable, MPI_COMM_WORLD));
+  }
+
+  /* UNCHANGED: same surface, same resolution. Same tolerance and same reason as
+   * test_the_two_strategies_reach_the_same_mesh. */
+  TEST_ASSERT(agreed(result[1].n_triangles > 0.0, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(fabs(result[1].n_triangles - result[0].n_triangles) <= 0.04 * result[0].n_triangles, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(fabs(result[1].volume - result[0].volume) <= 0.01 * fabs(result[0].volume), MPI_COMM_WORLD));
+
+  if (g_rank == 0)
+  {
+    printf("\n    np=%d: unbalanced -> imbalance %.2f, %d idle | balanced -> imbalance %.2f, %d idle, %d/16 bodies moved\n    ", g_nproc,
+           stats[0].load_imbalance, stats[0].n_ranks_idle, stats[1].load_imbalance, stats[1].n_ranks_idle, stats[1].n_bodies_reassigned);
+  }
+
+  return 0;
+}
+
+/**
+ * @brief The balancer is a pure function of replicated data, so it repeats.
+ *
+ * The assignment involves a qsort and a greedy search, and both are places where
+ * a comparator that is not a TOTAL order, or a candidate scan that reads
+ * `dom->neighbors`, would produce a per-rank answer. Neither failure crashes:
+ * MFTL_OwnerMap with two ranks naming different destinations for one entity is
+ * undefined, and what it does in practice is drop or duplicate entities quietly.
+ *
+ * Two runs of the same fixture must give the same mesh to the bit. That is a
+ * necessary condition for the assignment agreeing across ranks, and it is the
+ * one a test can check without reaching inside the driver -- an assignment that
+ * differed BETWEEN ranks would have failed the soundness checks above long
+ * before it reached here, and an assignment that differed BETWEEN RUNS is what
+ * this catches.
+ */
+static int test_the_balancer_is_deterministic(void)
+{
+  double volume[2] = {0.0, 0.0};
+  double triangles[2] = {0.0, 0.0};
+
+  for (int run = 0; run < 2; ++run)
+  {
+    MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE);
+    TEST_ASSERT(ens != MFTL_NULL);
+
+    add_four_droplets(ens);
+    TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+
+    MFTL_RemeshParameters params;
+    standard_params(&params, 0.05);
+
+    MFTL_RemeshStats stats;
+    TEST_ASSERT(agreed(MFTLRemeshEnsembleDispersed(ens, &params, &stats) == MFTL_SUCCESS, MPI_COMM_WORLD));
+
+    mesh_measure m;
+    measure(ens, &params, &m);
+    volume[run] = m.volume;
+    triangles[run] = m.n_triangles;
+
+    MFTLEnsembleDestroy(&ens);
+  }
+
+  /* Non-vacuity: an empty ensemble would compare equal to itself forever. */
+  TEST_ASSERT(agreed(triangles[0] > 0.0, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(triangles[0] == triangles[1], MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(volume[0] == volume[1], MPI_COMM_WORLD));
+
+  return 0;
+}
+
+/**
+ * @brief Small bodies on a fine grid stay DISPERSED instead of falling to spanning.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * THE FAILURE THIS PREVENTS IS A STRATEGY CHOICE MADE BY THE RANK COUNT
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * `r_max > 0.4 * h_min` sends the whole ensemble to the spanning driver. Raise
+ * the rank count on a fixed domain and `h_min` shrinks, so droplets that have
+ * not changed at all become "too large" -- and a spray takes the phase schedule,
+ * which for it is two migrations against thirty-four.
+ *
+ * With the fallback armed, the yardstick becomes the coarsened box, and the
+ * ensemble stays where it belongs.
+ *
+ * ── BOTH DIRECTIONS ARE ASSERTED, and that is the point ──────────────────
+ *
+ * A test that only showed DISPERSED with the fallback armed would pass on a
+ * fixture where the fine test already said DISPERSED, i.e. while proving
+ * nothing. So the same ensemble is measured with the fallback disarmed and must
+ * come back SPANNING. The pair is the claim; neither half is.
+ *
+ * The relaxation is deliberately bounded -- it needs `N_bodies >= nproc`, or it
+ * would take a jet that spanning would have shared and give it to one rank -- so
+ * the fixture carries enough bodies to satisfy that at every rank count here.
+ */
+static int test_small_bodies_at_a_fine_grid_stay_dispersed(void)
+{
+  if (g_nproc < 4) return 0;  // needs a grid with 3+ cells on an axis; see below
+
+  /* ── A SLAB GRID, BUILT HERE RATHER THAN TAKEN FROM THE SUITE ────────────
+   *
+   * The relaxation refuses to merge the WHOLE grid into one box -- that is the
+   * gather, it hands every body to one rank, and it belongs to the spanning path
+   * where a triangle count bounds it. The suite's cubic grids have exactly two
+   * cells per axis up to np = 8, so doubling any axis consumes the entire grid
+   * and the refusal is correct: there is no partial merge to test.
+   *
+   * `{nproc, 1, 1}` has nproc cells on x, so merging two of them leaves nproc/2
+   * groups and the relaxation is a genuine partial one. It is also the honest
+   * shape for this feature: a slab decomposition is what a domain gets when the
+   * rank count outruns one axis, which is exactly the regime where h_min stops
+   * describing the bodies and starts describing the rank count.
+   */
+  int cuts[3] = {g_nproc, 1, 1};
+  double lo[3] = {-1.0, -1.0, -1.0};
+  double hi[3] = {1.0, 1.0, 1.0};
+  bool per[3] = {MFTL_TRUE, MFTL_TRUE, MFTL_TRUE};
+
+  MFTL_Ensemble *ens = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, lo, hi, per, 2);
+  TEST_ASSERT(ens != MFTL_NULL);
+
+  const double h_min = MFTLDomainGetHMin(&ens->domain);
+  TEST_ASSERT(h_min > 0.0);
+
+  /* Just above 0.4 * h_min, so the fine test says SPANNING and the SMALLEST
+   * possible merge -- two boxes on one axis -- is enough to make it fit. Sizing
+   * it to need more would test the same branch while giving up more ranks. */
+  const double r = 0.45 * h_min;
+
+  /* The relaxation's own precondition is N_bodies >= nproc: below it, dispersed
+   * already leaves ranks idle and relaxing buys no parallelism, it only takes a
+   * body the spanning schedule would have shared and gives it to one rank. */
+  const int n_bodies = g_nproc;
+  for (int b = 0; b < n_bodies; ++b)
+  {
+    /* One droplet per rank box, at its centre, so the fixture is balanced and a
+     * failure here is unambiguously about the STRATEGY rather than the balancer. */
+    const double cx = -1.0 + (2.0 * ((double) b + 0.5)) / (double) g_nproc;
+    add_sphere(ens, b, cx, 0.0, 0.0, r, 1);
+  }
+
+  TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+
+  MFTL_RemeshParameters params;
+  standard_params(&params, 0.5 * r);
+
+  /* ── BOTH DIRECTIONS, and neither half is the claim on its own ───────────
+   *
+   * Armed-says-DISPERSED alone would pass on a fixture the fine test already
+   * called dispersed, i.e. while proving nothing. The pair is what says the
+   * yardstick moved. */
+  params.parallel_coarsen = 0;
+  TEST_ASSERT(agreed(MFTLRemeshChooseStrategy(ens, &params) == MFTL_REMESH_PARALLEL_SPANNING, MPI_COMM_WORLD));
+
+  params.parallel_coarsen = 1;
+  TEST_ASSERT(agreed(MFTLRemeshChooseStrategy(ens, &params) == MFTL_REMESH_PARALLEL_DISPERSED, MPI_COMM_WORLD));
+
+  /* And the driver AGREES with the chooser. If it did not, the admission test
+   * would reject bodies the chooser accepted and the pass would fall back to the
+   * spanning driver after a wasted measurement -- visible only as this field. */
+  MFTL_RemeshStats stats;
+  TEST_ASSERT(agreed(MFTLRemeshEnsemble(ens, &params, &stats) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(stats.strategy == MFTL_REMESH_PARALLEL_DISPERSED, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(stats.n_bodies_not_centred == 0, MPI_COMM_WORLD));
+
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(count_split_bodies(ens) == 0, MPI_COMM_WORLD));
+
+  if (g_rank == 0)
+  {
+    printf("\n    np=%d grid %dx1x1: %d bodies of r=%.4f against h_min=%.4f (0.4h=%.4f) -> disarmed SPANNING, armed DISPERSED\n    ", g_nproc, g_nproc,
+           n_bodies, r, h_min, 0.4 * h_min);
+  }
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
@@ -724,6 +1014,9 @@ int main(int argc, char **argv)
   RUN_TEST(test_a_spanning_body_forced_dispersed_falls_back_cleanly);
   RUN_TEST(test_the_public_entry_point_dispatches_to_dispersed);
   RUN_TEST(test_the_strategy_costs_one_measurement_not_two);
+  RUN_TEST(test_the_balancer_evens_out_a_pile_up);
+  RUN_TEST(test_the_balancer_is_deterministic);
+  RUN_TEST(test_small_bodies_at_a_fine_grid_stay_dispersed);
 
   if (g_rank == 0) TEST_REPORT();
 

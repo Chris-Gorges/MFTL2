@@ -331,7 +331,7 @@ int MFTLRemeshMeasurementCount(void) { return g_measurement_count; }
 
 void MFTLRemeshResetMeasurementCount(void) { g_measurement_count = 0; }
 
-void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radius)
+void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radius, double *weight)
 {
   const MFTL_Domain *const dom = &ens->domain;
   const int n = ens->num_objects;
@@ -339,18 +339,23 @@ void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radiu
 
   g_measurement_count++;
 
-  /* Layout per body: [w, s0, c0, s1, c1, s2, c2]. A periodic axis uses the
+  /* Layout per body: [w, s0, c0, s1, c1, s2, c2, ntri]. A periodic axis uses the
    * (sin, cos) pair, a non-periodic one puts its plain weighted sum in the `s`
    * slot and leaves `c` zero.
    *
-   * SEVEN, not eight. The eighth slot was padding, justified by making the
-   * per-body stride a power of two -- which buys an address calculation nothing
-   * a reduction cares about, and costs 12.5 % of the message. At the ensemble
-   * size this collective is FOR (an emulsion of ten thousand droplets is 560 kB
-   * per rank per pass, not 640) that is the only figure that matters. */
+   * EIGHT, and the eighth is not padding. It was, once: the stride was seven
+   * because an eighth slot bought a power-of-two address calculation that no
+   * reduction cares about, at 12.5 % of the message. The slot now carries the
+   * body's owned TRIANGLE COUNT, which the dispersed balancer needs, and that
+   * changes the trade completely -- the alternative is not a shorter message,
+   * it is a SECOND Allreduce over the same bodies.
+   *
+   * This is the module's only O(num_objects) collective, so its count is what
+   * decides the module's cost at ten thousand droplets. One reduction of 640 kB
+   * beats two of 560 and 80. */
   enum
   {
-    STRIDE = 7
+    STRIDE = 8
   };
   double *const acc = (double *) MFTLCallocOrDie((size_t) (2 * STRIDE * n), sizeof(double), "remesh body accumulators");
   double *const sum = acc + STRIDE * n;
@@ -366,6 +371,13 @@ void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radiu
      * the rank count, which is the one shape of error a global measurement must
      * not have. */
     const int nt = obj->tris.n_local;
+
+    /* The weight is a COUNT, and it is accumulated outside the loop because it
+     * does not depend on the geometry -- only on how many owned triangles this
+     * rank has of this body. Exactly the same ownership rule as the area sum
+     * below, for exactly the same reason: a ghost is counted by its owner. */
+    a[7] += (double) nt;
+
     for (int t = 0; t < nt; ++t)
     {
       const double w = obj->tris.area[t];
@@ -392,6 +404,13 @@ void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radiu
     MPI_Allreduce(acc, sum, STRIDE * n, MPI_DOUBLE, MPI_SUM, dom->comm_world);
   else
     memcpy(sum, acc, (size_t) (STRIDE * n) * sizeof(double));
+
+  /* Written before the centroids, because it needs nothing from them: the slot
+   * came back from the same reduction and is already the global count. */
+  if (weight)
+  {
+    for (int o = 0; o < n; ++o) weight[o] = sum[STRIDE * o + 7];
+  }
 
   /* Scratch for the centroid even when the caller does not want it -- the radius
    * is a distance to it. */

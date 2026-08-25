@@ -423,10 +423,13 @@ int MFTLRemeshIterate(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFT
  * @param      params   May be #MFTL_NULL for the default radius fraction.
  * @param[out] centroid `[3*num_objects]` area-weighted, seam-consistent, replicated.
  * @param[out] radius   `[num_objects]` max corner distance from it, replicated.
+ * @param[out] weight   `[num_objects]` global owned-triangle count, replicated.
+ *                      The dispersed balancer's input; may be #MFTL_NULL.
  * @return The resolved strategy, never #MFTL_REMESH_PARALLEL_AUTO.
  * @collective
  */
-MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategyMeasured(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, double *centroid, double *radius);
+MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategyMeasured(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, double *centroid, double *radius,
+                                                             double *weight);
 
 /**
  * @brief MFTLRemeshEnsembleDispersed() with the body measurement supplied.
@@ -435,10 +438,13 @@ MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategyMeasured(MFTL_Ensemble *ens,
  * @param[out] stats    May be #MFTL_NULL.
  * @param      centroid `[3*num_objects]` from MFTLRemeshChooseStrategyMeasured().
  * @param      radius   `[num_objects]` from the same call.
+ * @param      weight   `[num_objects]` from the same call, or #MFTL_NULL, in
+ *                      which case every body counts as one unit and the balancer
+ *                      equalises body COUNT rather than triangle count.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR if a migration failed.
  * @collective
  */
 int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats, const double *centroid,
-                                        const double *radius);
+                                        const double *radius, const double *weight);
 
 #endif  // MFTL_REMESH_INTERNAL_H

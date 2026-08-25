@@ -570,18 +570,58 @@
  *
  * ## Two distributed strategies, chosen by one ratio
  *
+ * An edge whose endpoints are owned by different ranks cannot be collapsed by
+ * either of them: each holds half of the one-ring the link condition is a
+ * statement about. Both strategies remove that situation rather than negotiating
+ * it, and MFTLRemeshChooseStrategy() picks between them from reduced data.
+ *
  * | | bodies larger than a rank box | bodies smaller than a rank box |
  * |---|---|---|
  * | what moves | the CUT PLANES, over the \f$\{0, h/2\}^3\f$ shift schedule | the BODIES, onto the rank owning their centroid |
  * | driver | MFTLRemeshEnsembleParallel() | MFTLRemeshEnsembleDispersed() |
+ * | migrations | one per phase, plus one | exactly two |
+ * | id cost | one Exscan + Allreduce per phase | one `Allreduce(MAX)`, total |
+ * | criterion | \f$R_{\max} > f\,h\f$ | \f$R_{\max} \le f\,h\f$, \f$f =\f$ `dispersed_radius_fraction` |
  *
  * They share no code past MFTLRemeshIterate(), which is what makes them each
  * other's cross-check: agreeing on the answer is evidence about the ANSWER
  * rather than about one implementation.
  *
+ * ## The covering condition
+ *
+ * An owned entity is FROZEN exactly when some other rank holds a copy of it,
+ * which MFTLRemeshMarkFrozen() derives locally from the ownership prefix — no
+ * distance test and no message. Write \f$\delta\f$ for the half-width of the
+ * band of frozen entities either side of a cut plane and \f$h_k\f$ for the rank
+ * box width. An entity frozen in one placement is at distance
+ * \f$\ge h_k/2 - \delta\f$ from the planes of the half-shifted placement, so it
+ * is interior there iff
+ *
+ * \f[
+ *   \frac{h_k}{2} - \delta > \delta
+ *   \quad\Longleftrightarrow\quad
+ *   h_k > 4\delta .
+ * \f]
+ *
+ * Under that condition each axis has at most ONE bad shift value, so an entity's
+ * conflict is a vector in \f$\{0,1,\varnothing\}^3\f$ and a placement works iff
+ * it differs from that vector on every conflicting axis. Hence: two placements
+ * cover every one-axis (slab) conflict, a strength-2 orthogonal array of four
+ * covers every two-axis (tube) conflict, and all eight are needed — and suffice —
+ * for a three-axis (corner) conflict. That is MFTL_REMESH_PHASES, ordered so
+ * that its prefixes are the useful covering sets.
+ *
+ * When \f$h_k > 4\delta\f$ fails, `parallel_coarsen` merges
+ * \f$g_k = \lceil 4\delta/h_k \rceil\f$ boxes per axis through
+ * #MFTL_OwnerMap — a coarser decomposition is just a different owner function, so
+ * no second communicator is involved.
+ *
  * @note **All of the module's MPI is in one file**, `src/remeshing/remesh_comm.c`,
  *       enforced at configure time by a CMake source check. The operators, the
  *       smoother, the compaction and both distributed drivers contain none.
+ *
+ * @see @ref mftl_mod_remeshing for the call graphs of both drivers, the full
+ *      derivation, and how to read MFTL_RemeshStats.
  */
 
 /**

@@ -25,11 +25,11 @@
  *   MFTLUpdateGhostVertexNormals  verts.normal  -- recomputable for OWNED
  *                                                 vertices, not for ghosts
  *
- * The previous version shipped position, normal, both curvatures and the area in
- * one 80-byte message. Bundling looks like a saving (one schedule instead of
- * two) and is not: four fifths of that payload is a function of the positions
- * and the topology, so it was sent to save a receiver-side pass that costs less
- * than the bytes did. Each field now costs exactly one exchange, and a caller
+ * Shipping position, normal, both curvatures and the area in one 80-byte message
+ * looks like a saving (one schedule instead of two) and is not: four fifths of
+ * that payload is a function of the positions and the topology, so it would be
+ * sent to save a receiver-side pass that costs less than the bytes do. Each field
+ * costs exactly one exchange here, and a caller
  * that does not need the normals does not send them -- which is the common case,
  * because MFTLComputeVertexNormals is exact for owned vertices with no
  * communication at all (mftl_geometry.h).
@@ -188,8 +188,8 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
    * Two lists per neighbour, filled in lockstep: the REQUEST (object index,
    * vertex gid) that goes on the wire, and the TARGET (object index, local vertex
    * slot) that stays here. Recording the target now is what lets the apply phase
-   * be a direct indexed write -- the previous version re-derived it with a hash
-   * lookup per ghost, every timestep.
+   * be a direct indexed write. Re-deriving it instead costs a hash lookup per
+   * ghost, every timestep.
    *
    * Ghosts are an array SUFFIX, so the loop bound is the ownership filter. */
   mftl_int_buffer *const requests = (mftl_int_buffer *) MFTLMallocOrDie((size_t) nn * sizeof(mftl_int_buffer), "ghost request lists");

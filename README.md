@@ -1,9 +1,7 @@
-# MFTL — MultiFlow Triangulation Library (version 6)
+# MFTL — MultiFlow Triangulation Library
 
 A HPC C11 library for distributed-memory (MPI) manipulation of closed and open triangulated surface meshes, for
 front-tracking and immersed-boundary CFD simulations.
-
-Version 6 is a ground-up rewrite of version 5. The algorithms mostly carried over; the data architecture did not.
 
 ## The idea
 
@@ -101,9 +99,19 @@ python3 run_local_tests.py        # build + full CTest suite
 ./build/vertex_normal_benchmark      # scatter vs fan gather vs CSR gather
 ./build/update_kernel_benchmark      # eleven ways to write the per-timestep kernel
 ./build/ensemble_update_benchmark    # the fused geometry+quality pass vs the naive half-edge loop
+./build/leveque_remeshing_singleproc # what feature detection on a smooth surface costs
 
 # the whole timestep, distributed: advection, ghost sync, geometry, redistribution
 mpirun -n 4 ./build/parallel_advection_redistribute_list 2 2 1 1 1 1 --spheres 256 --refine 3 --verify
+
+# distributed remeshing: does it track the serial answer, and what does a phase cost
+mpirun -n 4 ./build/leveque_remeshing_parallel
+mpirun -n 4 ./build/remesh_phase_profile        # where the time goes inside one phase
+mpirun -n 8 ./build/remesh_regime_sweep         # where the spanning/dispersed crossover lies
+
+# strong, weak and granularity scaling: one point by hand, then the whole sweep
+mpirun -n 4 ./build/parallel_advection_scaling --mode strong --spheres 256 --refine 3
+python3 run_scaling.py --preset laptop --all    # sweeps the rank counts, writes plots + report
 
 # ... and dump the surface every 10 steps, as one shared file written with MPI-IO
 mpirun -n 4 ./build/parallel_advection_redistribute_list 2 2 1 1 1 1 --spheres 256 --refine 3 \
@@ -137,15 +145,15 @@ warnings**, and that is the acceptance criterion for each.
 
 Present: ensemble/domain, object pools, half-edge topology, derived arrays and hot-loop iterators, Morton
 renumbering, periodic geometry, sphere generation, the fused per-timestep geometry+quality pass, area-weighted
-vertex normals, radix sort, redistribution and ghost synchronisation, VTK output.
+vertex normals, radix sort, redistribution and ghost synchronisation, VTK output, isotropic remeshing —
+serial and **distributed, by two strategies** (`src/remeshing/`) — the LBVH with exact object–object contact
+detection (`src/bvh/`), and the spatial halo that makes contact detection work across ranks.
 
 Geometry is split by SCOPE, not by entity: `MFTLCompute*` works on one object and never touches MPI,
 `MFTLEnsembleUpdate*` iterates the object list and owns the collective its result needs — a reduction for the
 triangle quality statistics, an exchange for the vertex normals.
 
-Not yet ported from version 5: open-surface generators, GTS I/O, topological ghost-layer growth. There is no
-mesh reader of any format. (Remeshing, the LBVH and surface-surface intersection were on this list and are
-not: `src/remeshing/`, `src/bvh/`.)
+Absent: open-surface generators, GTS I/O, topological ghost-layer growth, and a mesh reader of any format.
 
 ## Output
 

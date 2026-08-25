@@ -8,8 +8,8 @@
  *
  * Broad phase (this file) answers "which triangle pairs are close enough to be
  * worth an exact test"; the narrow phase answers "are they actually touching".
- * The module is a port of MFTL2's mftl_bvh.c, and four things changed for
- * reasons that are properties of THIS version's object model rather than taste.
+ * Four decisions shape the module, and every one of them is forced by the object
+ * model rather than chosen for taste.
  *
  * ## 1. A BVH IS BUILT OVER A PRIMITIVE SOUP, NOT OVER THE MESH
  *
@@ -26,10 +26,10 @@
  *
  * Because a patch is a real object, both kinds of primitive are reached through
  * the same MFTLGetTriangleCorners call and the distinction survives only as one
- * index comparison. An earlier version of this module carried a private array of
- * nine doubles per received triangle; that meant a second geometry
- * representation with its own growth path and its own periodic-consistency
- * argument, for data that the object machinery already knows how to hold.
+ * index comparison. The alternative -- a private array of nine doubles per
+ * received triangle -- is a second geometry representation with its own growth
+ * path and its own periodic-consistency argument, for data the object machinery
+ * already knows how to hold.
  *
  * What has NOT changed is that received triangles stay out of the BODY's pools.
  * Appending them there would need the two-way ownership split of mftl_types.h
@@ -41,8 +41,7 @@
  *
  * ## 2. PERIODICITY IS HANDLED AT TWO SCALES, AND THEY ARE DIFFERENT PROBLEMS
  *
- * The "ATTENTION: IS THIS CORRECT FOR PERIODIC DOMAINS ?" comment on the
- * centroid normalisation in the previous version was right to worry, and the
+ * A centroid normalisation on a periodic domain is the place to worry, and the
  * worry has two halves that need two different answers.
  *
  * WITHIN one object -- a triangle straddling the seam. Its three vertices are
@@ -70,12 +69,12 @@
  *
  * ## 3. THE TOLERANCE SCALES; IT IS NOT 1e-4
  *
- * The previous version inflated every leaf AABB by a hardcoded 1e-4 and passed a
- * hardcoded 1e-6 into the proximity test. Both are absolute lengths, so the
- * module only worked at one length scale: in a run carrying a millimetre droplet
- * and a metre body -- the case this library exists for -- 1e-4 is a tenth of the
- * droplet's radius (every leaf overlaps every other) and 1e-7 of the body's
- * (contact is missed until the surfaces interpenetrate).
+ * Inflating every leaf AABB by a hardcoded 1e-4 and passing a hardcoded 1e-6 into
+ * the proximity test is the obvious arrangement, and both are absolute lengths,
+ * so the module then works at exactly one length scale: in a run carrying a
+ * millimetre droplet and a metre body -- the case this library exists for --
+ * 1e-4 is a tenth of the droplet's radius (every leaf overlaps every other) and
+ * 1e-7 of the body's (contact is missed until the surfaces interpenetrate).
  *
  * MFTL_BVHBuildParams replaces both with ONE dimensionless number times the
  * object's bounding radius, floored by an absolute value:
@@ -101,8 +100,8 @@
  *     redistribution halo would make rank p and rank q both report the same
  *     contact, exactly as writing ghosts into a .vtu double-counts the surface;
  *   - only object B's triangles ever travel. MFTLExtendSpatialHalo is
- *     one-directional per ordered pair, which halves what the previous version
- *     sent;
+ *     one-directional per ordered pair, which halves what a symmetric exchange
+ *     would send;
  *   - `MFTLEnsembleIntersectObjects` iterates j > i, so "A" and "B" are
  *     well-defined and every unordered pair is visited once.
  *
@@ -231,10 +230,10 @@ typedef struct MFTL_BVHBuildParams
   double proximity_floor;
 
   /**
-   * @brief Maximum primitives per leaf. 4 is the measured sweet spot inherited
-   *        from the previous version; larger trades traversal steps for narrow-
-   *        phase tests, which is the right direction once the leaf batch is
-   *        vectorised and the wrong one until then.
+   * @brief Maximum primitives per leaf. 4 is the measured sweet spot; larger
+   *        trades traversal steps for narrow-phase tests, which is the right
+   *        direction once the leaf batch is vectorised and the wrong one until
+   *        then.
    */
   int leaf_size;
 
@@ -307,9 +306,9 @@ typedef struct MFTL_BVH
    * MFTLExtendSpatialHalo (mftl_communication.h §6). BORROWED: it belongs to the
    * MFTL_SpatialHalo, and the caller must keep that alive for the BVH's lifetime.
    *
-   * The BVH stores no geometry of its own for these. An earlier version carried
-   * a private array of nine doubles per remote triangle; a patch is a real
-   * object, so the same nine doubles come out of `tris.anchor`/`tris.edge`
+   * The BVH stores no geometry of its own for these, and does not need to: a
+   * patch is a real object, so the nine doubles a private per-triangle array
+   * would hold come out of `tris.anchor`/`tris.edge`
    * through exactly the accessor the local triangles use, and the local/remote
    * distinction disappears from everything except one index comparison.
    */
@@ -421,8 +420,8 @@ int MFTL_BVHPrimOwner(const MFTL_BVH *bvh, int p);
  * 2. A 63-bit Morton key per primitive from its SEAM-CONSISTENT centroid,
  *    quantised against the primitive bounding box (MFTLMorton3D, mftl_object.h --
  *    the same key the pool renumbering uses, at 21 bits per axis rather than the
- *    previous version's 10, so a million-triangle mesh no longer has thousands of
- *    primitives sharing one code).
+ *    customary 10, which is what stops a million-triangle mesh putting thousands
+ *    of primitives on one code).
  * 3. A stable radix sort of (key, prim id), then a top-down binary split at the
  *    highest differing bit.
  * 4. Bottom-up AABB refit, inflated by the resolved tolerance.
@@ -563,7 +562,7 @@ typedef void (*IntersectionCallback)(const MFTL_Object *objA, int primA, const M
  *
  * A stack of (nodeA, nodeB) pairs, descending into whichever side has the larger
  * AABB so the two trees stay balanced against each other. Three things that buys
- * over the previous version's recursion:
+ * over a four-argument recursive descent:
  *
  *   - no call frame per node pair, and the hot state (both node pointers, the
  *     shift) stays in registers across the loop;
@@ -675,8 +674,12 @@ double MFTL_TriTriDistanceSq(const double A[3][3], const double B[3][3]);
  * ── Why this one is adaptive and nothing else in the module is ─────────────
  *
  * This is the only predicate in the file whose SIGN, rather than magnitude,
- * decides the answer, and Guigue-Devillers asks for that sign twelve times per
- * triangle pair. Everything else here -- distances, areas, interval endpoints --
+ * decides the answer, and Guigue-Devillers asks for that sign up to EIGHT times
+ * per triangle pair -- six to classify the corners against the two planes, and
+ * two in check_min_max. The six-way permutation cascade evaluates none of its
+ * own: it branches on signs that are already computed.
+ *
+ * Everything else here -- distances, areas, interval endpoints --
  * degrades continuously under rounding: a distance that is wrong in the last
  * ulp gives a contact decision that is wrong only for pairs sitting exactly on
  * the tolerance, which is a tie the caller has already accepted by choosing a

@@ -37,12 +37,12 @@
  * A triangle is written by storing three TARGET vertices (`he[3t+k].vertex_idx`
  * is the target of corner k, so the triple (v0,v1,v2) is stored as v1,v2,v0),
  * and the patch is closed by re-pointing the twins of the half-edges on its rim.
- * Three consequences worth stating, because they are what make this version's
- * operators shorter than the previous version's rather than longer:
+ * Three consequences worth stating, because implicit indexing makes these
+ * operators SHORTER than their explicitly-indexed equivalents rather than longer:
  *
  *   - FLIP allocates nothing at all. Both triangles are rewritten in place and
- *     four rim twins are re-pointed. There is no `next` cycle to repair, which
- *     was most of the previous version's flip.
+ *     four rim twins are re-pointed. There is no `next` cycle to repair, and
+ *     repairing it is most of what an explicitly-indexed flip does.
  *   - SPLIT appends one triangle per side (two for an interior edge, one at a
  *     mesh boundary) and its three half-edges come with it, at the right indices,
  *     by construction.
@@ -63,19 +63,19 @@
  *
  * ## DELETION IS COMPACTION, AND IT HAPPENS INSIDE THE ITERATION
  *
- * The previous version marked entities dead and compacted once, at the very end
- * of the whole remeshing call. That is cheaper by one pass and wrong by one
- * class of bug: between the first collapse and the final compaction, every
- * consumer that walks the pools rather than the topology sees the dead entities.
- * The previous version's smoother skipped them with a per-vertex flag test, and
- * its feature detector read `triangles[t].normal` of dead triangles.
+ * Marking entities dead and compacting once, at the very end of the whole
+ * remeshing call, is cheaper by one pass and wrong by one class of bug: between
+ * the first collapse and the final compaction, every consumer that walks the
+ * POOLS rather than the topology sees the dead entities. The smoother then needs
+ * a per-vertex flag test to skip them, and a feature detector reading
+ * `tris.normal` reads dead triangles' normals without noticing.
  *
  * Here MFTLRemeshCompactObject() runs at the end of each iteration's collapse
  * sweep, before anything geometric. What that buys is not tidiness, it is reuse:
  * after it the object is an ordinary valid mesh, so the smoother calls
  * MFTLObjectRefreshFrames() and MFTLComputeVertexNormals() -- the library's own
- * measured kernels, with exact area-weighted normals -- instead of the previous
- * version's open-coded per-vertex cross-product loop.
+ * measured kernels, with exact area-weighted normals -- instead of an open-coded
+ * per-vertex cross-product loop that has to know about the dead.
  *
  * ## GLOBAL IDS AND WHY THEY ARE RENUMBERED
  *
@@ -244,6 +244,36 @@ typedef enum
   MFTL_REMESH_PARALLEL_DISPERSED
 } MFTL_RemeshParallelStrategy;
 
+/**
+ * @brief Why the spanning fallback merged rank boxes, as a bitmask.
+ *
+ * A BITMASK rather than an enum because the triggers are not exclusive: a
+ * partition fine enough to break `h > 4*delta` is also, necessarily, one where
+ * most of the mesh is frozen, so both fire together and a single-valued field
+ * would have to pick one and discard the other.
+ *
+ * It exists because `n_coarse_groups` says how much parallelism was given up and
+ * says nothing about WHY, and the two triggers call for opposite responses. BAND
+ * means the pass would otherwise have left a lattice of un-remeshed mesh: the
+ * coarsening is not optional and the cost is the price of a correct answer.
+ * FROZEN means the pass would have converged perfectly well and merely spent
+ * most of every migration on entities it was not allowed to touch: the cheaper
+ * answers -- a longer target length, or the dispersed strategy -- are still
+ * available and should be preferred. Reading one as the other wastes either a
+ * mesh or a machine.
+ */
+typedef enum
+{
+  /** No trigger fired. `group` was {1,1,1} and the pass took the uncoarsened path. */
+  MFTL_REMESH_COARSEN_NONE = 0,
+  /** Correctness: the measured band failed \f$h > 4\delta\f$ on some cut axis. */
+  MFTL_REMESH_COARSEN_BAND = 1,
+  /** Efficiency: the frozen share exceeded #MFTL_RemeshParameters.coarsen_frozen_fraction. */
+  MFTL_REMESH_COARSEN_FROZEN = 2,
+  /** Size: the ensemble fitted under #MFTL_RemeshParameters.serial_gather_max_triangles. */
+  MFTL_REMESH_COARSEN_GATHER = 4
+} MFTL_RemeshCoarsenTrigger;
+
 // -----------------------------------------------------------------------------
 // 1. PARAMETERS
 // -----------------------------------------------------------------------------
@@ -272,9 +302,10 @@ typedef enum
    * which is the form Botsch & Kobbelt specify. The area weight is not a detail:
    * it is the entire mechanism by which the smoother equalises triangle SIZE, by
    * pulling vertices out of densely triangulated regions towards sparse ones. An
-   * unweighted mean of centroids -- which is what the previous version computed
-   * under this name -- is very nearly another umbrella operator, and a remesher
-   * using it loses most of its isotropy.
+   * unweighted mean of centroids is very nearly another umbrella operator, and a
+   * remesher using it loses most of its isotropy -- measured in
+   * docs/remeshing-quality-analysis.md, where it costs volume conservation (6.0 %
+   * against 3.5 %) rather than triangle quality.
    */
   MFTL_SMOOTH_TRIANGLE_BASED
 } MFTL_SmoothMode;
@@ -357,9 +388,9 @@ typedef struct
    * for that operation to be allowed. Guards collapse and flip against creating
    * inverted or near-degenerate triangles.
    *
-   * This has no counterpart in the previous version, and its absence there is
-   * the head of a feedback loop rather than a missing nicety: an inverted
-   * triangle presents a ~180 degree dihedral angle, the feature detector reads
+   * Omitting it is not a missing nicety, it is the head of a feedback loop: an
+   * inverted triangle presents a ~180 degree dihedral angle, the feature detector
+   * reads
    * that as a sharp edge, the smoother locks every vertex of it, and the
    * inversion becomes permanent. Measured in
    * docs/remeshing-quality-analysis.md.
@@ -472,37 +503,182 @@ typedef struct
   double dispersed_radius_fraction;
 
   /**
-   * SPANNING only: merge rank boxes into groups so that `h > 4*delta` can hold.
+   * SPANNING only: ARM the fallback that merges rank boxes into groups.
    *
-   *   0  never (the behaviour before this existed, and still the default)
-   *   1  automatic -- coarsen exactly as far as the MEASURED band requires
-   *  >1  automatic, but capped at this many ranks per group
+   *   0  never -- the fallback is disarmed and a too-fine partition degrades
+   *   1  armed (the default) -- coarsen exactly as far as a trigger requires
+   *  >1  armed, but capped at this many ranks per group
    *
-   * ══ THIS IS A CORRECTNESS ESCAPE HATCH, NOT A PERFORMANCE FEATURE ═══════
+   * ══ ARMED IS NOT THE SAME AS ACTIVE, AND THAT DISTINCTION IS THE POINT ═══
    *
-   * Raise the rank count on a fixed domain and the rank box shrinks until it is
-   * no longer wider than four frozen bands. Past that point the shift schedule
-   * DEGRADES SILENTLY: a lattice of bands along the cut planes that no placement
-   * ever offers to anyone, each of them a perfectly valid piece of mesh that no
-   * structural check can see. `converged` and `n_edges_hidden_long` are the only
-   * symptoms.
+   * A non-zero value does NOT mean "always coarsen". It means "coarsen if a
+   * trigger fires". MFTLRemeshCoarseningFactors returns {1,1,1} on every axis
+   * whose box is already wide enough, and MFTLRemeshCoarseOwnerProc at {1,1,1}
+   * is bit-for-bit MFTLRemeshOwnerProc -- so on a healthy partition the armed
+   * driver takes the identical code path and produces the identical mesh. That
+   * equivalence is asserted, not asserted about: see
+   * `test_the_fallback_stays_off_on_a_healthy_partition`.
    *
-   * Coarsening merges `group[k]` boxes per axis into one, which multiplies the
-   * box width by the same factor and makes the precondition hold again. The
-   * price is exactly what it sounds like: `1/(g0*g1*g2)` of the ranks do ALL the
-   * sweep work, and the remesh is 96-99 % of a timestep in the measured case.
-   * Two cheaper answers exist and should be preferred whenever they are
-   * available -- remesh to a LONGER TARGET LENGTH, or use the DISPERSED strategy
-   * if the bodies fit in a rank box (it has no band and so no precondition).
+   * The cost of arming it is one pre-pass before the phase loop -- a geometry
+   * refresh, one freeze classification and two small Allreduces, no migration
+   * and no sweeps -- which is what makes the decision come from a MEASUREMENT
+   * rather than from the 3*max_edge_length estimate that overstates the band by
+   * about three.
+   *
+   * ── The two triggers ─────────────────────────────────────────────
+   *
+   * CORRECTNESS (#MFTL_REMESH_COARSEN_BAND). Raise the rank count on a fixed
+   * domain and the rank box shrinks until it is no longer wider than four frozen
+   * bands. Past that point the shift schedule DEGRADES SILENTLY: a lattice of
+   * bands along the cut planes that no placement ever offers to anyone, each of
+   * them a perfectly valid piece of mesh that no structural check can see.
+   * `converged` and `n_edges_hidden_long` are the only symptoms.
+   *
+   * EFFICIENCY (#MFTL_REMESH_COARSEN_FROZEN). The correctness trigger is
+   * extraordinarily permissive, and the arithmetic says by how much: the band is
+   * delta either side of every plane, so the frozen share is
+   * `1 - (1 - 2*delta/h)^3`, and at the correctness limit `h = 4*delta` that is
+   * 87.5 % OF THE MESH. A pass may therefore migrate everything, every phase, to
+   * remesh a seventh of it, and report a clean certificate for doing so.
+   * `coarsen_frozen_fraction` is the second trigger, and MFTL_RemeshStats
+   * ::frozen_fraction is what it fires on.
+   *
+   * ══ WHAT COARSENING COSTS, STATED BEFORE YOU RELY ON IT ═══════════════
+   *
+   * `1/(g0*g1*g2)` of the ranks do ALL the sweep work, and the remesh is 96-99 %
+   * of a timestep in the measured case. For the BAND trigger that is the price
+   * of a correct answer and there is nothing to weigh it against. For the FROZEN
+   * trigger there is: the remedy divides the sweeping ranks by `g0*g1*g2` while
+   * raising useful-work-per-migration only from `(1-f_old)` to `(1-f_new)`, and
+   * the two cheaper answers are still available -- remesh to a LONGER TARGET
+   * LENGTH, or use the DISPERSED strategy if the bodies fit in a rank box (it
+   * has no band and so no precondition). Check
+   * MFTL_RemeshStats::coarsen_trigger before concluding which situation you are
+   * in.
    *
    * The factors are per axis (MFTLRemeshCoarseningFactors), because the
    * precondition is per axis: a domain thin in x only costs 2x parallelism
    * rather than 8x.
-   *
-   * Default 0 so that nothing about an existing run changes. Set it to 1 when
-   * `converged` comes back false and rank 0 has printed the band warning.
    */
   int parallel_coarsen;
+
+  /**
+   * SPANNING only: the share of owned triangles that may be FROZEN at the start
+   * of a pass before `parallel_coarsen` merges boxes to reduce it.
+   *
+   * >= 1.0 DISABLES this trigger, leaving `parallel_coarsen` armed on the
+   * correctness condition alone. That is the default, and the reasoning is
+   * below.
+   *
+   * ══ IT DEFAULTS TO DISABLED, AND THAT IS A MEASURED DECISION ═══════════
+   *
+   * This shipped disabled because the measurement said so, and the measurement
+   * is worth repeating here so nobody re-enables it by reasoning from the model
+   * alone. Frozen share of a refine-3 / refine-2 sphere on `[-1,1]^3`, trigger
+   * off so that the number is only observed:
+   *
+   *     np (grid)     target 0.06     target 0.20     target 0.40
+   *      2 (2x1x1)        8.6 %          16.9 %          16.9 %
+   *      4 (2x2x1)       16.7 %          31.9 %          31.9 %
+   *      8 (2x2x2)       24.4 %          45.0 %          45.0 %
+   *     27 (3x3x3)       36.6 %          66.2 %          66.2 %
+   *
+   * At a threshold of a third the np = 27 / target 0.06 cell fires. That
+   * configuration's actual complaint is `converged == false` with 55 hidden long
+   * edges, and its actual cause is `parallel_phase_budget` -- the mesh is far
+   * from its target and four placements are not enough. Coarsening would have
+   * answered it by merging 3x3x3 boxes into ONE, spending the whole machine's
+   * parallelism on the wrong disease. That is the shape of the objection in
+   * general, and the arithmetic behind it is not close: the remedy costs
+   * `g0*g1*g2` in ranks and buys `(1-f_new)/(1-f_old)` in useful work per
+   * migration, so g = 2 per axis is eight times fewer ranks sweeping for about
+   * 1.3x the useful work.
+   *
+   * Note also what the table does to the obvious model. `1 - (1 - 2*delta/h)^3`
+   * predicts 71 % where 36.6 % was measured -- it OVER-PREDICTS BY ABOUT TWO,
+   * because a sphere of radius 0.7 in a box of side 2 does not sample the cut
+   * planes uniformly. Anyone setting this field from the geometry rather than
+   * from MFTL_RemeshStats::frozen_fraction will coarsen roughly twice as far as
+   * they meant to.
+   *
+   * ── So what it is FOR ──────────────────────────────────────────────
+   *
+   * The correctness trigger already covers everything above about 87 %, which is
+   * where the schedule genuinely stops working. This one covers the band below
+   * that, where the pass works and merely works wastefully -- and whether
+   * trading ranks for it pays is a property of the run, not of the library. Set
+   * it when you have measured `frozen_fraction` on YOUR configuration and want
+   * to act on it. Leave it alone otherwise; the diagnostic is free either way,
+   * because `frozen_fraction` is reported whenever `parallel_coarsen` is armed.
+   */
+  double coarsen_frozen_fraction;
+
+  /**
+   * SPANNING only: below this many triangles in the whole ensemble, remesh on
+   * ONE rank. 0 (the default) disables it.
+   *
+   * ── It is not a special case; it is the top rung of the coarsening ladder ──
+   *
+   * The mechanism is `group[k] = cuts[k]`, which MFTLRemeshCoarseningFactors
+   * already clamps to and MFTLRemeshCoarseOwnerProc already maps to a single
+   * representative cell. Every entity lands on one rank, so nothing is
+   * replicated, so nothing is frozen; no axis retains an interior plane, so
+   * `n_distinct_placements` collapses to 1. The pass becomes ONE PLACEMENT, ONE
+   * SWEEP AND TWO MIGRATIONS -- the coarse one out and the closing
+   * MFTLRedistribute back to the canonical fine partition.
+   *
+   * ── Why a triangle count and not a ratio ────────────────────────────
+   *
+   * Because the count IS the memory guard. One rank holds the entire ensemble
+   * for the duration of the sweep, and the only thing that bounds what that
+   * costs is how many triangles there are.
+   *
+   * ── This is a trade, not a free win ───────────────────────────────
+   *
+   * The phase driver does roughly 3.9x the remeshing work of one serial pass,
+   * and on a mesh that can resolve its surface that extra work is worth what it
+   * looks like: at 18 300 triangles the distributed answer measures min q 0.85
+   * against the serial 0.72. Gathering buys time and gives that back. The
+   * default is 0 because the crossover has not been measured -- the np = 1 rows
+   * in docs/parallel-remeshing-analysis.md take a different code path and never
+   * pay for the gather, so they do not answer the question.
+   */
+  int serial_gather_max_triangles;
+
+  /**
+   * DISPERSED only: how far above the mean a rank's share of the bodies may go
+   * before the driver reassigns bodies away from it. <= 0 disables balancing and
+   * restores pure centroid ownership.
+   *
+   * 1.25 means "a quarter above the mean is close enough". The cap is
+   * `MAX(mean * slack, heaviest single body)`, and the second term is not a
+   * detail: a cap below the heaviest body is unachievable and the assignment
+   * loop would not terminate.
+   *
+   * ── What it fixes, and what it cannot ────────────────────────────
+   *
+   * Bodies go where their centroids are, and centroids cluster -- an emulsion is
+   * not a uniform distribution over the process grid. With N_bodies >> P that is
+   * a real and fixable imbalance, and this fixes it. With N_bodies < P it is not
+   * fixable by anything, because there is no remeshing work to give a rank that
+   * holds no body; MFTL_RemeshStats::n_ranks_idle reports which case you are in.
+   *
+   * ── Why LOCALITY FIRST ─────────────────────────────────────────
+   *
+   * A body stays on its centroid's owner unless that rank is over the cap, and
+   * a reassigned one prefers the least-loaded of the 26 cells around it before
+   * anywhere else. Object-centering is a 26-neighbour exchange exactly while
+   * every destination is within a box of the body, so the bodies that do not
+   * move keep the stencil and only the reassigned tail pushes redistribution
+   * onto its global path -- which it detects itself.
+   *
+   * The assignment is a pure function of replicated data (the reduced centroids
+   * and the reduced per-body weights), so every rank computes the same one
+   * without communicating about it. That is required, not merely nice:
+   * #MFTL_OwnerMap is undefined if two ranks name different destinations for the
+   * same entity.
+   */
+  double dispersed_balance_slack;
 } MFTL_RemeshParameters;
 
 /**
@@ -526,8 +702,15 @@ typedef struct
    *                THIS rank did. Printing `n_split` from rank 0 at np = 8 shows
    *                roughly an eighth of the mesh's splits.
    *   GLOBAL       converged, n_edges_hidden*, n_phases, n_migrations*,
-   *                n_coarse_groups, n_bodies_not_centred, band_*, and
-   *                n_ops_busiest_rank.
+   *                n_coarse_groups, coarsen_trigger, frozen_fraction,
+   *                n_bodies_not_centred, n_bodies_reassigned, n_ranks_idle,
+   *                load_imbalance, band_*, and n_ops_busiest_rank.
+   *
+   * The last four of those are global for a reason worth stating, because it is
+   * not the usual one: they are computed from REPLICATED data rather than
+   * reduced. The balancer's inputs come out of an Allreduce already, so every
+   * rank derives the same assignment and the same imbalance without a second
+   * collective.
    *
    * They are not all reduced because they are not all reducible: summing
    * `n_feature_edges` would double-count every edge in a halo, and `iterations`
@@ -598,12 +781,46 @@ typedef struct
    * Ranks per coarse group, i.e. `g0*g1*g2`. 1 means no coarsening happened,
    * which is the normal case and the default.
    *
-   * Greater than 1 means the pass could not have offered every entity to some
-   * rank at the fine decomposition, and merged boxes to fix it -- so this many
+   * Greater than 1 means a trigger fired and boxes were merged -- so this many
    * ranks shared one box and only one of them did any sweeping. It is the field
-   * that says "this run is not scaling and here is by how much".
+   * that says "this run is not scaling and here is by how much"; `coarsen_trigger`
+   * is the field that says why, and the two are only useful together.
+   *
+   * Equal to `nproc` means the whole ensemble was gathered onto one rank, which
+   * is `serial_gather_max_triangles` firing rather than anything going wrong.
    */
   int n_coarse_groups;
+
+  /**
+   * WHICH trigger merged the boxes, as a bitmask of #MFTL_RemeshCoarsenTrigger.
+   * #MFTL_REMESH_COARSEN_NONE (0) whenever `n_coarse_groups == 1`.
+   *
+   * Read it before acting on `n_coarse_groups`. BAND is not negotiable -- the
+   * alternative was an un-remeshed lattice. FROZEN and GATHER are trades, and
+   * both have cheaper alternatives that the library cannot take on its own: a
+   * longer target length, or the dispersed strategy.
+   */
+  int coarsen_trigger;
+
+  /**
+   * GLOBAL share of owned triangles that were FROZEN when the pass started, in
+   * [0, 1]. Zero after a dispersed or serial pass, which have no band, and zero
+   * when the pre-pass did not run (`parallel_coarsen == 0` and no gather
+   * threshold), because it is a measurement and not an estimate.
+   *
+   * ── THE MOST USEFUL SINGLE NUMBER ABOUT A SPANNING PASS ────────────────
+   *
+   * A frozen entity is migrated with everything else and then not touched, so
+   * this is the share of every migration that buys nothing. It is what
+   * `coarsen_frozen_fraction` fires on, and it is worth logging even with that
+   * trigger disabled: `converged` says the pass got there, `n_phases` says how
+   * many migrations it took, and this says how much of each one was wasted.
+   *
+   * Measured at the START of the pass, before any sweep, and on the CANONICAL
+   * partition -- so it describes the decomposition the caller handed in rather
+   * than any placement the driver chose.
+   */
+  double frozen_fraction;
 
   /**
    * THE ONE FIELD TO CHECK after a parallel pass. True means the driver reached
@@ -683,6 +900,47 @@ typedef struct
 
   /** Which distributed path actually ran. AUTO is never reported -- it resolves. */
   MFTL_RemeshParallelStrategy strategy;
+
+  /**
+   * DISPERSED only: bodies the balancer moved off the rank owning their
+   * centroid. Zero when `dispersed_balance_slack <= 0`, and zero when the
+   * geometric assignment was already inside the cap.
+   *
+   * The non-vacuity measure for the balancer: `load_imbalance` improving while
+   * this is zero means the fixture was never imbalanced, not that the balancer
+   * worked. A reassigned body is also the one that leaves the 26-neighbourhood,
+   * so this is simultaneously what the balance cost in message locality.
+   */
+  int n_bodies_reassigned;
+
+  /**
+   * DISPERSED only: ranks assigned no body weight at all, AFTER balancing.
+   *
+   * The number that separates the two halves of the `N_bodies` versus `P`
+   * problem, which call for opposite responses. Non-zero with
+   * `N_bodies >= nproc` is a balancer failure worth investigating. Non-zero with
+   * `N_bodies < nproc` is arithmetic: there are fewer bodies than ranks and no
+   * assignment can give every rank one, because a body is the smallest unit of
+   * work this strategy has.
+   */
+  int n_ranks_idle;
+
+  /**
+   * DISPERSED only: heaviest rank's body weight divided by the mean, AFTER
+   * balancing. 1.0 is perfect; it is never below 1.
+   *
+   * Compare it against `dispersed_balance_slack`. Above the slack means the
+   * balancer could not reach the cap, which happens for exactly two reasons and
+   * they are distinguishable: one body is heavier than the cap (unfixable -- a
+   * body is indivisible here), or there are fewer bodies than ranks (see
+   * `n_ranks_idle`).
+   *
+   * Weights are per-body GLOBAL triangle counts, so this predicts sweep time
+   * rather than body count -- one large body outweighs three small ones, which
+   * is what a barrier-synchronised phase actually cares about. It pairs with
+   * `n_ops_busiest_rank`, which measures the same imbalance after the fact.
+   */
+  double load_imbalance;
 
   /**
    * DISPERSED only: bodies that did not become wholly local after centering, so
@@ -793,7 +1051,14 @@ static inline void MFTLInitRemeshParams(MFTL_RemeshParameters *params, MFTL_Reme
   params->freeze_dilation_rings = 0;  /* the classification is exact; see the field */
   params->parallel_strategy = MFTL_REMESH_PARALLEL_AUTO;
   params->dispersed_radius_fraction = 0.4;
-  params->parallel_coarsen = 0; /* correctness escape hatch, off by default; see the field */
+
+  /* ARMED, not active. {1,1,1} on a healthy partition, and that path is
+   * bit-for-bit the uncoarsened one -- see the field, and
+   * test_the_fallback_stays_off_on_a_healthy_partition. */
+  params->parallel_coarsen = 1;
+  params->coarsen_frozen_fraction = 1.0; /* disabled: measured, and it did not pay. See the field. */
+  params->serial_gather_max_triangles = 0; /* off: the crossover is unmeasured */
+  params->dispersed_balance_slack = 1.25;
 }
 
 /**
@@ -1113,9 +1378,9 @@ int MFTLDetectFeatures(MFTL_Object *obj, double angle_degrees, double corner_ang
  *            neighbours, projected onto the ridge TANGENT. This redistributes
  *            the vertex along its feature curve without moving the curve.
  *
- *            The projection is the whole point. Moving to the midpoint itself --
- *            which is what the previous version did, at full strength and
- *            ignoring its own relaxation factor -- is a chord cut: it pulls the
+ *            The projection is the whole point. Moving to the midpoint itself,
+ *            at full strength and ignoring the relaxation factor, is a chord
+ *            cut: it pulls the
  *            vertex off the curve towards the straight line between its
  *            neighbours, so a repeatedly smoothed ridge shrinks. Over the tens
  *            of sweeps a remeshing pass performs, that is a large systematic
@@ -1172,17 +1437,34 @@ int MFTLRemeshObject(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL
 /**
  * @brief Remeshes every object of an ensemble. The entry point to use.
  *
- * Dispatches on the rank count, and the two paths are genuinely different
- * algorithms rather than one with a fast case:
+ * Dispatches on the rank count, and the paths are genuinely different algorithms
+ * rather than one with a fast case:
  *
- *   nproc == 1   MFTLRemeshObject per object. No MPI is called at all, and the
- *                result is bit-identical to what this function produced before
- *                the distributed driver existed.
- *   nproc >  1   MFTLRemeshChooseStrategy decides between
- *                MFTLRemeshEnsembleDispersed (bodies smaller than a rank box:
- *                move the bodies) and MFTLRemeshEnsembleParallel (bodies larger:
- *                move the cut planes). `params->parallel_strategy` overrides the
- *                choice; MFTL_RemeshStats.strategy reports what actually ran.
+ *   MFTLRemeshEnsemble
+ *   |
+ *   +-- nproc == 1 ?  --yes-->  MFTLRemeshObject per object.  NO MPI AT ALL, and
+ *   |                           the result is bit-identical to the serial answer.
+ *   |
+ *   +-- params->parallel_strategy
+ *       |
+ *       +-- SPANNING  ------------------->  MFTLRemeshEnsembleParallel
+ *       +-- DISPERSED ------------------->  MFTLRemeshEnsembleDispersed
+ *       +-- AUTO
+ *           |
+ *           +-- MFTLRemeshChooseStrategyMeasured        two Allreduces
+ *               |  (centroid, radius and triangle count of every body)
+ *               |
+ *               +-- max radius > dispersed_radius_fraction * box ?
+ *                     yes -->  MFTLRemeshEnsembleParallel    move the PLANES
+ *                     no  -->  MFTLRemeshEnsembleDispersed   move the BODIES
+ *
+ * The measurement AUTO takes is handed straight to the dispersed driver rather
+ * than retaken, so the choice costs two collectives and not four.
+ * MFTL_RemeshStats::strategy reports what actually ran.
+ *
+ * The call graph of each driver, with the decision taken at every branch and the
+ * cost of every collective, is in src/remeshing/README.md (@ref rem_dispatch,
+ * @ref rem_spanning_flow, @ref rem_dispersed_flow).
  *
  * @param      ens    The ensemble, remeshed in place.
  * @param      params The parameter block.
@@ -1369,15 +1651,32 @@ MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategy(MFTL_Ensemble *ens, const M
  * difference is one edge length -- the same order as the band widths this is
  * compared against.
  *
+ * ── The weight rides along, and that is the whole reason it is here ────────
+ *
+ * @p weight is each body's GLOBAL owned-triangle count, and it is produced by
+ * widening this function's existing per-body reduction by one slot rather than
+ * by taking a second one. That matters more than it sounds: this is the module's
+ * only O(num_objects) collective, so how many of them a pass takes is what
+ * decides its cost at ten thousand droplets -- and the number is one. Asking for
+ * the weights separately would have made it two.
+ *
+ * A count rather than an area, because it is a proxy for SWEEP TIME: the
+ * operators iterate over half-edges, and a body of many small triangles costs
+ * more to remesh than one of few large ones covering the same area.
+ *
  * @param      ens      The ensemble.
  * @param[out] centroid [3*num_objects], may be #MFTL_NULL.
  * @param radius   [num_objects] out, may be MFTL_NULL. Skipping it skips the
  *                 second collective.
+ * @param[out] weight [num_objects] global owned-triangle count per body, as a
+ *                    double so it rides the same reduction. May be #MFTL_NULL,
+ *                    which costs nothing either way -- the slot is reduced
+ *                    regardless.
  * @note Collective: one MPI_Allreduce of 8*num_objects doubles, then one of
  *       num_objects. Reads `tris.area` and `tris.center`, so the caller owes a
  *       current geometry pass.
  */
-void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radius);
+void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radius, double *weight);
 
 /**
  * @brief How many flow ranks would have to be grouped into one remeshing rank

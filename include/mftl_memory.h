@@ -10,14 +10,14 @@
  *
  *   SMALL, INDEPENDENT ARRAYS  -- the ensemble's object list, scratch buffers
  *   inside an algorithm. These use MFTLMallocOrDie / MFTLCallocOrDie and the
- *   growth macros, exactly as in the previous version.
+ *   growth macros.
  *
  *   POOL BLOCKS -- the vertex and triangle pools of an MFTL_Object. Those are
  *   NOT independent arrays: the AoS topology records and every SoA geometry
  *   array describe the SAME entities and must have the SAME capacity, always.
- *   The previous version tried to hold that together with three capacity fields
- *   and a rule ("every site that grows a pool must call Reserve"), and a missed
- *   site was a heap overflow rather than a wrong number.
+ *   Holding that together with three capacity fields and a rule ("every site that
+ *   grows a pool must call Reserve") fails at the first missed site, and it fails
+ *   as a heap overflow rather than as a wrong number.
  *
  *   Here the rule is replaced by a structure: one pool is ONE allocation, cut
  *   into cache-line-aligned sub-arrays by MFTLLayoutAdd below. There is one

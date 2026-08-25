@@ -4,8 +4,8 @@
  *
  * @brief Is the fused per-timestep update kernel actually optimal?
  *
- * src/ensemble/ensemble_update.c makes three claims that were inherited from the
- * previous version rather than re-measured on this one:
+ * src/ensemble/ensemble_update.c rests on three claims that are easy to assert
+ * and were, until this program, never measured on this layout:
  *
  *   1. FUSING geometry and quality statistics into one pass beats two passes,
  *      because the statistics come from vectors already in registers.
