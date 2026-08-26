@@ -216,8 +216,9 @@ mftl_add_mpi_test_at(test_io_np4 test_io 4)
 mftl_add_mpi_test_at(test_vertex_normals_np3 test_vertex_normals 3)
 
 # The scaling benchmark is an EXAMPLE, and no scaling sweep belongs in this
-# suite -- docs/pages/building.md states the rule: "The rank count is not a
-# scaling knob in this suite; it changes which code path is reachable."
+# suite -- the build guide (MFTL_Documentation/pages/building.md) states the
+# rule: "The rank count is not a scaling knob in this suite; it changes which
+# code path is reachable."
 #
 # What is registered is a CORRECTNESS check of that example, because a program
 # whose whole purpose is to report timings has to be right before its numbers

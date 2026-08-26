@@ -7,14 +7,6 @@ option(ENABLE_SANITIZERS "Enable Address and Undefined sanitizers in Debug mode"
 option(BUILD_EXAMPLES    "Build example executables" ON)
 option(BUILD_TESTING     "Build the unit test suite" ON)
 
-# Documentation is OFF by default and deliberately so: Doxygen with call graphs
-# enabled takes longer than the library compiles, nothing in the normal build
-# depends on it, and with the option OFF this file does not even call
-# find_package(Doxygen), so configuration time is unchanged. The standalone
-# route -- python3 build_docs.py -- needs no CMake at all.
-option(MFTL_BUILD_DOCS        "Add the 'docs' target (Doxygen manual)"       OFF)
-option(MFTL_DOCS_WARN_AS_ERROR "Fail the 'docs' target on a Doxygen warning" OFF)
-
 # -march=native bakes in the ISA of the *build* machine. On a cluster the login
 # node routinely differs from the compute nodes, which turns into SIGILL at run
 # time, so it must be opted into explicitly. Set MFTL_ARCH_FLAGS instead to
@@ -141,83 +133,20 @@ endif()
 
 # --- Documentation ---------------------------------------------------------
 #
-# The same template (docs/doxygen/Doxyfile.in) drives this target and
-# build_docs.py, and both substitute the same placeholders, so the two routes
-# cannot drift apart.
+# There is none here, on purpose. The Doxygen comments in include/ and src/**,
+# the ten src/<module>/README.md theory chapters and the four measurement
+# documents in docs/ are the sources; everything that RENDERS them -- the
+# Doxyfile, the MkDocs site, the page-generation machinery and their Python
+# environment -- lives in the separate MFTL_Documentation repository, which
+# reads this tree from wherever it is checked out.
 #
-# The target is NOT attached to `all`: `cmake --build build` never runs Doxygen,
-# only `cmake --build build --target docs` does.
-if(MFTL_BUILD_DOCS)
-    find_package(Doxygen)
-
-    if(NOT DOXYGEN_FOUND)
-        message(WARNING
-            "MFTL_BUILD_DOCS=ON but Doxygen was not found -- the 'docs' target "
-            "will not exist. Install it with 'brew install doxygen graphviz' or "
-            "'apt-get install doxygen graphviz'.")
-    else()
-        # Graphviz is optional. Without it the manual is complete except for the
-        # call, caller, include and directory graphs.
-        if(DOXYGEN_DOT_FOUND)
-            set(MFTL_DOCS_HAVE_DOT "YES")
-            get_filename_component(MFTL_DOCS_DOT_PATH "${DOXYGEN_DOT_EXECUTABLE}" DIRECTORY)
-        else()
-            set(MFTL_DOCS_HAVE_DOT "NO")
-            set(MFTL_DOCS_DOT_PATH "")
-            message(STATUS "Graphviz 'dot' not found -- documentation graphs disabled.")
-        endif()
-
-        set(MFTL_VERSION           "${PROJECT_VERSION}")
-        set(MFTL_DOCS_SOURCE_DIR   "${CMAKE_CURRENT_SOURCE_DIR}")
-        set(MFTL_DOCS_OUTPUT_DIR   "${CMAKE_BINARY_DIR}/docs")
-
-        set(MFTL_DOXYFILE_IN  "${CMAKE_CURRENT_SOURCE_DIR}/docs/doxygen/Doxyfile.in")
-        set(MFTL_DOXYFILE_OUT "${MFTL_DOCS_OUTPUT_DIR}/Doxyfile")
-
-        # @ONLY: the template contains shell and Doxygen syntax that uses ${...},
-        # which must survive untouched. Only @PLACEHOLDER@ is substituted.
-        configure_file("${MFTL_DOXYFILE_IN}" "${MFTL_DOXYFILE_OUT}" @ONLY)
-
-        set(MFTL_DOCS_STAMP "${MFTL_DOCS_OUTPUT_DIR}/html/index.html")
-
-        # The manual is regenerated when a source, a page or the configuration
-        # changes -- not on every build of the target.
-        file(GLOB_RECURSE MFTL_DOCS_DEPENDS CONFIGURE_DEPENDS
-             "${CMAKE_CURRENT_SOURCE_DIR}/include/*.h"
-             "${CMAKE_CURRENT_SOURCE_DIR}/src/*.c"
-             "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h"
-             "${CMAKE_CURRENT_SOURCE_DIR}/src/*.md"
-             "${CMAKE_CURRENT_SOURCE_DIR}/docs/*.md"
-             "${CMAKE_CURRENT_SOURCE_DIR}/docs/pages/*.md"
-             "${CMAKE_CURRENT_SOURCE_DIR}/docs/doxygen/*")
-
-        add_custom_command(
-            OUTPUT  "${MFTL_DOCS_STAMP}"
-            COMMAND ${DOXYGEN_EXECUTABLE} "${MFTL_DOXYFILE_OUT}"
-            DEPENDS "${MFTL_DOXYFILE_OUT}" ${MFTL_DOCS_DEPENDS}
-            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-            COMMENT "Generating the MFTL manual with Doxygen"
-            VERBATIM)
-
-        add_custom_target(docs DEPENDS "${MFTL_DOCS_STAMP}")
-
-        # Doxygen exits 0 even when it emits warnings, so "warnings are the
-        # acceptance criterion" has to be enforced on the log rather than on the
-        # exit code.
-        if(MFTL_DOCS_WARN_AS_ERROR)
-            add_custom_command(TARGET docs POST_BUILD
-                COMMAND ${CMAKE_COMMAND}
-                        -DLOG=${MFTL_DOCS_OUTPUT_DIR}/doxygen-warnings.log
-                        -P ${CMAKE_CURRENT_SOURCE_DIR}/docs/doxygen/check_warnings.cmake
-                VERBATIM)
-        endif()
-
-        add_custom_command(TARGET docs POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E echo
-                    "MFTL manual: ${MFTL_DOCS_STAMP}"
-            VERBATIM)
-    endif()
-endif()
+#     cd ../MFTL_Documentation
+#     python3 build_mkdocs.py --serve --open    # the web manual
+#     python3 build_docs.py --strict            # the Doxygen manual, zero-warning
+#
+# So this file never calls find_package(Doxygen) and there is no `docs` target:
+# a documentation toolchain cannot slow down, or fail, a library build it is not
+# part of.
 
 # --- Status Output ---
 message(STATUS "-------------------------------------------------")
@@ -232,6 +161,5 @@ message(STATUS "comm profiling   : ${MFTL_COMM_PROFILE}")
 message(STATUS "Extra arch flags : ${MFTL_ARCH_FLAGS}")
 message(STATUS "Build Examples   : ${BUILD_EXAMPLES}")
 message(STATUS "Build Tests      : ${BUILD_TESTING}")
-message(STATUS "Build Docs       : ${MFTL_BUILD_DOCS}   (target: docs)")
 message(STATUS "Output Directory : ${CMAKE_BINARY_DIR}/lib")
 message(STATUS "-------------------------------------------------")

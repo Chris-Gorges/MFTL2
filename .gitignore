@@ -29,6 +29,6 @@ info
 poltergeist.config.json
 run_mpi.sh
 
-# Documentation toolchain (python3 build_mkdocs.py)
-/.venv-docs/
+# The documentation toolchain lives in the separate MFTL_Documentation
+# repository and cannot appear here; only __pycache__ from the helper scripts.
 __pycache__/

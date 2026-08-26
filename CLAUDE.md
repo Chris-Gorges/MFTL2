@@ -181,98 +181,36 @@ hang instead of a clean failure.
 
 ## Documentation
 
-```bash
-python3 build_docs.py            # -> build/docs/html/index.html
-python3 build_docs.py --open     # and open it
-python3 build_docs.py --strict   # any Doxygen warning is a failure
-python3 build_docs.py --no-graphs  # skip Graphviz, much faster while editing prose
-
-cmake -S . -B build -DMFTL_BUILD_DOCS=ON     # the CMake route, same output
-cmake --build build --target docs            # NOT attached to `all`
-```
-
-`MFTL_BUILD_DOCS` defaults to **OFF**, and with it off `CMakeLists.txt` does not even call
-`find_package(Doxygen)` — so the normal build and its configuration time are unchanged. Both routes
-substitute the same placeholders into the one template, `docs/doxygen/Doxyfile.in`, so they cannot drift
-apart.
-
-### The web manual (MkDocs Material)
+**The documentation build is NOT in this repository.** It lives in
+`MFTL_Documentation`, normally checked out beside this one, and reads this tree from wherever it is. What
+stays here is only what is read in place: the Doxygen comments in `include/` and `src/**`, the ten
+`src/<module>/README.md` theory chapters (they render on GitHub next to the code they explain) and the four
+`docs/*-analysis.md` measurement documents (some thirty comments in `src/`, `include/`, `tests/` and
+`examples/` cite them by path).
 
 ```bash
-python3 build_mkdocs.py                 # -> build/site/index.html
+cd ../MFTL_Documentation
+python3 build_mkdocs.py                 # -> build/site/index.html   (the web manual)
 python3 build_mkdocs.py --serve --open  # live-reload dev server on :8000
-python3 build_mkdocs.py --strict        # any warning, Doxygen or MkDocs, is a failure
-python3 build_mkdocs.py --no-doxygen --no-graphs --serve   # fastest prose loop
+python3 build_docs.py --strict          # the Doxygen manual; any warning is a failure
+python3 build_docs.py --no-graphs       # much faster while editing prose
 ```
 
-The site is MkDocs + Material for the prose, **mkdoxy** for the API reference, and the **whole Doxygen HTML
-manual mounted inside it at `/doxygen/`** by `docs/mkdocs/hooks.py`. One artefact, one URL, and the call
-graphs / include graphs / annotated sources come along — those are Graphviz output, so nothing that renders
-the XML can reproduce them. First run creates `.venv-docs/` from `requirements-docs.txt`; that environment is
-private to the documentation, for the same reason `build_all.py` recreates `build/` every time.
+It locates this checkout through `mftl_paths.py`: `--source-dir`, `$MFTL_SOURCE_DIR`, its own
+`mftl-source.txt`, or a sibling `MFTL_6`/`MFTL` directory — so side-by-side checkouts need no configuration.
 
-**No prose is duplicated, and that is the whole design.** `docs/mkdocs/gen_pages.py` reads the files Doxygen
-reads — `docs/pages/*.md`, the ten `src/*/README.md`, the three `docs/*-analysis.md` — and `docs/mkdocs/doxymd.py`
-rewrites the Doxygen Markdown dialect into Material's at build time (setext headings, `[TOC]`, `@note`/`@warning`
-paragraphs, `\f$...\f$`, `@ref`/`@subpage`, `#MFTL_Symbol`, `MFTLFunction()`). Editing a module README updates
-both manuals; there is no second copy to keep in step.
+**Both manuals build with ZERO warnings, and that is the acceptance criterion.** `WARN_IF_UNDOCUMENTED`,
+`WARN_IF_INCOMPLETE_DOC`, `WARN_NO_PARAMDOC` and `WARN_IF_UNDOC_ENUM_VAL` are all on, so **a new function
+here without `@param`/`@return` fails `build_docs.py --strict` there**. Run it after touching any header —
+it is the one consequence of the split that a change in this repository can still trigger.
 
-Five things about the setup are load-bearing:
+`CMakeLists.txt` here has no `docs` target and never calls `find_package(Doxygen)`; the CMake route to the
+manual is `MFTL_Documentation`'s own `CMakeLists.txt` (`LANGUAGES NONE`, so it compiles nothing).
 
-- **Plugin order in `mkdocs.yml` decides whether the API cross-references exist.** mkdoxy runs Doxygen and
-  writes the XML in its `on_files` event; `gen-files` resolves `@ref` / `#MFTL_Symbol` / `MFTLFunction()`
-  against that XML. MkDocs fires plugin events in declaration order, so swapping them makes every API link in
-  the prose degrade to a plain code span — on a clean tree only, and **nothing reports it**: the pages still
-  build and still read correctly.
-- **mkdoxy's Doxyfile is derived from `docs/doxygen/Doxyfile.in`, not written by hand.** `docs/mkdocs/doxyfile.py`
-  flattens the template (Doxygen's `+=` accumulation has to be collapsed, because mkdoxy's config reader keeps
-  one value per key) and overrides only the output-format keys. Without it the seven MFTL aliases —
-  `@collective`, `@rank_local`, `@silentfailure` … — come out as literal text in the API reference while
-  rendering correctly in the Doxygen manual.
-- **Member anchors are computed, not discovered.** mkdoxy renders a member as `### function MFTLObjectCreate`,
-  so `doxymd.slugify` must reproduce `pymdownx.slugs.slugify(case="lower")` exactly. It is pinned by the
-  `slugify` setting of the `toc` extension in `mkdocs.yml`; changing one without the other silently produces
-  links to anchors that do not exist.
-- **`docs/manual/doxygen/*.html` are placeholders, and they are load-bearing.** MkDocs validates every link
-  against the source tree, so the pages linking into `/doxygen/` need a target that exists at *build* time.
-  `on_post_build` then replaces the whole directory with `build/docs/html`. Delete them and `--strict` fails;
-  keep them and a site built without Doxygen explains itself instead of 404ing.
-- **`smartsymbols`, `tilde`, `caret`, `mark` and `critic` are deliberately NOT enabled.** Each claims a
-  character this corpus uses literally (`~128 KB`, `a^2`, `ops == 0`, `4/6/19/17`), and the failure mode is
-  silent reformatting rather than an error.
-
-**The site builds with zero MkDocs warnings under `--strict`, and that is its acceptance criterion**, the same
-one the Doxygen manual carries.
-
-**The manual currently builds with ZERO warnings, and that is the acceptance criterion.**
-`WARN_IF_UNDOCUMENTED`, `WARN_IF_INCOMPLETE_DOC`, `WARN_NO_PARAMDOC` and `WARN_IF_UNDOC_ENUM_VAL` are all
-on, so a new function without `@param`/`@return` fails `--strict`. Run it after touching any header.
-
-Where the content lives:
-
-| Source | Becomes |
-|---|---|
-| `docs/pages/*.md` | the main page and the four guide pages (architecture, building, timestep, invariants, modules, analysis) |
-| `src/*/README.md` | one theory page per module, bound in with `@subpage` |
-| `docs/doxygen/groups.dox` | the `@defgroup` hierarchy — the ONE place a group is defined |
-| `docs/*-analysis.md` | the three measurement documents |
-| `include/*.h`, `src/**/*.c` | the API reference, plus Graphviz call/caller/include graphs |
-| `docs/manual/` | the MkDocs site's own pages: landing page, guide index, API overview, theme assets |
-| `docs/mkdocs/` | the site machinery: `gen_pages.py`, `doxymd.py`, `doxyxml.py`, `doxyfile.py`, `hooks.py`, theme overrides |
-| `mkdocs.yml` | the site configuration — nav, theme, plugin order |
-
-Three things about the setup that are easy to break:
-
-- **`IMPLICIT_DIR_DOCS = NO` is load-bearing.** Doxygen's default is to absorb a directory's `README.md`
-  into that DIRECTORY's documentation rather than making it a page. With it on, the `{#mftl_mod_*}` labels
-  do not exist and every `@subpage` to them dangles.
-- **The module READMEs carry GitHub-dialect LaTeX (`$ ... $`), not `\f$ ... \f$`.** They are read on
-  GitHub as well as here, so `docs/doxygen/md_math_filter.py` rewrites one into the other on the way in.
-  It skips fenced blocks, indented blocks and inline code spans, and it leaves text that is already in the
-  Doxygen dialect alone.
-- **A macro defined inside a function body cannot be documented in place** — the doc comment is attributed
-  to the enclosing FUNCTION, which then reports "too many @param commands". `ASCII_ARRAY` and `DECL` in
-  `src/io/vtu_writer.c` are documented with `@def` at file scope for that reason.
+Everything about how the manuals are wired — the two-root Doxyfile template, the MkDocs plugin order, the
+mkdoxy `src-dirs` placeholder the hooks replace, the computed member anchors, the deliberately-disabled
+Markdown extensions — is documented in `MFTL_Documentation/README.md` and in its `pages/building.md`. Read
+those before changing anything there; nothing in this repository depends on them.
 
 ## Architecture
 
