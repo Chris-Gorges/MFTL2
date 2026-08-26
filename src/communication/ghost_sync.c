@@ -129,12 +129,15 @@ static void answer_object_requests(const MFTL_Object *obj, ghost_field field, co
   const double *const restrict src = ghost_field_read(obj, field);
   const int n_local = obj->verts.n_local;
 
-  gt_begin(tbl, MFTL_MAX(obj->next_vertex_gid, 1));
-  for (int v = 0; v < n_local; ++v)
-  {
-    MFTL_ASSERT(vr[v].global_id < tbl->capacity && "ghost sync: vertex global id outside the object's id range");
-    gt_put(tbl, vr[v].global_id, v);
-  }
+  CS_BEGIN(ts_tbl);
+  /* Entry count and id range: the owned vertices go in, and their ids are drawn
+   * from the body's whole range. gt_begin() takes the direct-address path while
+   * this rank holds a reasonable share of the body and switches to a sparse table
+   * when it does not, which is what stops the table growing with the process
+   * count at a fixed problem size. See comm_internal.h. */
+  gt_begin(tbl, n_local, MFTL_MAX(obj->next_vertex_gid, 1));
+  for (int v = 0; v < n_local; ++v) gt_put(tbl, vr[v].global_id, v);
+  CS_END(ts_tbl, g_t_table);
 
   for (int i = first; i < last; ++i)
   {
@@ -142,7 +145,7 @@ static void answer_object_requests(const MFTL_Object *obj, ghost_field field, co
     const int gid = flat_recv[2 * k + 1];
     MFTL_GhostUpdatePayload *const p = &replies[k];
 
-    if (gid < 0 || gid >= tbl->capacity || !gt_has(tbl, gid))
+    if (gid < 0 || !gt_has(tbl, gid))
     {
       MFTL_ASSERT(0 && "ghost sync: asked for a vertex this rank does not own");
       memset(p, 0, sizeof *p);
@@ -182,6 +185,10 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
   const int nn = domain->num_neighbors;
 
   if (num_objects == 0 || nn == 0 || nproc == 1) return MFTL_SUCCESS;
+
+  CS_BEGIN(ts_total);
+  MFTLCommStats.g_n_calls++;
+  CS_BEGIN(ts_collect);
 
   /* ── 1. Collect every ghost we hold, grouped by its owner ────────────────
    *
@@ -238,14 +245,18 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
 
       ib_add2(&requests[n_idx], o, vr[v].global_id);
       ib_add2(&targets[n_idx], o, v);
+      MFTLCommStats.g_n_ghosts_requested++;
     }
   }
   free(rank_to_neigh);
+  MFTLCommStats.g_n_orphaned += orphaned;
 
   if (orphaned > 0)
   {
     fprintf(stderr, "[MFTL rank %d] ghost sync: %d ghost vertices whose owner is not a graph neighbour were not updated\n", domain->rank, orphaned);
   }
+
+  CS_END(ts_collect, g_t_collect);
 
   /* ── 2. Exchange request counts ──────────────────────────────────────────
    *
@@ -259,6 +270,7 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
   for (int i = 0; i < nn; ++i) n_send[i] = requests[i].size;
 
   MPI_Request count_req;
+  CS_BEGIN(ts_counts);
   MPI_Ineighbor_alltoall(n_send, 1, MPI_INT, n_recv, 1, MPI_INT, domain->comm_graph, &count_req);
 
   int *const s_displs = (int *) MFTLMallocOrDie((size_t) nn * sizeof(int), "ghost send displs");
@@ -276,6 +288,7 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
   }
 
   MPI_Wait(&count_req, MPI_STATUS_IGNORE);
+  CS_END(ts_counts, g_t_counts);
 
   int *const r_displs = (int *) MFTLMallocOrDie((size_t) nn * sizeof(int), "ghost recv displs");
   int total_recv = 0;
@@ -286,9 +299,15 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
   }
 
   /* ── 3. Exchange the requests ────────────────────────────────────────────── */
+  CS_BEGIN(ts_req);
   int *const flat_recv = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(total_recv, 1) * sizeof(int), "ghost incoming requests");
   MPI_Neighbor_alltoallv(flat_send, n_send, s_displs, MPI_INT, flat_recv, n_recv, r_displs, MPI_INT, domain->comm_graph);
   free(flat_send);
+  CS_END(ts_req, g_t_requests);
+  MFTLCommStats.g_n_bytes_sent += (long) total_send * (long) sizeof(int);
+  MFTLCommStats.g_n_bytes_recv += (long) total_recv * (long) sizeof(int);
+
+  CS_BEGIN(ts_answer);
 
   /* ── 4. Answer them ──────────────────────────────────────────────────────
    *
@@ -338,19 +357,24 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
   }
 
   {
-    mftl_gid_table tbl;
-    gt_init(&tbl);
+    /* The ensemble's, not a local: this table is sized by a body's id range, and
+     * building and releasing one per TIMESTEP was the last per-step allocation on
+     * either path. It is retired by an epoch bump inside answer_object_requests,
+     * which is what the epoch was always for. */
+    mftl_gid_table *const tbl = MFTLCommWorkspaceGhostTable(ens);
     for (int o = 0; o < num_objects; ++o)
     {
       if (obj_off[o + 1] == obj_off[o]) continue;  // nothing asked of this body
-      answer_object_requests(objects[o], field, flat_recv, order, obj_off[o], obj_off[o + 1], replies, &tbl, &unserved);
+      answer_object_requests(objects[o], field, flat_recv, order, obj_off[o], obj_off[o + 1], replies, tbl, &unserved);
     }
-    gt_free(&tbl);
   }
 
   free(order);
   free(obj_off);
   free(flat_recv);
+  CS_END(ts_answer, g_t_answer);
+
+  CS_BEGIN(ts_rep);
 
   /* ── 5. Send the replies back ─────────────────────────────────────────────
    * No extra count exchange: the reply counts are exactly the request counts
@@ -372,6 +396,10 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
   MPI_Neighbor_alltoallv(replies, n_send_rep, r_displs, MFTL_MPI_GhostUpdatePayload, incoming, n_recv_rep, s_displs, MFTL_MPI_GhostUpdatePayload,
                          domain->comm_graph);
   free(replies);
+  CS_END(ts_rep, g_t_replies);
+  MFTLCommStats.g_n_bytes_sent += (long) (total_recv / 2) * (long) sizeof(MFTL_GhostUpdatePayload);
+  MFTLCommStats.g_n_bytes_recv += (long) (total_send / 2) * (long) sizeof(MFTL_GhostUpdatePayload);
+  CS_BEGIN(ts_apply);
 
   /* ── 6. Apply ─────────────────────────────────────────────────────────────
    * The replies come back in exactly the order the requests went out, so the
@@ -411,6 +439,8 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
   }
 
   free(incoming);
+  CS_END(ts_apply, g_t_apply);
+  CS_BEGIN(ts_free);
   for (int i = 0; i < nn; ++i)
   {
     ib_free(&requests[i]);
@@ -422,7 +452,9 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
   free(n_recv);
   free(s_displs);
   free(r_displs);
+  CS_END(ts_free, g_t_teardown);
 
+  CS_END(ts_total, g_t_total);
   return (unserved == 0) ? MFTL_SUCCESS : MFTL_ERROR;
 }
 

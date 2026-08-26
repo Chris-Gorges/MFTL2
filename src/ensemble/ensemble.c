@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "mftl_communication.h"
 #include "mftl_constants.h"
 #include "mftl_memory.h"
 #include "mftl_object.h"
@@ -237,6 +238,9 @@ void MFTLEnsembleDestroy(MFTL_Ensemble **p_ens)
   // 1. Destroy every object the ensemble owns
   for (int i = 0; i < ens->num_objects; ++i) MFTLObjectDestroy(&ens->objects[i]);
   free(ens->objects);
+
+  // 1b. And the communication module's scratch, if a redistribution built one
+  MFTLCommWorkspaceDestroy(&ens->comm_workspace);
 
   // 2. Release the domain resources
   MFTL_Domain *dom = &ens->domain;

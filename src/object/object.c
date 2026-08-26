@@ -345,6 +345,23 @@ void MFTLObjectClear(MFTL_Object *obj)
   obj->derived = 0u;
 }
 
+void MFTLObjectReleasePools(MFTL_Object *obj)
+{
+  MFTL_ASSERT(obj != MFTL_NULL);
+  MFTL_ASSERT(obj->verts.n == 0 && obj->tris.n == 0 && "MFTLObjectReleasePools: the object still holds entities");
+
+  free(obj->verts.block);
+  free(obj->tris.block);
+
+  /* Re-zeroed through the same path MFTLObjectCreate uses, so a released object
+   * is indistinguishable from a freshly created one and the next
+   * MFTLObjectReserve() simply allocates. Rebinding the sub-array pointers to
+   * NULL matters: MFTLObjectPoolsAreConsistent derives them from `block`, and a
+   * dangling pointer here would pass every count-based check. */
+  memset(&obj->verts, 0, sizeof obj->verts);
+  memset(&obj->tris, 0, sizeof obj->tris);
+}
+
 bool MFTLObjectPoolsAreConsistent(const MFTL_Object *obj)
 {
   if (obj == MFTL_NULL) return MFTL_FALSE;

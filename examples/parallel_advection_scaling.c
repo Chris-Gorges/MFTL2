@@ -1054,6 +1054,106 @@ static void run_step(MFTL_Ensemble *ens, const config *cfg, const double *vel, r
  * @param fp Destination.
  * @param s  The string.
  */
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Redistribution internals
+ *
+ * The phase table says the redistribution is the expensive phase. These say
+ * which PART of it is, which is the question an architecture decision actually
+ * turns on -- and the one that had no answer before #MFTL_RedistributeStats
+ * existed, because src/communication/ contained no timers at all.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Nanoseconds one MPI_Wtime() call costs on this machine.
+ *
+ * The redistribution instrumentation reads the clock once per phase boundary per
+ * BODY, so the perturbation scales with the body count. At a thousand droplets it
+ * is several per cent of the phase, and the breakdown is only honest if it says
+ * so -- hence measured rather than quoted, since MPI implementations differ by an
+ * order of magnitude in how MPI_Wtime is implemented.
+ *
+ * Best of five batches rather than a mean: the quantity wanted is the cost of the
+ * call itself, and every disturbance can only add to it.
+ *
+ * @return Cost of one call, in nanoseconds.
+ */
+static double measure_clock_cost(void)
+{
+  const int batch = 20000;
+  double best = 1e30;
+
+  for (int r = 0; r < 5; ++r)
+  {
+    const double t0 = MPI_Wtime();
+    double sink = 0.0;
+    for (int i = 0; i < batch; ++i) sink += MPI_Wtime();
+    const double dt = MPI_Wtime() - t0;
+
+    if (sink == 0.0) best = 0.0;  // keeps the loop observable
+    if (dt < best) best = dt;
+  }
+  return 1e9 * best / (double) batch;
+}
+
+/** @brief JSON keys for the redistribution sub-phases, in struct order. */
+static const char *const RSTAT_KEY[] = {"setup",      "owners",     "masks",     "destinations", "route",    "pack",   "exchange_counts",
+                                        "exchange_post", "wait",    "group",     "reserve",      "kept_gather", "kept_place", "relink",
+                                        "arrivals",   "twins",      "derived_topology", "derived_frames", "teardown"};
+
+/** @brief Human labels for the same, padded for the printed table. */
+static const char *const RSTAT_LABEL[] = {"setup           ", "owner classify  ", "mask clear      ", "destinations    ", "route decision  ",
+                                          "pack            ", "exchange counts ", "exchange post   ", "exchange wait   ", "arrival grouping",
+                                          "pool growth     ", "kept: gather    ", "kept: place     ", "kept: relink    ", "arrivals        ",
+                                          "twin repair     ", "derived topology", "derived FRAMES  ", "teardown        "};
+
+#define N_RSTAT 19
+
+/** @brief JSON keys for the ghost-sync sub-phases, in struct order. */
+static const char *const GSTAT_KEY[] = {"collect", "exchange_counts", "exchange_requests", "owner_table", "answer", "exchange_replies", "apply", "teardown"};
+
+/** @brief Human labels for the same. */
+static const char *const GSTAT_LABEL[] = {"collect requests", "exchange counts ", "exchange request", "owner id table  ",
+                                          "answer          ", "exchange replies", "apply           ", "teardown        "};
+
+#define N_GSTAT 8
+
+/**
+ * @brief Flattens #MFTL_RedistributeStats into the arrays the report and the
+ *        JSON both read, and reduces them to rank 0.
+ *
+ * Sums rather than maxima, for the reason the phase table gives: a per-bucket
+ * maximum lands on a different rank for each bucket and the parts stop adding up
+ * to the whole. Divide by the rank count for a per-rank mean.
+ *
+ * @param      st  This rank's counters.
+ * @param[out] rt  `[N_RSTAT]` redistribution bucket sums.
+ * @param[out] gt  `[N_GSTAT]` ghost-sync bucket sums.
+ * @param[out] tot `[2]` the two totals, `{redistribute, ghost sync}`.
+ * @param[out] ct  `[26]` counter sums, in the order the caller indexes them.
+ */
+static void rstats_reduce(const MFTL_RedistributeStats *st, double *rt, double *gt, double *tot, long *ct)
+{
+  const double lt[N_RSTAT] = {st->t_setup,     st->t_owners,          st->t_masks,           st->t_destinations, st->t_route,
+                              st->t_pack,      st->t_exchange_counts, st->t_exchange_data,   st->t_wait,         st->t_group,
+                              st->t_reserve,   st->t_kept_gather,     st->t_kept_place,      st->t_relink,       st->t_arrivals,
+                              st->t_twins,     st->t_derived_topology, st->t_derived_frames, st->t_teardown};
+  const double lg[N_GSTAT] = {st->g_t_collect, st->g_t_counts, st->g_t_requests, st->g_t_table, st->g_t_answer, st->g_t_replies, st->g_t_apply,
+                              st->g_t_teardown};
+  const double ltot[2] = {st->t_total, st->g_t_total};
+  const long lc[26] = {st->n_calls,          st->n_verts_scanned,      st->n_tris_scanned,   st->n_verts_owner_changed,
+                       st->n_tris_owner_changed, st->n_verts_kept,     st->n_tris_kept,      st->n_verts_received,
+                       st->n_tris_received,  st->n_destinations,       st->n_messages,       st->n_bytes_sent,
+                       st->n_bytes_recv,     st->n_route_neighbor,     st->n_route_global,   st->n_objects_visited,
+                       st->n_objects_empty_local, st->n_allocs,        st->n_frees,          st->n_bytes_allocated,
+                       st->n_gid_table_bytes, st->n_dedup_overflow,    st->n_clock_reads,    st->g_n_ghosts_requested,
+                       st->g_n_orphaned,     st->g_n_bytes_allocated};
+
+  MPI_Reduce(lt, rt, N_RSTAT, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+  MPI_Reduce(lg, gt, N_GSTAT, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+  MPI_Reduce(ltot, tot, 2, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+  MPI_Reduce(lc, ct, 26, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+}
+
 static void json_str(FILE *fp, const char *s)
 {
   fputc('"', fp);
@@ -1266,16 +1366,26 @@ int main(int argc, char **argv)
   double best_wall = 0.0;
   bool have_best = false;
 
+  /* The internals are captured PER REPEAT and kept alongside the winning wall
+   * clock. The accumulator is global and would otherwise sum every repeat,
+   * describing a run that was never reported. */
+  MFTL_RedistributeStats best_rstats;
+  memset(&best_rstats, 0, sizeof best_rstats);
+
   for (int rep = 0; rep < cfg.repeat; ++rep)
   {
     run_state st;
     memset(&st, 0, sizeof st);
+    MFTLRedistributeStatsReset();
 
     MPI_Barrier(MPI_COMM_WORLD);
     const double w0 = MPI_Wtime();
     for (int s = 0; s < cfg.steps; ++s) run_step(ens, &cfg, vel, &st, s, ref_ptr, &series[(size_t) s * N_PHASE]);
     MPI_Barrier(MPI_COMM_WORLD);
     const double wall_local = MPI_Wtime() - w0;
+
+    MFTL_RedistributeStats rstats_this;
+    MFTLRedistributeGetStats(&rstats_this);
 
     /* The selection criterion must be bit-identical on every rank, or two ranks
      * would keep different repeats and the reductions below would mix them. */
@@ -1286,6 +1396,7 @@ int main(int argc, char **argv)
     {
       best = st;
       best_wall = wall;
+      best_rstats = rstats_this;
       have_best = true;
       memcpy(best_series, series, series_n * sizeof(double));
     }
@@ -1293,6 +1404,13 @@ int main(int argc, char **argv)
   }
 
   /* ---- Reductions ------------------------------------------------------ */
+
+  /* Collective: every rank calls it, only rank 0 receives. Placed with the other
+   * reductions so the instrument stays out of the timed region entirely. */
+  double rstat_t[N_RSTAT], gstat_t[N_GSTAT], rstat_tot[2];
+  long rstat_c[26];
+  rstats_reduce(&best_rstats, rstat_t, gstat_t, rstat_tot, rstat_c);
+  const double clock_ns = measure_clock_cost();
 
   /* Three reductions for the phase statistics: sum and sum-of-squares in one
    * MPI_SUM array (mean and variance), then MPI_MAX and MPI_MIN. Doing this once
@@ -1403,6 +1521,58 @@ int main(int argc, char **argv)
     }
     printf("  NOTE max/mean is a LOWER bound for a collective phase: the collective has already equalised the finish times.\n");
 
+    {
+      const double inv_p = 1.0 / (double) nproc;
+      const double red_total = rstat_tot[0] * inv_p;
+      const double gs_total = rstat_tot[1] * inv_p;
+      const double mb = 1.0 / (1024.0 * 1024.0);
+
+      printf("  -- inside the redistribution (mean per rank) --------------------------\n");
+      printf("  %s %10.4f s  %5.1f %%  %8.4f ms/step\n", "TOTAL           ", red_total, 100.0 * red_total / best_wall, 1000.0 * red_total / per_step);
+      double acc = 0.0;
+      for (int i = 0; i < N_RSTAT; ++i)
+      {
+        const double v = rstat_t[i] * inv_p;
+        acc += v;
+        if (v <= 0.0) continue;
+        printf("  %s %10.4f s  %5.1f %%  %8.4f ms/step\n", RSTAT_LABEL[i], v, (red_total > 0.0) ? 100.0 * v / red_total : 0.0, 1000.0 * v / per_step);
+      }
+      printf("  %s %10.4f s  %5.1f %%   <- untimed residue; a big one means a phase has no timer\n", "residue         ", red_total - acc,
+             (red_total > 0.0) ? 100.0 * (red_total - acc) / red_total : 0.0);
+
+      printf("  -- inside the ghost sync (mean per rank) ------------------------------\n");
+      printf("  %s %10.4f s  %5.1f %%  %8.4f ms/step\n", "TOTAL           ", gs_total, 100.0 * gs_total / best_wall, 1000.0 * gs_total / per_step);
+      acc = 0.0;
+      for (int i = 0; i < N_GSTAT; ++i)
+      {
+        const double v = gstat_t[i] * inv_p;
+        acc += v;
+        if (v <= 0.0) continue;
+        printf("  %s %10.4f s  %5.1f %%  %8.4f ms/step\n", GSTAT_LABEL[i], v, (gs_total > 0.0) ? 100.0 * v / gs_total : 0.0, 1000.0 * v / per_step);
+      }
+      printf("  %s %10.4f s  %5.1f %%\n", "residue         ", gs_total - acc, (gs_total > 0.0) ? 100.0 * (gs_total - acc) / gs_total : 0.0);
+
+      printf("  -- what the redistribution moved (all ranks, per step) ----------------\n");
+      printf("  entities classified        %10.0f v + %.0f t   (%.2f %% / %.2f %% changed owner)\n", (double) rstat_c[1] / per_step,
+             (double) rstat_c[2] / per_step, (rstat_c[1] > 0) ? 100.0 * (double) rstat_c[3] / (double) rstat_c[1] : 0.0,
+             (rstat_c[2] > 0) ? 100.0 * (double) rstat_c[4] / (double) rstat_c[2] : 0.0);
+      printf("  kept / received            %10.0f / %.0f v      %.0f / %.0f t\n", (double) rstat_c[5] / per_step, (double) rstat_c[7] / per_step,
+             (double) rstat_c[6] / per_step, (double) rstat_c[8] / per_step);
+      printf("  wire volume                %10.3f MB/step out   %.3f MB/step in\n", (double) rstat_c[11] * mb / per_step,
+             (double) rstat_c[12] * mb / per_step);
+      printf("  messages / destinations    %10.0f / %.0f per step\n", (double) rstat_c[10] / per_step, (double) rstat_c[9] / per_step);
+      printf("  route neighbour / global   %10ld / %ld calls\n", rstat_c[13], rstat_c[14]);
+      printf("  bodies visited / EMPTY     %10.0f / %.0f per step   (%.1f %% of the per-body work is on nothing)\n", (double) rstat_c[15] / per_step,
+             (double) rstat_c[16] / per_step, (rstat_c[15] > 0) ? 100.0 * (double) rstat_c[16] / (double) rstat_c[15] : 0.0);
+      printf("  allocations                %10.0f /step        %.3f MB/step requested\n", (double) rstat_c[17] / per_step,
+             (double) rstat_c[19] * mb / per_step);
+      printf("  of which the id tables     %10.3f MB/step      <- sized from the GLOBAL id range, not the local one\n",
+             (double) rstat_c[20] * mb / per_step);
+      if (rstat_c[21] > 0) printf("  dedup budget exhausted     %10ld times\n", rstat_c[21]);
+      printf("  clock reads (instrument)   %10.0f /rank/step   %.4f ms/step at %.1f ns each\n", (double) rstat_c[22] / per_step / (double) nproc,
+             (double) rstat_c[22] / per_step / (double) nproc * clock_ns * 1e-6, clock_ns);
+    }
+
     printf("  -- partition ---------------------------------------------------------\n");
     printf("  owned triangles            %10ld   (mean %.0f, min %ld, max %ld per rank)\n", halo_sum[0], owned_mean, owned_min, owned_max);
     printf("  structural imbalance       %10.3f   (busiest rank / average owned triangles)\n", struct_imb);
@@ -1503,6 +1673,26 @@ int main(int argc, char **argv)
           fprintf(fp, "],\n");
         }
 
+        fprintf(fp, "  \"redistribute_internals_s\": {\n");
+        for (int i = 0; i < N_RSTAT; ++i)
+          fprintf(fp, "    \"%s\": %.17g%s\n", RSTAT_KEY[i], rstat_t[i] / (double) nproc, (i + 1 < N_RSTAT) ? "," : "");
+        fprintf(fp, "  },\n");
+        fprintf(fp, "  \"ghost_sync_internals_s\": {\n");
+        for (int i = 0; i < N_GSTAT; ++i)
+          fprintf(fp, "    \"%s\": %.17g%s\n", GSTAT_KEY[i], gstat_t[i] / (double) nproc, (i + 1 < N_GSTAT) ? "," : "");
+        fprintf(fp, "  },\n");
+        fprintf(fp, "  \"redistribute_total_s\": %.17g,\n  \"ghost_sync_total_s\": %.17g,\n", rstat_tot[0] / (double) nproc,
+                rstat_tot[1] / (double) nproc);
+        fprintf(fp, "  \"redistribute_counters\": {\"calls\": %ld, \"verts_scanned\": %ld, \"tris_scanned\": %ld, \"verts_moved\": %ld, "
+                    "\"tris_moved\": %ld, \"verts_kept\": %ld, \"tris_kept\": %ld, \"verts_recv\": %ld, \"tris_recv\": %ld, "
+                    "\"destinations\": %ld, \"messages\": %ld, \"bytes_sent\": %ld, \"bytes_recv\": %ld, \"route_neighbor\": %ld, "
+                    "\"route_global\": %ld, \"bodies_visited\": %ld, \"bodies_empty\": %ld, \"allocs\": %ld, \"frees\": %ld, "
+                    "\"bytes_allocated\": %ld, \"gid_table_bytes\": %ld, \"dedup_overflow\": %ld, \"clock_reads\": %ld, "
+                    "\"ghosts_requested\": %ld, \"ghosts_orphaned\": %ld},\n",
+                rstat_c[0], rstat_c[1], rstat_c[2], rstat_c[3], rstat_c[4], rstat_c[5], rstat_c[6], rstat_c[7], rstat_c[8], rstat_c[9], rstat_c[10],
+                rstat_c[11], rstat_c[12], rstat_c[13], rstat_c[14], rstat_c[15], rstat_c[16], rstat_c[17], rstat_c[18], rstat_c[19], rstat_c[20],
+                rstat_c[21], rstat_c[22], rstat_c[23], rstat_c[24]);
+        fprintf(fp, "  \"clock_cost_ns\": %.17g,\n", clock_ns);
         fprintf(fp, "  \"failures\": %d\n}\n", failures_total);
         fclose(fp);
       }

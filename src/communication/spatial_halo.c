@@ -465,7 +465,10 @@ static void rebuild_patch(MFTL_SpatialHalo *halo, int body, const MFTL_PackedVer
   {
     if (verts[i].global_id > max_gid) max_gid = verts[i].global_id;
   }
-  gt_begin(tbl, max_gid + 1);
+  /* Entry count and id range. A halo patch is a thin shell of another rank's
+   * share, so its ids are a sparse scattering over the whole body -- this is the
+   * case gt_begin()'s sparse mode exists for. */
+  gt_begin(tbl, n_verts, max_gid + 1);
 
   ib_reset(scratch);
 
@@ -518,7 +521,7 @@ static void rebuild_patch(MFTL_SpatialHalo *halo, int body, const MFTL_PackedVer
     for (int k = 0; k < 3; ++k)
     {
       const int g = p->vertex_gid[k];
-      if (g < 0 || g >= tbl->capacity || !gt_has(tbl, g))
+      if (g < 0 || !gt_has(tbl, g))
       {
         ok = MFTL_FALSE;
         break;
@@ -558,7 +561,7 @@ static void rebuild_patch(MFTL_SpatialHalo *halo, int body, const MFTL_PackedVer
       for (int k = 0; k < 3; ++k)
       {
         const int g = p->vertex_gid[k];
-        if (g < 0 || g >= tbl->capacity || !gt_has(tbl, g)) ok = MFTL_FALSE;
+        if (g < 0 || !gt_has(tbl, g)) ok = MFTL_FALSE;
       }
       if (!ok) continue;
 

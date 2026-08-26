@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "comm_internal.h"
 #include "mftl_constants.h"
 #include "mftl_memory.h"
 
@@ -142,6 +143,7 @@ void MFTLExchangeStart(const MFTL_Domain *domain, MFTL_Exchange *x, int n_payloa
    * and de-interleaved afterwards. A 1-int all-to-all is pure latency and does
    * not get cheaper with fewer bytes -- paying it once instead of once per
    * payload is what makes this scale. */
+  CS_BEGIN(ts_counts);
   int *stage = (int *) MFTLMallocOrDie(2 * block * sizeof(int), "MFTLExchangeStart staging");
   int *stage_recv = stage + block;
 
@@ -165,8 +167,12 @@ void MFTLExchangeStart(const MFTL_Domain *domain, MFTL_Exchange *x, int n_payloa
     }
   }
   free(stage);
+  cs_alloc(4 * block * sizeof(int) + 2 * block * sizeof(int));
+  cs_free();
+  CS_END(ts_counts, t_exchange_counts);
 
   /* ── 2. Displacements, buffers, and the rank-ordered send image ─────────── */
+  CS_BEGIN(ts_data);
   for (int p = 0; p < np; ++p)
   {
     int *const sc = s_cnt + (size_t) p * stride;
@@ -189,6 +195,7 @@ void MFTLExchangeStart(const MFTL_Domain *domain, MFTL_Exchange *x, int n_payloa
      * implementations differ on whether they validate the pointer first. */
     x[p].recv_buf = MFTLMallocOrDie((size_t) (r_tot > 0 ? r_tot : 1) * x[p].type_size, "MFTLExchangeStart recv");
     ctx->flat_send[p] = (char *) MFTLMallocOrDie((size_t) (s_tot > 0 ? s_tot : 1) * x[p].type_size, "MFTLExchangeStart send");
+    cs_alloc((size_t) ((r_tot > 0 ? r_tot : 1) + (s_tot > 0 ? s_tot : 1)) * x[p].type_size);
 
     for (int i = 0; i < nt; ++i)
     {
@@ -217,6 +224,8 @@ void MFTLExchangeStart(const MFTL_Domain *domain, MFTL_Exchange *x, int n_payloa
     else
       MPI_Ineighbor_alltoallv(ctx->flat_send[p], sc, sd, x[p].type, x[p].recv_buf, rc, rd, x[p].type, comm, &ctx->requests[p]);
   }
+
+  CS_END(ts_data, t_exchange_data);
 }
 
 void MFTLExchangeWait(MFTL_ExchangeCtx *ctx, int payload)

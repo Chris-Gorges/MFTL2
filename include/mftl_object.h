@@ -137,6 +137,32 @@ void MFTLObjectSetCounts(MFTL_Object *obj, int n_vertices, int n_local_vertices,
 void MFTLObjectClear(MFTL_Object *obj);
 
 /**
+ * @brief Empties the mesh AND gives its two pool blocks back to the allocator.
+ *
+ * The counterpart to MFTLObjectClear(), which deliberately keeps the allocations
+ * so that a mesh of stable size does not re-fault its pages every timestep. This
+ * one is for the opposite case: a body that is no longer here at all.
+ *
+ * Pools never shrink (see vertex_pool_reserve in src/object/object.c, and it is
+ * the right default), so an object keeps whatever capacity it ever reached for
+ * the rest of its life. On the generation path that is the whole mesh: bodies are
+ * built on rank 0 and then redistributed, so rank 0 retains capacity for every
+ * body in the ensemble -- `5120 * 4^refine + 176` bytes each, which
+ * docs/scaling-analysis.md prices at 671 MB for 512 bodies at refine 4. Nothing
+ * short of freeing the block recovers it.
+ *
+ * @param obj The mesh. Must already hold no entities -- this frees storage, it
+ *            does not decide what to discard. Afterwards the object is exactly as
+ *            MFTLObjectCreate() left it, and the next MFTLObjectReserve()
+ *            allocates from nothing.
+ *
+ * @warning Every pointer into either pool is dangling afterwards.
+ *
+ * @rank_local
+ */
+void MFTLObjectReleasePools(MFTL_Object *obj);
+
+/**
  * @brief Debug-only structural check of the pools themselves.
  *
  * Verifies what the single-block layout is supposed to make true: counts within
@@ -200,6 +226,29 @@ static inline void MFTLObjectInvalidateFrames(MFTL_Object *obj) { obj->derived &
  * @rank_local
  */
 void MFTLObjectBuildDerived(MFTL_Object *obj);
+
+/**
+ * @brief Rebuilds only `tris.verts` and `tris.neighbors` from the half-edge records.
+ *
+ * The topology half of MFTLObjectBuildDerived(), separated because the two
+ * halves answer to different invalidation rules and cost different amounts:
+ * this one is 24 B per triangle written from a streaming read of the half-edge
+ * array, while MFTLObjectRefreshFrames() is 72 B per triangle written from a
+ * SCATTERED gather of three vertex positions.
+ *
+ * `MFTLObjectBuildDerived(obj)` is exactly this call followed by
+ * MFTLObjectRefreshFrames(obj); a caller that wants both should still use it.
+ * Reach for this one only when the frames are genuinely not wanted, or -- as the
+ * redistribution does -- when the two costs must be attributed separately.
+ *
+ * @param obj The mesh. `tris.verts` and `tris.neighbors` are rewritten and
+ *            #MFTL_DERIVED_TOPOLOGY is set. The frame bit is left alone, so a
+ *            caller that does not follow up with MFTLObjectRefreshFrames() has
+ *            an object whose frames are stale and correctly marked so.
+ *
+ * @rank_local
+ */
+void MFTLObjectBuildTopologyArrays(MFTL_Object *obj);
 
 /**
  * @brief Rebuilds only `tris.anchor` and `tris.edge` from the current positions.

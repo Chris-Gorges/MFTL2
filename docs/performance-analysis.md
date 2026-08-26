@@ -404,6 +404,161 @@ the *first* run of a benchmark pays page faults the later ones do not — which 
 exactly the shape of an "improvement" that evaporates under repetition. Every
 figure here is the minimum of three consecutive runs.
 
+### 7b. What is INSIDE the redistribution, measured
+
+Everything above times the phase from outside. Until 2026-08-25 nothing timed it
+from inside: `git grep MPI_Wtime -- src/` returned exactly one hit and it was in
+`remesh_comm.c`. Every published statement about *which part* of the
+redistribution is expensive — including three architecture recommendations in
+`docs/` — was inference from the source.
+
+`MFTL_RedistributeStats` (`include/mftl_communication.h`) replaces that with
+nineteen disjoint phase buckets and twenty-six counters. The timers are behind
+`-DMFTL_COMM_PROFILE=ON` (`python3 build_all.py --comm-profile`) because two of
+them are not free; the counters are unconditional. Measured residue between
+`t_total` and the sum of the buckets: **1.5 %**, so the taxonomy is complete.
+
+**Where the time goes. 1000 bodies, 1 280 000 triangles, np = 4:**
+
+| bucket | ms/step | share |
+|---|---:|---:|
+| kept: gather into scratch | 5.72 | 17 % |
+| destination analysis | 5.29 | 16 % |
+| kept: relink half-edges | 3.85 | 11 % |
+| derived: **frames** | 3.60 | 11 % |
+| owner classification | 2.72 | 8 % |
+| route decision (Allreduce) | 2.25 | 7 % |
+| derived: topology arrays | 1.79 | 5 % |
+| arrivals | 1.69 | 5 % |
+| pool growth | 1.67 | 5 % |
+| kept: place back | 1.65 | 5 % |
+| exchange: wait | 0.98 | 3 % |
+| twin repair | 0.93 | 3 % |
+| pack / exchange / grouping / setup / teardown | 1.20 | 4 % |
+
+Two readings of that table are worth stating, because they are what an
+architecture decision turns on.
+
+**The block a delta engine would remove is 39 %; the block it would not is 34 %.**
+Gather, place-back, relink and the topology rebuild — 13.0 ms — are the work that
+exists only because the pool is permuted wholesale on every call, and a planner
+that touched only what moved would not do them. Owner classification, destination
+analysis and the frame rebuild — 11.6 ms — survive any such rewrite: the first two
+are `O(N + H)` by construction, and the third is required by the postcondition.
+So the ceiling on the whole proposed delta architecture is about **1.6× on the
+phase**, or about 1.2× on the timestep. Worth knowing before spending ten phases
+on it.
+
+**The frame rebuild is dead work in the documented loop.** Redistribution builds
+`tris.anchor`/`tris.edge` as step 4; step 1 of the next iteration moves owned
+vertices, and #MFTL_FOREACH_OWNED_VERTEX clears #MFTL_DERIVED_FRAMES on the way
+out. Nothing reads them in between, and step 3's `MFTLComputeTriangleGeometry`
+then takes its walk path *because* they are gone. 3.60 ms/step, 11 % of the
+phase, 72 B/triangle written for a value that is discarded unread — unless the
+caller runs `MFTLEnsembleUpdate` or `MFTLComputeVertexNormals` immediately after
+redistribution, which is the only case that benefits. The postcondition is
+unchanged for now; this is the first thing to renegotiate if the phase needs to
+get faster.
+
+**What the counters say about scaling.** These are exact and independent of
+machine state, which is what makes them the useful half of the measurement:
+
+| | np = 2 | np = 4 | np = 8 |
+|---|---:|---:|---:|
+| arrival id table, MB/rank/step, one 327 680-tri body | 15.2 | 31.0 | **62.0** |
+| bodies visited with nothing to do, 1000 bodies | 48 % | **71 %** | **84 %** |
+| triangles that changed owner | 2.7 % | 4.8 % | 7.9 % |
+
+The first row is a weak-scaling defect, not a constant: the table was
+direct-addressed and sized from `next_vertex_gid`, the body's GLOBAL vertex
+count, so it grew linearly with the process count at a FIXED problem size while
+the entries it held shrank. At np = 8 it was 97 % empty. The second row is the
+cost of a replicated object list — `rebuild_object` ran in full for every body in
+the ensemble, including an id-table epoch bump, a `MFTLObjectSetCounts(0,0,0,0)`
+and a complete `MFTLObjectBuildDerived`, on the 84 % of bodies a rank holds no
+part of. The third row is the number that motivates a delta engine at all: **95 %
+of the partition is unchanged from one timestep to the next.**
+
+### 7c. Five no-regret fixes: 2–19× less allocator traffic, and no faster
+
+Five changes were then made to the existing engine, chosen because they are
+correct regardless of which architecture eventually wins:
+
+1. a persistent communication workspace on `MFTL_Ensemble`, replacing per-call
+   allocation of the rank-sized arrays, the per-destination payload buffers and
+   the whole rebuild scratch;
+2. an id table that picks direct addressing or open-addressed hashing from the
+   density of the ids it is given, instead of always direct-addressing the global
+   range;
+3. geometric rather than exact pool growth on the redistribution path;
+4. an early return for bodies a rank holds no part of, plus
+   `MFTLObjectReleasePools()` for a body that has left;
+5. routing a single-body ensemble through the ensemble entry point, so it reaches
+   the workspace at all.
+
+**What they bought, exactly:**
+
+| per timestep, all ranks | before | after | |
+|---|---:|---:|---|
+| allocations, 1000 bodies np = 4 | 99 | 40 | **2.5×** |
+| MB requested, 1000 bodies np = 4 | 20.1 | 7.8 | **2.6×** |
+| MB requested, one big body np = 8 | 72.0 | 4.5 | **16.1×** |
+| id-table MB, one big body np = 8 | 62.0 | 0.8 | **77×** |
+| id-table MB, one big body np = 4 | 31.0 | 0.17 | **183×** |
+
+The id table is now a one-time allocation rather than a per-timestep one, and it
+no longer grows with the process count. Partition digests — a GID-keyed checksum
+of ownership, positions, flags, connectivity and twin partners, printed by
+`parallel_advection_redistribute_list --digest` — are **bit-identical before and
+after at np = 1, 2, 4 and 8 on all three cases**, in both the set form and the
+slot-order form. The changes are provably behaviour-neutral.
+
+**And they did not make it faster.** Interleaved A/B of the two binaries, both
+with the timers compiled out, minimum of five alternating repeats:
+
+| case | np = 1 | np = 2 | np = 4 | np = 8 |
+|---|---:|---:|---:|---:|
+| 256 bodies | 1.08× | 0.94× | 0.98× | 0.94× |
+| 1000 bodies | 1.07× | 0.95× | 0.95× | 0.95× |
+| one big body | 1.06× | 0.98× | 0.98× | 0.91× |
+
+The honest reading is **no change**. The control proves it: `triangle geometry`,
+a phase none of these five changes touches, moves by 0.89–1.08× across the same
+runs — the same spread. Everything in that table is inside the measurement error
+of this machine.
+
+The one real signal is the ghost sync on a single large body, **1.10–1.40×**,
+which is fix 2 working as designed: the owner-side table is now sized by the
+vertices this rank owns rather than by the body's global vertex count.
+
+**Why removing megabytes of allocator traffic bought no time**, which is the
+result worth carrying forward: macOS hands out large blocks as lazily-mapped zero
+pages, so `calloc` of a multi-megabyte table costs almost nothing until it is
+touched, and only the touched fraction ever faults in. The allocation was never
+on the critical path; it was a *footprint* problem, and it has been fixed as one.
+Re-measure on a cluster before assuming the same holds under a different
+allocator and a different page-fault cost.
+
+### 7d. Two mistakes made producing 7b and 7c, both worth repeating
+
+**A 50-step run measures the OS scheduler.** The first comparison runs used 50
+timesteps, about 0.4 s of measurement, and produced spreads of 1.5× between
+identical binaries — larger than any effect being looked for, and stable enough
+across repeats to look like a result. Ten runs of one binary at 200 steps spread
+by **1.05×**. Every number in 7c is at 200 steps (100 for the largest case) for
+that reason. The related trap: two data sets collected twenty minutes apart on
+this machine differed by **2.7× on identical binaries**, so nothing is compared
+across collections — the two binaries alternate within each repeat.
+
+**An instrumented binary cannot be compared against an uninstrumented one.** The
+first attempt at 7c put the new build (with timers) against the old build
+(without) and reported a uniform slowdown. Two of the timers are genuinely
+expensive — the per-body timeline reads the clock ten times per BODY, and the
+ownership-change counter adds a compare to `compute_owners`' per-entity loops,
+which is the loop CLAUDE.md records a 1.70× regression on. That is why
+`MFTL_COMM_PROFILE` exists and defaults to off, and why the table in 7c is
+measured with it off on both sides.
+
 ## 8. I/O: 23–32× from dropping ASCII — and MPI-IO is not the reason
 
 Source: a standalone harness that generates the mesh and times `MFTLWriteVtu`

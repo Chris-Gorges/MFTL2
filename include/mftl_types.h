@@ -395,6 +395,18 @@ typedef struct MFTL_Ensemble
   int capacity_objects;  ///< Slots allocated in `objects`.
 
   int total_global_triangles;  ///< Sum over all objects of global_n_triangles.
+
+  /**
+   * Opaque scratch owned by the communication module, created on the first
+   * MFTLRedistribute() and released by MFTLEnsembleDestroy().
+   *
+   * It holds only per-call working storage -- rank-sized arrays, per-destination
+   * payload buffers, the rebuild scratch and its id tables -- never mesh state.
+   * Keeping it here rather than on #MFTL_Domain is deliberate: the domain is
+   * read-only for the duration of a redistribution and a good deal of reasoning
+   * about who may touch what depends on that staying true.
+   */
+  void *comm_workspace;
 } MFTL_Ensemble;
 
 #endif  // MFTL_TYPES_H

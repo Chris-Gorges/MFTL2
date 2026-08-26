@@ -90,6 +90,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -111,7 +112,8 @@ typedef struct
   bool verify;
   bool quality;
   bool normals;
-  bool post_geom;  ///< Step 5: restore the geometry redistribution drops.
+  bool post_geom;
+  bool digest;  ///< Print the partition digest at the end.  ///< Step 5: restore the geometry redistribution drops.
   int vtk_every;  ///< 0 = never.
   MFTL_VtkOptions vtk;
 } config;
@@ -127,6 +129,7 @@ static int parse_args(int argc, char **argv, int rank, int nproc, config *cfg)
   cfg->quality = false;
   cfg->normals = false;
   cfg->post_geom = true;
+  cfg->digest = false;
   cfg->vtk_every = 0;
   cfg->vtk = MFTLVtkDefaults();
 
@@ -145,6 +148,7 @@ static int parse_args(int argc, char **argv, int rank, int nproc, config *cfg)
               "  --quality     also run MFTLEnsembleUpdate each step\n"
               "  --normals     also run MFTLEnsembleUpdateVertexNormals each step\n"
               "  --no-post-geom  skip the geometry pass after redistribution\n"
+              "  --digest      print a GID-keyed partition checksum at the end\n"
               "  --vtk N       write the surface every N steps\n"
               "  --vtk-mode M  binary (default) | ascii | shared\n",
               argv[0]);
@@ -166,6 +170,8 @@ static int parse_args(int argc, char **argv, int rank, int nproc, config *cfg)
       cfg->quality = true;
     else if (!strcmp(argv[i], "--normals"))
       cfg->normals = true;
+    else if (!strcmp(argv[i], "--digest"))
+      cfg->digest = true;
     else if (!strcmp(argv[i], "--no-post-geom"))
       cfg->post_geom = false;
     else if (!strcmp(argv[i], "--vtk") && i + 1 < argc)
@@ -244,6 +250,271 @@ static void local_totals(const MFTL_Ensemble *ens, double out[3])
     out[1] += (double) obj->tris.n_local;
     out[2] += (double) obj->verts.n_local;
   }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Partition digest
+ *
+ * Two numbers that identify the partition this run produced, so that a binary
+ * built before a change and one built after can be shown to agree rather than
+ * assumed to. That is the acceptance criterion for anything that claims to be a
+ * pure performance change.
+ *
+ * Both are keyed by GLOBAL ID, never by pool slot. A slot is an implementation
+ * detail that a capacity change or a different growth policy is allowed to move;
+ * "which entity does this rank own, where is it, and what is it connected to" is
+ * not. The set digest combines entities with ADDITION, so it is invariant to the
+ * order they are visited in and compares the partition as a set; the order digest
+ * mixes the running value, so it also catches a within-rank permutation. A change
+ * that alters the second and not the first has reordered the pool without
+ * changing the answer -- worth knowing, and not automatically a defect.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief One round of a 64-bit avalanche mix (splitmix64's finaliser).
+ * @param x Input.
+ * @return Well-distributed output; every input bit affects every output bit.
+ */
+static uint64_t mix64(uint64_t x)
+{
+  x += 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  return x ^ (x >> 31);
+}
+
+/** @brief Folds one value into a running hash. */
+static uint64_t mix_in(uint64_t h, uint64_t v) { return mix64(h ^ mix64(v)); }
+
+/** @brief Reinterprets a double as its bit pattern, so equality is exact. */
+static uint64_t bits_of(double d)
+{
+  uint64_t u;
+  memcpy(&u, &d, sizeof u);
+  return u;
+}
+
+/**
+ * @brief Computes this rank's contribution to the two partition digests.
+ *
+ * Owned entities carry their identity, their position and their connectivity;
+ * ghosts carry identity and owner only, which is what makes the halo MEMBERSHIP
+ * part of the comparison without making the halo's storage order part of it.
+ *
+ * A twin is recorded as the partner's `(triangle global id, corner)` rather than
+ * as a half-edge index, for the same reason the whole digest is GID-keyed: the
+ * index is a slot and the pair is the topology.
+ *
+ * @param      ens The ensemble.
+ * @param[out] out `{set digest, order digest}`.
+ */
+static void partition_digest(const MFTL_Ensemble *ens, uint64_t out[2])
+{
+  uint64_t set_h = 0, ord_h = 0x243f6a8885a308d3ULL;
+
+  for (int o = 0; o < ens->num_objects; ++o)
+  {
+    const MFTL_Object *const obj = ens->objects[o];
+    const uint64_t body = (uint64_t) obj->global_id;
+
+    for (int v = 0; v < obj->verts.n; ++v)
+    {
+      const bool owned = (v < obj->verts.n_local);
+      uint64_t h = mix_in(mix_in(body, (uint64_t) obj->verts.rec[v].global_id), owned ? 1u : 2u);
+      h = mix_in(h, (uint64_t) obj->verts.rec[v].owner_proc);
+      if (owned)
+      {
+        h = mix_in(h, (uint64_t) obj->verts.rec[v].flags);
+        for (int k = 0; k < 3; ++k) h = mix_in(h, bits_of(obj->verts.pos[3 * v + k]));
+      }
+      set_h += h;
+      ord_h = mix_in(ord_h, h);
+    }
+
+    for (int t = 0; t < obj->tris.n; ++t)
+    {
+      const bool owned = (t < obj->tris.n_local);
+      uint64_t h = mix_in(mix_in(body, (uint64_t) obj->tris.rec[t].global_id), owned ? 3u : 4u);
+      h = mix_in(h, (uint64_t) obj->tris.rec[t].owner_proc);
+      if (owned)
+      {
+        h = mix_in(h, (uint64_t) obj->tris.rec[t].flags);
+        for (int k = 0; k < 3; ++k)
+        {
+          const MFTL_HalfEdge *const he = &obj->tris.he[3 * t + k];
+          h = mix_in(h, (uint64_t) obj->verts.rec[he->vertex_idx].global_id);
+          h = mix_in(h, (uint64_t) he->flags);
+
+          /* The partner named by identity: its triangle's global id and its
+           * corner, or a sentinel when this edge has no partner here. */
+          const int tw = he->twin_idx;
+          if (tw == MFTL_ERROR) h = mix_in(h, 0xffffffffULL);
+          else h = mix_in(h, mix_in((uint64_t) obj->tris.rec[tw / 3].global_id, (uint64_t) (tw % 3)));
+        }
+      }
+      set_h += h;
+      ord_h = mix_in(ord_h, h);
+    }
+  }
+
+  out[0] = set_h;
+  out[1] = ord_h;
+}
+
+/**
+ * @brief Nanoseconds one MPI_Wtime() call costs on this machine.
+ *
+ * The instrumentation reads the clock once per phase boundary per BODY, so the
+ * perturbation scales with the body count and cannot be waved away with "a timer
+ * is free". Measuring it here rather than quoting a constant keeps the correction
+ * valid across machines and MPI implementations, which differ by an order of
+ * magnitude in how MPI_Wtime is implemented.
+ *
+ * Best of five batches rather than a mean: the quantity wanted is the cost of the
+ * call itself, and every disturbance can only add to it.
+ *
+ * @return Cost of one call, in nanoseconds.
+ */
+static double measure_clock_cost(void)
+{
+  const int batch = 20000;
+  double best = 1e30;
+
+  for (int r = 0; r < 5; ++r)
+  {
+    const double t0 = MPI_Wtime();
+    double sink = 0.0;
+    for (int i = 0; i < batch; ++i) sink += MPI_Wtime();
+    const double dt = MPI_Wtime() - t0;
+
+    /* Keep `sink` observable so the loop cannot be optimised away. */
+    if (sink == 0.0) best = 0.0;
+    if (dt < best) best = dt;
+  }
+  return 1e9 * best / (double) batch;
+}
+
+/**
+ * @brief Prints the inside of the redistribution and the ghost sync.
+ *
+ * The phase table above says WHICH phase is expensive; this one says which part
+ * of the expensive phase is. Every field is a per-rank mean, for the reason
+ * given at the caller: per-phase maxima land on different ranks and do not sum
+ * to the whole.
+ *
+ * The residue line is the check on the taxonomy. #MFTL_RedistributeStats
+ * documents its buckets as disjoint, so `t_total` minus the rest is measurement
+ * noise plus whatever has no timer; a residue of more than a few per cent means
+ * a phase is missing one.
+ *
+ * @param rank  This rank.
+ * @param nproc Ranks in the communicator.
+ * @param steps Timed steps, for the per-step columns.
+ */
+static void report_internals(int rank, int nproc, int steps)
+{
+  MFTL_RedistributeStats st;
+  MFTLRedistributeGetStats(&st);
+
+  /* Field order is fixed by these two tables and nothing else reads them, so a
+   * new counter is one line in each. */
+  const char *const tname[] = {"setup",     "owner classification",
+                               "mask clear", "destination analysis",
+                               "route decision", "pack",
+                               "exchange: counts", "exchange: post",
+                               "exchange: wait", "arrival grouping",
+                               "pool growth", "kept: gather",
+                               "kept: place back", "kept: relink half-edges",
+                               "arrivals", "twin repair",
+                               "derived: topology", "derived: FRAMES",
+                               "teardown"};
+  double tval[] = {st.t_setup,     st.t_owners,       st.t_masks,        st.t_destinations,     st.t_route,
+                   st.t_pack,      st.t_exchange_counts, st.t_exchange_data, st.t_wait,          st.t_group,
+                   st.t_reserve,   st.t_kept_gather,  st.t_kept_place,   st.t_relink,           st.t_arrivals,
+                   st.t_twins,     st.t_derived_topology, st.t_derived_frames, st.t_teardown};
+  const int nt = (int) (sizeof(tval) / sizeof(tval[0]));
+
+  const char *const gname[] = {"collect requests", "exchange: counts", "exchange: requests", "owner id table",
+                               "answer",           "exchange: replies", "apply",             "teardown"};
+  double gval[] = {st.g_t_collect, st.g_t_counts, st.g_t_requests, st.g_t_table, st.g_t_answer, st.g_t_replies, st.g_t_apply, st.g_t_teardown};
+  const int ng = (int) (sizeof(gval) / sizeof(gval[0]));
+
+  double totals[2] = {st.t_total, st.g_t_total};
+  long counters[] = {st.n_calls,          st.n_verts_scanned,  st.n_tris_scanned,     st.n_verts_owner_changed,
+                     st.n_tris_owner_changed, st.n_verts_kept, st.n_tris_kept,        st.n_verts_received,
+                     st.n_tris_received,  st.n_destinations,   st.n_messages,         st.n_bytes_sent,
+                     st.n_bytes_recv,     st.n_route_neighbor, st.n_route_global,     st.n_objects_visited,
+                     st.n_objects_empty_local, st.n_allocs,    st.n_frees,            st.n_bytes_allocated,
+                     st.n_gid_table_bytes, st.n_dedup_overflow, st.n_clock_reads,     st.g_n_ghosts_requested,
+                     st.g_n_orphaned,     st.g_n_bytes_allocated};
+  const int nc = (int) (sizeof(counters) / sizeof(counters[0]));
+
+  double rt[32], rg[16], rtot[2];
+  long rc[32];
+  MPI_Reduce(tval, rt, nt, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+  MPI_Reduce(gval, rg, ng, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+  MPI_Reduce(totals, rtot, 2, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+  MPI_Reduce(counters, rc, nc, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+  if (rank != 0) return;
+
+  const double inv_p = 1.0 / (double) nproc;
+  const double per_step = (steps > 0) ? (double) steps : 1.0;
+  const double red_total = rtot[0] * inv_p;
+  const double gs_total = rtot[1] * inv_p;
+
+  printf("\n  -- inside the redistribution (mean per rank) ------------------------\n");
+  printf("  %-26s %9.3f s              (%.3f ms/step)\n", "TOTAL", red_total, 1000.0 * red_total / per_step);
+  double acc = 0.0;
+  for (int i = 0; i < nt; ++i)
+  {
+    const double v = rt[i] * inv_p;
+    acc += v;
+    if (v <= 0.0) continue;
+    printf("  %-26s %9.3f s   %5.1f %%   (%.4f ms/step)\n", tname[i], v, (red_total > 0.0) ? 100.0 * v / red_total : 0.0, 1000.0 * v / per_step);
+  }
+  printf("  %-26s %9.3f s   %5.1f %%\n", "residue (untimed)", red_total - acc, (red_total > 0.0) ? 100.0 * (red_total - acc) / red_total : 0.0);
+
+  printf("  -- inside the ghost sync (mean per rank) ----------------------------\n");
+  printf("  %-26s %9.3f s              (%.3f ms/step)\n", "TOTAL", gs_total, 1000.0 * gs_total / per_step);
+  acc = 0.0;
+  for (int i = 0; i < ng; ++i)
+  {
+    const double v = rg[i] * inv_p;
+    acc += v;
+    if (v <= 0.0) continue;
+    printf("  %-26s %9.3f s   %5.1f %%   (%.4f ms/step)\n", gname[i], v, (gs_total > 0.0) ? 100.0 * v / gs_total : 0.0, 1000.0 * v / per_step);
+  }
+  printf("  %-26s %9.3f s   %5.1f %%\n", "residue (untimed)", gs_total - acc, (gs_total > 0.0) ? 100.0 * (gs_total - acc) / gs_total : 0.0);
+
+  /* Counters are SUMS over ranks, not means: "how many vertices did the fleet
+   * classify" is the question, and dividing it by the rank count would only
+   * re-hide the load imbalance the halo block above reports. */
+  const double mb = 1.0 / (1024.0 * 1024.0);
+  printf("  -- what it moved (all ranks, per step) ------------------------------\n");
+  printf("  vertices classified        %12.0f   of which %.2f %% changed owner\n", (double) rc[1] / per_step,
+         (rc[1] > 0) ? 100.0 * (double) rc[3] / (double) rc[1] : 0.0);
+  printf("  triangles classified       %12.0f   of which %.2f %% changed owner\n", (double) rc[2] / per_step,
+         (rc[2] > 0) ? 100.0 * (double) rc[4] / (double) rc[2] : 0.0);
+  printf("  vertices kept / received   %12.0f / %.0f\n", (double) rc[5] / per_step, (double) rc[7] / per_step);
+  printf("  triangles kept / received  %12.0f / %.0f\n", (double) rc[6] / per_step, (double) rc[8] / per_step);
+  printf("  messages / destinations    %12.0f / %.0f\n", (double) rc[10] / per_step, (double) rc[9] / per_step);
+  printf("  wire volume                %12.2f MB/step out, %.2f MB/step in\n", (double) rc[11] * mb / per_step, (double) rc[12] * mb / per_step);
+  printf("  route neighbour / global   %12ld / %ld  calls\n", rc[13], rc[14]);
+  printf("  bodies visited / empty     %12.0f / %.0f  per step\n", (double) rc[15] / per_step, (double) rc[16] / per_step);
+  printf("  allocations                %12.0f /step   %.2f MB/step requested\n", (double) rc[17] / per_step, (double) rc[19] * mb / per_step);
+  printf("  of which the id tables     %12.2f MB/step   <- sized from the GLOBAL id range\n", (double) rc[20] * mb / per_step);
+  printf("  ghost sync requests        %12.0f /step   %.0f orphaned\n", (double) rc[23] / per_step, (double) rc[24]);
+  if (rc[21] > 0) printf("  dedup budget exhausted     %12ld times\n", rc[21]);
+
+  /* The instrument charging itself. MEASURED, not assumed: one MPI_Wtime is tens
+   * of nanoseconds and the per-body buckets are entered once per BODY per call,
+   * so at a thousand droplets this is several per cent of the phase and the
+   * breakdown above is only honest if it says so. */
+  const double clock_ns = measure_clock_cost();
+  const double reads_per_rank_step = (double) rc[22] / per_step / (double) nproc;
+  printf("  clock reads (instrument)   %12.0f /step   %.1f ns each = %.4f ms/step (%.1f %% of the phase)\n", reads_per_rank_step, clock_ns,
+         reads_per_rank_step * clock_ns * 1e-6, (red_total > 0.0) ? 100.0 * reads_per_rank_step * clock_ns * 1e-9 * per_step / red_total : 0.0);
+  printf("======================================================================\n");
 }
 
 /** @brief Owned and ghost triangle counts, for the halo-fraction report. */
@@ -353,6 +624,10 @@ int main(int argc, char **argv)
   long ghost_bytes = 0;
   long vtk_writes = 0;
   int failures = 0;
+
+  /* After the initial scatter, so its first-touch faults and its one-off
+   * all-to-all do not land in the steady-state figures. */
+  MFTLRedistributeStatsReset();
 
   MPI_Barrier(MPI_COMM_WORLD);
   const double t_loop_start = MPI_Wtime();
@@ -513,6 +788,21 @@ int main(int argc, char **argv)
     }
     printf("==============================================\n");
   }
+
+  report_internals(rank, nproc, cfg.steps);
+
+  if (cfg.digest)
+  {
+    uint64_t mine[2], all[2];
+    partition_digest(ens, mine);
+
+    /* Summed, so the result does not depend on which rank holds what -- only on
+     * WHAT the partition is. Wrapping is defined for unsigned and is exactly the
+     * order-independent combination wanted. */
+    MPI_Reduce(mine, all, 2, MPI_UNSIGNED_LONG_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    if (rank == 0) printf("partition digest: set %016llx  order %016llx\n", (unsigned long long) all[0], (unsigned long long) all[1]);
+  }
+
 
   int total_failures = 0;
   MPI_Allreduce(&failures, &total_failures, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);

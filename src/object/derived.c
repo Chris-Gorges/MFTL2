@@ -225,6 +225,17 @@ void MFTLObjectBuildDerived(MFTL_Object *obj)
   obj->derived = MFTL_DERIVED_TOPOLOGY | MFTL_DERIVED_FRAMES;
 }
 
+void MFTLObjectBuildTopologyArrays(MFTL_Object *obj)
+{
+  MFTL_ASSERT(obj != MFTL_NULL);
+
+  if (obj->tris.n > 0) build_topology_arrays(obj);
+
+  /* An empty mesh is trivially described, so the bit is set: a hot loop over
+   * zero triangles is correct, not stale. */
+  obj->derived |= MFTL_DERIVED_TOPOLOGY;
+}
+
 void MFTLObjectRefreshFrames(MFTL_Object *obj)
 {
   MFTL_ASSERT(obj != MFTL_NULL);

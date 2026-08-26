@@ -390,7 +390,16 @@ static inline int MFTLRedistribute(MFTL_Ensemble *ens)
   if (ens == MFTL_NULL) return MFTL_ERROR;
 
   if (ens->num_objects == 0 || ens->objects == MFTL_NULL) return MFTL_SUCCESS;
-  if (ens->num_objects == 1) return MFTLRedistributeObject(ens->objects[0]);
+
+  /* One body goes through the ensemble entry point too, NOT through
+   * MFTLRedistributeObject(). The single-body fast path it used to take still
+   * exists -- redistribute_core drops the per-body count payload and the run
+   * bookkeeping whenever num_objects is 1, which was all that dispatch ever
+   * bought -- but MFTLRedistributeObject() takes an object rather than an
+   * ensemble and so cannot reach the persistent workspace. Routing a
+   * single-body ensemble through it meant re-allocating every scratch array,
+   * including the arrival id tables, on every timestep: measured at 28 MB per
+   * rank per step on one 327 680-triangle body. */
   return MFTLRedistributeListOfObjects(ens);
 }
 
@@ -462,6 +471,20 @@ typedef struct MFTL_OwnerMap
  *             entity; see #MFTL_OwnerMap.
  */
 int MFTLRedistributeWithOwners(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps);
+
+/**
+ * @brief Releases the redistribution workspace hanging off an ensemble.
+ *
+ * Called by MFTLEnsembleDestroy(). The workspace is created lazily on the first
+ * redistribution and holds nothing but working storage, so releasing it early is
+ * safe -- the next redistribution simply builds it again.
+ *
+ * @param p_ws Address of `MFTL_Ensemble::comm_workspace`. Set to #MFTL_NULL on
+ *             return. A #MFTL_NULL pointer or a #MFTL_NULL workspace is a no-op.
+ *
+ * @rank_local
+ */
+void MFTLCommWorkspaceDestroy(void **p_ws);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 5. Ghost synchronisation
@@ -776,5 +799,208 @@ static inline int MFTLSpatialHaloCount(const MFTL_SpatialHalo *halo, int body_id
   const MFTL_Object *const p = MFTLSpatialHaloPatch(halo, body_idx);
   return (p == MFTL_NULL) ? 0 : p->tris.n;
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 7. Instrumentation
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @struct MFTL_RedistributeStats
+ * @brief Where the time inside MFTLRedistribute() and MFTLUpdateGhostPositions()
+ *        actually goes. Purely diagnostic.
+ *
+ * It exists because this module had no instrumentation at all: `git grep
+ * MPI_Wtime -- src/` returned exactly one hit, in `remesh_comm.c`. The
+ * redistribution is the largest phase of the per-timestep loop
+ * (docs/performance-analysis.md section 7), and every published statement about
+ * WHICH PART of it is expensive was inference from the source rather than a
+ * measurement. Architectural decisions about this module were being made on that
+ * inference. These counters replace it.
+ *
+ * ## HOW TO READ IT
+ *
+ * Everything is RANK-LOCAL and everything ACCUMULATES until
+ * MFTLRedistributeStatsReset(). A caller wanting a per-rank mean divides by
+ * `n_calls`; a caller wanting a fleet figure reduces the fields it cares about
+ * itself. Nothing here takes a collective, which is what makes it safe to leave
+ * enabled: a reduction inside the measurement would synchronise the very phases
+ * it is trying to time.
+ *
+ * The `t_*` fields are SECONDS and they PARTITION the redistribution: every
+ * bucket except `t_total` is disjoint from every other, so
+ * `t_total - (sum of the rest)` is honest residue and should be small. If it is
+ * not, a phase is missing a timer.
+ *
+ * One of them reads differently from the others. `t_wait` overlaps nothing, but
+ * it absorbs LOAD IMBALANCE: a rank that arrives early at MFTLExchangeWait()
+ * charges its neighbours' slowness to itself. Read it as an imbalance measure,
+ * not as communication cost.
+ *
+ * Allocation is deliberately NOT a bucket. Its sites are spread through every
+ * phase, and wrapping individual `malloc` calls in a clock read whose cost is
+ * comparable to the call itself measures the instrument rather than the
+ * allocator. `t_setup` and `t_teardown` bracket the per-call scratch, which is
+ * where the churn actually lives, and `n_allocs` / `n_bytes_allocated` count the
+ * rest.
+ *
+ * ## THE COST OF MEASURING
+ *
+ * `n_clock_reads` counts every MPI_Wtime() call the instrumentation made. The
+ * per-object buckets are read once per body per call, so a 1000-body ensemble
+ * reads the clock tens of thousands of times per timestep and that is NOT
+ * negligible against a 10 ms phase. Multiply `n_clock_reads` by the measured
+ * cost of one MPI_Wtime() on the machine to get the perturbation, and treat the
+ * benchmark's un-instrumented wall clock as the authoritative total.
+ */
+typedef struct
+{
+  // --- Redistribution: the disjoint phase buckets, in call order -------------
+
+  double t_total;  ///< The whole of MFTLRedistribute(), including the serial short-circuit.
+
+  /**
+   * Per-call scratch setup: the eight `nproc`-sized allocations, the `nproc`
+   * initialisation loops, and the buffer-hint arithmetic.
+   *
+   * Invariant to how much of the mesh moves and proportional to the PROCESS
+   * COUNT rather than to the local mesh, which is what makes it the bucket to
+   * watch in a weak-scaling sweep.
+   */
+  double t_setup;
+
+  double t_owners;  ///< Ownership classification. O(N+H) and invariant to how much moves.
+  double t_masks;  ///< Clearing the per-object keep flags and de-duplication mask. O(V+T) per body.
+  double t_destinations;  ///< Destination analysis: seven candidates per owned triangle.
+  /**
+   * The neighbour-vs-global decision Allreduce. One int, so pure latency -- but
+   * it is the FIRST collective after the per-object loop, so like `t_wait` it
+   * absorbs load imbalance. On a small mesh where the loop is short it can read
+   * as a double-digit share of the phase and still be measuring nothing but the
+   * spread between ranks.
+   */
+  double t_route;
+  double t_pack;  ///< Building the per-destination payloads.
+  double t_exchange_counts;  ///< The merged count exchange, (Neighbor_)Alltoall.
+  double t_exchange_data;  ///< Posting the payload Alltoallv, plus the flattening copy.
+  double t_wait;  ///< Waiting for the payloads. Absorbs load imbalance; see above.
+  double t_group;  ///< De-interleaving the arrival stream by body.
+  double t_reserve;  ///< Pool growth inside MFTLObjectSetCounts().
+  double t_kept_gather;  ///< Gathering kept entities out of the pool into scratch.
+  double t_kept_place;  ///< Writing them back at their new offsets.
+  double t_relink;  ///< Re-linking kept half-edges: vertex remap, twin remap, out_he.
+  double t_arrivals;  ///< Classifying and writing what arrived.
+  double t_twins;  ///< repair_twins() over the half-edges that lost a partner.
+  double t_derived_topology;  ///< Rebuilding tris.verts and tris.neighbors.
+  double t_derived_frames;  ///< Rebuilding tris.anchor and tris.edge. 72 B/triangle.
+
+  /**
+   * Tearing the per-call scratch down again: every `free` on the path, including
+   * the per-destination id lists and the send and receive buffers.
+   *
+   * `t_setup + t_teardown` is what a persistent workspace would remove, and
+   * docs/performance-analysis.md section 7 identifies that churn as the reason a
+   * first benchmark run is slower than every repeat of it. The counters
+   * `n_allocs` / `n_bytes_allocated` say how much of it there is; these two say
+   * what it costs.
+   */
+  double t_teardown;
+
+  // --- Redistribution: counters ---------------------------------------------
+
+  long n_calls;  ///< Redistributions performed, serial short-circuit included.
+  long n_verts_scanned;  ///< Vertices classified, owned and ghost, summed over calls.
+  long n_tris_scanned;  ///< Triangles classified, owned and ghost.
+  long n_verts_owner_changed;  ///< Of those, how many changed hands.
+  long n_tris_owner_changed;  ///< Of those, how many changed hands.
+  long n_verts_kept;  ///< Kept in the pool rather than re-received.
+  long n_tris_kept;  ///< Kept in the pool rather than re-received.
+  long n_verts_received;  ///< Arrivals, before de-duplication.
+  long n_tris_received;  ///< Arrivals, before de-duplication.
+  long n_destinations;  ///< Distinct remote destinations touched, summed over calls.
+  long n_messages;  ///< Non-empty per-destination payloads sent.
+  long n_bytes_sent;  ///< Payload bytes out, wire format only.
+  long n_bytes_recv;  ///< Payload bytes in.
+  long n_route_neighbor;  ///< Calls that took the 26-neighbour graph route.
+  long n_route_global;  ///< Calls that fell back to the global communicator.
+  long n_objects_visited;  ///< Bodies iterated, summed over calls.
+
+  /**
+   * Bodies this rank held NOTHING of, and still paid for.
+   *
+   * The per-object rebuild runs unconditionally today: an id-table epoch bump, a
+   * MFTLObjectSetCounts(0,0,0,0) and a full MFTLObjectBuildDerived(), for every
+   * body in a replicated object list. This counter is what makes that cost
+   * visible rather than argued.
+   */
+  long n_objects_empty_local;
+
+  long n_allocs;  ///< Allocation calls on the path.
+  long n_frees;  ///< Matching frees.
+  long n_bytes_allocated;  ///< Bytes requested, summed. Not a peak.
+  long n_gid_table_bytes;  ///< Bytes the arrival id tables asked for.
+
+  /**
+   * How the arrival id tables were indexed, counted per use.
+   *
+   * Direct addressing is `tag[gid]`: one load, and a table proportional to the
+   * BODY's id range. Sparse is hashed with linear probing: a table proportional
+   * to what this rank actually holds, at roughly 1.5x the lookup cost. The
+   * crossover is a density ratio and the mode is chosen per body per call, so
+   * these two say which regime a run was actually in rather than which one it was
+   * expected to be in.
+   */
+  long n_gid_table_direct;
+  long n_gid_table_sparse;  ///< See n_gid_table_direct.
+
+  /**
+   * Times the per-object de-duplication bit budget was exhausted.
+   *
+   * Above #MFTL_DEDUP_BITS distinct destinations the vertex lists fall back to a
+   * radix sort per destination. Unreachable below 32 remote destinations, so on
+   * a 26-neighbour graph this is zero by construction and only the global route
+   * can raise it.
+   */
+  long n_dedup_overflow;
+
+  long n_clock_reads;  ///< MPI_Wtime() calls the instrumentation made. See above.
+
+  // --- Ghost synchronisation -------------------------------------------------
+
+  double g_t_total;  ///< The whole of MFTLUpdateGhostPositions()/VertexNormals().
+  double g_t_collect;  ///< Scanning the ghost suffix and building the request lists.
+  double g_t_counts;  ///< The count exchange.
+  double g_t_requests;  ///< Sending the (body, global id) requests.
+  double g_t_table;  ///< Owner-side id table build: a scatter over every owned vertex.
+  double g_t_answer;  ///< Resolving requests to positions.
+  double g_t_replies;  ///< Sending the payloads back.
+  double g_t_apply;  ///< Writing them into the ghost slots.
+  double g_t_teardown;  ///< Freeing the per-call request lists, buffers and id table.
+
+  long g_n_calls;  ///< Syncs performed.
+  long g_n_ghosts_requested;  ///< Ghost vertices asked for, summed over calls.
+  long g_n_orphaned;  ///< Ghosts whose owner was not a graph neighbour, and were SKIPPED.
+  long g_n_bytes_sent;  ///< Request bytes out plus reply bytes out.
+  long g_n_bytes_recv;  ///< Request bytes in plus reply bytes in.
+  long g_n_allocs;  ///< Allocation calls on the path.
+  long g_n_bytes_allocated;  ///< Bytes requested, summed.
+} MFTL_RedistributeStats;
+
+/**
+ * @brief Zeroes the accumulator.
+ *
+ * Call it after the warm-up steps of a benchmark, so that first-touch faults and
+ * the initial scatter do not land in the steady-state figures.
+ *
+ * @rank_local
+ */
+void MFTLRedistributeStatsReset(void);
+
+/**
+ * @brief Copies the accumulator out.
+ *
+ * @param[out] out Receives this rank's counters. Must not be #MFTL_NULL.
+ * @rank_local
+ */
+void MFTLRedistributeGetStats(MFTL_RedistributeStats *out);
 
 #endif  // MFTL_COMMUNICATION_H

@@ -22,6 +22,14 @@ option(MFTL_DOCS_WARN_AS_ERROR "Fail the 'docs' target on a Doxygen warning" OFF
 option(MFTL_ARCH_NATIVE "Compile with -march=native (build machine ISA only!)" OFF)
 set(MFTL_ARCH_FLAGS "" CACHE STRING "Extra architecture flags for Release builds")
 
+# The redistribution's per-phase timers. OFF by default because two of them are
+# not free: the per-body timeline reads the clock ten times per BODY per call
+# (1.5-2 % of the phase at a thousand droplets), and the ownership-change count
+# adds a compare to compute_owners' two per-entity loops. The COUNTERS in
+# MFTL_RedistributeStats are unconditional either way; only the t_* fields need
+# this. See the instrumentation section of src/communication/comm_internal.h.
+option(MFTL_COMM_PROFILE "Time the individual phases of MFTLRedistribute()" OFF)
+
 # --- Dependencies ---
 find_package(MPI REQUIRED)
 
@@ -48,6 +56,10 @@ endif()
 file(GLOB_RECURSE MFTL_SOURCES CONFIGURE_DEPENDS "src/*.c")
 
 add_library(MFTL STATIC ${MFTL_SOURCES})
+
+if(MFTL_COMM_PROFILE)
+    target_compile_definitions(MFTL PUBLIC MFTL_COMM_PROFILE)
+endif()
 
 # The adaptive orientation predicate in src/bvh/bvh_predicates.c is built from
 # error-free transformations: Two_Product recovers the exact residue of a*b by
@@ -216,6 +228,7 @@ message(STATUS "Build Type       : ${CMAKE_BUILD_TYPE}")
 message(STATUS "Sanitizers       : ${ENABLE_SANITIZERS}")
 message(STATUS "LTO (Release)    : ${IPO_SUPPORTED}")
 message(STATUS "-march=native    : ${MFTL_ARCH_NATIVE}")
+message(STATUS "comm profiling   : ${MFTL_COMM_PROFILE}")
 message(STATUS "Extra arch flags : ${MFTL_ARCH_FLAGS}")
 message(STATUS "Build Examples   : ${BUILD_EXAMPLES}")
 message(STATUS "Build Tests      : ${BUILD_TESTING}")
