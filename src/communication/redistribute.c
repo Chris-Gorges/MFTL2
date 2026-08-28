@@ -1204,9 +1204,16 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
     {
       /* The body was here last step and has now left entirely. Zero the counts,
        * then give the pool blocks back: they are at the high-water mark of
-       * everything this body ever held here, and pools never shrink on their own.
-       * That is what strands a generated ensemble's full footprint on rank 0 for
-       * the rest of the run (mftl_object.h, MFTLObjectReleasePools). */
+       * everything this body ever held here, and growth is a ratchet.
+       *
+       * This is the branch that recovers most of a generated ensemble's
+       * footprint, and it is worth knowing how much. Rank 0 builds every body
+       * whole; after the scatter it holds NOTHING of most of them, and each of
+       * those lands here. Measured at 256 bodies, refine 3, np = 4: 80 MB
+       * generated on rank 0 against 33.5 MB of pool capacity left there
+       * afterwards. What this branch cannot reach is the bodies rank 0 keeps a
+       * SLIVER of -- full capacity against a handful of triangles -- and that is
+       * MFTLRedistributeSetShrinkSlack()'s half of the job. */
       MFTLObjectSetCounts(obj, 0, 0, 0, 0);
       MFTLObjectReleasePools(obj);
     }
@@ -1400,7 +1407,15 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
    *
    * The policy stays local to this call site on purpose. `MFTLObjectReserve`'s
    * exactness is a contract other callers rely on, and src/object/object.c
-   * remains the only file that writes a capacity. */
+   * remains the only file that writes a capacity.
+   *
+   * THIS IS WHY THE SHRINK IN PHASE 5b HAS A GATE OF FOUR AND NOT TWO. What this
+   * line establishes is `capacity` in [n, 2n) -- MFTLGrowCapacity doubles from
+   * below n, so its result is under 2n whatever it started from. A shrink gate of
+   * `capacity > 2n` is therefore met by ANY decrease, and the two would take
+   * turns reallocating both pools every timestep on a body whose count moves by
+   * two entities. At four the count must halve first, so neither can see the
+   * other. Derivation and the worked sequence: MFTL_SHRINK_SLACK_DEFAULT. */
   if (n_v > obj->verts.capacity || n_t > obj->tris.capacity)
   {
     MFTLObjectReserve(obj, MFTLGrowCapacity(obj->verts.capacity, n_v), MFTLGrowCapacity(obj->tris.capacity, n_t));
@@ -1767,6 +1782,19 @@ static bool g_skip_unchanged = MFTL_TRUE;
 void MFTLRedistributeSetSkipUnchangedBodies(bool on) { g_skip_unchanged = on; }
 
 bool MFTLRedistributeGetSkipUnchangedBodies(void) { return g_skip_unchanged; }
+
+/**
+ * @brief Waste factor at which a rebuilt body's pools are given back. 0 = off.
+ *
+ * Deliberately NOT part of the object-list checksum: this changes no
+ * communication and no mesh, only how much memory a rank holds, so two ranks
+ * disagreeing about it is a legitimate local policy rather than a deadlock.
+ */
+static double g_shrink_slack = 0.0;
+
+void MFTLRedistributeSetShrinkSlack(double slack) { g_shrink_slack = (slack > 0.0) ? slack : 0.0; }
+
+double MFTLRedistributeGetShrinkSlack(void) { return g_shrink_slack; }
 
 /**
  * @brief Tests body @p o's vote in a per-body bitset.
@@ -2276,6 +2304,41 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
     }
 
     rebuild_object(obj, &states[o], (const MFTL_PackedVertex *) xfer[0].recv_buf, (const MFTL_PackedTriangleComplex *) xfer[1].recv_buf, my_rank, scratch);
+  }
+
+  /* ── Phase 5b: give back capacity this rank has outgrown ─────────────────
+   *
+   * Pools are grow-only (mftl_object.h), so a rank whose share of a body just
+   * SHRANK is still holding the block it needed at its high-water mark. After
+   * generation that is the whole mesh: MFTLGenerateSphere() builds every body
+   * whole on rank 0, and the scatter above leaves rank 0 with a sliver of each
+   * in a block sized for all of it.
+   *
+   * A separate pass rather than a line inside rebuild_object(): here no pointer
+   * into any pool is live, so the reallocation needs no argument about what it
+   * dangles, and skipped bodies are covered without one either. They can never
+   * fire anyway -- neither their count nor their capacity moved since the
+   * rebuild that last offered them -- but not having to know that is the point.
+   *
+   * The gate composes with the pre-grow in rebuild_object() rather than fighting
+   * it: that leaves capacity in [n, 2n), and this fires only above 4n, so a body
+   * whose count merely jitters is never touched by either. See
+   * MFTL_SHRINK_SLACK_DEFAULT for why 4 is a floor and not a preference. */
+  if (g_shrink_slack > 0.0)
+  {
+    CS_BEGIN(ts_shrink);
+    for (int o = 0; o < num_objects; ++o)
+    {
+      MFTL_Object *const obj = objects[o];
+      const size_t before = MFTLObjectPoolBytes(obj);
+
+      if (MFTLObjectShrinkToFit(obj, g_shrink_slack))
+      {
+        MFTLCommStats.n_objects_shrunk++;
+        MFTLCommStats.n_bytes_reclaimed += (long) (before - MFTLObjectPoolBytes(obj));
+      }
+    }
+    CS_END(ts_shrink, t_reserve);
   }
 
   /* What the next call needs to know: a body rebuilt because something CHANGED

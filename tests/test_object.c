@@ -321,8 +321,12 @@ static int test_set_counts_invalidates_the_derived_arrays(void)
   return 0;
 }
 
-static int test_pools_never_shrink(void)
+static int test_reserve_never_shrinks(void)
 {
+  /* MFTLObjectReserve() is grow-only, and that is a contract other callers rely
+   * on -- src/communication/redistribute.c pre-grows and then lets the reserve
+   * inside MFTLObjectSetCounts() early-return, which only works while this is
+   * true. Shrinking lives in MFTLObjectShrinkToFit() and nowhere else. */
   MFTL_Object *obj = MFTLObjectCreate(1);
 
   MFTLObjectReserve(obj, 5000, 5000);
@@ -345,6 +349,9 @@ static int test_pools_never_shrink(void)
 
 static int test_clear_keeps_the_allocation(void)
 {
+  /* MFTLObjectClear() empties the mesh and keeps the block, so refilling does
+   * not re-allocate. Giving it back is the other half, and it is a separate,
+   * explicit call: MFTLObjectShrinkToFit() or MFTLObjectReleasePools(). */
   MFTL_Object *obj = MFTLObjectCreate(1);
   MFTLObjectSetCounts(obj, 100, 100, 80, 80);
   MFTLObjectBuildDerived(obj);
@@ -390,6 +397,312 @@ static int test_reserve_additional_is_geometric(void)
   TEST_ASSERT_EQUAL_INT(20000, obj->verts.n);
   TEST_ASSERT(reallocs <= 12);  // O(log n), not O(n)
   TEST_ASSERT(MFTLObjectPoolsAreConsistent(obj));
+
+  MFTLObjectDestroy(&obj);
+  return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Shrinking -- the only way a pool ever gets smaller
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+static int test_shrink_to_fit_recovers_the_block(void)
+{
+  MFTL_Object *obj = MFTLObjectCreate(1);
+
+  MFTLObjectReserve(obj, 100000, 90000);
+  MFTLObjectSetCounts(obj, 300, 300, 200, 200);
+
+  const void *vb = obj->verts.block;
+  const void *tb = obj->tris.block;
+
+  TEST_ASSERT(MFTLObjectShrinkToFit(obj, MFTL_SHRINK_SLACK_DEFAULT));
+
+  // MFTLGrowCapacity(0, n): 128 doubled until it covers n.
+  TEST_ASSERT_EQUAL_INT(512, obj->verts.capacity);
+  TEST_ASSERT_EQUAL_INT(256, obj->tris.capacity);
+  TEST_ASSERT(obj->verts.block != vb);
+  TEST_ASSERT(obj->tris.block != tb);
+
+  // Counts are untouched -- this moved storage, not entities.
+  TEST_ASSERT_EQUAL_INT(300, obj->verts.n);
+  TEST_ASSERT_EQUAL_INT(200, obj->tris.n);
+
+  touch_every_array_at_capacity(obj);
+  TEST_ASSERT(MFTLObjectPoolsAreConsistent(obj));
+
+  MFTLObjectDestroy(&obj);
+  return 0;
+}
+
+static int test_shrink_to_fit_preserves_every_entity(void)
+{
+  /* The growth direction is covered by test_growth_preserves_every_array. This
+   * is the same statement for the shrink, and it is the test that catches a
+   * wrong copy count or a sub-array offset mis-derived at the new capacity. */
+  MFTL_Object *obj = MFTLObjectCreate(1);
+
+  MFTLObjectReserve(obj, 40000, 40000);
+  MFTLObjectSetCounts(obj, 700, 700, 600, 600);
+  fill_pattern(obj, 17);
+
+  TEST_ASSERT(MFTLObjectShrinkToFit(obj, MFTL_SHRINK_SLACK_DEFAULT));
+  TEST_ASSERT(check_pattern(obj, 17, 700, 600));
+
+  touch_every_array_at_capacity(obj);
+  TEST_ASSERT(MFTLObjectPoolsAreConsistent(obj));
+
+  MFTLObjectDestroy(&obj);
+  return 0;
+}
+
+static int test_shrink_to_fit_never_drops_entities(void)
+{
+  /* A slack of 1 asks for the most aggressive shrink the API permits. The
+   * target is still floored at the live count: this function moves storage and
+   * does not decide what to discard. */
+  MFTL_Object *obj = MFTLObjectCreate(1);
+
+  MFTLObjectReserve(obj, 80000, 80000);
+  MFTLObjectSetCounts(obj, 5000, 2500, 5000, 2500);
+
+  (void) MFTLObjectShrinkToFit(obj, 1.0);
+
+  TEST_ASSERT(obj->verts.capacity >= obj->verts.n);
+  TEST_ASSERT(obj->tris.capacity >= obj->tris.n);
+  TEST_ASSERT_EQUAL_INT(5000, obj->verts.n);
+  TEST_ASSERT_EQUAL_INT(2500, obj->verts.n_local);
+  TEST_ASSERT_EQUAL_INT(5000, obj->tris.n);
+
+  touch_every_array_at_capacity(obj);
+  TEST_ASSERT(MFTLObjectPoolsAreConsistent(obj));
+
+  MFTLObjectDestroy(&obj);
+  return 0;
+}
+
+static int test_shrink_to_fit_is_idempotent(void)
+{
+  MFTL_Object *obj = MFTLObjectCreate(1);
+
+  MFTLObjectReserve(obj, 60000, 60000);
+  MFTLObjectSetCounts(obj, 900, 900, 900, 900);
+
+  TEST_ASSERT(MFTLObjectShrinkToFit(obj, MFTL_SHRINK_SLACK_DEFAULT));
+  const int vc = obj->verts.capacity;
+  const int tc = obj->tris.capacity;
+  const void *vb = obj->verts.block;
+  const void *tb = obj->tris.block;
+
+  /* The BLOCK POINTER is the real assertion. A second call that reallocated to
+   * the same capacity would satisfy every count check while costing a full
+   * memcpy of both pools on every timestep it ran. */
+  TEST_ASSERT(!MFTLObjectShrinkToFit(obj, MFTL_SHRINK_SLACK_DEFAULT));
+  TEST_ASSERT(!MFTLObjectShrinkToFit(obj, MFTL_SHRINK_SLACK_DEFAULT));
+
+  TEST_ASSERT_EQUAL_INT(vc, obj->verts.capacity);
+  TEST_ASSERT_EQUAL_INT(tc, obj->tris.capacity);
+  TEST_ASSERT(obj->verts.block == vb);
+  TEST_ASSERT(obj->tris.block == tb);
+
+  /* And the same at a count below MFTL_INIT_CAPACITY, where the gate stays
+   * permanently true (capacity 128 against n == 4 satisfies 128 > 16 forever)
+   * and only the guard stops the reallocation. */
+  MFTLObjectSetCounts(obj, 4, 4, 4, 4);
+  (void) MFTLObjectShrinkToFit(obj, MFTL_SHRINK_SLACK_DEFAULT);
+  const void *vb2 = obj->verts.block;
+  TEST_ASSERT(!MFTLObjectShrinkToFit(obj, MFTL_SHRINK_SLACK_DEFAULT));
+  TEST_ASSERT(obj->verts.block == vb2);
+  TEST_ASSERT_EQUAL_INT(MFTL_INIT_CAPACITY, obj->verts.capacity);
+
+  touch_every_array_at_capacity(obj);
+  TEST_ASSERT(MFTLObjectPoolsAreConsistent(obj));
+
+  MFTLObjectDestroy(&obj);
+  return 0;
+}
+
+static int test_shrink_to_fit_respects_the_slack_gate(void)
+{
+  MFTL_Object *obj = MFTLObjectCreate(1);
+
+  MFTLObjectReserve(obj, 4096, 4096);
+  MFTLObjectSetCounts(obj, 2000, 2000, 2000, 2000);
+
+  const void *vb = obj->verts.block;
+  const void *tb = obj->tris.block;
+
+  // 4096 > 4 * 2000 is false: wasting 2x is not worth a reallocation.
+  TEST_ASSERT(!MFTLObjectShrinkToFit(obj, MFTL_SHRINK_SLACK_DEFAULT));
+  TEST_ASSERT_EQUAL_INT(4096, obj->verts.capacity);
+  TEST_ASSERT(obj->verts.block == vb);
+  TEST_ASSERT(obj->tris.block == tb);
+
+  // 4096 > 4 * 500 is true.
+  MFTLObjectSetCounts(obj, 500, 500, 500, 500);
+  TEST_ASSERT(MFTLObjectShrinkToFit(obj, MFTL_SHRINK_SLACK_DEFAULT));
+  TEST_ASSERT_EQUAL_INT(512, obj->verts.capacity);
+
+  /* And the case rank 0 is actually in for the bodies it keeps whole: capacity
+   * equals the count, nothing is wasted, nothing must move. */
+  MFTL_Object *tight = MFTLObjectCreate(2);
+  MFTLObjectSetCounts(tight, 2562, 2562, 5120, 5120);
+  TEST_ASSERT_EQUAL_INT(2562, tight->verts.capacity);
+  TEST_ASSERT(!MFTLObjectShrinkToFit(tight, MFTL_SHRINK_SLACK_DEFAULT));
+  TEST_ASSERT_EQUAL_INT(2562, tight->verts.capacity);
+  TEST_ASSERT_EQUAL_INT(5120, tight->tris.capacity);
+
+  touch_every_array_at_capacity(obj);
+  touch_every_array_at_capacity(tight);
+  TEST_ASSERT(MFTLObjectPoolsAreConsistent(obj));
+  TEST_ASSERT(MFTLObjectPoolsAreConsistent(tight));
+
+  MFTLObjectDestroy(&tight);
+  MFTLObjectDestroy(&obj);
+  return 0;
+}
+
+/**
+ * @brief Replays a redistribution's exact resize sequence for @p steps steps.
+ *
+ * `n` alternates between @p lo and @p hi -- the few-entity jitter a body under
+ * advection shows every timestep -- and each step does what rebuild_object()
+ * does: pre-grow geometrically, set the counts, then offer the pool back.
+ *
+ * @return Number of times the vertex block was reallocated.
+ */
+static int count_reallocs_under_jitter(double slack, int lo, int hi, int steps)
+{
+  MFTL_Object *obj = MFTLObjectCreate(1);
+
+  /* Start ON the doubling ladder, because that is the state the shrink itself
+   * produces: its target is MFTLGrowCapacity(0, n). MFTLObjectSetCounts() alone
+   * would leave capacity at exactly `lo`, half a rung low, where the gate
+   * happens to miss by one and nothing thrashes -- so a harness built that way
+   * would report both slacks as safe and prove nothing. */
+  MFTLObjectReserve(obj, MFTLGrowCapacity(0, lo), MFTLGrowCapacity(0, lo));
+  MFTLObjectSetCounts(obj, lo, lo, lo, lo);
+
+  const void *last = obj->verts.block;
+  int reallocs = 0;
+
+  for (int i = 0; i < steps; ++i)
+  {
+    const int n = (i & 1) ? hi : lo;
+
+    // src/communication/redistribute.c, rebuild_object step 4.
+    if (n > obj->verts.capacity) MFTLObjectReserve(obj, MFTLGrowCapacity(obj->verts.capacity, n), MFTLGrowCapacity(obj->tris.capacity, n));
+    MFTLObjectSetCounts(obj, n, n, n, n);
+    (void) MFTLObjectShrinkToFit(obj, slack);
+
+    if (obj->verts.block != last)
+    {
+      last = obj->verts.block;
+      reallocs++;
+    }
+  }
+
+  MFTLObjectDestroy(&obj);
+  return reallocs;
+}
+
+static int test_shrink_to_fit_does_not_thrash_against_the_grow_ladder(void)
+{
+  /* WHY THE DEFAULT SLACK IS 4 AND NOT 2, as an executable claim.
+   *
+   * Both resize operators leave capacity in [n, 2n), so a gate of
+   * `capacity > 2n` is satisfied by ANY decrease: a body dithering by two
+   * entities around 1024 grows to 2048, shrinks to 1024, grows to 2048 ...
+   * reallocating both pools every single timestep. At 4 the count has to halve
+   * before anything moves. */
+  const int lax = count_reallocs_under_jitter(2.0, 1023, 1025, 200);
+  const int sane = count_reallocs_under_jitter(MFTL_SHRINK_SLACK_DEFAULT, 1023, 1025, 200);
+
+  TEST_ASSERT(lax > 100);
+  TEST_ASSERT(sane <= 2);
+
+  return 0;
+}
+
+static int test_shrink_to_fit_at_zero_releases_the_block(void)
+{
+  /* At n == 0 the target is MFTLGrowCapacity(0, 0) == 0, so "give the block
+   * back entirely" needs no special case -- it is the same arithmetic. */
+  MFTL_Object *obj = MFTLObjectCreate(1);
+
+  MFTLObjectReserve(obj, 20000, 20000);
+  MFTLObjectSetCounts(obj, 0, 0, 0, 0);
+
+  TEST_ASSERT(MFTLObjectShrinkToFit(obj, MFTL_SHRINK_SLACK_DEFAULT));
+
+  TEST_ASSERT_EQUAL_INT(0, obj->verts.capacity);
+  TEST_ASSERT_EQUAL_INT(0, obj->tris.capacity);
+  TEST_ASSERT(obj->verts.block == MFTL_NULL);
+  TEST_ASSERT(obj->tris.block == MFTL_NULL);
+  TEST_ASSERT(obj->verts.rec == MFTL_NULL);
+  TEST_ASSERT(obj->tris.he == MFTL_NULL);
+  TEST_ASSERT(MFTLObjectPoolsAreConsistent(obj));
+
+  // A released pool must be refillable, exactly like a fresh one.
+  MFTLObjectSetCounts(obj, 50, 50, 40, 40);
+  fill_pattern(obj, 3);
+  TEST_ASSERT(check_pattern(obj, 3, 50, 40));
+  touch_every_array_at_capacity(obj);
+  TEST_ASSERT(MFTLObjectPoolsAreConsistent(obj));
+
+  MFTLObjectDestroy(&obj);
+  return 0;
+}
+
+static int test_shrink_to_fit_zeroes_the_new_tail(void)
+{
+  /* Same argument as test_zeroed_on_first_allocation, for the block a shrink
+   * produces: slots above the live count must read zero, or a later
+   * MFTLObjectSetCounts() hands the caller uninitialised `flags` and a closed
+   * mesh claims a boundary. */
+  MFTL_Object *obj = MFTLObjectCreate(1);
+
+  MFTLObjectReserve(obj, 30000, 30000);
+  MFTLObjectSetCounts(obj, 300, 300, 200, 200);
+  fill_pattern(obj, 9);
+
+  TEST_ASSERT(MFTLObjectShrinkToFit(obj, MFTL_SHRINK_SLACK_DEFAULT));
+
+  for (int v = obj->verts.n; v < obj->verts.capacity; ++v)
+  {
+    TEST_ASSERT_EQUAL_INT(0, obj->verts.rec[v].flags);
+    for (int k = 0; k < 3; ++k) TEST_ASSERT_EQUAL_DOUBLE(0.0, obj->verts.pos[3 * v + k], 0.0);
+  }
+  for (int h = 3 * obj->tris.n; h < 3 * obj->tris.capacity; ++h)
+  {
+    TEST_ASSERT_EQUAL_INT(0, obj->tris.he[h].flags);
+  }
+
+  MFTLObjectDestroy(&obj);
+  return 0;
+}
+
+static int test_shrink_to_fit_leaves_the_bookkeeping_alone(void)
+{
+  /* The one test that catches an implementation spelled through
+   * MFTLObjectSetCounts(): that stamps partition_dirty and clears `derived`, so
+   * every body would be permanently dirty and the redistribution's per-body
+   * skip would silently stop firing. Nothing else here would fail. */
+  MFTL_Object *obj = MFTLObjectCreate(1);
+
+  MFTLObjectReserve(obj, 50000, 50000);
+  MFTLObjectSetCounts(obj, 400, 400, 300, 300);
+  MFTLObjectBuildDerived(obj);
+  obj->partition_dirty = MFTL_FALSE;
+
+  TEST_ASSERT(MFTLObjectShrinkToFit(obj, MFTL_SHRINK_SLACK_DEFAULT));
+
+  TEST_ASSERT(MFTLObjectHasTopology(obj));
+  TEST_ASSERT(MFTLObjectHasFrames(obj));
+  TEST_ASSERT(!obj->partition_dirty);
+  TEST_ASSERT_EQUAL_INT(400, obj->verts.n);
+  TEST_ASSERT_EQUAL_INT(400, obj->verts.n_local);
+  TEST_ASSERT_EQUAL_INT(300, obj->tris.n);
 
   MFTLObjectDestroy(&obj);
   return 0;
@@ -452,9 +765,18 @@ int main(int argc, char **argv)
   RUN_TEST(test_growth_preserves_every_array);
   RUN_TEST(test_set_counts_reserves_before_it_assigns);
   RUN_TEST(test_set_counts_invalidates_the_derived_arrays);
-  RUN_TEST(test_pools_never_shrink);
+  RUN_TEST(test_reserve_never_shrinks);
   RUN_TEST(test_clear_keeps_the_allocation);
   RUN_TEST(test_reserve_additional_is_geometric);
+  RUN_TEST(test_shrink_to_fit_recovers_the_block);
+  RUN_TEST(test_shrink_to_fit_preserves_every_entity);
+  RUN_TEST(test_shrink_to_fit_never_drops_entities);
+  RUN_TEST(test_shrink_to_fit_is_idempotent);
+  RUN_TEST(test_shrink_to_fit_respects_the_slack_gate);
+  RUN_TEST(test_shrink_to_fit_does_not_thrash_against_the_grow_ladder);
+  RUN_TEST(test_shrink_to_fit_at_zero_releases_the_block);
+  RUN_TEST(test_shrink_to_fit_zeroes_the_new_tail);
+  RUN_TEST(test_shrink_to_fit_leaves_the_bookkeeping_alone);
   RUN_TEST(test_zeroed_on_first_allocation);
   RUN_TEST(test_update_global_stats_counts_the_owned_prefix);
 

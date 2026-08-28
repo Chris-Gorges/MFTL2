@@ -204,4 +204,34 @@
  */
 #define MFTL_INIT_CAPACITY 128
 
+/**
+ * @brief Waste factor at which MFTLObjectShrinkToFit() gives a pool block back.
+ *
+ * A pool is shrunk when `capacity > MFTL_SHRINK_SLACK_DEFAULT * n`. Four is a
+ * floor, not a taste: it is the PRODUCT of the two headroom factors, and
+ * anything below it thrashes.
+ *
+ * Both resize operators leave `capacity` in \f$[n, 2n)\f$ -- MFTLGrowCapacity()
+ * doubles from below its @p needed argument, so the result is under `2n`
+ * whatever it started from, and the shrink targets the same ladder. A gate of
+ * `capacity > 2n` is therefore satisfied by ANY decrease at all. Concretely,
+ * with `capacity = 1024` and a body whose count dithers 1023 <-> 1025 under
+ * advection: the step at 1025 grows to 2048, the step back at 1023 sees
+ * `2048 > 2046` and shrinks to 1024, the next grows again -- a whole pool
+ * reallocation and a memcpy of every sub-array, every timestep, for a body that
+ * moved by two entities. That is exactly what the pre-grow in
+ * src/communication/redistribute.c exists to prevent, and it is silent: nothing
+ * fails, only the timing moves.
+ *
+ * At 4 the gate re-fires only if the count HALVES -- after a resize at
+ * \f$n_0\f$ we have \f$C < 2 n_0\f$, so \f$C > 4 n_1\f$ needs
+ * \f$n_1 < n_0 / 2\f$ -- which keeps reallocations
+ * \f$O(\log(n_{max}/n_{min}))\f$ over a run. Nothing is lost on the case the
+ * shrink exists for: a rank holding a sliver of a generated body wastes 25x,
+ * not 3x.
+ *
+ * Pinned by `test_shrink_to_fit_does_not_thrash_against_the_grow_ladder`.
+ */
+#define MFTL_SHRINK_SLACK_DEFAULT 4.0
+
 #endif  // MFTL_CONSTANTS_H

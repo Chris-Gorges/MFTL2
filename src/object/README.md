@@ -73,6 +73,7 @@ Giving them their own pool would recreate exactly the problem this layout remove
 MFTLObjectReserve(obj, nv, nt);            /* exact, for bulk loads          */
 MFTLObjectReserveAdditional(obj, dv, dt);  /* geometric, for incremental use */
 MFTLObjectSetCounts(obj, nv, nvl, nt, ntl);
+MFTLObjectShrinkToFit(obj, slack);         /* the only way DOWN, and gated   */
 ```
 
 `MFTLObjectSetCounts` **reserves before it assigns**, so the postcondition
@@ -82,9 +83,31 @@ and capacity disagree" unreachable, and it is why nothing else needs to check.
 Setting a count invalidates the derived arrays: they describe a different number
 of entities than they did a moment ago.
 
-@warning Every pool-growing call **may reallocate both blocks**. Any raw pointer
-         into `obj->verts.*` or `obj->tris.*` taken before such a call is
-         dangling afterwards. Hold indices.
+### Growth is a ratchet, and shrinking is deliberate
+
+The first three never lower a capacity. That is not an oversight: a mesh of
+stable size must not re-fault its pages every timestep, and
+`src/communication/redistribute.c` pre-grows a body and then relies on the
+reserve inside `MFTLObjectSetCounts` early-returning. A shrink reachable from
+`SetCounts` would also be a heap overflow, because `SetCounts` reserves *before*
+it lowers `n` and the copy-forward is sized by `n`.
+
+So `MFTLObjectShrinkToFit` is separate, explicit and gated: it moves a pool only
+when `capacity > slack * n`, and lands it at `MFTLGrowCapacity(0, n)`, i.e. back
+on the doubling ladder in `[n, 2n)`. The slack must be at least **4** — both
+operators leave capacity within a factor of two of the count, so a gate of 2 is
+met by any decrease at all and the two take turns reallocating every timestep.
+`MFTL_SHRINK_SLACK_DEFAULT` derives it with a worked sequence, and
+`test_shrink_to_fit_does_not_thrash_against_the_grow_ladder` asserts it.
+
+It changes no count, no content, no derived bit and no partition stamp — it is a
+memory operation, not a mesh operation. `MFTLObjectReleasePools` is the
+all-or-nothing form, for a body that has left the rank entirely, and after the
+resize refactor it *is* this operation at zero capacity.
+
+@warning Every pool-**resizing** call, in either direction, may reallocate both
+         blocks. Any raw pointer into `obj->verts.*` or `obj->tris.*` taken
+         before such a call is dangling afterwards. Hold indices.
 
 ---
 

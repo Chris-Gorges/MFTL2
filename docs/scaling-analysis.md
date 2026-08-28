@@ -87,31 +87,70 @@ renders.
 These are the reason to read this page before trusting a curve. Every one of them
 produces a plausible-looking number.
 
-## 1. Pools never shrink, so batched generation cannot bound rank-0 memory {#scaling_trap_pools}
+## 1. Generation peak vs stranded capacity: two problems, and only one is fixed {#scaling_trap_pools}
 
-`MFTLGenerateSphere` builds the whole sphere on **rank 0**; every other rank gets
-an empty object. The obvious fix for the resulting footprint — generate in batches
-of K bodies with a `MFTLRedistribute` between them — does not work, and it is worth
-recording why, because it looks like it should.
+`MFTLGenerateSphere` builds the whole sphere on **rank 0**; every other rank gets an empty object.
+That is one cost. Growth being a ratchet — `vertex_pool_reserve` and `triangle_pool_reserve` open
+with `if (capacity <= p->capacity) return;` — used to be a second one on top of it. They need
+separating, because they have different fixes and only one of them has landed.
 
-MFTL pools never shrink. `vertex_pool_reserve` and `triangle_pool_reserve` open
-with `if (capacity <= p->capacity) return;`, and `mftl_object.h` states it as
-contract: *"pools never shrink, so a mesh of stable size does not re-fault its
-pages every timestep."* Redistribution lowers `tris.n`; it never lowers
-`tris.capacity`. So each body keeps its full generation capacity on rank 0 for the
-whole run, and after B batches rank 0 holds N full-sphere capacities — exactly as
-if nothing had been batched.
+### The generation peak is real and unfixed
 
-Batching would have shaved only the transient *on top of* that base, while costing
-O(N²/K) setup work, because `collect_destinations` re-derives the entire halo on
-every call and `rebuild_object` re-runs over every entity already placed.
+Every body exists at full size on rank 0 *before* the opening `MFTLRedistribute`, so nothing that
+runs inside that redistribution can lower the peak. `5120 · 4^refine + 176` bytes per body: 80 MB
+for 256 bodies at refine 3, 640 MiB for 512 at refine 4.
 
-What the benchmark does instead: prints the footprint
-(`5120 · 4^refine + 176` bytes per body), refuses above `--max-gen-mb`, and times
-setup separately. **In weak mode that setup cost grows linearly with P on one rank
-while the timed loop does not** — it is the harness's Amdahl ceiling, not the
-library's, and it is excluded from every scaling total. The real fix is an
-`MFTLObjectShrinkToFit` in `src/object/object.c`; it does not exist.
+Batching — generate K bodies, redistribute, repeat — does **not** fix it, and it is worth recording
+why because it looks like it should. It shaves only the transient on top of a base it cannot touch,
+while costing O(N²/K) setup work, because `collect_destinations` re-derives the entire halo on every
+call and `rebuild_object` re-runs over every entity already placed. Measured at 512 bodies, K = 32:
+~8× the setup work for a ~30 % cut in a peak dominated by the base.
+
+What the benchmark does instead: prints the footprint, refuses above `--max-gen-mb`, and times setup
+separately. **In weak mode that setup cost grows linearly with P on one rank while the timed loop
+does not** — the harness's Amdahl ceiling, not the library's, and excluded from every scaling total.
+The real fix is a distributed generator, and it does not exist.
+
+### The stranded capacity was the smaller half, and it is fixed
+
+After the scatter, what rank 0 does with those blocks splits in two:
+
+- **Bodies it keeps nothing of** are released outright — `MFTLObjectSetCounts(0,0,0,0)` plus
+  `MFTLObjectReleasePools` in `src/communication/redistribute.c`. This is most of them. Measured at
+  256 bodies, refine 3, np = 4: **80 MB generated, 33.5 MB of pool capacity left on rank 0.**
+- **Bodies it keeps a sliver of** hold a full-mesh block against a few dozen triangles.
+  `MFTLObjectShrinkToFit()` recovers those, armed by `MFTLRedistributeSetShrinkSlack()`.
+
+### What arming it is worth
+
+Capacity is a ratchet, so over a run every rank accumulates, per body, the largest share it ever
+held — measure at the END of the loop, not after the scatter. np = 4, 128 bodies, refine 3,
+200 steps, `examples/parallel_advection_scaling.c`. Capacity figures are bit-reproducible across
+runs; timings are three runs each.
+
+| | `--shrink-slack 0` | `--shrink-slack 4` |
+|---|---|---|
+| end capacity, max/rank | 22.8 MB | 20.8 MB (−8.8 %) |
+| end capacity, total | 73.3 MB | 68.0 MB (−7.2 %) |
+| stranded against live | 1.79× | 1.66× |
+| redistribute ms/step | 0.906 / 0.931 / 0.960 | 0.941 / 0.960 / 0.962 |
+| end RSS, sum over ranks | 213.3–217.7 MB | 210.4–212.6 MB |
+
+**8 % of capacity for about 2 % of the redistribution phase.** That is a trade, so it ships
+disabled, like `coarsen_frozen_fraction` and `serial_gather_max_triangles` and unlike
+`parallel_coarsen`. Most of the residual 1.66× sits in the 1×–4× band the gate declines on purpose:
+it cannot go to 2 without thrashing against the ×2 growth ladder, and `MFTL_SHRINK_SLACK_DEFAULT`
+derives that with a worked sequence. Arm it when bodies genuinely shrink — remeshing that coarsens,
+or a long run where shares drift far.
+
+### Measure it in RSS, never in a byte counter
+
+Whether `free()` returns pages to the operating system is the allocator's decision. glibc raises its
+mmap threshold dynamically as mmapped chunks are freed, up to 32 MiB, after which blocks come from
+the heap break and freeing them may not lower RSS at all; macOS madvise-frees large allocations. So
+`MFTL_RedistributeStats.n_bytes_reclaimed` is an **upper bound** on the win, and
+`current_rss_bytes()` is the measurement. It is deliberately not `peak_rss_bytes()`: `ru_maxrss` is
+a high-water mark, cannot fall, and would report "no change" for a change of hundreds of megabytes.
 
 ## 2. Counting migration warms the caches for the phase being timed {#scaling_trap_migration}
 

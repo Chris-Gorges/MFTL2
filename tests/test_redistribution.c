@@ -1149,6 +1149,206 @@ static int test_a_stamped_body_is_never_skipped(void)
   return 0;
 }
 
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Pool capacity after the scatter
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * @brief Bodies wasting more than @p factor x their live count, on this rank.
+ *
+ * The bound is `factor`, not 2, and the difference is the whole anti-thrash
+ * argument: a shrink lands capacity in [n, 2n), but a body already between 2n
+ * and `factor * n` is deliberately LEFT ALONE, because firing there is what
+ * makes a jittering count reallocate every timestep. So `factor * n` is what an
+ * armed pass guarantees, and asserting 2n instead would fail on bodies the
+ * policy is correctly declining to touch.
+ *
+ * @param ens    The ensemble.
+ * @param factor Waste factor to test against, i.e. the armed slack.
+ * @return Count of bodies over the bound, this rank only.
+ */
+static int bodies_over_the_bound(const MFTL_Ensemble *ens, double factor)
+{
+  int bad = 0;
+  for (int o = 0; o < ens->num_objects; ++o)
+  {
+    const MFTL_Object *const obj = ens->objects[o];
+    if (obj->verts.n == 0 && obj->tris.n == 0) continue;
+
+    const double v_bound = MFTL_MAX((double) MFTL_INIT_CAPACITY, factor * (double) obj->verts.n);
+    const double t_bound = MFTL_MAX((double) MFTL_INIT_CAPACITY, factor * (double) obj->tris.n);
+    if ((double) obj->verts.capacity > v_bound || (double) obj->tris.capacity > t_bound) bad++;
+  }
+  return bad;
+}
+
+/** @brief Bytes both pool blocks of every body occupy on this rank. */
+static long capacity_bytes(const MFTL_Ensemble *ens)
+{
+  long bytes = 0;
+  for (int o = 0; o < ens->num_objects; ++o) bytes += (long) MFTLObjectPoolBytes(ens->objects[o]);
+  return bytes;
+}
+
+/**
+ * @brief The scatter must not leave rank 0 holding every body at full capacity.
+ *
+ * MFTLGenerateSphere() builds on rank 0, pools are grow-only, and redistribution
+ * lowers `n` and never `capacity` -- so without MFTLRedistributeSetShrinkSlack()
+ * rank 0 keeps a full-mesh block for every body it retains a sliver of, for the
+ * whole run. That is deferred issue 20 in CLAUDE.md, and this is its regression
+ * test: it FAILS with the slack at 0.
+ */
+static int test_generation_capacity_does_not_stay_resident_on_rank_0(void)
+{
+  const int n_bodies = 16;
+  MFTL_Ensemble *ens = make_ensemble(MFTL_FALSE, n_bodies + 1);
+
+  /* Spread over the box so that at np > 1 rank 0 ends up holding slivers of
+   * several bodies rather than all of one or none of any. Refine 3 is 642
+   * vertices and 1280 triangles per body -- large enough that a sliver is far
+   * under the 2x bound, small enough to stay cheap at np = 8. */
+  for (int i = 0; i < n_bodies; ++i)
+  {
+    const double cx = -0.75 + 0.10 * (double) i;
+    const double cy = -0.55 + 0.07 * (double) ((i * 5) % 11);
+    const double cz = 0.60 - 0.09 * (double) ((i * 3) % 7);
+    add_sphere(ens, i, cx, cy, cz, 0.14, 3);
+  }
+
+  /* One body placed so that the x = 0 cut shaves a THIN CAP off it. Rank 0 is
+   * Cartesian cell (0,0,0) -- the low corner on every axis -- so the cap lands
+   * there, on the rank that generated the whole sphere and therefore holds a
+   * full-mesh block. That is issue 20 in one body: a few dozen triangles in
+   * storage sized for 1280.
+   *
+   * The spread bodies above cannot produce it. A small body either lands whole
+   * on one rank (capacity == n, nothing wasted) or splits near its middle
+   * (~2x, which the slack-4 gate correctly declines to touch). Only a cut near
+   * a body's EDGE stranded enough to be worth recovering, and without this body
+   * the test would pass while covering nothing. */
+  add_sphere(ens, n_bodies, 0.15, -0.5, -0.5, 0.18, 3);
+
+  /* NON-VACUITY, measured before anything is redistributed. On rank 0 every body
+   * is at capacity == n, which satisfies the bound -- so the interesting count
+   * is what a rank holds AFTER the scatter with the shrink off. Without this the
+   * test would pass at np = 1 while covering nothing: there, rank 0 legitimately
+   * keeps every body whole and the bound is met trivially. */
+  MFTLRedistributeSetShrinkSlack(0.0);
+  MFTLRedistribute(ens);
+  refresh_geometry(ens);  // redistribution leaves tris.center undefined by design
+  MFTLRedistribute(ens);  // the settling rebuild, so nothing below is mid-transition
+  refresh_geometry(ens);
+
+  int local_bad = bodies_over_the_bound(ens, MFTL_SHRINK_SLACK_DEFAULT);
+  int bad_without_shrink = 0;
+  MPI_Allreduce(&local_bad, &bad_without_shrink, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+
+  long local_bytes = capacity_bytes(ens);
+  long max_before = 0, sum_before = 0;
+  MPI_Allreduce(&local_bytes, &max_before, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
+  MPI_Allreduce(&local_bytes, &sum_before, 1, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
+
+  /* Above np = 1 the scatter MUST have stranded capacity somewhere, or this
+   * test is measuring nothing and the bound below is vacuous. */
+  if (g_nproc > 1) TEST_ASSERT(agreed(bad_without_shrink > 0, MPI_COMM_WORLD));
+
+  /* Now arm it and redistribute again. Nothing about the mesh changed, so every
+   * shrink that fires is pure recovery. */
+  MFTLRedistributeSetShrinkSlack(MFTL_SHRINK_SLACK_DEFAULT);
+  MFTLRedistribute(ens);
+  MFTLRedistributeSetShrinkSlack(0.0);  // back to the library default
+
+  /* PRIMARY: no body is left wasting more than the armed slack, with the
+   * MFTL_INIT_CAPACITY floor. Per body rather than in aggregate, which is
+   * sharper -- one stranded full-mesh block cannot hide behind fifteen small
+   * ones the way a total would let it. */
+  TEST_ASSERT(agreed(bodies_over_the_bound(ens, MFTL_SHRINK_SLACK_DEFAULT) == 0, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+
+  /* SECONDARY: capacity was actually RECOVERED, not merely redistributed.
+   *
+   * Deliberately not "rank 0 is no longer an outlier against the mean". Sixteen
+   * small bodies plus one sliver do not make rank 0 an outlier in the first
+   * place -- measured max/mean is about 1.2 here -- so that assertion would pass
+   * without testing anything, which is the failure mode this file's non-vacuity
+   * rule exists to prevent. The outlier claim needs issue 20's real shape,
+   * hundreds of bodies generated on one rank, and it is priced in RSS rather
+   * than in capacity bytes by examples/parallel_advection_scaling.c. What is
+   * checkable here is that the total fell, and it does: 7.87 -> 7.61 MB at
+   * np = 2, 9.22 -> 8.95 MB at np = 4 and 8. */
+  local_bytes = capacity_bytes(ens);
+  long max_after = 0, sum_after = 0;
+  MPI_Allreduce(&local_bytes, &max_after, 1, MPI_LONG, MPI_MAX, MPI_COMM_WORLD);
+  MPI_Allreduce(&local_bytes, &sum_after, 1, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
+
+  if (g_nproc > 1) TEST_ASSERT(agreed(sum_after < sum_before, MPI_COMM_WORLD));
+
+  if (g_rank == 0)
+  {
+    printf("      capacity bytes: max %ld -> %ld, total %ld -> %ld over %d ranks\n", max_before, max_after, sum_before, sum_after, g_nproc);
+  }
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/**
+ * @brief Shrinking is a memory policy: the mesh must come out bit-identical.
+ *
+ * The same protocol test_skipping_reproduces_the_full_rebuild() uses, and for
+ * the same reason -- both digest halves, every step. That test cannot stand in
+ * for this one: its digest folds entity content and slot order and deliberately
+ * says nothing about capacity, so it would pass while a shrink corrupted a pool.
+ */
+static int test_shrinking_does_not_change_the_mesh(void)
+{
+  const int n_bodies = 8;
+  MFTL_Ensemble *ens_on = make_ensemble(MFTL_TRUE, n_bodies);
+  MFTL_Ensemble *ens_off = make_ensemble(MFTL_TRUE, n_bodies);
+
+  for (int i = 0; i < n_bodies; ++i)
+  {
+    const double cx = -0.7 + 0.19 * (double) i;
+    const double cy = -0.5 + 0.11 * (double) ((i * 5) % 11);
+    const double cz = 0.6 - 0.13 * (double) ((i * 3) % 7);
+    add_sphere(ens_on, i, cx, cy, cz, 0.11, 2);
+    add_sphere(ens_off, i, cx, cy, cz, 0.11, 2);
+  }
+
+  MFTLRedistributeSetShrinkSlack(MFTL_SHRINK_SLACK_DEFAULT);
+  MFTLRedistribute(ens_on);
+  MFTLRedistributeSetShrinkSlack(0.0);
+  MFTLRedistribute(ens_off);
+
+  const double velocity[3] = {0.031, 0.017, 0.023};
+  int ok = 1;
+
+  for (int step = 0; step < 20 && ok; ++step)
+  {
+    advect_one_step(ens_on, velocity, 1.0);
+    advect_one_step(ens_off, velocity, 1.0);
+
+    MFTLRedistributeSetShrinkSlack(MFTL_SHRINK_SLACK_DEFAULT);
+    MFTLRedistribute(ens_on);
+    MFTLRedistributeSetShrinkSlack(0.0);
+    MFTLRedistribute(ens_off);
+
+    uint64_t d_on[2], d_off[2];
+    partition_digest(ens_on, d_on);
+    partition_digest(ens_off, d_off);
+
+    if (d_on[0] != d_off[0] || d_on[1] != d_off[1]) ok = 0;
+    if (!ensemble_is_sound(ens_on)) ok = 0;
+  }
+
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+
+  MFTLEnsembleDestroy(&ens_on);
+  MFTLEnsembleDestroy(&ens_off);
+  return 0;
+}
+
 static int test_empty_object_is_a_no_op(void)
 {
   MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 2);
@@ -1229,6 +1429,8 @@ int main(int argc, char **argv)
   RUN_TEST(test_non_periodic_domain);
   RUN_TEST(test_skipping_reproduces_the_full_rebuild);
   RUN_TEST(test_a_stamped_body_is_never_skipped);
+  RUN_TEST(test_generation_capacity_does_not_stay_resident_on_rank_0);
+  RUN_TEST(test_shrinking_does_not_change_the_mesh);
   RUN_TEST(test_empty_object_is_a_no_op);
   RUN_TEST(test_empty_ensemble_is_a_no_op);
   RUN_TEST(test_invalid_arguments);

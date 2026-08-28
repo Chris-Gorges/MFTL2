@@ -67,19 +67,27 @@
  *
  * -- Four traps this file exists to avoid ---------------------------------------
  *
- * 1. SETUP IS RANK-0-SERIAL AND ITS COST IS RESIDENT, NOT TRANSIENT.
- *    MFTLGenerateSphere builds the whole sphere on rank 0, and MFTL pools NEVER
- *    SHRINK (include/mftl_object.h, "pools never shrink, so a mesh of stable size
- *    does not re-fault its pages every timestep"). Redistribution lowers tris.n and
- *    never tris.capacity, so every body keeps its full generation capacity on rank 0
- *    for the whole run. Generating in batches with a redistribute between them --
- *    the obvious fix -- does not work: it shaves only the packed-buffer transient on
- *    top of a base it cannot touch, and costs O(N^2/K) setup work, because
- *    collect_destinations re-derives the entire halo on every call. So the footprint
- *    is PRINTED and checked against --max-gen-mb instead, and t_setup is timed and
- *    reported separately. In weak mode, where the body count grows with P, setup
- *    time grows LINEARLY WITH P on one rank while the timed loop does not -- it is
- *    the Amdahl ceiling of the harness, not of the library, and it must never be
+ * 1. SETUP IS RANK-0-SERIAL, AND ITS COST IS A TRANSIENT PEAK PLUS A SMALL
+ *    RESIDENT TAIL. Do not conflate them; they have different fixes and only one
+ *    of them has landed.
+ *      The PEAK: MFTLGenerateSphere builds the whole sphere on rank 0, so every
+ *    body exists at full size BEFORE the opening redistribute. Nothing that runs
+ *    inside that redistribute can lower it. Generating in batches with a
+ *    redistribute between them -- the obvious fix -- does not work either: it
+ *    shaves only the packed-buffer transient on top of a base it cannot touch,
+ *    and costs O(N^2/K) setup work, because collect_destinations re-derives the
+ *    entire halo on every call. So the footprint is PRINTED and checked against
+ *    --max-gen-mb, which is a TRANSIENT peak and is labelled as one.
+ *      The TAIL: MFTL pool growth is a ratchet, so a rank that keeps a SLIVER of
+ *    a body holds a full-mesh block for it. Bodies a rank keeps NOTHING of are
+ *    already released outright by redistribution, which is most of them -- 80 MB
+ *    generated leaves 33.5 MB of capacity on rank 0 at 256 bodies, refine 3,
+ *    np = 4. --shrink-slack recovers the rest, and it is worth about 8 % of
+ *    capacity for about 2 % of the redistribute phase, which is why it is off by
+ *    default. See docs/scaling-analysis.md section 1 for the table.
+ *      In weak mode, where the body count grows with P, setup time grows
+ *    LINEARLY WITH P on one rank while the timed loop does not -- it is the
+ *    Amdahl ceiling of the harness, not of the library, and it must never be
  *    folded into a weak-scaling total.
  *
  * 2. COUNTING MIGRATION WARMS THE CACHES FOR THE PHASE BEING TIMED.
@@ -171,6 +179,9 @@
  *     --per-step            put the per-step series in the JSON
  *     --verify              check conservation every step, exit non-zero on drift
  *     --max-gen-mb X        refuse if rank 0 generation exceeds this (default 8192)
+ *     --shrink-slack X      give pool capacity above X * the live count back after
+ *                           the scatter (default 0 = off; 4 is the tested value).
+ *                           Lowers the RESIDENT footprint, not the generation peak.
  *     --json PATH           write the machine-readable result here
  *     --git HASH            recorded verbatim in the JSON        (default "unknown")
  *
@@ -188,6 +199,11 @@
 #include <time.h>
 
 #include <sys/resource.h>
+#ifdef __APPLE__
+#include <mach/mach.h>
+#else
+#include <unistd.h>
+#endif
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -290,6 +306,41 @@ static long peak_rss_bytes(void)
 }
 
 /**
+ * @brief CURRENT resident set size of this process, in bytes.
+ *
+ * Not peak_rss_bytes(). `ru_maxrss` is a high-water mark, so it cannot fall and
+ * is structurally unable to show what MFTLRedistributeSetShrinkSlack() does --
+ * asking it would report "no change" for a change of hundreds of megabytes.
+ *
+ * A CAPACITY BYTE COUNT is not a substitute either, and that is the trap this
+ * function exists for: whether free() hands pages back to the operating system
+ * is the allocator's decision. glibc raises its mmap threshold dynamically as
+ * mmapped chunks are freed, up to 32 MiB, after which blocks come from the heap
+ * break and freeing them may not lower RSS at all; macOS madvise-frees large
+ * allocations. So the byte counter is an upper bound on the win and this is the
+ * measurement. Where they disagree, the allocator is the reason.
+ *
+ * @return Current RSS in bytes, or 0 if the platform query failed.
+ */
+static long current_rss_bytes(void)
+{
+#ifdef __APPLE__
+  mach_task_basic_info_data_t info;
+  mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+  if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t) &info, &count) != KERN_SUCCESS) return 0;
+  return (long) info.resident_size;
+#else
+  FILE *fp = fopen("/proc/self/statm", "r");
+  if (fp == MFTL_NULL) return 0;
+  long total_pages = 0, resident_pages = 0;
+  const int got = fscanf(fp, "%ld %ld", &total_pages, &resident_pages);
+  fclose(fp);
+  if (got != 2) return 0;
+  return resident_pages * (long) sysconf(_SC_PAGESIZE);
+#endif
+}
+
+/**
  * @brief Size of one file, in bytes, or 0 if it cannot be stat'd.
  * @param path The file.
  * @return Size in bytes.
@@ -345,6 +396,7 @@ typedef struct
   bool verify;
 
   double max_gen_mb;
+  double shrink_slack;
   int vtk_every;  ///< 0 = never.
   char vtk_dir[192];
   MFTL_VtkOptions vtk;
@@ -405,6 +457,7 @@ static int parse_args(int argc, char **argv, int rank, int nproc, config *cfg)
   cfg->repeat = 1;
   cfg->post_geom = true;
   cfg->max_gen_mb = 8192.0;
+  cfg->shrink_slack = 0.0;
   snprintf(cfg->vtk_dir, sizeof cfg->vtk_dir, ".");
   cfg->vtk = MFTLVtkDefaults();
 
@@ -468,6 +521,8 @@ static int parse_args(int argc, char **argv, int rank, int nproc, config *cfg)
       cfg->repeat = atoi(argv[++i]);
     else if (!strcmp(a, "--max-gen-mb") && i + 1 < argc)
       cfg->max_gen_mb = atof(argv[++i]);
+    else if (!strcmp(a, "--shrink-slack") && i + 1 < argc)
+      cfg->shrink_slack = atof(argv[++i]);
     else if (!strcmp(a, "--quality"))
       cfg->quality = true;
     else if (!strcmp(a, "--normals"))
@@ -1232,17 +1287,21 @@ int main(int argc, char **argv)
   const long tri_per_body = 20L * (1L << (2 * cfg.refinements));
   const long vert_per_body = 10L * (1L << (2 * cfg.refinements)) + 2L;
 
-  /* Rank 0 builds every sphere whole, and MFTL pools NEVER SHRINK, so this
-   * footprint is resident for the whole run rather than transient. Batched
-   * generation does not reduce it -- only the body count and the refinement do.
-   * See trap 1 in the header comment. */
+  /* Rank 0 builds every sphere whole, so this is a TRANSIENT PEAK that exists
+   * before the opening redistribute and that nothing inside it can lower. Batched
+   * generation does not reduce it either -- only the body count and the
+   * refinement do. What happens to the memory AFTERWARDS is a separate question
+   * with a separate answer: see trap 1 in the header comment. */
   const double gen_mb = (double) n_bodies * ((double) tri_per_body * 212.0 + (double) vert_per_body * 88.0) / (1024.0 * 1024.0);
   if (gen_mb > cfg.max_gen_mb)
   {
     if (rank == 0)
     {
       fprintf(stderr,
-              "refusing: generation would put %.1f MB on rank 0, over --max-gen-mb %.1f.\n"
+              "refusing: generation would peak at %.1f MB on rank 0, over --max-gen-mb %.1f.\n"
+              "  This is the TRANSIENT peak: every body is built whole before the first redistribute.\n"
+              "  Most of it is released by the scatter; --shrink-slack recovers the rest. Neither\n"
+              "  lowers this number.\n"
               "  %d bodies x refine %d (%ld triangles each). Refinement costs 4x per level;\n"
               "  reduce --refine or the body count, or raise --max-gen-mb if the node has the memory.\n",
               gen_mb, cfg.max_gen_mb, n_bodies, cfg.refinements, tri_per_body);
@@ -1281,7 +1340,7 @@ int main(int argc, char **argv)
     printf("  domain             %8.4g x %.4g x %.4g   periodic %d%d%d   lattice %dx%dx%d\n", size[0], size[1], size[2], (int) cfg.periodic[0],
            (int) cfg.periodic[1], (int) cfg.periodic[2], lat.n[0], lat.n[1], lat.n[2]);
     printf("  loop               %8d steps (+%d warmup) x %d repeat, dt %g, speed %g\n", cfg.steps, cfg.warmup, cfg.repeat, cfg.dt, cfg.speed);
-    printf("  rank-0 generation  %8.1f MB resident -- serial, and it grows with the body count\n", gen_mb);
+    printf("  rank-0 generation  %8.1f MB TRANSIENT peak -- serial, grows with the body count, not lowered by --shrink-slack\n", gen_mb);
     printf("  MPI_Wtick          %8.3g s   MPI_WTIME_IS_GLOBAL %s\n", tick, wtime_global ? "yes" : "no (durations only)");
     if (cfg.migration_stats) printf("  ** --migration-stats is ON: it warms the caches for the redistribute phase. Do not quote these timings. **\n");
     if (cfg.sync_phases) printf("  ** --sync-phases is ON: barriers remove inter-phase pipelining. Do not quote this wall clock. **\n");
@@ -1292,6 +1351,8 @@ int main(int argc, char **argv)
 
   MPI_Barrier(MPI_COMM_WORLD);
   const double t_setup0 = MPI_Wtime();
+
+  const long rss_before_gen = current_rss_bytes();
 
   for (int o = 0; o < n_bodies; ++o)
   {
@@ -1307,13 +1368,64 @@ int main(int argc, char **argv)
     MFTLComputeTriangleGeometry(obj, obj->tris.n);
   }
 
+  const long rss_after_gen = current_rss_bytes();
+
   /* NOT a redistribution in the steady-state sense: rank 0 holds everything and
    * no destination is in its 26-neighbourhood, so this takes the global
    * Alltoallv path and moves the whole mesh. Excluded from the loop, not warmed. */
+  MFTLRedistributeSetShrinkSlack(cfg.shrink_slack);
   MFTLRedistribute(ens);
+
+  /* Sampled AFTER the scatter, which is where the shrink runs and therefore the
+   * only place its effect exists. Note what this cannot show: rank 0 built every
+   * body whole BEFORE this line, so the generation PEAK is what it always was.
+   * Only the resident figure moves. */
+  const long rss_after_scatter = current_rss_bytes();
 
   MPI_Barrier(MPI_COMM_WORLD);
   const double t_setup = MPI_Wtime() - t_setup0;
+
+  /* ── What the shrink was worth, in RSS ──────────────────────────────────
+   *
+   * Three samples, because the interesting quantity is a DIFFERENCE and the two
+   * halves of issue 20 move differently. `after gen` minus `before gen` is the
+   * generation cost, which is rank-0 serial and which the shrink CANNOT lower --
+   * every body is built whole before the scatter runs. `after scatter` is the
+   * resident figure, and that is the one --shrink-slack moves.
+   *
+   * Reported as max and sum over ranks: the max is the number that decides
+   * whether a node has the memory, the sum is what the ensemble costs. */
+  {
+    long rss[3] = {rss_before_gen, rss_after_gen, rss_after_scatter};
+    long rmax[3], rsum[3];
+    MPI_Reduce(rss, rmax, 3, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(rss, rsum, 3, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    long cap_bytes = 0;
+    for (int o = 0; o < ens->num_objects; ++o) cap_bytes += (long) MFTLObjectPoolBytes(ens->objects[o]);
+    long cap_max = 0, cap_sum = 0;
+    MPI_Reduce(&cap_bytes, &cap_max, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&cap_bytes, &cap_sum, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    MFTL_RedistributeStats rst;
+    MFTLRedistributeGetStats(&rst);
+    long shrunk = 0, reclaimed = 0;
+    long my_shrunk = rst.n_objects_shrunk, my_reclaimed = rst.n_bytes_reclaimed;
+    MPI_Reduce(&my_shrunk, &shrunk, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&my_reclaimed, &reclaimed, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    if (rank == 0)
+    {
+      const double mb = 1024.0 * 1024.0;
+      printf("  rss max/sum        %8.1f/%.1f -> %.1f/%.1f -> %.1f/%.1f MB  (pre-gen -> post-gen -> post-scatter)\n", (double) rmax[0] / mb,
+             (double) rsum[0] / mb, (double) rmax[1] / mb, (double) rsum[1] / mb, (double) rmax[2] / mb, (double) rsum[2] / mb);
+      printf("  pool capacity      %8.1f/%.1f MB max/sum after the scatter, against %.1f MB generated on rank 0\n", (double) cap_max / mb,
+             (double) cap_sum / mb, gen_mb);
+      printf("  --shrink-slack     %8.2f  %ld bodies shrunk, %.1f MB of capacity reclaimed\n", cfg.shrink_slack, shrunk, (double) reclaimed / mb);
+      if (cfg.shrink_slack <= 0.0) printf("                              (off: pass --shrink-slack 4 to give the scatter's stranded capacity back)\n");
+      fflush(stdout);
+    }
+  }
 
   double *const vel = (double *) malloc((size_t) n_bodies * 3 * sizeof(double));
   if (!vel)
@@ -1443,6 +1555,47 @@ int main(int argc, char **argv)
   long rss_max = 0, rss_sum = 0;
   MPI_Reduce(&rss, &rss_max, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
   MPI_Reduce(&rss, &rss_sum, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
+  /* ── Where a shrink policy is actually decided ──────────────────────────
+   *
+   * Capacity is a RATCHET: without MFTLRedistributeSetShrinkSlack() every rank
+   * keeps, for every body, the largest share it ever held. So the number that
+   * matters is not the one right after the scatter -- it is this one, after the
+   * bodies have drifted for the whole run and every rank has accumulated its
+   * high-water mark. Compare `end capacity` here against `pool capacity` above
+   * to see what the ratchet cost, and against `live` to see what is stranded. */
+  {
+    long end_cap = 0, live = 0;
+    for (int o = 0; o < ens->num_objects; ++o)
+    {
+      const MFTL_Object *ob = ens->objects[o];
+      end_cap += (long) MFTLObjectPoolBytes(ob);
+      live += (long) ob->verts.n * 88L + (long) ob->tris.n * 212L;
+    }
+    const long end_rss = current_rss_bytes();
+
+    long ec_max = 0, ec_sum = 0, lv_sum = 0, er_max = 0, er_sum = 0;
+    MPI_Reduce(&end_cap, &ec_max, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&end_cap, &ec_sum, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&live, &lv_sum, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&end_rss, &er_max, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&end_rss, &er_sum, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    MFTL_RedistributeStats rst2;
+    MFTLRedistributeGetStats(&rst2);
+    long sh = rst2.n_objects_shrunk, rc = rst2.n_bytes_reclaimed, sh_t = 0, rc_t = 0;
+    MPI_Reduce(&sh, &sh_t, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&rc, &rc_t, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    if (rank == 0)
+    {
+      const double mb = 1024.0 * 1024.0;
+      printf("  end capacity       %8.1f/%.1f MB max/sum, live %.1f MB -> %.2fx stranded; rss %.1f/%.1f MB\n", (double) ec_max / mb, (double) ec_sum / mb,
+             (double) lv_sum / mb, (lv_sum > 0) ? (double) ec_sum / (double) lv_sum : 0.0, (double) er_max / mb, (double) er_sum / mb);
+      printf("  end shrink totals  %8ld bodies over the whole run, %.1f MB reclaimed\n", sh_t, (double) rc_t / mb);
+      fflush(stdout);
+    }
+  }
 
   double setup_max = 0.0;
   MPI_Reduce(&t_setup, &setup_max, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);

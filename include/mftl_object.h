@@ -82,8 +82,10 @@ void MFTLObjectDestroy(MFTL_Object **p_object);
  *
  * Exact growth, for bulk loads where the final size is known (generation, an I/O
  * read, the rebuild after a redistribution). A request at or below the current
- * capacity is a no-op: pools never shrink, so a mesh of stable size does not
- * re-fault its pages every timestep.
+ * capacity is a no-op: THIS function never shrinks, so a mesh of stable size
+ * does not re-fault its pages every timestep, and callers may pre-grow and rely
+ * on the next call early-returning. Giving capacity back is a separate, explicit
+ * and gated operation -- MFTLObjectShrinkToFit().
  *
  * Growth PRESERVES contents -- every array, including the derived ones. The
  * alternative is to discard the geometry on every resize on the grounds that the
@@ -130,7 +132,9 @@ void MFTLObjectSetCounts(MFTL_Object *obj, int n_vertices, int n_local_vertices,
  * @brief Empties the mesh, keeping the allocations.
  *
  * Counts and the global-ID counters go to zero; capacity is untouched, so
- * refilling the object does not re-allocate.
+ * refilling the object does not re-allocate. Giving the storage back is the
+ * other half and is never implicit: MFTLObjectShrinkToFit() for a mesh that is
+ * merely smaller, MFTLObjectReleasePools() for one that is gone.
  *
  * @param obj The mesh. Counts and the global-ID counters go to zero.
  */
@@ -143,13 +147,18 @@ void MFTLObjectClear(MFTL_Object *obj);
  * so that a mesh of stable size does not re-fault its pages every timestep. This
  * one is for the opposite case: a body that is no longer here at all.
  *
- * Pools never shrink (see vertex_pool_reserve in src/object/object.c, and it is
- * the right default), so an object keeps whatever capacity it ever reached for
- * the rest of its life. On the generation path that is the whole mesh: bodies are
- * built on rank 0 and then redistributed, so rank 0 retains capacity for every
- * body in the ensemble -- `5120 * 4^refine + 176` bytes each, which
- * docs/scaling-analysis.md prices at 671 MB for 512 bodies at refine 4. Nothing
- * short of freeing the block recovers it.
+ * Growth is a RATCHET (see vertex_pool_reserve in src/object/object.c, and it is
+ * the right default), so an object keeps whatever capacity it ever reached until
+ * something explicitly asks for it back. This is the all-or-nothing form of that
+ * ask and it requires an empty mesh; MFTLObjectShrinkToFit() is the graduated
+ * form, for a body that is merely smaller than it was.
+ *
+ * Both are needed. On the generation path bodies are built whole on rank 0 --
+ * `5120 * 4^refine + 176` bytes each -- and the opening redistribution then
+ * leaves rank 0 with a SLIVER of the ones it still overlaps and NOTHING of the
+ * rest. This function is what src/communication/redistribute.c calls for the
+ * second group; the shrink is what handles the first. See
+ * docs/scaling-analysis.md for what each is worth.
  *
  * @param obj The mesh. Must already hold no entities -- this frees storage, it
  *            does not decide what to discard. Afterwards the object is exactly as
@@ -161,6 +170,73 @@ void MFTLObjectClear(MFTL_Object *obj);
  * @rank_local
  */
 void MFTLObjectReleasePools(MFTL_Object *obj);
+
+/**
+ * @brief Gives back pool capacity a mesh has outgrown, if it is wasteful enough.
+ *
+ * The only way a pool ever gets smaller. MFTLObjectReserve() and
+ * MFTLObjectSetCounts() raise `capacity` and never lower it, deliberately -- a
+ * mesh of stable size must not re-fault its pages every timestep -- so a rank
+ * whose share of a body SHRANK keeps the block it held at its high-water mark
+ * for the rest of the run. That is not hypothetical: MFTLGenerateSphere() builds
+ * every body whole on rank 0, and after the opening MFTLRedistribute() rank 0
+ * holds a sliver of each in a block sized for all of it.
+ *
+ * Both pools are considered independently. One is shrunk when
+ *
+ *     capacity > slack * n
+ *
+ * and then to `MFTLGrowCapacity(0, n)`, the capacity an incrementally grown pool
+ * would have reached -- which is `n` rounded up the doubling ladder, so the
+ * result is in \f$[n, 2n)\f$ and the next append is still amortised. At `n == 0`
+ * that target is 0 and the block is released outright, exactly as
+ * MFTLObjectReleasePools() would.
+ *
+ * **No entity is ever discarded.** The target is at least `n` by construction;
+ * this function moves STORAGE and does not decide what to drop. Lower the counts
+ * first, through MFTLObjectSetCounts(), if that is what you meant.
+ *
+ * **Nothing observable changes.** `n`, `n_local`, every array's live prefix, both
+ * MFTL_DERIVED_* bits and the partition-dirty stamp are exactly as they were --
+ * this is a memory operation, not a mesh operation. In particular it must not be
+ * spelled through MFTLObjectSetCounts(), which stamps the body dirty and would
+ * silently defeat MFTLRedistributeSetSkipUnchangedBodies().
+ *
+ * @param obj   The mesh.
+ * @param slack Waste factor at which a pool is worth reallocating. Use
+ *              #MFTL_SHRINK_SLACK_DEFAULT unless you have measured otherwise;
+ *              values below 4 can thrash against the doubling growth ladder, and
+ *              that constant's documentation derives why. Must be at least 1.
+ * @return `true` if either pool actually reallocated, so a caller can count the
+ *         event without asking a second question.
+ *
+ * @warning Every pointer into either pool is dangling afterwards.
+ *
+ * @rank_local
+ */
+bool MFTLObjectShrinkToFit(MFTL_Object *obj, double slack);
+
+/**
+ * @brief Bytes the two pool blocks currently occupy.
+ *
+ * What this object costs in memory: `capacity` entities' worth of every array of
+ * both pools, including the cache-line padding between sub-arrays, which is the
+ * only honest form of the question since a pool is one allocation. Sizes are
+ * re-derived from the block layout, so adding an array to a pool cannot leave
+ * this stale.
+ *
+ * It reports CAPACITY, not the live count, which is the point: the gap between
+ * the two is exactly what MFTLObjectShrinkToFit() recovers. It is also not a
+ * resident-set measurement -- whether free() hands pages back to the OS is
+ * allocator-dependent, so a drop here is an upper bound on the drop in RSS.
+ *
+ * @param obj The mesh.
+ * @return Total bytes in `verts.block` plus `tris.block`. Zero for an object
+ *         whose pools have never been reserved or have been released.
+ *
+ * @rank_local
+ */
+size_t MFTLObjectPoolBytes(const MFTL_Object *obj);
 
 /**
  * @brief Debug-only structural check of the pools themselves.

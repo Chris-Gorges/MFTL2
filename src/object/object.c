@@ -10,7 +10,9 @@
  *
  * A pool is one allocation. `vertex_layout_compute` decides where each
  * sub-array starts inside it, `*_pool_bind` publishes those addresses into the
- * struct, and `*_pool_reserve` is the only function that ever calls either. The
+ * struct, and `*_pool_resize` is the only function that ever calls either --
+ * `*_pool_reserve` is its grow-only wrapper, `MFTLObjectReleasePools` is it at
+ * zero capacity, and `MFTLObjectShrinkToFit` is the only way down. The
  * consequence is the property the whole rewrite is organised around:
  *
  *     THE AoS RECORDS AND EVERY SoA ARRAY OF A POOL HAVE THE SAME CAPACITY,
@@ -103,7 +105,13 @@ static void vertex_pool_bind(MFTL_VertexPool *p, unsigned char *blk, const verte
 }
 
 /**
- * @brief Grows the vertex pool to @p capacity entities. Never shrinks.
+ * @brief Resizes the vertex pool to exactly @p capacity entities, either way.
+ *
+ * The one function that allocates, frees or rebinds a vertex block. Growing and
+ * shrinking are the SAME operation -- lay out a block for the requested
+ * capacity, copy the live prefix in, free the old one -- so there is no second
+ * code path for a shrink to get subtly wrong, and no second place that can
+ * disagree with vertex_layout_compute() about where an array starts.
  *
  * Contents are preserved: the live prefix of every array is copied into the new
  * block. Discarding the geometry on resize -- on the argument that the caller is
@@ -112,12 +120,35 @@ static void vertex_pool_bind(MFTL_VertexPool *p, unsigned char *blk, const verte
  * memory bandwidth, O(log n) times over the mesh's life, is not worth that class
  * of bug.
  *
+ * @p capacity must be at least `p->n`. This function moves STORAGE; it does not
+ * decide what to discard, exactly as MFTLObjectReleasePools() does not. A caller
+ * that wants fewer entities lowers the count first, through
+ * MFTLObjectSetCounts(). Clamping the copy to `MFTL_MIN(p->n, capacity)` instead
+ * would not prevent that mistake -- it would convert an immediate heap overflow
+ * into `n > capacity`, which is the corrupt state MFTLObjectPoolsAreConsistent()
+ * exists to detect, surfacing later and somewhere else.
+ *
  * @param p        The pool. Its `block` is replaced and the old one freed.
- * @param capacity Vertices the pool must hold afterwards.
+ * @param capacity Vertices the pool must hold afterwards. 0 releases the block.
  */
-static void vertex_pool_reserve(MFTL_VertexPool *p, int capacity)
+static void vertex_pool_resize(MFTL_VertexPool *p, int capacity)
 {
-  if (capacity <= p->capacity) return;
+  MFTL_ASSERT(capacity >= p->n && "vertex_pool_resize: would discard live entities");
+
+  if (capacity == p->capacity) return;
+
+  /* Zero capacity is a RELEASE, not an allocation of nothing.
+   * MFTLAlignedAllocOrDie() treats a request of 0 bytes as 1 and returns a real
+   * pointer, which would leave `capacity == 0 && block != MFTL_NULL` -- exactly
+   * the state MFTLObjectPoolsAreConsistent() rejects. Zeroing the whole struct
+   * also re-NULLs every sub-array pointer, which matters for the same reason:
+   * a dangling pointer here passes every count-based check. */
+  if (capacity == 0)
+  {
+    free(p->block);
+    memset(p, 0, sizeof *p);
+    return;
+  }
 
   vertex_layout l;
   const size_t bytes = vertex_layout_compute(&l, capacity);
@@ -144,6 +175,24 @@ static void vertex_pool_reserve(MFTL_VertexPool *p, int capacity)
   p->block = blk;
   vertex_pool_bind(p, blk, &l);
   p->capacity = capacity;
+}
+
+/**
+ * @brief Grows the vertex pool to @p capacity entities. Never shrinks.
+ *
+ * The grow-only half of vertex_pool_resize(). It stays its own function because
+ * "a request at or below the current capacity is a no-op" is a contract
+ * MFTLObjectReserve() publishes and MFTLObjectSetCounts() depends on -- see
+ * include/mftl_object.h. Shrinking is reachable only through
+ * MFTLObjectShrinkToFit(), which is explicit, gated, and never on a hot path.
+ *
+ * @param p        The pool.
+ * @param capacity Vertices the pool must hold afterwards.
+ */
+static void vertex_pool_reserve(MFTL_VertexPool *p, int capacity)
+{
+  if (capacity <= p->capacity) return;
+  vertex_pool_resize(p, capacity);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -215,14 +264,31 @@ static void triangle_pool_bind(MFTL_TrianglePool *p, unsigned char *blk, const t
 }
 
 /**
- * @brief Grows the triangle pool to @p capacity triangles. Never shrinks.
+ * @brief Resizes the triangle pool to exactly @p capacity triangles, either way.
+ *
+ * The triangle-side mirror of vertex_pool_resize(), and everything said there
+ * applies: one code path for both directions, contents preserved, @p capacity at
+ * least `p->n`, and 0 meaning release rather than an allocation of nothing.
+ *
+ * Half-edges come along automatically -- they are in this block at 3x this
+ * capacity (triangle_layout_compute), so a shrink cannot leave them behind at
+ * the old size any more than a growth can.
  *
  * @param p        The pool. Its `block` is replaced and the old one freed.
- * @param capacity Triangles the pool must hold afterwards.
+ * @param capacity Triangles the pool must hold afterwards. 0 releases the block.
  */
-static void triangle_pool_reserve(MFTL_TrianglePool *p, int capacity)
+static void triangle_pool_resize(MFTL_TrianglePool *p, int capacity)
 {
-  if (capacity <= p->capacity) return;
+  MFTL_ASSERT(capacity >= p->n && "triangle_pool_resize: would discard live entities");
+
+  if (capacity == p->capacity) return;
+
+  if (capacity == 0)
+  {
+    free(p->block);
+    memset(p, 0, sizeof *p);
+    return;
+  }
 
   triangle_layout l;
   const size_t bytes = triangle_layout_compute(&l, capacity);
@@ -247,6 +313,21 @@ static void triangle_pool_reserve(MFTL_TrianglePool *p, int capacity)
   p->block = blk;
   triangle_pool_bind(p, blk, &l);
   p->capacity = capacity;
+}
+
+/**
+ * @brief Grows the triangle pool to @p capacity triangles. Never shrinks.
+ *
+ * The grow-only half of triangle_pool_resize(); see vertex_pool_reserve() for
+ * why the two halves are separate functions.
+ *
+ * @param p        The pool.
+ * @param capacity Triangles the pool must hold afterwards.
+ */
+static void triangle_pool_reserve(MFTL_TrianglePool *p, int capacity)
+{
+  if (capacity <= p->capacity) return;
+  triangle_pool_resize(p, capacity);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -357,21 +438,86 @@ void MFTLObjectClear(MFTL_Object *obj)
   obj->partition_dirty = MFTL_TRUE;
 }
 
+size_t MFTLObjectPoolBytes(const MFTL_Object *obj)
+{
+  MFTL_ASSERT(obj != MFTL_NULL);
+
+  /* Re-derived from the layout functions rather than from a per-entity constant,
+   * so it cannot drift when an array is added to either pool. That is also why
+   * it lives here: they are file-static, and this file is the only one that
+   * knows how big a block actually is. */
+  size_t bytes = 0;
+
+  if (obj->verts.capacity > 0)
+  {
+    vertex_layout vl;
+    bytes += vertex_layout_compute(&vl, obj->verts.capacity);
+  }
+  if (obj->tris.capacity > 0)
+  {
+    triangle_layout tl;
+    bytes += triangle_layout_compute(&tl, obj->tris.capacity);
+  }
+
+  return bytes;
+}
+
+bool MFTLObjectShrinkToFit(MFTL_Object *obj, double slack)
+{
+  MFTL_ASSERT(obj != MFTL_NULL);
+  MFTL_ASSERT(slack >= 1.0 && "MFTLObjectShrinkToFit: a slack below 1 would ask for a capacity under the count");
+
+  bool moved = MFTL_FALSE;
+
+  /* The target is where an incrementally grown pool would have landed, so a
+   * shrink puts the capacity back ON the growth ladder rather than beside it.
+   * At n == 0 MFTLGrowCapacity() returns 0 -- the `needed <= current` early
+   * return -- so "give the block back entirely" is not a special case here, it
+   * is the same arithmetic reaching *_pool_resize(p, 0). */
+  const int v_target = MFTLGrowCapacity(0, obj->verts.n);
+  const int t_target = MFTLGrowCapacity(0, obj->tris.n);
+
+  /* Two conditions, and they are not the same condition twice.
+   *
+   * The GATE is the policy: is this block wasteful enough to be worth a
+   * reallocation. The GUARD is correctness of repetition: for any count at or
+   * below MFTL_INIT_CAPACITY the target is a flat 128, so the gate stays true
+   * forever while there is nothing left to do -- a pool at capacity 128 with
+   * n == 4 satisfies `128 > 4 * 4` on every call, and without the guard would
+   * reallocate to the same size every timestep. Idempotence comes from the
+   * guard. */
+  if ((double) obj->verts.capacity > slack * (double) obj->verts.n && v_target < obj->verts.capacity)
+  {
+    vertex_pool_resize(&obj->verts, v_target);
+    moved = MFTL_TRUE;
+  }
+
+  if ((double) obj->tris.capacity > slack * (double) obj->tris.n && t_target < obj->tris.capacity)
+  {
+    triangle_pool_resize(&obj->tris, t_target);
+    moved = MFTL_TRUE;
+  }
+
+  /* Deliberately NOT stamped: see the header. This function moved storage; the
+   * counts, the contents, the derived arrays and the partition are all exactly
+   * what they were. */
+  return moved;
+}
+
 void MFTLObjectReleasePools(MFTL_Object *obj)
 {
   MFTL_ASSERT(obj != MFTL_NULL);
   MFTL_ASSERT(obj->verts.n == 0 && obj->tris.n == 0 && "MFTLObjectReleasePools: the object still holds entities");
 
-  free(obj->verts.block);
-  free(obj->tris.block);
-
-  /* Re-zeroed through the same path MFTLObjectCreate uses, so a released object
-   * is indistinguishable from a freshly created one and the next
+  /* A release IS a resize to zero capacity, and routing it through the same two
+   * functions is what keeps "one place lays a block out, one place frees it"
+   * true rather than nearly true. The resize re-zeroes the struct, so a released
+   * object is indistinguishable from a freshly created one and the next
    * MFTLObjectReserve() simply allocates. Rebinding the sub-array pointers to
    * NULL matters: MFTLObjectPoolsAreConsistent derives them from `block`, and a
    * dangling pointer here would pass every count-based check. */
-  memset(&obj->verts, 0, sizeof obj->verts);
-  memset(&obj->tris, 0, sizeof obj->tris);
+  vertex_pool_resize(&obj->verts, 0);
+  triangle_pool_resize(&obj->tris, 0);
 }
 
 bool MFTLObjectPoolsAreConsistent(const MFTL_Object *obj)

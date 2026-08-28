@@ -528,6 +528,47 @@ void MFTLRedistributeSetSkipUnchangedBodies(bool on);
 bool MFTLRedistributeGetSkipUnchangedBodies(void);
 
 /**
+ * @brief Lets a redistribution give back pool capacity its ranks have outgrown.
+ *
+ * Pools are grow-only by design (MFTLObjectReserve(), and the reason is in
+ * mftl_object.h), so a rank whose share of a body SHRANK keeps the block it held
+ * at its high-water mark for the rest of the run. That is not a corner case:
+ * MFTLGenerateSphere() builds every body whole on rank 0, and after the opening
+ * redistribution rank 0 holds a sliver of each in a block sized for all of it --
+ * `5120 * 4^refine + 176` bytes per body, 640 MiB for 512 bodies at refine 4.
+ * With this armed, the redistribution offers every body it touched back to
+ * MFTLObjectShrinkToFit() once the rebuild is complete.
+ *
+ * It is a MEMORY policy and nothing else. No count, no content, no derived bit
+ * and no partition stamp changes, so the mesh a caller sees is identical either
+ * way; `tests/test_redistribution.c` asserts that against both digest halves.
+ * It needs no collective and no agreement between ranks -- capacity is purely
+ * local state, which is why this setter, unlike
+ * MFTLRedistributeSetSkipUnchangedBodies(), is @rank_local.
+ *
+ * **It does not lower the GENERATION peak**, only the resident footprint. Every
+ * body is still built whole on rank 0 before the first redistribution, and this
+ * runs inside that redistribution.
+ *
+ * Default 0.0, i.e. OFF. #MFTL_SHRINK_SLACK_DEFAULT is the value to pass, and
+ * its documentation derives why anything below 4 can thrash against the
+ * doubling growth ladder.
+ *
+ * @param slack Waste factor at which a pool is worth reallocating: a pool is
+ *              shrunk when `capacity > slack * n`. Zero or negative disables.
+ *
+ * @rank_local
+ */
+void MFTLRedistributeSetShrinkSlack(double slack);
+
+/**
+ * @brief Reports the current setting of MFTLRedistributeSetShrinkSlack().
+ * @return The slack, or 0.0 when shrinking is off.
+ * @rank_local
+ */
+double MFTLRedistributeGetShrinkSlack(void);
+
+/**
  * @brief Releases the redistribution workspace hanging off an ensemble.
  *
  * Called by MFTLEnsembleDestroy(). The workspace is created lazily on the first
@@ -951,7 +992,7 @@ typedef struct
   double t_exchange_data;  ///< Posting the payload Alltoallv, plus the flattening copy.
   double t_wait;  ///< Waiting for the payloads. Absorbs load imbalance; see above.
   double t_group;  ///< De-interleaving the arrival stream by body.
-  double t_reserve;  ///< Pool growth inside MFTLObjectSetCounts().
+  double t_reserve;  ///< Pool resize: growth inside MFTLObjectSetCounts(), plus the phase 5b shrink.
   double t_kept_gather;  ///< Gathering kept entities out of the pool into scratch.
   double t_kept_place;  ///< Writing them back at their new offsets.
   double t_relink;  ///< Re-linking kept half-edges: vertex remap, twin remap, out_he.
@@ -1033,6 +1074,22 @@ typedef struct
    * read it against `n_objects_skipped` to see what exactness cost.
    */
   long n_objects_settled;
+
+  /**
+   * Bodies whose pool blocks were given back, and how many bytes that recovered.
+   *
+   * Zero unless MFTLRedistributeSetShrinkSlack() is armed. Read them against
+   * `n_objects_visited`: a healthy steady state shrinks nothing, because both
+   * resize operators leave capacity within a factor of two of the count and the
+   * gate is four. A NON-ZERO count every step means the gate is firing on
+   * jitter and the slack is too low -- see #MFTL_SHRINK_SLACK_DEFAULT.
+   *
+   * `n_bytes_reclaimed` is the drop in requested capacity, not a measured RSS
+   * change: whether free() returns pages to the OS is allocator-dependent, so
+   * only a resident-set measurement can answer that.
+   */
+  long n_objects_shrunk;
+  long n_bytes_reclaimed;  ///< Capacity bytes released by the shrink. See `n_objects_shrunk`.
 
   long n_allocs;  ///< Allocation calls on the path.
   long n_frees;  ///< Matching frees.

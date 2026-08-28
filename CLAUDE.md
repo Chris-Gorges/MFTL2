@@ -68,7 +68,8 @@ in a comment is the arrangement this replaces; a growth site that forgets one pr
 AoS and every SoA array are the same `malloc`, so that class of bug is not expressible.
 
 `src/object/object.c` is the **only** file allowed to write a pool pointer, a `capacity`, or a `block`. Everything
-else changes size through `MFTLObjectReserve` / `MFTLObjectReserveAdditional` / `MFTLObjectSetCounts`.
+else changes size through `MFTLObjectReserve` / `MFTLObjectReserveAdditional` / `MFTLObjectSetCounts`, and
+gives storage back through `MFTLObjectShrinkToFit` / `MFTLObjectReleasePools` — never implicitly.
 
 ### Three invariants every module may assume
 
@@ -275,8 +276,12 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
 - Functions return `int` using `MFTL_SUCCESS`/`MFTL_ERROR`. `MFTL_ASSERT(...)` compiles to `assert()` in Debug and
   to nothing in Release — never put side effects inside it.
 - `MFTL_ERROR` (-1) doubles as the "no such entity" index sentinel.
-- Pool sizes change only through `mftl_object.h`. Plain, genuinely independent arrays use `MFTL_ENSURE_CAPACITY`
-  (geometric) or `MFTL_RESERVE_ADDITIONAL` (exact) from `mftl_memory.h`. All allocation aborts on OOM by design.
+- Pool sizes change only through `mftl_object.h`. Growth is a RATCHET: `MFTLObjectReserve` never shrinks, because
+  a mesh of stable size must not re-fault its pages every timestep and because `redistribute.c` pre-grows and
+  relies on the next reserve early-returning. `MFTLObjectShrinkToFit(obj, slack)` is the only way down, it is
+  explicit and gated, and its slack must be ≥ 4 — see `MFTL_SHRINK_SLACK_DEFAULT`.
+  Plain, genuinely independent arrays use `MFTL_ENSURE_CAPACITY` (geometric) or `MFTL_RESERVE_ADDITIONAL` (exact)
+  from `mftl_memory.h`. All allocation aborts on OOM by design.
 - File-static helpers are `snake_case`; everything with external linkage is `MFTLPascalCase` (functions) or
   `MFTL_PascalCase` (types). Nothing but `MFTL*` may be exported.
 - Formatting follows `.clang-format` (Google-based, 2-space indent, 160 columns, Allman braces).
@@ -867,25 +872,57 @@ comments:**
    `test_two_length_scales_share_the_larger_envelope`. Whether a per-pair rule that is neither the max nor
    the min is wanted is a physics question, not a code one, and has not been asked.
 
-20. **`MFTLGenerateSphere` builds on rank 0 and POOLS NEVER SHRINK, so a generated ensemble's
-   footprint is RESIDENT on rank 0 for the whole run.** `vertex_pool_reserve`/`triangle_pool_reserve`
-   (`src/object/object.c`) return early when `capacity <= p->capacity`, which is deliberate and
-   documented (`mftl_object.h`: a mesh of stable size must not re-fault its pages every timestep). But
-   it means a redistribution lowers `tris.n` and never `tris.capacity`, so every body keeps its full
-   generation capacity where it was built. Cost is `5120 * 4^refine + 176` bytes per body on rank 0 --
-   671 MB for 512 bodies at refine 4.
+20. **THE GENERATION PEAK IS RANK-0 SERIAL AND STILL UNFIXED; THE STRANDED CAPACITY IT USED TO LEAVE
+   BEHIND IS FIXED, AND WAS NEVER THE LARGER HALF.** This entry used to say that a generated
+   ensemble's whole footprint stayed resident on rank 0 for the run. That was two claims welded
+   together, and measuring them apart is what this entry now records.
 
-   **Generating in batches with a `MFTLRedistribute` between them does NOT fix it**, which is the part
-   worth recording, because it looks like it should: it shaves only the packed-buffer transient on top
-   of a base it cannot touch, and costs `O(N^2/K)` setup work because `collect_destinations` re-derives
-   the whole halo on every call. Measured trade at 512 bodies, K = 32: ~8x the setup work for a ~30 %
-   cut in a peak dominated by the base. The real fix is an `MFTLObjectShrinkToFit`, or letting
-   `MFTLObjectReserve` shrink when `capacity > 2*n`; it belongs in `src/object/object.c`, the only file
-   allowed to touch `capacity`/`block`, and it does not exist. `examples/parallel_advection_scaling.c`
-   prints the footprint and refuses above `--max-gen-mb` instead. It is also this benchmark's Amdahl
-   ceiling: generation is rank-0 serial, so in a WEAK scaling sweep the setup time grows linearly with
-   `nproc` while the timed loop does not, and it must never be folded into a scaling total. Full
-   reasoning in `docs/scaling-analysis.md`.
+   `MFTLGenerateSphere` builds every body whole on rank 0 — `5120 * 4^refine + 176` bytes each,
+   80 MB for 256 bodies at refine 3, 640 MiB for 512 at refine 4. **That peak is real, it is serial,
+   and nothing here touches it**: every body exists at full size before the opening
+   `MFTLRedistribute` runs. `examples/parallel_advection_scaling.c` prints it and refuses above
+   `--max-gen-mb`. Fixing it needs a generator that builds distributed, which does not exist.
+   Batched generation is NOT the fix — it shaves only the packed-buffer transient and costs
+   `O(N^2/K)` because `collect_destinations` re-derives the whole halo per call (measured at 512
+   bodies, K = 32: ~8x the setup work for a ~30 % cut).
+
+   What happens to that 80 MB after the scatter splits in two, and the split is the useful part:
+
+   - **Bodies rank 0 keeps NOTHING of** are released outright — `MFTLObjectSetCounts(0,0,0,0)` plus
+     `MFTLObjectReleasePools` in `redistribute.c`, added in commit `2272622`. This is most of them,
+     and it is why the old wording was wrong. Measured at 256 bodies, refine 3, np = 4: **80 MB
+     generated, 33.5 MB of pool capacity left on rank 0 afterwards.**
+   - **Bodies rank 0 keeps a SLIVER of** hold a full-mesh block against a few dozen triangles.
+     `MFTLObjectShrinkToFit` (`src/object/object.c`) is the fix, armed per call by
+     `MFTLRedistributeSetShrinkSlack`.
+
+   **The residual is single-digit percent, which is why the shrink ships OFF.** Growth is a ratchet,
+   so over a run every rank accumulates, per body, the largest share it ever held. Measured at
+   np = 4, 128 bodies, refine 3, 200 steps — capacity figures are bit-reproducible across runs:
+
+   | | slack 0 (off) | slack 4 |
+   |---|---|---|
+   | end capacity, max/rank | 22.8 MB | 20.8 MB (−8.8 %) |
+   | end capacity, total | 73.3 MB | 68.0 MB (−7.2 %) |
+   | stranded against live | 1.79x | 1.66x |
+   | redistribute ms/step, 3 runs | 0.906 / 0.931 / 0.960 | 0.941 / 0.960 / 0.962 |
+
+   **8 % of capacity for about 2 % of the redistribution phase, i.e. a TRADE**, which is the shape
+   this library ships disabled (`coarsen_frozen_fraction`, `serial_gather_max_triangles`) rather
+   than the shape it ships armed. Most of the remaining 1.66x sits in the 1x–4x band the gate
+   declines on purpose: the gate cannot go to 2 without thrashing against the doubling growth
+   ladder, and `MFTL_SHRINK_SLACK_DEFAULT` derives why. Arm it when bodies genuinely shrink —
+   remeshing that coarsens, or a long run where shares drift far — not as a default.
+
+   **Measure it in RSS, never in a byte counter.** Whether `free()` returns pages to the OS is the
+   allocator's decision (glibc raises its mmap threshold dynamically up to 32 MiB, after which
+   blocks come from `brk`), so `n_bytes_reclaimed` is an upper bound on the win.
+   `current_rss_bytes()` in the benchmark is the measurement, and it is deliberately not
+   `peak_rss_bytes()` — a high-water mark cannot fall.
+
+   Generation remains the benchmark's Amdahl ceiling: it is rank-0 serial, so in a WEAK scaling
+   sweep setup time grows linearly with `nproc` while the timed loop does not, and it must never be
+   folded into a scaling total. Full reasoning in `docs/scaling-analysis.md`.
 
 ### Settled, so nobody re-opens them
 
