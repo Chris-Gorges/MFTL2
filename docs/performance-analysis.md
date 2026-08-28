@@ -559,6 +559,157 @@ which is the loop CLAUDE.md records a 1.70× regression on. That is why
 `MFTL_COMM_PROFILE` exists and defaults to off, and why the table in 7c is
 measured with it off on both sides.
 
+### 7e. Skipping unchanged bodies: 1.6–2.1×, and the frames rebuild is now the biggest bucket left
+
+The optimisation 7b's table implies but 7c did not attempt: a body for which
+neither input to the rebuild changed — the global topology and the owner map —
+already holds the answer, so nothing needs doing to it.
+`MFTLRedistributeSetSkipUnchangedBodies` (default **on**) leaves such a body
+alone, and the reasoning about *when* that is legal is in
+`src/communication/README.md` and `docs/redistribution_skip_correctness.md`.
+
+**The number the whole idea turns on had never been measured**, and it is a BODY
+fraction, not an entity fraction — the ~95 % of entities that stay put says
+nothing about it, because a body straddling a cut plane very likely has *some*
+entity cross every step. Measured, 1000 bodies × refine 3 = 1 280 000 triangles,
+the same case as 7b:
+
+| | np = 1 | np = 2 | np = 4 |
+|---|---:|---:|---:|
+| bodies skipped | — (serial short-circuit) | **85.6 %** | **77.2 %** |
+| redistribution phase | 1.00× | **2.11×** | **1.63×** |
+
+Interleaved A/B **inside one process** — `--ab 20` alternates the switch every 20
+steps and reports both arms, 400 steps, first block of each arm discarded. That
+is not a nicety: 7d records two collections twenty minutes apart differing by
+2.7× on identical binaries, and this is the first measurement here that could
+alternate the two configurations within a single run rather than across binaries.
+np = 1 is the control — the serial path short-circuits before any of this, and it
+reads 1.004×.
+
+#### What it does to a whole timestep
+
+The phase share is the question a solver actually asks, and 7b put the
+redistribution at 60-64 % of a timestep. Same case, np = 4, 200 steps, one run
+per arm:
+
+| mean per rank, ms/step | skip off | skip on | |
+|---|---:|---:|---:|
+| **redistribute** | **12.20 (62.7 %)** | **7.12 (50.3 %)** | **1.71x** |
+| post-redistribution geometry | 2.77 (14.2 %) | 3.02 (21.4 %) | — |
+| triangle geometry | 3.07 (15.7 %) | 2.99 (21.1 %) | — |
+| ghost sync | 0.90 (4.6 %) | 0.52 (3.7 %) | — |
+| advection | 0.52 (2.7 %) | 0.49 (3.4 %) | — |
+| *redistribute + post ("the honest total")* | *14.97* | *10.14* | *1.48x* |
+| **whole timestep** | **19.47** | **14.14** | **1.38x** |
+
+So the redistribution drops from **62.7 % of a timestep to 50.3 %**, and the step
+as a whole gets **1.38x faster**. Nothing else moved: the two geometry passes and
+the advection are within noise of each other and only their *shares* grew.
+
+**Do not compare the absolute milliseconds in this table against the interleaved
+A/B above.** They were collected minutes apart and the un-skipped arm reads
+12.20 ms/step here against 26.80 there on the same binary and the same input --
+a 2.2x collection-to-collection spread, which is 7d's warning arriving on
+schedule. Only ratios taken WITHIN one collection mean anything on this machine,
+and the two independent ones agree: 1.63x interleaved, 1.71x here.
+
+**It is provably behaviour-neutral.** Both partition digests — the set form and
+the **slot-order** form — are identical with the skip on and off, at np = 4 on
+1000 small bodies, at np = 4 on 8 domain-spanning bodies, and at np = 8 on 500
+bodies. `tests/test_redistribution.c` asserts the same thing every step of a
+24-step run.
+
+**And arming it costs nothing measurable.** The change verdict needs a compare
+per entity in `compute_owners`' two loops, which is the loop CLAUDE.md records a
+1.70× regression on, so the counters that used to live behind
+`MFTL_COMM_PROFILE` are now unconditional. HEAD against the new binary with the
+skip switched *off*, alternating within one collection, five repeats, minima:
+**26.72 → 26.70 ms/step at np = 4**. The spread within either binary is 1.6 %.
+
+#### Where the time went, and what is left
+
+`-DMFTL_COMM_PROFILE=ON`, np = 4, 200 steps. Absolute values are inflated by the
+instrument — 53.5 ms/step against 26.8 un-instrumented, because the per-body
+timeline reads the clock ten times per body and there are a thousand of them — so
+read the columns against each other, not against 7b.
+
+| bucket, ms/step | skip off | skip on | |
+|---|---:|---:|---:|
+| kept: relink half-edges | 5.53 | 1.05 | **5.2×** |
+| kept: place back | 2.11 | 0.45 | **4.7×** |
+| derived: topology | 2.34 | 0.51 | **4.6×** |
+| kept: gather | 6.85 | 1.65 | **4.1×** |
+| destination analysis | 7.60 | 2.09 | **3.6×** |
+| arrivals | 3.01 | 1.45 | 2.1× |
+| twin repair | 1.58 | 1.50 | 1.05× |
+| pool growth | 1.30 | 1.21 | 1.07× |
+| owner classification | 4.19 | 4.15 | 1.01× — the decision itself |
+| **derived: FRAMES** | **4.81** | **5.32** | **0.90×** |
+| TOTAL | 53.53 | 35.31 | 1.52× |
+
+**Three results are worth carrying forward.**
+
+**The frames rebuild does not shrink, and it is now the largest non-collective
+bucket.** A skipped body still pays it, because step 1 of the documented loop
+moves owned vertices through `MFTL_FOREACH_OWNED_VERTEX`, which clears
+`MFTL_DERIVED_FRAMES` — the vertices really did move even though nobody changed
+hands, and the postcondition promises the bit set. It goes from 9.0 % of the
+phase to 15.1 % of it. §9 already measures those 72 B/triangle as written and
+discarded unread in this exact loop; this makes weakening the postcondition the
+obvious next change rather than one of several.
+
+**The buckets that shrink least are the ones proportional to the HALO, not to the
+mesh.** Twin repair moves by 1.05× and pool growth by 1.07×, against 3.6–5.2× for
+everything proportional to the entity count. The bodies a skip removes are the
+ones nothing crossed — interior bodies, with the smallest halo churn — so what is
+left is disproportionately halo work. A skip is a reduction in *touched bytes*,
+which §7c identifies as the only kind of change that has ever bought time here,
+and it reduces them for the per-entity passes rather than for the per-halo ones.
+
+**`skip vote` reads as 13.5–19.2 % of the phase and is not a cost.** It is
+7.20 ms/step with the skip switched OFF, where it decides nothing at all, and
+6.77 ms/step with it on. That is the same thing `t_route`'s header comment says
+about itself: it is the first collective after the object loop, so it absorbs the
+spread between ranks, and inserting a reduction there makes *it* the imbalance
+sink rather than adding one. The authoritative reading is the un-instrumented
+one above — 26.72 against 26.70 ms/step — where the vote is present in both arms
+and the totals are indistinguishable.
+
+#### The second pass is nearly free, and that is a statement about the halo
+
+Splitting the object loop in two — classify everything, vote, then pick up the
+bodies another rank saw change — was expected to cost an ownership rescan on the
+bodies this rank got wrong. Measured at np = 4: **43 bodies per step out of 4000
+visits, and all 43 of them are settling rebuilds** rather than reclassifications.
+The "clean here, dirty elsewhere" case essentially never occurs, and the reason is
+the vertex-complete halo: an entity that changes owner is almost always already in
+the pool of every rank that holds the body, so every rank sees the change on its
+own. What the second pass actually pays for is the settling rule (below), at
+about 1.4 % of the bodies that would otherwise be skipped.
+
+#### One thing that had to be found by measurement: the rebuild is not idempotent
+
+The first working version compared **identical** on the set digest and
+**different** on the slot-order digest, from the first timestep, on any body
+large enough to span three ranks. `rebuild_object` lays the pool out as
+`[kept owned | new owned | kept ghost | new ghost]`, and "kept" means "a corner of
+one of MY triangles" — so an owned vertex whose incident triangles all belong to
+other ranks is *not* kept, it is dropped, re-received, and lands at the end of the
+owned run rather than where it was. Running the rebuild twice on an unchanged
+body therefore moves entities the first run left in place: the second run is the
+one that reaches a fixed point, and the initial scatter's output is not one
+either.
+
+A skip taken before that fixed point is reached is still a correct partition, and
+the set digest says so. It is a different *storage order*, which is exactly the
+class of difference the order digest exists to catch and the reason 7c reports
+both. The fix is one bit per body — a body must be seen clean **twice** before it
+is skipped, so it gets one settling rebuild per dirty-to-clean transition. Cost:
+the 43 bodies per step above. Benefit: the optimisation is invisible rather than
+merely harmless, and `--digest` stays a complete acceptance test instead of a
+partial one.
+
 ## 8. I/O: 23–32× from dropping ASCII — and MPI-IO is not the reason
 
 Source: a standalone harness that generates the mesh and times `MFTLWriteVtu`

@@ -180,6 +180,14 @@ void MFTLRemeshMarkFrozen(MFTL_Object *obj)
               "MFTLRemeshMarkFrozen: tris.verts/neighbors are stale. The classification IS those two arrays -- "
               "call MFTLObjectBuildDerived first (a redistribution leaves them current).");
 
+  /* This writes entity FLAGS without changing any entity count, which is one of
+   * the three things MFTLRedistribute's per-body skip has to be told about: a
+   * kept ghost vertex retains its LOCAL record across a redistribution, so a
+   * flag written here would otherwise survive a skip and diverge from its
+   * owner's. Once per phase, not once per timestep -- it costs nothing here and
+   * it removes the one class of divergence the skip cannot see. */
+  MFTLObjectMarkPartitionDirty(obj);
+
   const int nv = obj->verts.n;
   const int nvl = obj->verts.n_local;
   const int nt = obj->tris.n;
@@ -650,6 +658,15 @@ static int redensify_global_ids(MFTL_Ensemble *ens, gid_scratch *g)
     obj->next_vertex_gid = g->total[2 * o + 0];
     obj->next_triangle_gid = g->total[2 * o + 1];
     obj->next_halfedge_gid = 3 * obj->next_triangle_gid;
+
+    /* The ids of entities other ranks hold copies of have just been rewritten,
+     * and the ghost TRIANGLES above were deliberately left on the previous
+     * numbering. The caller's closing migration is what repairs them -- by
+     * dropping and re-receiving every one of them -- so it must not be allowed
+     * to decide the body is unchanged and skip it. Without this stamp the skip
+     * fires on exactly the most common case: a converged body whose smoother
+     * moved no vertex across a cut plane. */
+    MFTLObjectMarkPartitionDirty(obj);
   }
 
   return status;

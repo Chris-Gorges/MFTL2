@@ -267,6 +267,10 @@ MFTL_Object *MFTLObjectCreate(int global_id)
   object->global_id = global_id;
   object->domain = MFTL_NULL;  // set by MFTLEnsembleAddObject
   object->derived = 0u;
+  /* A mesh that has never been partitioned cannot have a partition that is still
+   * current, so the conservative value is the one that forces the first
+   * redistribution to do the work. */
+  object->partition_dirty = MFTL_TRUE;
 
   return object;
 }
@@ -324,6 +328,13 @@ void MFTLObjectSetCounts(MFTL_Object *obj, int n_vertices, int n_local_vertices,
   /* The derived arrays describe a different entity count than they did a moment
    * ago, so whatever they hold is no longer a description of this mesh. */
   obj->derived = 0u;
+
+  /* And neither does the partition. This is THE choke point for entity creation
+   * and destruction, which is what makes the redistribution's per-body skip
+   * independent of an unenforceable convention: a caller that splits an edge or
+   * collapses one cannot get here without stamping, whatever it forgot to do.
+   * See MFTLObjectMarkPartitionDirty() for the whole list. */
+  obj->partition_dirty = MFTL_TRUE;
 }
 
 void MFTLObjectClear(MFTL_Object *obj)
@@ -343,6 +354,7 @@ void MFTLObjectClear(MFTL_Object *obj)
   obj->global_n_triangles = 0;
 
   obj->derived = 0u;
+  obj->partition_dirty = MFTL_TRUE;
 }
 
 void MFTLObjectReleasePools(MFTL_Object *obj)

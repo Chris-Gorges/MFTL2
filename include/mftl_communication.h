@@ -473,6 +473,61 @@ typedef struct MFTL_OwnerMap
 int MFTLRedistributeWithOwners(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps);
 
 /**
+ * @brief Lets redistribution leave a body alone when nothing about it changed.
+ *
+ * A rank's local state after a redistribution is a pure function of the global
+ * topology and the owner map, so a body for which neither input changed already
+ * holds the answer: the ownership prefix, the halo, the twins and the derived
+ * topology are all reproductions of what is in the pool. With this on, the
+ * per-object loop tests both inputs, agrees on the verdict with every other rank
+ * in one MPI_BOR over a per-body bitset, and skips the destination analysis, the
+ * kept gather, the relink, the arrival classification, the twin repair and the
+ * topology rebuild for every body that did not move. The frames are still
+ * rebuilt, because the vertices did move and the postcondition owes them.
+ *
+ * It is BEHAVIOUR-NEUTRAL, not an approximation: the resulting pool is
+ * bit-identical to the rebuilt one, slot for slot.
+ * `examples/parallel_advection_redistribute_list.c --digest` is the check -- it
+ * reports a SET digest and a SLOT-ORDER digest and both must match -- and it is
+ * the same protocol the module's other behaviour-neutral changes were proven
+ * with. `tests/test_redistribution.c` runs it as an assertion.
+ *
+ * Getting the order half is what costs a body ONE extra rebuild. A rebuild is
+ * not idempotent: an owned vertex whose incident triangles all belong to other
+ * ranks is dropped and re-received, so it ends up at the end of the owned run
+ * rather than where it was, and a second rebuild moves entities the first one
+ * left alone. A body is therefore rebuilt once more after it stops changing
+ * before it may be skipped -- once per dirty-to-clean transition, so a body that
+ * sits still for L steps loses one skip out of L, and one that alternates never
+ * skips at all, which is the right answer for it. `n_objects_settled` reports
+ * what that cost.
+ *
+ * The second half of the precondition is not free of the caller, though it is
+ * enforced rather than documented: anything that rewrites global ids, writes
+ * entity flags, or creates or destroys entities must stamp the object through
+ * MFTLObjectMarkPartitionDirty() (mftl_object.h), which MFTLObjectSetCounts()
+ * and the remesher already do. Read that function before adding a mesh
+ * operation of your own.
+ *
+ * Default ON.
+ *
+ * @param on `true` to allow the skip, `false` to rebuild every body every call.
+ *
+ * @collective In the sense that every rank must pass the SAME value: the setting
+ *             decides how many collectives a redistribution makes, so a
+ *             disagreement deadlocks. A Debug-only checksum inside the
+ *             redistribution reports it instead.
+ */
+void MFTLRedistributeSetSkipUnchangedBodies(bool on);
+
+/**
+ * @brief Reports the current setting of MFTLRedistributeSetSkipUnchangedBodies().
+ * @return `true` if unchanged bodies may be skipped.
+ * @rank_local
+ */
+bool MFTLRedistributeGetSkipUnchangedBodies(void);
+
+/**
  * @brief Releases the redistribution workspace hanging off an ensemble.
  *
  * Called by MFTLEnsembleDestroy(). The workspace is created lazily on the first
@@ -879,6 +934,18 @@ typedef struct
    * spread between ranks.
    */
   double t_route;
+
+  /**
+   * The per-body skip vote: one MPI_BOR over a bitset of one bit per body.
+   *
+   * Pure latency by payload -- 1.25 kB at ten thousand bodies -- but it is the
+   * FIRST collective after the object loop, so it takes over t_route's other job
+   * of absorbing the spread between ranks. Read the two together: if this bucket
+   * is large and `t_route` has collapsed, the imbalance simply moved and the
+   * skip cost one latency. If both are large, it did not.
+   */
+  double t_skip_vote;
+
   double t_pack;  ///< Building the per-destination payloads.
   double t_exchange_counts;  ///< The merged count exchange, (Neighbor_)Alltoall.
   double t_exchange_data;  ///< Posting the payload Alltoallv, plus the flattening copy.
@@ -933,6 +1000,39 @@ typedef struct
    * visible rather than argued.
    */
   long n_objects_empty_local;
+
+  /**
+   * Bodies left entirely alone because no rank saw them change.
+   *
+   * `n_objects_skipped / n_objects_visited` is THE number this optimisation
+   * turns on, and it is a body fraction rather than an entity fraction: a body
+   * straddling a cut plane very likely has some entity cross every step, so the
+   * ~95 % of entities that do not move does not predict it. See
+   * MFTLRedistributeSetSkipUnchangedBodies().
+   */
+  long n_objects_skipped;
+
+  /**
+   * Bodies the second pass of the object loop picked up.
+   *
+   * Their ownership classification therefore ran twice, which is the price of
+   * not storing a per-body owner array between the two passes. Large against
+   * `n_objects_skipped` means the vote is mostly being overruled and the split
+   * is buying little.
+   */
+  long n_objects_reclassified;
+
+  /**
+   * Of those, the ones rebuilt only to reach a fixed point.
+   *
+   * A rebuild is not idempotent -- it moves entities that are no longer corners
+   * of one of this rank's triangles to the end of their run -- so a body is
+   * rebuilt once more after it stops changing before it may be skipped. That is
+   * what makes a skipped body's SLOT ORDER identical to a rebuilt one's, not
+   * merely its contents. The cost is one rebuild per dirty-to-clean transition:
+   * read it against `n_objects_skipped` to see what exactness cost.
+   */
+  long n_objects_settled;
 
   long n_allocs;  ///< Allocation calls on the path.
   long n_frees;  ///< Matching frees.

@@ -166,6 +166,78 @@ payload is what keeps the small-message cost of a redistribution flat.
 
 The choice is reduced across ranks, never taken locally.
 
+### A body that did not move is not touched {#comm_skip}
+
+A rank's local state after a redistribution is a pure function of two inputs, the
+global topology and the owner map. Read the halo rule backwards and it is a
+definition of the OUTPUT rather than a procedure — *rank r holds triangle t iff r
+owns t, or owns one of its corners, or owns one of its edge neighbours*, plus the
+corners of everything it holds. **Positions are not an input.** They decide the
+owner map, but once the map is fixed, moving a vertex inside its own cell changes
+nothing about who holds what.
+
+So a body for which neither input changed already holds the answer, and
+everything in "Entities that stay never leave the pool" above is a very expensive
+way of reproducing it. `MFTLRedistributeSetSkipUnchangedBodies` (default **on**)
+leaves such a body alone: no destination analysis, no kept gather, no relink, no
+arrival classification, no twin repair, no topology rebuild. The measured share
+of a redistribution that removes is in `docs/performance-analysis.md`.
+
+**The precondition is NOT "did topology change".** Under the remesher's freeze
+discipline a topology change is invisible to the halo rule — an unfrozen entity
+has no ghost corner and no ghost edge neighbour, so every triangle an operator
+builds out of it has all seven halo clauses resolving to the acting rank. What a
+skip genuinely breaks is **global ids**: the spanning remesher renumbers owned
+entities and deliberately leaves ghost *triangle* ids alone, because
+redistribution drops and re-receives every ghost triangle and that is what
+repairs them. The minimal correct precondition is therefore
+
+> no entity of the body changed owner, **and** nothing rewrote the global ids or
+> the flags of entities that other ranks hold copies of
+
+and the second clause is `MFTLObjectMarkPartitionDirty` (@ref mftl_object.h),
+stamped by `MFTLObjectSetCounts` — the choke point every entity creation and
+destruction already passes through — plus the two renumbering sites and
+`MFTLRemeshMarkFrozen`. Full derivation in
+`docs/redistribution_skip_correctness.md`.
+
+**Two passes and one collective.** The decision cannot be local: a rank with zero
+local changes is still the receiver of a change made elsewhere. Agreeing per body
+*inside* the object loop would be `num_objects` collectives per timestep, so
+instead:
+
+| | |
+|---|---|
+| pass 1a | classify ownership for **every** body; do the full analysis and packing for every body **this rank** saw change |
+| vote | one `MPI_Allreduce(MPI_BOR)` over a bitset of one bit per body |
+| pass 1c | the bodies that were clean here and dirty somewhere else |
+
+Pass 1c does not need pass 1a's owner arrays kept alive — which is what would
+otherwise cost `O(sum_verts + sum_tris)` of new storage. `compute_owners` is
+idempotent, so it simply runs again on the few bodies it reaches.
+
+**A body must be clean twice before it is skipped.** `rebuild_object` is not
+idempotent: an owned vertex whose incident triangles all belong to other ranks is
+not kept, so it is dropped, re-received, and lands at the *end* of the owned run
+rather than where it was. Running the rebuild twice on an unchanged body
+therefore moves entities the first run left in place. A skip taken before that
+fixed point is reached still produces a correct partition — same entities, same
+ownership, same halo, same ids, same positions — but a different **slot order**,
+which is precisely what the order digest of
+`parallel_advection_redistribute_list --digest` exists to catch, and it diverged
+on the first step for bodies spanning three ranks. One extra bit per body closes
+it:
+
+| `D` now | `D` before | action | layout afterwards |
+|---|---|---|---|
+| 1 | — | rebuild | not necessarily a fixed point |
+| 0 | 1 | rebuild ("settle") | a fixed point |
+| 0 | 0 | **skip** | unchanged, so still a fixed point |
+
+The cost is one rebuild per dirty-to-clean transition, reported as
+`n_objects_settled`. What it buys is that the optimisation is invisible rather
+than merely harmless.
+
 ### Postcondition
 
 @warning A redistributed object comes back with valid topology, valid **positions**

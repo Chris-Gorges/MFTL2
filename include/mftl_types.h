@@ -322,6 +322,27 @@ typedef struct MFTL_Object
 
   int global_id;  ///< Identifies this object across all ranks.
 
+  /**
+   * Something changed this mesh in a way the CURRENT partition does not describe.
+   *
+   * Redistribution may leave a body entirely alone when no entity of it changed
+   * owner -- the local state of a rank after a redistribution is a pure function
+   * of (global topology, owner map), and neither input moved. This flag is the
+   * second half of that precondition: it says that something OTHER than the owner
+   * map changed, so the partition has to be rebuilt even though nothing moved.
+   *
+   * Set by MFTLObjectMarkPartitionDirty() (mftl_object.h), which is where the
+   * complete list of the things that must set it lives. Cleared by redistribution
+   * once the body has actually been rebuilt. It is deliberately CONSERVATIVE: a
+   * spurious `true` costs one body's rebuild, a missed one is silent corruption
+   * that surfaces several timesteps later.
+   *
+   * It occupies padding that was already there -- `global_id` is followed by four
+   * bytes of it before the 8-aligned `domain` pointer -- so sizeof(MFTL_Object)
+   * is unchanged.
+   */
+  bool partition_dirty;
+
   struct MFTL_Domain *domain;  ///< Borrowed from the ensemble; MFTL_NULL until added.
 
   MFTL_ObjectQualityStatistics quality;  ///< By value: nine doubles do not need their own allocation.

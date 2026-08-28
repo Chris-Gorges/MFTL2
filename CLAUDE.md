@@ -302,6 +302,34 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   refreshing only the owned ones makes two ranks disagree about a ghost's destination; and there is deliberately
   no `MFTLObjectRefreshFrames` in the loop, because `MFTLComputeTriangleGeometry` reads the half-edges and the
   redistribution rebuilds the frames on its way out. Anything wanting the frames goes AFTER the redistribution.
+- **A BODY THAT DID NOT MOVE IS NOT TOUCHED, AND THE PRECONDITION IS NOT "DID TOPOLOGY CHANGE".** A rank's
+  local state after a redistribution is a pure function of (global topology, owner map) — read the halo rule
+  backwards and it defines the OUTPUT, not a procedure. Positions are not an input; they DECIDE the owner map,
+  and once it is fixed, moving a vertex inside its own cell changes nothing about who holds what. So
+  `MFTLRedistributeSetSkipUnchangedBodies` (default ON) leaves such a body entirely alone.
+
+  A topology change under the freeze discipline is invisible to the halo rule — an unfrozen entity has no ghost
+  corner and no ghost edge neighbour, so every triangle an operator builds out of it has all seven halo clauses
+  resolving to the acting rank. What a skip genuinely breaks is **ghost triangle global ids**:
+  `redensify_global_ids` renumbers owned entities and deliberately leaves ghosts alone, because redistribution
+  drops and re-receives every ghost triangle and THAT is the repair. Skip it and the stale ids sit in the pool
+  colliding with fresh ones — silently, on a converged body, every step. So the guard is
+  `MFTLObjectMarkPartitionDirty` (`mftl_object.h`), stamped by `MFTLObjectSetCounts` (the choke point every
+  entity creation and destruction already passes through), by both renumbering sites and by
+  `MFTLRemeshMarkFrozen`. **Anything that edits a mesh without going through `MFTLObjectSetCounts` owes that
+  call.** Derivation in `docs/redistribution_skip_correctness.md`.
+
+  Three consequences. The vote is per body through ONE `MPI_BOR` bitset, never per body per collective — that
+  splits the object loop in two, and pass 2 re-runs the idempotent `compute_owners` rather than storing
+  `O(sum_verts + sum_tris)` of owner arrays. The FRAMES are still rebuilt for a skipped body, because
+  `MFTL_FOREACH_OWNED_VERTEX` cleared the bit and the vertices really did move. And **a body must be clean
+  TWICE before it is skipped**: `rebuild_object` is not idempotent (an owned vertex whose incident triangles are
+  all remote is dropped and re-received, so it lands at the end of the run), so one settling rebuild per
+  dirty→clean transition is what makes a skipped pool bit-identical to a rebuilt one *slot for slot* rather
+  than merely equal as a set. Guarded by `test_skipping_reproduces_the_full_rebuild`, which compares BOTH
+  digests — the set form passed while the order form failed from step 1, which is how the non-idempotence was
+  found.
+
 - **Redistribution invalidates all cached geometry except the vertex positions.** It returns an object with valid
   topology, valid positions and both derived bits set; `tris.area/normal/center` and
   `verts.normal/area/mean_curv/gauss_curv` hold unspecified values until something recomputes them. That is what
@@ -643,12 +671,12 @@ benchmarks rather than trusting the tables — there are four, and each answers 
 | `vertex_normal_benchmark.c` | scatter vs fan gather vs CSR gather |
 | `update_kernel_benchmark.c` | eleven ways to write the per-timestep kernel |
 | `ensemble_update_benchmark.c` | the fused geometry+quality pass against the naive half-edge loop |
-| `parallel_advection_redistribute_list.c` | what a whole timestep costs, and how much of it is communication |
+| `parallel_advection_redistribute_list.c` | what a whole timestep costs, how much of it is communication, and (`--ab N`) what skipping unchanged bodies is worth |
 | `orient3d_predicate_profile.c` | does the plain orientation determinant misclassify thin-film contact, and what does the adaptive one cost |
 | `leveque_remeshing_parallel.c` | over 150 remeshed timesteps, does the distributed answer track the serial one, is it reproducible to the bit, and what does a phase cost |
 | `parallel_advection_scaling.c` | strong, weak and granularity scaling of the timestep; `run_scaling.py` sweeps the rank counts and renders the curves |
 
-**Six results contradict what the design predicted, and are the reason to read the doc rather than the code
+**Seven results contradict what the design predicted, and are the reason to read the doc rather than the code
 comments:**
 
 1. The frame kernel is worth **1.25–1.57× non-periodic and 1.94–2.00× periodic**, not the 3× a pointer-chasing
@@ -671,12 +699,21 @@ comments:**
    Fusing is still right (two passes cost 2.20 ns against 1.47 fused), but `MFTLEnsembleUpdate` is **slower than
    `MFTLComputeTriangleGeometry` on a non-periodic domain** while computing strictly more. Call it for the
    statistics, not as a free upgrade. On a periodic domain — what a real run has — it wins at 1.19×.
-6. **MPI-IO did not make output faster; dropping ASCII did.** A shared collective file is 1.0× at one rank and
+6. **Skipping unchanged bodies is worth 1.6-2.1x of the redistribution phase, and the number it turns on is a
+   BODY fraction that nothing had ever measured** - 77-86 % at 1000 bodies, np = 2-4, against an estimate of
+   60-75 % made from a radius/cell-width ratio. Two consequences contradict the prediction. The frames rebuild
+   does NOT shrink (a skipped body still moved its vertices, so it still owes them) and becomes the largest
+   non-collective bucket at 15 %, which promotes "weaken the postcondition" from one option among several to the
+   obvious next change. And the buckets that shrink least are the ones proportional to the HALO rather than to
+   the mesh - twin repair 1.05x against 3.6-5.2x for everything per-entity - because the bodies a skip removes
+   are the interior ones with the least halo churn. Full table in `docs/performance-analysis.md` §7e.
+
+7. **MPI-IO did not make output faster; dropping ASCII did.** A shared collective file is 1.0× at one rank and
    0.45× at four against one file per rank on a laptop SSD, because there is nothing for two-phase buffering to
    aggregate. The 23–32× came entirely from raw binary replacing `printf`. `MFTL_IO_SINGLE_FILE` is kept for the
    property that was NOT measured — P+1 files per dump is what stops working first on a parallel filesystem.
 
-7. **The LeVeque remeshing test's poor final mesh was caused by FEATURE DETECTION ON A SMOOTH SURFACE**, not
+8. **The LeVeque remeshing test's poor final mesh was caused by FEATURE DETECTION ON A SMOOTH SURFACE**, not
    by any single operator. The sphere has no features, so every flagged edge is a false positive, and each one
    removes smoothing degrees of freedom from vertices that needed them. Four spurious edges are enough: at the
    step they appear, the worst triangle in the mesh drops from 0.797 to 0.045 and then FREEZES there, because a

@@ -197,8 +197,13 @@ static bool centres_are_current(const MFTL_Object *obj)
  * than derived afterwards, because `owner_proc` is overwritten in place and the
  * previous value has no other reader. The cost is one integer compare per entity
  * on a record the loop is already storing into -- the cache line is resident by
- * necessity -- and it buys the single most useful number about a redistribution:
- * what fraction of the partition actually moved.
+ * necessity.
+ *
+ * They used to be a profile-build extra. They are unconditional now because the
+ * VERDICT is load-bearing: "did any entity of this body change owner" is half of
+ * the precondition for leaving the body alone entirely (see redistribute_core),
+ * so the compare has to happen whether or not anyone is reading the counter. The
+ * counters come along for free once it does.
  *
  * @param nv        Vertices classified, ghosts included.
  * @param nt        Triangles classified, ghosts included.
@@ -239,14 +244,30 @@ static void stats_owner_scan(int nv, int nt, long changed_v, long changed_t)
  * for it, and asserting anyway would make a legitimate caller pay a full
  * geometry pass to satisfy a precondition it does not have.
  *
- * @param      obj        The mesh.
- * @param      map        Explicit owner map, or NULL for the geometric rule.
- * @param[out] tri_owner  `[tris.n]` destination rank per triangle.
- * @param[out] vert_owner `[verts.n]` destination rank per vertex.
- * @param[out] vert_gid   `[verts.n]` vertex global ids, gathered contiguously so
- *                        the packing loops never touch the AoS records again.
+ * ── The verdict ────────────────────────────────────────────────────────────
+ *
+ * The return value is what lets redistribute_core leave a body alone. `changed`
+ * is accumulated in both loops from the value being overwritten -- the previous
+ * `owner_proc` has no other reader, so this is the only place the question can
+ * be asked at all, and asking it costs one compare against a word the loop is
+ * already storing into.
+ *
+ * It is idempotent, and the second pass over a body relies on that: called again
+ * on a pool it has already classified it rewrites the same values and reports
+ * 0. @p record_stats is what stops the second call double-counting.
+ *
+ * @param      obj          The mesh.
+ * @param      map          Explicit owner map, or NULL for the geometric rule.
+ * @param[out] tri_owner    `[tris.n]` destination rank per triangle.
+ * @param[out] vert_owner   `[verts.n]` destination rank per vertex.
+ * @param[out] vert_gid     `[verts.n]` vertex global ids, gathered contiguously so
+ *                          the packing loops never touch the AoS records again.
+ * @param      record_stats `false` on a re-classification, so that the scan and
+ *                          change counters describe entities once each.
+ * @return Non-zero if any entity of @p obj changed owner.
  */
-static void compute_owners(MFTL_Object *obj, const MFTL_OwnerMap *map, int *restrict tri_owner, int *restrict vert_owner, int *restrict vert_gid)
+static int compute_owners(MFTL_Object *obj, const MFTL_OwnerMap *map, int *restrict tri_owner, int *restrict vert_owner, int *restrict vert_gid,
+                          bool record_stats)
 {
   const MFTL_Domain *const dom = obj->domain;
 
@@ -272,7 +293,7 @@ static void compute_owners(MFTL_Object *obj, const MFTL_OwnerMap *map, int *rest
       MFTL_ASSERT(owner >= 0 && owner < dom->nproc && "redistribute: owner map names a rank outside the communicator");
       vert_owner[v] = owner;
       vert_gid[v] = vr[v].global_id;
-      if (CS_COUNT_OWNER_CHANGES) changed_v += (vr[v].owner_proc != owner);
+      changed_v += (vr[v].owner_proc != owner);
       vr[v].owner_proc = owner;
     }
 
@@ -281,12 +302,12 @@ static void compute_owners(MFTL_Object *obj, const MFTL_OwnerMap *map, int *rest
       const int owner = to[t];
       MFTL_ASSERT(owner >= 0 && owner < dom->nproc && "redistribute: owner map names a rank outside the communicator");
       tri_owner[t] = owner;
-      if (CS_COUNT_OWNER_CHANGES) changed_t += (tr[t].owner_proc != owner);
+      changed_t += (tr[t].owner_proc != owner);
       tr[t].owner_proc = owner;
     }
 
-    stats_owner_scan(nv, nt, changed_v, changed_t);
-    return;
+    if (record_stats) stats_owner_scan(nv, nt, changed_v, changed_t);
+    return (changed_v | changed_t) != 0;
   }
 
   MFTL_ASSERT(centres_are_current(obj) &&
@@ -299,9 +320,11 @@ static void compute_owners(MFTL_Object *obj, const MFTL_OwnerMap *map, int *rest
     const int owner = MFTLGetOwnerProc(dom, &pos[3 * v]);
     vert_owner[v] = owner;
     vert_gid[v] = vr[v].global_id;
-    /* Compiled out unless MFTL_COMM_PROFILE: this is once per entity per
-     * timestep, in the loop CLAUDE.md records a 1.70x regression on. */
-    if (CS_COUNT_OWNER_CHANGES) changed_v += (vr[v].owner_proc != owner);
+    /* One compare against a word this loop is storing into anyway, in the loop
+     * CLAUDE.md records a 1.70x regression on. It is here rather than behind
+     * MFTL_COMM_PROFILE because the ANSWER decides whether the rest of the
+     * redistribution runs for this body at all. */
+    changed_v += (vr[v].owner_proc != owner);
     vr[v].owner_proc = owner;
   }
 
@@ -309,11 +332,12 @@ static void compute_owners(MFTL_Object *obj, const MFTL_OwnerMap *map, int *rest
   {
     const int owner = MFTLGetOwnerProc(dom, &ctr[3 * t]);
     tri_owner[t] = owner;
-    if (CS_COUNT_OWNER_CHANGES) changed_t += (tr[t].owner_proc != owner);
+    changed_t += (tr[t].owner_proc != owner);
     tr[t].owner_proc = owner;
   }
 
-  stats_owner_scan(nv, nt, changed_v, changed_t);
+  if (record_stats) stats_owner_scan(nv, nt, changed_v, changed_t);
+  return (changed_v | changed_t) != 0;
 }
 
 /**
@@ -811,6 +835,31 @@ typedef struct
   int *grp_off_t;  ///< [cap_objects + 1] and triangles.
   int *cursor;  ///< [cap_objects] counting-sort cursors.
 
+  /**
+   * The per-body skip votes: one BIT per body, not one int.
+   *
+   * A bitset rather than an `int` array because this is the one per-body
+   * structure that also has to travel: it is the payload of an MPI_BOR
+   * Allreduce, so its size is a message length as well as an allocation. At one
+   * bit per body it is 1/32 of the smallest array that could hold the same
+   * answer and 1/576 of `states` above, which is already sized [cap_objects] --
+   * so it adds no scalability class that redistribution did not already have,
+   * and there is nothing smaller available.
+   */
+  int cap_dirty_words;  ///< Words in ONE bitset, i.e. ceil(cap_objects/32).
+  uint32_t *dirty_votes;  ///< [3 * cap_dirty_words]: this rank's votes, the reduced result, the PREVIOUS result.
+
+  /**
+   * Bodies the previous call's votes were sized for; 0 before the first call.
+   *
+   * `dirty_votes`' third bitset is the only piece of state redistribution carries
+   * BETWEEN calls, so it is the only one that can be invalidated by the object
+   * list changing under it. A body index is stable while the list only grows,
+   * but a changed length means the mapping might not be, and the conservative
+   * answer -- treat every body as unsettled -- costs one rebuild each.
+   */
+  int prev_num_objects;
+
   int cap_arena_v;  ///< Vertices the kept-list arena holds.
   int *kept_arena_v;  ///< [cap_arena_v]
   int cap_arena_t;  ///< Triangles the kept-list arena holds.
@@ -945,6 +994,20 @@ static void ws_reserve(comm_workspace *ws, int nproc, int num_objects, int sum_v
   ws_bytes((void **) &ws->kept_arena_v, &ws->cap_arena_v, MFTL_MAX(sum_verts, 1), sizeof(int), "redistribution kept vertex lists");
   ws_bytes((void **) &ws->kept_arena_t, &ws->cap_arena_t, MFTL_MAX(sum_tris, 1), sizeof(int), "redistribution kept triangle lists");
 
+  /* One block, three slices. Keeping them in a single allocation with a single
+   * capacity is what makes "they are all the same length" unrepresentable rather
+   * than merely true -- and MPI_Allreduce needs the first two separate, so
+   * MPI_IN_PLACE is not an option: the local votes have to survive the reduction
+   * to tell pass 2 which bodies this rank already did.
+   *
+   * The third slice is the previous call's result and must survive this call.
+   * ws_bytes discards contents when it grows, so a growth is also an
+   * invalidation -- which prev_num_objects turns into the conservative answer
+   * below rather than into a silent read of freed state. */
+  const int had_words = ws->cap_dirty_words;
+  ws_bytes((void **) &ws->dirty_votes, &ws->cap_dirty_words, MFTL_MAX((num_objects + 31) / 32, 1), 3 * sizeof(uint32_t), "redistribution skip votes");
+  if (ws->cap_dirty_words != had_words) ws->prev_num_objects = 0;
+
   if (max_verts > ws->cap_verts)
   {
     const int c = MFTLGrowCapacity(ws->cap_verts, max_verts);
@@ -997,6 +1060,7 @@ static void ws_free(comm_workspace *ws)
   free(ws->cursor);
   free(ws->kept_arena_v);
   free(ws->kept_arena_t);
+  free(ws->dirty_votes);
   free(ws->vert_owner);
   free(ws->vert_gid);
   free(ws->keep_v);
@@ -1149,6 +1213,9 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
 
     /* An empty mesh is trivially described, so both bits are honest. */
     obj->derived = MFTL_DERIVED_TOPOLOGY | MFTL_DERIVED_FRAMES;
+    /* MFTLObjectSetCounts above stamps the body; this call IS the rebuild the
+     * stamp was asking for, so it is discharged here rather than by the caller. */
+    obj->partition_dirty = MFTL_FALSE;
     return;
   }
 
@@ -1509,6 +1576,11 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
   CS_LAP(tm, t_derived_topology);
   MFTLObjectRefreshFrames(obj);
   CS_LAP(tm, t_derived_frames);
+
+  /* Whatever asked for this rebuild has had it. Cleared LAST, because
+   * MFTLObjectSetCounts sets the stamp on the way through and would otherwise
+   * leave the body permanently dirty. */
+  obj->partition_dirty = MFTL_FALSE;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1566,6 +1638,218 @@ static int group_runs_by_object(const body_run *runs, int n_runs, int num_object
   return out_off[num_objects];
 }
 
+/* ════════════════════════════════════════════════════════════════════════════
+ * 6b. Leaving a body alone
+ *
+ * MOST BODIES DO NOT MOVE BETWEEN TWO TIMESTEPS, AND A BODY THAT DID NOT MOVE
+ * NEEDS NOTHING DONE TO IT.
+ *
+ * A rank's local state after a redistribution is a pure function of two things:
+ * the global topology, and the owner map. Read the halo rule backwards and it is
+ * a definition of the OUTPUT rather than a description of a procedure --
+ *
+ *     rank r holds triangle t iff r owns t, or owns one of its three corners,
+ *     or owns one of its three edge neighbours
+ *
+ * -- together with the corners of everything it holds. Positions are not an
+ * input. They DECIDE the owner map (compute_owners reads verts.pos and
+ * tris.center), but once the map is fixed, moving a vertex inside its own cell
+ * changes nothing about who holds what.
+ *
+ * So if neither input changed, the whole of section 5 is a very expensive way of
+ * reproducing the pool that is already there. The review in
+ * docs/redistribution_optimizations_review.md prices what a skip removes at 68 %
+ * of the phase: kept gather, destination analysis, relink, topology arrays,
+ * arrivals, pool growth, place-back and twin repair. What survives is the
+ * ownership scan (which is how the decision is made), the frames rebuild (which
+ * the postcondition owes, and which is genuinely stale because the vertices
+ * moved), and the collectives.
+ *
+ * ── THE PRECONDITION IS NOT "DID TOPOLOGY CHANGE" ──────────────────────────
+ *
+ * A topology change under the remesher's freeze discipline is invisible to the
+ * halo rule: an unfrozen entity has no ghost corner and no ghost edge neighbour,
+ * so every triangle an operator builds out of it has all seven halo clauses
+ * resolving to the acting rank, and no other rank's halo can name it. The
+ * library already relies on this -- MFTLRemeshMigrateShifted skips an entire
+ * migration on one MPI_LOR of "did anything move", on the hot path, every
+ * phase 0 of every remeshing call.
+ *
+ * What a skip DOES break is global ids. The spanning remesher's closing
+ * redensification renumbers owned entities and deliberately leaves ghost
+ * TRIANGLE ids alone, because redistribution drops and re-receives every ghost
+ * triangle and that is what repairs them. A skip removes the repair. Worse, the
+ * skip's trigger and the hazard coincide on the most common case rather than a
+ * corner one: a converged body whose smoother moved no vertex across a cut plane
+ * gets renumbered and then skipped, every step, and the stale ids sit in the
+ * pool colliding with fresh ones until something finally reads them.
+ *
+ * The minimal correct precondition is therefore
+ *
+ *     no entity of the body changed owner, AND nothing rewrote the global ids
+ *     or the flags of entities that other ranks hold copies of
+ *
+ * and the second clause is `obj->partition_dirty` (MFTLObjectMarkPartitionDirty,
+ * mftl_object.h), stamped at the choke point every entity creation and
+ * destruction already passes through plus the two renumbering sites and the one
+ * flag-writing site. Full derivation in docs/redistribution_skip_correctness.md.
+ *
+ * ── WHY IT TAKES TWO PASSES AND ONE COLLECTIVE ─────────────────────────────
+ *
+ * The decision cannot be local. A rank with zero local changes is still the
+ * RECEIVER of a change made elsewhere -- a triangle whose centre crossed into
+ * its cell was owned by a neighbour, and if it was not in this rank's halo, this
+ * rank sees nothing at all. So every rank must agree, per body.
+ *
+ * Agreeing per body inside the object loop would be num_objects collectives per
+ * timestep, which at a thousand droplets costs more than the phase it is saving.
+ * One MPI_BOR over a bitset is the alternative, and it forces the loop in two:
+ *
+ *   pass 1  classify ownership for EVERY body, and do the full analysis and
+ *           packing immediately for every body THIS rank saw change;
+ *   vote    one Allreduce;
+ *   pass 2  the bodies that were clean here and dirty somewhere else.
+ *
+ * Pass 2 does not need pass 1's owner arrays kept alive, which is the thing that
+ * would otherwise cost O(sum_verts + sum_tris) of new storage: compute_owners is
+ * IDEMPOTENT, so pass 2 simply re-runs it on the few bodies it reaches. That set
+ * is exactly the bodies whose motion happened on a neighbour's side of the
+ * boundary, and it is small for the same reason the skip pays at all.
+ *
+ * ── A BODY MUST BE CLEAN TWICE BEFORE IT IS SKIPPED, AND THAT IS WHAT MAKES
+ *    THE SKIP EXACT RATHER THAN MERELY EQUIVALENT ─────────────────────────
+ *
+ * rebuild_object is NOT idempotent. Its output layout is
+ *
+ *     [ kept owned | new owned | kept ghost | new ghost ]
+ *
+ * and "kept" means "a corner of one of MY triangles": an owned vertex whose
+ * incident triangles all belong to other ranks is not kept, it is dropped and
+ * re-received, and it therefore lands at the END of the owned run rather than
+ * wherever it was. So running the rebuild twice on an unchanged body moves
+ * entities the FIRST run left in place -- the second run is the one that reaches
+ * a fixed point.
+ *
+ * A skip on a layout that has not reached that fixed point is still a correct
+ * partition -- same entities, same ownership, same halo, same ids, same
+ * positions, same topology -- but it is a different SLOT ORDER than a rebuild
+ * would have produced, and slot order is exactly what the acceptance test
+ * compares (`parallel_advection_redistribute_list --digest` reports a set digest
+ * and an order digest, and the second is there to catch this class of
+ * difference). Measured: 8 domain-spanning bodies at np = 4 diverge in the order
+ * digest on the FIRST step, because the initial scatter's output is not a fixed
+ * point either.
+ *
+ * One extra bit per body closes it. Let D be "some rank saw this body change":
+ *
+ *     D now  D before   action              layout afterwards
+ *     -----  --------   ------------------  -----------------------------
+ *       1       -       rebuild             not necessarily a fixed point
+ *       0       1       rebuild ("settle")  a fixed point, by the argument above
+ *       0       0       SKIP                unchanged, so still a fixed point
+ *
+ * -- i.e. skip iff `!D_now && !D_prev`, and the new "before" is simply `D_now`.
+ * The cost is ONE extra rebuild per dirty->clean transition, so a body that sits
+ * still for a run of L steps loses one skip out of L; a body that alternates
+ * never skips, which is the right answer for it anyway. What it buys is that the
+ * order digest matches too, and the optimisation becomes invisible rather than
+ * merely harmless.
+ *
+ * "D before" is the only state redistribution carries between calls, and it
+ * lives in the workspace. MFTLRedistributeObject() builds a workspace for the
+ * duration of its one call, so it starts with everything unsettled and skips
+ * nothing -- which is correct, and is also all a single call could ever do.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+/** @brief Whether unchanged bodies may be left alone. See MFTLRedistributeSetSkipUnchangedBodies(). */
+static bool g_skip_unchanged = MFTL_TRUE;
+
+void MFTLRedistributeSetSkipUnchangedBodies(bool on) { g_skip_unchanged = on; }
+
+bool MFTLRedistributeGetSkipUnchangedBodies(void) { return g_skip_unchanged; }
+
+/**
+ * @brief Tests body @p o's vote in a per-body bitset.
+ * @param bits The bitset.
+ * @param o    Body index.
+ * @return `true` if the bit is set.
+ */
+static inline bool vote_get(const uint32_t *bits, int o) { return (bits[o >> 5] & ((uint32_t) 1 << (o & 31))) != 0u; }
+
+/**
+ * @brief Sets body @p o's vote in a per-body bitset.
+ * @param bits The bitset.
+ * @param o    Body index.
+ */
+static inline void vote_set(uint32_t *bits, int o) { bits[o >> 5] |= (uint32_t) 1 << (o & 31); }
+
+/**
+ * @brief Destination analysis, kept lists and packing for ONE body.
+ *
+ * Everything the per-object loop does after the ownership classification, in one
+ * place so that both passes run identical code rather than two copies that can
+ * drift. It consumes `ws->tri_owner` / `ws->vert_owner` / `ws->vert_gid`, so
+ * compute_owners must have run on @p obj immediately before.
+ *
+ * @param      ws           The workspace; supplies every scratch array.
+ * @param      obj          The mesh.
+ * @param      o            Its index in the caller's object list -- the body id
+ *                          on the wire.
+ * @param      my_rank      This rank.
+ * @param      group_bodies `true` when the per-body count payload is being built.
+ * @param      dd           Per-destination vertex de-duplication state.
+ * @param[out] bs           This body's kept lists and counts.
+ * @return 1 if any destination fell outside the 26-neighbourhood, which forces
+ *         the exchange onto the global communicator.
+ */
+static int analyze_and_pack_body(comm_workspace *ws, MFTL_Object *obj, int o, int my_rank, bool group_bodies, vertex_dedup *dd, body_state *bs)
+{
+  CS_TIMELINE(tm);
+
+  memset(ws->keep_v, 0, (size_t) obj->verts.n);
+  memset(ws->keep_t, 0, (size_t) obj->tris.n_local);
+  memset(dd->mask, 0, (size_t) obj->verts.n * sizeof(uint32_t));
+  dd->n_bits = 0;
+  CS_LAP(tm, t_masks);
+
+  int n_touched = 0;
+  const int requires_global = collect_destinations(obj, my_rank, ws->is_neighbor, ws->tri_owner, ws->vert_owner, dd, ws->keep_t, ws->keep_v, ws->tri_ids,
+                                                   ws->vert_ids, ws->touched, &n_touched);
+
+  build_kept_lists(obj, ws->keep_v, ws->keep_t, my_rank, bs);
+  CS_LAP(tm, t_destinations);
+
+  MFTLCommStats.n_destinations += n_touched;
+
+  /* Only the ranks this object actually reached -- typically fewer than 27, not
+   * nproc. That difference is the whole point of the touched list. */
+  for (int i = 0; i < n_touched; ++i)
+  {
+    const int r = ws->touched[i];
+    const int tri_before = ws->send_tris[r].count;
+    const int vert_before = ws->send_verts[r].count;
+
+    append_destination(obj, o, ws->vert_gid, &ws->tri_ids[r], &ws->vert_ids[r], &ws->send_tris[r], &ws->send_verts[r], dd->rank_bit[r] == MFTL_DEDUP_NO_BIT);
+
+    if (group_bodies)
+    {
+      sb_reserve(&ws->send_counts[r], MFTL_BODY_COUNT_INTS, sizeof(int));
+      int *const c = (int *) ws->send_counts[r].buffer + ws->send_counts[r].count;
+      c[0] = o;  // the object INDEX; every rank holds the same list
+      c[1] = ws->send_tris[r].count - tri_before;
+      c[2] = ws->send_verts[r].count - vert_before;
+      ws->send_counts[r].count += MFTL_BODY_COUNT_INTS;
+    }
+
+    ib_reset(&ws->tri_ids[r]);
+    ib_reset(&ws->vert_ids[r]);
+    dd->rank_bit[r] = MFTL_ERROR;
+  }
+
+  CS_LAP(tm, t_pack);
+  return requires_global;
+}
+
 #ifndef NDEBUG
 /**
  * @brief Debug check: every rank holds the same object list in the same order.
@@ -1581,18 +1865,25 @@ static int group_runs_by_object(const body_run *runs, int n_runs, int num_object
  * disagreement silently merges entities into the wrong body. A checksum
  * reduction reports it instead.
  *
+ * The skip switch rides along for free. It changes how many collectives the call
+ * makes, so two ranks disagreeing about it is an immediate deadlock with no
+ * diagnostic -- exactly the failure this reduction already exists to report, and
+ * one more term in the checksum costs nothing.
+ *
  * @param dom     Supplies the communicator.
  * @param objects The object list.
  * @param n       Its length.
  */
 static void check_object_lists_agree(const MFTL_Domain *dom, MFTL_Object *const *objects, int n)
 {
-  unsigned sig = (unsigned) n;
+  unsigned sig = (unsigned) n * 2u + (g_skip_unchanged ? 1u : 0u);
   for (int o = 0; o < n; ++o) sig = sig * 1000003u + (unsigned) objects[o]->global_id;
 
   unsigned v[2] = {sig, ~sig};
   MPI_Allreduce(MPI_IN_PLACE, v, 2, MPI_UNSIGNED, MPI_MIN, dom->comm_world);
-  MFTL_ASSERT(v[0] == sig && v[1] == ~sig && "redistribute: ranks disagree about the object list -- bodies are identified by list INDEX");
+  MFTL_ASSERT(v[0] == sig && v[1] == ~sig &&
+              "redistribute: ranks disagree about the object list or about the skip switch -- bodies are identified by list INDEX, and "
+              "MFTLRedistributeSetSkipUnchangedBodies is collective");
 }
 #endif
 
@@ -1690,20 +1981,15 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
   memset(is_neighbor, 0, (size_t) nproc);
   for (int i = 0; i < domain->num_neighbors; ++i) is_neighbor[domain->neighbors[i]] = 1;
 
-  mftl_int_buffer *const tri_ids = ws->tri_ids;
-  mftl_int_buffer *const vert_ids = ws->vert_ids;
   MFTL_SendBuffer *const send_tris = ws->send_tris;
   MFTL_SendBuffer *const send_verts = ws->send_verts;
   MFTL_SendBuffer *const send_counts = group_bodies ? ws->send_counts : MFTL_NULL;
-  int *const touched = ws->touched;
   int *const kept_arena_v = ws->kept_arena_v;
   int *const kept_arena_t = ws->kept_arena_t;
   body_state *const states = ws->states;
   int *const tri_owner = ws->tri_owner;
   int *const vert_owner = ws->vert_owner;
   int *const vert_gid = ws->vert_gid;
-  char *const keep_v = ws->keep_v;
-  char *const keep_t = ws->keep_t;
 
   /* The payload buffers keep their allocations; only the fill level is reset. */
   for (int r = 0; r < nproc; ++r)
@@ -1720,9 +2006,26 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
   dd.n_bits = 0;
   CS_END(ts_setup, t_setup);
 
-  /* ── Phase 1: per object, decide destinations, keep or pack ─────────────── */
+  /* ── Phase 1a: ownership everywhere, the rest where THIS rank sees change ─
+   *
+   * See section 6b for why the object loop is in two halves and why the split
+   * costs no per-body storage. */
   int requires_global = 0;
   int arena_v = 0, arena_t = 0;
+
+  const int n_vote_words = (num_objects + 31) / 32;
+  uint32_t *const dirty_local = ws->dirty_votes;
+  uint32_t *const dirty_global = ws->dirty_votes + ws->cap_dirty_words;
+  uint32_t *const dirty_prev = ws->dirty_votes + 2 * ws->cap_dirty_words;
+
+  memset(dirty_local, 0, (size_t) n_vote_words * sizeof(uint32_t));
+  if (ws->prev_num_objects != num_objects)
+  {
+    /* First call for this workspace, or the object list changed length. Nothing
+     * here is settled, so nothing may be skipped this time round. */
+    memset(dirty_prev, 0xff, (size_t) n_vote_words * sizeof(uint32_t));
+    ws->prev_num_objects = num_objects;
+  }
 
   for (int o = 0; o < num_objects; ++o)
   {
@@ -1734,53 +2037,70 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
     arena_v += obj->verts.n;
     arena_t += obj->tris.n_local;
 
+    /* Nothing of this body is here, so this rank has no opinion. Another rank
+     * that IS holding it votes for both of them. */
     if (obj->tris.n < 1 || obj->verts.n < 1) continue;
 
     CS_TIMELINE(tm);
-
-    compute_owners(obj, maps ? &maps[o] : MFTL_NULL, tri_owner, vert_owner, vert_gid);
+    int dirty = compute_owners(obj, maps ? &maps[o] : MFTL_NULL, tri_owner, vert_owner, vert_gid, MFTL_TRUE);
     CS_LAP(tm, t_owners);
 
-    memset(keep_v, 0, (size_t) obj->verts.n);
-    memset(keep_t, 0, (size_t) obj->tris.n_local);
-    memset(dd.mask, 0, (size_t) obj->verts.n * sizeof(uint32_t));
-    dd.n_bits = 0;
-    CS_LAP(tm, t_masks);
+    /* The other half of the precondition (section 6b), plus one guard: a body
+     * whose derived arrays were never built has no partition to preserve, and
+     * collect_destinations' assertion on them must not be lost on the skip
+     * path. */
+    dirty |= obj->partition_dirty;
+    dirty |= !MFTLObjectHasTopology(obj);
+    if (!g_skip_unchanged) dirty = 1;
 
-    int n_touched = 0;
-    requires_global |= collect_destinations(obj, my_rank, is_neighbor, tri_owner, vert_owner, &dd, keep_t, keep_v, tri_ids, vert_ids, touched, &n_touched);
+    if (!dirty) continue;
 
-    build_kept_lists(obj, keep_v, keep_t, my_rank, bs);
-    CS_LAP(tm, t_destinations);
+    vote_set(dirty_local, o);
+    requires_global |= analyze_and_pack_body(ws, obj, o, my_rank, group_bodies, &dd, bs);
+  }
 
-    MFTLCommStats.n_destinations += n_touched;
+  /* ── Phase 1b: agree, per body ────────────────────────────────────────────
+   *
+   * BLOCKING, and there is nothing to overlap it with: pass 1 has finished and
+   * pass 2 consumes the answer, so an MPI_Iallreduce would be waited on in the
+   * next statement. The payload is one bit per body -- 1.25 kB at ten thousand
+   * of them -- so this is latency at any rank count worth discussing.
+   *
+   * Not MPI_IN_PLACE: pass 2 needs to know which bodies THIS rank already did,
+   * which is exactly the information a reduction in place would destroy.
+   *
+   * It is now the FIRST collective after the object loop, so it inherits
+   * t_route's other job -- absorbing the load imbalance between ranks. The route
+   * reduction that follows then finds everyone already synchronised and costs
+   * pure latency, which is why this is one extra latency rather than one extra
+   * imbalance absorption. t_skip_vote against t_route is the measurement. */
+  CS_BEGIN(ts_vote);
+  MPI_Allreduce(dirty_local, dirty_global, n_vote_words, MPI_UINT32_T, MPI_BOR, domain->comm_cart);
+  CS_END(ts_vote, t_skip_vote);
 
-    /* Only the ranks this object actually reached -- typically fewer than 27, not
-     * nproc. That difference is the whole point of the touched list. */
-    for (int i = 0; i < n_touched; ++i)
-    {
-      const int r = touched[i];
-      const int tri_before = send_tris[r].count;
-      const int vert_before = send_verts[r].count;
+  /* ── Phase 1c: everything pass 1a left, that is not being skipped ────────
+   *
+   * Two kinds of body reach this loop: the ones another rank saw change while
+   * this one did not, and the ones nobody saw change but whose layout has not
+   * reached its fixed point yet (section 6b). */
+  for (int o = 0; o < num_objects; ++o)
+  {
+    if (vote_get(dirty_local, o)) continue;  // already done in pass 1a
+    if (!vote_get(dirty_global, o) && !vote_get(dirty_prev, o)) continue;  // skipped
 
-      append_destination(obj, o, vert_gid, &tri_ids[r], &vert_ids[r], &send_tris[r], &send_verts[r], dd.rank_bit[r] == MFTL_DEDUP_NO_BIT);
+    MFTL_Object *const obj = objects[o];
+    if (obj->tris.n < 1 || obj->verts.n < 1) continue;  // nothing here to send
 
-      if (group_bodies)
-      {
-        sb_reserve(&send_counts[r], MFTL_BODY_COUNT_INTS, sizeof(int));
-        int *const c = (int *) send_counts[r].buffer + send_counts[r].count;
-        c[0] = o;  // the object INDEX; every rank holds the same list
-        c[1] = send_tris[r].count - tri_before;
-        c[2] = send_verts[r].count - vert_before;
-        send_counts[r].count += MFTL_BODY_COUNT_INTS;
-      }
+    /* compute_owners is idempotent, so this rewrites the same values pass 1a
+     * wrote and reports no change; the counters it feeds must not be told about
+     * the same entities twice. */
+    CS_TIMELINE(tm);
+    (void) compute_owners(obj, maps ? &maps[o] : MFTL_NULL, tri_owner, vert_owner, vert_gid, MFTL_FALSE);
+    CS_LAP(tm, t_owners);
 
-      ib_reset(&tri_ids[r]);
-      ib_reset(&vert_ids[r]);
-      dd.rank_bit[r] = MFTL_ERROR;
-    }
-
-    CS_LAP(tm, t_pack);
+    requires_global |= analyze_and_pack_body(ws, obj, o, my_rank, group_bodies, &dd, &states[o]);
+    MFTLCommStats.n_objects_reclassified++;
+    if (!vote_get(dirty_global, o)) MFTLCommStats.n_objects_settled++;
   }
 
   /* Nothing to release: every array above belongs to the workspace and is reused
@@ -1926,9 +2246,42 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
 
   for (int o = 0; o < num_objects; ++o)
   {
-    rebuild_object(objects[o], &states[o], (const MFTL_PackedVertex *) xfer[0].recv_buf, (const MFTL_PackedTriangleComplex *) xfer[1].recv_buf, my_rank,
-                   scratch);
+    MFTL_Object *const obj = objects[o];
+
+    if (g_skip_unchanged && !vote_get(dirty_global, o) && !vote_get(dirty_prev, o))
+    {
+      /* Nobody saw this body change, so the pool it is already holding IS the
+       * answer -- see section 6b. Two things still have to be true on the way
+       * out, and both are cheap.
+       *
+       * The postcondition promises both derived bits set. The FRAMES bit is
+       * genuinely stale: step 1 of the documented timestep loop moves owned
+       * vertices through MFTL_FOREACH_OWNED_VERTEX, which clears it, and the
+       * vertices really did move even though nobody changed hands. So the frame
+       * rebuild is the one part of the rebuild a skip does not remove. The
+       * TOPOLOGY bit was checked in pass 1a and cannot have gone stale here. */
+      MFTLCommStats.n_objects_skipped++;
+
+      if (obj->tris.n < 1 || obj->verts.n < 1)
+      {
+        obj->derived = MFTL_DERIVED_TOPOLOGY | MFTL_DERIVED_FRAMES;  // an empty mesh is trivially described
+      }
+      else if (!MFTLObjectHasFrames(obj))
+      {
+        CS_TIMELINE(tm);
+        MFTLObjectRefreshFrames(obj);
+        CS_LAP(tm, t_derived_frames);
+      }
+      continue;
+    }
+
+    rebuild_object(obj, &states[o], (const MFTL_PackedVertex *) xfer[0].recv_buf, (const MFTL_PackedTriangleComplex *) xfer[1].recv_buf, my_rank, scratch);
   }
+
+  /* What the next call needs to know: a body rebuilt because something CHANGED
+   * has a layout that is not yet a fixed point, so it gets one more rebuild
+   * before it may be skipped. See section 6b. */
+  memcpy(dirty_prev, dirty_global, (size_t) n_vote_words * sizeof(uint32_t));
 
   /* Only what the exchange layer allocated for this call. Everything else --
    * the rebuild scratch with its two id tables, the run table, the arrival CSRs

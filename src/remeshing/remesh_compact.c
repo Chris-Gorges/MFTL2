@@ -437,4 +437,10 @@ void MFTLRemeshRenumberGlobalIds(MFTL_Object *obj)
   obj->next_vertex_gid = n_v;
   obj->next_triangle_gid = n_t;
   obj->next_halfedge_gid = 3 * n_t;
+
+  /* Every id in the body just moved. The assertion above says this rank holds
+   * the whole mesh, so nothing is replicated RIGHT NOW -- but the migration that
+   * puts it back on the grid is the one that has to observe the new numbering,
+   * and it decides per body whether to bother. Tell it. */
+  MFTLObjectMarkPartitionDirty(obj);
 }

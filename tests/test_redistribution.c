@@ -30,6 +30,7 @@
  */
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -194,6 +195,125 @@ static int ownership_is_exclusive(const MFTL_Object *obj)
   free(mine);
   free(total);
   return ok;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
+ * A partition digest, for the skip
+ *
+ * The same construction examples/parallel_advection_redistribute_list.c uses,
+ * because the same question is being asked: is one way of arriving at a
+ * partition indistinguishable from another?
+ *
+ * TWO digests, and the pair is the point. The SET digest is a sum, so it depends
+ * on what the partition contains and not on where in the pool anything sits; the
+ * ORDER digest is a chain, so it also depends on the slot order. A skip that got
+ * the contents right and the order wrong would pass the first and fail the
+ * second -- which is exactly what happened before the settling rule went in.
+ *
+ * Ghosts contribute identity and owner only, which is what makes halo MEMBERSHIP
+ * part of the comparison without making the halo's storage order part of it for
+ * the SET form.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/** @brief splitmix64, so that a one-bit change of any input changes the digest. */
+static uint64_t dg_mix(uint64_t x)
+{
+  x += 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  return x ^ (x >> 31);
+}
+
+/** @brief Folds one value into a running hash. */
+static uint64_t dg_in(uint64_t h, uint64_t v) { return dg_mix(h ^ dg_mix(v)); }
+
+/** @brief Reinterprets a double as its bit pattern, so equality is exact. */
+static uint64_t dg_bits(double d)
+{
+  uint64_t u;
+  memcpy(&u, &d, sizeof u);
+  return u;
+}
+
+/**
+ * @brief `{set digest, slot-order digest}` of a whole ensemble, summed over ranks.
+ * @param      ens The ensemble.
+ * @param[out] out Receives the two reduced digests.
+ * @note Collective.
+ */
+static void partition_digest(const MFTL_Ensemble *ens, uint64_t out[2])
+{
+  uint64_t mine[2] = {0, 0x243f6a8885a308d3ULL};
+
+  for (int o = 0; o < ens->num_objects; ++o)
+  {
+    const MFTL_Object *const obj = ens->objects[o];
+    const uint64_t body = (uint64_t) obj->global_id;
+
+    for (int v = 0; v < obj->verts.n; ++v)
+    {
+      const bool owned = (v < obj->verts.n_local);
+      uint64_t h = dg_in(dg_in(body, (uint64_t) obj->verts.rec[v].global_id), owned ? 1u : 2u);
+      h = dg_in(h, (uint64_t) obj->verts.rec[v].owner_proc);
+      /* Positions for EVERY vertex, ghosts included: a skip retains a ghost's
+       * local record rather than replacing it from the wire, so this is the one
+       * place that difference could show up. */
+      for (int k = 0; k < 3; ++k) h = dg_in(h, dg_bits(obj->verts.pos[3 * v + k]));
+      h = dg_in(h, (uint64_t) obj->verts.rec[v].flags);
+      mine[0] += h;
+      mine[1] = dg_in(mine[1], h);
+    }
+
+    for (int t = 0; t < obj->tris.n; ++t)
+    {
+      const bool owned = (t < obj->tris.n_local);
+      uint64_t h = dg_in(dg_in(body, (uint64_t) obj->tris.rec[t].global_id), owned ? 3u : 4u);
+      h = dg_in(h, (uint64_t) obj->tris.rec[t].owner_proc);
+      h = dg_in(h, (uint64_t) obj->tris.rec[t].flags);
+      for (int k = 0; k < 3; ++k)
+      {
+        const MFTL_HalfEdge *const he = &obj->tris.he[3 * t + k];
+        h = dg_in(h, (uint64_t) obj->verts.rec[he->vertex_idx].global_id);
+        h = dg_in(h, (uint64_t) he->flags);
+        h = dg_in(h, (uint64_t) he->global_id);
+
+        /* The partner named by IDENTITY -- its triangle's global id and its
+         * corner -- rather than by slot, for the same reason the whole digest is
+         * gid-keyed: the index is storage, the pair is the topology. */
+        const int tw = he->twin_idx;
+        if (tw == MFTL_ERROR) h = dg_in(h, 0xffffffffULL);
+        else h = dg_in(h, dg_in((uint64_t) obj->tris.rec[tw / 3].global_id, (uint64_t) (tw % 3)));
+      }
+      mine[0] += h;
+      mine[1] = dg_in(mine[1], h);
+    }
+  }
+
+  /* Summed over ranks: unsigned wrap-around is defined, and it makes the result
+   * describe WHAT the partition is rather than which rank happens to hold what. */
+  MPI_Allreduce(mine, out, 2, MPI_UNSIGNED_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+}
+
+/** @brief Bodies redistribution has left alone since the counters were reset. */
+static long skipped_so_far(void)
+{
+  MFTL_RedistributeStats st;
+  MFTLRedistributeGetStats(&st);
+  return st.n_objects_skipped;
+}
+
+/** @brief One timestep of the documented loop, up to and including step 3. */
+static void advect_one_step(MFTL_Ensemble *ens, const double vel[3], double dt)
+{
+  /* `vel` rather than `v`: MFTL_FOREACH_OWNED_VERTEX names its loop index `v`. */
+  const double dx = vel[0] * dt, dy = vel[1] * dt, dz = vel[2] * dt;
+  for (int o = 0; o < ens->num_objects; ++o)
+  {
+    MFTL_Object *obj = ens->objects[o];
+    MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += dx; pos[1] += dy; pos[2] += dz; MFTLApplyPeriodicity(&ens->domain, pos););
+  }
+  MFTLUpdateGhostPositions(ens);
+  for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
 }
 
 /** @brief Sorted list of the global ids this rank OWNS. Caller frees. */
@@ -886,6 +1006,149 @@ static int test_non_periodic_domain(void)
  * It is not a contrived case: MFTLGenerateSphere leaves every rank but 0 exactly
  * like this, so the empty path runs on nproc-1 ranks of every single call.
  */
+/* ─────────────────────────────────────────────────────────────────────────────
+ * N. Leaving unchanged bodies alone
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * @brief A skipped body is INDISTINGUISHABLE from a rebuilt one, slot for slot.
+ *
+ * The acceptance test for the whole optimisation. Two ensembles are built from
+ * identical inputs and advected in lockstep through the documented per-timestep
+ * loop; one is redistributed with MFTLRedistributeSetSkipUnchangedBodies on and
+ * the other with it off, and after every step both partition digests must be
+ * equal on both ensembles.
+ *
+ * Why BOTH digests. The set digest catches a wrong partition: a missing ghost, a
+ * duplicated owner, a stale global id, a position that did not travel. The order
+ * digest catches a right partition reached by a different route -- entities in
+ * different slots. That is not hypothetical and it is not harmless-by-inspection:
+ * rebuild_object is not idempotent, so an early version of the skip passed the
+ * set digest and failed the order digest from the FIRST step on any body large
+ * enough to span three ranks. The settling rule in redistribute.c section 6b is
+ * what closes it, and this test is what would notice if it were removed.
+ *
+ * NON-VACUITY. A run in which nothing was ever skipped compares a code path
+ * against itself and would pass forever, so the number of skipped bodies is
+ * asserted to be positive. It cannot be at np = 1, where redistribution
+ * short-circuits before any of this, so the assertion is made only above that.
+ */
+static int test_skipping_reproduces_the_full_rebuild(void)
+{
+  /* Small bodies on a coarse grid: most of them are nowhere near a cut plane in
+   * any given step, which is the regime the skip exists for. Two of them start
+   * deliberately ON a plane so the run also contains bodies that never qualify. */
+  const int n_bodies = 12;
+  MFTL_Ensemble *ens_on = make_ensemble(MFTL_TRUE, n_bodies);
+  MFTL_Ensemble *ens_off = make_ensemble(MFTL_TRUE, n_bodies);
+
+  for (int i = 0; i < n_bodies; ++i)
+  {
+    const double cx = -0.8 + 0.13 * (double) i;
+    const double cy = -0.6 + 0.09 * (double) ((i * 5) % 11);
+    const double cz = 0.7 - 0.11 * (double) ((i * 3) % 7);
+    add_sphere(ens_on, i, cx, cy, cz, 0.09, 2);
+    add_sphere(ens_off, i, cx, cy, cz, 0.09, 2);
+  }
+
+  MFTLRedistributeSetSkipUnchangedBodies(MFTL_TRUE);
+  MFTLRedistribute(ens_on);
+  MFTLRedistributeSetSkipUnchangedBodies(MFTL_FALSE);
+  MFTLRedistribute(ens_off);
+
+  /* Irrational-ish per axis, so vertices land on cell faces at unpredictable
+   * times rather than never or all at once. */
+  const double velocity[3] = {0.031, 0.017, 0.023};
+
+  MFTLRedistributeStatsReset();
+  long skipped = 0;
+  int ok = 1;
+
+  for (int step = 0; step < 24 && ok; ++step)
+  {
+    advect_one_step(ens_on, velocity, 1.0);
+    advect_one_step(ens_off, velocity, 1.0);
+
+    const long before = skipped_so_far();
+    MFTLRedistributeSetSkipUnchangedBodies(MFTL_TRUE);
+    MFTLRedistribute(ens_on);
+    skipped += skipped_so_far() - before;
+
+    MFTLRedistributeSetSkipUnchangedBodies(MFTL_FALSE);
+    MFTLRedistribute(ens_off);
+
+    uint64_t d_on[2], d_off[2];
+    partition_digest(ens_on, d_on);
+    partition_digest(ens_off, d_off);
+
+    if (d_on[0] != d_off[0] || d_on[1] != d_off[1]) ok = 0;
+    if (!ensemble_is_sound(ens_on)) ok = 0;
+  }
+
+  MFTLRedistributeSetSkipUnchangedBodies(MFTL_TRUE);  // back to the library default
+
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  if (g_nproc > 1) TEST_ASSERT(agreed(skipped > 0, MPI_COMM_WORLD));
+
+  MFTLEnsembleDestroy(&ens_on);
+  MFTLEnsembleDestroy(&ens_off);
+  return 0;
+}
+
+/**
+ * @brief A stamped body is rebuilt even when nothing about its ownership moved.
+ *
+ * The half of the precondition an owner-change test cannot see. The spanning
+ * remesher renumbers a body's OWNED entities and leaves its ghost triangle ids
+ * on the previous numbering, because redistribution drops and re-receives every
+ * ghost triangle and that is what repairs them; a skip removes the repair, on a
+ * converged body, every step. MFTLObjectMarkPartitionDirty is what says so, and
+ * this asserts that saying so is enough.
+ *
+ * It is measured through the counter rather than through the symptom, because
+ * the symptom is silent: the stale ids sit in the pool until something reads
+ * them, which in a production loop is nothing at all.
+ */
+static int test_a_stamped_body_is_never_skipped(void)
+{
+  const int n_bodies = 8;
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, n_bodies);
+  for (int i = 0; i < n_bodies; ++i) add_sphere(ens, i, -0.7 + 0.19 * (double) i, 0.1 * (double) (i % 3), -0.2 + 0.07 * (double) (i % 5), 0.09, 2);
+
+  MFTLRedistributeSetSkipUnchangedBodies(MFTL_TRUE);
+  MFTLRedistribute(ens);
+
+  const double velocity[3] = {0.019, 0.011, 0.013};
+
+  /* Two steps to leave the initial scatter behind and let the bodies settle, so
+   * that the baseline step below genuinely has something to skip. */
+  for (int step = 0; step < 3; ++step)
+  {
+    advect_one_step(ens, velocity, 1.0);
+    MFTLRedistribute(ens);
+  }
+
+  advect_one_step(ens, velocity, 1.0);
+  long before = skipped_so_far();
+  MFTLRedistribute(ens);
+  const long baseline = skipped_so_far() - before;
+
+  /* Same loop, same motion, but every body now says the partition no longer
+   * describes it. Nothing may be skipped. */
+  advect_one_step(ens, velocity, 1.0);
+  for (int o = 0; o < ens->num_objects; ++o) MFTLObjectMarkPartitionDirty(ens->objects[o]);
+  before = skipped_so_far();
+  MFTLRedistribute(ens);
+  const long stamped = skipped_so_far() - before;
+
+  TEST_ASSERT(agreed(stamped == 0, MPI_COMM_WORLD));
+  if (g_nproc > 1) TEST_ASSERT(agreed(baseline > 0, MPI_COMM_WORLD));  // else the comparison is vacuous
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
 static int test_empty_object_is_a_no_op(void)
 {
   MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 2);
@@ -964,6 +1227,8 @@ int main(int argc, char **argv)
   RUN_TEST(test_body_can_leave_a_rank_entirely);
   RUN_TEST(test_body_straddling_a_periodic_seam);
   RUN_TEST(test_non_periodic_domain);
+  RUN_TEST(test_skipping_reproduces_the_full_rebuild);
+  RUN_TEST(test_a_stamped_body_is_never_skipped);
   RUN_TEST(test_empty_object_is_a_no_op);
   RUN_TEST(test_empty_ensemble_is_a_no_op);
   RUN_TEST(test_invalid_arguments);

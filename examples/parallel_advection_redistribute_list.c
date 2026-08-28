@@ -78,6 +78,8 @@
  *     --quality    also run MFTLEnsembleUpdate (quality statistics) per step
  *     --normals    also run MFTLEnsembleUpdateVertexNormals per step
  *     --no-post-geom  drop step 5 (see above)
+ *     --no-skip    rebuild every body, even ones nothing changed about
+ *     --ab N       alternate the skip every N steps, report both arms
  *     --vtk N      write the surface every N steps
  *     --vtk-mode M  binary (default) | ascii | shared
  *                   binary/ascii write one .vtu per rank plus a .pvtu index;
@@ -114,6 +116,8 @@ typedef struct
   bool normals;
   bool post_geom;
   bool digest;  ///< Print the partition digest at the end.  ///< Step 5: restore the geometry redistribution drops.
+  bool skip;  ///< Let redistribution leave unchanged bodies alone.
+  int ab_block;  ///< 0 = off; otherwise alternate the skip every N steps and report both arms.
   int vtk_every;  ///< 0 = never.
   MFTL_VtkOptions vtk;
 } config;
@@ -123,6 +127,8 @@ static int parse_args(int argc, char **argv, int rank, int nproc, config *cfg)
   cfg->n_spheres = 64;
   cfg->refinements = 3;
   cfg->steps = 100;
+  cfg->skip = MFTL_TRUE;
+  cfg->ab_block = 0;
   cfg->dt = 0.1;
   cfg->radius = 0.1;
   cfg->verify = false;
@@ -149,6 +155,8 @@ static int parse_args(int argc, char **argv, int rank, int nproc, config *cfg)
               "  --normals     also run MFTLEnsembleUpdateVertexNormals each step\n"
               "  --no-post-geom  skip the geometry pass after redistribution\n"
               "  --digest      print a GID-keyed partition checksum at the end\n"
+              "  --no-skip     rebuild every body, even unchanged ones\n"
+              "  --ab N        alternate the skip every N steps and report both arms\n"
               "  --vtk N       write the surface every N steps\n"
               "  --vtk-mode M  binary (default) | ascii | shared\n",
               argv[0]);
@@ -170,6 +178,10 @@ static int parse_args(int argc, char **argv, int rank, int nproc, config *cfg)
       cfg->quality = true;
     else if (!strcmp(argv[i], "--normals"))
       cfg->normals = true;
+    else if (!strcmp(argv[i], "--no-skip"))
+      cfg->skip = MFTL_FALSE;
+    else if (!strcmp(argv[i], "--ab") && i + 1 < argc)
+      cfg->ab_block = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--digest"))
       cfg->digest = true;
     else if (!strcmp(argv[i], "--no-post-geom"))
@@ -419,19 +431,19 @@ static void report_internals(int rank, int nproc, int steps)
   /* Field order is fixed by these two tables and nothing else reads them, so a
    * new counter is one line in each. */
   const char *const tname[] = {"setup",     "owner classification",
-                               "mask clear", "destination analysis",
-                               "route decision", "pack",
-                               "exchange: counts", "exchange: post",
-                               "exchange: wait", "arrival grouping",
-                               "pool growth", "kept: gather",
-                               "kept: place back", "kept: relink half-edges",
-                               "arrivals", "twin repair",
-                               "derived: topology", "derived: FRAMES",
-                               "teardown"};
-  double tval[] = {st.t_setup,     st.t_owners,       st.t_masks,        st.t_destinations,     st.t_route,
-                   st.t_pack,      st.t_exchange_counts, st.t_exchange_data, st.t_wait,          st.t_group,
-                   st.t_reserve,   st.t_kept_gather,  st.t_kept_place,   st.t_relink,           st.t_arrivals,
-                   st.t_twins,     st.t_derived_topology, st.t_derived_frames, st.t_teardown};
+                               "skip vote", "mask clear",
+                               "destination analysis", "route decision",
+                               "pack", "exchange: counts",
+                               "exchange: post", "exchange: wait",
+                               "arrival grouping", "pool growth",
+                               "kept: gather", "kept: place back",
+                               "kept: relink half-edges", "arrivals",
+                               "twin repair", "derived: topology",
+                               "derived: FRAMES", "teardown"};
+  double tval[] = {st.t_setup,     st.t_owners,       st.t_skip_vote,    st.t_masks,            st.t_destinations,
+                   st.t_route,     st.t_pack,         st.t_exchange_counts, st.t_exchange_data, st.t_wait,
+                   st.t_group,     st.t_reserve,      st.t_kept_gather,  st.t_kept_place,       st.t_relink,
+                   st.t_arrivals,  st.t_twins,        st.t_derived_topology, st.t_derived_frames, st.t_teardown};
   const int nt = (int) (sizeof(tval) / sizeof(tval[0]));
 
   const char *const gname[] = {"collect requests", "exchange: counts", "exchange: requests", "owner id table",
@@ -446,11 +458,12 @@ static void report_internals(int rank, int nproc, int steps)
                      st.n_bytes_recv,     st.n_route_neighbor, st.n_route_global,     st.n_objects_visited,
                      st.n_objects_empty_local, st.n_allocs,    st.n_frees,            st.n_bytes_allocated,
                      st.n_gid_table_bytes, st.n_dedup_overflow, st.n_clock_reads,     st.g_n_ghosts_requested,
-                     st.g_n_orphaned,     st.g_n_bytes_allocated};
+                     st.g_n_orphaned,     st.g_n_bytes_allocated, st.n_objects_skipped, st.n_objects_reclassified,
+                     st.n_objects_settled};
   const int nc = (int) (sizeof(counters) / sizeof(counters[0]));
 
   double rt[32], rg[16], rtot[2];
-  long rc[32];
+  long rc[40];
   MPI_Reduce(tval, rt, nt, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
   MPI_Reduce(gval, rg, ng, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
   MPI_Reduce(totals, rtot, 2, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
@@ -501,6 +514,17 @@ static void report_internals(int rank, int nproc, int steps)
   printf("  wire volume                %12.2f MB/step out, %.2f MB/step in\n", (double) rc[11] * mb / per_step, (double) rc[12] * mb / per_step);
   printf("  route neighbour / global   %12ld / %ld  calls\n", rc[13], rc[14]);
   printf("  bodies visited / empty     %12.0f / %.0f  per step\n", (double) rc[15] / per_step, (double) rc[16] / per_step);
+
+  /* THE number the per-body skip turns on, and the reason it is reported as a
+   * BODY fraction rather than an entity one: a body straddling a cut plane very
+   * likely has some entity cross every step, so the ~95 % of entities that stay
+   * put says nothing about how many bodies can be left alone. The
+   * reclassification count is the price: bodies this rank saw as unchanged and
+   * some other rank did not, whose ownership scan therefore ran twice. */
+  printf("  bodies skipped             %12.0f  per step   (%.1f %% of those visited)\n", (double) rc[26] / per_step,
+         (rc[15] > 0) ? 100.0 * (double) rc[26] / (double) rc[15] : 0.0);
+  printf("  bodies reclassified        %12.0f  per step   (of which %.0f were settling rebuilds)\n", (double) rc[27] / per_step,
+         (double) rc[28] / per_step);
   printf("  allocations                %12.0f /step   %.2f MB/step requested\n", (double) rc[17] / per_step, (double) rc[19] * mb / per_step);
   printf("  of which the id tables     %12.2f MB/step   <- sized from the GLOBAL id range\n", (double) rc[20] * mb / per_step);
   printf("  ghost sync requests        %12.0f /step   %.0f orphaned\n", (double) rc[23] / per_step, (double) rc[24]);
@@ -571,6 +595,8 @@ int main(int argc, char **argv)
     printf("%d ranks in a %dx%dx%d grid | periodic %d%d%d | %d spheres of radius %g, refine %d (%d triangles each) | %d steps\n", nproc, cfg.cuts[0],
            cfg.cuts[1], cfg.cuts[2], (int) cfg.periodic[0], (int) cfg.periodic[1], (int) cfg.periodic[2], cfg.n_spheres, cfg.radius, cfg.refinements,
            20 << (2 * cfg.refinements), cfg.steps);
+    if (cfg.ab_block > 0) printf("skip of unchanged bodies: A/B, alternating every %d steps\n", cfg.ab_block);
+    else printf("skip of unchanged bodies: %s\n", cfg.skip ? "ON" : "OFF");
     printf("wire format: %d B per vertex, %d B per triangle complex, %d B per ghost update\n", (int) sizeof(MFTL_PackedVertex),
            (int) sizeof(MFTL_PackedTriangleComplex), (int) sizeof(MFTL_GhostUpdatePayload));
   }
@@ -624,6 +650,28 @@ int main(int argc, char **argv)
   long ghost_bytes = 0;
   long vtk_writes = 0;
   int failures = 0;
+
+  /* ── The A/B, interleaved in ONE process ────────────────────────────────
+   *
+   * Not two invocations. docs/performance-analysis.md sections 7c-7d record five
+   * obviously-correct fixes measuring as no change at all because the
+   * process-to-process spread on this machine is larger than the effect; the
+   * only readings that have ever resolved anything here are interleaved ones.
+   *
+   * Blocks rather than alternate steps: a skipped step immediately after a full
+   * rebuild finds every pool line resident and would flatter the skip. A block
+   * of a few dozen steps lets each arm reach its own steady state, and the first
+   * block of each arm is discarded for the same reason.
+   *
+   * The skip is BEHAVIOUR-NEUTRAL, which is what makes interleaving legitimate
+   * at all -- the two arms are the same simulation, and `--digest` from two runs
+   * with and without it is the proof. */
+  double ab_time[2] = {0.0, 0.0};
+  long ab_steps[2] = {0, 0};
+  long ab_skipped[2] = {0, 0};
+  long ab_visited[2] = {0, 0};
+
+  MFTLRedistributeSetSkipUnchangedBodies(cfg.skip);
 
   /* After the initial scatter, so its first-touch faults and its one-off
    * all-to-all do not land in the steady-state figures. */
@@ -679,9 +727,31 @@ int main(int argc, char **argv)
     }
 
     /* 4. Re-decide ownership from the fresh centres. */
+    const int arm = (cfg.ab_block > 0) ? ((step / cfg.ab_block) & 1) : -1;
+    MFTL_RedistributeStats ab_before;
+    if (arm >= 0)
+    {
+      MFTLRedistributeSetSkipUnchangedBodies(arm != 0);  // arm 0 = off, arm 1 = on
+      MFTLRedistributeGetStats(&ab_before);
+    }
+
     t0 = MPI_Wtime();
     MFTLRedistribute(ens);
-    t_redist += MPI_Wtime() - t0;
+    const double dt_redist = MPI_Wtime() - t0;
+    t_redist += dt_redist;
+
+    /* The first block of each arm is warm-up: the two arms leave the pools in
+     * different cache states and the arrays the workspace grows are still
+     * reaching their high-water marks. */
+    if (arm >= 0 && step >= 2 * cfg.ab_block)
+    {
+      MFTL_RedistributeStats ab_after;
+      MFTLRedistributeGetStats(&ab_after);
+      ab_time[arm] += dt_redist;
+      ab_steps[arm] += 1;
+      ab_skipped[arm] += ab_after.n_objects_skipped - ab_before.n_objects_skipped;
+      ab_visited[arm] += ab_after.n_objects_visited - ab_before.n_objects_visited;
+    }
 
     /* 5. Restore what the redistribution deliberately did not send. The object
      *    now has valid topology and valid positions; its areas, normals and
@@ -787,6 +857,38 @@ int main(int argc, char **argv)
              1000.0 * (sum[4] + sum[6]) / per_step);
     }
     printf("==============================================\n");
+  }
+
+  if (cfg.ab_block > 0)
+  {
+    /* Means over ranks, like every other phase figure here: the loop is bounded
+     * by a barrier, so the interesting quantity is what the fleet spent, not
+     * what the slowest rank did in one phase. */
+    double ab_sum[2];
+    long ab_cnt[2], ab_skp[2], ab_vis[2];
+    MPI_Reduce(ab_time, ab_sum, 2, MPI_DOUBLE, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(ab_steps, ab_cnt, 2, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(ab_skipped, ab_skp, 2, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+    MPI_Reduce(ab_visited, ab_vis, 2, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
+    if (rank == 0)
+    {
+      printf("\n=== interleaved A/B: skipping unchanged bodies (blocks of %d steps) ===\n", cfg.ab_block);
+      const char *const label[2] = {"OFF (rebuild every body)", "ON  (skip unchanged)"};
+      double ms[2] = {0.0, 0.0};
+      for (int a = 0; a < 2; ++a)
+      {
+        const double steps_per_rank = (ab_cnt[a] > 0) ? (double) ab_cnt[a] / (double) nproc : 1.0;
+        ms[a] = 1000.0 * ab_sum[a] / (double) nproc / steps_per_rank;
+        printf("  %-26s %8.3f ms/step over %.0f timed steps", label[a], ms[a], steps_per_rank);
+        if (ab_vis[a] > 0) printf("   %.1f %% of bodies skipped", 100.0 * (double) ab_skp[a] / (double) ab_vis[a]);
+        printf("\n");
+      }
+      if (ms[1] > 0.0) printf("  speed-up                   %8.3fx\n", ms[0] / ms[1]);
+      printf("  NOTE: report_internals below MIXES the two arms; it is the A/B's phase\n");
+      printf("        breakdown only when the run is not in --ab mode.\n");
+      printf("======================================================================\n");
+    }
   }
 
   report_internals(rank, nproc, cfg.steps);

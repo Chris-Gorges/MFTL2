@@ -214,6 +214,43 @@ static inline void MFTLObjectInvalidateDerived(MFTL_Object *obj) { obj->derived 
 static inline void MFTLObjectInvalidateFrames(MFTL_Object *obj) { obj->derived &= ~MFTL_DERIVED_FRAMES; }
 
 /**
+ * @brief Declares that the CURRENT partition no longer describes this mesh.
+ *
+ * MFTLRedistribute() may leave a body entirely alone when no entity of it changed
+ * owner: a rank's local state after a redistribution is a pure function of
+ * (global topology, owner map), so if neither input moved neither does the
+ * output. This flag is the other half of that precondition -- it reports that
+ * something which is NOT the owner map changed, so the body must be rebuilt even
+ * though nothing moved.
+ *
+ * Three kinds of change need it, and the library already stamps all three:
+ *
+ *   1. ENTITY COUNTS. MFTLObjectSetCounts() is the enforced choke point for any
+ *      creation or destruction, and it stamps.
+ *   2. GLOBAL IDS. MFTLRemeshRenumberGlobalIds() and the spanning remesher's
+ *      closing redensification rewrite ids of entities other ranks hold copies
+ *      of. Ghost TRIANGLE ids in particular are repaired only by being dropped
+ *      and re-received, so a skip would remove the repair and leave stale ids
+ *      colliding with fresh ones -- silently, and several timesteps from the
+ *      cause.
+ *   3. ENTITY FLAGS. Redistribution replaces a ghost triangle's flags from its
+ *      owner's copy but RETAINS a kept ghost vertex's local record, so a pass
+ *      that writes flags without changing counts must stamp too.
+ *      MFTLRemeshMarkFrozen() does.
+ *
+ * Anything else that edits a mesh in place without going through
+ * MFTLObjectSetCounts() owes this call. It is CONSERVATIVE by design: a spurious
+ * stamp costs one body's rebuild, a missing one is silent corruption.
+ *
+ * @param obj The mesh. Only `partition_dirty` is written; the derived bits are
+ *            a separate question and are not touched.
+ *
+ * @rank_local It is a local statement about a local pool. Redistribution reduces
+ *             the per-body votes of every rank before acting on any of them.
+ */
+static inline void MFTLObjectMarkPartitionDirty(MFTL_Object *obj) { obj->partition_dirty = MFTL_TRUE; }
+
+/**
  * @brief Rebuilds every derived per-triangle array from the half-edge structure.
  *
  * One pass emits `tris.verts` and `tris.neighbors`; a second emits `tris.anchor`
