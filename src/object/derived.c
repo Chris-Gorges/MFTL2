@@ -82,6 +82,17 @@
  * t's three half-edges are at 3t, and their records are contiguous. The loop
  * reads a 48-byte block and writes two 12-byte blocks, all sequential.
  *
+ * ── The one other place these two arrays are written ───────────────────────
+ *
+ * `rebuild_object()` (src/communication/redistribute.c) emits both arrays inside
+ * its relink and arrival loops instead of calling MFTLObjectBuildDerived()
+ * afterwards, because it already holds every input in registers -- so this
+ * rotation and this `twin_idx / 3` are spelled twice in the library. They are
+ * pinned together by inv_derived_matches_topology()
+ * (tests/test_mesh_invariants.h), which re-derives both arrays from the records
+ * and compares them element for element on every redistributed mesh. Change the
+ * convention here and that test fails there, which is the point.
+ *
  * @param obj The mesh. `tris.verts` and `tris.neighbors` are rewritten.
  */
 static void build_topology_arrays(MFTL_Object *obj)

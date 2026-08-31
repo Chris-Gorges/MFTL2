@@ -436,11 +436,11 @@ static void report_internals(int rank, int nproc, int steps)
                                "arrival grouping", "pool growth",
                                "kept: gather", "kept: place back",
                                "kept: relink half-edges", "arrivals",
-                               "twin repair", "derived: topology", "teardown"};
+                               "twin repair", "teardown"};
   double tval[] = {st.t_setup,     st.t_owners,       st.t_skip_vote,    st.t_masks,            st.t_destinations,
                    st.t_route,     st.t_pack,         st.t_exchange_counts, st.t_exchange_data, st.t_wait,
                    st.t_group,     st.t_reserve,      st.t_kept_gather,  st.t_kept_place,       st.t_relink,
-                   st.t_arrivals,  st.t_twins,        st.t_derived_topology, st.t_teardown};
+                   st.t_arrivals,  st.t_twins,        st.t_teardown};
   const int nt = (int) (sizeof(tval) / sizeof(tval[0]));
 
   const char *const gname[] = {"collect requests", "exchange: counts", "exchange: requests", "owner id table",

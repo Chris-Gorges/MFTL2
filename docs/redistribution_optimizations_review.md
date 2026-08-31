@@ -2,7 +2,27 @@
 > object and every consumer now gathers current positions through compact
 > connectivity. Frame-related API names below describe the reviewed historical
 > implementation and are retained as decision evidence.
-
+>
+> Resolution (2026-08-31): **every item in this review is now closed.**
+> Optimization 1 shipped as `MFTLRedistributeSetSkipUnchangedBodies` (default on,
+> 1.6–2.1x on the phase; `docs/performance-analysis.md` 7e). Optimization 3 was
+> resolved by deleting frames rather than by any of 3a/3b/3c. **4a, 2a, 4b's free
+> half and 2b are all implemented**, measured at 1.038-1.040x on the phase in the
+> regime the skip cannot help and 1.02x with it firing; 4c stays rejected on the
+> grounds given below. Full measurement in `docs/performance-analysis.md` 7f.
+>
+> Two of this review's own judgements did not survive the measurement, and both
+> are worth reading against the text below:
+>
+> - **The verdict table's shares were measured with the skip OFF and the frames
+>   present, so they no longer rank the items.** 4a is ranked here at 5 % of the
+>   phase and "best effort/reward in the list"; against the current profile it is
+>   1.7 % when the skip fires, and the destination-analysis items it is ranked
+>   above turned out to be the ones carrying the win.
+> - **4a's traffic model was optimistic by 3x.** "Trade one full pass for 24 B/tri
+>   of stores into lines you're already sequential over" leaves out which loop the
+>   stores land in: the removed pass is a pure stream, the relink is
+>   dependency-bound, and 0.369 of the 0.588 ms/step comes straight back.
 
 ## Implemented result
 

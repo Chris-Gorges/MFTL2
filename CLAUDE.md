@@ -675,7 +675,7 @@ benchmarks rather than trusting the tables — each answers one question:
 | `leveque_remeshing_parallel.c` | over 150 remeshed timesteps, does the distributed answer track the serial one, is it reproducible to the bit, and what does a phase cost |
 | `parallel_advection_scaling.c` | strong, weak and granularity scaling of the timestep; `run_scaling.py` sweeps the rank counts and renders the curves |
 
-**Seven results contradict what the design predicted, and are the reason to read the doc rather than the code
+**Nine results contradict what the design predicted, and are the reason to read the doc rather than the code
 comments:**
 
 1. Persistent triangle frames made isolated consumer kernels faster, especially
@@ -722,6 +722,19 @@ comments:**
    than triangle quality, which is a wash. Set `feature_angle_threshold` to 180 for any smooth closed
    interface. Full measurement in `docs/remeshing-quality-analysis.md`.
 
+9. **MOVING WORK OUT OF A STREAMING PASS INTO A DEPENDENCY-BOUND LOOP RECOVERS A THIRD OF IT, NOT ALL OF IT.**
+   Redistribution used to close with `MFTLObjectBuildDerived`; `rebuild_object` now emits `tris.verts` /
+   `tris.neighbors` inside the relink, where every input is already in a register. The traffic argument
+   (−48 B/tri, one pass fewer) predicted 5 % of the phase. Measured: **the pass costs 0.588 ms/step and
+   0.369 of it comes straight back into `t_relink`**, so the trade is 0.22 ms/step, 2.3 %. What the model left
+   out is WHICH loop the stores land in — `build_topology_arrays` is a pure stream the prefetcher handles
+   perfectly, the relink already does two random gathers per half-edge. It is kept (one pass fewer over the
+   pool is a footprint statement too, and §7c says footprint is what has mattered), but the
+   destination-analysis items it was ranked ABOVE are the ones carrying the win: `build_kept_lists` reading
+   the dense owner arrays in one two-cursor pass instead of the AoS records in four scans, plus a branch-free
+   stencil test in `collect_destinations`, take **20 % off the destination analysis** in both regimes. All
+   four together: 1.038–1.040x on the phase where the body skip cannot fire, 1.02x where it can.
+   `docs/performance-analysis.md` §7f closes out `docs/redistribution_optimizations_review.md`.
 
 ## Known deferred issues
 
@@ -915,7 +928,35 @@ comments:**
    sweep setup time grows linearly with `nproc` while the timed loop does not, and it must never be
    folded into a scaling total. Full reasoning in `docs/scaling-analysis.md`.
 
+21. **`compute_owners` IS NOW THE LARGEST NON-COLLECTIVE BUCKET, AND THE BODY SKIP CANNOT TOUCH IT BECAUSE
+   IT IS THE DECISION.** With the skip on and the frames gone it is 1.4 of 4.7 ms/step at np = 4 on 1000
+   bodies — 30 % of the phase — and it is the one bucket that does not move when a body is skipped, because
+   the classification is what produces the verdict.
 
+   **The sufficient condition that would remove it needs no scan and no collective, only a number the
+   caller already has.** The question is "did any entity change cell". Cache per body the minimum distance
+   from any entity to its own cell's boundary planes — `slack[o]`, three `fabs`/`min` per entity, in
+   registers, inside the loop that is already reading the position. A flow solver knows how far anything
+   can have moved since: it is `dt * v_max`, the CFL number that set the timestep. Then
+   `motion_bound < slack[o]` PROVES no entity crossed a plane, so the body votes clean and the
+   classification is skipped; `slack[o] -= motion_bound` on each skipped step, rescan when it reaches zero.
+   Exact, conservative, and it amortises one scan over `slack / bound` steps — a droplet of radius 0.1 in a
+   0.5-wide cell moving 0.01 per step would scan about every fifteenth step instead of every step.
+
+   **It must ship OFF, and the reasons are the interesting part.** It adds work to `compute_owners` — the
+   loop this file records a 1.70x regression on — in order to save that same loop later, so the extra work
+   has to be selected by one branch hoisted per body exactly as the `MFTL_OwnerMap` seam is. It moves a
+   correctness precondition to the CALLER: a solver that understates its bound gets a silently wrong
+   partition, so it needs a Debug-only verifier that runs the scan anyway and asserts the verdict, and the
+   switch belongs in `check_object_lists_agree`'s checksum the way `g_skip_unchanged` already is. It must
+   be disabled whenever `maps != MFTL_NULL`, because the remesher moves the cut planes and a cached slack
+   then describes planes that no longer exist. And `slack[]` belongs in the `comm_workspace` next to
+   `dirty_votes`, under the same `prev_num_objects` invalidation rule — NOT on `MFTL_Object`.
+
+   Fusing the classification into `MFTLComputeTriangleGeometry` instead, which writes `tris.center` one
+   step earlier and would save the 24 B/tri stream, was rejected: it covers only the triangle half (nothing
+   in the library writes `verts.pos` — the solver does) and it puts routing into the geometry API, which is
+   the boundary deferred issue 7 declines to cross.
 
 ### Settled, so nobody re-opens them
 

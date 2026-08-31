@@ -499,6 +499,59 @@ static int test_twin_repair_matches_full_rebuild(void)
   return 0;
 }
 
+/**
+ * @brief The derived arrays a redistribution emits are the ones a rebuild builds.
+ *
+ * rebuild_object() no longer closes with MFTLObjectBuildDerived(). It writes
+ * `tris.verts` and `tris.neighbors` inside its relink loop, its arrival loop and
+ * repair_twins(), because every input is already in a register there -- so the
+ * rotation `verts[3t+k] == he[3t+(k+2)%3].vertex_idx` and the arithmetic
+ * `neighbors[3t+k] == he[3t+k].twin_idx / 3` are now spelled in TWO places.
+ *
+ * inv_derived_matches_topology() already catches a disagreement on every
+ * redistributed mesh, but only as one clause of inv_mesh_is_sound(). This names
+ * it: it takes the arrays redistribution produced, re-derives them with the
+ * function that owns the convention, and compares them element for element. A
+ * drift between the two sites fails HERE, where the comment says what broke.
+ */
+static int test_derived_arrays_match_a_full_rebuild(void)
+{
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 1);
+  MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.65, 3);
+
+  MFTLRedistribute(ens);
+
+  /* A second round after motion, so the mesh contains all four kinds of slot the
+   * emission has to cover: kept owned, kept ghost, arrived owned, arrived ghost
+   * -- plus a repair set with genuinely re-paired twins. */
+  MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += 0.11; pos[1] += 0.07; pos[2] -= 0.05; MFTLApplyPeriodicity(&ens->domain, pos););
+  MFTLUpdateGhostPositions(ens);
+  refresh_geometry(ens);
+  MFTLRedistribute(ens);
+
+  const int n = 3 * obj->tris.n;
+  int *emitted = (int *) malloc((size_t) (n > 0 ? 2 * n : 2) * sizeof(int));
+  for (int i = 0; i < n; ++i) emitted[i] = obj->tris.verts[i];
+  for (int i = 0; i < n; ++i) emitted[n + i] = obj->tris.neighbors[i];
+
+  MFTLObjectBuildDerived(obj);
+
+  int same = 1;
+  for (int i = 0; i < n; ++i)
+    if (emitted[i] != obj->tris.verts[i] || emitted[n + i] != obj->tris.neighbors[i]) same = 0;
+  free(emitted);
+
+  /* Non-vacuity: an all-ghost or empty pool would compare equal trivially. */
+  const int worth_checking = (obj->tris.n_local > 0 && obj->tris.n > obj->tris.n_local);
+
+  TEST_ASSERT(agreed(same, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ens->domain.nproc < 2 || worth_checking, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
 /* ─────────────────────────────────────────────────────────────────────────────
  * 4. The per-timestep loop
  * ─────────────────────────────────────────────────────────────────────────── */
@@ -1412,6 +1465,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_scatter_from_rank0);
   RUN_TEST(test_redistribute_is_idempotent);
   RUN_TEST(test_twin_repair_matches_full_rebuild);
+  RUN_TEST(test_derived_arrays_match_a_full_rebuild);
   RUN_TEST(test_advection_conserves_entities);
   RUN_TEST(test_ghost_positions_are_synced);
   RUN_TEST(test_vertex_normals_match_serial_reference);

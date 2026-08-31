@@ -988,10 +988,26 @@ typedef struct
   double t_reserve;  ///< Pool resize: growth inside MFTLObjectSetCounts(), plus the phase 5b shrink.
   double t_kept_gather;  ///< Gathering kept entities out of the pool into scratch.
   double t_kept_place;  ///< Writing them back at their new offsets.
-  double t_relink;  ///< Re-linking kept half-edges: vertex remap, twin remap, out_he.
-  double t_arrivals;  ///< Classifying and writing what arrived.
+  /**
+   * Re-linking kept half-edges: vertex remap, twin remap, `out_he_idx`, and the
+   * `tris.verts` / `tris.neighbors` entries of every kept triangle.
+   *
+   * THERE IS NO `derived: topology` BUCKET, and its absence is a result rather
+   * than an omission. The rebuild used to close with MFTLObjectBuildDerived(),
+   * one streaming pass re-deriving two arrays whose inputs this loop already
+   * holds in registers; it now emits them as it goes.
+   *
+   * READ THE TWO BUCKETS TOGETHER, because most of the removed pass reappears
+   * here. Isolated at np = 4 on 1000 bodies with the skip off: the pass cost
+   * 0.588 ms/step and 0.369 of it came back into this bucket, so the trade is
+   * worth about 0.22 ms/step -- roughly a THIRD of what the traffic arithmetic
+   * predicts, because a streaming pass the prefetcher handles perfectly is being
+   * traded for scattered stores in a loop that is already dependency-bound.
+   * docs/performance-analysis.md section 7f has the measurement.
+   */
+  double t_relink;
+  double t_arrivals;  ///< Classifying and writing what arrived, derived entries included.
   double t_twins;  ///< repair_twins() over the half-edges that lost a partner.
-  double t_derived_topology;  ///< Rebuilding tris.verts and tris.neighbors.
 
   /**
    * Tearing the per-call scratch down again: every `free` on the path, including

@@ -448,35 +448,36 @@ static int collect_destinations(const MFTL_Object *obj, int my_rank, const char 
      * dests[] decides the order this body is appended to each destination's id
      * lists, hence the wire order, hence the arrival order, hence the pool slot
      * order. The candidate list is built exactly as it was. */
-    int cand[7];
-    int n_cand = 0;
-    cand[n_cand++] = tri_owner[t];
-    cand[n_cand++] = vert_owner[v0];
-    cand[n_cand++] = vert_owner[v1];
-    cand[n_cand++] = vert_owner[v2];
-    for (int j = 0; j < 3; ++j)
-    {
-      const int adj = tn[base + j];
-      if (adj != MFTL_ERROR) cand[n_cand++] = tri_owner[adj];
-    }
+    const int r = tri_owner[t];
+    const int o0 = vert_owner[v0], o1 = vert_owner[v1], o2 = vert_owner[v2];
+    const int a0 = tn[base + 0], a1 = tn[base + 1], a2 = tn[base + 2];
+    const int r0 = (a0 != MFTL_ERROR) ? tri_owner[a0] : r;
+    const int r1 = (a1 != MFTL_ERROR) ? tri_owner[a1] : r;
+    const int r2 = (a2 != MFTL_ERROR) ? tri_owner[a2] : r;
 
     int dests[7];
     int n_dests = 1;
-    dests[0] = cand[0];
-    for (int j = 1; j < n_cand; ++j)
+    dests[0] = r;
+
+    if (((o0 ^ r) | (o1 ^ r) | (o2 ^ r) | (r0 ^ r) | (r1 ^ r) | (r2 ^ r)) != 0)
     {
-      if (cand[j] != cand[0])
-      {
-        n_dests = MFTLGetUniqueIntegers(cand, n_cand, dests, 7);
-        break;
-      }
+      int cand[7];
+      int n_cand = 0;
+      cand[n_cand++] = r;
+      cand[n_cand++] = o0;
+      cand[n_cand++] = o1;
+      cand[n_cand++] = o2;
+      if (a0 != MFTL_ERROR) cand[n_cand++] = r0;
+      if (a1 != MFTL_ERROR) cand[n_cand++] = r1;
+      if (a2 != MFTL_ERROR) cand[n_cand++] = r2;
+      n_dests = MFTLGetUniqueIntegers(cand, n_cand, dests, 7);
     }
 
     for (int k = 0; k < n_dests; ++k)
     {
-      const int r = dests[k];
+      const int dst = dests[k];
 
-      if (r == my_rank)
+      if (dst == my_rank)
       {
         keep_t[t] = 1;
         keep_v[v0] = 1;
@@ -485,23 +486,23 @@ static int collect_destinations(const MFTL_Object *obj, int my_rank, const char 
         continue;
       }
 
-      if (!is_neighbor[r]) requires_global = 1;
+      if (!is_neighbor[dst]) requires_global = 1;
 
-      int b = rank_bit[r];
+      int b = rank_bit[dst];
       if (b == MFTL_ERROR)
       {
-        touched[(*n_touched)++] = r;  // first contact and first triangle coincide
-        MFTL_ASSERT(tri_ids[r].size == 0 && "collect_destinations: bit slot and buffer state disagree");
+        touched[(*n_touched)++] = dst;  // first contact and first triangle coincide
+        MFTL_ASSERT(tri_ids[dst].size == 0 && "collect_destinations: bit slot and buffer state disagree");
         b = (dd->n_bits < MFTL_DEDUP_BITS) ? dd->n_bits++ : MFTL_DEDUP_NO_BIT;
         if (b == MFTL_DEDUP_NO_BIT) MFTLCommStats.n_dedup_overflow++;
-        rank_bit[r] = b;
+        rank_bit[dst] = b;
       }
 
-      ib_add(&tri_ids[r], t);
+      ib_add(&tri_ids[dst], t);
 
       if (b == MFTL_DEDUP_NO_BIT)
       {
-        ib_add3(&vert_ids[r], v0, v1, v2);  // append_destination will sort this one
+        ib_add3(&vert_ids[dst], v0, v1, v2);  // append_destination will sort this one
         continue;
       }
 
@@ -509,17 +510,17 @@ static int collect_destinations(const MFTL_Object *obj, int my_rank, const char 
       if (!(mask[v0] & m))
       {
         mask[v0] |= m;
-        ib_add(&vert_ids[r], v0);
+        ib_add(&vert_ids[dst], v0);
       }
       if (!(mask[v1] & m))
       {
         mask[v1] |= m;
-        ib_add(&vert_ids[r], v1);
+        ib_add(&vert_ids[dst], v1);
       }
       if (!(mask[v2] & m))
       {
         mask[v2] |= m;
-        ib_add(&vert_ids[r], v2);
+        ib_add(&vert_ids[dst], v2);
       }
     }
   }
@@ -688,37 +689,90 @@ typedef struct
 } body_state;
 
 /**
+ * @brief Splits one entity class's keep flags into the two runs, in ONE pass.
+ *
+ * ── Why two cursors rather than two scans ──────────────────────────────────
+ *
+ * The rebuild wants the owned entities first (n_local is an array PREFIX) and
+ * both runs ascending (so the gather in rebuild_object stays a forward scan).
+ * The obvious way to get that is one scan per run, which reads the flags and the
+ * ownership twice. Instead the owned run is filled FORWARD from 0 and the ghost
+ * run BACKWARD from the top of the body's arena slice -- which is already sized
+ * for the whole class, so the two cursors cannot meet: every kept entity takes
+ * one slot from one end and there are at most @p n of them.
+ *
+ * The backward run comes out descending, so it is reversed and moved down
+ * against the owned run. Both are O(halo), against O(n) for the pass they
+ * replace, and the result is BYTE-IDENTICAL to what two scans produce -- which
+ * is what keeps the pool's slot order, and therefore the partition digest,
+ * unchanged.
+ *
+ * Counting the runs first would let the two be written straight to their final
+ * offsets and skip the fix-up, and it is the wrong trade: the counter would have
+ * to be incremented in collect_destinations, where `keep[i] = 1` is an
+ * unconditional store today, and a read-modify-write with a loop-carried
+ * dependency in the hottest loop of the phase is not worth an O(halo) memmove
+ * here.
+ *
+ * ── Why the OWNERSHIP comes from the dense array and not from the record ───
+ *
+ * `owner[i]` and `rec[i].owner_proc` hold the same value -- compute_owners()
+ * wrote both, immediately before, and the entry is the NEW owner rather than the
+ * one the entity arrived with. The array is 4 B per entity against 16 for
+ * MFTL_Vertex and 12 for MFTL_Triangle, it is dense, and it is still hot. This
+ * is an AoS record being read for one int; the SoA copy already exists.
+ *
+ * @param      keep    `[n]` keep flags from collect_destinations().
+ * @param      owner   `[n]` destination rank per entity, from compute_owners().
+ * @param      n       Entities to consider: `verts.n`, or `tris.n_local` because
+ *                     only an owned triangle can ever be kept.
+ * @param      my_rank This rank.
+ * @param[out] out     `[n]` the kept indices: owned run then ghost run, both
+ *                     ascending. Must be the body's full arena slice.
+ * @param[out] n_owned Length of the owned run.
+ * @return Kept entities in total, owned plus retained ghosts.
+ */
+static int split_kept_run(const char *restrict keep, const int *restrict owner, int n, int my_rank, int *restrict out, int *n_owned)
+{
+  int lo = 0, hi = n;
+
+  for (int i = 0; i < n; ++i)
+  {
+    if (!keep[i]) continue;
+    if (owner[i] == my_rank) out[lo++] = i;
+    else out[--hi] = i;
+  }
+
+  *n_owned = lo;
+  const int n_ghost = n - hi;
+
+  for (int a = 0, b = n_ghost - 1; a < b; ++a, --b)
+  {
+    const int tmp = out[hi + a];
+    out[hi + a] = out[hi + b];
+    out[hi + b] = tmp;
+  }
+  if (n_ghost > 0 && hi != lo) memmove(out + lo, out + hi, (size_t) n_ghost * sizeof(int));
+
+  return lo + n_ghost;
+}
+
+/**
  * @brief Splits the keep flags into the two ascending runs the rebuild wants.
  *
- * @param      obj     The mesh.
- * @param      keep_v  `[verts.n]` flags.
- * @param      keep_t  `[tris.n]` flags.
- * @param      my_rank This rank.
- * @param[out] bs      Per-body state.
+ * @param      obj        The mesh, for the two class sizes.
+ * @param      keep_v     `[verts.n]` flags from collect_destinations().
+ * @param      keep_t     `[tris.n_local]` flags from collect_destinations().
+ * @param      vert_owner `[verts.n]` destination rank per vertex.
+ * @param      tri_owner  `[tris.n]` destination rank per triangle.
+ * @param      my_rank    This rank.
+ * @param[out] bs         Per-body state; its kept lists and counts are filled in.
  */
-static void build_kept_lists(const MFTL_Object *obj, const char *restrict keep_v, const char *restrict keep_t, int my_rank, body_state *bs)
+static void build_kept_lists(const MFTL_Object *obj, const char *restrict keep_v, const char *restrict keep_t, const int *restrict vert_owner,
+                             const int *restrict tri_owner, int my_rank, body_state *bs)
 {
-  const MFTL_Vertex *const vr = obj->verts.rec;
-  const int nv = obj->verts.n;
-  int n = 0;
-
-  for (int v = 0; v < nv; ++v)
-    if (keep_v[v] && vr[v].owner_proc == my_rank) bs->kept_v[n++] = v;
-  bs->n_kept_v_owned = n;
-  for (int v = 0; v < nv; ++v)
-    if (keep_v[v] && vr[v].owner_proc != my_rank) bs->kept_v[n++] = v;
-  bs->n_kept_v = n;
-
-  const MFTL_Triangle *const tr = obj->tris.rec;
-  const int nt = obj->tris.n_local;
-  n = 0;
-
-  for (int t = 0; t < nt; ++t)
-    if (keep_t[t] && tr[t].owner_proc == my_rank) bs->kept_t[n++] = t;
-  bs->n_kept_t_owned = n;
-  for (int t = 0; t < nt; ++t)
-    if (keep_t[t] && tr[t].owner_proc != my_rank) bs->kept_t[n++] = t;
-  bs->n_kept_t = n;
+  bs->n_kept_v = split_kept_run(keep_v, vert_owner, obj->verts.n, my_rank, bs->kept_v, &bs->n_kept_v_owned);
+  bs->n_kept_t = split_kept_run(keep_t, tri_owner, obj->tris.n_local, my_rank, bs->kept_t, &bs->n_kept_t_owned);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1150,6 +1204,7 @@ void MFTLCommWorkspaceDestroy(void **p_ws)
 static void repair_twins(MFTL_Object *obj, const int *restrict u_list, int n_u, int *restrict v_head, int *restrict u_next)
 {
   MFTL_HalfEdge *const he = obj->tris.he;
+  int *const restrict tn = obj->tris.neighbors;
 
   for (int j = 0; j < n_u; ++j) v_head[he[MFTLHePrevIdx(u_list[j])].vertex_idx] = MFTL_ERROR;
 
@@ -1175,6 +1230,8 @@ static void repair_twins(MFTL_Object *obj, const int *restrict u_list, int n_u, 
 
       he[h].twin_idx = h2;
       he[h2].twin_idx = h;
+      tn[h] = MFTLHeTriIdx(h2);
+      tn[h2] = MFTLHeTriIdx(h);
       break;
     }
   }
@@ -1495,7 +1552,9 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
    * so every slot the relink reads was written by the loop below it, and in
    * Release the sentinel has no reader at all. n_old_v * 4 B of stores per
    * rebuilt body per step, for an assert. */
+#ifndef NDEBUG
   for (int v = 0; v < n_old_v; ++v) s->v_final_of_old[v] = MFTL_ERROR;
+#endif
   for (int t = 0; t < n_old_t; ++t) s->t_final_of_old[t] = MFTL_ERROR;
   for (int i = 0; i < n_kept_v; ++i) s->v_final_of_old[bs->kept_v[i]] = s->v_final_of_logical[i];
   for (int i = 0; i < n_kept_t; ++i) s->t_final_of_old[bs->kept_t[i]] = s->t_final_of_logical[i];
@@ -1536,6 +1595,8 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
   ib_reset(&s->u_list);
   MFTL_HalfEdge *const he = obj->tris.he;
   MFTL_Vertex *const vr = obj->verts.rec;
+  int *const restrict tv = obj->tris.verts;
+  int *const restrict tn = obj->tris.neighbors;
 
   for (int i = 0; i < n_kept_t; ++i)
   {
@@ -1567,6 +1628,7 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
        * branch and MFTL_ERROR on the other, which is exactly what
        * build_topology_arrays() writes in each case. repair_twins() overwrites
        * the entries whose half-edge finds a new partner. */
+      tn[3 * slot + k] = tw_tri;
     }
 
     /* origin(3s+k) == target(3s+(k+2)%3), and all three targets are final now. */
@@ -1576,6 +1638,9 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
 
     /* The same rotation, deliberately spelled the way build_topology_arrays()
      * spells it: slot k is the ORIGIN of half-edge 3s+k. */
+    tv[3 * slot + 0] = h3[2].vertex_idx;
+    tv[3 * slot + 1] = h3[0].vertex_idx;
+    tv[3 * slot + 2] = h3[1].vertex_idx;
   }
 
   CS_LAP(tm, t_relink);
@@ -1623,6 +1688,7 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
       h3[k].global_id = 3 * p->global_id + k;
       h3[k].flags = p->he_flags[k];
       h3[k].twin_idx = MFTL_ERROR;
+      tn[3 * slot + k] = MFTL_ERROR;  // every arriving twin is resolved by repair_twins
       ib_add(&s->u_list, 3 * slot + k);
     }
 
@@ -1630,6 +1696,9 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
     vr[h3[0].vertex_idx].out_he_idx = 3 * slot + 1;
     vr[h3[1].vertex_idx].out_he_idx = 3 * slot + 2;
 
+    tv[3 * slot + 0] = h3[2].vertex_idx;
+    tv[3 * slot + 1] = h3[0].vertex_idx;
+    tv[3 * slot + 2] = h3[1].vertex_idx;
   }
 
   /* ── 8. Repair, then rebuild what is genuinely derived ───────────────────── */
@@ -1655,8 +1724,7 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
    * slot as they went and repair_twins() finished the neighbours it relinked.
    * MFTLObjectSetCounts() cleared the bit on the way through, so it is restored
    * here by hand -- the one line MFTLObjectBuildDerived() would still contribute. */
-  MFTLObjectBuildDerived(obj);
-  CS_LAP(tm, t_derived_topology);
+  obj->derived = MFTL_DERIVED_TOPOLOGY;
 
   /* Whatever asked for this rebuild has had it. Cleared LAST, because
    * MFTLObjectSetCounts sets the stamp on the way through and would otherwise
@@ -1908,7 +1976,7 @@ static int analyze_and_pack_body(comm_workspace *ws, MFTL_Object *obj, int o, in
   const int requires_global = collect_destinations(obj, my_rank, ws->is_neighbor, ws->tri_owner, ws->vert_owner, dd, ws->keep_t, ws->keep_v, ws->tri_ids,
                                                    ws->vert_ids, ws->touched, &n_touched);
 
-  build_kept_lists(obj, ws->keep_v, ws->keep_t, my_rank, bs);
+  build_kept_lists(obj, ws->keep_v, ws->keep_t, ws->vert_owner, ws->tri_owner, my_rank, bs);
   CS_LAP(tm, t_destinations);
 
   MFTLCommStats.n_destinations += n_touched;

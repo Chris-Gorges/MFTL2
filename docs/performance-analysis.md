@@ -455,14 +455,18 @@ on it.
 
 **The frame rebuild is dead work in the documented loop.** Redistribution builds
 `tris.anchor`/`tris.edge` as step 4; step 1 of the next iteration moves owned
-vertices, and #MFTL_FOREACH_OWNED_VERTEX clears #MFTL_DERIVED_FRAMES on the way
-out. Nothing reads them in between, and step 3's `MFTLComputeTriangleGeometry`
-then takes its walk path *because* they are gone. 3.60 ms/step, 11 % of the
+vertices, and #MFTL_FOREACH_OWNED_VERTEX cleared `MFTL_DERIVED_FRAMES` on the way
+out. Nothing read them in between, and step 3's `MFTLComputeTriangleGeometry`
+then took its walk path *because* they were gone. 3.60 ms/step, 11 % of the
 phase, 72 B/triangle written for a value that is discarded unread — unless the
 caller runs `MFTLEnsembleUpdate` or `MFTLComputeVertexNormals` immediately after
-redistribution, which is the only case that benefits. The postcondition is
-unchanged for now; this is the first thing to renegotiate if the phase needs to
-get faster.
+redistribution, which is the only case that benefits.
+
+**This is the one entry in the table above that no longer exists.** It was
+resolved not by making the rebuild cheaper but by deleting persistent frames
+outright (§9), which is why `MFTL_DERIVED_FRAMES` is named here as plain text: the
+enumerator is gone. Everything else in the table is still a live bucket, subject
+to §7e and §7f.
 
 **What the counters say about scaling.** These are exact and independent of
 machine state, which is what makes them the useful half of the measurement:
@@ -713,6 +717,110 @@ is skipped, so it gets one settling rebuild per dirty-to-clean transition. Cost:
 the 43 bodies per step above. Benefit: the optimisation is invisible rather than
 merely harmless, and `--digest` stays a complete acceptance test instead of a
 partial one.
+
+### 7f. The last four items of the review: 1.02–1.04× on the phase, and the top-ranked one was worth a third of its estimate
+
+`docs/redistribution_optimizations_review.md` ranked eight ideas. Optimization 1
+(skip unchanged bodies) is 7e; Optimization 3 (the frames rebuild) was resolved by
+deleting frames outright. This is the remaining four, implemented together:
+
+| item | change | where |
+|---|---|---|
+| **4a** | emit `tris.verts`/`tris.neighbors` inside the relink, the arrival loop and `repair_twins()` instead of a closing `MFTLObjectBuildDerived()` | `rebuild_object` |
+| **2a** | `build_kept_lists`: four record scans → one pass with two cursors, reading the dense `vert_owner[]`/`tri_owner[]` instead of the AoS records | `build_kept_lists` |
+| **4b** | the `v_final_of_old` clear feeds only an assert, so it is `#ifndef NDEBUG` now; the TRIANGLE clear is load-bearing and stays | `rebuild_object` |
+| **2b** | `collect_destinations`: a branch-free XOR-OR reduction answers "does the whole stencil sit on one rank", and `cand[7]` is built only when it does not | `collect_destinations` |
+
+**The review's shares no longer rank them, and that is the first thing to say.**
+Every percentage in its verdict table was measured with the skip OFF and the
+frames still present. 4a was ranked "best effort/reward in the list" at 5 % of the
+phase; against the current profile it is 1.7 % when the skip fires. What these
+four are actually for is the case the skip *cannot* help — one domain-spanning
+body, a remeshing step where every body is `partition_dirty`, the settling
+rebuilds — because every bucket they touch is one that already shrinks 3.6–5.2×
+under a skip.
+
+**End-to-end, un-instrumented, np = 4, 200 steps, 6 reps:**
+
+| arm | 1000 bodies, `--no-skip` | 8 spanning bodies |
+|---|---:|---:|
+| 4a alone | 1.017× (4/6 reps) | 1.008× (4/6) |
+| 2a + 2b + 4b | 1.028× (**6/6**) | 1.039× (**6/6**) |
+| **all four** | **1.038× (6/6)** | **1.040× (4/6)** |
+| *control: `triangle geometry`* | *0.979–1.002×* | *0.983–1.002×* |
+
+With the skip on and 1000 small bodies it is 1.02× and inside the noise, exactly
+as the re-ranking predicts.
+
+#### Where it came from, and the one number that contradicts the estimate
+
+`-DMFTL_COMM_PROFILE=ON`, same case, 5 reps, deltas taken pairwise per rep. Only
+the buckets that moved are listed; the largest move among the buckets these
+changes cannot touch was +0.067 ms/step, which is the noise floor here.
+
+| bucket, ms/step | skip off | | | skip on | | |
+|---|---:|---:|---:|---:|---:|---:|
+| | before | after | sign | before | after | sign |
+| destination analysis | 1.899 | 1.514 | **5/5** | 0.625 | 0.498 | **5/5** |
+| derived: topology | 0.595 | 0.009 | **5/5** | 0.140 | 0.003 | **5/5** |
+| kept: relink half-edges | 1.240 | 1.668 | 0/5 | 0.273 | 0.352 | 0/5 |
+| **TOTAL** | **9.603** | **9.177** | **5/5** | **4.843** | **4.733** | 4/5 |
+
+**2a + 2b take 20 % off the destination analysis**, which is the second-largest
+bucket of the phase, and they do it in both regimes. That is a straight reduction
+in touched bytes: `build_kept_lists` went from 34 B/vertex and 26 B/triangle over
+four scans to 5 B/entity over one, and `cand[7]` stopped being written to the
+stack — confirmed in the `-O3` arm64 disassembly, where the array lived at
+`[x29, #-124]` with four to seven stores per owned triangle and three reloads for
+the all-equal test, and where the frame-slot memory operations of the whole
+function fell from 30 to 17.
+
+**4a IS a win, and it is worth a third of what the traffic arithmetic predicts.**
+Isolated in its own A/B: the closing pass costs 0.588 ms/step and **0.369 of it
+comes straight back into `t_relink`**, for a net 0.22 ms/step — 2.3 % of the
+phase, not the 5 % (or the 6 % the 0.588 alone would suggest). The review's model
+was "trade one full pass for 24 B/tri of stores into lines you are already
+sequential over", and what it leaves out is *which loop*: `build_topology_arrays`
+is a pure stream over three contiguous arrays that the prefetcher handles
+perfectly, while the relink is a dependency-bound loop already doing two random
+gathers per half-edge. Moving stores from the first kind of loop into the second
+is not free even when the byte count falls. The bucket had to be retired for the
+same reason it was worth doing: what remains of it is one assignment, so it now
+reads 0.003–0.009 ms/step and the sum `t_relink + t_arrivals` is the honest
+place to look.
+
+Both are still worth having: 4a removes a whole pass over the pool (which is a
+footprint statement as much as a time one, and §7c is clear that footprint is
+what has historically mattered on a cluster), and it costs one duplicated
+convention that `inv_derived_matches_topology()` already pins.
+
+#### All four are behaviour-neutral, verified as such
+
+Partition digests — set form **and** slot-order form — are identical to the
+un-patched tree at np = 1, 2, 4 and 8, on 1000 small bodies, on 8 domain-spanning
+bodies and on 500 bodies at np = 8, each with the skip on and off: **16
+configurations, and each of the four items was checked separately as it landed.**
+`tests/test_derived_arrays_match_a_full_rebuild` re-derives both arrays with
+`MFTLObjectBuildDerived` after a redistribution and compares them element for
+element; rotating the emitted `tris.verts` by one corner makes it fail at np = 2
+and np = 4, which is how it was confirmed to be able to fail at all.
+
+#### A third measurement trap, on top of 7d's two
+
+7d says compare interleaved, within one collection. That is not sufficient here.
+**Inside a single collection this machine drifts upward monotonically** — the
+un-patched arm went from 9.08 to 10.54 ms/step over six reps, 16 %, while the
+effect being looked for is 4 % — so a minimum taken across arms compares
+different points on the drift curve and can return either sign. Every ratio above
+is formed **inside one rep** and then averaged, and the count of reps in which
+the sign agrees is reported next to it, because that count is what distinguishes
+a 4 % effect from a 16 % ramp.
+
+The same mistake was made once more while producing the bucket table: the first
+version ran all of A and then all of B. Every bucket then moved in the same
+direction, including `owner classification`, which none of these changes touches,
+and the table was unreadable. Interleaving the two arms fixed it. A bucket the
+change cannot reach is the control, and it must be printed.
 
 ## 8. I/O: 23–32× from dropping ASCII — and MPI-IO is not the reason
 

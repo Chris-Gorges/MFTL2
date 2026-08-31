@@ -241,8 +241,15 @@ than merely harmless.
 ### Postcondition
 
 @warning A redistributed object comes back with valid topology, valid **positions**
-         and both derived bits set. Its `tris.area/normal/center` and
+         and #MFTL_DERIVED_TOPOLOGY set. Its `tris.area/normal/center` and
          `verts.normal/area/mean_curv/gauss_curv` hold **unspecified** values.
+
+`tris.verts` and `tris.neighbors` are not rebuilt by a closing pass; the relink
+loop, the arrival loop and `repair_twins` emit them as they go, because every
+input is already in a register there. Two thirds of what that saves comes back as
+store traffic in a loop that is dependency-bound rather than streaming, which is
+the measurement in `docs/performance-analysis.md` §7f and the reason the
+`derived: topology` bucket no longer exists.
 
 That is what buys the 3× smaller wire format. The loop that satisfies it with
 exactly one geometry pass is in @ref mftl_page_timestep, and the three things in
