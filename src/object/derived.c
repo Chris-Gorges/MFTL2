@@ -4,22 +4,20 @@
  * @date 2026-08-14
  * @ingroup mftl_object
  *
- * @brief The derived per-triangle arrays, and the Morton renumbering of the pools.
+ * @brief The derived connectivity arrays, and the Morton renumbering of the pools.
  *
- * ## FOUR DERIVED ARRAYS, AND THE SIX THAT ARE DELIBERATELY ABSENT
+ * ## TWO DERIVED ARRAYS
  *
  * A "flattened" representation of a half-edge mesh naturally grows to about ten
- * arrays. Four are here. The other six were removed after counting their
+ * arrays. Two are here. The others were removed after counting their
  * consumers, which is the only honest way to decide:
  *
  *   flat_vert_pos + flat_pos_unwrapped   DELETED. It was a second copy of every
  *     position, kept in a second index space, sometimes unwrapped and sometimes
  *     not depending on whether the object fitted in half a domain -- a mode a
  *     consumer had to query and branch on. Positions are now the authoritative
- *     SoA array `verts.pos`, in the one index space there is. The seam handling
- *     it existed for lives in `tris.edge` instead, which is exact for EVERY
- *     object regardless of size, because a single triangle is always small
- *     enough to place unambiguously even when the whole surface is not.
+ *     SoA array `verts.pos`, in the one index space there is. Consumers compute
+ *     minimum-image triangle edges directly from it.
  *
  *   sfc_perm + sfc_inv                   DELETED. The permutation is applied to
  *     the pools (MFTLObjectReorderMorton below), so there is nothing to store
@@ -32,12 +30,13 @@
  *     is for. Bring it back when a kernel exists that streams it.
  *
  *   flat_he_verts                        DELETED. Zero consumers. The three edge
- *     vectors of a triangle are e1, e2 and e2-e1, all in registers inside any
- *     loop over `tris.edge`.
+ *     vectors of a triangle are e1, e2 and e2-e1, all in consumer registers.
  *
- * The four that stayed are `tris.verts`, `tris.neighbors`, `tris.anchor` and
- * `tris.edge`. The first two are redundant with the half-edge records and are
- * stored anyway; the accounting is in build_topology_arrays() below.
+ * The arrays that stay are `tris.verts` and `tris.neighbors`. They are redundant
+ * with the half-edge records and are stored anyway; the accounting is in
+ * build_topology_arrays() below. Seam-corrected edge vectors are intentionally
+ * computed from these indices and `verts.pos` in consumer registers instead of
+ * being retained as another mesh-wide cache.
  */
 
 #include "mftl_object.h"
@@ -112,120 +111,7 @@ static void build_topology_arrays(MFTL_Object *obj)
   }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * 2. Derived frames
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/**
- * @brief Rebuilds `tris.anchor` and `tris.edge` from the current positions.
- *
- * The anchor is corner 0's position; the edges are {v1-v0, v2-v0}, made
- * SEAM-CONSISTENT here so that no consumer ever has to be. That is the array
- * that makes a triangle hot loop branch-free, and unlike a set of unwrapped
- * vertex coordinates it stays exactly correct for an object spanning a periodic
- * axis -- a single triangle is always small enough to place unambiguously even
- * when the whole surface is not.
- *
- * Writing the anchor out costs three sequential stores of a value already in a
- * register (both edge vectors are differences against it) and deletes the last
- * indirection from every consumer that needs an absolute position.
- *
- * ── Two loops, not one branch ──────────────────────────────────────────────
- *
- * The periodic correction is loop-invariant in structure but not in value, so it
- * is hoisted as data rather than as a branch: `inv_len[k]` is zero on a
- * non-periodic axis, which makes nearbyint() return zero and the correction
- * vanish without a test. That form is branchless and vectorises.
- *
- * A domain with no periodic axis at all still gets its own loop, because paying
- * three multiplies, three rounds and three FMAs per component to subtract zero
- * is not free -- and the non-periodic case is common enough to deserve the
- * duplication. This is manual loop unswitching; it is written out because the
- * fast loop must vectorise and a call to MFTLGetMinimumImageVector in the body
- * would stop it.
- *
- * @param obj The mesh. `tris.anchor` and `tris.edge` are rewritten from
- *            `verts.pos`, with the minimum-image correction applied once here.
- */
-static void build_frames(MFTL_Object *obj)
-{
-  const int n_tris = obj->tris.n;
-  const int *restrict tv = obj->tris.verts;
-  const double *restrict pos = obj->verts.pos;
-  double *restrict anc = obj->tris.anchor;
-  double *restrict ed = obj->tris.edge;
-
-  const MFTL_Domain *dom = obj->domain;
-  const bool periodic = (dom != MFTL_NULL) && (dom->is_periodic[0] || dom->is_periodic[1] || dom->is_periodic[2]);
-
-  if (!periodic)
-  {
-    for (int t = 0; t < n_tris; ++t)
-    {
-      const double *restrict p0 = &pos[3 * tv[3 * t + 0]];
-      const double *restrict p1 = &pos[3 * tv[3 * t + 1]];
-      const double *restrict p2 = &pos[3 * tv[3 * t + 2]];
-
-      anc[3 * t + 0] = p0[0];
-      anc[3 * t + 1] = p0[1];
-      anc[3 * t + 2] = p0[2];
-
-      ed[6 * t + 0] = p1[0] - p0[0];
-      ed[6 * t + 1] = p1[1] - p0[1];
-      ed[6 * t + 2] = p1[2] - p0[2];
-      ed[6 * t + 3] = p2[0] - p0[0];
-      ed[6 * t + 4] = p2[1] - p0[1];
-      ed[6 * t + 5] = p2[2] - p0[2];
-    }
-    return;
-  }
-
-  /* Zero on a non-periodic axis: nearbyint(d * 0) == 0, so the correction is a
-   * no-op there without a branch. */
-  double len[3];
-  double inv_len[3];
-  for (int k = 0; k < 3; ++k)
-  {
-    len[k] = dom->domain_size[k];
-    inv_len[k] = dom->is_periodic[k] ? dom->inv_domain_size[k] : 0.0;
-  }
-
-  for (int t = 0; t < n_tris; ++t)
-  {
-    const double *restrict p0 = &pos[3 * tv[3 * t + 0]];
-    const double *restrict p1 = &pos[3 * tv[3 * t + 1]];
-    const double *restrict p2 = &pos[3 * tv[3 * t + 2]];
-
-    anc[3 * t + 0] = p0[0];
-    anc[3 * t + 1] = p0[1];
-    anc[3 * t + 2] = p0[2];
-
-    for (int k = 0; k < 3; ++k)
-    {
-      const double d1 = p1[k] - p0[k];
-      const double d2 = p2[k] - p0[k];
-      ed[6 * t + 0 + k] = d1 - len[k] * nearbyint(d1 * inv_len[k]);
-      ed[6 * t + 3 + k] = d2 - len[k] * nearbyint(d2 * inv_len[k]);
-    }
-  }
-}
-
 void MFTLObjectBuildDerived(MFTL_Object *obj)
-{
-  MFTL_ASSERT(obj != MFTL_NULL);
-
-  if (obj->tris.n > 0)
-  {
-    build_topology_arrays(obj);
-    build_frames(obj);
-  }
-
-  /* An empty mesh is trivially described, so both bits are set: a hot loop over
-   * zero triangles is correct, not stale. */
-  obj->derived = MFTL_DERIVED_TOPOLOGY | MFTL_DERIVED_FRAMES;
-}
-
-void MFTLObjectBuildTopologyArrays(MFTL_Object *obj)
 {
   MFTL_ASSERT(obj != MFTL_NULL);
 
@@ -233,17 +119,7 @@ void MFTLObjectBuildTopologyArrays(MFTL_Object *obj)
 
   /* An empty mesh is trivially described, so the bit is set: a hot loop over
    * zero triangles is correct, not stale. */
-  obj->derived |= MFTL_DERIVED_TOPOLOGY;
-}
-
-void MFTLObjectRefreshFrames(MFTL_Object *obj)
-{
-  MFTL_ASSERT(obj != MFTL_NULL);
-  MFTL_ASSERT(MFTLObjectHasTopology(obj) && "MFTLObjectRefreshFrames: tris.verts is stale -- call MFTLObjectBuildDerived after a topology change");
-
-  if (obj->tris.n > 0) build_frames(obj);
-
-  obj->derived |= MFTL_DERIVED_FRAMES;
+  obj->derived = MFTL_DERIVED_TOPOLOGY;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -483,9 +359,8 @@ static bool reorder_triangles(MFTL_Object *obj, int *old_of_new, int *new_of_old
 
   for (int i = 0; i < nt; ++i) new_of_old[old_of_new[i]] = i;
 
-  /* Only the AUTHORITATIVE triangle state is permuted. `verts`, `neighbors`,
-   * `anchor` and `edge` are derived and are rebuilt by the caller in one pass,
-   * which is cheaper than permuting four arrays and exactly as correct. */
+  /* Only the authoritative triangle state is permuted. `verts` and `neighbors`
+   * are derived and rebuilt by the caller in one pass. */
   permute_triangle_recs(obj->tris.rec, (MFTL_Triangle *) scratch, old_of_new, nt);
   permute_he_triples(obj->tris.he, (MFTL_HalfEdge *) scratch, old_of_new, nt);
   permute_doubles(obj->tris.area, (double *) scratch, old_of_new, nt, 1);

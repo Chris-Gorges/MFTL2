@@ -13,18 +13,18 @@
  *
  *   GATHER   for each vertex, walk its one-ring and accumulate in registers.
  *            One sequential write stream, no zeroing pass, no read-modify-write
- *            -- but the inner loop has a data-dependent trip count, every step
- *            of the fan is a dependent load (he -> twin -> next), and reading
- *            each face's edge vectors is a random access into `tris.edge`.
+ *            -- but the inner loop has a data-dependent trip count and every
+ *            step of the fan is a dependent load (he -> twin -> next).
  *
- *   SCATTER  for each triangle, add its face normal into its three vertices.
- *            Two contiguous input streams (`tris.verts`, `tris.edge`), a flat
- *            loop with a compile-time-constant body, and no pointer chasing at
- *            all -- but a read-modify-write into three indexed vertex slots,
- *            plus a zeroing pass before and a normalisation pass after.
+ *   SCATTER  for each triangle, gather three current positions through the
+ *            contiguous `tris.verts` stream and add its face normal into its
+ *            three vertices. The loop is flat and has no pointer chasing, but
+ *            pays a read-modify-write into three indexed vertex slots, plus a
+ *            zeroing pass before and a normalisation pass after.
  *
- * Measured by examples/vertex_normal_benchmark.c, on the same mesh in the same
- * binary and checked to agree to rounding:
+ * The historical frame-backed comparison was measured on the same mesh in the
+ * same binary and checked to agree to rounding (the retired benchmark and its
+ * results are documented in docs/performance-analysis.md):
  *
  *     scatter over triangles       5.2 - 5.5 ns per vertex, flat in mesh size
  *     gather by fan walk          17.8 - 21.6 ns per vertex, i.e. 3.4x slower
@@ -69,6 +69,7 @@
 #include <string.h>
 
 #include "mftl_constants.h"
+#include "mftl_object.h"
 #include "mftl_types.h"
 
 /**
@@ -79,10 +80,8 @@
  * vertices, and the compiler may not assume that in a loop it has to prove
  * something about.
  *
- * There is deliberately no `restrict` relationship claimed between `vn` and the
- * inputs beyond what is true: `tris.verts` and `tris.edge` live in the triangle
- * pool block and `verts.normal` in the vertex pool block, so they genuinely
- * cannot alias.
+ * The position and normal arrays share the vertex allocation but occupy
+ * disjoint aligned sub-arrays; the topology indices live in the triangle pool.
  *
  * @param obj The mesh. `verts.normal` is accumulated into, having been zeroed
  *            by the caller.
@@ -92,8 +91,6 @@ static void scatter_face_normals(MFTL_Object *obj)
   const int n_tris = obj->tris.n;
   const int n_verts = obj->verts.n;
 
-  const int *restrict tv = obj->tris.verts;
-  const double *restrict ed = obj->tris.edge;
   double *restrict vn = obj->verts.normal;
 
   /* Every vertex is written by this pass, so the whole live prefix is cleared
@@ -101,11 +98,8 @@ static void scatter_face_normals(MFTL_Object *obj)
    * be a stale number that looks like a fresh one. */
   memset(vn, 0, 3 * (size_t) n_verts * sizeof(double));
 
-  for (int t = 0; t < n_tris; ++t)
-  {
-    const double e1x = ed[6 * t + 0], e1y = ed[6 * t + 1], e1z = ed[6 * t + 2];
-    const double e2x = ed[6 * t + 3], e2y = ed[6 * t + 4], e2z = ed[6 * t + 5];
-
+  MFTL_FOREACH_TRIANGLE_GEOMETRY(
+      obj, n_tris,
     /* e1 x e2 is twice the area times the unit normal, so accumulating it raw
      * IS the area weighting. No sqrt here; the only one in the whole pass is the
      * single normalisation per vertex below. */
@@ -113,22 +107,17 @@ static void scatter_face_normals(MFTL_Object *obj)
     const double ny = e1z * e2x - e1x * e2z;
     const double nz = e1x * e2y - e1y * e2x;
 
-    const int a = tv[3 * t + 0];
-    const int b = tv[3 * t + 1];
-    const int c = tv[3 * t + 2];
+    vn[3 * v0 + 0] += nx;
+    vn[3 * v0 + 1] += ny;
+    vn[3 * v0 + 2] += nz;
 
-    vn[3 * a + 0] += nx;
-    vn[3 * a + 1] += ny;
-    vn[3 * a + 2] += nz;
+    vn[3 * v1 + 0] += nx;
+    vn[3 * v1 + 1] += ny;
+    vn[3 * v1 + 2] += nz;
 
-    vn[3 * b + 0] += nx;
-    vn[3 * b + 1] += ny;
-    vn[3 * b + 2] += nz;
-
-    vn[3 * c + 0] += nx;
-    vn[3 * c + 1] += ny;
-    vn[3 * c + 2] += nz;
-  }
+    vn[3 * v2 + 0] += nx;
+    vn[3 * v2 + 1] += ny;
+    vn[3 * v2 + 2] += nz;);
 }
 
 /**
@@ -169,10 +158,7 @@ void MFTLComputeVertexNormals(MFTL_Object *obj)
 {
   MFTL_ASSERT(obj != MFTL_NULL);
 
-  /* Both derived bits, tested directly rather than through the mftl_object.h
-   * helpers: this is a layer-2 module and may not depend on layer 3. */
   MFTL_ASSERT((obj->derived & MFTL_DERIVED_TOPOLOGY) != 0u && "MFTLComputeVertexNormals: tris.verts is stale -- MFTLObjectBuildDerived first");
-  MFTL_ASSERT((obj->derived & MFTL_DERIVED_FRAMES) != 0u && "MFTLComputeVertexNormals: stale frames -- MFTLObjectRefreshFrames first");
 
   if (obj->verts.n == 0) return;
 

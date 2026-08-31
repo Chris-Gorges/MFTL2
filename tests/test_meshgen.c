@@ -34,11 +34,11 @@ static MFTL_Object *make_sphere(double cx, double cy, double cz, double r, int r
   return obj;
 }
 
-/** @brief Total surface area, from the derived frames. */
+/** @brief Total surface area from gathered triangle geometry. */
 static double total_area(MFTL_Object *obj)
 {
   double sum = 0.0;
-  MFTL_FOREACH_TRIANGLE_EDGE(obj, obj->tris.n,
+  MFTL_FOREACH_TRIANGLE_GEOMETRY(obj, obj->tris.n,
                              const double nx = e1y * e2z - e1z * e2y;
                              const double ny = e1z * e2x - e1x * e2z;
                              const double nz = e1x * e2y - e1y * e2x;
@@ -117,7 +117,6 @@ static int test_indexed_mesh_establishes_the_conventions(void)
 
   // Generation leaves the derived arrays ready to use.
   TEST_ASSERT(MFTLObjectHasTopology(obj));
-  TEST_ASSERT(MFTLObjectHasFrames(obj));
   return 0;
 }
 

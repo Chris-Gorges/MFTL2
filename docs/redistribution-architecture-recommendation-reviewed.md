@@ -1,5 +1,9 @@
 # Redistribution architecture: reviewed recommendation
 
+> Historical design note: persistent triangle frames were removed on
+> 2026-08-30. Frame-state postconditions below describe the implementation this
+> recommendation reviewed.
+
 ## Status
 
 This document reviews [`updated_redistribution-architecture-recommendation.md`](updated_redistribution-architecture-recommendation.md)

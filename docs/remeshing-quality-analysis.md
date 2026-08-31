@@ -274,9 +274,8 @@ tension it is worth paying.
 ### What pins it
 
 - `test_triangle_normals_are_unit_at_every_scale` — 17 triangle scales from 1e-8 to 1e+8, scalene and
-  off-axis, checked on the scalar path **and** on both bulk kernels, since
-  `MFTLComputeTriangleGeometry` dispatches on `MFTL_DERIVED_FRAMES` and the two carry separate copies of
-  the expression.
+  off-axis, checked on the scalar path **and** on both bulk connectivity paths
+  (compact indices and half-edge fallback).
 - `test_normalize_is_unit_across_magnitudes` — 31 input scales from 1e-150 to 1e+150, asserting unit
   length *and* unchanged direction, because those are separate claims and only one of them used to hold.
 - `test_normals_of_a_whole_mesh_are_unit` — a real sphere straddling a periodic seam, both kernels, plus

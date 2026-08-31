@@ -1,5 +1,9 @@
 # Performance analysis {#mftl_page_perf}
 
+> Historical note (2026-08-30): the persistent triangle-frame implementation
+> measured in several sections below has been removed. Those results are kept as
+> the evidence behind that decision, not as a description of the current API.
+
 Everything here was measured with the benchmarks in `examples/` in a Release
 build (`python3 build_all.py`); each section names the one it came from.
 Reproduce before quoting; the machine matters more than usual for three of these

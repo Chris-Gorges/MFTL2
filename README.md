@@ -20,7 +20,7 @@ MFTL_Object
     ├── rec[]                AoS   12 B   global_id, owner_proc, flags
     ├── he[]                 AoS   16 B   vertex_idx, twin_idx, global_id, flags   (3 per triangle)
     ├── area[] normal[] center[]   SoA    derived per-triangle geometry
-    └── verts[] neighbors[] anchor[] edge[]   SoA   the hot-loop representation
+    └── verts[] neighbors[]          SoA   compact hot-loop connectivity
 ```
 
 **Topology and identity are AoS** — a remesher edits one entity at a time and touches most of its record when it
@@ -68,10 +68,11 @@ MFTLEnsembleDestroy(&ens);                    // cascades to every object
 MPI_Finalize();
 ```
 
-A hot loop over triangles streams the precomputed frames and dereferences nothing:
+A hot loop streams compact triangle indices, gathers current positions and forms
+minimum-image edges in registers:
 
 ```c
-MFTL_FOREACH_TRIANGLE_EDGE(obj, obj->tris.n_local,
+MFTL_FOREACH_TRIANGLE_GEOMETRY(obj, obj->tris.n_local,
     const double nx = e1y * e2z - e1z * e2y;
     const double ny = e1z * e2x - e1x * e2z;
     const double nz = e1x * e2y - e1y * e2x;
@@ -79,8 +80,8 @@ MFTL_FOREACH_TRIANGLE_EDGE(obj, obj->tris.n_local,
 );
 ```
 
-The edge vectors are already seam-consistent, so this is correct across a periodic boundary with no branch and no
-correction in the loop.
+The macro unswitches periodicity outside the triangle loop, so the body receives
+seam-consistent edge vectors without managing derived position state.
 
 ## Build and test
 
@@ -94,11 +95,7 @@ python3 run_local_tests.py        # build + full CTest suite
 
 ```bash
 ./build/sphere_creation_serial       # full lifecycle, writes sphere.vtk
-./build/geometry_update_benchmark    # half-edge walk vs streaming frames; Morton renumbering
 ./build/layout_benchmark             # interleaved vs padded vs split xyz, four access patterns
-./build/vertex_normal_benchmark      # scatter vs fan gather vs CSR gather
-./build/update_kernel_benchmark      # eleven ways to write the per-timestep kernel
-./build/ensemble_update_benchmark    # the fused geometry+quality pass vs the naive half-edge loop
 ./build/leveque_remeshing_singleproc # what feature detection on a smooth surface costs
 
 # the whole timestep, distributed: advection, ghost sync, geometry, redistribution
@@ -168,8 +165,8 @@ o.layout = MFTL_IO_SINGLE_FILE;          // ... or ONE .vtu, written collectivel
 MFTLWriteVtu(ens, "surface", &o);
 ```
 
-Triangles that straddle a periodic face are unwrapped at write time, out of `tris.anchor` and `tris.edge`, so they
-render at their true size without the mesh in memory being touched. Only owned entities are written, so the merged
+Triangles that straddle a periodic face are unwrapped at write time from current
+positions and compact connectivity, so they render at their true size without the mesh in memory being touched. Only owned entities are written, so the merged
 dataset contains every triangle exactly once and an integral computed over it in ParaView is right.
 
 Raw binary is 23–32× faster to write than ASCII and about half the size. The shared file is **not** faster on a

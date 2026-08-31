@@ -53,15 +53,9 @@ static inline const double *MFTLVertexPos(const MFTL_Object *obj, int v)
 /**
  * @brief Writable position of vertex @p v.
  *
- * Moving a vertex invalidates the derived triangle frames. Call
- * MFTLObjectRefreshFrames() once after a motion pass -- not once per vertex.
- *
  * @param obj The mesh.
  * @param v   Vertex index. Bounds-asserted in Debug.
  * @return Writable pointer to `{x, y, z}`.
- *
- * @warning This does NOT clear #MFTL_DERIVED_FRAMES. #MFTL_FOREACH_OWNED_VERTEX
- *          does, which is why it is the preferred way to move vertices.
  */
 static inline double *MFTLVertexPosMut(MFTL_Object *obj, int v)
 {
@@ -221,17 +215,11 @@ static inline double MFTLGetEdgeLength(const MFTL_Object *obj, int h) { return M
 /**
  * @brief Area, unit normal and centroid of triangle @p t, in one pass.
  *
- * Deliberately reads the HALF-EDGES rather than `tris.verts`, so it is valid on
- * an object whose derived arrays have not been built -- a mesh generator needs
- * exactly that. Any of the outputs may be MFTL_NULL.
- *
- * A loop over many triangles should prefer MFTL_FOREACH_TRIANGLE_* (mftl_object.h),
- * which streams the precomputed frames and needs no minimum-image work at all.
- * The margin is 1.25-1.57x on a walled domain and 1.94-2.00x on a periodic one,
- * rather than the 3x a pointer-chasing baseline would show: this function chases
- * no pointers, strides 12-byte records and reads positions from one contiguous
- * array, so the BASELINE is itself fast. Use whichever is clearer unless the loop
- * is hot.
+ * Uses compact `tris.verts` when current and falls back to the half-edge records
+ * during construction, before derived connectivity has been built. Any output
+ * may be MFTL_NULL. A loop over many triangles should use
+ * MFTL_FOREACH_TRIANGLE_GEOMETRY (mftl_object.h), which unswitches periodicity
+ * outside the loop.
  *
  * @param      obj        The mesh.
  * @param      t          Triangle index.
@@ -245,15 +233,20 @@ static inline double MFTLGetEdgeLength(const MFTL_Object *obj, int h) { return M
  *                        the true centroid even for a triangle straddling a
  *                        periodic face. May be #MFTL_NULL.
  *
- * @measured{The frame kernel is worth 1.25-1.57x on a non-periodic domain and
- *           1.94-2.00x on a periodic one, interleaved and taking minima. An
- *           earlier figure of 1.03-1.24x was two thirds harness -- the benchmark
- *           timed the variants in blocks and averaged within each.}
  */
 static inline void MFTLGetTriangleProperties(const MFTL_Object *obj, int t, double *area_out, double normal_out[3], double center_out[3])
 {
   int v[3];
-  MFTLGetTriangleVertices(obj, t, v);
+  if ((obj->derived & MFTL_DERIVED_TOPOLOGY) != 0u)
+  {
+    v[0] = obj->tris.verts[3 * t + 0];
+    v[1] = obj->tris.verts[3 * t + 1];
+    v[2] = obj->tris.verts[3 * t + 2];
+  }
+  else
+  {
+    MFTLGetTriangleVertices(obj, t, v);
+  }
 
   const double *p0 = MFTLVertexPos(obj, v[0]);
 
@@ -301,11 +294,10 @@ static inline void MFTLGetTriangleProperties(const MFTL_Object *obj, int t, doub
    * length, so a consumer can tell "not computable" from "computed".
    *
    * It costs one instruction per triangle: `fcmp`+`fcsel` against `fmax`.
-   * Measured on ensemble_update_benchmark at 327 680 triangles, best of six over
-   * two rounds: 7.33 -> 7.41 ns/tri, i.e. +1.1 % on the fused geometry+quality
-   * pass. That is the price of a normal that is unit at every scale rather than
-   * above an arbitrary one, and for a quantity that multiplies surface tension it
-   * is worth paying. */
+   * The retired frame-backed ensemble benchmark measured this guard at +1.1%
+   * on the fused geometry+quality pass. That historical result is recorded in
+   * docs/performance-analysis.md; the exactness argument remains independent of
+   * the triangle input layout. */
   double cr[3];
   cr[0] = e1[1] * e2[2] - e1[2] * e2[1];
   cr[1] = e1[2] * e2[0] - e1[0] * e2[2];
@@ -342,15 +334,6 @@ static inline void MFTLGetTriangleProperties(const MFTL_Object *obj, int t, doub
  * the domain box. That is the point -- a triangle at x = L-eps and x = +eps comes
  * out as a small triangle rather than a domain-spanning sliver.
  *
- * Dispatches on the frame bit exactly as MFTLComputeTriangleGeometry does:
- *
- *   frames current   read `tris.anchor` and `tris.edge`, nine contiguous
- *                    doubles, no gather and no periodic work -- the minimum-image
- *                    correction was already paid at frame-build time.
- *   frames stale     walk the half-edges and redo the minimum-image differences.
- *                    Identical arithmetic, one gather per corner, and valid on an
- *                    object that has never had derived arrays at all.
- *
  * Used by the BVH (primitive geometry and leaf boxes) and by the spatial halo
  * (per-triangle bounds before packing). It is here rather than in either of them
  * because two modules needing the same nine doubles is the definition of a
@@ -366,25 +349,17 @@ static inline void MFTLGetTriangleCorners(const MFTL_Object *obj, int t, double 
 {
   MFTL_ASSERT(t >= 0 && t < obj->tris.n && "MFTLGetTriangleCorners: triangle index out of range");
 
-  if ((obj->derived & MFTL_DERIVED_FRAMES) != 0u)
-  {
-    const double *const a = &obj->tris.anchor[3 * t];
-    const double *const e = &obj->tris.edge[6 * t];
-
-    out[0][0] = a[0];
-    out[0][1] = a[1];
-    out[0][2] = a[2];
-    out[1][0] = a[0] + e[0];
-    out[1][1] = a[1] + e[1];
-    out[1][2] = a[2] + e[2];
-    out[2][0] = a[0] + e[3];
-    out[2][1] = a[1] + e[4];
-    out[2][2] = a[2] + e[5];
-    return;
-  }
-
   int v[3];
-  MFTLGetTriangleVertices(obj, t, v);
+  if ((obj->derived & MFTL_DERIVED_TOPOLOGY) != 0u)
+  {
+    v[0] = obj->tris.verts[3 * t + 0];
+    v[1] = obj->tris.verts[3 * t + 1];
+    v[2] = obj->tris.verts[3 * t + 2];
+  }
+  else
+  {
+    MFTLGetTriangleVertices(obj, t, v);
+  }
 
   const double *const p0 = MFTLVertexPos(obj, v[0]);
   double e1[3];
@@ -476,38 +451,12 @@ static inline void MFTLGetTriangleCenter(const MFTL_Object *obj, int t, double o
 /**
  * @brief Writes area, normal and centroid for the first @p count triangles.
  *
- * The always-valid form: correct on any object, whatever state its derived
- * arrays are in. Internally it is TWO kernels and picks between them on one test
- * outside the loop (src/geometry/triangle_geometry.c):
- *
- *   frames current   stream `tris.anchor` and `tris.edge` -- two contiguous
- *                    arrays, no gather, no periodic correction in the loop,
- *                    because the seam correction was paid at frame-build time.
- *                    1.25-1.57x faster non-periodic, 1.94-2.00x periodic --
- *                    and the periodic margin is the one that matters, because
- *                    that correction is what the walk pays per edge per pass.
- *
- *   frames stale     walk the half-edges and gather three positions per
- *                    triangle, exactly as MFTLGetTriangleProperties does. Needs
- *                    no derived arrays at all, so this is callable on a mesh
- *                    whose half-edges were filled in by hand and which has never
- *                    had any.
- *
- * The two produce BIT-IDENTICAL results -- `build_frames` computes the same
- * minimum-image differences from the same positions, so the streaming path is
- * not an approximation of the general one, it is the same arithmetic with the
- * gather hoisted out. Guarded by `test_geometry_paths_are_bit_identical`.
- *
- * A caller therefore never chooses, and in particular should NOT refresh the
- * frames in order to get the fast path: MFTLObjectRefreshFrames costs about what
- * the half-edge walk costs, so paying it for a single geometry pass is a net
- * loss. It pays off when the frames are current anyway. In the per-timestep loop
- * that is exactly the split you want, with no call site changing:
- *
- *   after MFTL_FOREACH_OWNED_VERTEX   frames cleared by the iterator  -> walk
- *   after MFTLUpdateGhostPositions    frames cleared by the exchange  -> walk
- *   after MFTLRedistribute            frames rebuilt on the way out   -> stream
- *   after MFTLGenerateSphere          frames built by the generator   -> stream
+ * Correct on any object, whatever state its derived connectivity is in. With
+ * current `tris.verts`, the steady-state kernel streams compact indices, gathers
+ * authoritative positions and unswitches periodicity outside the triangle loop.
+ * Before that array exists it falls back to implicit half-edge indexing. The two
+ * paths are bit-identical and covered by
+ * `test_triangle_geometry_paths_are_bit_identical`.
  *
  * @param obj   The mesh. `tris.area`, `tris.normal` and `tris.center` are
  *              overwritten for the first @p count triangles.
@@ -529,9 +478,10 @@ void MFTLComputeTriangleGeometry(MFTL_Object *obj, int count);
 /**
  * @brief Area-weighted vertex normals for the whole mesh, into `verts.normal`.
  *
- * The per-vertex counterpart of MFTLEnsembleUpdate: one streaming pass over the
- * triangle frames scatters each face's normal into its three vertices, and one
- * streaming pass normalises. Implemented in src/geometry/vertex_geometry.c,
+ * The per-vertex counterpart of MFTLEnsembleUpdate: one flat pass gathers each
+ * triangle's current positions and scatters its face normal into its three
+ * vertices, then one streaming pass normalises. Implemented in
+ * src/geometry/vertex_geometry.c,
  * where the choice of loop shape is argued and measured.
  *
  * ── The weighting ──────────────────────────────────────────────────────────
@@ -554,13 +504,9 @@ void MFTLComputeTriangleGeometry(MFTL_Object *obj, int count);
  *
  * ── Preconditions ──────────────────────────────────────────────────────────
  *
- * Needs `tris.verts` AND `tris.edge`, i.e. both derived bits: call
- * MFTLObjectBuildDerived() after a topology change or MFTLObjectRefreshFrames()
- * after a motion pass first. Asserted in Debug.
- *
- * Because it reads `tris.edge`, the result is correct across a periodic seam
- * without a single branch in the loop -- the edge vectors already carry the
- * minimum-image correction.
+ * Needs current `tris.verts`: call MFTLObjectBuildDerived() after a topology
+ * change. Vertex motion needs no derived refresh. The triangle loop is
+ * unswitched by domain periodicity and computes minimum-image edges in registers.
  *
  * ── What it computes on a distributed mesh ─────────────────────────────────
  *

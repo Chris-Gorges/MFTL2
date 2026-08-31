@@ -40,7 +40,7 @@ is not expressible.**
 ```
 vertex block    rec[cap]  pos[3cap]  normal[3cap]  area[cap]  mean_curv[cap]  gauss_curv[cap]
 triangle block  rec[cap]  he[3cap]   area[cap]  normal[3cap]  center[3cap]
-                verts[3cap]  neighbors[3cap]  anchor[3cap]  edge[6cap]
+                verts[3cap]  neighbors[3cap]
 ```
 
 ### Field order is not arbitrary
@@ -113,13 +113,12 @@ resize refactor it *is* this operation at zero capacity.
 
 ## Derived arrays {#object_derived}
 
-`derived.c` maintains four per-triangle arrays that are *functions of the mesh*,
-tracked by a two-bit word:
+`derived.c` maintains two per-triangle arrays that are *functions of topology*,
+tracked by one bit:
 
 | Bit | Arrays | Rebuilt by | Invalidated by |
 |---|---|---|---|
 | #MFTL_DERIVED_TOPOLOGY | `verts`, `neighbors` | `build_topology_arrays` | any topology change |
-| #MFTL_DERIVED_FRAMES | `anchor`, `edge` | `build_frames` | topology change **or** vertex motion |
 
 ### They are redundant, and that is the price
 
@@ -144,17 +143,17 @@ changes.
 @note The 4× figure is arithmetic, not a measurement — see deferred issue 3 in
       `CLAUDE.md`. Re-examine when a consumer that isolates them exists.
 
-### The frames
+### Why position-derived triangle arrays are absent
 
-`anchor` holds corner 0; `edge` holds
-$\{\mathbf{e}_1, \mathbf{e}_2\} = \{\mathbf{p}_1 - \mathbf{p}_0, \mathbf{p}_2 - \mathbf{p}_0\}$, **always
-seam-consistent** — the minimum-image correction is applied once here, at frame
-build time, and never again downstream. That is what lets
-`MFTLComputeTriangleGeometry`'s streaming kernel do no periodic arithmetic at all.
+Triangle consumers stream `verts`, gather the authoritative `verts.pos`, and
+form minimum-image edges in registers. This saves 72 bytes per triangle and
+removes rebuild/invalidation work after motion, redistribution and every
+smoothing sweep. Periodic correctness remains centralized in the shared
+geometry iterator rather than stored as mutable mesh state.
 
 ### What was deleted, and why it stays deleted
 
-Four derived arrays are kept, and the ones that are not are listed in
+Two derived arrays are kept, and the ones that are not are listed in
 `derived.c` with the reason. The vertex→triangle **CSR** is the one worth naming:
 `derived.c` asked for it to be reconsidered when a consumer appeared. Vertex normals are that consumer, and §5 of
 `docs/performance-analysis.md` measures a CSR gather as a **dead heat** with the
@@ -227,16 +226,15 @@ root box carries for the same reason.
 
 ## The hot-loop iterators {#object_iterators}
 
-Four macros in the header, each pinned to one access pattern:
+Three macros in the header, each pinned to one access pattern:
 
 | Macro | Streams | Asserts |
 |---|---|---|
-| #MFTL_FOREACH_TRIANGLE_EDGE | `tris.edge` | frames current |
-| #MFTL_FOREACH_TRIANGLE_FRAME | `tris.anchor` + `tris.edge` | frames current |
+| #MFTL_FOREACH_TRIANGLE_GEOMETRY | `tris.verts`, gathered `verts.pos` | topology current |
 | #MFTL_FOREACH_VERTEX_POS | `verts.pos`, read-only | — |
 | #MFTL_FOREACH_OWNED_VERTEX | `verts.pos`, writable, `[0, n_local)` | — |
 
-#MFTL_FOREACH_OWNED_VERTEX **clears** #MFTL_DERIVED_FRAMES on the way out, which
-is what makes it impossible for a motion pass written with the iterator to leave
-geometry a timestep stale. That is the whole reason to prefer it over a bare loop
-with `MFTLVertexPosMut`.
+#MFTL_FOREACH_TRIANGLE_GEOMETRY unswitches periodicity once per call. Its body
+receives the three vertex indices, corner 0 and two seam-consistent edges. Vertex
+motion needs no cache invalidation because every geometric value comes from the
+current position array.

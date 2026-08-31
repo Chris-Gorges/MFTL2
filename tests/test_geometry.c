@@ -311,10 +311,8 @@ static int test_a_very_small_triangle_is_measured_exactly(void)
  * face. Nothing downstream is positioned to notice a normal of length 0.999 or
  * 1e-6.
  *
- * Both kernels are checked at every scale, not just one: MFTLComputeTriangleGeometry
- * dispatches on MFTL_DERIVED_FRAMES, so a caller silently gets the walk before a
- * frame build and the stream after one, and the two carry separate copies of the
- * expression.
+ * Both connectivity paths are checked at every scale: the construction-time
+ * half-edge path and the steady-state compact-index path.
  */
 static int test_triangle_normals_are_unit_at_every_scale(void)
 {
@@ -341,10 +339,8 @@ static int test_triangle_normals_are_unit_at_every_scale(void)
       TEST_FAIL();
     }
 
-    /* Walk kernel (no frames), then stream kernel (frames current). */
+    /* Half-edge path, then compact-index gathered path. */
     MFTLObjectInvalidateDerived(obj);
-    MFTLObjectBuildDerived(obj);
-    MFTLObjectInvalidateFrames(obj);
     MFTLComputeTriangleGeometry(obj, 1);
     if (!inv_triangle_normals_are_unit(obj, 1e-12))
     {
@@ -352,11 +348,11 @@ static int test_triangle_normals_are_unit_at_every_scale(void)
       TEST_FAIL();
     }
 
-    MFTLObjectRefreshFrames(obj);
+    MFTLObjectBuildDerived(obj);
     MFTLComputeTriangleGeometry(obj, 1);
     if (!inv_triangle_normals_are_unit(obj, 1e-12))
     {
-      printf("\n  stream kernel, triangle scale 1e%d ", e);
+      printf("\n  gathered kernel, triangle scale 1e%d ", e);
       TEST_FAIL();
     }
   }
@@ -375,11 +371,11 @@ static int test_normals_of_a_whole_mesh_are_unit(void)
   double c[3] = {0.0, 5.0, 5.0};
   MFTLGenerateSphere(obj, c, 2.0, 3);
 
-  MFTLObjectInvalidateFrames(obj);
+  MFTLObjectInvalidateDerived(obj);
   MFTLComputeTriangleGeometry(obj, obj->tris.n);
   TEST_ASSERT(inv_triangle_normals_are_unit(obj, 1e-12));
 
-  MFTLObjectRefreshFrames(obj);
+  MFTLObjectBuildDerived(obj);
   MFTLComputeTriangleGeometry(obj, obj->tris.n);
   TEST_ASSERT(inv_triangle_normals_are_unit(obj, 1e-12));
 
@@ -446,19 +442,9 @@ static int test_bulk_geometry_matches_the_scalar_path(void)
 /**
  * @brief The two kernels behind MFTLComputeTriangleGeometry agree BIT FOR BIT.
  *
- * The function dispatches on MFTL_DERIVED_FRAMES: current frames get a streaming
- * pass over `tris.anchor` / `tris.edge`, stale ones get the half-edge walk. That
- * is only a safe thing to do silently if the two are the same answer, not merely
- * close -- a caller must never see its geometry change because something
- * unrelated rebuilt the derived arrays.
- *
- * They are the same expressions evaluated on the same inputs (`build_frames`
- * computes exactly the minimum-image differences MFTLGetTriangleProperties
- * computes), so `memcmp` is the right comparison and a tolerance would be hiding
- * something. Run on the PERIODIC ensemble, because that is where the two
- * spellings of the seam correction could diverge: the walk tests
- * `is_periodic[i]` and skips, while `build_frames` multiplies by an inverse
- * length that is zero off a periodic axis.
+ * The construction-time path reads the half-edges; the steady-state path streams
+ * compact vertex indices. They must give the same answer. Run on the periodic
+ * ensemble because that also compares their two minimum-image loop shapes.
  */
 static int test_triangle_geometry_paths_are_bit_identical(void)
 {
@@ -481,15 +467,15 @@ static int test_triangle_geometry_paths_are_bit_identical(void)
    * for explicitly here. That is worth knowing in itself: after generation, and
    * after a redistribution, the streaming path is what a caller gets for free. */
   MFTLObjectInvalidateDerived(obj);
-  TEST_ASSERT(!MFTLObjectHasFrames(obj));
+  TEST_ASSERT(!MFTLObjectHasTopology(obj));
   MFTLComputeTriangleGeometry(obj, nt);
   memcpy(walk_area, obj->tris.area, bytes);
   memcpy(walk_normal, obj->tris.normal, 3 * bytes);
   memcpy(walk_center, obj->tris.center, 3 * bytes);
 
-  /* Same object, same positions, frames now current -- so this takes the stream. */
+  /* Same object and positions, compact connectivity now current. */
   MFTLObjectBuildDerived(obj);
-  TEST_ASSERT(MFTLObjectHasFrames(obj));
+  TEST_ASSERT(MFTLObjectHasTopology(obj));
   memset(obj->tris.area, 0, bytes);
   memset(obj->tris.normal, 0, 3 * bytes);
   memset(obj->tris.center, 0, 3 * bytes);

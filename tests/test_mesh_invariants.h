@@ -312,43 +312,6 @@ static int inv_derived_matches_topology(const MFTL_Object *obj)
   return 1;
 }
 
-/**
- * @brief `tris.anchor` and `tris.edge` agree with the positions, seam included.
- *
- * The edges are compared against a minimum-image difference, which is the
- * definition they are supposed to satisfy for EVERY object -- including one
- * spanning a periodic axis, where a naive difference would be a domain-length
- * vector instead of an edge.
- */
-static int inv_frames_match_positions(const MFTL_Object *obj, double tol)
-{
-  if (!MFTLObjectHasFrames(obj)) return 0;
-
-  for (int t = 0; t < obj->tris.n; ++t)
-  {
-    int v[3];
-    MFTLGetTriangleVertices(obj, t, v);
-    const double *p0 = MFTLVertexPos(obj, v[0]);
-
-    for (int k = 0; k < 3; ++k)
-    {
-      if (fabs(obj->tris.anchor[3 * t + k] - p0[k]) > tol) return 0;
-    }
-
-    double e1[3];
-    double e2[3];
-    MFTLGetMinimumImageVector(obj->domain, e1, p0, MFTLVertexPos(obj, v[1]));
-    MFTLGetMinimumImageVector(obj->domain, e2, p0, MFTLVertexPos(obj, v[2]));
-
-    for (int k = 0; k < 3; ++k)
-    {
-      if (fabs(obj->tris.edge[6 * t + 0 + k] - e1[k]) > tol) return 0;
-      if (fabs(obj->tris.edge[6 * t + 3 + k] - e2[k]) > tol) return 0;
-    }
-  }
-  return 1;
-}
-
 /* ─────────────────────────────────────────────────────────────────────────────
  * 5b. Normals are UNIT vectors
  *
@@ -451,7 +414,6 @@ static int inv_mesh_is_sound(const MFTL_Object *obj, int rank)
   if (!inv_twins_are_symmetric(obj)) return 0;
   if (!inv_vertex_out_he_is_outgoing(obj)) return 0;
   if (!inv_derived_matches_topology(obj)) return 0;
-  if (!inv_frames_match_positions(obj, 1e-12)) return 0;
   if (!inv_ownership_is_a_prefix(obj, rank)) return 0;
   return 1;
 }

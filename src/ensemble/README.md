@@ -80,11 +80,10 @@ Four properties make the loop cheap, and only the last is a micro-optimisation:
    $\mathbf{e}_2 - \mathbf{e}_1$, so the statistics cost three subtractions and
    three dot products on vectors already in registers — against a second pass
    that re-gathers eighteen doubles per triangle.
-2. **No minimum-image work in the loop.** `tris.edge` carries the seam correction
-   already applied, so it is paid once per frame rebuild instead of nine
-   comparisons and eighteen fused operations per triangle per timestep.
-3. **No gather at all.** Two contiguous arrays in, three contiguous arrays out.
-   Nothing in the loop dereferences anything.
+2. **Periodicity is unswitched.** Non-periodic objects pay only position gathers
+   and subtractions; periodic objects use branchless minimum-image arithmetic.
+3. **No retained position-derived state.** Compact `tris.verts` is streamed and
+   current positions are gathered directly, so no rebuild pass precedes this one.
 4. **The owned prefix, not an ownership test.** Owned triangles are an array
    prefix, so the loop bound *is* the ownership filter.
 

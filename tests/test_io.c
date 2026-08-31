@@ -535,13 +535,10 @@ static int test_periodic_seam_is_unwrapped(void)
 }
 
 /**
- * @brief The frame-streaming wrap test and the gathering fallback agree.
+ * @brief Compact connectivity and the half-edge fallback write the same mesh.
  *
- * analyze_piece() has two criteria for "this triangle straddles a seam": with
- * current frames it asks whether a reconstructed corner left the box, without
- * them it recomputes the minimum-image vectors and compares them against the raw
- * differences. They are different expressions and this is the only test that
- * makes them answer the same question about the same mesh.
+ * Both paths gather current positions and apply the same minimum-image seam test;
+ * only the source of the three vertex indices differs.
  */
 static int test_wrap_detection_paths_agree(void)
 {
@@ -555,8 +552,7 @@ static int test_wrap_detection_paths_agree(void)
 
   MFTL_VtkOptions opt = MFTLVtkDefaults();
 
-  /* Redistribution leaves both derived bits set, so this is the streaming path. */
-  TEST_ASSERT(agreed(MFTLObjectHasFrames(ens->objects[0]), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLObjectHasTopology(ens->objects[0]), MPI_COMM_WORLD));
   TEST_ASSERT(agreed(MFTLWriteVtu(ens, with, &opt) == MFTL_SUCCESS, MPI_COMM_WORLD));
 
   for (int o = 0; o < ens->num_objects; ++o) MFTLObjectInvalidateDerived(ens->objects[o]);

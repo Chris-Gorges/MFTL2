@@ -302,7 +302,7 @@ int MFTLRemeshCompactObject(MFTL_Object *obj, MFTL_RemeshStats *stats)
    * no list of arrays here that a later addition could be left out of, because
    * the loop below IS the layout.
    *
-   * The derived arrays (`verts`, `neighbors`, `anchor`, `edge`) are deliberately
+   * The derived arrays (`verts`, `neighbors`) are deliberately
    * absent: they are rebuilt at the end of this function, so moving them would be
    * work thrown away. */
   if (swap_v || swap_t)

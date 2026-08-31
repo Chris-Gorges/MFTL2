@@ -1,5 +1,9 @@
 # Final redistribution architecture recommendation
 
+> Compatibility note (2026-08-30): the recommendation to leave frames stale was
+> superseded by removing persistent frames entirely. Current consumers gather
+> authoritative positions through compact triangle connectivity.
+
 ## Status
 
 This document is the final recommendation after critically reviewing:

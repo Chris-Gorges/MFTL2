@@ -112,15 +112,14 @@ void MFTLEnsembleUpdateGlobalCounts(MFTL_Ensemble *ensemble);
  *   min/max/avg mean-ratio quality   q = 4*sqrt(3)*A / (a^2+b^2+c^2), 1 = equilateral
  *   min/max/avg squared edge length
  *
- * It is substantially cheaper than MFTLComputeTriangleGeometry despite computing
- * strictly more, because it streams `tris.edge` instead of walking the half-edge
- * structure: no indirection, no periodic correction in the loop, and the edge
- * statistics come free from vectors already in registers rather than from a
- * second pass over the half-edges.
+ * It is cheaper than separate geometry and quality passes because the three
+ * gathered positions and their minimum-image edges serve both outputs. Compact
+ * `tris.verts` is streamed; the edge statistics come from vectors already in
+ * registers instead of a second pass.
  *
- * @note Requires current frames -- MFTLObjectBuildDerived() after a topology
- *       change, MFTLObjectRefreshFrames() after vertices have moved. Asserted in
- *       Debug.
+ * @note Requires current derived connectivity -- call
+ *       MFTLObjectBuildDerived() after a topology change. Vertex motion needs no
+ *       refresh. Asserted in Debug.
  * @note GHOST triangles are not touched. Anything preceding a redistribution
  *       must additionally refresh the ghosts' centres with
  *       MFTLComputeTriangleGeometry(obj, obj->tris.n).
@@ -157,8 +156,8 @@ void MFTLEnsembleUpdate(MFTL_Ensemble *ensemble);
  * exists. Use MFTLComputeVertexNormals() directly only if you are certain you
  * will read owned vertices and nothing else.
  *
- * @note Requires current derived arrays (both bits). After a redistribution they
- *       already are; after a motion pass call MFTLObjectRefreshFrames() first.
+ * @note Requires current derived connectivity. After a redistribution it is
+ *       already current; vertex motion does not invalidate it.
  * @note Collective: exactly three neighbourhood collectives for the whole
  *       ensemble, sized by the ghost count, none of them scaling with nproc.
  * @return MFTL_SUCCESS, or MFTL_ERROR if the exchange could not serve every

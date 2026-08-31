@@ -298,7 +298,6 @@ static int test_rebuild_twins_invalidates_derived(void)
    * loop reading a neighbour table for a topology that no longer exists. */
   MFTLRebuildTwins(obj);
   TEST_ASSERT(!MFTLObjectHasTopology(obj));
-  TEST_ASSERT(!MFTLObjectHasFrames(obj));
 
   MFTLObjectBuildDerived(obj);
   TEST_ASSERT(inv_derived_matches_topology(obj));

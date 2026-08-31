@@ -1,3 +1,40 @@
+> Resolution (2026-08-30): persistent triangle frames were removed from the
+> object and every consumer now gathers current positions through compact
+> connectivity. Frame-related API names below describe the reviewed historical
+> implementation and are retained as decision evidence.
+
+
+## Implemented result
+
+The frame removal was measured in the same Release + LTO build, before and after
+the change, with four MPI ranks, 256 spheres, refinement level 3 (327,680
+triangles), 500 steps, and an output digest:
+
+```text
+mpirun -n 4 ./build/parallel_advection_redistribute_list \
+  2 2 1 1 1 1 --spheres 256 --refine 3 --steps 500 --digest
+```
+
+| timing, median of 7 runs | with frames | without frames | result |
+|---|---:|---:|---:|
+| whole timestep loop | 3.945 s | 3.217 s | **1.226x throughput; 18.5% less time** |
+| redistribution + deferred post-geometry | 2.717 s | 2.128 s | **1.277x throughput; 21.7% less time** |
+
+The whole-loop ranges were 3.536--4.121 s before and 3.023--3.340 s after; all
+seven frame-free samples were faster than every frame-backed sample. The
+partition set/order digest was identical in every run:
+`set 1dbb389d394d61a5 order 6f79c8f911b7139d`.
+
+The harder consumer case adds `--quality --normals`, forcing the gathered
+geometry/statistics and vertex-normal paths every step. Its median whole-loop
+time fell from 5.283 s to 4.344 s over five runs: **1.216x throughput, or 17.8%
+less elapsed time**. Thus the frame-free result still wins after charging the
+new gathered consumers, rather than merely moving work out of redistribution.
+
+Persistent storage also fell by **72 bytes per triangle of pool capacity** (one
+3-double anchor plus two 3-double edges): 22.5 MiB for this benchmark's 327,680
+triangles before ghost/capacity overhead.
+
 I read `redistribute.c`, `comm_internal.h`, `derived.c`, and §7b–7d of `docs/performance-analysis.md`. Every number below is from the phase breakdown already measured in that doc (1000 bodies, 1 280 000 triangles, np = 4, phase ≈ 33.3 ms/step), so these are ranked against a real profile rather than against structure.
 
 ## Verdict

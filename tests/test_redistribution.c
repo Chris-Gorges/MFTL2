@@ -102,13 +102,12 @@ static MFTL_Object *add_sphere(MFTL_Ensemble *ens, int id, double cx, double cy,
   return obj;
 }
 
-/** @brief Steps 3 and 4 of the per-timestep loop: frames, then ALL centres. */
+/** @brief Refreshes geometry for every local triangle. */
 static void refresh_geometry(MFTL_Ensemble *ens)
 {
   for (int o = 0; o < ens->num_objects; ++o)
   {
     MFTL_Object *obj = ens->objects[o];
-    MFTLObjectRefreshFrames(obj);
     MFTLComputeTriangleGeometry(obj, obj->tris.n);
   }
 }
@@ -775,31 +774,26 @@ static int test_ghost_vertex_normals_are_exact(void)
 }
 
 /**
- * @brief The normal exchange must NOT invalidate the derived frames.
+ * @brief Position and normal exchange preserve derived connectivity.
  *
- * MFTLUpdateGhostPositions clears the frame bit, because moving a ghost changes
- * the geometry of every triangle incident to it. A normal is an OUTPUT of that
- * geometry and nothing derived depends on it, so clearing the bit here would
- * force every downstream consumer into a needless frame rebuild -- silently, and
- * only in the distributed case.
+ * Neither operation changes triangle topology, so both must leave the compact
+ * vertex/neighbor arrays current.
  */
-static int test_normal_sync_leaves_the_frames_alone(void)
+static int test_ghost_syncs_leave_topology_current(void)
 {
   MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 1);
   MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.6, 2);
 
   MFTLRedistribute(ens);
   refresh_geometry(ens);
-  MFTLObjectRefreshFrames(obj);
 
-  TEST_ASSERT(agreed(MFTLObjectHasFrames(obj) && MFTLObjectHasTopology(obj), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLObjectHasTopology(obj), MPI_COMM_WORLD));
 
   TEST_ASSERT(agreed(MFTLEnsembleUpdateVertexNormals(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
-  TEST_ASSERT(agreed(MFTLObjectHasFrames(obj), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLObjectHasTopology(obj), MPI_COMM_WORLD));
 
-  /* The position sync is the contrast, and it must still clear it. */
   TEST_ASSERT(agreed(MFTLUpdateGhostPositions(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
-  if (g_nproc > 1) TEST_ASSERT(agreed(!MFTLObjectHasFrames(obj), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLObjectHasTopology(obj), MPI_COMM_WORLD));
 
   MFTLEnsembleDestroy(&ens);
   return 0;
@@ -1361,7 +1355,7 @@ static int test_empty_object_is_a_no_op(void)
 
   TEST_ASSERT_EQUAL_INT(0, empty->verts.n);
   TEST_ASSERT_EQUAL_INT(0, empty->tris.n);
-  TEST_ASSERT(MFTLObjectHasTopology(empty) && MFTLObjectHasFrames(empty));
+  TEST_ASSERT(MFTLObjectHasTopology(empty));
   TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
   TEST_ASSERT(agreed(ownership_is_exclusive(real), MPI_COMM_WORLD));
 
@@ -1422,7 +1416,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_ghost_positions_are_synced);
   RUN_TEST(test_vertex_normals_match_serial_reference);
   RUN_TEST(test_ghost_vertex_normals_are_exact);
-  RUN_TEST(test_normal_sync_leaves_the_frames_alone);
+  RUN_TEST(test_ghost_syncs_leave_topology_current);
   RUN_TEST(test_multibody_round);
   RUN_TEST(test_body_can_leave_a_rank_entirely);
   RUN_TEST(test_body_straddling_a_periodic_seam);

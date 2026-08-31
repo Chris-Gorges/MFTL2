@@ -24,25 +24,21 @@
  * capacity per pool, because a pool is one allocation. A growth that forgets an
  * array is not a bug you can make.
  *
- * ## THE DERIVED ARRAYS AND WHEN THEY GO STALE
+ * ## THE DERIVED CONNECTIVITY AND WHEN IT GOES STALE
  *
  *   tris.verts, tris.neighbors     rebuilt by MFTLObjectBuildDerived
  *                                  invalid after any TOPOLOGY change
- *   tris.anchor, tris.edge         rebuilt by MFTLObjectBuildDerived and
- *                                  refreshed by MFTLObjectRefreshFrames
- *                                  invalid after topology change OR vertex motion
  *
- * `obj->derived` records which of the two groups is current. Every iterator
- * below asserts on it in Debug and costs nothing in Release, and
- * MFTL_FOREACH_OWNED_VERTEX clears the frame bit on the way out because a loop
- * that moves vertices has invalidated the frames by construction. The previous
- * version required the caller to remember an explicit MFTLSyncFlatPositions
- * call, and getting it wrong produced geometry silently one timestep stale.
+ * Vertex motion does not invalidate connectivity. Geometric loops gather the
+ * three current positions through `tris.verts` and form seam-corrected edge
+ * vectors in registers, so there is no position-derived cache to refresh or
+ * accidentally leave stale.
  */
 
 #ifndef MFTL_OBJECT_H
 #define MFTL_OBJECT_H
 
+#include <math.h>
 #include <stdint.h>
 
 #include "mftl_constants.h"
@@ -267,27 +263,10 @@ bool MFTLObjectPoolsAreConsistent(const MFTL_Object *obj);
 static inline bool MFTLObjectHasTopology(const MFTL_Object *obj) { return (obj->derived & MFTL_DERIVED_TOPOLOGY) != 0u; }
 
 /**
- * @brief True if `tris.anchor` and `tris.edge` describe the current positions.
- * @param obj The mesh.
- * @return `true` iff #MFTL_DERIVED_FRAMES is set.
- */
-static inline bool MFTLObjectHasFrames(const MFTL_Object *obj) { return (obj->derived & MFTL_DERIVED_FRAMES) != 0u; }
-
-/**
  * @brief Declares every derived array stale. Call after editing topology by hand.
  * @param obj The mesh.
  */
 static inline void MFTLObjectInvalidateDerived(MFTL_Object *obj) { obj->derived = 0u; }
-
-/**
- * @brief Declares only the frames stale. Call after moving vertices by hand.
- *
- * #MFTL_FOREACH_OWNED_VERTEX does this on the way out, which is why a motion
- * pass written with the iterator cannot leave geometry a timestep stale.
- *
- * @param obj The mesh.
- */
-static inline void MFTLObjectInvalidateFrames(MFTL_Object *obj) { obj->derived &= ~MFTL_DERIVED_FRAMES; }
 
 /**
  * @brief Declares that the CURRENT partition no longer describes this mesh.
@@ -329,52 +308,15 @@ static inline void MFTLObjectMarkPartitionDirty(MFTL_Object *obj) { obj->partiti
 /**
  * @brief Rebuilds every derived per-triangle array from the half-edge structure.
  *
- * One pass emits `tris.verts` and `tris.neighbors`; a second emits `tris.anchor`
- * and `tris.edge`. Call it after any topology change -- generation, remeshing,
- * redistribution.
+ * One streaming pass emits `tris.verts` and `tris.neighbors`. Call it after any
+ * topology change -- generation, remeshing, redistribution.
  *
- * @param obj The mesh. `tris.verts`, `tris.neighbors`, `tris.anchor` and
- *            `tris.edge` are all rewritten, and both `derived` bits are set.
+ * @param obj The mesh. `tris.verts` and `tris.neighbors` are rewritten and
+ *            #MFTL_DERIVED_TOPOLOGY is set.
  *
  * @rank_local
  */
 void MFTLObjectBuildDerived(MFTL_Object *obj);
-
-/**
- * @brief Rebuilds only `tris.verts` and `tris.neighbors` from the half-edge records.
- *
- * The topology half of MFTLObjectBuildDerived(), separated because the two
- * halves answer to different invalidation rules and cost different amounts:
- * this one is 24 B per triangle written from a streaming read of the half-edge
- * array, while MFTLObjectRefreshFrames() is 72 B per triangle written from a
- * SCATTERED gather of three vertex positions.
- *
- * `MFTLObjectBuildDerived(obj)` is exactly this call followed by
- * MFTLObjectRefreshFrames(obj); a caller that wants both should still use it.
- * Reach for this one only when the frames are genuinely not wanted, or -- as the
- * redistribution does -- when the two costs must be attributed separately.
- *
- * @param obj The mesh. `tris.verts` and `tris.neighbors` are rewritten and
- *            #MFTL_DERIVED_TOPOLOGY is set. The frame bit is left alone, so a
- *            caller that does not follow up with MFTLObjectRefreshFrames() has
- *            an object whose frames are stale and correctly marked so.
- *
- * @rank_local
- */
-void MFTLObjectBuildTopologyArrays(MFTL_Object *obj);
-
-/**
- * @brief Rebuilds only `tris.anchor` and `tris.edge` from the current positions.
- *
- * The position-only update, for advection and smoothing. Requires
- * MFTLObjectHasTopology(), since it gathers through `tris.verts`.
- *
- * @param obj The mesh. `tris.anchor` and `tris.edge` are rewritten and
- *            #MFTL_DERIVED_FRAMES is set.
- *
- * @rank_local
- */
-void MFTLObjectRefreshFrames(MFTL_Object *obj);
 
 // -----------------------------------------------------------------------------
 // 4. SPATIAL (MORTON) ORDERING
@@ -497,108 +439,100 @@ void MFTLObjectUpdateGlobalStats(MFTL_Object *object);
  * the loop textually, so the optimiser sees one flat loop over contiguous arrays
  * and nothing else.
  *
- * What every iterator guarantees, and what an open-coded loop usually gets
- * wrong:
+ * What every iterator guarantees, and what an open-coded loop often gets wrong:
  *
  *   - the arrays are hoisted into `restrict`-qualified locals, so the compiler
  *     may assume they do not alias each other or the output;
  *   - the loop bound is a local, not a struct member reloaded every iteration;
- *   - reads are SEQUENTIAL, with no pointer chasing and no gather;
- *   - the triangle iterators need no minimum-image correction, because
- *     `tris.edge` is already seam-consistent.
+ *   - connectivity reads are sequential and there is no pointer chasing;
+ *   - periodicity is unswitched once per call, never tested per triangle;
+ *   - seam-corrected edges live only in registers.
  *
  * The body is variadic, so it may contain commas. `break` and `continue` behave
  * as in any for loop.
  *
  * ── An honest note on "SIMD" ──────────────────────────────────────────────
  *
- * These loops are SHAPED so the compiler can vectorise them -- contiguous reads,
- * restrict pointers, an invariant bound, no branch and no gather per element.
+ * These loops are shaped to expose the work to the compiler: restrict pointers,
+ * an invariant bound and no branch per triangle. Position reads are indexed
+ * gathers, so SIMD profitability remains architecture- and body-dependent.
  * They deliberately do NOT force it with a pragma: the caller's body may
  * legitimately carry a dependency the macro cannot see.
  *
- * Whether a given use vectorises is therefore decided by the BODY. Measured over
- * four kernels that differ only in how the body writes its result:
- *
- *   body writes contiguous arrays, no reduction   -> vectorises
- *   body reduces with fmin/fmax                   -> vectorises
- *   body reduces with `if (a < lo) lo = a;`       -> HARD REFUSAL, always
- *   body writes back into an AoS record           -> never vectorises
- *
- * The last line no longer applies to geometry, which is exactly why the geometry
- * left the records. The reliable win here is not the vector units, though: it is
- * the memory traffic. No pointer chasing, no gathers, no per-element branch.
+ * The reliable properties are compact connectivity traffic and current
+ * positions. There is no mesh-wide position-derived array to build, write,
+ * invalidate or keep resident.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Iterates triangle EDGE VECTORS. The cheapest loop in the library.
+ * @brief Iterates current triangle geometry from compact connectivity.
  *
- * Pure streaming over `tris.edge`: no gather, no indirection, no periodic
- * correction. Everything that depends only on a triangle's SHAPE -- area,
- * normal, edge lengths, aspect ratio, any quality measure -- needs exactly this
- * and nothing else, and touches 48 bytes per triangle to get it.
+ * Streams `tris.verts`, gathers the three authoritative vertex positions and
+ * forms two minimum-image edge vectors in registers. Periodicity is tested once
+ * outside the triangle loop. In a non-periodic domain the hot loop contains only
+ * the gathers and subtractions; in a periodic domain its correction is
+ * branchless, with zero reciprocal on non-periodic axes.
  *
  * In scope for the body:
  *   int    t                 triangle pool index
+ *   int    v0, v1, v2        vertex pool indices
+ *   double p0x, p0y, p0z     wrapped position of corner 0
  *   double e1x, e1y, e1z     v1 - v0, seam-consistent
  *   double e2x, e2y, e2z     v2 - v0, seam-consistent
  *
  * @param count Triangles to visit from index 0. Pass `obj->tris.n_local` for
  *        owned only (they are an array prefix) or `obj->tris.n` to include ghosts.
  */
-#define MFTL_FOREACH_TRIANGLE_EDGE(obj, count, ...)                                                    \
+#define MFTL_FOREACH_TRIANGLE_GEOMETRY(obj, count, ...)                                                \
   do                                                                                                   \
   {                                                                                                    \
-    MFTL_ASSERT(MFTLObjectHasFrames(obj) && "MFTL_FOREACH_TRIANGLE_EDGE: stale frames -- build/refresh first"); \
-    const double *restrict mftl__e = (obj)->tris.edge;                                                 \
+    MFTL_ASSERT(MFTLObjectHasTopology(obj) && "MFTL_FOREACH_TRIANGLE_GEOMETRY: stale tris.verts -- rebuild derived connectivity first"); \
+    const int *restrict mftl__tv = (obj)->tris.verts;                                                  \
+    const double *restrict mftl__pos = (obj)->verts.pos;                                               \
+    const MFTL_Domain *const mftl__dom = (obj)->domain;                                                \
     const int mftl__n = (count);                                                                       \
-    for (int t = 0; t < mftl__n; ++t)                                                                  \
+    MFTL_ASSERT(mftl__n <= (obj)->tris.n && "MFTL_FOREACH_TRIANGLE_GEOMETRY: count exceeds triangle pool"); \
+    const bool mftl__periodic = mftl__dom != MFTL_NULL &&                                              \
+                                (mftl__dom->is_periodic[0] || mftl__dom->is_periodic[1] || mftl__dom->is_periodic[2]); \
+    if (!mftl__periodic)                                                                                \
     {                                                                                                  \
-      const double e1x = mftl__e[6 * t + 0], e1y = mftl__e[6 * t + 1], e1z = mftl__e[6 * t + 2];       \
-      const double e2x = mftl__e[6 * t + 3], e2y = mftl__e[6 * t + 4], e2z = mftl__e[6 * t + 5];       \
-      __VA_ARGS__;                                                                                     \
+      for (int t = 0; t < mftl__n; ++t)                                                               \
+      {                                                                                                \
+        const int v0 = mftl__tv[3 * t + 0], v1 = mftl__tv[3 * t + 1], v2 = mftl__tv[3 * t + 2];       \
+        const double *const mftl__p0 = &mftl__pos[3 * v0];                                            \
+        const double *const mftl__p1 = &mftl__pos[3 * v1];                                            \
+        const double *const mftl__p2 = &mftl__pos[3 * v2];                                            \
+        const double p0x = mftl__p0[0], p0y = mftl__p0[1], p0z = mftl__p0[2];                         \
+        const double e1x = mftl__p1[0] - p0x, e1y = mftl__p1[1] - p0y, e1z = mftl__p1[2] - p0z;       \
+        const double e2x = mftl__p2[0] - p0x, e2y = mftl__p2[1] - p0y, e2z = mftl__p2[2] - p0z;       \
+        __VA_ARGS__;                                                                                   \
+      }                                                                                                \
     }                                                                                                  \
-  } while (0)
-
-/**
- * @brief The complete triangle FRAME: edge vectors plus the anchor at corner 0.
- *
- * The same loop with one more streaming read, `tris.anchor`. Use it when an
- * absolute position is genuinely needed -- a centroid, a bounding box; anything
- * shape-only should use MFTL_FOREACH_TRIANGLE_EDGE, which touches 24 B per
- * triangle less.
- *
- * The anchor is a per-triangle copy of corner 0, written at build time where it
- * is already in a register because both edge vectors are differences against it.
- * That deletes the last indirection from the loop: no gather at all, two
- * contiguous arrays in, whatever the body writes out. The expected shape of the
- * payoff is "free while the positions fit in cache, worth about 13 % once they do
- * not", which is what deleting a random read looks like. The second half has NOT
- * been reproduced on this machine -- see docs/performance-analysis.md, where the
- * gather this removes turns out not to cost anything measurable on a part with a
- * large L2. It is kept because 24 B per triangle is cheap insurance on a cluster
- * node where it will.
- *
- * Corner positions are p0, p0 + e1, p0 + e2. p0 is a WRAPPED position, so a
- * centroid derived from it must be wrapped back into the box before it is used
- * as a position.
- *
- * In scope: everything MFTL_FOREACH_TRIANGLE_EDGE provides, plus
- *   double p0x, p0y, p0z     position of corner 0
- */
-#define MFTL_FOREACH_TRIANGLE_FRAME(obj, count, ...)                                                   \
-  do                                                                                                   \
-  {                                                                                                    \
-    MFTL_ASSERT(MFTLObjectHasFrames(obj) && "MFTL_FOREACH_TRIANGLE_FRAME: stale frames -- build/refresh first"); \
-    const double *restrict mftl__e = (obj)->tris.edge;                                                 \
-    const double *restrict mftl__a = (obj)->tris.anchor;                                               \
-    const int mftl__n = (count);                                                                       \
-    for (int t = 0; t < mftl__n; ++t)                                                                  \
+    else                                                                                               \
     {                                                                                                  \
-      const double e1x = mftl__e[6 * t + 0], e1y = mftl__e[6 * t + 1], e1z = mftl__e[6 * t + 2];       \
-      const double e2x = mftl__e[6 * t + 3], e2y = mftl__e[6 * t + 4], e2z = mftl__e[6 * t + 5];       \
-      const double p0x = mftl__a[3 * t + 0], p0y = mftl__a[3 * t + 1], p0z = mftl__a[3 * t + 2];       \
-      __VA_ARGS__;                                                                                     \
+      const double mftl__l0 = mftl__dom->domain_size[0];                                              \
+      const double mftl__l1 = mftl__dom->domain_size[1];                                              \
+      const double mftl__l2 = mftl__dom->domain_size[2];                                              \
+      const double mftl__i0 = mftl__dom->is_periodic[0] ? mftl__dom->inv_domain_size[0] : 0.0;         \
+      const double mftl__i1 = mftl__dom->is_periodic[1] ? mftl__dom->inv_domain_size[1] : 0.0;         \
+      const double mftl__i2 = mftl__dom->is_periodic[2] ? mftl__dom->inv_domain_size[2] : 0.0;         \
+      for (int t = 0; t < mftl__n; ++t)                                                               \
+      {                                                                                                \
+        const int v0 = mftl__tv[3 * t + 0], v1 = mftl__tv[3 * t + 1], v2 = mftl__tv[3 * t + 2];       \
+        const double *const mftl__p0 = &mftl__pos[3 * v0];                                            \
+        const double *const mftl__p1 = &mftl__pos[3 * v1];                                            \
+        const double *const mftl__p2 = &mftl__pos[3 * v2];                                            \
+        const double p0x = mftl__p0[0], p0y = mftl__p0[1], p0z = mftl__p0[2];                         \
+        const double mftl__d10 = mftl__p1[0] - p0x, mftl__d11 = mftl__p1[1] - p0y, mftl__d12 = mftl__p1[2] - p0z; \
+        const double mftl__d20 = mftl__p2[0] - p0x, mftl__d21 = mftl__p2[1] - p0y, mftl__d22 = mftl__p2[2] - p0z; \
+        const double e1x = mftl__d10 - mftl__l0 * nearbyint(mftl__d10 * mftl__i0);                    \
+        const double e1y = mftl__d11 - mftl__l1 * nearbyint(mftl__d11 * mftl__i1);                    \
+        const double e1z = mftl__d12 - mftl__l2 * nearbyint(mftl__d12 * mftl__i2);                    \
+        const double e2x = mftl__d20 - mftl__l0 * nearbyint(mftl__d20 * mftl__i0);                    \
+        const double e2y = mftl__d21 - mftl__l1 * nearbyint(mftl__d21 * mftl__i1);                    \
+        const double e2z = mftl__d22 - mftl__l2 * nearbyint(mftl__d22 * mftl__i2);                    \
+        __VA_ARGS__;                                                                                   \
+      }                                                                                                \
     }                                                                                                  \
   } while (0)
 
@@ -634,11 +568,6 @@ void MFTLObjectUpdateGlobalStats(MFTL_Object *object);
  * loop -- a hand-written advection loop almost always carries that branch, and
  * it is pure waste on a correctly partitioned mesh.
  *
- * It CLEARS the frame bit on the way out, so a subsequent frame loop asserts in
- * Debug unless MFTLObjectRefreshFrames() has run. Leaving that to the caller's
- * memory is what makes a forgotten call produce geometry one timestep stale --
- * silently, and only where the mesh actually moved.
- *
  * In scope:
  *   int      v               vertex pool index
  *   double  *pos             three writable doubles
@@ -657,7 +586,6 @@ void MFTLObjectUpdateGlobalStats(MFTL_Object *object);
       (void) rec;                                                                      \
       __VA_ARGS__;                                                                     \
     }                                                                                  \
-    MFTLObjectInvalidateFrames(obj);                                                   \
   } while (0)
 
 #endif  // MFTL_OBJECT_H

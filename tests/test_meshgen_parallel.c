@@ -51,7 +51,7 @@ static int test_only_rank_zero_holds_the_mesh(void)
      * runs a hot loop does not trip the staleness assertion on a non-root rank. */
     ok = (obj->verts.n == 0) && (obj->tris.n == 0);
     ok = ok && MFTLObjectPoolsAreConsistent(obj);
-    ok = ok && MFTLObjectHasTopology(obj) && MFTLObjectHasFrames(obj);
+    ok = ok && MFTLObjectHasTopology(obj);
   }
 
   TEST_ASSERT(agreed(ok, g_ens->domain.comm_world));

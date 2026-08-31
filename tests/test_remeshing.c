@@ -680,7 +680,6 @@ static int test_collapse_refuses_a_fold(void)
   double *pb = MFTLVertexPosMut(obj, b);
   pb[1] = 3.0;  // far outside the square, across the A-B direction
 
-  MFTLObjectRefreshFrames(obj);
   MFTLComputeTriangleGeometry(obj, obj->tris.n);
   MFTLDetectFeatures(obj, 180.0, 45.0, MFTL_NULL);
 
@@ -975,7 +974,6 @@ static int test_tangential_smoothing_does_not_shrink_a_sphere(void)
     for (int k = 0; k < 3; ++k) p[k] /= r;
   }
 
-  MFTLObjectRefreshFrames(obj);
   MFTLDetectFeatures(obj, 180.0, 45.0, MFTL_NULL);
 
   const double stddev_before = edge_length_stddev(obj);
@@ -1032,8 +1030,6 @@ static int test_area_weighting_is_actually_applied(void)
     }
   }
 
-  MFTLObjectRefreshFrames(obj_a);
-  MFTLObjectRefreshFrames(obj_b);
   MFTLDetectFeatures(obj_a, 180.0, 45.0, MFTL_NULL);
   MFTLDetectFeatures(obj_b, 180.0, 45.0, MFTL_NULL);
 
@@ -1132,7 +1128,6 @@ static int test_remesh_improves_quality_and_inverts_nothing(void)
     const double r = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]);
     for (int k = 0; k < 3; ++k) q[k] /= r;
   }
-  MFTLObjectRefreshFrames(obj);
   MFTLComputeTriangleGeometry(obj, obj->tris.n);
 
   const double q_before = min_quality(obj);
@@ -1172,13 +1167,10 @@ static int test_remesh_leaves_the_object_ready_to_stream(void)
 
   TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLRemeshObject(obj, &p, MFTL_NULL));
 
-  /* The documented postcondition. A caller's next line is normally a
-   * MFTL_FOREACH_TRIANGLE_* loop, which asserts on the frame bit in Debug and
-   * reads silently stale data in Release. */
+  /* The documented postcondition: compact connectivity describes the remeshed
+   * half-edge structure. */
   TEST_ASSERT(MFTLObjectHasTopology(obj));
-  TEST_ASSERT(MFTLObjectHasFrames(obj));
   TEST_ASSERT(inv_derived_matches_topology(obj));
-  TEST_ASSERT(inv_frames_match_positions(obj, 1e-12));
 
   /* tris.normal must describe THIS mesh, not the one before the pass. */
   for (int t = 0; t < obj->tris.n; ++t)

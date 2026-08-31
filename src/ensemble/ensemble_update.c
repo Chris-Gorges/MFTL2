@@ -6,9 +6,8 @@
  *
  * @brief The fused per-timestep geometry and quality update.
  *
- * One streaming pass over the triangle frames produces area, normal and centroid
- * AND nine quality accumulators, from the same loads. Four properties of the
- * loop are what make it cheap, and only the last is a micro-optimisation:
+ * One gathered pass over compact triangle connectivity produces area, normal
+ * and centroid AND nine quality accumulators from the same position loads.
  *
  *   1. ONE PASS, NOT TWO. Area/normal/centroid and the edge-length statistics
  *      read the same edges. The three edges of a triangle are e1, e2 and e2-e1,
@@ -16,16 +15,11 @@
  *      vectors already in registers -- against a second pass that re-gathered
  *      eighteen doubles per triangle to recompute them.
  *
- *   2. NO MINIMUM-IMAGE WORK IN THE LOOP. `tris.edge` carries the seam
- *      correction already applied (src/object/derived.c), so it is paid once per
- *      frame rebuild instead of nine comparisons and eighteen fused operations
- *      per triangle per timestep.
+ *   2. PERIODICITY IS UNSWITCHED. The periodic-domain decision is outside the
+ *      triangle loop. Non-periodic meshes pay no correction instructions;
+ *      periodic meshes use branchless minimum-image arithmetic.
  *
- *   3. NO GATHER AT ALL. Two contiguous arrays in (`tris.edge`, `tris.anchor`),
- *      three contiguous arrays out (`tris.area`, `tris.normal`, `tris.center`).
- *      Nothing in the loop dereferences anything.
- *
- *   4. THE OWNED PREFIX, NOT AN OWNERSHIP TEST. Owned triangles are an array
+ *   3. THE OWNED PREFIX, NOT AN OWNERSHIP TEST. Owned triangles are an array
  *      prefix, so the loop bound IS the ownership filter.
  */
 
@@ -102,7 +96,7 @@ typedef struct
  */
 static void update_kernel(MFTL_Object *obj, int n_tris, update_accumulators *acc)
 {
-  MFTL_ASSERT(MFTLObjectHasFrames(obj) && "MFTLEnsembleUpdate: stale frames -- MFTLObjectBuildDerived or MFTLObjectRefreshFrames first");
+  MFTL_ASSERT(MFTLObjectHasTopology(obj) && "MFTLEnsembleUpdate: stale tris.verts -- call MFTLObjectBuildDerived first");
   MFTL_ASSERT(n_tris <= obj->tris.n && "MFTLEnsembleUpdate: count exceeds the triangle pool");
 
   /* Three contiguous output streams. As fields of MFTL_Triangle they would make
@@ -125,7 +119,7 @@ static void update_kernel(MFTL_Object *obj, int n_tris, update_accumulators *acc
   double min_q = acc->min_q, max_q = acc->max_q, sum_q = 0.0;
   double min_esq = acc->min_esq, max_esq = acc->max_esq, sum_esq = 0.0;
 
-  MFTL_FOREACH_TRIANGLE_FRAME(
+  MFTL_FOREACH_TRIANGLE_GEOMETRY(
       obj, n_tris,
 
       /* Unnormalised normal; its magnitude is twice the area. */
@@ -334,14 +328,13 @@ int MFTLEnsembleUpdateVertexNormals(MFTL_Ensemble *ensemble)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Vectorisation: asked, forced, and priced
+ * Historical vectorisation evidence: asked, forced, and priced
  *
- * Everything below is from examples/update_kernel_benchmark.c, which rebuilds
- * this kernel eleven different ways on one mesh in one binary and checks that
- * they all produce the same three arrays and the same nine statistics. Numbers
- * are ns per triangle, best of nine runs, Apple M-series, Release + LTO, and
- * they are flat from 5 120 to 1 310 720 triangles -- so this loop is NOT memory
- * bound at any size that fits in RAM. Re-measure on the cluster.
+ * Everything below predates frame removal and comes from the retired
+ * update-kernel benchmark, which rebuilt the frame-backed kernel eleven ways on
+ * one mesh in one binary and checked identical results. It explains retained
+ * arithmetic choices, but is not a current frame-vs-gather measurement. Current
+ * end-to-end measurements live in docs/redistribution_optimizations_review.md.
  *
  * ── 1. Does the loop vectorise?  No, and not for the reason believed ───────
  *
@@ -390,8 +383,7 @@ int MFTLEnsembleUpdateVertexNormals(MFTL_Ensemble *ensemble)
  *     means recomputing the cross product and the three edge lengths.
  *   - KEEP THE WRAP BRANCHY, AND DO NOT UNSWITCH IT EITHER. The branchless form
  *     is the textbook advice and was 1.34-1.37x SLOWER. Hoisting a separate
- *     non-periodic loop the way src/object/derived.c does for the frames is also
- *     not worth it here: that variant measures 3.64 against 3.45, i.e. nominally
+ *     separate non-periodic loop is also not worth it here: that variant measures 3.64 against 3.45, i.e. nominally
  *     SLOWER while doing strictly less work, which puts the wrap below this
  *     machine's code-alignment noise floor.
  *   - THE OUTPUT LAYOUT BARELY MATTERS. One array per component measures 3.41

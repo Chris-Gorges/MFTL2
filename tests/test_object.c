@@ -63,8 +63,6 @@ static void touch_every_array_at_capacity(MFTL_Object *obj)
     obj->tris.center[3 * tc - 1] = 1.0;
     obj->tris.verts[3 * tc - 1] = 1;
     obj->tris.neighbors[3 * tc - 1] = 1;
-    obj->tris.anchor[3 * tc - 1] = 1.0;
-    obj->tris.edge[6 * tc - 1] = 1.0;
   }
 }
 
@@ -98,9 +96,7 @@ static void fill_pattern(MFTL_Object *obj, int seed)
       obj->tris.center[3 * t + k] = (double) (seed - 3 * t - k);
       obj->tris.verts[3 * t + k] = seed + 3 * t + k;
       obj->tris.neighbors[3 * t + k] = seed - 3 * t - k;
-      obj->tris.anchor[3 * t + k] = (double) (seed * 5 + 3 * t + k);
     }
-    for (int k = 0; k < 6; ++k) obj->tris.edge[6 * t + k] = (double) (seed * 6 + 6 * t + k);
     for (int k = 0; k < 3; ++k)
     {
       obj->tris.he[3 * t + k].global_id = seed + 3 * t + k;
@@ -139,15 +135,10 @@ static int check_pattern(const MFTL_Object *obj, int seed, int nv, int nt)
       if (obj->tris.center[3 * t + k] != (double) (seed - 3 * t - k)) return 0;
       if (obj->tris.verts[3 * t + k] != seed + 3 * t + k) return 0;
       if (obj->tris.neighbors[3 * t + k] != seed - 3 * t - k) return 0;
-      if (obj->tris.anchor[3 * t + k] != (double) (seed * 5 + 3 * t + k)) return 0;
       if (obj->tris.he[3 * t + k].global_id != seed + 3 * t + k) return 0;
       if (obj->tris.he[3 * t + k].vertex_idx != seed + k) return 0;
       if (obj->tris.he[3 * t + k].twin_idx != seed - k) return 0;
       if (obj->tris.he[3 * t + k].flags != k) return 0;
-    }
-    for (int k = 0; k < 6; ++k)
-    {
-      if (obj->tris.edge[6 * t + k] != (double) (seed * 6 + 6 * t + k)) return 0;
     }
   }
   return 1;
@@ -177,7 +168,6 @@ static int test_fresh_object_is_empty_and_consistent(void)
 
   // Nothing derived yet.
   TEST_ASSERT(!MFTLObjectHasTopology(obj));
-  TEST_ASSERT(!MFTLObjectHasFrames(obj));
 
   MFTLObjectDestroy(&obj);
   TEST_ASSERT(obj == MFTL_NULL);
@@ -310,12 +300,10 @@ static int test_set_counts_invalidates_the_derived_arrays(void)
 
   MFTLObjectBuildDerived(obj);
   TEST_ASSERT(MFTLObjectHasTopology(obj));
-  TEST_ASSERT(MFTLObjectHasFrames(obj));
 
   // A different entity count means the derived arrays describe a different mesh.
   MFTLObjectSetCounts(obj, 6, 6, 2, 2);
   TEST_ASSERT(!MFTLObjectHasTopology(obj));
-  TEST_ASSERT(!MFTLObjectHasFrames(obj));
 
   MFTLObjectDestroy(&obj);
   return 0;
@@ -698,7 +686,6 @@ static int test_shrink_to_fit_leaves_the_bookkeeping_alone(void)
   TEST_ASSERT(MFTLObjectShrinkToFit(obj, MFTL_SHRINK_SLACK_DEFAULT));
 
   TEST_ASSERT(MFTLObjectHasTopology(obj));
-  TEST_ASSERT(MFTLObjectHasFrames(obj));
   TEST_ASSERT(!obj->partition_dirty);
   TEST_ASSERT_EQUAL_INT(400, obj->verts.n);
   TEST_ASSERT_EQUAL_INT(400, obj->verts.n_local);

@@ -117,7 +117,7 @@ a tight bound on the longest edge, and a narrow window that smoothing absorbs.
   a mesh where the short edges are genuinely short rather than merely short
   relative to their over-long neighbours.
 - **COMPACT between COLLAPSE and FLIP.** The payoff is not tidiness: the smoother calls
-  `MFTLObjectRefreshFrames` and `MFTLComputeVertexNormals`, which **stream the
+  `MFTLComputeVertexNormals`, which traverses the
   whole pool** and would otherwise accumulate dead triangles into live vertices'
   normals.
 - **FLIP before SMOOTH**, because the valence criterion is combinatorial — it
@@ -400,9 +400,8 @@ large step does the most damage. A vertex whose accumulated normal came back
 exactly zero is left alone rather than moved by the un-projected displacement.
 
 The free case's normal comes from `MFTLComputeVertexNormals`, refreshed each
-sweep, which is both more accurate and **faster** than accumulating a cross
-product per vertex over its one-ring: it streams `tris.edge` with no fan walk and
-no dependent loads (measured at 3.4×).
+sweep through a flat triangle traversal with no fan walk or dependent topology
+loads.
 
 Every difference is a minimum-image vector and every result is wrapped, so the
 smoother is correct across a periodic seam.
@@ -561,7 +560,7 @@ flowchart TD
   P -->|DISPERSED| DI["MFTLRemeshEnsembleDispersed"]
   P -->|AUTO| M["MFTLRemeshChooseStrategyMeasured — COLLECTIVE"]
 
-  M --> M1["prepare_for_migration: frames and triangle geometry"]
+  M --> M1["prepare_for_migration: triangle geometry"]
   M1 --> M2["MFTLRemeshMeasureBodies — 2 Allreduce, centroid and radius and weight"]
   M2 --> M3["dispersed_box_min — the yardstick, local"]
   M3 --> R{"r_max greater than dispersed_radius_fraction times the box?"}
@@ -588,7 +587,7 @@ MFTLRemeshEnsemble(ens, params, stats)                          COLLECTIVE
      └─ MFTL_REMESH_PARALLEL_AUTO
           │
           ├─ MFTLRemeshChooseStrategyMeasured                     COLLECTIVE
-          │    ├─ prepare_for_migration        frames + tri geometry     local
+          │    ├─ prepare_for_migration        triangle geometry          local
           │    ├─ MFTLRemeshMeasureBodies      Allreduce(SUM) 8*N_b doubles
           │    │                               Allreduce(MAX)   N_b doubles
           │    │                               ▸ centroid[3N] radius[N] weight[N]

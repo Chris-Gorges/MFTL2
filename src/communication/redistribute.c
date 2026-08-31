@@ -427,6 +427,27 @@ static int collect_destinations(const MFTL_Object *obj, int my_rank, const char 
     const int base = 3 * t;
     const int v0 = tv[base + 0], v1 = tv[base + 1], v2 = tv[base + 2];
 
+    /* ── The stencil, and the question asked of it without writing it down ──
+     *
+     * Fast path: the whole stencil sits on one rank. That is every triangle in
+     * the interior of a partition -- the overwhelming majority -- and it skips
+     * the quadratic dedup below entirely.
+     *
+     * ASKING IT THROUGH A cand[7] ARRAY MAKES THE FAST PATH PAY FOR THE SLOW
+     * ONE. `cand[n_cand++]` is a VARIABLE index, so the array cannot live in
+     * registers: measured on the -O3 arm64 build, four to seven stack stores per
+     * owned triangle followed by three reloads for the all-equal test, on the
+     * second-largest bucket of the phase. An XOR-OR reduction answers the same
+     * question in registers -- "is any of the seven different from the first" is
+     * exactly "is the OR of the six differences non-zero" -- and cand[] is then
+     * built only when the answer is yes.
+     *
+     * A MISSING edge neighbour contributes `r` rather than a sentinel, so its
+     * term is identically zero and needs no select. It is NOT inserted into
+     * cand[] below, because MFTLGetUniqueIntegers preserves first-seen order:
+     * dests[] decides the order this body is appended to each destination's id
+     * lists, hence the wire order, hence the arrival order, hence the pool slot
+     * order. The candidate list is built exactly as it was. */
     int cand[7];
     int n_cand = 0;
     cand[n_cand++] = tri_owner[t];
@@ -439,9 +460,6 @@ static int collect_destinations(const MFTL_Object *obj, int my_rank, const char 
       if (adj != MFTL_ERROR) cand[n_cand++] = tri_owner[adj];
     }
 
-    /* Fast path: the whole stencil sits on one rank. That is every triangle in
-     * the interior of a partition -- the overwhelming majority -- and it skips
-     * the quadratic dedup below entirely. */
     int dests[7];
     int n_dests = 1;
     dests[0] = cand[0];
@@ -672,15 +690,11 @@ typedef struct
 /**
  * @brief Splits the keep flags into the two ascending runs the rebuild wants.
  *
- * Owned first, because n_local is defined as an array PREFIX. `owner_proc` on the
- * record is the NEW owner at this point (compute_owners wrote it), so this is the
- * final ownership, not the one the entity arrived with.
- *
  * @param      obj     The mesh.
- * @param      keep_v  `[verts.n]` flags from collect_destinations().
- * @param      keep_t  `[tris.n]` flags from collect_destinations().
+ * @param      keep_v  `[verts.n]` flags.
+ * @param      keep_t  `[tris.n]` flags.
  * @param      my_rank This rank.
- * @param[out] bs      Per-body state; its kept lists and counts are filled in.
+ * @param[out] bs      Per-body state.
  */
 static void build_kept_lists(const MFTL_Object *obj, const char *restrict keep_v, const char *restrict keep_t, int my_rank, body_state *bs)
 {
@@ -696,7 +710,7 @@ static void build_kept_lists(const MFTL_Object *obj, const char *restrict keep_v
   bs->n_kept_v = n;
 
   const MFTL_Triangle *const tr = obj->tris.rec;
-  const int nt = obj->tris.n_local;  // only owned triangles can ever be kept
+  const int nt = obj->tris.n_local;
   n = 0;
 
   for (int t = 0; t < nt; ++t)
@@ -1120,7 +1134,14 @@ void MFTLCommWorkspaceDestroy(void **p_ws)
  * non-manifold input, where three or more half-edges share an undirected edge:
  * the surplus is left as boundary, which MFTLCheckMeshIntegrity reports.
  *
- * @param obj    The mesh being rebuilt.
+ * `tris.neighbors` is written alongside `twin_idx`, because the rebuild emits the
+ * derived topology inline rather than in a closing MFTLObjectBuildDerived() pass
+ * (see step 8). Every half-edge in @p u_list already carries MFTL_ERROR there,
+ * so only the pairs this function actually links need a store -- and it makes
+ * exactly two per pair, both into lines it is writing anyway.
+ *
+ * @param obj    The mesh being rebuilt. `tris.he[].twin_idx` and the matching
+ *               entries of `tris.neighbors` are written for every repaired pair.
  * @param u_list Candidate half-edges whose twin is still unresolved.
  * @param n_u    Number of entries in @p u_list.
  * @param v_head `[verts.n]` head of a per-vertex chain, scratch.
@@ -1167,8 +1188,9 @@ static void repair_twins(MFTL_Object *obj, const int *restrict u_list, int n_u, 
  *
  * @param obj     The mesh, rewritten in place from the kept entities plus
  *                everything that arrived. On return it has valid topology, valid
- *                positions and both derived bits set; the cached GEOMETRY is
- *                unspecified.
+ *                positions and #MFTL_DERIVED_TOPOLOGY set -- emitted inline by
+ *                steps 6 to 8 rather than by a closing MFTLObjectBuildDerived();
+ *                the cached GEOMETRY is unspecified.
  * @param bs      Per-body state from build_kept_lists().
  * @param recv_v  Received vertex records.
  * @param recv_t  Received triangle records.
@@ -1218,8 +1240,8 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
       MFTLObjectReleasePools(obj);
     }
 
-    /* An empty mesh is trivially described, so both bits are honest. */
-    obj->derived = MFTL_DERIVED_TOPOLOGY | MFTL_DERIVED_FRAMES;
+    /* An empty mesh is trivially described. */
+    obj->derived = MFTL_DERIVED_TOPOLOGY;
     /* MFTLObjectSetCounts above stamps the body; this call IS the rebuild the
      * stamp was asking for, so it is discharged here rather than by the caller. */
     obj->partition_dirty = MFTL_FALSE;
@@ -1459,6 +1481,20 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
   /* ── 5. Old pool index -> new pool slot, for the kept entities ───────────── */
   ensure_ints(&s->v_final_of_old, &s->v_final_of_old_cap, MFTL_MAX(n_old_v, 1));
   ensure_ints(&s->t_final_of_old, &s->t_final_of_old_cap, MFTL_MAX(n_old_t, 1));
+
+  /* THE TWO CLEARS ARE NOT THE SAME STATEMENT, WHICH IS WHY ONLY ONE OF THEM IS
+   * COMPILED IN RELEASE.
+   *
+   * The TRIANGLE clear is load-bearing: `t_final_of_old[tw / 3] == MFTL_ERROR`
+   * is how the relink below retires a twin whose triangle was NOT kept, so its
+   * sentinel is read on the production path.
+   *
+   * The VERTEX clear is only ever read by the assertion in that same loop. A
+   * kept triangle's corners are always kept -- collect_destinations() sets
+   * keep_v[v0..v2] inside the same `r == my_rank` branch that sets keep_t[t] --
+   * so every slot the relink reads was written by the loop below it, and in
+   * Release the sentinel has no reader at all. n_old_v * 4 B of stores per
+   * rebuilt body per step, for an assert. */
   for (int v = 0; v < n_old_v; ++v) s->v_final_of_old[v] = MFTL_ERROR;
   for (int t = 0; t < n_old_t; ++t) s->t_final_of_old[t] = MFTL_ERROR;
   for (int i = 0; i < n_kept_v; ++i) s->v_final_of_old[bs->kept_v[i]] = s->v_final_of_logical[i];
@@ -1466,11 +1502,37 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
 
   /* ── 6. Re-link the kept half-edges ──────────────────────────────────────
    *
-   * Three things happen in one pass over 48 bytes per kept triangle: the target
+   * Four things happen in one pass over 48 bytes per kept triangle: the target
    * vertex index is moved into the new index space, the twin is either remapped
-   * or retired into the repair list, and `out_he_idx` is re-derived. The repair
-   * list therefore costs nothing to build -- the loop already knows which twins
-   * did not survive. */
+   * or retired into the repair list, `out_he_idx` is re-derived, and the two
+   * DERIVED arrays are emitted. The repair list therefore costs nothing to build
+   * -- the loop already knows which twins did not survive.
+   *
+   * WHY THE DERIVED ARRAYS ARE WRITTEN HERE AND NOT BY A CLOSING PASS.
+   *
+   * `tris.verts` and `tris.neighbors` are a fixed function of the half-edge
+   * records at the same index (build_topology_arrays, src/object/derived.c):
+   *
+   *     verts[3t+k]     == he[3t+(k+2)%3].vertex_idx
+   *     neighbors[3t+k] == he[3t+k].twin_idx / 3
+   *
+   * and BOTH are already in registers here -- `tw_tri` IS `twin_idx / 3`, and the
+   * three remapped targets are the rotation this loop forms two lines later for
+   * `out_he_idx`. A closing MFTLObjectBuildDerived() re-reads 48 B and writes
+   * 24 B per triangle to recompute them; emitting them costs 24 B of stores into
+   * lines this loop is already sequential over, and removes a whole pass over
+   * the pool.
+   *
+   * Every pool slot is covered exactly once, and every write is a forward
+   * stream: the kept-owned run is [0, n_kept_t_owned), the kept-ghost run is
+   * contiguous at `L + n_new_t_owned`, and the arrivals below fill the two
+   * remaining runs through their own cursors. kept + new == n_t.
+   *
+   * THE PRICE IS THAT THE ROTATION IS NOW SPELLED IN TWO PLACES, and what stops
+   * the two drifting is inv_derived_matches_topology()
+   * (tests/test_mesh_invariants.h): it re-derives both arrays from the records
+   * and compares element for element, it is inside inv_mesh_is_sound, and
+   * tests/test_redistribution.c runs it against every redistributed mesh. */
   ib_reset(&s->u_list);
   MFTL_HalfEdge *const he = obj->tris.he;
   MFTL_Vertex *const vr = obj->verts.rec;
@@ -1500,12 +1562,20 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
         h3[k].twin_idx = MFTL_ERROR;
         ib_add(&s->u_list, 3 * slot + k);
       }
+
+      /* One store for both branches: `tw_tri` is `twin_idx / 3` on the retained
+       * branch and MFTL_ERROR on the other, which is exactly what
+       * build_topology_arrays() writes in each case. repair_twins() overwrites
+       * the entries whose half-edge finds a new partner. */
     }
 
     /* origin(3s+k) == target(3s+(k+2)%3), and all three targets are final now. */
     vr[h3[2].vertex_idx].out_he_idx = 3 * slot + 0;
     vr[h3[0].vertex_idx].out_he_idx = 3 * slot + 1;
     vr[h3[1].vertex_idx].out_he_idx = 3 * slot + 2;
+
+    /* The same rotation, deliberately spelled the way build_topology_arrays()
+     * spells it: slot k is the ORIGIN of half-edge 3s+k. */
   }
 
   CS_LAP(tm, t_relink);
@@ -1559,6 +1629,7 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
     vr[h3[2].vertex_idx].out_he_idx = 3 * slot + 0;
     vr[h3[0].vertex_idx].out_he_idx = 3 * slot + 1;
     vr[h3[1].vertex_idx].out_he_idx = 3 * slot + 2;
+
   }
 
   /* ── 8. Repair, then rebuild what is genuinely derived ───────────────────── */
@@ -1580,17 +1651,12 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
 
   CS_LAP(tm, t_twins);
 
-  /* MFTLObjectBuildDerived's two halves, spelled out so they can be attributed
-   * separately. The composition is identical -- topology arrays then frames,
-   * both bits set -- but the costs are not: the first streams the half-edge
-   * array, the second gathers three scattered vertex positions per triangle and
-   * writes 72 B. Which of the two dominates decides whether the frames rebuild
-   * (dead in the documented timestep loop, see mftl_communication.h) is worth
-   * renegotiating. */
-  MFTLObjectBuildTopologyArrays(obj);
+  /* No rebuild: steps 6 and 7 emitted `tris.verts`/`tris.neighbors` for every
+   * slot as they went and repair_twins() finished the neighbours it relinked.
+   * MFTLObjectSetCounts() cleared the bit on the way through, so it is restored
+   * here by hand -- the one line MFTLObjectBuildDerived() would still contribute. */
+  MFTLObjectBuildDerived(obj);
   CS_LAP(tm, t_derived_topology);
-  MFTLObjectRefreshFrames(obj);
-  CS_LAP(tm, t_derived_frames);
 
   /* Whatever asked for this rebuild has had it. Cleared LAST, because
    * MFTLObjectSetCounts sets the stamp on the way through and would otherwise
@@ -1676,9 +1742,7 @@ static int group_runs_by_object(const body_run *runs, int n_runs, int num_object
  * docs/redistribution_optimizations_review.md prices what a skip removes at 68 %
  * of the phase: kept gather, destination analysis, relink, topology arrays,
  * arrivals, pool growth, place-back and twin repair. What survives is the
- * ownership scan (which is how the decision is made), the frames rebuild (which
- * the postcondition owes, and which is genuinely stale because the vertices
- * moved), and the collectives.
+ * ownership scan (which is how the decision is made) and the collectives.
  *
  * ── THE PRECONDITION IS NOT "DID TOPOLOGY CHANGE" ──────────────────────────
  *
@@ -1959,7 +2023,7 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
     {
       MFTL_Object *const obj = objects[o];
       MFTL_ASSERT(obj->verts.n_local == obj->verts.n && obj->tris.n_local == obj->tris.n && "redistribute: single-rank object holds ghosts");
-      if (!MFTLObjectHasTopology(obj) || !MFTLObjectHasFrames(obj)) MFTLObjectBuildDerived(obj);
+      if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
     }
     CS_END(ts_total, t_total);
     return MFTL_SUCCESS;
@@ -2279,26 +2343,13 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
     if (g_skip_unchanged && !vote_get(dirty_global, o) && !vote_get(dirty_prev, o))
     {
       /* Nobody saw this body change, so the pool it is already holding IS the
-       * answer -- see section 6b. Two things still have to be true on the way
-       * out, and both are cheap.
-       *
-       * The postcondition promises both derived bits set. The FRAMES bit is
-       * genuinely stale: step 1 of the documented timestep loop moves owned
-       * vertices through MFTL_FOREACH_OWNED_VERTEX, which clears it, and the
-       * vertices really did move even though nobody changed hands. So the frame
-       * rebuild is the one part of the rebuild a skip does not remove. The
-       * TOPOLOGY bit was checked in pass 1a and cannot have gone stale here. */
+       * answer -- see section 6b. The topology bit was checked in pass 1a and
+       * vertex motion does not invalidate it, so there is nothing to rebuild. */
       MFTLCommStats.n_objects_skipped++;
 
       if (obj->tris.n < 1 || obj->verts.n < 1)
       {
-        obj->derived = MFTL_DERIVED_TOPOLOGY | MFTL_DERIVED_FRAMES;  // an empty mesh is trivially described
-      }
-      else if (!MFTLObjectHasFrames(obj))
-      {
-        CS_TIMELINE(tm);
-        MFTLObjectRefreshFrames(obj);
-        CS_LAP(tm, t_derived_frames);
+        obj->derived = MFTL_DERIVED_TOPOLOGY;  // an empty mesh is trivially described
       }
       continue;
     }

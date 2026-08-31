@@ -73,7 +73,7 @@
  * Here MFTLRemeshCompactObject() runs at the end of each iteration's collapse
  * sweep, before anything geometric. What that buys is not tidiness, it is reuse:
  * after it the object is an ordinary valid mesh, so the smoother calls
- * MFTLObjectRefreshFrames() and MFTLComputeVertexNormals() -- the library's own
+ * MFTLComputeVertexNormals() -- the library's own
  * measured kernels, with exact area-weighted normals -- instead of an open-coded
  * per-vertex cross-product loop that has to know about the dead.
  *
@@ -1393,9 +1393,7 @@ int MFTLDetectFeatures(MFTL_Object *obj, double angle_degrees, double corner_ang
  *            the exact area-weighted vertex normal.
  *
  * The normal comes from MFTLComputeVertexNormals(), refreshed each sweep, which
- * is both more accurate and faster than accumulating a cross product per vertex
- * over its one-ring: it streams `tris.edge` with no fan walk and no dependent
- * loads (src/geometry/vertex_geometry.c measures the two at 3.4x).
+ * uses a flat triangle pass with no fan walk or dependent topology loads.
  *
  * Every difference is a minimum-image vector and every result is wrapped, so the
  * smoother is correct across a periodic seam.
@@ -1406,7 +1404,7 @@ int MFTLDetectFeatures(MFTL_Object *obj, double angle_degrees, double corner_ang
  * @param iterations  Sweeps to perform. Each is a full Jacobi update: all new
  *                    positions are computed from the old ones, then applied.
  *
- * @note Requires #MFTL_DERIVED_TOPOLOGY. Leaves the frames current.
+ * @note Requires #MFTL_DERIVED_TOPOLOGY.
  * @rank_local
  */
 void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params, int iterations);

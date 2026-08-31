@@ -85,7 +85,7 @@ MFTLEnsembleIntersectObjects(ens, params, callback, user_data)   COLLECTIVE
 ├─ 1 ── ONE TREE PER BODY ────────────────────────────────────────────────────
 │   └─ for each body:  MFTL_GenerateLBVH(obj, params)                   local
 │        └─ MFTLBVHBuildFromPrims                                       local
-│             ├─ centroids ▸ MFTL_BVHPrimVerts   seam-consistent frame  O(n)
+│             ├─ centroids ▸ MFTL_BVHPrimVerts   gathered current corners O(n)
 │             ├─ MFTLMorton3D ▸ MFTLSortPairs64  stable radix sort      O(n)
 │             ├─ build_topology                  recursive radix split  O(n)
 │             └─ MFTLBVHRefit                    three linear passes    O(nodes)
@@ -135,7 +135,7 @@ to *"what is actually being decided, and at which line"*:
 | # | Decision | Site | Rule | If it goes the wrong way |
 |---|---|---|---|---|
 | 1 | which triangles become primitives | `MFTL_GenerateLBVH` | `include_ghosts ? tris.n : tris.n_local` | a distributed contact is reported twice |
-| 2 | where a primitive's corners come from | `MFTL_BVHPrimVerts` | always the seam-consistent `anchor`/`edge` frame | a straddling triangle gets a domain-spanning AABB |
+| 2 | where a primitive's corners come from | `MFTL_BVHPrimVerts` | current positions with minimum-image edges | a straddling triangle gets a domain-spanning AABB |
 | 3 | how a centroid is turned into a key | `MFTLBVHBuildFromPrims` | one shared scale, 21 bits per axis, **not** wrapped | neighbours across the seam land at opposite ends of the key range |
 | 4 | where an internal node splits | `build_topology` | highest differing bit of the 95-bit key | equal keys fail to split: infinite descent or an unbounded leaf |
 | 5 | leaf or internal | `build_topology` | `prim_count <= leaf_size` | deeper tree, more pair pops |
@@ -219,18 +219,17 @@ received triangle — is a second geometry representation with its own growth pa
 and its own periodic-consistency argument, for data the object machinery already
 knows how to hold.
 
-`MFTL_BVHPrimVerts` is the single accessor, and it reads the seam-consistent
-frame:
+`MFTL_BVHPrimVerts` is the single accessor. It gathers corner 0 and forms two
+minimum-image edges from the current positions:
 
 $$
-\mathbf{p}_0 = \mathbf{a},\qquad
-\mathbf{p}_1 = \mathbf{a} + \mathbf{e}_1,\qquad
-\mathbf{p}_2 = \mathbf{a} + \mathbf{e}_2
+\mathbf{p}_0,\qquad
+\mathbf{p}_1 = \mathbf{p}_0 + \mathbf{e}_1,\qquad
+\mathbf{p}_2 = \mathbf{p}_0 + \mathbf{e}_2
 $$
 
-from `tris.anchor` / `tris.edge`, whose minimum-image correction was already paid
-at frame-build time. A primitive's three corners are therefore always mutually
-unwrapped. That is decision 2 of the table, and it is half of @ref bvh_periodic.
+The three corners are therefore always mutually unwrapped. That is decision 2
+of the table, and it is half of @ref bvh_periodic.
 
 ### Step 2 — centroids, quantisation, and the Morton key {#bvh_morton}
 
@@ -495,9 +494,9 @@ A triangle straddling a seam has wrapped vertices, so a centroid built from the
 raw coordinates lands in the **middle of the domain**, and its AABB spans the
 box — a false positive against everything.
 
-Fixed by building **every** primitive from the seam-consistent `tris.anchor` /
-`tris.edge` frame, through `MFTL_BVHPrimVerts` — the one accessor both primitive
-kinds go through, so no consumer branches on local-versus-remote. Guarded by
+Fixed by gathering every primitive through `MFTL_BVHPrimVerts` and applying
+minimum-image edges — the one accessor both primitive kinds go through, so no
+consumer branches on local-versus-remote. Guarded by
 `test_periodic_morton_of_a_straddling_object`.
 
 A straddling object's **root** box legitimately spans the domain and is **not** a

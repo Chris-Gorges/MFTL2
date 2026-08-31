@@ -184,7 +184,6 @@ static void measure(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, rep
     MFTL_Object *const obj = ens->objects[o];
     if (obj->tris.n == 0) continue;
 
-    MFTLObjectRefreshFrames(obj);
     MFTLComputeVertexNormals(obj);
 
     s[0] += (double) obj->tris.n_local;
@@ -201,9 +200,7 @@ static void measure(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, rep
 
     for (int t = 0; t < obj->tris.n_local; ++t)
     {
-      /* Seam-consistent corners. The domain here is non-periodic so raw
-       * positions would do, but reading them through the frame is what makes the
-       * same integral correct if anyone runs this with periodic walls. */
+      /* Seam-consistent corners from the shared geometry accessor. */
       double c[3][3];
       MFTLGetTriangleCorners(obj, t, c);
 

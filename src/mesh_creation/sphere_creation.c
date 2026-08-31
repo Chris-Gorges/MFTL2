@@ -236,10 +236,6 @@ int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int
         MFTLApplyPeriodicity(domain, p);
       }
 
-      /* Positions moved, so the frames built by the last topology rebuild
-       * describe the unit sphere rather than this one. */
-      MFTLObjectRefreshFrames(object);
-
       /* An icosphere is closed, so this finds nothing. Running it anyway is what
        * makes MFTL_FLAG_BOUNDARY authoritative for EVERY generated mesh: code
        * that branches on it behaves identically on closed and open surfaces

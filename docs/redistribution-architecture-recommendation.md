@@ -1,5 +1,8 @@
 ## Recommendation
 
+> Historical design note: persistent triangle frames were removed on
+> 2026-08-30. Frame refreshes mentioned below no longer exist in the current API.
+
 I would change the internal redistribution architecture, while keeping the public API, geometric ownership rule, packed identity formats, and vertex-complete halo semantics.
 
 The present implementation should remain as:

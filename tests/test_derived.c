@@ -7,12 +7,11 @@
  * These two are what a "flatten" module would otherwise grow into, and the
  * properties worth pinning are the ones such a module gets wrong or makes hard:
  *
- *   - the derived arrays say EXACTLY what a half-edge walk says (they are an
+ *   - the connectivity arrays say EXACTLY what a half-edge walk says (they are an
  *     optimisation, and the moment they disagree they are a second, wrong mesh);
- *   - the frames are seam-consistent for an object straddling a periodic
- *     boundary, with no mode flag and no fallback path for the consumer;
- *   - staleness is tracked, so a loop that moves vertices cannot silently leave
- *     the geometry one timestep behind;
+ *   - gathered geometry is seam-consistent for an object straddling a periodic
+ *     boundary;
+ *   - motion is observed immediately without refreshing position-derived state;
  *   - the Morton reorder permutes AoS and SoA together and is a pure
  *     relabelling: the mesh afterwards is the same mesh.
  */
@@ -63,9 +62,7 @@ static int test_derived_arrays_agree_with_the_half_edges(void)
   MFTL_Object *obj = make_sphere(g_ens, 3);
 
   TEST_ASSERT(MFTLObjectHasTopology(obj));
-  TEST_ASSERT(MFTLObjectHasFrames(obj));
   TEST_ASSERT(inv_derived_matches_topology(obj));
-  TEST_ASSERT(inv_frames_match_positions(obj, 1e-12));
 
   /* tris.neighbors is documented as twin/3; check that literally, since the
    * whole justification for storing it is that reading it beats recomputing it. */
@@ -97,29 +94,25 @@ static int test_derived_arrays_agree_with_the_half_edges(void)
   return 0;
 }
 
-static int test_frames_reproduce_area_and_normal(void)
+static int test_gathered_iterator_reproduces_area_and_normal(void)
 {
   MFTL_Object *obj = make_sphere(g_ens, 2);
 
-  /* The streaming path and the scalar path must agree to round-off. If they ever
-   * do not, one of the two is what every consumer is silently using. */
-  for (int t = 0; t < obj->tris.n; ++t)
-  {
+  MFTL_FOREACH_TRIANGLE_GEOMETRY(
+      obj, obj->tris.n,
     double area_ref;
     double normal_ref[3];
     MFTLGetTriangleProperties(obj, t, &area_ref, normal_ref, MFTL_NULL);
 
-    const double *e = &obj->tris.edge[6 * t];
-    const double nx = e[1] * e[5] - e[2] * e[4];
-    const double ny = e[2] * e[3] - e[0] * e[5];
-    const double nz = e[0] * e[4] - e[1] * e[3];
+    const double nx = e1y * e2z - e1z * e2y;
+    const double ny = e1z * e2x - e1x * e2z;
+    const double nz = e1x * e2y - e1y * e2x;
     const double mag = sqrt(nx * nx + ny * ny + nz * nz);
 
     TEST_ASSERT_EQUAL_DOUBLE(area_ref, 0.5 * mag, 1e-14);
     TEST_ASSERT_EQUAL_DOUBLE(normal_ref[0], nx / mag, 1e-12);
     TEST_ASSERT_EQUAL_DOUBLE(normal_ref[1], ny / mag, 1e-12);
-    TEST_ASSERT_EQUAL_DOUBLE(normal_ref[2], nz / mag, 1e-12);
-  }
+    TEST_ASSERT_EQUAL_DOUBLE(normal_ref[2], nz / mag, 1e-12););
   return 0;
 }
 
@@ -127,65 +120,49 @@ static int test_frames_reproduce_area_and_normal(void)
  * Periodic seam
  * ─────────────────────────────────────────────────────────────────────────── */
 
-static int test_frames_are_seam_consistent(void)
+static int test_gathered_geometry_is_seam_consistent(void)
 {
   MFTL_Object *obj = make_seam_triangle();
 
   /* The naive difference across the seam is -0.90; the true edge is +0.10.
-   * Unwrapping all POSITIONS solves it only while the object fits in half a
-   * domain, and needs a flag telling consumers whether it did. The edge vectors
-   * carry the correction instead, which is exact for every object of any size,
-   * because a single triangle always is. */
-  const double *e = &obj->tris.edge[0];
-  TEST_ASSERT_EQUAL_DOUBLE(0.10, e[0], 1e-12);
-  TEST_ASSERT_EQUAL_DOUBLE(0.00, e[1], 1e-12);
-  TEST_ASSERT_EQUAL_DOUBLE(0.00, e[2], 1e-12);
+   * MFTLGetTriangleCorners must reconstruct a small, mutually unwrapped
+   * triangle directly from current positions. */
+  double c[3][3];
+  MFTLGetTriangleCorners(obj, 0, c);
+  TEST_ASSERT_EQUAL_DOUBLE(0.95, c[0][0], 1e-15);
+  TEST_ASSERT_EQUAL_DOUBLE(0.10, c[1][0] - c[0][0], 1e-12);
+  TEST_ASSERT_EQUAL_DOUBLE(0.00, c[1][1] - c[0][1], 1e-12);
+  TEST_ASSERT_EQUAL_DOUBLE(0.05, c[2][0] - c[0][0], 1e-12);
+  TEST_ASSERT_EQUAL_DOUBLE(0.12, c[2][1] - c[0][1], 1e-12);
 
-  TEST_ASSERT_EQUAL_DOUBLE(0.05, e[3], 1e-12);
-  TEST_ASSERT_EQUAL_DOUBLE(0.12, e[4], 1e-12);
-
-  // The anchor stays the STORED (wrapped) position -- it is a position, and
-  // positions are what a rank lookup expects.
-  TEST_ASSERT_EQUAL_DOUBLE(0.95, obj->tris.anchor[0], 1e-15);
-
-  /* The area a consumer computes from the frame is the small true triangle, not
+  /* The computed area is the small true triangle, not
    * the domain-spanning sliver a naive difference would produce. */
   const double area = MFTLGetTriangleArea(obj, 0);
   TEST_ASSERT(area < 0.01);
   TEST_ASSERT(area > 0.0);
 
-  TEST_ASSERT(inv_frames_match_positions(obj, 1e-14));
   return 0;
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
- * Staleness tracking
+ * Motion observes authoritative positions
  * ─────────────────────────────────────────────────────────────────────────── */
 
-static int test_moving_vertices_invalidates_the_frames(void)
+static int test_motion_needs_no_derived_refresh(void)
 {
   MFTL_Object *obj = make_sphere(g_ens, 1);
-  TEST_ASSERT(MFTLObjectHasFrames(obj));
+  MFTLComputeTriangleGeometry(obj, obj->tris.n);
+  const double before = obj->tris.center[0];
 
-  /* The motion iterator clears the frame bit on the way out, so a subsequent
-   * frame loop asserts in Debug. Leaving it to the caller's memory is what makes
-   * a forgotten refresh produce geometry one timestep stale -- silently, and only
-   * where the mesh had actually moved. */
   MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += 0.25;);
 
-  TEST_ASSERT(!MFTLObjectHasFrames(obj));
   TEST_ASSERT(MFTLObjectHasTopology(obj));  // topology did NOT change
-
-  MFTLObjectRefreshFrames(obj);
-  TEST_ASSERT(MFTLObjectHasFrames(obj));
-  TEST_ASSERT(inv_frames_match_positions(obj, 1e-12));
-
-  // The refresh must have picked the motion up, not merely re-set the flag.
-  TEST_ASSERT_EQUAL_DOUBLE(obj->verts.pos[3 * obj->tris.verts[0] + 0], obj->tris.anchor[0], 1e-15);
+  MFTLComputeTriangleGeometry(obj, obj->tris.n);
+  TEST_ASSERT_EQUAL_DOUBLE(before + 0.25, obj->tris.center[0], 1e-12);
   return 0;
 }
 
-static int test_read_only_vertex_loop_keeps_the_frames(void)
+static int test_read_only_vertex_loop(void)
 {
   MFTL_Object *obj = make_sphere(g_ens, 1);
 
@@ -195,8 +172,6 @@ static int test_read_only_vertex_loop_keeps_the_frames(void)
   // A unit sphere: every vertex is at radius 1.
   TEST_ASSERT_EQUAL_DOUBLE((double) obj->verts.n, sum, 1e-9);
 
-  // Reading positions changes nothing, so the frames stay valid.
-  TEST_ASSERT(MFTLObjectHasFrames(obj));
   return 0;
 }
 
@@ -474,10 +449,10 @@ int main(int argc, char **argv)
   printf("--- Running MFTL Derived-Array Tests ---\n");
 
   RUN_TEST(test_derived_arrays_agree_with_the_half_edges);
-  RUN_TEST(test_frames_reproduce_area_and_normal);
-  RUN_TEST(test_frames_are_seam_consistent);
-  RUN_TEST(test_moving_vertices_invalidates_the_frames);
-  RUN_TEST(test_read_only_vertex_loop_keeps_the_frames);
+  RUN_TEST(test_gathered_iterator_reproduces_area_and_normal);
+  RUN_TEST(test_gathered_geometry_is_seam_consistent);
+  RUN_TEST(test_motion_needs_no_derived_refresh);
+  RUN_TEST(test_read_only_vertex_loop);
   RUN_TEST(test_reorder_is_a_pure_relabelling);
   RUN_TEST(test_reorder_produces_monotone_morton_keys);
   RUN_TEST(test_reorder_improves_edge_locality);

@@ -105,7 +105,7 @@ against `fmax`): **7.33 → 7.41 ns/tri, +1.1 %**, best of six over two rounds.
 
 ---
 
-## Two kernels, one entry point, and the test is outside the loop {#geom_dispatch}
+## Two connectivity paths, one entry point {#geom_dispatch}
 
 `MFTLComputeTriangleGeometry` produces the same three outputs two ways, and which
 one is available depends on the **state of the object**, not on what the caller
@@ -113,47 +113,14 @@ wants:
 
 | Path | Reads | Valid when |
 |---|---|---|
-| `geometry_by_walk` | three half-edge records, three gathered positions, two minimum-image corrections | **always** — a freshly generated mesh has no derived arrays, and a generator has to be able to call this |
-| `geometry_by_frames` | `tris.anchor` and `tris.edge`, both contiguous, both already seam-consistent | only while #MFTL_DERIVED_FRAMES is set |
+| `geometry_by_walk` | implicit half-edge indices and three gathered positions | **always**, including construction before derived arrays exist |
+| `geometry_by_vertices` | compact `tris.verts` and three gathered positions | while #MFTL_DERIVED_TOPOLOGY is set |
 
-Measured by `examples/geometry_update_benchmark.c`, interleaved, best of many,
-5 120 to 327 680 triangles:
-
-| Domain | walk | stream | ratio |
-|---|---|---|---|
-| non-periodic | 2.1–2.6 ns/tri | 1.4–2.0 ns/tri | **1.25–1.57×** |
-| periodic | 3.5–3.8 ns/tri | 1.8–1.9 ns/tri | **1.94–2.00×** |
-
-The periodic margin is the larger one because that is where the walk actually
-pays for the correction the frames already carry — which is the whole argument
-for `tris.edge` existing, arriving here as a number.
-
-### Why a dispatch and not a second public function
-
-`MFTLComputeTriangleGeometryFromFrames()` next to the existing entry point was
-rejected: it makes every call site restate a fact the object already knows, and a
-call site that gets it wrong either asserts (best case) or reads stale frames
-(worst). One test on `obj->derived`, hoisted out of the loop, costs a predicted
-branch **per call** — not per triangle — and cannot be got wrong.
-
-It also removes the temptation to "optimise" by refreshing the frames first.
-`MFTLObjectRefreshFrames` gathers three positions per triangle and writes 72 B,
-i.e. it costs about what the walk costs; paying it to enable a 1.6 ns kernel is a
-net loss for a single pass. The fast path is worth taking when the frames are
-current **anyway** — which after a redistribution they always are:
-
-| After | Frames | Path taken |
-|---|---|---|
-| `MFTL_FOREACH_OWNED_VERTEX` | cleared by the iterator | walk |
-| `MFTLUpdateGhostPositions` | cleared by the exchange | walk |
-| `MFTLRedistribute` | rebuilt on the way out | stream |
-| `MFTLGenerateSphere` | built by the generator | stream |
-
-@note What the dispatch does **not** buy is in `docs/performance-analysis.md` §9:
-      in the one production loop in this repository the phase that benefits is
-      waiting on first-touch of pools a redistribution has just rewritten, and
-      the dispatch moves it by about **one percent**. The kernel is faster; that
-      pass is not kernel-bound.
+The steady-state path unswitches periodicity outside the triangle loop. Its
+non-periodic branch contains only compact-index loads, position gathers and
+arithmetic; its periodic branch applies minimum-image corrections without a
+per-triangle branch. The fallback preserves the construction-time API. The two
+paths are bit-identical, tested on seam-straddling meshes.
 
 ---
 
@@ -172,35 +139,14 @@ the pass never divides per face.
 
 | | Shape | Cost |
 |---|---|---|
-| **gather** | per vertex, walk the one-ring, accumulate in registers | data-dependent trip count; every fan step is a *dependent* load (`he → twin → next`); random access into `tris.edge` |
-| **scatter** | per triangle, add its face normal into three vertices | two contiguous input streams, flat loop, constant body, no pointer chasing — but a read-modify-write into three indexed slots, plus a zeroing pass before and a normalisation pass after |
-
-Measured by `examples/vertex_normal_benchmark.c` on the same mesh in the same
-binary, checked to agree to rounding:
-
-| Variant | ns/vertex |
-|---|---|
-| **scatter over triangles** | **5.2 – 5.5**, flat in mesh size |
-| gather by fan walk | 17.8 – 21.6 — **3.4× slower** |
-
-and the fan walk is measured *with* its fast path, skipping the rewind on every
-vertex not flagged #MFTL_FLAG_BOUNDARY. Without that it is 8× slower, because
-`MFTLVertexFanStart` walks a whole extra lap to discover that a closed fan is
-closed. What is left after that is the dependent loads: a valence-6 fan
-serialises six round trips the scatter never makes.
+| **gather** | per vertex, walk the one-ring, recompute incident face normals | data-dependent trip count; every fan step is a *dependent* load (`he → twin → next`) |
+| **scatter** | per triangle, gather positions and add its face normal into three vertices | compact connectivity and a flat constant body, but a read-modify-write into three indexed slots plus zeroing and normalisation passes |
 
 ### The CSR question, settled
 
-`src/object/derived.c` records the vertex→triangle CSR as deleted for want of a
-consumer, and asks for it to be reconsidered when one appears. **This is that
-consumer**, so it was measured rather than assumed: a CSR gather removes the
-dependent loads entirely and lands at **5.2 – 5.7 ns/vertex — a dead heat**, not
-a win.
-
-It loses on everything else: 16 bytes per triangle of permanent state, and a
-rebuild costing another 5.5 – 5.8 ns/vertex — as much as the whole normal pass —
-on every topology change. On a remeshed surface that is paid every step. **The
-CSR stays deleted, now for a measured reason.**
+The vertex→triangle CSR remains absent: it would add 16 bytes per triangle and a
+topology rebuild solely to offer another adjacency traversal. Reconsider it only
+with an end-to-end workload that amortises both costs.
 
 ### Why the scatter target stays interleaved
 
@@ -225,11 +171,8 @@ this pass **zero communication**.
 
 ---
 
-## Layering note {#geom_layering}
+## Shared gathered loop {#geom_layering}
 
-Both files implement a layer-2 header, so they test `obj->derived` **directly**
-rather than through `MFTLObjectHasFrames()`, and write their streaming loops out
-rather than using #MFTL_FOREACH_TRIANGLE_FRAME — both of those live in
-`mftl_object.h`, which is layer 3.
-
-The loop bodies are identical to the macros'. **If one changes, both must.**
+The bulk triangle and vertex-normal kernels use
+#MFTL_FOREACH_TRIANGLE_GEOMETRY. Periodicity unswitching and compact-index
+gathers therefore have one implementation shared with external hot loops.

@@ -69,12 +69,8 @@
  * someone's owned triangle silently loses an edge neighbour. A Debug assertion in
  * the redistribution catches it.
  *
- * There is deliberately NO MFTLObjectRefreshFrames in that loop.
- * MFTLComputeTriangleGeometry reads the half-edge structure rather than the
- * frames, and the redistribution rebuilds the frames itself at the end -- so a
- * caller that also wants MFTLEnsembleUpdate's quality statistics, or
- * MFTLComputeVertexNormals, gets current frames without a pass of its own. Insert
- * those AFTER step 4, not before it.
+ * A caller that also wants MFTLEnsembleUpdate's quality statistics or vertex
+ * normals inserts those after step 4 so they operate on the new partition.
  *
  * "Exactly one geometry pass" is precise, and it is the reason the postcondition
  * above is worth stating so loudly: the loop ENDS on step 4, so between two
@@ -482,8 +478,8 @@ int MFTLRedistributeWithOwners(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps);
  * per-object loop tests both inputs, agrees on the verdict with every other rank
  * in one MPI_BOR over a per-body bitset, and skips the destination analysis, the
  * kept gather, the relink, the arrival classification, the twin repair and the
- * topology rebuild for every body that did not move. The frames are still
- * rebuilt, because the vertices did move and the postcondition owes them.
+ * topology rebuild for every body that did not move. Vertex motion requires no
+ * derived work.
  *
  * It is BEHAVIOUR-NEUTRAL, not an approximation: the resulting pool is
  * bit-identical to the rebuilt one, slot for slot.
@@ -628,8 +624,7 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble *ens);
  * where the ownership prefix ends. MFTLEnsembleUpdateVertexNormals() is the
  * one-call form.
  *
- * Unlike the position sync, this does NOT invalidate the derived frames: a normal
- * is an output of the geometry, not an input to it.
+ * Neither normal nor position synchronisation changes derived connectivity.
  *
  * @note Requires MFTLComputeVertexNormals() to have run on every object first;
  *       it synchronises `verts.normal`, it does not compute it.
@@ -690,7 +685,7 @@ int MFTLUpdateGhostVertexNormals(MFTL_Ensemble *ens);
  * `ens->objects`, so redistribution and the ghost syncs never see it. Nothing
  * that loops over the real body sees it either. And because it is an ordinary
  * object, every existing pass works on it unmodified -- MFTLObjectBuildDerived,
- * the frames, MFTLComputeTriangleGeometry, MFTLGetTriangleCorners -- which is
+ * MFTLComputeTriangleGeometry, MFTLGetTriangleCorners -- which is
  * what makes the patch reusable by anything that accepts an MFTL_Object, at the
  * price of a consumer having to ask the halo for it rather than finding it
  * already spliced into the body.
@@ -704,9 +699,8 @@ int MFTLUpdateGhostVertexNormals(MFTL_Ensemble *ens);
  * accumulating, and the intended order is:
  *
  *   1..4  the usual loop, ending in MFTLRedistribute
- *   5.    MFTLComputeTriangleGeometry(obj, obj->tris.n)   frames for the bounds
- *   6.    MFTLExtendSpatialHalo(...)                      the halo
- *   7.    contact detection
+ *   5.    MFTLExtendSpatialHalo(...)                      the halo
+ *   6.    contact detection
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -715,7 +709,7 @@ int MFTLUpdateGhostVertexNormals(MFTL_Ensemble *ens);
  *
  * `patch[b]` is MFTL_NULL until body b actually receives something. When it is
  * not null it is a fully valid MFTL_Object: twins linked WITHIN the patch,
- * derived arrays built, frames current, and `n_local == 0` because this rank
+ * derived connectivity built, and `n_local == 0` because this rank
  * owns none of it.
  *
  * Global ids on a patch are body b's real ids, so a contact reported against a
@@ -775,7 +769,7 @@ void MFTLSpatialHaloDestroy(MFTL_SpatialHalo **p_halo);
  * same simulation would detect contact at a different separation depending only
  * on how it was launched.
  *
- * @note Collective. Requires current frames, or falls back to a half-edge walk.
+ * @note Collective. Reads current positions and uses compact connectivity when available.
  * @return MFTL_SUCCESS, or MFTL_ERROR on invalid arguments.
  *
  * @param ens  The ensemble.
@@ -863,9 +857,8 @@ int MFTLSpatialHaloResolveRadii(MFTL_Ensemble *ens, MFTL_SpatialHalo *halo);
  * @return MFTL_SUCCESS, or MFTL_ERROR on invalid arguments.
  *
  * @note Collective over the ensemble's graph communicator.
- * @note Reads `verts.pos` and the frames of the OWNED triangles of each body B.
- *       Call MFTLComputeTriangleGeometry / MFTLObjectRefreshFrames first if the
- *       mesh has moved since the last derived rebuild.
+ * @note Reads current `verts.pos` and triangle connectivity. No geometry cache
+ *       refresh is required after motion.
  */
 int MFTLExtendSpatialHalo(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *requests, int n_requests, MFTL_SpatialHalo *halo);
 
@@ -999,7 +992,6 @@ typedef struct
   double t_arrivals;  ///< Classifying and writing what arrived.
   double t_twins;  ///< repair_twins() over the half-edges that lost a partner.
   double t_derived_topology;  ///< Rebuilding tris.verts and tris.neighbors.
-  double t_derived_frames;  ///< Rebuilding tris.anchor and tris.edge. 72 B/triangle.
 
   /**
    * Tearing the per-call scratch down again: every `free` on the path, including

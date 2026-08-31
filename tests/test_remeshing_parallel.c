@@ -717,8 +717,6 @@ static int ghosts_agree_with_owners(MFTL_Ensemble *ens)
 
   free(snapshot);
 
-  /* The sync clears the frame bit, and the caller may still want the frames. */
-  for (int o = 0; o < ens->num_objects; ++o) MFTLObjectRefreshFrames(ens->objects[o]);
   return ok;
 }
 

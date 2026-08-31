@@ -31,10 +31,8 @@
  * silently loses an edge neighbour. Nothing crashes; the ghost halo is just
  * short. A Debug build asserts on it inside the redistribution.
  *
- * Note what is NOT in the loop: no MFTLObjectRefreshFrames. Step 3 reads the
- * half-edge structure, and step 4 rebuilds the derived arrays on its way out, so
- * a frame refresh here would recompute something that is about to be recomputed.
- * --quality adds MFTLEnsembleUpdate AFTER step 4, where the frames are current.
+ * Step 3 reads the current positions and compact triangle connectivity. Step 4
+ * rebuilds that connectivity only for bodies whose partition changes.
  *
  * ── Step 5, and why the benchmark would lie without it ─────────────────────
  *
@@ -59,8 +57,8 @@
  *
  * The pass used is MFTLComputeTriangleGeometry rather than MFTLEnsembleUpdate,
  * because restoring what the wire dropped is geometry only: ALL triangles, no
- * quality statistics and no reduction. examples/ensemble_update_benchmark.c
- * measures what the fused alternative would cost instead.
+ * quality statistics and no reduction. Pass `--quality` to charge the fused
+ * geometry/statistics alternative in this same end-to-end workload.
  *
  * ── Usage ──────────────────────────────────────────────────────────────────
  *
@@ -438,12 +436,11 @@ static void report_internals(int rank, int nproc, int steps)
                                "arrival grouping", "pool growth",
                                "kept: gather", "kept: place back",
                                "kept: relink half-edges", "arrivals",
-                               "twin repair", "derived: topology",
-                               "derived: FRAMES", "teardown"};
+                               "twin repair", "derived: topology", "teardown"};
   double tval[] = {st.t_setup,     st.t_owners,       st.t_skip_vote,    st.t_masks,            st.t_destinations,
                    st.t_route,     st.t_pack,         st.t_exchange_counts, st.t_exchange_data, st.t_wait,
                    st.t_group,     st.t_reserve,      st.t_kept_gather,  st.t_kept_place,       st.t_relink,
-                   st.t_arrivals,  st.t_twins,        st.t_derived_topology, st.t_derived_frames, st.t_teardown};
+                   st.t_arrivals,  st.t_twins,        st.t_derived_topology, st.t_teardown};
   const int nt = (int) (sizeof(tval) / sizeof(tval[0]));
 
   const char *const gname[] = {"collect requests", "exchange: counts", "exchange: requests", "owner id table",
@@ -764,9 +761,8 @@ int main(int argc, char **argv)
       t_post += MPI_Wtime() - t0;
     }
 
-    /* Optional consumers of the rebuilt derived arrays. Both go AFTER the
-     * redistribution: it leaves the frames current, so neither needs a refresh
-     * of its own, and both would otherwise operate on the old partition. */
+    /* Optional consumers go after redistribution so they operate on the new
+     * partition and its compact connectivity arrays. */
     if (cfg.quality || cfg.normals)
     {
       t0 = MPI_Wtime();

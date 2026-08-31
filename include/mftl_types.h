@@ -24,8 +24,7 @@
  *   (12-16 bytes) so one cache line carries four of them.
  *
  *   GEOMETRY -> Structure of Arrays.
- *   Positions, normals, areas, centroids, curvatures, and the derived per-
- *   triangle frames. These are read and written by kernels that touch ONE
+ *   Positions, normals, areas, centroids and curvatures. These are read and written by kernels that touch ONE
  *   component of EVERY entity, every timestep. That is the access pattern AoS is
  *   worst at, and it is where all the time goes.
  *
@@ -40,7 +39,7 @@
  *
  *     MFTL_VertexPool  = one block  -> rec[] pos[] normal[] area[] curvatures[]
  *     MFTL_TrianglePool= one block  -> rec[] he[] area[] normal[] center[]
- *                                      verts[] neighbors[] anchor[] edge[]
+ *                                      verts[] neighbors[]
  *
  * "The AoS grew but the SoA did not" is not a bug that can be made here; it is
  * not expressible. See mftl_memory.h (MFTLLayoutAdd) and src/object/object.c.
@@ -210,12 +209,9 @@ typedef struct MFTL_VertexPool
  * 3t..3t+2. Giving them their own capacity would recreate exactly the
  * "reallocated independently" problem this layout exists to remove.
  *
- * The four derived connectivity/frame arrays are the hot-loop representation.
- * They are rebuilt by MFTLObjectBuildDerived / MFTLObjectRefreshFrames and are
- * only meaningful while the corresponding bit of MFTL_Object.derived is set:
- *
- *   verts, neighbors   invalidated by any TOPOLOGY change
- *   anchor, edge       invalidated by topology AND by vertex motion
+ * The two derived connectivity arrays are the hot-loop representation. They are
+ * rebuilt by MFTLObjectBuildDerived and are meaningful only while
+ * MFTL_DERIVED_TOPOLOGY is set.
  *
  * On what they duplicate, stated plainly so nobody has to rediscover it:
  * `verts[3t+k]` is a rotation of `he[3t+k'].vertex_idx`, and `neighbors[3t+k]`
@@ -234,11 +230,9 @@ typedef struct MFTL_TrianglePool
   double *normal;  ///< [3*capacity]    unit normal, xyz interleaved.
   double *center;  ///< [3*capacity]    centroid, xyz interleaved, WRAPPED into the domain.
 
-  /* --- Derived connectivity and frames: rebuilt, never authoritative --------- */
+  /* --- Derived connectivity: rebuilt, never authoritative ------------------- */
   int *verts;  ///< [3*capacity]    vertex pool index; slot k is the ORIGIN of half-edge 3t+k.
   int *neighbors;  ///< [3*capacity]    triangle across half-edge 3t+k, MFTL_ERROR at a boundary.
-  double *anchor;  ///< [3*capacity]    position of corner 0, replicated per triangle.
-  double *edge;  ///< [6*capacity]    {e1, e2} = {v1-v0, v2-v0}, ALWAYS seam-consistent.
 
   int n;  ///< Active triangles (owned + ghost). Half-edges number 3*n.
   int n_local;  ///< Owned triangles; they occupy [0, n_local).
@@ -288,8 +282,6 @@ typedef struct MFTL_ObjectQualityStatistics
 
 /** @brief `derived` bit: tris.verts and tris.neighbors are current. */
 #define MFTL_DERIVED_TOPOLOGY 0x1u
-/** @brief `derived` bit: tris.anchor and tris.edge are current. */
-#define MFTL_DERIVED_FRAMES 0x2u
 
 /**
  * @struct MFTL_Object

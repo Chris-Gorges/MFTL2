@@ -27,7 +27,7 @@
  *   P1 STREAM-REDUCE   read every position once, reduce         (bounding box)
  *   P2 STREAM-MAP      read every position, write it back       (advection step)
  *   P3 GATHER          read 3 positions per triangle via an
- *                      index array, write contiguously          (build_frames)
+ *                      index array, write temporary geometry
  *   P4 SCATTER-ACC     read contiguously, accumulate into 3
  *                      indexed vertex slots                     (vertex normals)
  *
@@ -81,7 +81,7 @@ typedef struct
   /* Shared outputs/inputs, identical for both layouts so they cancel out. */
   double *anchor;  /* [3*nt] */
   double *edge;    /* [6*nt] */
-  double *in_edge; /* [6*nt] the frame array the scatter kernel streams */
+  double *in_edge; /* [6*nt] temporary edge vectors for the scatter probe */
 
   void *block;
   double sink; /* keeps reductions alive */
@@ -195,7 +195,7 @@ static void p2_split(layout_ctx *c)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * P3  GATHER -- exactly what build_frames() does, per layout
+ * P3  GATHER -- triangle positions through compact connectivity, per layout
  *
  * Three positions per triangle, reached through tris.verts. The outputs are the
  * same interleaved arrays in both variants, so the only difference measured is
@@ -297,8 +297,8 @@ static void p3_split(layout_ctx *c)
 /* ═══════════════════════════════════════════════════════════════════════════
  * P4  SCATTER-ACC -- the vertex-normal accumulation, per layout
  *
- * Streams tris.verts and tris.edge, and accumulates one unnormalised face
- * normal into each of the triangle's three vertex slots. The read side is
+ * Streams triangle indices and temporary edge vectors, and accumulates one
+ * unnormalised face normal into each of the triangle's three vertex slots. The read side is
  * identical in both variants; the write side is the layout under test.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -476,7 +476,8 @@ static layout_ctx *ctx_build(const MFTL_Object *obj)
     c->Y[v] = p[1];
     c->Z[v] = p[2];
   }
-  memcpy(c->in_edge, obj->tris.edge, 6 * nt * sizeof(double));
+  p3_packed(c);
+  memcpy(c->in_edge, c->edge, 6 * nt * sizeof(double));
 
   return c;
 }
@@ -632,7 +633,7 @@ int main(int argc, char *argv[])
   printf("\nWhat each pattern is\n");
   printf("  P1  bounding box over verts.pos           -- pure streaming reduction\n");
   printf("  P2  translate every vertex                -- streaming read + write\n");
-  printf("  P3  build_frames(): 3 gathered positions per triangle through tris.verts\n");
+  printf("  P3  triangle gather: 3 positions per triangle through tris.verts\n");
   printf("  P4  vertex-normal accumulation: scatter-add into 3 vertex slots per triangle\n");
   printf("\n");
   printf("Why the numbers come out this way -- read from the disassembly, not guessed\n");
@@ -654,7 +655,7 @@ int main(int argc, char *argv[])
   printf("      three separate load-add-store triples: SIX. Scattering into one array\n");
   printf("      pairs up; scattering into three cannot.\n");
   printf("\n");
-  printf("  Net: the two patterns that run every timestep (P3 build_frames and P4\n");
+  printf("  Net: the two gathered/scattered patterns (P3 and P4)\n");
   printf("  vertex normals) pull in OPPOSITE directions by similar amounts, so the\n");
   printf("  layout question is close to a wash on time and is therefore decided on\n");
   printf("  the API instead. Interleaved keeps MFTLVertexPos() returning a plain\n");

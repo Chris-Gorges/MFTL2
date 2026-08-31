@@ -27,7 +27,7 @@ what the rest produced.
 
 @warning `MFTLWriteVtu` must **never** write `tris.area` or `tris.normal`.
          Nothing on the object records whether they are current — `derived`
-         tracks the topology and the frames, not the geometry — and a
+         tracks connectivity, not geometry — and a
          redistribution leaves them undefined by design, so a production file
          containing them would look right and be stale. `MFTLWriteVtk` writes
          them deliberately, because the raw dump's contract is to show what is in
@@ -53,24 +53,20 @@ Guarded by `test_ghost_inclusion` and `test_cell_count_is_the_owned_count`.
 
 ---
 
-## Periodic unwrapping is free {#io_unwrap}
+## Periodic unwrapping is computed once {#io_unwrap}
 
 A triangle straddling a periodic face has corners stored at opposite ends of the
 box; drawn naively it stretches across the whole domain.
 
-Detecting it from scratch means two `MFTLGetMinimumImageVector` calls per
-triangle, inside a helper the writer needs four times per triangle per file.
-
-None of that is necessary here: `tris.anchor` and `tris.edge` already hold what
-that helper would compute — corner 0 and the two seam-consistent edge vectors —
-so the unwrapped corners are
+`analyze_piece` gathers each triangle once and computes two minimum-image edge
+vectors. The unwrapped corners are
 
 $$
   \mathbf{p}_0, \quad \mathbf{p}_0 + \mathbf{e}_1, \quad \mathbf{p}_0 + \mathbf{e}_2
 $$
 
-with **no periodic arithmetic at all**, and the analysis is a single streaming
-pass over two contiguous arrays.
+Only wrapped triangles retain those nine coordinates. All subsequent output
+blocks reuse them instead of recomputing the geometry.
 
 ### Shared points and private points
 
@@ -85,16 +81,16 @@ it.
 
 ### The detection test has no tolerance, on purpose {#io_wrap_test}
 
-It asks whether a reconstructed corner $\mathbf{p}_0 + \mathbf{e}$ left the domain
-box. That is a strict comparison, with no epsilon.
+It compares each minimum-image edge with the corresponding raw position
+difference. The comparison is exact and has no epsilon.
 
 - A **false positive** costs three extra points carrying correct coordinates, and
   renders identically.
 - A **false negative** draws a triangle across the whole domain.
 
 Any slack added to suppress the first buys the second, so there is none.
-`test_wrap_detection_paths_agree` pins it against the gathering criterion used
-when the frames are stale.
+`test_wrap_detection_paths_agree` pins compact connectivity against the half-edge
+fallback on the same seam-straddling surface.
 
 ---
 

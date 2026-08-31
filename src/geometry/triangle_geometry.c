@@ -6,64 +6,26 @@
  *
  * @brief Per-triangle geometry: area, unit normal and centroid for a whole mesh.
  *
- * ## TWO KERNELS, ONE ENTRY POINT, AND THE TEST IS OUTSIDE THE LOOP
+ * ## TWO CONNECTIVITY PATHS, ONE ENTRY POINT
  *
  * The same three outputs can be produced two ways, and which one is available
  * depends on the state of the object rather than on what the caller wants:
  *
- *   WALK    three half-edge records per triangle, three gathered vertex
- *           positions, two minimum-image corrections. Valid on ANY object --
- *           a freshly generated mesh has no derived arrays and this is what a
- *           generator has to be able to call.
+ *   HALF EDGE  valid even before derived connectivity has been built. This is
+ *              the construction-time fallback.
  *
- *   STREAM  `tris.anchor` and `tris.edge`, both contiguous, both already
- *           seam-consistent. No gather, no periodic arithmetic, no indirection.
- *           Valid only while MFTL_DERIVED_FRAMES is set.
+ *   VERTICES   streams `tris.verts`, gathers the authoritative positions and
+ *              creates seam-corrected edges in registers. Periodicity is
+ *              unswitched outside the triangle loop.
  *
- * Measured by examples/geometry_update_benchmark.c, interleaved, best of many,
- * 5 120 to 327 680 triangles:
- *
- *     non-periodic    walk 2.1-2.6 ns/tri   stream 1.4-2.0 ns/tri   1.25-1.57x
- *     periodic        walk 3.5-3.8 ns/tri   stream 1.8-1.9 ns/tri   1.94-2.00x
- *
- * The periodic margin is the larger one because that is where the walk actually
- * pays for the minimum-image correction the frames already carry -- which is the
- * whole argument for `tris.edge` existing, arriving here as a number.
- *
- * What this does NOT buy is stated in docs/performance-analysis.md §9: in the
- * one production loop in this repository the phase that benefits is waiting on
- * first-touch of pools a redistribution has just rewritten, and the dispatch
- * moves it by about one percent. The kernel is faster; that pass is not
- * kernel-bound.
- *
- * ### Why this is a dispatch and not a second public function
- *
- * The alternative was `MFTLComputeTriangleGeometryFromFrames()` next to the
- * existing entry point, and it was rejected: it makes every call site restate a
- * fact the object already knows, and a call site that gets it wrong either
- * asserts (best case) or reads stale frames (worst). One test on `obj->derived`,
- * hoisted out of the loop, costs a predicted branch per CALL -- not per triangle
- * -- and cannot be got wrong.
- *
- * It also removes the temptation to "optimise" by refreshing the frames first.
- * MFTLObjectRefreshFrames gathers three positions per triangle and writes 72 B,
- * i.e. it costs about what the walk costs; paying it to enable a 1.6 ns kernel
- * is a net loss for a single pass. The fast path is worth taking when the frames
- * are current ANYWAY -- which after a redistribution they always are.
- *
- * ### Layering
- *
- * This implements a layer-2 header, so it tests `obj->derived` directly rather
- * than through MFTLObjectHasFrames() and writes the streaming loop out rather
- * than using MFTL_FOREACH_TRIANGLE_FRAME -- both of those live in mftl_object.h,
- * which is layer 3. src/geometry/vertex_geometry.c does the same thing for the
- * same reason. The loop body is identical to the macro's; if one changes, both
- * must.
+ * Both paths have identical geometry arithmetic. The normal steady-state path
+ * is VERTICES; the half-edge fallback preserves the construction-time API.
  */
 
 #include "mftl_geometry.h"
 
 #include "mftl_constants.h"
+#include "mftl_object.h"
 #include "mftl_types.h"
 
 /**
@@ -90,12 +52,7 @@ static void geometry_by_walk(MFTL_Object *obj, int count)
 }
 
 /**
- * @brief The hot path: two contiguous input streams, three contiguous outputs.
- *
- * Everything this loop needs is already in `tris.anchor` (corner 0) and
- * `tris.edge` ({v1-v0, v2-v0}, seam-consistent). So there is no gather, and no
- * minimum-image call -- the correction was applied once when the frames were
- * built and is baked into the edge vectors.
+ * @brief The hot path: compact indices plus gathered authoritative positions.
  *
  * The centroid still needs MFTLApplyPeriodicity, and that stays the branchy
  * library call deliberately: `p0 + (e1+e2)/3` is a true centroid but not
@@ -105,30 +62,19 @@ static void geometry_by_walk(MFTL_Object *obj, int count)
  * unconditional work on non-periodic axes too while these three branches are
  * perfectly predicted.
  *
- * Five `restrict` pointers, one invariant bound, no aliasing possible in fact --
- * the inputs live in the triangle pool block and so do the outputs, but at
- * disjoint cache-line-aligned sub-arrays, which is exactly what the single-block
- * layout guarantees.
- *
- * @param obj   The mesh. Requires #MFTL_DERIVED_FRAMES.
+ * @param obj   The mesh. Requires #MFTL_DERIVED_TOPOLOGY.
  * @param count Triangles to process, from index 0.
  */
-static void geometry_by_frames(MFTL_Object *obj, int count)
+static void geometry_by_vertices(MFTL_Object *obj, int count)
 {
-  const double *const restrict anc = obj->tris.anchor;
-  const double *const restrict ed = obj->tris.edge;
-
   double *const restrict out_area = obj->tris.area;
   double *const restrict out_normal = obj->tris.normal;
   double *const restrict out_center = obj->tris.center;
 
   const MFTL_Domain *const dom = obj->domain;
 
-  for (int t = 0; t < count; ++t)
-  {
-    const double e1x = ed[6 * t + 0], e1y = ed[6 * t + 1], e1z = ed[6 * t + 2];
-    const double e2x = ed[6 * t + 3], e2y = ed[6 * t + 4], e2z = ed[6 * t + 5];
-
+  MFTL_FOREACH_TRIANGLE_GEOMETRY(
+      obj, count,
     /* Unnormalised normal; its magnitude is twice the area, so one sqrt serves
      * both outputs and there is no second square root anywhere in the loop. */
     const double nx = e1y * e2z - e1z * e2y;
@@ -150,15 +96,12 @@ static void geometry_by_frames(MFTL_Object *obj, int count)
     out_normal[3 * t + 1] = ny * inv;
     out_normal[3 * t + 2] = nz * inv;
 
-    const double p0x = anc[3 * t + 0], p0y = anc[3 * t + 1], p0z = anc[3 * t + 2];
-
     double c[3] = {p0x + (e1x + e2x) * MFTL_ONE_THIRD, p0y + (e1y + e2y) * MFTL_ONE_THIRD, p0z + (e1z + e2z) * MFTL_ONE_THIRD};
     MFTLApplyPeriodicity(dom, c);
 
     out_center[3 * t + 0] = c[0];
     out_center[3 * t + 1] = c[1];
-    out_center[3 * t + 2] = c[2];
-  }
+    out_center[3 * t + 2] = c[2];);
 }
 
 void MFTLComputeTriangleGeometry(MFTL_Object *obj, int count)
@@ -168,10 +111,8 @@ void MFTLComputeTriangleGeometry(MFTL_Object *obj, int count)
 
   if (count <= 0) return;
 
-  /* The frames are built for the WHOLE live prefix (build_frames runs to
-   * tris.n), so any count the assertion above admits is covered by them. */
-  if ((obj->derived & MFTL_DERIVED_FRAMES) != 0u)
-    geometry_by_frames(obj, count);
+  if ((obj->derived & MFTL_DERIVED_TOPOLOGY) != 0u)
+    geometry_by_vertices(obj, count);
   else
     geometry_by_walk(obj, count);
 }

@@ -58,7 +58,7 @@ A mesh is described by two things that want opposite memory layouts, and each is
 
 - **Topology and identity → AoS.** `MFTL_Vertex` (16 B), `MFTL_Triangle` (12 B), `MFTL_HalfEdge` (16 B). A remesher
   edits one entity at a time and touches most of its record when it does.
-- **Geometry → SoA.** Positions, normals, areas, centroids, curvatures and the derived per-triangle frames. These
+- **Geometry → SoA.** Positions, normals, areas, centroids and curvatures. These
   are read and written by kernels that touch one component of every entity, every timestep.
 
 **Both live in ONE allocation per entity class.** `MFTL_VertexPool` and `MFTL_TrianglePool` each hold a single
@@ -88,16 +88,15 @@ gives storage back through `MFTLObjectShrinkToFit` / `MFTLObjectReleasePools` �
 
 ### Derived arrays and staleness
 
-`tris.verts`, `tris.neighbors`, `tris.anchor`, `tris.edge` are rebuildable caches, tracked by `obj->derived`:
+`tris.verts` and `tris.neighbors` are rebuildable caches, tracked by `obj->derived`:
 
 | bit | arrays | invalidated by |
 |---|---|---|
 | `MFTL_DERIVED_TOPOLOGY` | `verts`, `neighbors` | any topology change |
-| `MFTL_DERIVED_FRAMES` | `anchor`, `edge` | topology change **or** vertex motion |
 
-`MFTLObjectBuildDerived` rebuilds both; `MFTLObjectRefreshFrames` rebuilds only the frames. Every `MFTL_FOREACH_*`
-iterator asserts on the relevant bit in Debug, and `MFTL_FOREACH_OWNED_VERTEX` clears the frame bit on the way out,
-so a motion pass cannot silently leave geometry a timestep stale.
+`MFTLObjectBuildDerived` rebuilds both arrays. Geometric consumers gather the
+authoritative positions and construct seam-corrected edges in registers, so
+vertex motion invalidates no derived state.
 
 `tris.verts` and `tris.neighbors` are *redundant* with the half-edge records (a rotation of `he.vertex_idx`, and
 `he.twin_idx / 3`). They are stored for traffic — 12 B/triangle instead of 48 — not for instructions. See
@@ -298,15 +297,14 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   and never from anything local; two ranks entering different drivers is an immediate deadlock with no
   diagnostic.
 - The per-timestep order WITHOUT redistribution is: move owned vertices (`MFTL_FOREACH_OWNED_VERTEX`) →
-  `MFTLObjectRefreshFrames` → `MFTLEnsembleUpdate` → `MFTLComputeVertexNormals` (if per-vertex geometry is wanted).
+  `MFTLEnsembleUpdate` → `MFTLComputeVertexNormals` (if per-vertex geometry is wanted).
 - The per-timestep order WITH redistribution is: move owned vertices → `MFTLUpdateGhostPositions` →
   `MFTLComputeTriangleGeometry(obj, obj->tris.n)` → `MFTLRedistribute` → (optionally) `MFTLEnsembleUpdate` and
   `MFTLComputeVertexNormals`. Three things about it are load-bearing, and all three are silent when wrong:
   the ghost sync must precede the geometry pass (a triangle's three vertices can belong to three ranks); the
   geometry pass must cover the GHOSTS too, because redistribution routes them by their cached centre and
-  refreshing only the owned ones makes two ranks disagree about a ghost's destination; and there is deliberately
-  no `MFTLObjectRefreshFrames` in the loop, because `MFTLComputeTriangleGeometry` reads the half-edges and the
-  redistribution rebuilds the frames on its way out. Anything wanting the frames goes AFTER the redistribution.
+  refreshing only the owned ones makes two ranks disagree about a ghost's destination. Geometry and quality
+  consumers go after redistribution when they need the new partition.
 - **A BODY THAT DID NOT MOVE IS NOT TOUCHED, AND THE PRECONDITION IS NOT "DID TOPOLOGY CHANGE".** A rank's
   local state after a redistribution is a pure function of (global topology, owner map) — read the halo rule
   backwards and it defines the OUTPUT, not a procedure. Positions are not an input; they DECIDE the owner map,
@@ -326,8 +324,8 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
 
   Three consequences. The vote is per body through ONE `MPI_BOR` bitset, never per body per collective — that
   splits the object loop in two, and pass 2 re-runs the idempotent `compute_owners` rather than storing
-  `O(sum_verts + sum_tris)` of owner arrays. The FRAMES are still rebuilt for a skipped body, because
-  `MFTL_FOREACH_OWNED_VERTEX` cleared the bit and the vertices really did move. And **a body must be clean
+  `O(sum_verts + sum_tris)` of owner arrays. A skipped body now needs no derived
+  work because motion leaves compact connectivity current. **A body must be clean
   TWICE before it is skipped**: `rebuild_object` is not idempotent (an owned vertex whose incident triangles are
   all remote is dropped and re-received, so it lands at the end of the run), so one settling rebuild per
   dirty→clean transition is what makes a skipped pool bit-identical to a rebuilt one *slot for slot* rather
@@ -362,9 +360,9 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   corner `p0 + e` left the domain box. A false positive costs three extra points carrying correct coordinates and
   renders identically; a false negative draws a triangle across the whole domain. Any slack added to suppress the
   first buys the second, so there is none. `test_wrap_detection_paths_agree` pins it against the gathering
-  criterion used when the frames are stale.
+  criterion used by the half-edge connectivity fallback.
 - **`MFTLWriteVtu` must never write `tris.area` or `tris.normal`.** Nothing on the object records whether they are
-  current — `derived` tracks the topology and the frames, not the geometry — and a redistribution leaves them
+  current — `derived` tracks connectivity, not geometry — and a redistribution leaves them
   undefined by design, so a production file containing them would look right and be stale. `MFTLWriteVtk` writes
   them deliberately, because the raw dump's contract is to show what is actually in memory.
 
@@ -615,8 +613,8 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
 - **Periodicity is TWO problems in the BVH and they need two different fixes.** Within an object, a
   triangle straddling a seam has wrapped vertices, so a centroid built from the raw coordinates lands in
   the middle of the domain and its AABB spans the box — the corruption a centroid normalisation on a periodic
-  domain always invites, fixed by building every primitive from the seam-consistent `tris.anchor`/`tris.edge`
-  frame. Between objects, two bodies on
+  domain always invites, fixed by gathering current corners and applying
+  minimum-image edges. Between objects, two bodies on
   opposite faces are neighbours and no per-triangle arithmetic can see it; that is fixed by traversing
   the pair once per periodic IMAGE (up to 27, each rejected by one root-AABB test). A straddling object's
   ROOT box legitimately spans the domain and is not a bug — same accepted cost, for the same reason, as
@@ -667,15 +665,11 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
 equivalent for the remesher, and `docs/parallel-remeshing-analysis.md` the distributed one — correctness
 against serial, bitwise determinism, phase counts and scaling, all from
 `examples/leveque_remeshing_parallel.c`. Read it before optimising anything, and re-run the
-benchmarks rather than trusting the tables — there are four, and each answers one question:
+benchmarks rather than trusting the tables — each answers one question:
 
 | benchmark | question |
 |---|---|
-| `geometry_update_benchmark.c` | half-edge walk vs streaming frames; what Morton renumbering is worth |
 | `layout_benchmark.c` | interleaved vs padded vs split xyz, on four access patterns |
-| `vertex_normal_benchmark.c` | scatter vs fan gather vs CSR gather |
-| `update_kernel_benchmark.c` | eleven ways to write the per-timestep kernel |
-| `ensemble_update_benchmark.c` | the fused geometry+quality pass against the naive half-edge loop |
 | `parallel_advection_redistribute_list.c` | what a whole timestep costs, how much of it is communication, and (`--ab N`) what skipping unchanged bodies is worth |
 | `orient3d_predicate_profile.c` | does the plain orientation determinant misclassify thin-film contact, and what does the adaptive one cost |
 | `leveque_remeshing_parallel.c` | over 150 remeshed timesteps, does the distributed answer track the serial one, is it reproducible to the bit, and what does a phase cost |
@@ -684,12 +678,10 @@ benchmarks rather than trusting the tables — there are four, and each answers 
 **Seven results contradict what the design predicted, and are the reason to read the doc rather than the code
 comments:**
 
-1. The frame kernel is worth **1.25–1.57× non-periodic and 1.94–2.00× periodic**, not the 3× a pointer-chasing
-   baseline suggests — the margin is set by how fast the GENERAL path is. The figure this file carried before
-   (1.03–1.24×) was two thirds harness: `geometry_update_benchmark.c` timed the variants in blocks and averaged
-   within each. Interleaving and taking minima moved it. `MFTLComputeTriangleGeometry` now DISPATCHES between the
-   two on `MFTL_DERIVED_FRAMES`, and they are bit-identical — but see performance doc §9 for why that is worth
-   about 1 % in the one production loop here.
+1. Persistent triangle frames made isolated consumer kernels faster, especially
+   periodically, but their build cost and 72 B/triangle footprint did not
+   amortise in the moving/remeshing workflows. They were removed; geometry now
+   dispatches only between compact-index and construction-time half-edge paths.
 2. Morton renumbering buys no measurable time on Apple silicon despite cutting mean edge index distance 160×.
    **Needs re-measuring on an x86 node with 1–2 MiB L2 per core.**
 3. Splitting `verts.pos` into three component arrays is faster for gathers and *slower* for scatters, by similar
@@ -706,9 +698,9 @@ comments:**
    statistics, not as a free upgrade. On a periodic domain — what a real run has — it wins at 1.19×.
 6. **Skipping unchanged bodies is worth 1.6-2.1x of the redistribution phase, and the number it turns on is a
    BODY fraction that nothing had ever measured** - 77-86 % at 1000 bodies, np = 2-4, against an estimate of
-   60-75 % made from a radius/cell-width ratio. Two consequences contradict the prediction. The frames rebuild
-   does NOT shrink (a skipped body still moved its vertices, so it still owes them) and becomes the largest
-   non-collective bucket at 15 %, which promotes "weaken the postcondition" from one option among several to the
+   60-75 % made from a radius/cell-width ratio. The former position-derived
+   rebuild became the largest non-collective bucket at 15 % and was subsequently
+   removed together with persistent frames.
    obvious next change. And the buckets that shrink least are the ones proportional to the HALO rather than to
    the mesh - twin repair 1.05x against 3.6-5.2x for everything per-entity - because the bodies a skip removes
    are the interior ones with the least halo churn. Full table in `docs/performance-analysis.md` §7e.
@@ -729,6 +721,7 @@ comments:**
    MISSING AREA WEIGHTING in "triangle-based" smoothing costs volume conservation (3.5 % against 6.0 %) rather
    than triangle quality, which is a wash. Set `feature_angle_threshold` to 180 for any smooth closed
    interface. Full measurement in `docs/remeshing-quality-analysis.md`.
+
 
 ## Known deferred issues
 
@@ -764,10 +757,8 @@ comments:**
    (performance doc §7). Keeping them as scratch on the domain would remove it; not
    done because it puts mutable per-call state on a struct that is otherwise read-only during a redistribution.
 
-7. **Step 5 of the per-timestep loop is bound by first touch, not by its kernel.** The geometry pass that restores
-   what redistribution drops runs on pools the redistribution has just rewritten, and costs 6.4 ns/triangle against
-   2.9 ns for the same function on a resident mesh. Making the kernel 1.4–2.0× faster (the frame dispatch) moved it
-   by ~1 %. The remaining lever is not a better kernel — it is fusing the recompute INTO the redistribution's
+7. **Step 5 of the per-timestep loop is bound by first touch, not only by arithmetic.** The geometry pass that restores
+   what redistribution drops runs on pools the redistribution has just rewritten. The remaining lever is fusing the recompute INTO the redistribution's
    rebuild, where the arrays are already in registers and already being written. Not attempted; it would put
    geometry into a module that deliberately transmits none.
 
@@ -923,6 +914,8 @@ comments:**
    Generation remains the benchmark's Amdahl ceiling: it is rank-0 serial, so in a WEAK scaling
    sweep setup time grows linearly with `nproc` while the timed loop does not, and it must never be
    folded into a scaling total. Full reasoning in `docs/scaling-analysis.md`.
+
+
 
 ### Settled, so nobody re-opens them
 

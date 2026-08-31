@@ -150,7 +150,6 @@ static void refresh(MFTL_Ensemble *ens)
 {
   for (int i = 0; i < ens->num_objects; ++i)
   {
-    MFTLObjectRefreshFrames(ens->objects[i]);
     MFTLComputeTriangleGeometry(ens->objects[i], ens->objects[i]->tris.n);
   }
 }
@@ -302,7 +301,7 @@ static int test_distributed_contacts_match_the_serial_answer(void)
  * This is the property the whole shadow-object design exists to provide, and it
  * is the reason the arrivals are not simply nine loose doubles: a patch that
  * satisfies the ordinary mesh invariants can be handed to any pass in the
- * library that accepts an MFTL_Object -- geometry, frames, normals, output --
+ * library that accepts an MFTL_Object -- geometry, normals, output --
  * without that pass knowing what a spatial halo is.
  *
  * Three things are checked and each rules out a different mistake:

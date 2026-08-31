@@ -19,8 +19,8 @@
  * version. It compacted once at the very end of the whole call, so the flip and
  * smoothing sweeps ran over a pool containing dead entities and had to defend
  * against them individually. Here they never see one, and the payoff is not
- * tidiness: the smoother can call MFTLObjectRefreshFrames() and
- * MFTLComputeVertexNormals(), which stream the whole pool and would otherwise
+ * tidiness: the smoother can call MFTLComputeVertexNormals() over the whole
+ * compact pool and would otherwise
  * accumulate dead triangles into live vertices' normals.
  *
  * FLIP before SMOOTH, because the valence criterion is combinatorial: it reads

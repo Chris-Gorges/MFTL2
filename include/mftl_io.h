@@ -61,7 +61,7 @@
  *    whole pool deliberately, for when the halo itself is what you want to look
  *    at.
  *
- * 4. THE PERIODIC UNWRAPPING IS FREE.
+ * 4. PERIODIC UNWRAPPING IS COMPUTED ONCE.
  *
  *    A triangle straddling a periodic face has corners stored at opposite ends of
  *    the box; drawn naively it stretches across the whole domain. The previous
@@ -69,12 +69,9 @@
  *    triangle inside a helper it then called FOUR TIMES per triangle per file
  *    (its own src/io/README.md §3.3 records the redundancy).
  *
- *    Here `tris.anchor` and `tris.edge` already hold exactly what that helper
- *    computed -- corner 0 and the two seam-consistent edge vectors -- so the
- *    unwrapped corners are p0, p0+e1, p0+e2 with no periodic arithmetic at all,
- *    and the analysis is a single streaming pass over two contiguous arrays. See
- *    src/io/vtu_writer.c §2 for the detection criterion and why it is the safe
- *    one to get wrong.
+ *    The analysis now gathers each triangle once, computes its minimum-image
+ *    edges, and retains private coordinates only for triangles that wrap.
+ *    Subsequent output blocks reuse that result. See src/io/vtu_writer.c §2.
  */
 
 #ifndef MFTL_IO_H
@@ -119,7 +116,7 @@ typedef enum
  * The optional arrays are all things that are ALWAYS well-defined: identity and
  * ownership. Note what is deliberately absent -- there is no option to write
  * `tris.area` or `tris.normal`. Nothing on the object records whether those are
- * current (`derived` tracks the topology and the frames, not the geometry), and
+ * current (`derived` tracks connectivity, not geometry), and
  * a redistribution leaves them holding unspecified values by design. A writer
  * that emitted them would produce a file that looks right and is stale, which is
  * the exact failure mode this library spends its architecture avoiding. Compute
@@ -206,11 +203,9 @@ int MFTLWriteVtk(const MFTL_Object *object, const char *base_filename);
  *
  * ── Preconditions ──────────────────────────────────────────────────────────
  *
- * None on the geometry: positions are the only thing read, and they are always
- * authoritative. Current derived arrays (MFTLObjectHasTopology / HasFrames) are
- * not required but ARE used when present -- they turn the periodic-unwrap
- * analysis from a gathering pass into a streaming one. A freshly generated mesh
- * whose frames were never built writes correctly, just a little slower.
+ * None on the geometry: positions are authoritative. Current compact
+ * connectivity is used when present; otherwise the writer obtains the same
+ * indices from implicit half-edge records.
  *
  * ── Restrictions ───────────────────────────────────────────────────────────
  *

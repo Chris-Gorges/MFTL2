@@ -60,13 +60,13 @@
  * @brief Which per-vertex 3-vector an exchange moves.
  *
  * An enum rather than a pointer-to-member or an array offset, because the two
- * cases differ in more than the array: only a moved POSITION invalidates the
- * derived frames. Resolved once per call, outside every loop.
+ * cases share the schedule and differ only in which array is packed. Resolved
+ * once per call, outside every loop.
  */
 typedef enum
 {
-  GHOST_FIELD_POSITION = 0,  ///< `verts.pos`. Moving it invalidates the derived frames.
-  GHOST_FIELD_NORMAL = 1  ///< `verts.normal`. Leaves the frames alone.
+  GHOST_FIELD_POSITION = 0,  ///< `verts.pos`.
+  GHOST_FIELD_NORMAL = 1  ///< `verts.normal`.
 } ghost_field;
 
 /**
@@ -424,18 +424,6 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
       dst[3 * idx + 1] = src->value[1];
       dst[3 * idx + 2] = src->value[2];
     }
-  }
-
-  /* Moving a ghost POSITION invalidates the derived frames of every triangle
-   * incident to it, so the frame bit is cleared for the same reason
-   * MFTL_FOREACH_OWNED_VERTEX clears it: a caller that forgets would otherwise
-   * read geometry one timestep stale, silently and only where the mesh moved.
-   * A normal is an OUTPUT of the geometry and no frame depends on it, so the
-   * normal sync must not clear the bit -- doing so would force a needless frame
-   * rebuild on every consumer that runs after it. */
-  if (field == GHOST_FIELD_POSITION)
-  {
-    for (int o = 0; o < num_objects; ++o) MFTLObjectInvalidateFrames(objects[o]);
   }
 
   free(incoming);

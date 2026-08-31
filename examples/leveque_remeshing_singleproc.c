@@ -58,9 +58,7 @@ static void leveque_velocity(const double x[3], double t, double T, double u[3])
  * @brief Advects every owned vertex one step with classical RK4.
  *
  * MFTL_FOREACH_OWNED_VERTEX rather than a hand-written loop: it exploits the
- * ownership prefix so there is no per-vertex rank test, and it clears the frame
- * bit on the way out, so the geometry pass that follows cannot silently use
- * frames describing where the mesh was before the step.
+ * ownership prefix so there is no per-vertex rank test.
  */
 static void advect(MFTL_Object *obj, double t, double dt, double T)
 {
@@ -280,10 +278,6 @@ int main(int argc, char *argv[])
   for (double t = 0.0; t < T - 0.5 * dt; t += dt)
   {
     advect(obj, t, dt, T);
-
-    /* No redistribution on one rank, so the per-timestep order is the simple
-     * one: move the owned vertices, rebuild the frames, then remesh. */
-    MFTLObjectRefreshFrames(obj);
 
     MFTL_RemeshStats st;
     MFTLRemeshObject(obj, &params, &st);

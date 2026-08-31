@@ -50,8 +50,8 @@
  * ## WHY THE NORMAL IS NOT COMPUTED HERE
  *
  * MFTLComputeVertexNormals() gives the exact area-weighted normal for every
- * vertex in one streaming pass over `tris.edge` -- no fan walk, no dependent
- * loads, and correct across a periodic seam without a branch. Accumulating a
+ * vertex in one flat triangle pass -- no fan walk or dependent topology loads,
+ * and correct across a periodic seam. Accumulating a
  * cross product per vertex over its own one-ring, inside this loop, is the same
  * arithmetic done 3.4x slower (src/geometry/vertex_geometry.c) and invites the
  * boundary bug on top: walking the ring with is_inner = true means the
@@ -531,10 +531,7 @@ void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params,
 
   for (int sweep = 0; sweep < iterations; ++sweep)
   {
-    /* Both are needed every sweep, and in this order: the normals are computed
-     * from the frames, and the frames were invalidated by the previous sweep's
-     * motion. */
-    MFTLObjectRefreshFrames(obj);
+    /* Normals are refreshed from current positions every sweep. */
     MFTLComputeVertexNormals(obj);
 
     memcpy(new_pos, obj->verts.pos, (size_t) n_v * 3 * sizeof(double));
@@ -588,11 +585,8 @@ void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params,
     }
 
     memcpy(obj->verts.pos, new_pos, (size_t) n_v * 3 * sizeof(double));
-    MFTLObjectInvalidateFrames(obj);
   }
 
   free(new_pos);
 
-  /* Documented postcondition: the caller gets frames it can stream immediately. */
-  MFTLObjectRefreshFrames(obj);
 }

@@ -223,22 +223,20 @@ static void sb_addf(sbuf *b, const char *fmt, ...)
  * triangle's connectivity at them. Other triangles sharing those vertices are
  * unaffected, and the mesh in memory is never touched.
  *
- * Computed from scratch, the unwrapped corners take two
- * MFTLGetMinimumImageVector calls inside a helper the writer needs FOUR TIMES per
- * triangle per file (once to size the point list, once per data block). Here
- * `tris.anchor` and `tris.edge` ALREADY hold corner 0 and the two
- * seam-consistent edge vectors -- that is what the frames are -- so:
+ * The analysis pass computes the two minimum-image vectors once for each
+ * triangle that may wrap and retains the nine output coordinates only for
+ * triangles that actually cross a seam:
  *
  *     unwrapped corners = p0, p0 + e1, p0 + e2
  *
- * with no periodic arithmetic at all, from two contiguous streaming arrays.
+ * Subsequent output blocks reuse those retained coordinates.
  *
  * ── The detection criterion, and why it is the safe one to get wrong ────────
  *
  * A triangle straddles iff a reconstructed corner falls OUTSIDE the domain box
  * on a periodic axis. If no minimum-image correction applied on that axis then
- * e[d] is exactly p1[d]-p0[d] (build_frames subtracts a literal zero, which is
- * exact), so p0+e reproduces an in-box position to within one rounding. If a
+ * e[d] is exactly p1[d]-p0[d], so p0+e reproduces an in-box position to within
+ * one rounding. If a
  * correction did apply, the reconstruction sits a FULL domain length outside the
  * box -- not a close call.
  *
@@ -249,10 +247,8 @@ static void sb_addf(sbuf *b, const char *fmt, ...)
  * NO tolerance: any slack traded for fewer false positives buys them at the
  * price of false negatives, which is the wrong direction.
  *
- * (Comparing the edge vector against a freshly recomputed raw difference is
- * exact in both directions too -- but it needs the two far corner positions,
- * i.e. a gather per triangle. That form is kept as the fallback for a mesh whose
- * frames were never built.)
+ * Comparing each minimum-image edge against its raw difference makes the seam
+ * decision exact in both directions.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /** @brief Growable double buffer for the unwrapped corner coordinates. */
@@ -319,12 +315,11 @@ typedef struct
 /**
  * @brief Fills @p p for one object and appends its unwrapped corners to @p wpos.
  *
- * Three loop shapes rather than one with branches in it, because the periodic
- * test is loop-invariant in structure and the non-periodic case is common:
+ * Two loop shapes rather than one with branches in it, because the periodic
+ * test is loop-invariant and the non-periodic case is common:
  *
- *   (a) non-periodic          mark only; nothing can straddle
- *   (b) periodic + frames     streaming: tris.verts + anchor + edge, no gather
- *   (c) periodic, no frames   gathering: the exact test, two corners per edge
+ *   (a) non-periodic   mark connectivity only; nothing can straddle
+ *   (b) periodic       gather current positions and apply the exact seam test
  *
  * @param      obj            The mesh.
  * @param      include_ghosts Count ghost triangles too. Off in production.
@@ -346,13 +341,13 @@ static void analyze_piece(const MFTL_Object *obj, bool include_ghosts, piece *p,
 
   for (int v = 0; v < nv; ++v) p->remap[v] = MFTL_ERROR;
 
-  const bool streaming = MFTLObjectHasTopology(obj) && MFTLObjectHasFrames(obj);
+  const bool compact = MFTLObjectHasTopology(obj);
 
   if (!periodic)
   {
     /* (a) Marking only. With the derived array this is a flat pass over 12 bytes
      * per triangle; without it, three loads with a 16-byte stride. */
-    if (streaming)
+    if (compact)
     {
       const int *restrict tv = obj->tris.verts;
       for (int t = 0; t < nt; ++t)
@@ -375,49 +370,24 @@ static void analyze_piece(const MFTL_Object *obj, bool include_ghosts, piece *p,
     }
     if (nt > 0) memset(p->wflag, 0, (size_t) nt);
   }
-  else if (streaming)
-  {
-    /* (b) The streaming path. Reads three contiguous arrays and dereferences
-     * nothing; the wrap test is six compares against the box. */
-    const int *restrict tv = obj->tris.verts;
-    const double *restrict anc = obj->tris.anchor;
-    const double *restrict ed = obj->tris.edge;
-
-    for (int t = 0; t < nt; ++t)
-    {
-      p->remap[tv[3 * t + 0]] = 0;
-      p->remap[tv[3 * t + 1]] = 0;
-      p->remap[tv[3 * t + 2]] = 0;
-
-      const double *const a = &anc[3 * t];
-      const double *const e = &ed[6 * t];
-
-      int wrapped = 0;
-      for (int k = 0; k < 3; ++k)
-      {
-        if (!dom->is_periodic[k]) continue;
-        const double c1 = a[k] + e[k];
-        const double c2 = a[k] + e[3 + k];
-        if (c1 < dom->global_min[k] || c1 >= dom->global_max[k] || c2 < dom->global_min[k] || c2 >= dom->global_max[k]) wrapped = 1;
-      }
-
-      p->wflag[t] = (unsigned char) wrapped;
-      if (wrapped)
-      {
-        db_add_corners(wpos, a, e, e + 3);
-        p->n_wrapped++;
-      }
-    }
-  }
   else
   {
-    /* (c) No frames: recompute them for this triangle and use the exact test.
-     * Correct on a mesh that was just generated or just read in. */
+    /* (b) Compute each triangle's seam-consistent edges once during analysis. */
     const double *const pos = obj->verts.pos;
+    const int *const tv = compact ? obj->tris.verts : MFTL_NULL;
     for (int t = 0; t < nt; ++t)
     {
       int v[3];
-      MFTLGetTriangleVertices(obj, t, v);
+      if (compact)
+      {
+        v[0] = tv[3 * t + 0];
+        v[1] = tv[3 * t + 1];
+        v[2] = tv[3 * t + 2];
+      }
+      else
+      {
+        MFTLGetTriangleVertices(obj, t, v);
+      }
       p->remap[v[0]] = 0;
       p->remap[v[1]] = 0;
       p->remap[v[2]] = 0;

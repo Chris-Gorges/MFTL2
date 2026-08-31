@@ -956,8 +956,8 @@ typedef struct
  * precede the geometry pass (a triangle's three corners can belong to three
  * ranks), the geometry pass must cover the GHOSTS too (redistribution routes them
  * by their cached centre, and refreshing only the owned ones makes two ranks
- * disagree about a ghost's destination), and the frames are deliberately not
- * refreshed here because the redistribution rebuilds them on its way out.
+ * disagree about a ghost's destination). Position motion requires no derived
+ * geometry refresh.
  *
  * @param      ens        The ensemble.
  * @param      cfg        The configuration.
@@ -1041,7 +1041,7 @@ static void run_step(MFTL_Ensemble *ens, const config *cfg, const double *vel, r
     ph[PH_POST] += MPI_Wtime() - t0;
   }
 
-  /* Both go AFTER the redistribution, where the frames are current. */
+  /* Both go after redistribution so they operate on the new partition. */
   if (cfg->quality)
   {
     t0 = phase_begin(cfg->sync_phases, &wt[PH_QUAL]);
@@ -1153,15 +1153,15 @@ static double measure_clock_cost(void)
 /** @brief JSON keys for the redistribution sub-phases, in struct order. */
 static const char *const RSTAT_KEY[] = {"setup",      "owners",     "masks",     "destinations", "route",    "pack",   "exchange_counts",
                                         "exchange_post", "wait",    "group",     "reserve",      "kept_gather", "kept_place", "relink",
-                                        "arrivals",   "twins",      "derived_topology", "derived_frames", "teardown"};
+                                        "arrivals",   "twins",      "derived_topology", "teardown"};
 
 /** @brief Human labels for the same, padded for the printed table. */
 static const char *const RSTAT_LABEL[] = {"setup           ", "owner classify  ", "mask clear      ", "destinations    ", "route decision  ",
                                           "pack            ", "exchange counts ", "exchange post   ", "exchange wait   ", "arrival grouping",
                                           "pool growth     ", "kept: gather    ", "kept: place     ", "kept: relink    ", "arrivals        ",
-                                          "twin repair     ", "derived topology", "derived FRAMES  ", "teardown        "};
+                                          "twin repair     ", "derived topology", "teardown        "};
 
-#define N_RSTAT 19
+#define N_RSTAT 18
 
 /** @brief JSON keys for the ghost-sync sub-phases, in struct order. */
 static const char *const GSTAT_KEY[] = {"collect", "exchange_counts", "exchange_requests", "owner_table", "answer", "exchange_replies", "apply", "teardown"};
@@ -1191,7 +1191,7 @@ static void rstats_reduce(const MFTL_RedistributeStats *st, double *rt, double *
   const double lt[N_RSTAT] = {st->t_setup,     st->t_owners,          st->t_masks,           st->t_destinations, st->t_route,
                               st->t_pack,      st->t_exchange_counts, st->t_exchange_data,   st->t_wait,         st->t_group,
                               st->t_reserve,   st->t_kept_gather,     st->t_kept_place,      st->t_relink,       st->t_arrivals,
-                              st->t_twins,     st->t_derived_topology, st->t_derived_frames, st->t_teardown};
+                              st->t_twins,     st->t_derived_topology, st->t_teardown};
   const double lg[N_GSTAT] = {st->g_t_collect, st->g_t_counts, st->g_t_requests, st->g_t_table, st->g_t_answer, st->g_t_replies, st->g_t_apply,
                               st->g_t_teardown};
   const double ltot[2] = {st->t_total, st->g_t_total};

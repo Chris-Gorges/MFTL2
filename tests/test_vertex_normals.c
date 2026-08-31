@@ -9,8 +9,7 @@
  * missed zeroing, a vertex whose contributions are counted twice. So the tests
  * do not check the implementation against itself -- most of them compare it with
  * a REFERENCE built from a completely different code path (a half-edge one-ring
- * walk plus MFTLGetTriangleProperties, which reads positions rather than the
- * derived frames), and the rest check physics that no implementation detail can
+ * walk plus MFTLGetTriangleProperties), and the rest check physics that no implementation detail can
  * fake.
  *
  * Multi-rank note: MFTLGenerateSphere is collective and gives rank 0 the whole
@@ -41,10 +40,8 @@ static MFTL_Ensemble *g_per = MFTL_NULL;   ///< periodic in all three axes, [0, 
  *
  * Deliberately shares nothing with the implementation under test: it walks the
  * half-edge fan instead of streaming triangles, and it gets each face's area and
- * unit normal from MFTLGetTriangleProperties, which reads `verts.pos` and does
- * its own minimum-image work rather than trusting `tris.edge`. Agreement between
- * the two therefore also checks that the derived frames are consistent with the
- * positions they were built from.
+ * unit normal from MFTLGetTriangleProperties. Agreement therefore checks two
+ * independent traversal strategies over the same authoritative positions.
  */
 static void reference_vertex_normals(const MFTL_Object *obj, double *out)
 {
@@ -276,8 +273,8 @@ static int test_normals_are_unaffected_by_a_periodic_seam(void)
    * it, once centred exactly on the corner so that every one of its triangles
    * near the seam has vertices wrapped to the opposite face.
    *
-   * The vertex normal is built from tris.edge, which carries the minimum-image
-   * correction, so the two must produce the SAME normal at corresponding
+   * The vertex normal uses minimum-image edge vectors, so the two must produce
+   * the SAME normal at corresponding
    * vertices. If the seam handling were wrong, the wrapped sphere's rim vertices
    * would get normals pointing across the domain. */
   const double inside[3] = {4.0, 4.0, 4.0};
@@ -402,10 +399,8 @@ static int test_normals_follow_vertex_motion(void)
   const double c[3] = {0.0, 0.0, 0.0};
   MFTL_Object *obj = make_sphere(g_open, c, 1.0, 4);
 
-  /* Squash the sphere into an ellipsoid. This is the real per-timestep order:
-   * move owned vertices, refresh the frames, then recompute. */
+  /* Squash the sphere into an ellipsoid and recompute from current positions. */
   MFTL_FOREACH_OWNED_VERTEX(obj, pos[2] *= 0.5;);
-  MFTLObjectRefreshFrames(obj);
   MFTLComputeVertexNormals(obj);
 
   int ok = 1;

@@ -84,14 +84,13 @@ static int cmp_ll(const void *a, const void *b)
 
 static void pair_log_sort(pair_log *l) { qsort(l->keys, (size_t) l->n, sizeof(long long), cmp_ll); }
 
-/** @brief A sphere in @p ens, ready to use: geometry computed, frames current. */
+/** @brief A sphere in @p ens, ready to use with current geometry. */
 static MFTL_Object *make_sphere(MFTL_Ensemble *ens, double cx, double cy, double cz, double r, int refine)
 {
   MFTL_Object *const obj = MFTLObjectCreate(0);
   MFTLEnsembleAddObject(ens, obj);
   double c[3] = {cx, cy, cz};
   MFTLGenerateSphere(obj, c, r, refine);
-  MFTLObjectRefreshFrames(obj);
   MFTLComputeTriangleGeometry(obj, obj->tris.n);
   return obj;
 }
@@ -434,8 +433,6 @@ static int test_refit_only_matches_full_rebuild(void)
     pos[1] += 0.01 * cos(2.0 * pos[2]);
     pos[2] += 0.005 * sin(5.0 * pos[0]);
   }
-  MFTLObjectRefreshFrames(obj);
-
   TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTL_RefitLBVH(refitted, obj));
 
   MFTL_BVH *const rebuilt = MFTL_GenerateLBVH(obj, &p);
@@ -600,8 +597,8 @@ static int test_separated_bodies_report_nothing(void)
  * into a cell it is nowhere near, and its AABB spans the whole box and overlaps
  * everything.
  *
- * The fix is that a primitive is built from the SEAM-CONSISTENT frame, so its
- * three corners are mutually unwrapped. The assertion below is the observable
+ * The fix is that a primitive uses minimum-image edges, so its three corners are
+ * mutually unwrapped. The assertion below is the observable
  * consequence: the root box of a small sphere sitting on the seam must stay
  * about as wide as the sphere, not as wide as the domain.
  */
@@ -859,42 +856,38 @@ static int test_absolute_floor_overrides_the_relative_envelope(void)
  * ─────────────────────────────────────────────────────────────────────────── */
 
 /**
- * @brief The frame path and the half-edge path must give the same corners.
- *
- * MFTL_BVHPrimVerts dispatches on whether the frames are current, exactly as
- * MFTLComputeTriangleGeometry does. The two must agree, or a BVH built before a
- * frame refresh describes different geometry from one built after it.
+ * @brief Compact connectivity and half-edge fallback give the same corners.
  */
-static int test_prim_verts_agree_whether_frames_are_current(void)
+static int test_prim_verts_agree_for_both_connectivity_paths(void)
 {
   MFTL_Object *const obj = make_sphere(g_per, 0.2, 5.0, 5.0, 1.0, 1);
   MFTL_BVHBuildParams p = params_with(1e-3);
   MFTL_BVH *const bvh = MFTL_GenerateLBVH(obj, &p);
 
   const int n = bvh->n_local_prims;
-  double *const with_frames = (double *) malloc(9 * (size_t) n * sizeof(double));
+  double *const with_topology = (double *) malloc(9 * (size_t) n * sizeof(double));
 
-  TEST_ASSERT(MFTLObjectHasFrames(obj));
+  TEST_ASSERT(MFTLObjectHasTopology(obj));
   for (int i = 0; i < n; ++i)
   {
     double tri[3][3];
     MFTL_BVHPrimVerts(bvh, i, tri);
-    memcpy(&with_frames[9 * i], tri, 9 * sizeof(double));
+    memcpy(&with_topology[9 * i], tri, 9 * sizeof(double));
   }
 
-  MFTLObjectInvalidateFrames(obj);
-  TEST_ASSERT(!MFTLObjectHasFrames(obj));
+  MFTLObjectInvalidateDerived(obj);
+  TEST_ASSERT(!MFTLObjectHasTopology(obj));
 
   for (int i = 0; i < n; ++i)
   {
     double tri[3][3];
     MFTL_BVHPrimVerts(bvh, i, tri);
     for (int c = 0; c < 3; ++c)
-      for (int k = 0; k < 3; ++k) TEST_ASSERT_EQUAL_DOUBLE(with_frames[9 * i + 3 * c + k], tri[c][k], 1e-15);
+      for (int k = 0; k < 3; ++k) TEST_ASSERT_EQUAL_DOUBLE(with_topology[9 * i + 3 * c + k], tri[c][k], 1e-15);
   }
 
-  free(with_frames);
-  MFTLObjectRefreshFrames(obj);
+  free(with_topology);
+  MFTLObjectBuildDerived(obj);
   MFTL_DestroyBVH(bvh);
   return 0;
 }
@@ -970,7 +963,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_detection_at_two_disparate_length_scales);
   RUN_TEST(test_absolute_floor_overrides_the_relative_envelope);
 
-  RUN_TEST(test_prim_verts_agree_whether_frames_are_current);
+  RUN_TEST(test_prim_verts_agree_for_both_connectivity_paths);
   RUN_TEST(test_empty_partition_yields_an_empty_hierarchy);
 
   TEST_REPORT();

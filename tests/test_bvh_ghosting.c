@@ -402,7 +402,6 @@ static void refresh(void)
 {
   for (int i = 0; i < g_ens->num_objects; ++i)
   {
-    MFTLObjectRefreshFrames(g_ens->objects[i]);
     MFTLComputeTriangleGeometry(g_ens->objects[i], g_ens->objects[i]->tris.n);
   }
 }

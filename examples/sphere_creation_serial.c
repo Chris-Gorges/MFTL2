@@ -96,14 +96,13 @@ int main(int argc, char *argv[])
 
   /* --- 5. The per-timestep pass -------------------------------------------
    *
-   * One streaming pass over the triangle frames writes area, normal and centre
-   * AND accumulates the quality statistics, then three fused reductions make
+   * One gathered pass writes area, normal and centre AND accumulates the quality statistics, then three fused reductions make
    * them global. Collective. */
   MFTLEnsembleUpdate(ensemble);
 
   /* --- 5b. Per-vertex geometry --------------------------------------------
    *
-   * Area-weighted vertex normals: one scatter over the triangle frames, one
+   * Area-weighted vertex normals: one triangle scatter, one
    * normalising pass. LOCAL -- it accumulates over ghost triangles too, so an
    * owned vertex needs no communication to get the exact answer. */
   MFTLComputeVertexNormals(object);

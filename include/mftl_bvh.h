@@ -50,11 +50,9 @@
  * (the triangle sorts into a cell it is nowhere near) and, worse, its AABB, which
  * then spans the whole domain and is a false positive against everything.
  *
- *   Fixed by building every primitive from a SEAM-CONSISTENT frame:
- *   p0 = anchor, p1 = anchor + e1, p2 = anchor + e2 (`tris.anchor`/`tris.edge`,
- *   whose minimum-image correction was already paid at frame-build time). A
- *   primitive's three corners are therefore always mutually unwrapped, its AABB
- *   is tight, and its centroid is the true one. Guarded by
+ *   Fixed by gathering every primitive's current positions and forming
+ *   minimum-image edges from corner 0. The three corners are therefore mutually
+ *   unwrapped, its AABB is tight, and its centroid is the true one. Guarded by
  *   `test_periodic_morton_of_a_straddling_object`.
  *
  * BETWEEN two objects -- two bodies on opposite faces of the domain that are
@@ -307,9 +305,8 @@ typedef struct MFTL_BVH
    * MFTL_SpatialHalo, and the caller must keep that alive for the BVH's lifetime.
    *
    * The BVH stores no geometry of its own for these, and does not need to: a
-   * patch is a real object, so the nine doubles a private per-triangle array
-   * would hold come out of `tris.anchor`/`tris.edge`
-   * through exactly the accessor the local triangles use, and the local/remote
+   * patch is a real object, so its current corners come from positions and
+   * connectivity through exactly the accessor the local triangles use. The local/remote
    * distinction disappears from everything except one index comparison.
    */
   const MFTL_Object *halo;
@@ -369,9 +366,8 @@ typedef struct MFTL_BVH
  * @brief Writes the three corners of primitive @p p into @p out, unwrapped.
  *
  * The one accessor both primitive kinds go through, so no consumer branches on
- * local-versus-remote. The corners are SEAM-CONSISTENT: for a local primitive
- * they come from the triangle frame (or from a minimum-image walk of the
- * half-edges when the frames are stale), for a remote one they arrived that way.
+ * local-versus-remote. The corners are seam-consistent and gathered from the
+ * source object's current positions with minimum-image edges.
  *
  * @param      bvh The hierarchy.
  * @param      p   Primitive index in `[0, n_prims)`.

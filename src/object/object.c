@@ -209,8 +209,6 @@ typedef struct
   size_t center;  ///< [3*capacity] centroids, wrapped into the domain.
   size_t verts;  ///< [3*capacity] derived: vertex index per corner.
   size_t neighbors;  ///< [3*capacity] derived: triangle across each half-edge.
-  size_t anchor;  ///< [3*capacity] derived: position of corner 0.
-  size_t edge;  ///< [6*capacity] derived: {e1, e2}, seam-consistent.
 } triangle_layout;
 
 /**
@@ -238,8 +236,6 @@ static size_t triangle_layout_compute(triangle_layout *l, int cap)
   l->center = MFTLLayoutAdd(&cursor, 3 * n, sizeof(double));
   l->verts = MFTLLayoutAdd(&cursor, 3 * n, sizeof(int));
   l->neighbors = MFTLLayoutAdd(&cursor, 3 * n, sizeof(int));
-  l->anchor = MFTLLayoutAdd(&cursor, 3 * n, sizeof(double));
-  l->edge = MFTLLayoutAdd(&cursor, 6 * n, sizeof(double));
   return cursor;
 }
 
@@ -259,8 +255,6 @@ static void triangle_pool_bind(MFTL_TrianglePool *p, unsigned char *blk, const t
   p->center = (double *) (void *) (blk + l->center);
   p->verts = (int *) (void *) (blk + l->verts);
   p->neighbors = (int *) (void *) (blk + l->neighbors);
-  p->anchor = (double *) (void *) (blk + l->anchor);
-  p->edge = (double *) (void *) (blk + l->edge);
 }
 
 /**
@@ -305,8 +299,6 @@ static void triangle_pool_resize(MFTL_TrianglePool *p, int capacity)
     memcpy(blk + l.center, p->center, 3 * n * sizeof(double));
     memcpy(blk + l.verts, p->verts, 3 * n * sizeof(int));
     memcpy(blk + l.neighbors, p->neighbors, 3 * n * sizeof(int));
-    memcpy(blk + l.anchor, p->anchor, 3 * n * sizeof(double));
-    memcpy(blk + l.edge, p->edge, 6 * n * sizeof(double));
   }
 
   free(p->block);
@@ -573,8 +565,6 @@ bool MFTLObjectPoolsAreConsistent(const MFTL_Object *obj)
     if ((const unsigned char *) tp->center != blk + l.center) return MFTL_FALSE;
     if ((const unsigned char *) tp->verts != blk + l.verts) return MFTL_FALSE;
     if ((const unsigned char *) tp->neighbors != blk + l.neighbors) return MFTL_FALSE;
-    if ((const unsigned char *) tp->anchor != blk + l.anchor) return MFTL_FALSE;
-    if ((const unsigned char *) tp->edge != blk + l.edge) return MFTL_FALSE;
   }
 
   return MFTL_TRUE;
