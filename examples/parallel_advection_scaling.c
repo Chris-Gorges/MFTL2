@@ -1291,8 +1291,19 @@ int main(int argc, char **argv)
    * before the opening redistribute and that nothing inside it can lower. Batched
    * generation does not reduce it either -- only the body count and the
    * refinement do. What happens to the memory AFTERWARDS is a separate question
-   * with a separate answer: see trap 1 in the header comment. */
-  const double gen_mb = (double) n_bodies * ((double) tri_per_body * 212.0 + (double) vert_per_body * 88.0) / (1024.0 * 1024.0);
+   * with a separate answer: see trap 1 in the header comment.
+   *
+   * The two constants are the POOL BLOCK SIZES and must track object.c:
+   *   triangle_layout_compute: 12 rec + 48 he(3x) + 8 area + 24 normal
+   *                            + 24 center + 12 verts + 12 neighbors = 140
+   *   vertex_layout_compute:   16 rec + 24 pos + 24 normal + 8 area
+   *                            + 8 mean_curv + 8 gauss_curv           =  88
+   * so one body is 3680 * 4^refine + 176 bytes. This read 212 until the
+   * persistent triangle frames were deleted (commit 71199c6, -72 B/triangle) and
+   * nothing updated it, which overstated every generation figure by 1.391x.
+   * There is no compile-time link between these numbers and the layout -- if a
+   * pool array is added or removed, change them here too. */
+  const double gen_mb = (double) n_bodies * ((double) tri_per_body * 140.0 + (double) vert_per_body * 88.0) / (1024.0 * 1024.0);
   if (gen_mb > cfg.max_gen_mb)
   {
     if (rank == 0)

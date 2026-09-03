@@ -134,7 +134,7 @@ plus 8 B of list pointer — **288 B per body per rank**.
 
 The original never states this number, so there is no way to tell which regime it is optimising for.
 Note that this is *not* the memory problem `CLAUDE.md` deferred issue 20 describes — that one is
-about **pool capacity** on the generating rank (`5120 · 4^refine + 176` bytes per body), which
+about **pool capacity** on the generating rank (`3680 · 4^refine + 176` bytes per body), which
 survives redistribution because pools never shrink, and which removing empty objects does not touch.
 
 ### What it cannot remove

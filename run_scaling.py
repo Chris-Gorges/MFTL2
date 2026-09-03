@@ -37,11 +37,20 @@ Two properties of the accumulation are deliberate:
 Usage:
     python3 run_scaling.py --preset laptop --all
     python3 run_scaling.py --preset laptop --case medium --mode strong --ranks 1,2,4,8
+    python3 run_scaling.py --preset redist --results results/scaling-redist
     python3 run_scaling.py --plots-only
     python3 run_scaling.py --smoke
 
+The `redist` preset is the two-regime matrix described at CASES: one spanning body
+against thousands of dispersed ones, over a x4 size ladder, at np = 2, 3, 4 with the
+grid pinned to a slab. It exists to find where the redistribution's overhead starts
+paying rather than to re-confirm that it does not pay at a few hundred thousand
+triangles. Give it its OWN --results directory: the store is read whole and repeats
+collapse to a minimum without consulting the git hash, so results from two commits
+in one directory silently become one curve.
+
 Options:
-    --preset laptop|cluster   rank set, repeat count and default cases
+    --preset laptop|cluster|redist   rank set, repeat count and default cases
     --case NAME               one case, repeatable; default is the preset's list
     --mode strong|weak|both   default both
     --ranks A,B,C             override the preset's rank set
@@ -78,11 +87,70 @@ TRIS_PER_BODY = {r: 20 * (4 ** r) for r in range(0, 8)}
 
 #: The matrix. Each case is one strong curve and one weak curve; sweeping several
 #: is what separates "scaling holds" from "scaling holds at this size".
+#:
+#: Optional keys, both of which exist for the spanning family below:
+#:   "extra"  extra benchmark arguments, appended verbatim. This is the only way
+#:            to reach --radius / --jitter / --domain / --box / --max-gen-mb.
+#:   "modes"  the modes this case is defined for; default both. A case that is
+#:            strong-only is SKIPPED in weak mode rather than silently run.
 CASES = {
     "tiny": {"spheres": 100, "per_rank": 100, "refine": 5},
     "medium": {"spheres": 1000, "per_rank": 1000, "refine": 5},
     "large": {"spheres": 2000, "per_rank": 2000, "refine": 6},
 }
+
+# ── The redistribution re-measurement matrix ───────────────────────────────
+#
+# Two regimes over one size ladder, to find where the redistribution's overhead
+# starts paying rather than to re-confirm that it does not pay at 327 680
+# triangles (which is what the e38d23d shakedown measured).
+#
+# SPANNING is one body split across every rank: halo-dominated, one object, and
+# the case MFTLRedistributeSetSkipUnchangedBodies can never help, because the one
+# body moves every step. DISPERSED is thousands of bodies each well inside a rank
+# box, which is the regime the body skip was built for.
+#
+# The ladder is powers of four because a single icosphere is 20*4^R triangles and
+# nothing else is reachable for the spanning row. S below is the TOTAL triangle
+# count at np = 4; the dispersed row matches it exactly with refine-3 bodies, and
+# the weak row carries S/4 per rank so that its np = 4 total is S again.
+#
+# Three fixture decisions, each of which is load-bearing:
+#
+#  * SPANNING NEEDS AN EXPLICIT --radius. derive_radius caps the phi-derived
+#    radius at 0.45 * the lattice cell so that lattice neighbours cannot
+#    interpenetrate, and for one body the cell IS the domain -- so phi alone can
+#    never produce a body bigger than 0.9 of the box, and the cap is what an
+#    explicit radius bypasses. At radius 1.5 in a 4^3 domain the body covers
+#    x in [0.5, 3.5] and therefore spans every rank at 2x1x1, 3x1x1 and 4x1x1.
+#
+#  * SPANNING SETS --jitter 0. With one body the jitter is not stratification, it
+#    is just an unreproducible offset; zero puts the body exactly at the domain
+#    centre so the partition is a pure function of the rank count.
+#
+#  * WEAK SETS --box 16^(1/3), NOT the default 1.0. The weak domain is box*cuts,
+#    so at the default the weak row would be 16x denser than the strong row at
+#    the same S -- and density feeds derive_radius, so the two rows would have
+#    different body radii and incomparable halo fractions. At box = 16^(1/3) the
+#    per-rank volume equals the strong row's per-rank volume at np = 4 (16.0),
+#    both rows sit at 1.0 bodies per unit volume, and derive_radius returns the
+#    same 0.2287 in both. The rows then differ in what they are meant to differ
+#    in and in nothing else.
+SPAN_EXTRA = ["--radius", "1.5", "--jitter", "0", "--domain", "4", "4", "4", "--max-gen-mb", "3000"]
+WEAK_BOX = ["--box", "2.5198421", "--max-gen-mb", "3000"]
+
+#: (label stem, total triangles at np=4, spanning refine, dispersed bodies).
+#: Dispersed is refine 3 = 1280 triangles per body at every rung, so the size is
+#: carried by the body COUNT; spanning carries it by refinement. That asymmetry is
+#: forced -- growing a dispersed body would eventually make it span.
+REDIST_LADDER = [("82k", 81920, 6, 64), ("328k", 327680, 7, 256), ("1311k", 1310720, 8, 1024), ("5243k", 5242880, 9, 4096)]
+
+for _stem, _S, _refine, _bodies in REDIST_LADDER:
+    CASES["span_" + _stem] = {"spheres": 1, "per_rank": 0, "refine": _refine, "extra": SPAN_EXTRA, "modes": ["strong"]}
+    CASES["disp_" + _stem] = {"spheres": _bodies, "per_rank": _bodies // 4, "refine": 3, "extra": WEAK_BOX}
+
+#: The cases the 'redist' preset sweeps, in ladder order.
+REDIST_CASES = [p + "_" + s for p in ("span", "disp") for s, _, _, _ in REDIST_LADDER]
 
 #: The iso-triangle ladder: (bodies, refine), all exactly 327 680 triangles.
 #: Exact powers of four, so the ladder is exact rather than approximate. With the
@@ -108,6 +176,29 @@ PRESETS = {
         "cases": ["tiny", "medium", "large"],
         "iso_ranks": [36],
         "cores": 36,
+    },
+    # Re-measuring the redistribution on a 4-performance-core laptop.
+    #
+    # NO np = 1. The e38d23d shakedown baselined there and mostly measured the
+    # cost of becoming parallel at all: at np = 1 no ghosts exist and the
+    # redistribution communicates with nobody, so the step is a different
+    # operation rather than the same one on fewer ranks. Baselining at np = 2
+    # costs the absolute speedup number and buys a curve whose points are all the
+    # same code path.
+    #
+    # NO np = 8 either. The machine has four performance cores, so every rank
+    # above four lands on an efficiency core and the absolute per-triangle cost
+    # roughly triples -- a hardware cliff that is indistinguishable from a
+    # scaling limit in the plot.
+    "redist": {
+        "ranks": [2, 3, 4],
+        "repeats": 3,
+        "steps": 30,
+        "warmup": 3,
+        "cases": REDIST_CASES,
+        "iso_ranks": [4],
+        "cores": os.cpu_count() or 4,
+        "pin_slabs": True,
     },
 }
 
@@ -218,7 +309,7 @@ def build_release():
         fail("build_all.py failed")
 
 
-def case_args(label, mode, spheres, per_rank, refine, steps, warmup):
+def case_args(label, mode, spheres, per_rank, refine, steps, warmup, extra=None):
     """The benchmark arguments for one point of one curve.
 
     :param label:    Tag recorded in the result.
@@ -228,6 +319,9 @@ def case_args(label, mode, spheres, per_rank, refine, steps, warmup):
     :param refine:   Subdivision level.
     :param steps:    Timed steps.
     :param warmup:   Untimed steps first.
+    :param extra:    Extra benchmark arguments, appended verbatim. The benchmark
+                     rejects an unknown option rather than ignoring it, so a typo
+                     here fails the point instead of silently changing the fixture.
     :returns: A list of command-line arguments.
     """
     args = ["--label", label, "--mode", mode, "--refine", str(refine), "--steps", str(steps), "--warmup", str(warmup), "--repeat", "1"]
@@ -235,7 +329,25 @@ def case_args(label, mode, spheres, per_rank, refine, steps, warmup):
         args += ["--spheres-per-rank", str(per_rank)]
     else:
         args += ["--spheres", str(spheres)]
-    return args
+    return args + list(extra or [])
+
+
+def slab_cuts(p):
+    """The process grid that keeps the decomposition's SHAPE fixed across a sweep.
+
+    MPI_Dims_create gives 2x1x1, 3x1x1 and 2x2x1 at np = 2, 3, 4, so the grid
+    changes DIMENSIONALITY between the last two points. In a three-point curve that
+    is confounded with the rank count: np = 4 has more neighbours and a different
+    halo structure as well as more ranks, and no amount of repeats separates them.
+    Pinning every point to a slab leaves P as the only thing that moves.
+
+    The cost is that a slab is not what a real run would choose, so the sweep also
+    takes ONE np = 4 point at the square grid to price the shape on its own.
+
+    :param p: Rank count.
+    :returns: The --cuts arguments for a 1-D slab decomposition.
+    """
+    return ["--cuts", str(p), "1", "1"]
 
 
 def build_jobs(opts, preset):
@@ -251,14 +363,33 @@ def build_jobs(opts, preset):
     steps = opts.steps or preset["steps"]
     warmup = preset["warmup"]
 
+    pin = preset.get("pin_slabs", False)
+
     for name in opts.case or preset["cases"]:
         if name not in CASES:
             fail("unknown case '%s' (have: %s)" % (name, ", ".join(sorted(CASES))))
         c = CASES[name]
+        extra = c.get("extra", [])
         for mode in modes:
+            # A case may be defined for only one mode -- the spanning family is
+            # strong-only, because weak scaling needs work proportional to P and a
+            # single icosphere only moves in factors of four, so 2 -> 3 -> 4 is
+            # not expressible. Skipping is the honest answer; the alternative is a
+            # weak "curve" whose per-rank work silently is not constant.
+            if mode not in c.get("modes", ["strong", "weak"]):
+                continue
             for p in ranks:
                 jobs.append({"label": name, "mode": mode, "ranks": p,
-                             "args": case_args(name, mode, c["spheres"], c["per_rank"], c["refine"], steps, warmup)})
+                             "args": case_args(name, mode, c["spheres"], c["per_rank"], c["refine"], steps, warmup,
+                                               extra + (slab_cuts(p) if pin else []))})
+            # The shape probe. It needs its own LABEL, not just its own arguments:
+            # the store filename is <label>_<mode>_np<P>_r<rep>.json, so a second
+            # np = 4 point under the same label would overwrite the first.
+            if pin and 4 in ranks:
+                sq = name + "_sq"
+                jobs.append({"label": sq, "mode": mode, "ranks": 4,
+                             "args": case_args(sq, mode, c["spheres"], c["per_rank"], c["refine"], steps, warmup,
+                                               extra + ["--cuts", "2", "2", "1"])})
 
     if opts.iso:
         # The granularity ladder is a STRONG-mode family: the total triangle count
@@ -513,8 +644,8 @@ def write_report(groups, runs, path):
     out.append("headline is the **mean over timed steps**, because only means add up to the wall\n")
     out.append("clock. Repeats were taken round robin over the rank counts, never in blocks.\n")
 
-    strong = sorted(k for k in groups if k[1] == "strong" and not k[0].startswith("iso") and not k[0].startswith("io_"))
-    weak = sorted(k for k in groups if k[1] == "weak")
+    strong = [k for k in matrix_keys(groups, "strong")]
+    weak = [k for k in matrix_keys(groups, "weak")]
 
     if strong:
         out.append("\n## Strong scaling\n")
@@ -544,10 +675,14 @@ def write_report(groups, runs, path):
         out.append("\n## Weak scaling\n")
         out.append("\nWork per rank fixed; the domain grows with the process grid, so bodies per rank,\n")
         out.append("halo fraction and neighbour count are all invariant. Ideal is a FLAT line.\n")
-        out.append("\nThe `E(P0)` and `E(P2)` columns differ on purpose. P=1 is a different code path --\n")
-        out.append("no ghosts exist and the redistribution communicates with nobody -- so the first\n")
-        out.append("step is the cost of being parallel at all rather than a scaling trend, and\n")
-        out.append("normalising only to P=1 charges that one-off to the trend.\n")
+        out.append("\n**Two baselines, and the reason depends on where the sweep starts.** A sweep that\n")
+        out.append("includes P=1 has a first point that is a different code path -- no ghosts exist and\n")
+        out.append("the redistribution communicates with nobody -- so normalising only to it charges the\n")
+        out.append("one-off cost of being parallel at all to the scaling trend. A sweep that starts at\n")
+        out.append("P=2 has a subtler version of the same problem: on a periodic axis with two cells the\n")
+        out.append("-1 and +1 neighbour offsets land on the SAME rank and are deduplicated, so P=2 has\n")
+        out.append("one distinct neighbour per pinned axis where P=3 and P=4 have two. Either way the\n")
+        out.append("second column removes the first point from the comparison.\n")
         for key in weak:
             ps, rs = curve(groups[key])
             if not ps:
@@ -555,7 +690,8 @@ def write_report(groups, runs, path):
             base = rs[0]
             second = rs[1] if len(rs) > 1 else None
             out.append("\n### %s -- %d bodies/rank x refine %d\n\n" % (key[0], base["n_bodies"] // base["nranks"], base["refinements"]))
-            out.append("| P | grid | bodies | triangles | ms/step | E(P0) | E(P2) | comm % | imbalance | halo % | setup s |\n")
+            out.append("| P | grid | bodies | triangles | ms/step | E(P%d) | E(P%s) | comm %% | imbalance | halo %% | setup s |\n"
+                       % (ps[0], str(ps[1]) if second else "-"))
             out.append("|---|---|---|---|---|---|---|---|---|---|---|\n")
             for p, r in zip(ps, rs):
                 e0 = base["wall_s"] / r["wall_s"]
@@ -568,6 +704,26 @@ def write_report(groups, runs, path):
         out.append("> builds every body on rank 0, so in weak mode the setup column grows linearly with P\n")
         out.append("> on one rank while the timed loop does not. It is excluded from every scaling total\n")
         out.append("> above and must never be folded back in.\n")
+
+    probes = sorted(k for k in groups if k[0].endswith("_sq"))
+    if probes:
+        out.append("\n## Grid shape at np = 4\n")
+        out.append("\nEvery curve above pins the decomposition to a 1-D slab (`--cuts P 1 1`) so that the\n")
+        out.append("rank count is the only thing moving along it. That leaves the SHAPE unmeasured, so\n")
+        out.append("each case also runs one np = 4 point at 2x2x1. The ratio below is the whole content\n")
+        out.append("of the choice: a slab has two neighbours per rank, a square grid has more, and the\n")
+        out.append("halo column says what that costs.\n\n")
+        out.append("| case | mode | 4x1x1 ms/step | 2x2x1 ms/step | ratio | halo % slab | halo % square |\n")
+        out.append("|---|---|---|---|---|---|---|\n")
+        for key in probes:
+            base_key = (key[0][:-3], key[1])
+            if base_key not in groups or 4 not in groups[base_key] or 4 not in groups[key]:
+                continue
+            slab, square = groups[base_key][4], groups[key][4]
+            out.append("| %s | %s | %.3f | %.3f | %.2fx | %.2f | %.2f |\n" % (
+                base_key[0], key[1], ms_per_step(slab), ms_per_step(square),
+                ms_per_step(square) / ms_per_step(slab),
+                100.0 * slab["halo_fraction"], 100.0 * square["halo_fraction"]))
 
     iso = sorted(k for k in groups if k[0].startswith("iso"))
     if iso:
@@ -708,15 +864,85 @@ def save(plt, fig, plots_dir, name):
     plt.close(fig)
 
 
+def is_curve_label(label):
+    """Whether a label belongs on a scaling curve at all.
+
+    Excludes the iso-triangle ladder and the I/O configurations, which are swept at
+    a single rank count, and the `_sq` grid-shape probes, which are one np = 4
+    point each. Plotting a one-point series draws a marker with no line and reads
+    as a curve that collapsed.
+
+    :param label: A run label.
+    :returns: True if it is a rank-count curve.
+    """
+    return not label.startswith("iso") and not label.startswith("io_") and not label.endswith("_sq")
+
+
+#: Line style per regime family, so identity is never carried by colour alone.
+FAMILY_STYLE = {"span": ("-", "o", "spanning"), "disp": ("--", "s", "dispersed")}
+
+
+def series_style(label, fallback_index, sizes):
+    """Colour, marker and line style for one curve.
+
+    Two encodings, chosen by what the quantity IS. A `<family>_<size>` label carries
+    an ORDERED quantity (the size rung) and a two-level categorical one (the
+    regime), so the size takes the ordinal blue ramp and the regime takes the line
+    style and marker. Painting eight `<family>_<size>` curves from the categorical
+    slots instead is the mistake this avoids twice over: it encodes an ordered
+    quantity as unordered hues, and it interleaves the two regimes so that the
+    comparison the chart exists for has to be read out of the legend.
+
+    Anything else -- `tiny`, `medium`, `large`, the iso rungs -- is genuinely
+    categorical and keeps the fixed-order categorical slots.
+
+    :param label:          The run label.
+    :param fallback_index: Position among the plotted keys, for the categorical case.
+    :param sizes:          Ordered list of size stems present, for the ordinal case.
+    :returns: (colour, marker, linestyle, legend label).
+    """
+    parts = label.split("_", 1)
+    if len(parts) == 2 and parts[0] in FAMILY_STYLE and parts[1] in sizes:
+        style, marker, family = FAMILY_STYLE[parts[0]]
+        colour, _ = ordinal_steps(len(sizes))[sizes.index(parts[1])]
+        return colour, marker, style, "%s %s" % (family, parts[1])
+    return CATEGORICAL[fallback_index % len(CATEGORICAL)], "o", "-", label
+
+
+def size_stems(keys):
+    """The size rungs present among `<family>_<size>` labels, in ladder order.
+
+    :param keys: The (label, mode) keys being plotted.
+    :returns: A list of size stems, smallest first; empty if none are ladder labels.
+    """
+    order = [stem for stem, _, _, _ in REDIST_LADDER]
+    present = {k[0].split("_", 1)[1] for k in keys if k[0].split("_", 1)[0] in FAMILY_STYLE and "_" in k[0]}
+    return [stem for stem in order if stem in present]
+
+
+def narrow_range(values):
+    """Whether a set of positive values is too tight for a log axis to read.
+
+    A log2 speedup axis is right when the sweep spans 1 to 8 and wrong when it spans
+    0.98 to 1.20: there the only labelled ticks are 2^0 and 2^1 and every curve is
+    squashed against the bottom. The scale is chosen from the data rather than fixed.
+
+    :param values: The values to be plotted.
+    :returns: True if a linear axis should be used.
+    """
+    vals = [v for v in values if v > 0]
+    return not vals or max(vals) / min(vals) < 4.0
+
+
 def matrix_keys(groups, mode):
-    """The non-iso, non-io cases of one mode, in a stable order.
+    """The non-iso, non-io, non-probe cases of one mode, in a stable order.
 
     :param groups: Output of group_runs.
     :param mode:   'strong' or 'weak'.
     :returns: A sorted list of keys.
     """
     order = list(CASES)
-    keys = [k for k in groups if k[1] == mode and not k[0].startswith("iso") and not k[0].startswith("io_")]
+    keys = [k for k in groups if k[1] == mode and is_curve_label(k[0])]
     return sorted(keys, key=lambda k: order.index(k[0]) if k[0] in order else 99)
 
 
@@ -731,37 +957,47 @@ def plot_strong(plt, groups, plots_dir):
     if not keys:
         return
 
+    sizes = size_stems(keys)
     fig, ax = plt.subplots(figsize=(6.4, 4.2))
     all_ranks = set()
     for i, key in enumerate(keys):
         ps, rs = curve(groups[key])
         all_ranks.update(ps)
-        ax.plot(ps, [ms_per_step(r) for r in rs], marker="o", color=CATEGORICAL[i % len(CATEGORICAL)], label=key[0])
+        c, mk, ls, lab = series_style(key[0], i, sizes)
+        ax.plot(ps, [ms_per_step(r) for r in rs], marker=mk, linestyle=ls, color=c, label=lab)
         ideal = [ms_per_step(rs[0]) * ps[0] / float(p) for p in ps]
-        ax.plot(ps, ideal, linestyle="--", linewidth=1.2, color=INK_MUTED, zorder=0, label="ideal 1/P" if i == 0 else None)
+        ax.plot(ps, ideal, linestyle=":", linewidth=0.9, color=GRID, zorder=0, label="ideal 1/P" if i == 0 else None)
     ax.set_yscale("log")
     rank_axis(ax, sorted(all_ranks))
-    ax.legend()
+    # Outside the axes: with eight series the legend has nowhere inside to sit that
+    # is not on top of a curve.
+    ax.legend(loc="center left", bbox_to_anchor=(1.02, 0.5))
     finish(ax, "Strong scaling: total work fixed", "MPI ranks", "ms per timestep",
-           "Dashed: ideal 1/P from each case's own baseline. Log-log, so ideal is a straight line.")
+           "Dotted: ideal 1/P from each case's own baseline. Log-log, so ideal is a straight line.")
     save(plt, fig, plots_dir, "strong_walltime.png")
 
     fig, axes = plt.subplots(1, 2, figsize=(10.4, 4.2))
+    all_sp = []
     for i, key in enumerate(keys):
         ps, rs = curve(groups[key])
         base_p, base = ps[0], rs[0]
         sp = [base["wall_s"] / r["wall_s"] for r in rs]
-        eff = [s / (float(p) / base_p) for s, p in zip(sp, ps)]
-        c = CATEGORICAL[i % len(CATEGORICAL)]
-        axes[0].plot(ps, sp, marker="o", color=c, label=key[0])
-        axes[1].plot(ps, eff, marker="o", color=c, label=key[0])
+        eff = [x / (float(p) / base_p) for x, p in zip(sp, ps)]
+        all_sp += sp
+        c, mk, ls, lab = series_style(key[0], i, sizes)
+        axes[0].plot(ps, sp, marker=mk, linestyle=ls, color=c, label=lab)
+        axes[1].plot(ps, eff, marker=mk, linestyle=ls, color=c, label=lab)
     lim = sorted(set().union(*[set(curve(groups[k])[0]) for k in keys]))
-    axes[0].plot(lim, [p / float(lim[0]) for p in lim], "--", linewidth=1.2, color=INK_MUTED, zorder=0, label="ideal")
-    axes[1].axhline(1.0, linestyle="--", linewidth=1.2, color=INK_MUTED, zorder=0)
+    axes[0].plot(lim, [p / float(lim[0]) for p in lim], ":", linewidth=1.0, color=INK_MUTED, zorder=0, label="ideal")
+    axes[0].axhline(1.0, linestyle="-", linewidth=0.8, color=GRID, zorder=0)
+    axes[1].axhline(1.0, linestyle=":", linewidth=1.0, color=INK_MUTED, zorder=0)
     for ax in axes:
         rank_axis(ax, lim)
-    axes[0].set_yscale("log", base=2)
-    axes[0].legend()
+    # A log2 speedup axis is right for a 1..8 sweep and unreadable for a 0.98..1.20
+    # one, where the only labelled ticks are 2^0 and 2^1. Choose it from the data.
+    if not narrow_range(all_sp + [float(lim[-1]) / lim[0]]):
+        axes[0].set_yscale("log", base=2)
+    axes[0].legend(ncol=2)
     finish(axes[0], "Speedup", "MPI ranks", "T(baseline) / T(P)")
     finish(axes[1], "Parallel efficiency", "MPI ranks", "speedup / (P / P_baseline)",
            "1.0 is ideal. Below 1 is the fraction of added ranks that bought nothing.")
@@ -779,30 +1015,34 @@ def plot_weak(plt, groups, plots_dir):
     if not keys:
         return
 
+    sizes = size_stems(keys)
     fig, axes = plt.subplots(1, 2, figsize=(10.4, 4.2))
     all_ranks = set()
     for i, key in enumerate(keys):
         ps, rs = curve(groups[key])
         all_ranks.update(ps)
-        c = CATEGORICAL[i % len(CATEGORICAL)]
-        axes[0].plot(ps, [ms_per_step(r) for r in rs], marker="o", color=c, label=key[0])
+        c, mk, ls, lab = series_style(key[0], i, sizes)
+        axes[0].plot(ps, [ms_per_step(r) for r in rs], marker=mk, linestyle=ls, color=c, label=lab)
         base = rs[0]
-        axes[1].plot(ps, [base["wall_s"] / r["wall_s"] for r in rs], marker="o", color=c, label="%s (vs P=%d)" % (key[0], ps[0]))
+        axes[1].plot(ps, [base["wall_s"] / r["wall_s"] for r in rs], marker=mk, linestyle=ls, color=c,
+                     label="%s (vs P=%d)" % (lab, ps[0]))
         if len(rs) > 1:
             second = rs[1]
-            axes[1].plot(ps[1:], [second["wall_s"] / r["wall_s"] for r in rs[1:]], marker="s", markerfacecolor=SURFACE,
-                         linestyle=":", color=c, label="%s (vs P=%d)" % (key[0], ps[1]))
+            axes[1].plot(ps[1:], [second["wall_s"] / r["wall_s"] for r in rs[1:]], marker=mk, markerfacecolor=SURFACE,
+                         linestyle=":", color=c, label="%s (vs P=%d)" % (lab, ps[1]))
     ranks = sorted(all_ranks)
-    axes[1].axhline(1.0, linestyle="--", linewidth=1.2, color=INK_MUTED, zorder=0)
+    axes[1].axhline(1.0, linestyle=":", linewidth=1.0, color=INK_MUTED, zorder=0)
     for ax in axes:
         rank_axis(ax, ranks)
-    axes[0].legend()
-    axes[1].legend()
+    axes[0].set_yscale("log")
+    axes[0].legend(ncol=2, loc="upper left")
+    axes[1].legend(ncol=2, fontsize=6, loc="lower left")
     finish(axes[0], "Weak scaling: work per rank fixed", "MPI ranks", "ms per timestep",
            "Ideal is a FLAT line: the domain grows with the grid, so each rank keeps a constant volume.")
     finish(axes[1], "Weak efficiency", "MPI ranks", "T(baseline) / T(P)",
-           "Two baselines on purpose: P=1 has no ghosts and no exchange, so the first step is the\n"
-           "cost of being parallel at all, not a trend. The dotted series removes it.")
+           "Two baselines on purpose. The first point of a sweep is never a clean baseline: at P=1\n"
+           "there are no ghosts and no exchange, and at P=2 a periodic axis aliases both neighbours\n"
+           "onto one rank. The dotted series removes it.")
     save(plt, fig, plots_dir, "weak_scaling.png")
 
 
@@ -892,11 +1132,11 @@ def plot_partition(plt, groups, plots_dir):
     for i, key in enumerate(keys):
         ps, rs = curve(groups[key])
         all_ranks.update(ps)
-        c = CATEGORICAL[i % len(CATEGORICAL)]
+        c, mk, _, lab = series_style(key[0], i, size_stems(keys))
         style = "-" if key[1] == "strong" else ":"
-        label = "%s / %s" % key
-        axes[0].plot(ps, [r["structural_imbalance"] for r in rs], marker="o", linestyle=style, color=c, label=label)
-        axes[1].plot(ps, [100.0 * r["halo_fraction"] for r in rs], marker="o", linestyle=style, color=c, label=label)
+        label = "%s / %s" % (lab, key[1])
+        axes[0].plot(ps, [r["structural_imbalance"] for r in rs], marker=mk, linestyle=style, color=c, label=label)
+        axes[1].plot(ps, [100.0 * r["halo_fraction"] for r in rs], marker=mk, linestyle=style, color=c, label=label)
     axes[0].axhline(1.0, linestyle="--", linewidth=1.2, color=INK_MUTED, zorder=0)
     for ax in axes:
         rank_axis(ax, sorted(all_ranks))
@@ -1001,11 +1241,11 @@ def plot_memory_setup(plt, groups, plots_dir):
     for i, key in enumerate(keys):
         ps, rs = curve(groups[key])
         all_ranks.update(ps)
-        c = CATEGORICAL[i % len(CATEGORICAL)]
+        c, mk, _, lab = series_style(key[0], i, size_stems(keys))
         style = "-" if key[1] == "strong" else ":"
-        label = "%s / %s" % key
-        axes[0].plot(ps, [r["maxrss_bytes_max"] / (1024.0 * 1024.0) for r in rs], marker="o", linestyle=style, color=c, label=label)
-        axes[1].plot(ps, [r["t_setup_s"] for r in rs], marker="o", linestyle=style, color=c, label=label)
+        label = "%s / %s" % (lab, key[1])
+        axes[0].plot(ps, [r["maxrss_bytes_max"] / (1024.0 * 1024.0) for r in rs], marker=mk, linestyle=style, color=c, label=label)
+        axes[1].plot(ps, [r["t_setup_s"] for r in rs], marker=mk, linestyle=style, color=c, label=label)
     for ax in axes:
         rank_axis(ax, sorted(all_ranks))
         ax.set_yscale("log")

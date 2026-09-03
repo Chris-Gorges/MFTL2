@@ -179,7 +179,7 @@ typedef struct
  * @brief ONE per-vertex 3-vector, plus the id that identifies whose it is.
  *
  * Deliberately generic rather than named after the position: the same 32 bytes,
- * the same datatype and the same request/reply schedule carry whichever per-vertex
+ * the same datatype and the same request/reply exchange carry whichever per-vertex
  * vector is being synchronised. Two callers use it today --
  * MFTLUpdateGhostPositions and MFTLUpdateGhostVertexNormals -- and they differ
  * only in which array they read from and write into.
@@ -531,7 +531,7 @@ bool MFTLRedistributeGetSkipUnchangedBodies(void);
  * at its high-water mark for the rest of the run. That is not a corner case:
  * MFTLGenerateSphere() builds every body whole on rank 0, and after the opening
  * redistribution rank 0 holds a sliver of each in a block sized for all of it --
- * `5120 * 4^refine + 176` bytes per body, 640 MiB for 512 bodies at refine 4.
+ * `3680 * 4^refine + 176` bytes per body, 460 MiB for 512 bodies at refine 4.
  * With this armed, the redistribution offers every body it touched back to
  * MFTLObjectShrinkToFit() once the rebuild is complete.
  *
@@ -607,7 +607,7 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble *ens);
 /**
  * @brief Pulls exact NORMALS for every ghost vertex from its owning rank.
  *
- * The same request/reply schedule as MFTLUpdateGhostPositions, over the same
+ * The same request/reply exchange as MFTLUpdateGhostPositions, over the same
  * communicator, with the same cost -- only the array read and written differs.
  *
  * ── Why this exists at all, when normals need no communication ─────────────

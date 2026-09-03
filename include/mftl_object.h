@@ -150,7 +150,7 @@ void MFTLObjectClear(MFTL_Object *obj);
  * form, for a body that is merely smaller than it was.
  *
  * Both are needed. On the generation path bodies are built whole on rank 0 --
- * `5120 * 4^refine + 176` bytes each -- and the opening redistribution then
+ * `3680 * 4^refine + 176` bytes each -- and the opening redistribution then
  * leaves rank 0 with a SLIVER of the ones it still overlaps and NOTHING of the
  * rest. This function is what src/communication/redistribute.c calls for the
  * second group; the shrink is what handles the first. See

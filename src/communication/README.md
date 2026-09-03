@@ -275,7 +275,7 @@ positions and the topology — so four fifths of it is recomputable at the recei
 for less than it costs to send.
 
 #MFTL_GhostUpdatePayload is therefore deliberately **generic** rather than named
-after the position. The same 32 bytes, the same datatype and the same schedule
+after the position. The same 32 bytes, the same datatype and the same exchange
 carry whichever per-vertex vector is being synchronised; the two callers differ
 only in which array they read from and write into. Anything that genuinely needs
 a second field sends a second exchange and pays only for that field.
@@ -285,13 +285,8 @@ only worth doing per object that actually received a request — which is why th
 caller groups the requests by object first. In the many-body case that skips
 almost everything.
 
-@note **The schedule is rebuilt from scratch every timestep, and could be cached.**
-      Only the holder of a ghost knows that it holds it, so the request phase
-      cannot be removed — but after a redistribution the schedule is fixed until
-      the next one, so the owner side could keep its resolved slot list and every
-      subsequent sync would be a single `MPI_Neighbor_alltoallv` with no lookup.
-      Not done, because the loop this library is built around redistributes every
-      step and there would be nothing to amortise over.
+Every call reconstructs the requests directly from the current ghost suffix.
+No persistent owner-to-holder state or pool indices are retained between calls.
 
 ---
 

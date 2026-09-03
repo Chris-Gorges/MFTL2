@@ -881,9 +881,12 @@ comments:**
    ensemble's whole footprint stayed resident on rank 0 for the run. That was two claims welded
    together, and measuring them apart is what this entry now records.
 
-   `MFTLGenerateSphere` builds every body whole on rank 0 — `5120 * 4^refine + 176` bytes each,
-   80 MB for 256 bodies at refine 3, 640 MiB for 512 at refine 4. **That peak is real, it is serial,
-   and nothing here touches it**: every body exists at full size before the opening
+   `MFTLGenerateSphere` builds every body whole on rank 0 — `3680 * 4^refine + 176` bytes each,
+   57.5 MiB for 256 bodies at refine 3, 460 MiB for 512 at refine 4. That constant is
+   `140 B/triangle + 88 B/vertex`, read off `triangle_layout_compute` / `vertex_layout_compute` in
+   `src/object/object.c`; it said 5120 until 2026-08-31, because the triangle block lost the
+   72 B/triangle persistent frames and nothing that quotes the formula was updated with it.
+   **That peak is real, it is serial, and nothing here touches it**: every body exists at full size before the opening
    `MFTLRedistribute` runs. `examples/parallel_advection_scaling.c` prints it and refuses above
    `--max-gen-mb`. Fixing it needs a generator that builds distributed, which does not exist.
    Batched generation is NOT the fix — it shaves only the packed-buffer transient and costs

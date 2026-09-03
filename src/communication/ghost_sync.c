@@ -15,10 +15,9 @@
  *
  * ### One field per exchange, and why that is not a missed fusion
  *
- * The whole schedule -- who asks whom for which vertex, and where each reply
- * lands -- is a function of the PARTITION, not of the payload. So it is written
- * once, parameterised by which per-vertex 3-vector is being moved, and both
- * callers share every line of it:
+ * The whole exchange -- who asks whom for which vertex, and where each reply
+ * lands -- is independent of the payload. The implementation is parameterised
+ * by which per-vertex 3-vector is being moved, and both callers share it:
  *
  *   MFTLUpdateGhostPositions      verts.pos     -- authoritative, cannot be
  *                                                 recomputed anywhere else
@@ -26,7 +25,7 @@
  *                                                 vertices, not for ghosts
  *
  * Shipping position, normal, both curvatures and the area in one 80-byte message
- * looks like a saving (one schedule instead of two) and is not: four fifths of
+ * looks like a saving (one exchange instead of two) and is not: four fifths of
  * that payload is a function of the positions and the topology, so it would be
  * sent to save a receiver-side pass that costs less than the bytes do. Each field
  * costs exactly one exchange here, and a caller
@@ -37,11 +36,8 @@
  * ### Why a request/reply and not a push
  *
  * Only the HOLDER of a ghost knows that it holds it; the owner has no record of
- * who copied its vertex. The request phase is exactly that piece of information,
- * so it cannot be removed -- only amortised, by caching the schedule across
- * timesteps. That is not done here because the schedule is invalidated by every
- * redistribution, and the per-timestep loop this library is built around
- * redistributes every step.
+ * who copied its vertex. The request phase supplies exactly that information on
+ * every call. No persistent owner-to-holder state is stored.
  */
 
 #include "mftl_communication.h"
@@ -60,7 +56,7 @@
  * @brief Which per-vertex 3-vector an exchange moves.
  *
  * An enum rather than a pointer-to-member or an array offset, because the two
- * cases share the schedule and differ only in which array is packed. Resolved
+ * cases share the exchange code and differ only in which array is packed. Resolved
  * once per call, outside every loop.
  */
 typedef enum
@@ -165,10 +161,7 @@ static void answer_object_requests(const MFTL_Object *obj, ghost_field field, co
 }
 
 /**
- * @brief The shared request/reply exchange. Both public entry points are one
- *        line each on top of this.
- *
- * @brief The shared request/reply schedule behind both public ghost syncs.
+ * @brief The shared request/reply exchange behind both public ghost syncs.
  * @param ens   The ensemble.
  * @param field Which per-vertex 3-vector to move.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR if the exchange failed.
