@@ -335,6 +335,33 @@ typedef struct MFTL_Object
    */
   bool partition_dirty;
 
+  /**
+   * The last redistribution found this body globally unchanged, so its layout is
+   * at a fixed point and the next one may leave it alone entirely.
+   *
+   * The second half of the skip precondition, and it is a SEPARATE statement from
+   * `partition_dirty`: that one says "something changed and the current partition
+   * does not describe it", this one says "the current partition has already been
+   * rebuilt once since anything last changed".
+   *
+   * Both are needed because rebuild_object() is not idempotent -- an owned vertex
+   * whose incident triangles are all remote is dropped and re-received, so it
+   * lands at the END of the run. A body must therefore be clean TWICE before a
+   * skip reproduces the full rebuild SLOT FOR SLOT rather than merely as a set.
+   * `test_skipping_reproduces_the_full_rebuild` compares both digests and it is
+   * the order one that catches this.
+   *
+   * It lives on the object rather than in redistribution's workspace because it
+   * is per rank per BODY, and a workspace bitset indexed by list position has to
+   * be thrown away whenever the list changes -- which un-settles every body to
+   * answer a question about one. Here a body created on arrival simply starts
+   * unsettled, which is both correct and free.
+   *
+   * It occupies padding that was already there, next to `partition_dirty`, so
+   * sizeof(MFTL_Object) is unchanged.
+   */
+  bool partition_settled;
+
   struct MFTL_Domain *domain;  ///< Borrowed from the ensemble; MFTL_NULL until added.
 
   MFTL_ObjectQualityStatistics quality;  ///< By value: nine doubles do not need their own allocation.
@@ -364,6 +391,24 @@ typedef struct MFTL_Domain
 
   int num_neighbors;  ///< Degree of comm_graph.
   int *neighbors;  ///< [num_neighbors] neighbour ranks, in the order MPI reports them.
+
+  /**
+   * `[26][3]`, parallel to `neighbors`: the cell offset of that neighbour from
+   * this rank, each component in {-1, 0, +1}.
+   *
+   * It is the RELATIVE form on purpose. Absolute cell coordinates would answer
+   * the same question and would need MPI_Cart_coords per neighbour per query,
+   * plus a periodic-wrap correction at the seam; an offset needs neither, and
+   * "are these two cells 26-neighbours" becomes "is every component of the
+   * difference within 1".
+   *
+   * With a thin decomposition several of the 26 stencil offsets map onto the
+   * SAME rank (cuts = {2,1,1} periodic reaches its one neighbour both ways), so
+   * this records the FIRST offset that produced the neighbour. That is not a
+   * loss: at two cells per axis every cell is every other cell's neighbour, so
+   * either offset gives the same verdict. See MFTLEnsembleReduceBodies().
+   */
+  signed char neighbor_offset[26][3];
 
   // --- Domain Decomposition ---
   int cuts[3];  ///< Process grid {nx, ny, nz}; the product is nproc.
@@ -397,17 +442,69 @@ typedef struct MFTL_Ensemble
   /**
    * Owned; MFTLEnsembleDestroy() destroys each of them.
    *
-   * @warning Bodies are identified ON THE WIRE by their INDEX in this list, not
-   *          by `global_id`. Every rank must therefore hold the same object list
-   *          in the same order. A Debug-only checksum reduction inside the
-   *          redistribution reports a violation rather than silently merging
-   *          entities into the wrong body.
+   * Bodies are identified ON THE WIRE by #MFTL_Object::global_id, which
+   * MFTLEnsembleAddObject() hands out densely in add order -- NOT by their
+   * position in this list. The distinction does not show yet, because every rank
+   * holds every body and the two numbers are equal; it is what lets a rank stop
+   * holding bodies it has nothing of.
+   *
+   * @warning Every rank must still add the same bodies in the same order, so that
+   *          the same id names the same body everywhere. A Debug-only checksum
+   *          reduction inside the redistribution reports a violation rather than
+   *          silently merging entities into the wrong body.
    */
-  MFTL_Object **objects;
-  int num_objects;  ///< Objects currently in the list.
-  int capacity_objects;  ///< Slots allocated in `objects`.
+  MFTL_Object **local_objects;
+  int n_local_objects;  ///< Bodies THIS RANK holds. Never a global quantity.
+  int capacity_objects;  ///< Slots allocated in `local_objects`.
+
+  /**
+   * Size of the body-id space: every body's `global_id` is in [0, n_bodies_global).
+   *
+   * MFTLEnsembleAddObject() hands out the ids, so they are DENSE by construction
+   * -- the same rule vertices and triangles already follow (see
+   * MFTL_Object::next_vertex_gid). Density is what lets a body id be an array
+   * index rather than a lookup, which is why the counter is a scalar here and
+   * never an array: an array indexed by body is exactly the thing that stops
+   * scaling once the body count grows with the rank count.
+   *
+   * It is identical on every rank because every rank adds the same bodies in the
+   * same order, and it never decreases -- an id is retired with its body, not
+   * reused, so nothing that stored one can be silently pointed at another.
+   */
+  int n_bodies_global;
 
   int total_global_triangles;  ///< Sum over all objects of global_n_triangles.
+
+  /**
+   * @name The dense body view
+   *
+   * A `[n_bodies_global]` array of #MFTL_Object* in which slot `g` is the body
+   * with `global_id == g`, or a shared, permanently EMPTY object for a body this
+   * rank holds nothing of. Built on demand by MFTLEnsembleAcquireDenseView().
+   *
+   * It exists for a CALLER that genuinely has to enumerate every body in the
+   * ensemble, and **the library itself no longer has one**. Contact detection and
+   * the spatial halo were its two consumers, on the premise that their work list
+   * had to be identical on every rank so that the collectives it drove would
+   * match. The premise was false -- the halo's collectives are one neighbourhood
+   * allgatherv of body extents and one of payload, and neither's count depends on
+   * the request list -- so both now work from what this rank holds and what its
+   * neighbours published. See MFTLExtendSpatialHaloNearBodies().
+   *
+   * It is kept because it is the honest answer for a caller that does need every
+   * body, and because deleting a documented entry point is a separate decision
+   * from no longer needing it.
+   *
+   * READ-ONLY for its users, and that is what makes one shared empty object legal
+   * rather than a per-body one: every absent slot aliases the same struct, so a
+   * write to any of them would land on all of them. A Debug check on release
+   * asserts its counts are still zero.
+   * @{
+   */
+  MFTL_Object **dense_view;  ///< [dense_view_cap], MFTL_NULL until first acquired.
+  int dense_view_cap;  ///< Slots allocated in `dense_view`.
+  MFTL_Object *empty_body;  ///< The shared placeholder every absent slot points at.
+  /** @} */
 
   /**
    * Opaque scratch owned by the communication module, created on the first

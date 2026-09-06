@@ -18,8 +18,15 @@ What exists today:
 - derived per-triangle arrays and the `MFTL_FOREACH_*` hot-loop iterators
 - Morton renumbering of the pools (`MFTLObjectReorderMorton`)
 - periodic-aware geometry
-- sphere generation by icosahedron subdivision, over the shared `MFTLBuildIndexedMesh` builder
-- the fused per-timestep geometry + quality pass (`MFTLEnsembleUpdate`)
+- sphere generation by icosahedron subdivision, over the shared `MFTLBuildIndexedMesh` builder, in a
+  collective form (`MFTLGenerateSphere`) and a split local/publish form (`MFTLGenerateSphereLocal` +
+  `MFTLPublishGeneratedBodies`) that costs 2 collectives for N bodies rather than 2N
+- per-body reductions over each body's HOLDERS rather than over `comm_world`
+  (`MFTLEnsembleReduceBodies`, `src/ensemble/ensemble_reduce.c`) — the one place a per-body collective
+  chooses its communicator, used by the quality statistics, the global counts, the skip vote, the halo's
+  body radii, the remesher's body measurement and its id counters
+- the fused per-timestep geometry + quality pass (`MFTLEnsembleUpdate`), whose statistics are PER BODY
+  because that is what a solver reads to decide whether a given droplet needs remeshing
 - area-weighted vertex normals (`MFTLComputeVertexNormals`, `src/geometry/`) and their ensemble-wide form
   (`MFTLEnsembleUpdateVertexNormals`), which adds the ghost exchange that makes them exact on ghosts too
 - array functions (stable radix sort for keys and key/value pairs)
@@ -44,10 +51,15 @@ What exists today:
   collectives and the ghost id exchange. Enforced by `test_remeshing_mpi_is_confined`
 - LBVH and object–object contact detection (`src/bvh/`, `MFTL_GenerateLBVH` / `MFTL_RefitLBVH` /
   `MFTL_IntersectObjects`): Morton radix-split tree, explicit-stack dual traversal,
-  Shewchuk-adaptive orientation and an exact Guigue–Devillers narrow phase
-- the spatial halo (`src/communication/spatial_halo.c`, `MFTLExtendSpatialHalo`): the triangles of one
-  body that neighbouring ranks hold near this rank's share of another, delivered as a standalone
-  shadow `MFTL_Object` per body
+  Shewchuk-adaptive orientation and an exact Guigue–Devillers narrow phase, over a body-extent
+  BROAD PHASE rather than an all-pairs enumeration (`MFTLEnsembleIntersectObjects`)
+- the spatial halo (`src/communication/spatial_halo.c`, `MFTLExtendSpatialHalo` and
+  `MFTLExtendSpatialHaloNearBodies`): the triangles of one body that neighbouring ranks hold near this
+  rank's share of another, delivered as a standalone shadow `MFTL_Object` per body, out of a sparse
+  gid-keyed directory
+- per-body EXCLUSIVE PREFIX SUMS over each body's holders (`MFTLEnsembleExscanBodies`,
+  `src/ensemble/ensemble_reduce.c`) — the sibling of the reduction, and what lets the distributed
+  remesher hand out global ids without a `comm_world` scan over the id space
 
 **Absent**: open-surface generators, GTS I/O, topological ghost-layer growth, and a mesh READER of any
 format. Do not add references to these from the current modules — build the module first.
@@ -132,7 +144,7 @@ ctest --output-on-failure              # from build/
 ctest --output-on-failure -R object    # one module
 ```
 
-Forty CTest entries, built on `tests/test_utils.h` (`RUN_TEST`, `TEST_ASSERT*`, `TEST_REPORT`). **Run the suite in
+Forty-eight CTest entries, built on `tests/test_utils.h` (`RUN_TEST`, `TEST_ASSERT*`, `TEST_REPORT`). **Run the suite in
 the `--debug` build too** — `tests/test_object.c` deliberately writes the last addressable element of every pool
 array, so an array that was not grown with the rest is an ASan failure rather than a silent corruption.
 
@@ -163,6 +175,15 @@ sets would still match. That is not hypothetical: it is what happens when the bo
 grid changes shape. Any new distributed test needs an equivalent non-vacuity measure, or it will pass forever
 without covering anything.
 
+**A STRUCTURAL INVARIANT CANNOT SEE A CALLER MISUSING THE HANDLE, SO ONE TEST MEASURES PHYSICS.**
+`test_leveque_parallel_conserves` runs `examples/leveque_remeshing_parallel` for twelve advected, remeshed,
+redistributed steps at **np = 2** and checks the enclosed volume, the winding and the Euler characteristic.
+It exists because a caller that holds an `MFTL_Object*` across a redistribution produces a mesh that is
+structurally perfect — valid closed sphere, Euler 2, mean quality above 0.98, nothing for
+`MFTLCheckMeshIntegrity` to say — and 93 % smaller than it should be. np = 2 and not 1: at one rank nothing
+is ever destroyed and the same code is correct. Every example that advects a distributed mesh owes an
+equivalent `--verify` mode; `parallel_advection_scaling` already had one.
+
 **Never compare two vectors that should be identical with `acos(a·b)`.** The arc cosine has infinite derivative at
 1, so a dot product one ulp below 1 reports 1.5e-8 rad — a noise floor of ~1e-6 degrees regardless of how exact the
 inputs are. Use the chord `|a − b|`. `tests/test_vertex_normals.c` records the false failure this produced.
@@ -187,6 +208,10 @@ stays here is only what is read in place: the Doxygen comments in `include/` and
 `src/<module>/README.md` theory chapters (they render on GitHub next to the code they explain) and the four
 `docs/*-analysis.md` measurement documents (some thirty comments in `src/`, `include/`, `tests/` and
 `examples/` cite them by path).
+
+`docs/scalability-update-status.md` is a prose STATUS document rather than a measurement one: what the
+sparse-object-list work changed, what it measurably bought, and what is still missing. It is not in the
+manual's page list — read it in place. Its numbers all come from `docs/scaling-analysis.md`.
 
 ```bash
 cd ../MFTL_Documentation
@@ -286,11 +311,16 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
 - Formatting follows `.clang-format` (Google-based, 2-space indent, 160 columns, Allman braces).
 - Collective functions (anything touching `MFTL_Ensemble`/`MFTL_Domain`, e.g. `MFTLEnsembleCreate`,
   `MFTLGenerateSphere`, `MFTLEnsembleUpdate`) must be called by every rank. `MFTLObjectReorderMorton`,
-  `MFTLEnsembleUpdateVertexNormals`, `MFTLUpdateGhostVertexNormals`, `MFTLUpdateGhostGlobalIds` and
-  `MFTLRemeshEnsembleParallel` are collective too.
-  `MFTLObjectReorderMorton`, `MFTLObjectBuildDerived`, `MFTLComputeVertexNormals`, `MFTLRemeshMarkFrozen` and
-  `MFTLDilateFrozenBand` are deliberately **local** — each rank works on its own
-  partition. `test_vertex_normals_np3` exists to make an accidentally-introduced collective deadlock in CI.
+  `MFTLEnsembleUpdateVertexNormals`, `MFTLUpdateGhostVertexNormals`, `MFTLUpdateGhostGlobalIds`,
+  `MFTLEnsembleReduceBodies` and `MFTLRemeshEnsembleParallel` are collective too.
+  `MFTLObjectReorderMorton`, `MFTLObjectBuildDerived`, `MFTLComputeVertexNormals`, `MFTLRemeshMarkFrozen`,
+  `MFTLDilateFrozenBand`, `MFTLEnsembleBodyHoldersFitTheGraph` and `MFTLGenerateSphereLocal` are
+  deliberately **local** — each rank works on its own partition. `test_vertex_normals_np3` exists to make an accidentally-introduced collective deadlock in CI.
+- **A SWITCH THAT CHANGES A MESSAGE LENGTH OR A MESSAGE COUNT IS COLLECTIVE STATE, EVEN THOUGH IT LOOKS
+  LOCAL.** `MFTLRedistributeSetSkipUnchangedBodies` changes how many collectives a redistribution makes, so
+  two ranks disagreeing about it is a deadlock with no diagnostic — which is why it rides in the Debug
+  checksum. Contrast `MFTLRedistributeSetShrinkSlack`, which changes no message and no mesh, only how much
+  memory a rank holds, and is therefore legitimately per-rank policy.
   `MFTLRemeshEnsemble` DISPATCHES: `nproc == 1` takes the serial path unchanged; above that
   `MFTLRemeshChooseStrategy` (itself collective — it measures the bodies) picks the dispersed or the
   spanning driver. **Both drivers must be reached by every rank**, so the choice is made from reduced data
@@ -333,15 +363,129 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   digests — the set form passed while the order form failed from step 1, which is how the non-idempotence was
   found.
 
+  The second half of that precondition is **`MFTL_Object.partition_settled`**, not a third bitset in the
+  workspace, and the difference is a scaling one: a bitset indexed by list position has to be discarded
+  whenever the list changes, so ADDING one body un-settles every body and costs the whole ensemble a
+  rebuild. On the object, a body carries its own answer and one created on arrival simply starts unsettled,
+  which is the conservative verdict arrived at for free.
+
+- **A RANK HOLDS AN `MFTL_Object` EXACTLY FOR THE BODIES IT HOLDS ENTITIES OF, AND A REDISTRIBUTION IS
+  WHERE THAT BECOMES TRUE.** A body whose entities have all left is destroyed; a body arriving where the
+  rank held nothing is created. `MFTL_Ensemble.local_objects` is therefore a SPARSE, gid-sorted subset —
+  `n_local_objects` is what THIS rank holds and `n_bodies_global` is the ensemble.
+
+  **So an `MFTL_Object*`, a list slot and the local count are all invalid after a redistribution.** The
+  handle that survives is `global_id`; `MFTLEnsembleFindLocalObject` is the way back and returns `MFTL_NULL`
+  when the rank no longer holds the body. It is the same rule global ids and pool indices already follow
+  across a remesh, and the failure is a use-after-free on a pointer that was valid one line earlier — hidden
+  for a long time by any fixture where every rank keeps a share.
+
+  **THE FAILURE IS PHYSICAL, NOT STRUCTURAL, AND THAT IS WHY IT SURVIVED.**
+  `examples/leveque_remeshing_parallel` advected through the pointer `MFTLObjectCreate` returned and lost
+  **93 % of its enclosed volume in twelve steps at np = 2** — while the mesh stayed a valid closed sphere
+  with Euler characteristic 2, mean triangle quality above 0.98 and nothing for `MFTLCheckMeshIntegrity` to
+  report. At np = 1 the same code is CORRECT, because nothing is ever destroyed. No structural invariant can
+  see this and no short test can: `test_leveque_parallel_conserves` exists because catching it needs a
+  physical quantity measured over enough timesteps at np >= 2. Anything that caches an `MFTL_Object*`,
+  a list slot, a local count, or a per-body array indexed by list position across a redistribution owes the
+  same kind of check.
+
+  Two consequences worth stating separately. **A guard on the LOCAL count in front of a collective is a
+  deadlock**: `if (n_local_objects == 0) return` used to be globally consistent and no longer is, so every
+  such guard reads `n_bodies_global`. And **anything that CROSSES A RANK indexed by body must be indexed by
+  `global_id`**, not by a list slot — that covers the wire, the skip votes, and every per-body array in the
+  remesher that a migration outlives.
+
+  **The converse is the part that got over-applied, and it cost the last `O(B)` array in the tree.** A
+  per-body argument that never leaves the rank is indexed by LOCAL SLOT, because the two ends walk the same
+  list in the same order and no identity has to survive anything. `MFTL_OwnerMap` is the case: keyed by gid
+  it made every remeshing migration allocate, clear and carry two pointers for every body in the JOB on a
+  rank that might hold none of them — 16 B/body/rank, four to eight times per remesh. It is
+  `[ens->n_local_objects]` in `ens->local_objects` order, and so is `MFTL_RemeshMigrator.maps`. The rule to
+  apply is "does this index have to mean the same thing on two ranks", not "is it about a body". `MFTLEnsembleAcquireDenseView` is kept for a CALLER that genuinely needs every body; it is
+  `O(bodies in the ensemble)`, it must not appear on a per-timestep path, and **the library itself no longer
+  uses it** — contact detection and the spatial halo, its last two consumers, were the premise that turned
+  out to be false (see the spatial-halo entry below).
+
+- **HANDING OUT IDS IS A SCAN, NOT A REDUCTION, AND `MFTLEnsembleExscanBodies` IS ITS SIBLING.** Two ranks
+  that both split an edge of one body each create a vertex, and the two need DIFFERENT global ids — so a
+  holder needs the count of what the holders BEFORE it created, which no combination can give. `MPI_Exscan`
+  gives it over `comm_world` on a body-id-indexed buffer; this gives it over a body's HOLDERS, indexed by
+  LOCAL SLOT, on the same records and the same ascending-source-rank order the reduction folds in. "Before"
+  is that rank order, so the ranges are disjoint and cover `[0, total)` exactly. It replaced the distributed
+  remesher's per-phase `MPI_Exscan` + `MPI_Allreduce` of `2 * n_bodies_global` ints and the `11 * bodies + 6`
+  ints of scratch a pass allocated for them. The tiling — every holder's range abutting the previous one and
+  the last closing on the total — is what `test_the_scan_tiles_every_body_exactly_once` checks, and it is a
+  property a reduction test cannot express.
+
+  One trade came with it and it is worth knowing: the phase's convergence certificate used to ride the id
+  `Allreduce` for free. It now pays its own 3-int `Allreduce` (`MFTLRemeshSumInts`) — one small latency per
+  phase, against an ensemble-sized payload per phase.
+
+- **A PER-BODY REDUCTION GOES TO THAT BODY'S HOLDERS, AND `MFTLEnsembleReduceBodies` IS THE ONLY PLACE
+  THE COMMUNICATOR IS CHOSEN.** Three per-timestep collectives reduce one record per body — the skip vote
+  (1 value), `MFTLEnsembleUpdateGlobalCounts` (2) and `MFTLEnsembleUpdate`'s quality statistics (11) — and
+  all three used to stage into a buffer indexed by BODY ID and call `MPI_Allreduce` on `comm_world`,
+  because that is the only index two ranks holding different bodies agree about. **The caller's buffer is
+  now indexed by LOCAL SLOT and reduced in place**; moving the id indexing inside is most of the saving,
+  since otherwise the message shrinks and the per-rank memory does not
+  (`MFTLEnsembleUpdate` allocated `22 × bodies` doubles per call — 176 B/body, i.e. 176 MB at a
+  million bodies).
+
+  **The route is decided, not assumed, and the test is local, exact and uncached.** A rank checks that
+  every body it holds owns at least one entity here, that every other holder named by its ghosts'
+  `owner_proc` is a graph neighbour, and that those neighbours' cell offsets span at most one cell per
+  axis; `MPI_LAND` of that is exactly "the neighbourhood route is exact". It reads only the ghost suffix,
+  so a body held whole costs nothing. It is re-derived every call because a cached verdict is invalidated
+  by any holder-set change anywhere in the job and a stale one is a *silently wrong reduction*. Derivation
+  and its one assumption — a body is a CONNECTED surface — on `MFTLEnsembleReduceBodies`.
+
+  Four things about it are load-bearing and every one of them is silent when wrong. **An empty holder
+  vetoes**: a rank owning nothing appears in no other holder's halo, so it can neither be discovered nor
+  served — which is the state a *generated* ensemble is in before its first redistribution, and what made
+  `test_ensemble_update_tolerates_empty_ranks` fail at np = 4. **`comm_graph` carries a SELF-LOOP** on any
+  grid with a single cut on a periodic axis (`domain_init_comm` skips the (0,0,0) OFFSET, not the own
+  RANK), and folding that block in twice is invisible to MIN and MAX while it doubles every SUM — shapes
+  `{2,1,1}` and `{2,2,1}` have it, `{2,2,2}` and `{3,3,3}` do not, which is exactly the set of rank counts
+  that failed. **Contributions are folded in ascending SOURCE-RANK order** with self spliced in at its
+  own position, because two holders disagreeing in the last ulp about `quality` is two ranks entering
+  different collectives when a solver branches on it. And **redistribution takes the route test itself,
+  before `compute_owners` rewrites `owner_proc` with the destination ranks** — one line later it is a
+  plausible answer to the wrong question, wrong exactly when something moved far.
+
+  **Bytes are WORSE below about 45 ranks and better above, and that trade is deliberate.** The
+  neighbourhood route sends every held body to every neighbour, so its payload is `b_local × (1+d)`
+  records against `B_global`; measured 1.97× → 1.70× at np = 2 → 27, falling as `(1+d)/P` saturates at
+  27/P, and 22× *less* at P = 1000. Per consumer the crossover is P ≈ 35 (quality), 96 (counts) and 4100
+  (the vote, whose bitset is simply a very good encoding). The vote is kept on the same mechanism anyway:
+  one payload encoding is one mechanism, and at the design point it wins on bytes too. Table in
+  `docs/scaling-analysis.md` §scaling_holder_reductions.
+
+  **A PINNED SCOPE IS A SCALING REGRESSION THAT NO TEST OF THE ANSWER CAN SEE, so the routes are counted
+  rather than trusted.** The two routes agree TO THE BIT by construction — that is the property every other
+  test in `tests/test_body_reduce.c` is about — so a call site pinned to `MFTL_BODY_REDUCE_SCOPE_GLOBAL`
+  reproduces every mesh digest, passes every remeshing test at every rank count, and quietly stages
+  `O(bodies in the ensemble)` per rank per call. The spanning remesher's per-phase id scan spent a while
+  exactly there. The only observable is WHICH COMMUNICATOR RAN, so
+  `MFTLEnsembleGetBodyReduceStats` exists and two tests assert the split: a droplet TIMESTEP takes 3 holder
+  reductions and 0 global (`test_a_droplet_timestep_takes_no_global_reduction`), a droplet REMESH takes 11
+  and 0 (`test_a_droplet_remesh_takes_no_global_reduction`). Pass `AUTO` unless the fallback is provably
+  the only correct route — `AUTO` already falls back, and the one int it costs to find out is the cheapest
+  thing on the path.
 - **Redistribution invalidates all cached geometry except the vertex positions.** It returns an object with valid
   topology, valid positions and both derived bits set; `tris.area/normal/center` and
   `verts.normal/area/mean_curv/gauss_curv` hold unspecified values until something recomputes them. That is what
   buys the 3× smaller wire format — see `include/mftl_communication.h`. A solver that consumes triangle geometry
   AFTER the redistribution therefore owes one more pass — the price of not shipping the geometry on the wire. `parallel_advection_redistribute_list` runs it as step 5 and times it separately, because comparing the
   two versions' redistribute timings alone credits this one with a saving it has not finished paying for.
-- Bodies are identified on the wire by their INDEX in the ensemble's object list, not by `global_id`. Every rank
-  must therefore hold the same object list in the same order; a Debug-only checksum reduction inside the
-  redistribution reports a violation rather than silently merging entities into the wrong body.
+- **Bodies are identified on the wire by `MFTL_Object.global_id`, and the ensemble hands those ids out.**
+  `MFTLEnsembleAddObject` sets `global_id = ens->n_bodies_global++`, so body ids are DENSE in
+  `[0, n_bodies_global)` — the same rule vertex and triangle ids follow, and for the same reason: a dense
+  id indexes an array as cheaply as a list position did. Every rank must still add the same bodies in the
+  same order, and a Debug-only checksum inside the redistribution reduces `(num_objects, n_bodies_global,
+  skip switch)` to report a violation rather than silently merging entities into the wrong body. Whatever
+  was passed to `MFTLObjectCreate` is provisional. `slot_of_body` (`redistribute.c`) is the one place a
+  wire gid becomes a local index.
 - **`MFTLComputeVertexNormals` needs a VERTEX-COMPLETE halo and no communication.** It accumulates over all
   triangles including ghosts, so an owned vertex gets the exact answer iff every triangle incident to it is present
   locally. That is a stronger requirement on redistribution than "one layer of edge-adjacent ghost triangles", and
@@ -426,14 +570,30 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   clustered centroids and `dispersed_balance_slack` fixes it (default 1.25, ON): measured imbalance
   4.00/8.00/27.00 -> 1.25 at np = 4/8/27, **2.5–5.2× less wall clock**, idle ranks to zero. Below
   `N_bodies == P` nothing can, because a body is the smallest unit of work this strategy has;
-  `n_ranks_idle` versus `load_imbalance` is how to tell which you have. The assignment **costs no
-  collective** — the per-body weights ride the reduction `MFTLRemeshMeasureBodies` already takes (its stride
-  went 7 -> 8 for exactly this) — and that is a constraint, not a bonus: `MFTL_OwnerMap` is undefined if two
-  ranks name different destinations, so every tie-break is total (ranks by id, bodies by index) and
+  `n_ranks_idle` versus `load_imbalance` is how to tell which you have. The greedy is over RANK LOADS, and a
+  rank's load sums bodies held anywhere in the job, so it **needs replicated per-body data and no
+  communicator choice fixes that**: `MFTL_OwnerMap` is undefined — not slow, undefined — if two ranks name
+  different destinations, so every tie-break is total (ranks by id, bodies by index) and
   **`domain->neighbors` must never be used** to find the 26 candidates, because it is this rank's list and
-  differs on every rank. The cells are re-derived from the body's own centroid. The balancer decides who
-  REMESHES, not who holds the mesh afterwards — the closing `MFTLRedistribute` restores the geometric
-  partition.
+  differs on every rank. The cells are re-derived from the body's own centroid.
+
+  **IT IS THE LIBRARY'S LAST `O(bodies in the ensemble)` TERM, AND IT IS NOW THE ONLY THING THAT PAYS FOR
+  IT.** `replicate_for_balancer` broadcasts `4 * n_bodies_global` doubles by MAX — MAX, not SUM, because
+  every holder came out of `MFTLEnsembleReduceBodies` with the same value TO THE BIT and a sum would multiply
+  a shared body by its holder count. It runs **only when `dispersed_balance_slack > 0`**; with the balancer
+  off, `assign_destinations_local` decides from each rank's own measurement rows and the whole driver is
+  `O(local + nproc)`, its imbalance report included. The replacement is a local rule decided by each body's
+  home rank — see `docs/scalability-update-status.md` §6 for what has to be proved first.
+
+  The balancer decides who REMESHES, not who holds the mesh afterwards — the closing `MFTLRedistribute`
+  restores the geometric partition.
+
+  **A PER-BODY VERDICT SUMMED OVER RANKS COUNTS A SHARED BODY ONCE PER HOLDER.** Every holder reduces to the
+  same radius, so `sum over ranks of (radius > frac*h_min)` reported "4 of 1 bodies are wider than a rank
+  box". `MFTLRemeshMeasureBodies` therefore carries a ninth slot, a MIN of the contributing rank, i.e. the
+  body's LOWEST-NUMBERED HOLDER; `lowest_holder[o] == rank` is the licence to count body `o`. It costs one
+  double per local body on a reduction already being taken, and it is the general answer whenever a per-body
+  quantity has to be counted exactly once across the job.
 
 - **COARSENING REACHES THE DISPERSED PATH ONLY AS A YARDSTICK, AND THE RELAXATION IS BOUNDED BY BODY COUNT,
   NOT BY GEOMETRY.** `r_max > 0.4*h_min` sends a spray to the spanning driver purely because the boxes
@@ -562,12 +722,11 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   `MFTLGetVertexOneRingHalfedges` deliberately does not (its contract is outgoing half-edges). Guarded by
   `test_one_ring_at_a_boundary_vertex_has_one_extra_neighbour`.
 - **A spatial ghost is a triangle in a SHADOW OBJECT, not an entity in the body's pools.**
-  `MFTLExtendSpatialHalo` (`src/communication/spatial_halo.c`) puts what the neighbours sent into
-  `MFTL_SpatialHalo.patch[b]` — an ordinary, self-consistent `MFTL_Object` with `n_local == 0`, twins
-  linked within the patch, derived arrays built. It is deliberately NOT in `ens->objects`, so
-  redistribution and both ghost syncs never see it. The BVH borrows it and stores no geometry of its own;
-  `MFTL_BVHPrimVerts` resolves a primitive to (object, triangle) and both kinds go through
-  `MFTLGetTriangleCorners`.
+  `MFTLExtendSpatialHalo` (`src/communication/spatial_halo.c`) puts what the neighbours sent into the halo's
+  patch for that body — an ordinary, self-consistent `MFTL_Object` with `n_local == 0`, twins linked within
+  the patch, derived arrays built. It is deliberately NOT in `ens->local_objects`, so redistribution and both
+  ghost syncs never see it. The BVH borrows it and stores no geometry of its own; `MFTL_BVHPrimVerts`
+  resolves a primitive to (object, triangle) and both kinds go through `MFTLGetTriangleCorners`.
 
   Appending them to the body's own ghost suffix instead — which looks free, because the ownership prefix is
   untouched — fails for two reasons that are invisible until they bite.
@@ -582,7 +741,39 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   become three-way, i.e. a change to invariant 2 of `mftl_types.h`. Guarded by
   `test_halo_does_not_touch_the_bodies` and `test_halo_patch_is_a_valid_object`.
 
-  Guarded by `test_halo_does_not_touch_the_bodies` and `test_halo_patch_is_a_valid_object`.
+- **THE HALO'S DIRECTORY IS SPARSE AND IS NOT THE LOCAL OBJECT LIST.** `MFTL_SpatialHalo` keys its patches
+  and radii on a sorted `body_gid` array — `MFTLSpatialHaloFindBody` / `MFTLSpatialHaloPatch` /
+  `MFTLSpatialHaloRadius` binary-search it — and it holds the bodies this rank HOLDS **plus the bodies it
+  RECEIVED A PATCH FOR**. The second set is why it cannot simply be `ens->local_objects`: a rank with droplet
+  A and none of droplet B is exactly the rank that must be told about B, and it has no local object to hang
+  that on. Measured on twelve bodies at np = 27: 12 directory slots against the 324 a `[n_bodies_global]`
+  table would have cost across the job.
+
+- **THE CONTACT PAIR LIST IS DERIVED FROM THE EXTENTS, NOT ENUMERATED.** `MFTLEnsembleIntersectObjects` built
+  `B*(B-1)/2` ordered requests on every rank every call — 134 million records and two gigabytes at 16 384
+  bodies — on the premise that "the request list drives a sequence of collectives and so must be identical on
+  every rank". **The premise was false**: the halo's collectives are one neighbourhood allgatherv of extents
+  and one of payload, and neither's COUNT depends on the requests. A request only says what THIS rank is
+  willing to send. So `MFTLExtendSpatialHaloNearBodies` bins the arriving `(gid, centre, half-width, radius,
+  envelope)` records into a uniform grid whose cell is at least `2*max_half + max_envelope` wide — which
+  makes "extents overlap" imply "within one cell", so a query is 27 cells — and returns `halo->pair`.
+  Measured on six well-separated touching couples (6 of 66 pairs are real): 6 / 6 / 9 / 18 / 6 candidate
+  pairs over all ranks at np = 1 / 2 / 4 / 8 / 27, against 66 / 132 / 264 / 528 / 1782.
+
+  Two halves are asserted and neither alone is enough. COMPLETE: the contact count must equal an exhaustive
+  `O(nA*nB)` sweep over ALL pairs taken on one rank before partitioning, which shares no code with the BVH,
+  the halo or the grid. TIGHT: every kept pair must be a real one — a grid that admitted a far-apart pair
+  would still give the right ANSWER, because the traversal rejects it, so counting hits cannot see it.
+  `test_the_broad_phase_finds_the_pairs_without_enumerating_them`.
+
+  **`MFTLSpatialHaloResolveRadii` publishes one hop further than it reduces**, and that is not redundancy. The
+  per-body reduction gives a body's global radius to its HOLDERS; a rank deciding what to SEND needs the size
+  of the body it is sending TOWARDS and holds none of it. One `(gid, radius)` neighbourhood allgatherv fixes
+  it, and one hop is exactly right because the halo only ever ships along `comm_graph`. The corollary is that
+  a rank two hops from a body has no envelope for it AND can never report a contact with it — so
+  `test_the_distributed_answer_matches_the_unpartitioned_one` compares envelopes on the ranks that can
+  report, which is the whole of the property rather than a weakening of it.
+
 - **The spatial halo is TRANSIENT and cannot be otherwise.** Redistribution keeps only owned triangles
   (`collect_destinations` scans `[0, tris.n_local)`), so a halo cannot survive a repartition even in
   principle, and the documented loop redistributes every step. Each `MFTLExtendSpatialHalo` REPLACES the
@@ -601,7 +792,8 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   measured in two frames, raw and shifted by half a domain, keeping the tighter per axis; that is what makes a
   straddling share report its true size, and it is the same trick `MFTLSpatialHaloResolveRadii` needs so a
   droplet on the seam does not report a bounding radius of half the box (which would scale every envelope
-  derived from it). Payload is six doubles per body per rank either way. Guarded by
+  derived from it). Payload is nine doubles per body A RANK HOLDS — not per body in the ensemble, which is
+  the `1.2 kB/body/rank` the dense form cost on a full 26-neighbourhood. Guarded by
   `test_contact_through_the_seam_survives_the_decomposition` and
   `test_a_seam_straddling_body_is_not_measured_as_domain_sized`.
 - **A pre-filter must be strictly MORE permissive than the test it short-cuts, and the halo's macro test
@@ -844,10 +1036,18 @@ comments:**
    `centres_are_current` for it — and the halo is stale exactly when ownership changed, which is the
    moment it would have to be right.
 
-14. **Nothing in `src/bvh/` has been profiled at all beyond `orient3d_predicate_profile.c`.** The
+14. **Nothing in `src/bvh/` has been profiled in TIME beyond `orient3d_predicate_profile.c`.** The
    explicit-stack traversal, the refit-only fast path and the batched leaf phase are all argued from
    structure rather than measured; there is no BVH entry in `docs/performance-analysis.md`.
    Build/refit/traverse timings are the first thing to measure before optimising any of it.
+
+   What HAS been measured is the shape of the pipeline around it, and only in counted quantities: candidate
+   pairs and halo directory slots, in
+   `test_the_broad_phase_finds_the_pairs_without_enumerating_them`. The broad phase's own weak spot is
+   known and unmeasured — the uniform grid's cell is `2*max_half + max_envelope`, so ONE domain-spanning
+   body collapses it to a single bucket and the phase degrades to all-pairs within the neighbourhood. That
+   is the correct answer and the right cost for the SPANNING regime (a handful of bodies), but it is a cliff
+   rather than a slope; a two-level grid removes it and nothing has asked for one yet.
 
 15. **Remeshing renumbers global ids at the end of every pass, and it has to.** Splits hand out fresh ids and
    collapses retire them, so ids stay unique but stop being dense. Density is not cosmetic here:
@@ -953,8 +1153,11 @@ comments:**
    partition, so it needs a Debug-only verifier that runs the scan anyway and asserts the verdict, and the
    switch belongs in `check_object_lists_agree`'s checksum the way `g_skip_unchanged` already is. It must
    be disabled whenever `maps != MFTL_NULL`, because the remesher moves the cut planes and a cached slack
-   then describes planes that no longer exist. And `slack[]` belongs in the `comm_workspace` next to
-   `dirty_votes`, under the same `prev_num_objects` invalidation rule — NOT on `MFTL_Object`.
+   then describes planes that no longer exist. And `slack[]` belongs **on `MFTL_Object`**, next to
+   `partition_settled`: it is per rank per BODY and has to survive between calls, which is exactly the
+   shape that made a workspace bitset indexed by list position wrong — such a bitset has to be discarded
+   whenever the list changes, i.e. it answers a question about one body by invalidating every body. (This
+   entry used to say the opposite, before `dirty_prev` was moved onto the object for that reason.)
 
    Fusing the classification into `MFTLComputeTriangleGeometry` instead, which writes `tris.center` one
    step earlier and would save the 24 B/tri stream, was rejected: it covers only the triangle half (nothing

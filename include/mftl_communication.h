@@ -137,6 +137,20 @@
  * 40 bytes, laid out as one run of doubles followed by one run of ints, so the
  * MPI datatype is two contiguous blocks rather than one block per field. There is
  * no padding anywhere in it -- 3 doubles and 4 ints fill 40 bytes exactly.
+ *
+ * ## WHY `body_gid` AND NOT A LIST POSITION
+ *
+ * A body used to be named on the wire by its INDEX in `MFTL_Ensemble::objects`,
+ * which required every rank to hold the same list in the same order -- and
+ * therefore to hold an #MFTL_Object for every body in the ensemble, including
+ * every body it holds nothing of. That is the assumption that stops scaling once
+ * the body count grows with the rank count.
+ *
+ * #MFTL_Object::global_id is dense (MFTLEnsembleAddObject() hands it out), so it
+ * indexes an array just as cheaply as a list position did, and it stays valid
+ * when a rank holds only some of the bodies. While every rank does still hold the
+ * whole list the two are numerically equal, which is exactly what makes the
+ * change safe to land on its own.
  */
 typedef struct
 {
@@ -145,7 +159,7 @@ typedef struct
   int global_id;  ///< Stable name of this vertex across ranks and reorderings.
   int owner_proc;  ///< The NEW owner, decided by the sender from @c pos.
   int flags;  ///< MFTL_FLAG_BOUNDARY travels with the entity; it cannot be re-derived.
-  int body_idx;  ///< Index of the owning object in the ensemble's object list.
+  int body_gid;  ///< #MFTL_Object::global_id of the owning body. See the struct note.
 } MFTL_PackedVertex;
 
 /**
@@ -168,7 +182,7 @@ typedef struct
   int global_id;  ///< Stable name of this triangle. Its half-edges' ids are 3*this + k.
   int owner_proc;  ///< The NEW owner, decided by the sender from the cached centre.
   int flags;  ///< MFTL_FLAG_BOUNDARY travels with the entity; it cannot be re-derived.
-  int body_idx;  ///< Index of the owning object in the ensemble's object list.
+  int body_gid;  ///< #MFTL_Object::global_id of the owning body. See the struct note.
 
   int vertex_gid[3];  ///< Global id of the TARGET vertex of half-edge k.
   int he_flags[3];  ///< Half-edge flags; MFTL_FLAG_BOUNDARY is not re-derivable.
@@ -319,8 +333,53 @@ void MFTLExchangeFree(MFTL_ExchangeCtx *ctx);
  * 4. Redistribution
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * WHAT A REDISTRIBUTION DOES TO THE OBJECT LIST
+ *
+ * A rank holds an #MFTL_Object for a body exactly when it holds entities of it,
+ * and redistribution is what makes that true: a body whose entities have all left
+ * is DESTROYED here, and a body arriving on a rank that held nothing of it is
+ * CREATED here. That is the whole of the per-body footprint a rank used to carry
+ * for every body in the ensemble whether it held any of it or not.
+ *
+ * ## AN MFTL_Object POINTER DOES NOT SURVIVE A REDISTRIBUTION
+ *
+ * Neither does a slot in #MFTL_Ensemble::local_objects, nor the local body count.
+ * The handle that does survive is #MFTL_Object::global_id, and the way back is
+ * MFTLEnsembleFindLocalObject(), which returns MFTL_NULL when this rank no longer
+ * holds anything of the body:
+ *
+ * @code
+ * MFTLRedistribute(ens);
+ * obj = MFTLEnsembleFindLocalObject(ens, body_gid);   // may be MFTL_NULL now
+ * @endcode
+ *
+ * This is the same rule global ids and pool indices already follow across a
+ * remeshing pass, extended to the object itself. It is stated this loudly because
+ * the failure is a use-after-free on a pointer that was valid one line earlier,
+ * and because a large body on few ranks can hide it for a long time: only a rank
+ * that genuinely ends up holding nothing triggers it.
+ *
+ * A body that ends up empty on EVERY rank -- one that was added and never given
+ * any entities -- therefore ends up held by nobody. Its id stays allocated in the
+ * space; nothing else of it remains.
+ *
+ * Anything that must enumerate every body regardless of what this rank holds
+ * takes MFTLEnsembleAcquireDenseView() instead. That is
+ * `O(bodies in the ensemble)` per rank by definition and does not belong on a
+ * per-timestep path.
+ *
+ * **Nothing in the library does.** Contact detection and the spatial halo were
+ * the two consumers, on the premise that their work list had to be identical on
+ * every rank; the premise was false -- see MFTLExtendSpatialHaloNearBodies(), and
+ * §6 of `docs/scalability-update-status.md` for the whole story.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
 /**
  * @brief Redistributes a SINGLE object across the process grid.
+ *
+ * @note This entry point has no ensemble, so it neither creates nor destroys:
+ *       the caller owns the object and keeps it whatever the partition does.
  *
  * Phases:
  *   1. ANALYSIS  Every OWNED triangle is assigned to the rank owning its centre,
@@ -362,6 +421,8 @@ int MFTLRedistributeObject(MFTL_Object *object);
  * triangles per rank pair.
  *
  * @note Collective. Every rank must hold the same object list in the same order.
+ *       An empty ensemble is a no-op, not an error -- the same contract as
+ *       MFTLRedistribute() and MFTLRedistributeWithOwners().
  * @return MFTL_SUCCESS, or MFTL_ERROR on an invalid ensemble.
  *
  * @param ensemble The ensemble. Every object is repartitioned in one round.
@@ -385,7 +446,9 @@ static inline int MFTLRedistribute(MFTL_Ensemble *ens)
   MFTL_ASSERT(ens != MFTL_NULL && "MFTLRedistribute: NULL ensemble");
   if (ens == MFTL_NULL) return MFTL_ERROR;
 
-  if (ens->num_objects == 0 || ens->objects == MFTL_NULL) return MFTL_SUCCESS;
+  /* GLOBAL: a rank holding no bodies must still enter the exchange, because
+   * another rank may be about to send it one. */
+  if (ens->n_bodies_global == 0 || ens->local_objects == MFTL_NULL) return MFTL_SUCCESS;
 
   /* One body goes through the ensemble entry point too, NOT through
    * MFTLRedistributeObject(). The single-body fast path it used to take still
@@ -451,16 +514,36 @@ typedef struct MFTL_OwnerMap
  * @brief Redistribution with the ownership rule supplied rather than derived.
  *
  * Identical to MFTLRedistribute in every other respect, including the
- * postcondition. @p maps is `[ens->num_objects]`, or MFTL_NULL for the
- * geometric rule (in which case this IS MFTLRedistribute).
+ * postcondition. @p maps is indexed by **local slot** --
+ * `[ens->n_local_objects]`, entry `o` describing `ens->local_objects[o]` -- or
+ * MFTL_NULL for the geometric rule (in which case this IS MFTLRedistribute).
+ *
+ * ── WHY A SLOT HERE, WHEN THE WIRE INSISTS ON A GID ────────────────────────
+ *
+ * It used to be `[ens->n_bodies_global]` keyed by #MFTL_Object::global_id, on
+ * the rule everything that crosses a rank boundary follows: a list position is
+ * only an identity while every rank holds every body. THIS ARGUMENT NEVER
+ * CROSSES ONE. The caller builds it by walking `ens->local_objects` and this
+ * function reads it by walking the same list in the same order on the same
+ * rank, so slot `o` names the same body at both ends by construction and no
+ * identity has to survive anything.
+ *
+ * Keyed by gid it cost every caller an array with a slot for every body in the
+ * ensemble -- two pointers plus a clearing pass per call, on a rank that may
+ * hold none of them. That is the last `O(bodies in the ensemble)` term the
+ * remesher had, and it sat on the per-PHASE path. The correction is the one
+ * MFTLEnsembleReduceBodies() makes to its own caller's buffer: keep the id
+ * indexing inside whatever genuinely needs it, or the message shrinks and the
+ * per-rank memory does not.
  *
  * Ghost entries matter as much as owned ones: a rank routes its ghosts in order
  * to work out which of its OWN triangles the ghost's owner is about to need, so
  * a map that only fills in `[0, n_local)` produces a halo with holes.
  *
  * @param ens  The ensemble.
- * @param maps `[ens->num_objects]` owner maps, or #MFTL_NULL for the geometric
- *             rule. An individual entry may also be #MFTL_NULL.
+ * @param maps `[ens->n_local_objects]` owner maps in `ens->local_objects` order,
+ *             or #MFTL_NULL for the geometric rule. An individual entry may also
+ *             be #MFTL_NULL, which means "use the geometric rule for this body".
  * @return #MFTL_SUCCESS, or #MFTL_ERROR on an invalid ensemble.
  *
  * @collective Every rank must call it with maps that agree on every shared
@@ -682,7 +765,7 @@ int MFTLUpdateGhostVertexNormals(MFTL_Ensemble *ens);
  *
  * So the arrivals go into a SHADOW OBJECT instead: a complete, self-consistent
  * MFTL_Object holding nothing but the received patch. It is not in
- * `ens->objects`, so redistribution and the ghost syncs never see it. Nothing
+ * `ens->local_objects`, so redistribution and the ghost syncs never see it. Nothing
  * that loops over the real body sees it either. And because it is an ordinary
  * object, every existing pass works on it unmodified -- MFTLObjectBuildDerived,
  * MFTLComputeTriangleGeometry, MFTLGetTriangleCorners -- which is
@@ -704,24 +787,74 @@ int MFTLUpdateGhostVertexNormals(MFTL_Ensemble *ens);
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
+ * @struct MFTL_SpatialHaloPair
+ * @brief One candidate body pair the broad phase kept, ordered by body id.
+ *
+ * `body_a < body_b`, always: the smaller id is the A side, the side whose OWNED
+ * triangles are the ones reported, and the larger is the side whose triangles
+ * travel. That asymmetry is the whole of the "reported once" rule -- see
+ * MFTL_SpatialHaloRequest -- so the ordering is a contract and not a
+ * convenience.
+ *
+ * A pair is present on THIS rank iff this rank holds body A and can see body B,
+ * either because it holds part of it or because a patch for it arrived.
+ */
+typedef struct MFTL_SpatialHaloPair
+{
+  int body_a;  ///< Smaller body id. Held by this rank; its owned triangles report.
+  int body_b;  ///< Larger body id. Held here, patched here, or both.
+} MFTL_SpatialHaloPair;
+
+/**
  * @struct MFTL_SpatialHalo
- * @brief One shadow object per body, holding what the neighbours sent.
+ * @brief A SPARSE, body-id-keyed directory of shadow objects and body scales.
  *
- * `patch[b]` is MFTL_NULL until body b actually receives something. When it is
- * not null it is a fully valid MFTL_Object: twins linked WITHIN the patch,
- * derived connectivity built, and `n_local == 0` because this rank
- * owns none of it.
+ * ## IT IS INDEXED BY A SORTED KEY ARRAY, NOT BY BODY ID
  *
- * Global ids on a patch are body b's real ids, so a contact reported against a
+ * `body_gid` is strictly ascending and `num_objects` is its length, so entry `e`
+ * describes body `body_gid[e]`. A `[n_bodies_global]` array would be the obvious
+ * shape and is the one that stops scaling: at a million bodies every rank would
+ * hold a million patch pointers and a million radii to describe the handful of
+ * bodies it is anywhere near. Use MFTLSpatialHaloPatch() and
+ * MFTLSpatialHaloRadius(), which binary-search; the arrays are public only so
+ * that a consumer can walk the directory.
+ *
+ * ## WHICH BODIES ARE IN IT
+ *
+ * The bodies this rank HOLDS, plus the bodies it RECEIVED A PATCH FOR. The
+ * second set is not a subset of the first and that is the point: a rank holding
+ * droplet A and nothing of droplet B is exactly the rank that must be told about
+ * B, and it has no local object to hang that on.
+ *
+ * `patch[e]` is MFTL_NULL until body `body_gid[e]` actually receives something.
+ * When it is not null it is a fully valid MFTL_Object: twins linked WITHIN the
+ * patch, derived connectivity built, and `n_local == 0` because this rank owns
+ * none of it.
+ *
+ * Global ids on a patch are the body's real ids, so a contact reported against a
  * patch triangle names something the owning rank recognises. They are NOT dense
  * and NOT unique against the body's own pool -- a patch is a fragment, and
  * inv_global_ids_are_dense must not be applied to it.
  */
 typedef struct MFTL_SpatialHalo
 {
-  MFTL_Object **patch;  ///< [num_objects] shadow object per body, or MFTL_NULL.
+  int *body_gid;  ///< [num_objects] body ids, STRICTLY ASCENDING. The key.
+  MFTL_Object **patch;  ///< [num_objects] shadow object per entry, or MFTL_NULL.
   double *global_radius;  ///< [num_objects] half the LONGEST SIDE of the body's global box.
-  int num_objects;  ///< Length of both arrays. Matches the ensemble's object count.
+  int num_objects;  ///< Entries in the directory. NOT the size of the ensemble.
+  int capacity;  ///< Entries allocated.
+
+  /**
+   * @brief The candidate pairs the broad phase kept, ascending and unique.
+   *
+   * Filled by MFTLExtendSpatialHaloNearBodies(); left empty by the explicit
+   * request-list form, which is told what to fetch and therefore has no opinion
+   * about what to traverse.
+   */
+  MFTL_SpatialHaloPair *pair;
+  int n_pairs;  ///< Entries in `pair`.
+  int cap_pairs;  ///< Entries allocated in `pair`.
+
   MFTL_Domain *domain;  ///< Borrowed from the ensemble.
 } MFTL_SpatialHalo;
 
@@ -742,11 +875,43 @@ typedef struct MFTL_SpatialHaloRequest
 } MFTL_SpatialHaloRequest;
 
 /**
- * @brief Allocates an empty halo for @p ens.
- * @param ens The ensemble. Its object count fixes the halo's array lengths.
+ * @brief Allocates a halo seeded with the bodies @p ens currently holds here.
+ *
+ * The directory is re-synchronised against the ensemble by every later
+ * MFTLSpatialHaloResolveRadii() and MFTLExtendSpatialHalo*() call, so a halo
+ * created before a redistribution is still usable after one. Seeding it here
+ * only saves the first growth.
+ *
+ * @param ens The ensemble. Only its LOCAL object list is read.
  * @return A halo with every patch #MFTL_NULL. Free with MFTLSpatialHaloDestroy().
  */
 MFTL_SpatialHalo *MFTLSpatialHaloCreate(MFTL_Ensemble *ens);
+
+/**
+ * @brief Directory slot of body @p body_gid, by binary search.
+ *
+ * @param halo     The halo, or #MFTL_NULL.
+ * @param body_gid The body id.
+ * @return The slot in `body_gid` / `patch` / `global_radius`, or #MFTL_ERROR if
+ *         this halo knows nothing about that body.
+ */
+static inline int MFTLSpatialHaloFindBody(const MFTL_SpatialHalo *halo, int body_gid)
+{
+  if (halo == MFTL_NULL) return MFTL_ERROR;
+
+  int lo = 0, hi = halo->num_objects - 1;
+  while (lo <= hi)
+  {
+    const int mid = lo + ((hi - lo) >> 1);
+    const int g = halo->body_gid[mid];
+    if (g == body_gid) return mid;
+    if (g < body_gid)
+      lo = mid + 1;
+    else
+      hi = mid - 1;
+  }
+  return MFTL_ERROR;
+}
 
 /**
  * @brief Destroys a halo and every patch object it owns. Safe on MFTL_NULL.
@@ -756,25 +921,39 @@ MFTL_SpatialHalo *MFTLSpatialHaloCreate(MFTL_Ensemble *ens);
 void MFTLSpatialHaloDestroy(MFTL_SpatialHalo **p_halo);
 
 /**
- * @brief Fills `global_radius[b]` for every body: half the longest side of the
- *        body's bounding box over ALL ranks.
+ * @brief Fills `global_radius` for every body THIS RANK HOLDS: half the longest
+ *        side of that body's bounding box over all of its holders.
  *
  * Exists as its own call because a caller that scales anything by the body size
  * needs the number BEFORE it can state a margin, and the number is only
- * obtainable collectively. One MPI_Allreduce covers every body, so the message
- * count does not grow with the ensemble.
+ * obtainable collectively.
  *
  * Why the GLOBAL box and not this rank's: a partition is a fraction of the body,
  * so a margin scaled by a local extent would shrink as ranks are added and the
  * same simulation would detect contact at a different separation depending only
  * on how it was launched.
  *
- * @note Collective. Reads current positions and uses compact connectivity when available.
- * @return MFTL_SUCCESS, or MFTL_ERROR on invalid arguments.
+ * ## IT IS A PER-BODY REDUCTION, SO IT GOES TO THE BODY'S HOLDERS
  *
- * @param ens  The ensemble.
- * @param halo The halo whose `global_radius` array is filled in.
- * @return #MFTL_SUCCESS, or #MFTL_ERROR on mismatched arguments.
+ * Twelve values per body -- a lower corner and a negated upper corner, in the raw
+ * frame and in one displaced by half a domain -- through MFTLEnsembleReduceBodies()
+ * rather than through an `MPI_Allreduce` over `comm_world` on a
+ * `[12 * n_bodies_global]` staging buffer. The two frames are what stop a droplet
+ * ON THE SEAM from reporting a radius of half the box, and they cost payload
+ * rather than a second collective.
+ *
+ * A body this rank holds nothing of gets no radius here, because this rank has
+ * nothing to scale by it. Ask MFTLSpatialHaloRadius() and the answer is 0.0 until
+ * a patch for that body arrives carrying the owner's number.
+ *
+ * @note Collective: every rank must call it, including one holding no bodies.
+ * @note Reads current positions and uses compact connectivity when available.
+ *
+ * @param ens  The ensemble. Its local object list is re-synchronised into the
+ *             halo directory first, so a halo created before a redistribution
+ *             keeps working after one.
+ * @param halo The halo whose `global_radius` entries are filled in.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on a NULL argument.
  */
 int MFTLSpatialHaloResolveRadii(MFTL_Ensemble *ens, MFTL_SpatialHalo *halo);
 
@@ -797,6 +976,17 @@ int MFTLSpatialHaloResolveRadii(MFTL_Ensemble *ens, MFTL_SpatialHalo *halo);
  * partner, and the work is indexed by BODY rather than by pair -- which is also
  * what stops a triangle relevant to two different A bodies from being sent, and
  * therefore reported, twice.
+ *
+ * ── The extent exchange is SPARSE, and that is what makes it scale ─────────
+ *
+ * A rank publishes one record per body IT HOLDS -- `(body id, centre, half-width,
+ * global radius, tolerance)` -- through a neighbourhood allgatherv, so the
+ * payload is `O(local bodies * degree)` and not `O(bodies in the ensemble) *
+ * degree`. The dense form cost 48 bytes per body per neighbour, i.e. 1.2 kB per
+ * body per rank at a full 26-neighbourhood: a gigabyte at a million bodies, to
+ * describe droplets that are almost all nowhere near this rank. Requests naming
+ * a body this rank does not hold are simply not matched -- there is nothing here
+ * to send.
  *
  * ── Extents are CENTRE + HALF-WIDTH, and that is a correctness statement ───
  *
@@ -849,11 +1039,16 @@ int MFTLSpatialHaloResolveRadii(MFTL_Ensemble *ens, MFTL_SpatialHalo *halo);
  * same one. A rank holding nothing of either body contributes zero counts and
  * still enters every call.
  *
- * @param ens      The ensemble. All ranks must call with the SAME request list
- *                 in the same order.
- * @param requests [n_requests] ordered pairs and their margins.
- * @param n_requests Zero is a valid no-op.
- * @param halo     Filled in. Previous contents are DISCARDED, not accumulated.
+ * @param ens      The ensemble. Every rank must call, but the request lists no
+ *                 longer have to agree: the sequence of collectives is fixed by
+ *                 the neighbour count alone, and a request is only ever a
+ *                 statement about what THIS rank is willing to send.
+ * @param requests [n_requests] ordered pairs and their margins. A pair naming a
+ *                 body this rank does not hold as B is ignored.
+ * @param n_requests Zero is a valid no-op that still enters every collective.
+ * @param halo     Filled in. Patches of the requested B bodies are DISCARDED
+ *                 first, not accumulated. `pair` is left untouched -- an explicit
+ *                 request list says what to fetch, not what to traverse.
  * @return MFTL_SUCCESS, or MFTL_ERROR on invalid arguments.
  *
  * @note Collective over the ensemble's graph communicator.
@@ -863,29 +1058,89 @@ int MFTLSpatialHaloResolveRadii(MFTL_Ensemble *ens, MFTL_SpatialHalo *halo);
 int MFTLExtendSpatialHalo(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *requests, int n_requests, MFTL_SpatialHalo *halo);
 
 /**
- * @brief The received patch of body @p body_idx, or MFTL_NULL if it received nothing.
+ * @brief The same exchange, with the pair list DERIVED from the body extents
+ *        instead of enumerated by the caller.
+ *
+ * ## WHY THIS EXISTS: AN ALL-PAIRS REQUEST LIST IS THE LAST \f$O(B^2)\f$ TERM
+ *
+ * The caller that wants "every body against every other body" -- contact
+ * detection -- used to build exactly that list: `B*(B-1)/2` ordered pairs, on
+ * every rank, every timestep. At 16 384 bodies that is 134 million records and
+ * two gigabytes of request array before a single triangle is examined, and it
+ * grows quadratically in a quantity that is already the one the sparse local
+ * object list was introduced to stop paying linearly for.
+ *
+ * Nothing in the list was information: a pair is worth fetching exactly when the
+ * two bodies' extents are within the pair's envelope, and after the extent
+ * exchange every rank already holds the extents it needs to decide that. So the
+ * list is not built at all. This function bins the neighbours' published extents
+ * into a uniform grid whose cell is at least as wide as the widest body plus the
+ * largest envelope, and asks each of its own bodies for the 27 cells around it.
+ * Cost is `O(local bodies + records)` and the answer is the same set.
+ *
+ * ## THE PAIR ORDER IS THE "REPORTED ONCE" RULE
+ *
+ * Body B travels towards body A only when `A < B` by body id, matching
+ * MFTL_SpatialHaloRequest: the holder of the smaller id is the rank that reports
+ * the pair, so it is the rank that must receive the copy. Sending both ways
+ * would have both ranks report the same contact.
+ *
+ * ## WHAT COMES BACK
+ *
+ * `halo->pair` is the candidate list for the traversal, ascending and unique:
+ * every `(A, B)` with `A < B` such that this rank holds A and can see B -- as a
+ * local object, as a patch, or both. A caller with a different definition of
+ * "near" than `MAX(tol_A, tol_B)` should use the explicit request form instead.
+ *
+ * @param ens The ensemble. Collective; every rank must call.
+ * @param tolerance `[ens->n_local_objects]` contact envelope per LOCAL SLOT, in
+ *                  the order of `ens->local_objects`. MFTL_NULL means zero for
+ *                  every body, i.e. overlap-only.
+ * @param halo Filled in. EVERY patch is discarded first, and `pair` is rebuilt.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on a NULL ensemble or halo.
+ *
+ * @note Collective over the ensemble's graph communicator.
+ */
+int MFTLExtendSpatialHaloNearBodies(MFTL_Ensemble *ens, const double *tolerance, MFTL_SpatialHalo *halo);
+
+/**
+ * @brief The received patch of body @p body_gid, or MFTL_NULL if it received nothing.
  *
  * @param halo     The halo, or #MFTL_NULL.
- * @param body_idx Index in the ensemble's object list.
+ * @param body_gid The body id.
  * @return The shadow object, or #MFTL_NULL. It is owned by the halo and is
  *         invalidated by the next MFTLExtendSpatialHalo() or
  *         MFTLSpatialHaloDestroy().
  */
-static inline const MFTL_Object *MFTLSpatialHaloPatch(const MFTL_SpatialHalo *halo, int body_idx)
+static inline const MFTL_Object *MFTLSpatialHaloPatch(const MFTL_SpatialHalo *halo, int body_gid)
 {
-  if (halo == MFTL_NULL || body_idx < 0 || body_idx >= halo->num_objects) return MFTL_NULL;
-  return halo->patch[body_idx];
+  const int e = MFTLSpatialHaloFindBody(halo, body_gid);
+  return (e == MFTL_ERROR) ? MFTL_NULL : halo->patch[e];
 }
 
 /**
- * @brief Number of triangles this rank received for body @p body_idx.
+ * @brief Half the longest side of body @p body_gid's box over ALL ranks.
+ *
  * @param halo     The halo, or #MFTL_NULL.
- * @param body_idx Index in the ensemble's object list.
+ * @param body_gid The body id.
+ * @return The radius MFTLSpatialHaloResolveRadii() resolved, or 0.0 if this halo
+ *         knows nothing about that body.
+ */
+static inline double MFTLSpatialHaloRadius(const MFTL_SpatialHalo *halo, int body_gid)
+{
+  const int e = MFTLSpatialHaloFindBody(halo, body_gid);
+  return (e == MFTL_ERROR) ? 0.0 : halo->global_radius[e];
+}
+
+/**
+ * @brief Number of triangles this rank received for body @p body_gid.
+ * @param halo     The halo, or #MFTL_NULL.
+ * @param body_gid The body id.
  * @return Triangle count of the patch, or 0 if nothing was received.
  */
-static inline int MFTLSpatialHaloCount(const MFTL_SpatialHalo *halo, int body_idx)
+static inline int MFTLSpatialHaloCount(const MFTL_SpatialHalo *halo, int body_gid)
 {
-  const MFTL_Object *const p = MFTLSpatialHaloPatch(halo, body_idx);
+  const MFTL_Object *const p = MFTLSpatialHaloPatch(halo, body_gid);
   return (p == MFTL_NULL) ? 0 : p->tris.n;
 }
 
@@ -1099,10 +1354,58 @@ typedef struct
   long n_objects_shrunk;
   long n_bytes_reclaimed;  ///< Capacity bytes released by the shrink. See `n_objects_shrunk`.
 
+  /**
+   * Bodies created here on arrival, and destroyed here on becoming empty.
+   *
+   * A rank holds an #MFTL_Object only for the bodies it has entities of, so a
+   * body crossing a rank boundary is created on the receiving rank and destroyed
+   * on the one it left. These count that churn -- the per-body footprint a rank
+   * used to carry unconditionally, now paid only when a body actually moves.
+   *
+   * They are also the non-vacuity measure for any test of the sparse list: a
+   * fixture in which both stay zero exercised no arrival and no departure, and
+   * would pass unchanged with the whole mechanism deleted.
+   */
+  long n_objects_created;
+  long n_objects_destroyed;  ///< See n_objects_created.
+
   long n_allocs;  ///< Allocation calls on the path.
   long n_frees;  ///< Matching frees.
   long n_bytes_allocated;  ///< Bytes requested, summed. Not a peak.
   long n_gid_table_bytes;  ///< Bytes the arrival id tables asked for.
+
+  /**
+   * @name Persistent workspace, split by WHAT it is proportional to
+   *
+   * High-water marks, not a running sum: what the workspace currently holds,
+   * which is what a rank's resident footprint actually is.
+   *
+   * The split is the point. `n_bytes_allocated` says how much churn there is;
+   * these three say which of them can be expected to STAY CONSTANT as a job
+   * grows, and that is the only form of the question weak scaling cares about:
+   *
+   *   ws_bytes_per_body    proportional to the number of bodies in the ensemble.
+   *                        Every rank pays it for every body, held or not,
+   *                        because bodies are identified by their position in a
+   *                        replicated list. In a weak-scaling sweep the body
+   *                        count grows with the rank count, so this one grows
+   *                        LINEARLY WITH P for a fixed amount of work per rank.
+   *   ws_bytes_per_rank    proportional to nproc. Bounded-degree neighbour
+   *                        traffic does not need it; the global Alltoallv
+   *                        fallback does.
+   *   ws_bytes_per_entity  proportional to the mesh this rank actually holds.
+   *                        The only one of the three that is SUPPOSED to be
+   *                        constant per rank in a weak sweep, and the yardstick
+   *                        the other two are read against.
+   *
+   * A run whose per-body and per-rank figures are flat as P rises is the
+   * acceptance criterion; one where they track P is the defect.
+   * @{
+   */
+  long ws_bytes_per_body;
+  long ws_bytes_per_rank;
+  long ws_bytes_per_entity;
+  /** @} */
 
   /**
    * How the arrival id tables were indexed, counted per use.

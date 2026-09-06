@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "mftl_ensemble.h"
 #include "mftl_geometry.h"
 #include "mftl_memory.h"
 #include "mftl_object.h"
@@ -54,17 +55,56 @@ void MFTLRemeshMigratorFree(MFTL_RemeshMigrator *m)
  */
 static void migrator_reserve(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens)
 {
-  const int n = ens->num_objects;
+  const int n = ens->n_local_objects;
+
+  /* ── The map array is indexed by LOCAL SLOT, and that is the whole of it ──
+   *
+   * It used to be indexed by BODY GID and sized `MAX(n_bodies_global, n)`, on
+   * the rule the wire follows: a list position is only an identity while every
+   * rank holds every body. THE MAP IS NOT ON A WIRE. It is an argument handed
+   * straight back to MFTLRedistributeWithOwners(), which walks the SAME list in
+   * the SAME order this function just walked, on this rank only -- so slot `o`
+   * names the same body at both ends by construction and no identity has to
+   * survive anything.
+   *
+   * Keyed by gid it was the remesher's last `O(bodies in the ensemble)` term,
+   * and it was on the per-PHASE path: two pointers plus a NULL-fill for every
+   * body in the job, once per migration, on a rank that may hold none of them.
+   * 16 MB per rank at a million bodies, cleared four to eight times per remesh.
+   * This is the same correction MFTLEnsembleReduceBodies() makes to its caller's
+   * buffer, and for the same reason -- move the id indexing inside the one place
+   * that genuinely crosses a rank boundary, or the message shrinks and the
+   * per-rank memory does not.
+   *
+   * At least one slot even for a rank holding nothing, so that `m->maps` is
+   * never NULL: NULL is a legal argument to MFTLRedistributeWithOwners() and it
+   * means "use the geometric rule", which is emphatically not what a migration
+   * under moved cut planes is asking for. Nothing dereferences it -- the loops
+   * there are bounded by the same local count -- but a pointer whose value
+   * changes the documented meaning of the call must not depend on how many
+   * bodies happen to have landed here. */
+  const int n_slots = MFTL_MAX(n, 1);
 
   int need = 0;
-  for (int o = 0; o < n; ++o) need += ens->objects[o]->verts.n + ens->objects[o]->tris.n;
+  for (int o = 0; o < n; ++o) need += ens->local_objects[o]->verts.n + ens->local_objects[o]->tris.n;
 
-  if (n > m->cap_objects)
+  if (n_slots > m->cap_objects)
   {
     free(m->maps);
     m->cap_objects = (m->cap_objects > 0) ? m->cap_objects : 1;
-    while (m->cap_objects < n) m->cap_objects *= 2;
+    while (m->cap_objects < n_slots) m->cap_objects *= 2;
     m->maps = (MFTL_OwnerMap *) MFTLMallocOrDie((size_t) m->cap_objects * sizeof(MFTL_OwnerMap), "remesh owner maps");
+  }
+
+  /* Every slot in [0, n) is overwritten below, so this only ever clears the
+   * padding slot of a rank holding nothing. Kept anyway: NULL is the entry
+   * MFTLRedistributeWithOwners() cannot misread, and a stale pointer from the
+   * previous phase -- when this rank held a different set of bodies -- is
+   * exactly what would be there otherwise. */
+  for (int o = 0; o < n_slots; ++o)
+  {
+    m->maps[o].vert_owner = MFTL_NULL;
+    m->maps[o].tri_owner = MFTL_NULL;
   }
 
   /* `m->arena == MFTL_NULL` is part of the condition, not a redundant guard: a
@@ -83,7 +123,7 @@ static void migrator_reserve(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens)
   int off = 0;
   for (int o = 0; o < n; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
+    const MFTL_Object *const obj = ens->local_objects[o];
     m->maps[o].vert_owner = m->arena + off;
     off += obj->verts.n;
     m->maps[o].tri_owner = m->arena + off;
@@ -135,7 +175,9 @@ int MFTLRemeshMigrateShifted(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const i
     report->n_moved = 0;
     report->performed = MFTL_FALSE;
   }
-  if (ens->num_objects == 0) return MFTL_SUCCESS;
+  /* GLOBAL: an MPI_Allreduce and a collective redistribution follow, so a rank
+   * holding no bodies must still reach them. */
+  if (ens->n_bodies_global == 0) return MFTL_SUCCESS;
 
   const MFTL_Domain *const dom = &ens->domain;
   const int my_rank = dom->rank;
@@ -143,9 +185,9 @@ int MFTLRemeshMigrateShifted(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const i
 
   migrator_reserve(m, ens);
 
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
+    const MFTL_Object *const obj = ens->local_objects[o];
 
     MFTL_ASSERT(centres_are_current(obj) &&
                 "MFTLRemeshMigrateShifted: stale triangle centres -- call MFTLComputeTriangleGeometry(obj, obj->tris.n) "
@@ -225,16 +267,23 @@ int MFTLRemeshMigrateToRanks(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const i
     report->n_moved = 0;
     report->performed = MFTL_TRUE;  // the dispersed migration is never the identity in practice
   }
-  if (ens->num_objects == 0) return MFTL_SUCCESS;
+  /* GLOBAL: MFTLRedistributeWithOwners() below is collective. */
+  if (ens->n_bodies_global == 0) return MFTL_SUCCESS;
 
   const int my_rank = ens->domain.rank;
   int moved = 0;
 
   migrator_reserve(m, ens);
 
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
+    const MFTL_Object *const obj = ens->local_objects[o];
+
+    /* `dest` is indexed by LOCAL SLOT. Every holder of a body must still have
+     * arrived at the SAME destination for it -- that is what MFTL_OwnerMap
+     * requires, and it is the caller's obligation, not this loop's. What changed
+     * is only where the answer is stored: a rank keeps the destinations of the
+     * bodies it holds instead of a copy of every body's. */
     const int r = dest[o];
     MFTL_ASSERT(r >= 0 && r < ens->domain.nproc && "MFTLRemeshMigrateToRanks: destination outside the communicator");
 
@@ -257,21 +306,10 @@ int MFTLRemeshMigrateToRanks(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const i
  * 2. Small collectives
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-void MFTLRemeshIdReduce(const MFTL_Domain *domain, const int *send, int *prefix, int *total, int n_counts, int n_extra)
+void MFTLRemeshSumInts(const MFTL_Domain *domain, int *values, int n)
 {
-  if (domain->nproc < 2)
-  {
-    memset(prefix, 0, (size_t) n_counts * sizeof(int));
-    memcpy(total, send, (size_t) (n_counts + n_extra) * sizeof(int));
-    return;
-  }
-
-  memset(prefix, 0, (size_t) n_counts * sizeof(int));  // MPI_Exscan leaves rank 0's recvbuf untouched
-
-  MPI_Request req[2];
-  MPI_Iexscan(send, prefix, n_counts, MPI_INT, MPI_SUM, domain->comm_world, &req[0]);
-  MPI_Iallreduce(send, total, n_counts + n_extra, MPI_INT, MPI_SUM, domain->comm_world, &req[1]);
-  MPI_Waitall(2, req, MPI_STATUSES_IGNORE);
+  if (domain->nproc < 2 || n < 1) return;
+  MPI_Allreduce(MPI_IN_PLACE, values, n, MPI_INT, MPI_SUM, domain->comm_world);
 }
 
 void MFTLRemeshAgreeIntMax(const MFTL_Domain *domain, int *values, int n)
@@ -331,13 +369,19 @@ int MFTLRemeshMeasurementCount(void) { return g_measurement_count; }
 
 void MFTLRemeshResetMeasurementCount(void) { g_measurement_count = 0; }
 
-void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radius, double *weight)
+void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radius, double *weight, double *r_max, double *lowest_holder)
 {
   const MFTL_Domain *const dom = &ens->domain;
-  const int n = ens->num_objects;
-  if (n < 1) return;
+
+  if (r_max != MFTL_NULL) *r_max = 0.0;
+
+  /* GLOBAL: the reductions below are collective, so a rank holding nothing still
+   * has to enter them. */
+  if (ens->n_bodies_global < 1) return;
 
   g_measurement_count++;
+
+  const int b = ens->n_local_objects;
 
   /* Layout per body: [w, s0, c0, s1, c1, s2, c2, ntri]. A periodic axis uses the
    * (sin, cos) pair, a non-periodic one puts its plain weighted sum in the `s`
@@ -348,22 +392,54 @@ void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radiu
    * reduction cares about, at 12.5 % of the message. The slot now carries the
    * body's owned TRIANGLE COUNT, which the dispersed balancer needs, and that
    * changes the trade completely -- the alternative is not a shorter message,
-   * it is a SECOND Allreduce over the same bodies.
+   * it is a SECOND reduction over the same bodies.
    *
-   * This is the module's only O(num_objects) collective, so its count is what
-   * decides the module's cost at ten thousand droplets. One reduction of 640 kB
-   * beats two of 560 and 80. */
+   * ── AND IT IS INDEXED BY LOCAL SLOT ───────────────────────────────────────
+   *
+   * This used to stage `8 * n_bodies_global` doubles into an `MPI_Allreduce` on
+   * `comm_world`, and then `n_bodies_global` more for the radius: 72 bytes per
+   * body on every rank, whether or not it held a triangle of it. The measurement
+   * is a per-body reduction like any other, so it goes through the one place that
+   * chooses a communicator, and the caller's buffers describe what this rank
+   * holds.
+   *
+   * What that costs is stated rather than hidden: the dispersed balancer needs a
+   * REPLICATED assignment and therefore replicated inputs, so it re-broadcasts
+   * these results over `comm_world` itself -- see replicate_for_balancer() in
+   * remesh_dispersed.c. Everything else here -- the strategy ratio, the
+   * admission test, the destination of a body this rank holds -- is answered
+   * from the local rows and one scalar.
+   */
   enum
   {
-    STRIDE = 8
+    STRIDE = 9
   };
-  double *const acc = (double *) MFTLCallocOrDie((size_t) (2 * STRIDE * n), sizeof(double), "remesh body accumulators");
-  double *const sum = acc + STRIDE * n;
 
-  for (int o = 0; o < n; ++o)
+  MFTL_BodyReduceOp ops[STRIDE];
+  for (int j = 0; j < STRIDE; ++j) ops[j] = MFTL_BODY_REDUCE_SUM;
+
+  /* ── The ninth slot: WHO SPEAKS FOR THIS BODY ─────────────────────────────
+   *
+   * A MIN of the contributing rank, i.e. the lowest-numbered holder, and it is
+   * what makes a per-body quantity COUNTABLE exactly once across the job. Every
+   * holder of a body comes out of the reduction with the same radius, so summing
+   * "is this body too large" over ranks counts a shared body once per holder --
+   * and reports "4 of 1 bodies", which is how this slot came to exist.
+   * Designating one holder fixes it without a second collective and without
+   * anyone having to know the holder set.
+   *
+   * It rides THIS reduction rather than the radius one because the radius pass
+   * is skipped when the caller wants neither radius nor r_max, and who speaks
+   * for a body is not conditional on that. */
+  ops[8] = MFTL_BODY_REDUCE_MIN;
+
+  double *const acc = (double *) MFTLCallocOrDie((size_t) MFTL_MAX(b * STRIDE, 1), sizeof(double), "remesh body accumulators");
+
+  for (int o = 0; o < b; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
-    double *const a = acc + STRIDE * o;
+    const MFTL_Object *const obj = ens->local_objects[o];
+    double *const a = acc + (size_t) STRIDE * o;
+    a[8] = (double) dom->rank;
 
     /* OWNED triangles only. A ghost is another rank's triangle and it is
      * contributing to the same reduction from there, so counting it here would
@@ -400,25 +476,27 @@ void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radiu
     }
   }
 
-  if (dom->nproc > 1)
-    MPI_Allreduce(acc, sum, STRIDE * n, MPI_DOUBLE, MPI_SUM, dom->comm_world);
-  else
-    memcpy(sum, acc, (size_t) (STRIDE * n) * sizeof(double));
+  MFTLEnsembleReduceBodies(ens, acc, STRIDE, ops, MFTL_BODY_REDUCE_SCOPE_AUTO);
 
   /* Written before the centroids, because it needs nothing from them: the slot
    * came back from the same reduction and is already the global count. */
-  if (weight)
+  if (weight != MFTL_NULL)
   {
-    for (int o = 0; o < n; ++o) weight[o] = sum[STRIDE * o + 7];
+    for (int o = 0; o < b; ++o) weight[o] = acc[(size_t) STRIDE * o + 7];
+  }
+
+  if (lowest_holder != MFTL_NULL)
+  {
+    for (int o = 0; o < b; ++o) lowest_holder[o] = acc[(size_t) STRIDE * o + 8];
   }
 
   /* Scratch for the centroid even when the caller does not want it -- the radius
    * is a distance to it. */
-  double *const ctr = centroid ? centroid : (double *) MFTLMallocOrDie((size_t) (3 * n) * sizeof(double), "remesh centroids");
+  double *const ctr = (centroid != MFTL_NULL) ? centroid : (double *) MFTLMallocOrDie((size_t) MFTL_MAX(3 * b, 1) * sizeof(double), "remesh centroids");
 
-  for (int o = 0; o < n; ++o)
+  for (int o = 0; o < b; ++o)
   {
-    const double *const s = sum + STRIDE * o;
+    const double *const s = acc + (size_t) STRIDE * o;
     const double w = s[0];
     const double inv = (w > 0.0) ? 1.0 / w : 0.0;
 
@@ -443,14 +521,16 @@ void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radiu
     MFTLApplyPeriodicity(dom, &ctr[3 * o]);
   }
 
-  if (radius)
+  /* The second reduction. Whether it is taken is a property of the CALL and not
+   * of this rank's data, so two ranks cannot disagree about entering it. */
+  if (radius != MFTL_NULL || r_max != MFTL_NULL)
   {
-    double *const rmax = (double *) MFTLCallocOrDie((size_t) (2 * n), sizeof(double), "remesh body radii");
-    double *const rsum = rmax + n;
+    double *const rad = (radius != MFTL_NULL) ? radius : (double *) MFTLMallocOrDie((size_t) MFTL_MAX(b, 1) * sizeof(double), "remesh body radii");
+    MFTL_BodyReduceOp rop = MFTL_BODY_REDUCE_MAX;
 
-    for (int o = 0; o < n; ++o)
+    for (int o = 0; o < b; ++o)
     {
-      const MFTL_Object *const obj = ens->objects[o];
+      const MFTL_Object *const obj = ens->local_objects[o];
       double best = 0.0;
 
       /* Corners rather than centres: a triangle sticking out of the body is part
@@ -470,19 +550,34 @@ void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radiu
           if (l2 > best) best = l2;
         }
       }
-      rmax[o] = sqrt(best);
+      rad[o] = sqrt(best);
     }
 
-    if (dom->nproc > 1)
-      MPI_Allreduce(rmax, rsum, n, MPI_DOUBLE, MPI_MAX, dom->comm_world);
-    else
-      memcpy(rsum, rmax, (size_t) n * sizeof(double));
+    MFTLEnsembleReduceBodies(ens, rad, 1, &rop, MFTL_BODY_REDUCE_SCOPE_AUTO);
 
-    memcpy(radius, rsum, (size_t) n * sizeof(double));
-    free(rmax);
+    /* ── The largest body in the ENSEMBLE, as ONE scalar ────────────────────
+     *
+     * The strategy ratio and the admission test are both taken against it, and
+     * both must give the same answer on every rank or the ranks split between
+     * two drivers -- which is an immediate deadlock with no diagnostic. A
+     * replicated `[n_bodies_global]` radius array used to be how every rank
+     * could compute the maximum; one double through an `MPI_MAX` is the same
+     * number for a constant message. */
+    if (r_max != MFTL_NULL)
+    {
+      double mine = 0.0;
+      for (int o = 0; o < b; ++o) mine = MFTL_MAX(mine, rad[o]);
+
+      if (dom->nproc > 1)
+        MPI_Allreduce(&mine, r_max, 1, MPI_DOUBLE, MPI_MAX, dom->comm_world);
+      else
+        *r_max = mine;
+    }
+
+    if (radius == MFTL_NULL) free(rad);
   }
 
-  if (!centroid) free(ctr);
+  if (centroid == MFTL_NULL) free(ctr);
   free(acc);
 }
 
@@ -600,12 +695,14 @@ int MFTLRemeshSyncGhostIds(MFTL_Ensemble *ens, const int *vertex_gid_base)
   MFTL_ASSERT(ens != MFTL_NULL && vertex_gid_base != MFTL_NULL);
 
   MFTL_Domain *const dom = &ens->domain;
-  MFTL_Object *const *const objects = ens->objects;
-  const int num_objects = ens->num_objects;
+  MFTL_Object *const *const objects = ens->local_objects;
+  const int n_local = ens->n_local_objects;
   const int nproc = dom->nproc;
   const int nn = dom->num_neighbors;
 
-  if (num_objects == 0 || nproc == 1) return MFTL_SUCCESS;
+  /* GLOBAL: an MPI_Allreduce decides the route below, so a rank holding no
+   * bodies must still reach it. */
+  if (ens->n_bodies_global == 0 || nproc == 1) return MFTL_SUCCESS;
 
   /* ── 0. Can the 26-neighbourhood carry this exchange at all? ─────────────
    *
@@ -633,7 +730,7 @@ int MFTLRemeshSyncGhostIds(MFTL_Ensemble *ens, const int *vertex_gid_base)
   for (int i = 0; i < nn; ++i) rank_to_slot[dom->neighbors[i]] = i;
 
   int needs_global = 0;
-  for (int o = 0; o < num_objects && !needs_global; ++o)
+  for (int o = 0; o < n_local && !needs_global; ++o)
   {
     const MFTL_Object *const obj = objects[o];
     for (int v = obj->verts.n_local; v < obj->verts.n; ++v)
@@ -674,7 +771,7 @@ int MFTLRemeshSyncGhostIds(MFTL_Ensemble *ens, const int *vertex_gid_base)
   }
 
   int unserved = 0;
-  for (int o = 0; o < num_objects; ++o)
+  for (int o = 0; o < n_local; ++o)
   {
     const MFTL_Object *const obj = objects[o];
     const MFTL_Vertex *const vr = obj->verts.rec;
@@ -693,7 +790,11 @@ int MFTLRemeshSyncGhostIds(MFTL_Ensemble *ens, const int *vertex_gid_base)
         unserved++;
         continue;
       }
-      pl_add2(&requests[idx], o, vr[v].global_id);
+      /* The REQUEST names the body by its global id -- the owner has its own
+       * slot for it and no reason to have the same one. The TARGET never leaves
+       * this rank, so it keeps the local slot and the apply phase stays a direct
+       * indexed write. */
+      pl_add2(&requests[idx], obj->global_id, vr[v].global_id);
       pl_add2(&targets[idx], o, v);
     }
   }
@@ -756,29 +857,39 @@ int MFTLRemeshSyncGhostIds(MFTL_Ensemble *ens, const int *vertex_gid_base)
    * because the requester matches them positionally. */
   const int n_req = total_recv / 2;
   int *const reply = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_req, 1) * sizeof(int), "remesh ghost replies");
-  int *const obj_off = (int *) MFTLCallocOrDie((size_t) num_objects + 1, sizeof(int), "remesh ghost grouping");
+  int *const obj_off = (int *) MFTLCallocOrDie((size_t) n_local + 1, sizeof(int), "remesh ghost grouping");
   int *const order = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_req, 1) * sizeof(int), "remesh ghost order");
 
+  /* Resolve each request's body id to THIS rank's slot for it, ONCE, in place.
+   * Everything downstream then buckets by local slot, so the counting sort and
+   * its cursors are sized by what this rank holds rather than by the ensemble.
+   * `flat_recv[2k+1]` -- the vertex id answer_body() actually reads -- is left
+   * alone. A request for a body this rank has nothing of is a routing error, not
+   * a partition this rank simply is not part of: the requester named this rank
+   * as the vertex's OWNER. */
   for (int k = 0; k < n_req; ++k)
   {
-    const int o = flat_recv[2 * k];
-    if (o >= 0 && o < num_objects)
-      obj_off[o + 1]++;
-    else
+    const int slot = MFTLEnsembleFindLocalSlot(ens, flat_recv[2 * k]);
+    flat_recv[2 * k] = slot;
+    if (slot == MFTL_ERROR)
+    {
+      MFTL_ASSERT(0 && "remesh ghost ids: request names a body this rank does not hold, but claims this rank owns the vertex");
       unserved++;
+      continue;
+    }
+    obj_off[slot + 1]++;
   }
-  for (int o = 0; o < num_objects; ++o) obj_off[o + 1] += obj_off[o];
+  for (int o = 0; o < n_local; ++o) obj_off[o + 1] += obj_off[o];
 
   {
-    int *const cursor = (int *) MFTLMallocOrDie((size_t) num_objects * sizeof(int), "remesh ghost cursors");
-    for (int o = 0; o < num_objects; ++o) cursor[o] = obj_off[o];
+    int *const cursor = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_local, 1) * sizeof(int), "remesh ghost cursors");
+    for (int o = 0; o < n_local; ++o) cursor[o] = obj_off[o];
 
     for (int k = 0; k < n_req; ++k)
     {
       const int o = flat_recv[2 * k];
-      if (o < 0 || o >= num_objects)
+      if (o == MFTL_ERROR)
       {
-        MFTL_ASSERT(0 && "remesh ghost ids: request names a body outside the list -- ranks disagree about the object list");
         reply[k] = MFTL_ERROR;
         continue;
       }
@@ -789,16 +900,21 @@ int MFTLRemeshSyncGhostIds(MFTL_Ensemble *ens, const int *vertex_gid_base)
 
   {
     int table_len = 0;
-    for (int o = 0; o < num_objects; ++o)
+    for (int o = 0; o < n_local; ++o)
     {
       if (obj_off[o + 1] > obj_off[o]) table_len = MFTL_MAX(table_len, objects[o]->next_vertex_gid);
     }
 
     int *const slot_of_gid = (table_len > 0) ? (int *) MFTLMallocOrDie((size_t) table_len * sizeof(int), "remesh ghost id table") : MFTL_NULL;
 
-    for (int o = 0; o < num_objects; ++o)
+    for (int o = 0; o < n_local; ++o)
     {
       if (obj_off[o + 1] == obj_off[o]) continue;  // nothing asked of this body
+
+      /* `vertex_gid_base` is keyed by LOCAL SLOT. It came out of a per-body scan
+       * over that body's holders, so it describes the bodies THIS RANK holds and
+       * nothing else -- which is all this rank can ever be asked about, because a
+       * request only arrives here when it names this rank as a vertex's owner. */
       answer_body(objects[o], vertex_gid_base[o], flat_recv, order, obj_off[o], obj_off[o + 1], reply, slot_of_gid, objects[o]->next_vertex_gid, &unserved);
     }
     free(slot_of_gid);

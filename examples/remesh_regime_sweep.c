@@ -222,7 +222,7 @@ static MFTL_Ensemble *build_clustered(int n_bodies, double r, int refine, bool p
 static double imbalance(const MFTL_Ensemble *ens)
 {
   double mine = 0.0;
-  for (int o = 0; o < ens->num_objects; ++o) mine += (double) ens->objects[o]->tris.n_local;
+  for (int o = 0; o < ens->n_local_objects; ++o) mine += (double) ens->local_objects[o]->tris.n_local;
 
   double sum = mine, max = mine;
   MPI_Allreduce(MPI_IN_PLACE, &sum, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
@@ -231,10 +231,25 @@ static double imbalance(const MFTL_Ensemble *ens)
   return (sum > 0.0) ? max / (sum / (double) g_nproc) : 0.0;
 }
 
+/**
+ * @brief Owned triangles over the WHOLE ensemble.
+ *
+ * Reduced, not read off `global_n_triangles`. That field is the count for ONE
+ * body and every holder of it carries the same number, so summing it over a
+ * rank's local list answers "how big are the bodies this rank happens to hold" --
+ * which used to be the whole ensemble, because every rank held every body, and
+ * is now a rank-dependent fraction of it. The printed column then halves when
+ * the rank count doubles, for no reason connected to the mesh.
+ *
+ * @param ens The ensemble.
+ * @return The total, identical on every rank.
+ * @collective
+ */
 static int global_triangles(const MFTL_Ensemble *ens)
 {
   int n = 0;
-  for (int o = 0; o < ens->num_objects; ++o) n += ens->objects[o]->global_n_triangles;
+  for (int o = 0; o < ens->n_local_objects; ++o) n += ens->local_objects[o]->tris.n_local;
+  MPI_Allreduce(MPI_IN_PLACE, &n, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
   return n;
 }
 

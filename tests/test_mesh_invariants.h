@@ -435,6 +435,46 @@ static int inv_partition_is_sound(const MFTL_Object *obj, int rank)
   return 1;
 }
 
+/**
+ * @brief The local object DIRECTORY is what a sparse ensemble says it is.
+ *
+ * Three statements, and each one is a different bug:
+ *
+ *   SORTED, strictly increasing by `global_id`. That is what makes gid -> slot a
+ *   binary search instead of a scan, and what makes iterating locally visit
+ *   bodies in the global order restricted to this rank. A duplicate id would also
+ *   mean two objects for one body, which nothing downstream expects.
+ *
+ *   NO EMPTY OBJECT. A rank holds an MFTL_Object exactly when it holds entities
+ *   of the body; an empty one is the per-body footprint this design removes,
+ *   surviving a redistribution that should have destroyed it.
+ *
+ *   IN RANGE. Every local id is a real body in the ensemble's id space, which is
+ *   what lets an id index a replicated per-body array without a bounds test in
+ *   the hot path.
+ *
+ * @note NOT collective, and deliberately: it is a statement about one rank's
+ *       list. Reduce the verdict with agreed() as usual.
+ *
+ * @param ens The ensemble.
+ * @return 1 if the directory is sound.
+ */
+static int inv_local_directory_is_sound(const MFTL_Ensemble *ens)
+{
+  if (ens == MFTL_NULL) return 0;
+  if (ens->n_local_objects < 0 || ens->n_local_objects > ens->n_bodies_global) return 0;
+
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    const MFTL_Object *const obj = ens->local_objects[o];
+    if (obj == MFTL_NULL) return 0;
+    if (obj->global_id < 0 || obj->global_id >= ens->n_bodies_global) return 0;
+    if (o > 0 && ens->local_objects[o - 1]->global_id >= obj->global_id) return 0;
+    if (obj->verts.n == 0 && obj->tris.n == 0) return 0;
+  }
+  return 1;
+}
+
 /* ─────────────────────────────────────────────────────────────────────────────
  * 8. Multi-rank helper
  * ─────────────────────────────────────────────────────────────────────────── */

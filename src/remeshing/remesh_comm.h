@@ -48,18 +48,23 @@
  *                               rank box, which is the regime that asks for it;
  *                               redistribution detects the exception itself and
  *                               falls back to the global path.
- *   MFTLRemeshIdReduce          2 x O(log P) latency, OVERLAPPED, 2*n_bodies+3
- *                               ints. Once per phase.
+ *   MFTLRemeshSumInts           1 Allreduce of 3 ints. Pure latency. Once per
+ *                               phase, carrying the convergence certificate.
  *   MFTLRemeshSyncGhostIds      3 neighbourhood collectives, 4 bytes per ghost
  *                               vertex. Once per remeshing call. Falls back to
  *                               the GLOBAL communicator when any ghost's owner
  *                               is not a graph neighbour -- which is what the
  *                               coarsened placement makes normal.
- *   MFTLRemeshMeasureBodies     1 Allreduce of 8*n_bodies doubles, then 1 of
- *                               n_bodies. ONCE per pass, not once per driver:
+ *   MFTLRemeshMeasureBodies     9 SUM/MIN values per LOCAL body over that body's
+ *                               holders, then 1 MAX value per local body, then
+ *                               one scalar MPI_MAX for the largest body in the
+ *                               ensemble. Nothing here is proportional to the id
+ *                               space. ONCE per pass, not once per driver:
  *                               MFTLRemeshEnsemble threads the measurement from
  *                               the strategy choice into the dispersed driver.
- *   MFTLRemeshAgreeIntMax       1 Allreduce of n ints. Id counters, watermarks.
+ *   MFTLRemeshAgreeIntMax       1 Allreduce of n ints, n a small constant. Id
+ *                               counters and watermarks are per-body and go
+ *                               through MFTLEnsembleReduceBodies() instead.
  *   MFTLRemeshAgreeDoubleMax    1 Allreduce of 8 doubles. The profile and the
  *                               band measurement, once per pass.
  *
@@ -342,12 +347,17 @@ static inline void MFTLRemeshCapGroups(int group[3], int cap)
  * rather than to MFTL_Domain: the domain is read-only during a redistribution,
  * and a phase-local buffer hanging off it would be mutable per-call state on a
  * struct whose whole contract is that it is not.
+ *
+ * BOTH ARRAYS ARE SIZED BY WHAT THIS RANK HOLDS, never by the id space. `maps`
+ * is indexed by local slot because the only thing that reads it walks the same
+ * list in the same order on the same rank; keyed by body gid it was the last
+ * `O(bodies in the ensemble)` allocation on the per-phase path.
  */
 typedef struct MFTL_RemeshMigrator
 {
-  MFTL_OwnerMap *maps;  ///< [cap_objects] handed straight to MFTLRedistributeWithOwners.
+  MFTL_OwnerMap *maps;  ///< [cap_objects] by LOCAL SLOT, handed straight to MFTLRedistributeWithOwners.
   int *arena;  ///< [cap_entities] all bodies' vertex and triangle destinations, back to back.
-  int cap_objects;  ///< Bodies the `maps` array can describe.
+  int cap_objects;  ///< LOCAL bodies the `maps` array can describe. Never the id space -- see migrator_reserve().
   int cap_entities;  ///< Total entity slots the arena holds. Grown monotonically.
 } MFTL_RemeshMigrator;
 
@@ -404,22 +414,27 @@ void MFTLRemeshMigratorFree(MFTL_RemeshMigrator *m);
 int MFTLRemeshMigrateShifted(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const int group[3], const double shift[3], MFTL_RemeshMigrationReport *report);
 
 /**
- * @brief Redistributes the ensemble so that body `o` lands wholly on `dest[o]`.
+ * @brief Redistributes the ensemble so that local body `o` lands wholly on `dest[o]`.
  *
  * The object-centering migration of the dispersed strategy: every entity of a
  * body -- owned and ghost, vertex and triangle -- is given the same
  * destination, so the body arrives complete on one rank with no ghosts and the
  * untouched serial kernel can run on all of it.
  *
- * @p dest must be the SAME on every rank (it comes from MFTLRemeshMeasureBodies
- * plus MFTLGetOwnerProc on the reduced centroid, so it is). It is a 26-neighbour
- * exchange exactly when each body fits inside a rank box; when it does not,
- * redistribution notices by itself and falls back to the global communicator,
- * so the failure mode is a slower message pattern and not a wrong answer.
+ * @p dest is indexed by LOCAL SLOT, but every HOLDER of a body must still have
+ * arrived at the same destination for it -- #MFTL_OwnerMap is undefined, not
+ * merely slow, when two ranks name different destinations for one entity. Both
+ * of the dispersed driver's paths satisfy that: the unbalanced one applies
+ * MFTLGetOwnerProc() to a centroid every holder received identically to the bit
+ * from MFTLEnsembleReduceBodies(), and the balanced one runs a greedy over
+ * replicated data. It is a 26-neighbour exchange exactly when each body fits
+ * inside a rank box; when it does not, redistribution notices by itself and
+ * falls back to the global communicator, so the failure mode is a slower message
+ * pattern and not a wrong answer.
  *
  * @param      m      Migrator handle, reused across calls.
  * @param      ens    The ensemble.
- * @param      dest   `[ens->num_objects]` destination rank per body.
+ * @param      dest   `[ens->n_local_objects]` destination rank per LOCAL SLOT.
  * @param[out] report Optional. See #MFTL_RemeshMigrationReport.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR if the redistribution failed.
  * @collective
@@ -431,32 +446,28 @@ int MFTLRemeshMigrateToRanks(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const i
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief One Exscan and one Allreduce of the same counts, latencies overlapped.
+ * @brief In-place `MPI_Allreduce(MPI_SUM)` of @p n ints over the world.
  *
- * Two collectives rather than one because they are different reductions of the
- * same input: the Exscan says where this rank's block of new global ids starts,
- * the Allreduce says how long the global block is. They are independent, so both
- * are posted before either is waited on and the two O(log P) latencies overlap
- * instead of adding.
+ * The convergence certificate and nothing else: three ints, once per phase, of
+ * pure latency.
  *
- * @p n_extra trailing entries of @p send ride the Allreduce only -- the phase's
- * convergence counters go there, because a 2-int Allreduce of their own is pure
- * latency and does not get cheaper for being small.
+ * ## THE COLLECTIVE THIS REPLACED, AND WHY IT WENT
  *
- * Deadlock freedom: both are posted unconditionally, in the same order, by every
- * rank. The order comes from this function and never from the data.
+ * The phase used to hand out its new global ids with an `MPI_Exscan` plus an
+ * `MPI_Allreduce` of `2 * n_bodies_global` ints, and these three counters rode
+ * along in the same message -- free, because the message was already
+ * ensemble-sized. The ids now go through MFTLEnsembleExscanBodies(), which is a
+ * per-body scan over that body's HOLDERS and `O(local bodies)`, so appending
+ * three ensemble-wide ints to it would put a `comm_world` reduction back on
+ * every phase. One small latency is the price of removing an
+ * `O(bodies in the ensemble)` payload.
  *
- * @param      domain   The MPI/physical world.
- * @param      send     `[n_counts + n_extra]` this rank's counts.
- * @param[out] prefix   `[n_counts]` exclusive scan: where this rank's block of new
- *                      ids starts.
- * @param[out] total    `[n_counts + n_extra]` sums over all ranks.
- * @param      n_counts Counts that need both a scan and a sum.
- * @param      n_extra  Trailing values that need only the sum -- the convergence
- *                      certificate rides along here rather than in a collective of
- *                      its own.
+ * @param domain The MPI/physical world.
+ * @param values `[n]` values, replaced by their sums over all ranks.
+ * @param n      How many. Less than 1 is a no-op.
+ * @collective
  */
-void MFTLRemeshIdReduce(const MFTL_Domain *domain, const int *send, int *prefix, int *total, int n_counts, int n_extra);
+void MFTLRemeshSumInts(const MFTL_Domain *domain, int *values, int n);
 
 /**
  * @brief In-place MPI_Allreduce(MPI_SUM) of @p n doubles over the world.
@@ -571,7 +582,7 @@ double MFTLRemeshWallTime(void);
  * MPI datatype at all.
  *
  * @param ens             The ensemble.
- * @param vertex_gid_base `[ens->num_objects]` first new vertex id this rank was
+ * @param vertex_gid_base `[ens->n_local_objects]` first new vertex id this rank was
  *                        allotted per body, or #MFTL_NULL when the ids did not move.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR if the exchange failed.
  */

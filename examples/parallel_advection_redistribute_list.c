@@ -253,9 +253,9 @@ static void local_totals(const MFTL_Ensemble *ens, double out[3])
 {
   out[0] = out[1] = out[2] = 0.0;
 
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *obj = ens->objects[o];
+    const MFTL_Object *obj = ens->local_objects[o];
     for (int i = 0; i < obj->tris.n_local; ++i) out[0] += obj->tris.area[i];
     out[1] += (double) obj->tris.n_local;
     out[2] += (double) obj->verts.n_local;
@@ -322,9 +322,9 @@ static void partition_digest(const MFTL_Ensemble *ens, uint64_t out[2])
 {
   uint64_t set_h = 0, ord_h = 0x243f6a8885a308d3ULL;
 
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
+    const MFTL_Object *const obj = ens->local_objects[o];
     const uint64_t body = (uint64_t) obj->global_id;
 
     for (int v = 0; v < obj->verts.n; ++v)
@@ -542,9 +542,9 @@ static void report_internals(int rank, int nproc, int steps)
 static void local_halo(const MFTL_Ensemble *ens, long out[2])
 {
   out[0] = out[1] = 0;
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *obj = ens->objects[o];
+    const MFTL_Object *obj = ens->local_objects[o];
     out[0] += obj->tris.n_local;
     out[1] += obj->tris.n - obj->tris.n_local;
   }
@@ -554,7 +554,7 @@ static void local_halo(const MFTL_Ensemble *ens, long out[2])
 static long local_ghost_bytes(const MFTL_Ensemble *ens)
 {
   long n = 0;
-  for (int o = 0; o < ens->num_objects; ++o) n += ens->objects[o]->verts.n - ens->objects[o]->verts.n_local;
+  for (int o = 0; o < ens->n_local_objects; ++o) n += ens->local_objects[o]->verts.n - ens->local_objects[o]->verts.n_local;
   return n * (long) sizeof(MFTL_GhostUpdatePayload);
 }
 
@@ -617,12 +617,16 @@ int main(int argc, char **argv)
       centre[d] = lo + ((double) rand() / (double) RAND_MAX) * (hi - lo);
     }
 
-    MFTLGenerateSphere(obj, centre, radius, cfg.refinements);
+    /* The LOCAL half; the two collectives are hoisted out of the loop below so
+     * setup costs 2 messages rather than 2 per body. */
+    MFTLGenerateSphereLocal(obj, centre, radius, cfg.refinements);
 
     /* Ownership is decided from the cached centre, and a freshly generated mesh
-     * has none. MFTLGenerateSphere already wrapped the positions. */
+     * has none. MFTLGenerateSphereLocal already wrapped the positions. */
     MFTLComputeTriangleGeometry(obj, obj->tris.n);
   }
+
+  MFTLPublishGeneratedBodies(ens);
 
   /* Scatter: everything is on rank 0 after generation. */
   MFTLRedistribute(ens);
@@ -635,7 +639,7 @@ int main(int argc, char **argv)
   {
     /* The pools were just rebuilt, so the areas are not valid yet -- one geometry
      * pass before the reference is taken, exactly as step 3 does in the loop. */
-    for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+    for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
 
     double local[3];
     local_totals(ens, local);
@@ -681,9 +685,9 @@ int main(int argc, char **argv)
   {
     /* 1. Move what we own, and only what we own. */
     double t0 = MPI_Wtime();
-    for (int o = 0; o < ens->num_objects; ++o)
+    for (int o = 0; o < ens->n_local_objects; ++o)
     {
-      MFTL_Object *obj = ens->objects[o];
+      MFTL_Object *obj = ens->local_objects[o];
       MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += velocity[0] * cfg.dt; pos[1] += velocity[1] * cfg.dt; pos[2] += velocity[2] * cfg.dt;
                                 MFTLApplyPeriodicity(&ens->domain, pos););
     }
@@ -698,7 +702,7 @@ int main(int argc, char **argv)
     /* 3. Every triangle now has current vertices: refresh its geometry. ALL of
      *    them, ghosts included -- see the note in the header comment. */
     t0 = MPI_Wtime();
-    for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+    for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
     t_geom += MPI_Wtime() - t0;
 
     if (cfg.verify)
@@ -757,7 +761,7 @@ int main(int argc, char **argv)
     if (cfg.post_geom)
     {
       t0 = MPI_Wtime();
-      for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+      for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
       t_post += MPI_Wtime() - t0;
     }
 

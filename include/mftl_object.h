@@ -54,7 +54,12 @@
  * Both pools start with zero capacity; a mesh generator or an I/O reader fills
  * them. The object has no domain until it is handed to MFTLEnsembleAddObject().
  *
- * @param global_id Identifies this object across all ranks.
+ * @param global_id PROVISIONAL body id. MFTLEnsembleAddObject() overwrites it
+ *                  with the next dense id, because the ids have to be dense and
+ *                  agreed on every rank and only the ensemble can guarantee
+ *                  that. It is the object's real identity only for an object
+ *                  that never joins an ensemble -- a spatial-halo shadow patch,
+ *                  or a fixture in a serial test.
  * @return The new object, or MFTL_NULL if the struct allocation failed.
  */
 MFTL_Object *MFTLObjectCreate(int global_id);

@@ -326,7 +326,15 @@ Bodies go where their centroids are, and centroids cluster — an emulsion is no
 a process grid. The balancer keeps each body on its centroid's owner unless that rank exceeds
 `mean × dispersed_balance_slack`, then prefers the least-loaded of the 26 cells around it, then anywhere.
 It is a pure function of the replicated centroids and per-body triangle counts, so it costs **no collective
-at all** — the weights ride the reduction `MFTLRemeshMeasureBodies` already takes.
+of its own** — the weights ride the reduction `MFTLRemeshMeasureBodies` already takes.
+
+Since the ensemble's object list became sparse, "replicated" is no longer free: the measurement is indexed
+by local slot and reduced over each body's holders, so the balancer broadcasts what it needs itself
+(`replicate_for_balancer`, one `MPI_Allreduce` of `4 × n_bodies_global` doubles by MAX — MAX and not SUM,
+because every holder already reduced to the same value to the bit). **That is the library's last
+`O(bodies in the ensemble)` term**, it runs only when `dispersed_balance_slack > 0`, and it is a property of
+the algorithm rather than of the route: the greedy is over rank *loads*, and a rank's load sums bodies held
+anywhere in the job. Every number in the tables below was re-measured after that change and is unchanged.
 
 $4P$ droplets, all packed into one rank's box:
 

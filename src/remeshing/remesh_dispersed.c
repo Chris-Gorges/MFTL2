@@ -202,15 +202,40 @@ static double dispersed_box_min(const MFTL_Domain *dom, const MFTL_RemeshParamet
   return (box == MFTL_DBL_MAX) ? 0.0 : box;
 }
 
-MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategyMeasured(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, double *centroid, double *radius,
-                                                             double *weight)
+void MFTLRemeshMeasurementInit(MFTL_RemeshMeasurement *m, const MFTL_Ensemble *ens)
 {
-  MFTL_ASSERT(ens != MFTL_NULL && centroid != MFTL_NULL && radius != MFTL_NULL);
+  const int b = ens->n_local_objects;
+  m->n_local = b;
+  m->r_max = 0.0;
+  /* One block: a pass takes one measurement, so one malloc. */
+  m->centroid = (double *) MFTLCallocOrDie((size_t) MFTL_MAX(6 * b, 1), sizeof(double), "remesh body measurement");
+  m->radius = m->centroid + 3 * b;
+  m->weight = m->radius + b;
+  m->lowest_holder = m->weight + b;
+}
+
+void MFTLRemeshMeasurementFree(MFTL_RemeshMeasurement *m)
+{
+  free(m->centroid);
+  m->centroid = MFTL_NULL;
+  m->radius = MFTL_NULL;
+  m->weight = MFTL_NULL;
+  m->lowest_holder = MFTL_NULL;
+  m->n_local = 0;
+  m->r_max = 0.0;
+}
+
+MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategyMeasured(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshMeasurement *m)
+{
+  MFTL_ASSERT(ens != MFTL_NULL && m != MFTL_NULL);
 
   /* At one rank nothing is split and both strategies degenerate to the serial
    * kernel. Answering SPANNING keeps MFTLRemeshEnsemble's nproc == 1 path the
    * only special case there is. */
-  if (ens->domain.nproc < 2 || ens->num_objects == 0) return MFTL_REMESH_PARALLEL_SPANNING;
+  /* GLOBAL body count: MFTLRemeshMeasureBodies() below is collective, and both
+   * this function's callers dispatch on its answer -- two ranks returning
+   * different strategies is an immediate deadlock. */
+  if (ens->domain.nproc < 2 || ens->n_bodies_global == 0) return MFTL_REMESH_PARALLEL_SPANNING;
 
   const double frac = (params && params->dispersed_radius_fraction > 0.0) ? params->dispersed_radius_fraction : 0.4;
 
@@ -219,31 +244,31 @@ MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategyMeasured(MFTL_Ensemble *ens,
    * would otherwise have to know whether they were filled. Filling them
    * unconditionally is one collective on a path that is about to run a dozen. */
   prepare_for_migration(ens);
-  MFTLRemeshMeasureBodies(ens, centroid, radius, weight);
+  MFTLRemeshMeasureBodies(ens, m->centroid, m->radius, m->weight, &m->r_max, m->lowest_holder);
 
   if (MFTLDomainGetHMin(&ens->domain) <= 0.0) return MFTL_REMESH_PARALLEL_SPANNING;
 
-  double r_max = 0.0;
-  for (int o = 0; o < ens->num_objects; ++o) r_max = MFTL_MAX(r_max, radius[o]);
-
-  /* The reduction inside MFTLRemeshMeasureBodies already made every rank agree
-   * on every radius, so this comparison is a pure function of replicated data
-   * and cannot split the ranks between the two drivers. That property is the
-   * whole reason the measurement is collective rather than local-and-reduced-
-   * later: two ranks entering different drivers is an immediate deadlock. */
-  const double box = dispersed_box_min(&ens->domain, params, r_max, ens->num_objects);
-  return (r_max > frac * box) ? MFTL_REMESH_PARALLEL_SPANNING : MFTL_REMESH_PARALLEL_DISPERSED;
+  /* ONE SCALAR, and it has to be one. `radius` describes this rank's bodies and
+   * nothing else, so a maximum over it is a different number on every rank; the
+   * dispatch below would then split the ranks between two drivers, which is an
+   * immediate deadlock with no diagnostic. `r_max` came out of a scalar `MPI_MAX`
+   * inside the measurement and is identical to the bit everywhere.
+   *
+   * The replicated `[n_bodies_global]` radius array this replaces was, for this
+   * consumer, an expensive way of computing one number. */
+  const double box = dispersed_box_min(&ens->domain, params, m->r_max, ens->n_bodies_global);
+  return (m->r_max > frac * box) ? MFTL_REMESH_PARALLEL_SPANNING : MFTL_REMESH_PARALLEL_DISPERSED;
 }
 
 MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategy(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params)
 {
   MFTL_ASSERT(ens != MFTL_NULL);
-  if (ens->domain.nproc < 2 || ens->num_objects == 0) return MFTL_REMESH_PARALLEL_SPANNING;
+  if (ens->domain.nproc < 2 || ens->n_bodies_global == 0) return MFTL_REMESH_PARALLEL_SPANNING;
 
-  const int n = ens->num_objects;
-  double *const scratch = (double *) MFTLMallocOrDie((size_t) (5 * n) * sizeof(double), "remesh strategy measurement");
-  const MFTL_RemeshParallelStrategy strategy = MFTLRemeshChooseStrategyMeasured(ens, params, scratch, scratch + 3 * n, scratch + 4 * n);
-  free(scratch);
+  MFTL_RemeshMeasurement m;
+  MFTLRemeshMeasurementInit(&m, ens);
+  const MFTL_RemeshParallelStrategy strategy = MFTLRemeshChooseStrategyMeasured(ens, params, &m);
+  MFTLRemeshMeasurementFree(&m);
   return strategy;
 }
 
@@ -396,11 +421,11 @@ static int by_weight_desc(const void *a, const void *b)
  *
  * @param      dom      The MPI/physical world.
  * @param      params   Supplies `dispersed_balance_slack`. <= 0 disables.
- * @param      centroid [3*n] replicated body centroids.
+ * @param      centroid [3*n] REPLICATED body centroids, indexed by body id.
  * @param      weight   [n] replicated per-body global triangle counts, or
  *                      #MFTL_NULL for one unit each.
- * @param      n        Bodies.
- * @param[out] dest     [n] destination rank per body.
+ * @param      n        Bodies in the ensemble.
+ * @param[out] dest     [n] destination rank per body, by body id.
  * @param[out] st       Receives `n_bodies_reassigned`, `n_ranks_idle` and
  *                      `load_imbalance`.
  * @rank_local No MPI at all -- see the section banner for why it must be so.
@@ -528,6 +553,138 @@ static void assign_destinations(const MFTL_Domain *dom, const MFTL_RemeshParamet
   free(load);
 }
 
+/**
+ * @brief Broadcasts the local measurement rows into replicated per-body arrays.
+ *
+ * ══ THE ONE `O(bodies)` TERM THIS MODULE STILL HAS, AND IT IS NOT AN OVERSIGHT
+ *
+ * assign_destinations() is a greedy over RANK LOADS, and a rank's load is a sum
+ * over bodies that may be held anywhere in the job. Every rank has to reach the
+ * same assignment -- MFTL_OwnerMap is undefined, not slow, if two ranks name
+ * different destinations for one entity -- so every rank has to see every body.
+ * No communicator choice fixes that; it is a property of the algorithm, and
+ * replacing it needs a different balancer rather than a different route.
+ *
+ * What IS fixed here is that nothing else pays for it. The measurement itself,
+ * the strategy ratio, the admission test and the destination of a body this rank
+ * holds are all answered from local rows and two scalars; this function is
+ * entered only when `dispersed_balance_slack > 0`, and a caller who turns the
+ * balancer off pays no per-body collective at all.
+ *
+ * ── MAX, and the rows are already identical ───────────────────────────────
+ *
+ * Every holder of a body came out of MFTLEnsembleReduceBodies() with the same
+ * value TO THE BIT -- that is the guarantee its ascending-source-rank fold
+ * exists to give -- so a maximum over the holders is that value, and a body no
+ * rank holds keeps the identity and is recognisable as such. A SUM would have
+ * multiplied a shared body by its holder count.
+ *
+ * @param      ens      The ensemble.
+ * @param      m        The local measurement.
+ * @param[out] centroid `[3 * n_bodies_global]` replicated centroids.
+ * @param[out] weight   `[n_bodies_global]` replicated triangle counts.
+ * @collective One MFTLRemeshAgreeDoubleMax() of `4 * n_bodies_global` doubles.
+ */
+static void replicate_for_balancer(MFTL_Ensemble *ens, const MFTL_RemeshMeasurement *m, double *centroid, double *weight)
+{
+  const MFTL_Domain *const dom = &ens->domain;
+  const int n = ens->n_bodies_global;
+
+  double *const glo = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(4 * n, 1) * sizeof(double), "dispersed balancer staging");
+
+  for (int i = 0; i < 4 * n; ++i) glo[i] = -MFTL_DBL_MAX;
+
+  for (int o = 0; o < m->n_local; ++o)
+  {
+    const int g = ens->local_objects[o]->global_id;
+    MFTL_ASSERT(g >= 0 && g < n && "dispersed balancer: body id outside the id space");
+    glo[4 * g + 0] = m->centroid[3 * o + 0];
+    glo[4 * g + 1] = m->centroid[3 * o + 1];
+    glo[4 * g + 2] = m->centroid[3 * o + 2];
+    glo[4 * g + 3] = m->weight[o];
+  }
+
+  MFTLRemeshAgreeDoubleMax(dom, glo, 4 * n);
+
+  for (int g = 0; g < n; ++g)
+  {
+    if (glo[4 * g] == -MFTL_DBL_MAX)
+    {
+      /* Nobody holds it. It has no entities to route, so any destination is as
+       * good as any other -- but it must be the SAME one on every rank, and it
+       * must not be a coordinate no cell contains. */
+      for (int k = 0; k < 3; ++k) centroid[3 * g + k] = dom->global_min[k];
+      weight[g] = 0.0;
+      continue;
+    }
+    for (int k = 0; k < 3; ++k) centroid[3 * g + k] = glo[4 * g + k];
+    weight[g] = glo[4 * g + 3];
+  }
+
+  free(glo);
+}
+
+/**
+ * @brief The load table and the imbalance statistics, without replicating anything.
+ *
+ * The path taken when the balancer is off: a body stays on the rank owning its
+ * centroid, which every holder can decide for itself from its own row. What is
+ * still global is the REPORT -- `n_ranks_idle` and `load_imbalance` are sums over
+ * bodies held elsewhere -- and that costs `nproc` doubles rather than
+ * `n_bodies_global`, i.e. it scales with the machine and not with the
+ * simulation.
+ *
+ * A body is counted by every holder, so the contribution is divided among them:
+ * that is what `share` is, and it is why the weight is not simply added by each.
+ *
+ * @param      ens  The ensemble.
+ * @param      m    The local measurement.
+ * @param[out] dest `[m->n_local]` destination rank per LOCAL SLOT.
+ * @param[out] st   Receives `n_bodies_reassigned` (always 0 here), `n_ranks_idle`
+ *                  and `load_imbalance`.
+ * @collective One MFTLRemeshAgreeDouble() of `nproc` doubles.
+ */
+static void assign_destinations_local(MFTL_Ensemble *ens, const MFTL_RemeshMeasurement *m, int *dest, MFTL_RemeshStats *st)
+{
+  const MFTL_Domain *const dom = &ens->domain;
+  const int nproc = dom->nproc;
+
+  double *const load = (double *) MFTLCallocOrDie((size_t) nproc, sizeof(double), "dispersed rank loads");
+
+  for (int o = 0; o < m->n_local; ++o)
+  {
+    dest[o] = MFTLGetOwnerProc(dom, &m->centroid[3 * o]);
+
+    /* EACH HOLDER CONTRIBUTES ITS OWN SHARE, so the sum over ranks is the body's
+     * global weight and not that weight once per holder. `m->weight[o]` is the
+     * reduced owned-triangle count of the whole body and `tris.n_local` is this
+     * rank's part of it, so the parts add up to the whole by construction.
+     *
+     * A body with no triangles anywhere still occupies a rank, so it counts as
+     * one unit; it is credited by its lowest-numbered holder, for the same
+     * reason the admission test below is. */
+    const int mine = ens->local_objects[o]->tris.n_local;
+    load[dest[o]] += (m->weight[o] > 0.0) ? (double) mine : (((int) m->lowest_holder[o] == dom->rank) ? 1.0 : 0.0);
+  }
+
+  MFTLRemeshAgreeDouble(dom, load, nproc);
+
+  double total = 0.0, peak = 0.0;
+  int idle = 0;
+  for (int r = 0; r < nproc; ++r)
+  {
+    total += load[r];
+    if (load[r] > peak) peak = load[r];
+    if (load[r] <= 0.0) idle++;
+  }
+
+  st->n_bodies_reassigned = 0;
+  st->n_ranks_idle = idle;
+  st->load_imbalance = (total > 0.0) ? (peak * (double) nproc / total) : 1.0;
+
+  free(load);
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * 2. The driver
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -570,9 +727,9 @@ static void accumulate_stats(MFTL_RemeshStats *dst, const MFTL_RemeshStats *src)
  */
 static void prepare_for_migration(MFTL_Ensemble *ens)
 {
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    MFTL_Object *const obj = ens->objects[o];
+    MFTL_Object *const obj = ens->local_objects[o];
     if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
     MFTLComputeTriangleGeometry(obj, obj->tris.n);
   }
@@ -585,25 +742,35 @@ int MFTLRemeshEnsembleDispersed(MFTL_Ensemble *ens, const MFTL_RemeshParameters 
   /* The public entry point owes its own measurement. MFTLRemeshEnsemble does not
    * come through here -- it measured once for the strategy choice and hands that
    * measurement straight to the Measured form below. */
-  const int n_bodies = ens->num_objects;
-  if (n_bodies < 1) return MFTLRemeshEnsembleDispersedMeasured(ens, params, stats, MFTL_NULL, MFTL_NULL, MFTL_NULL);
+  MFTL_RemeshMeasurement m;
+  MFTLRemeshMeasurementInit(&m, ens);
 
-  double *const scratch = (double *) MFTLMallocOrDie((size_t) (5 * n_bodies) * sizeof(double), "dispersed body measurements");
-  prepare_for_migration(ens);
-  MFTLRemeshMeasureBodies(ens, scratch, scratch + 3 * n_bodies, scratch + 4 * n_bodies);
+  if (ens->n_bodies_global >= 1)
+  {
+    prepare_for_migration(ens);
+    MFTLRemeshMeasureBodies(ens, m.centroid, m.radius, m.weight, &m.r_max, m.lowest_holder);
+  }
 
-  const int rc = MFTLRemeshEnsembleDispersedMeasured(ens, params, stats, scratch, scratch + 3 * n_bodies, scratch + 4 * n_bodies);
-  free(scratch);
+  const int rc = MFTLRemeshEnsembleDispersedMeasured(ens, params, stats, &m);
+  MFTLRemeshMeasurementFree(&m);
   return rc;
 }
 
-int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats, const double *centroid_in,
-                                        const double *radius_in, const double *weight_in)
+int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats, const MFTL_RemeshMeasurement *m)
 {
-  MFTL_ASSERT(ens != MFTL_NULL && params != MFTL_NULL);
+  MFTL_ASSERT(ens != MFTL_NULL && params != MFTL_NULL && m != MFTL_NULL);
 
   MFTL_Domain *const dom = &ens->domain;
-  const int n = ens->num_objects;
+
+  /* The GLOBAL body count, and only for the guard and for the balancer's
+   * replicated table: everything below is collective, so a rank holding nothing
+   * must still reach it.
+   *
+   * There is deliberately NO cached local count. A migration destroys the object
+   * of a body a rank keeps nothing of and creates one for a body arriving, so
+   * `ens->n_local_objects` and `ens->local_objects` both change under this
+   * function -- every loop below re-reads them. */
+  const int n = ens->n_bodies_global;
 
   MFTL_RemeshStats sink;
   MFTL_RemeshStats *const st = stats ? stats : &sink;
@@ -647,20 +814,21 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
 
   /* ── 1. Where is each body, and how big is it? ───────────────────────────
    *
-   * Handed in, not measured here. MFTLRemeshMeasureBodies is two Allreduces for
-   * the whole ensemble -- 7*num_objects doubles and then num_objects -- and the
-   * caller has already paid them to decide the strategy. Measuring again would
-   * double the collectives of the whole pass to recompute an identical answer.
+   * Handed in, not measured here. MFTLRemeshMeasureBodies is two per-body
+   * reductions and a scalar, and the caller has already paid them to decide the
+   * strategy. Measuring again would double the collectives of the whole pass to
+   * recompute an identical answer.
    *
    * The radius is not diagnostic here. It is the ADMISSION TEST, and it has to
-   * be taken before the migration rather than after it -- see step 2. */
-  MFTL_ASSERT(centroid_in != MFTL_NULL && radius_in != MFTL_NULL &&
-              "MFTLRemeshEnsembleDispersedMeasured: the caller owes a replicated measurement -- see remesh_internal.h");
+   * be taken before the migration rather than after it -- see step 2.
+   *
+   * The rows describe THIS RANK'S bodies. That is enough for everything except
+   * the balancer, which needs the whole ensemble and says so. */
+  MFTL_ASSERT(m->n_local == ens->n_local_objects &&
+              "MFTLRemeshEnsembleDispersedMeasured: the measurement describes a different local list -- something migrated between the two calls");
 
-  const double *const centroid = centroid_in;
-  const double *const radius = radius_in;
-  const double *const weight = weight_in;
-  int *const dest = (int *) MFTLMallocOrDie((size_t) n * sizeof(int), "dispersed destinations");
+  const int n_local = m->n_local;
+  int *const dest = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_local, 1) * sizeof(int), "dispersed destinations");
 
   /* ── 2. Is this strategy applicable at all? ──────────────────────────────
    *
@@ -701,19 +869,28 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
    * data it already holds. A chooser and a driver disagreeing here would elect
    * DISPERSED and then reject it, costing a measurement and a fall back to
    * spanning -- visible only as `n_bodies_not_centred`. */
-  double r_max = 0.0;
-  for (int o = 0; o < n; ++o) r_max = MFTL_MAX(r_max, radius[o]);
+  const double h_min = dispersed_box_min(dom, params, m->r_max, n);
 
-  const double h_min = dispersed_box_min(dom, params, r_max, n);
-
+  /* Counted over THIS RANK'S bodies and summed, rather than read off a
+   * replicated radius array. The verdict `too_large > 0` was already agreed by a
+   * collective -- it decides whether the whole ensemble falls back to the
+   * spanning driver, so it always was -- and this only changes what is summed
+   * into it.
+   *
+   * ONCE PER BODY, NOT ONCE PER HOLDER. Every holder of a body reduced to the
+   * same radius, so an unqualified sum reports a body held by four ranks four
+   * times -- which the regime sweep printed as "4 of 1 bodies are wider than a
+   * rank box". `lowest_holder` designates one of them and costs no collective;
+   * see MFTL_RemeshMeasurement. */
   int too_large = 0;
   if (dom->nproc > 1 && h_min > 0.0)
   {
-    for (int o = 0; o < n; ++o)
+    for (int o = 0; o < n_local; ++o)
     {
-      if (radius[o] > frac * h_min) too_large++;
+      if (m->radius[o] > frac * h_min && (int) m->lowest_holder[o] == dom->rank) too_large++;
     }
   }
+  MFTLRemeshSumInts(dom, &too_large, 1);
   st->n_bodies_not_centred = too_large;
 
   if (too_large > 0)
@@ -737,10 +914,41 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
     return rc;
   }
 
-  /* Centroid ownership, then balance. Both halves are pure functions of
-   * replicated data; see the banner on assign_destinations for why that is the
-   * load-bearing property and not merely a convenience. */
-  assign_destinations(dom, params, centroid, weight, n, dest, st);
+  /* ── Centroid ownership, then balance ────────────────────────────────────
+   *
+   * Two paths, and which one runs is what decides whether this driver has an
+   * `O(bodies in the ensemble)` term at all.
+   *
+   * BALANCER OFF. A body goes to the rank owning its centroid, which every
+   * holder decides from its own measurement row. Nothing is replicated and
+   * nothing is `O(bodies)`; the only collective is `nproc` doubles for the
+   * imbalance report.
+   *
+   * BALANCER ON (the default). The greedy is over RANK LOADS, and a rank's load
+   * sums bodies held anywhere in the job, so every rank has to see every body or
+   * two of them will name different destinations for one entity -- which
+   * MFTL_OwnerMap does not merely handle badly, it leaves undefined. The
+   * replication is therefore explicit, priced and attributable to one switch.
+   * See replicate_for_balancer(). */
+  if (params->dispersed_balance_slack > 0.0 && dom->nproc > 1 && n > 1)
+  {
+    double *const rep = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(4 * n, 1) * sizeof(double), "dispersed replicated measurement");
+    double *const rep_centroid = rep;
+    double *const rep_weight = rep + 3 * n;
+    int *const rep_dest = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n, 1) * sizeof(int), "dispersed replicated destinations");
+
+    replicate_for_balancer(ens, m, rep_centroid, rep_weight);
+    assign_destinations(dom, params, rep_centroid, rep_weight, n, rep_dest, st);
+
+    for (int o = 0; o < n_local; ++o) dest[o] = rep_dest[ens->local_objects[o]->global_id];
+
+    free(rep_dest);
+    free(rep);
+  }
+  else
+  {
+    assign_destinations_local(ens, m, dest, st);
+  }
 
   /* ── 3. Move each body whole ─────────────────────────────────────────────── */
   t_mark = MFTLRemeshWallTime();
@@ -758,9 +966,9 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
    * inspection. Asserted because it is the hinge of the whole strategy and it is
    * free in Release. */
 #ifndef NDEBUG
-  for (int o = 0; o < n; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
+    const MFTL_Object *const obj = ens->local_objects[o];
     MFTL_ASSERT(obj->verts.n_local == obj->verts.n && obj->tris.n_local == obj->tris.n &&
                 "dispersed remeshing: a body kept ghosts after centering -- the owner map did not name one rank");
   }
@@ -774,9 +982,9 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
    * which is why this loop needs no ownership test of its own. */
   t_mark = MFTLRemeshWallTime();
   int local_ops = 0;
-  for (int o = 0; o < n; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    MFTL_Object *const obj = ens->objects[o];
+    MFTL_Object *const obj = ens->local_objects[o];
     if (obj->tris.n == 0) continue;
 
     MFTL_RemeshStats one;
@@ -806,26 +1014,47 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
    *
    * The convergence counter rides the same message. It is reported rather than
    * looped on -- there is only ever one pass here. */
-  int *const counters = (int *) MFTLCallocOrDie((size_t) (2 * n + 1), sizeof(int), "dispersed id counters");
-  for (int o = 0; o < n; ++o)
-  {
-    const MFTL_Object *const obj = ens->objects[o];
-    counters[2 * o + 0] = (obj->verts.n > 0) ? obj->next_vertex_gid : 0;
-    counters[2 * o + 1] = (obj->tris.n > 0) ? obj->next_triangle_gid : 0;
-  }
-  /* The operation count rides the same message so that the reduction is one
-   * collective rather than two, and it is read back below into the stats. */
-  counters[2 * n] = local_ops;
+  /* Re-read, not `n_local`: the migration in step 3 changed which bodies this
+   * rank holds, which is the whole point of it. */
+  const int n_held = ens->n_local_objects;
+  MFTL_BodyReduceOp cops[2] = {MFTL_BODY_REDUCE_MAX, MFTL_BODY_REDUCE_MAX};
+  double *const counters = (double *) MFTLCallocOrDie((size_t) MFTL_MAX(2 * n_held, 1), sizeof(double), "dispersed id counters");
 
+  for (int o = 0; o < n_held; ++o)
+  {
+    const MFTL_Object *const obj = ens->local_objects[o];
+    counters[2 * o + 0] = (obj->verts.n > 0) ? (double) obj->next_vertex_gid : 0.0;
+    counters[2 * o + 1] = (obj->tris.n > 0) ? (double) obj->next_triangle_gid : 0.0;
+  }
+
+  /* PER BODY, over that body's holders, and indexed by LOCAL SLOT. The staging
+   * buffer this replaces was `2 * n_bodies_global + 1` ints on every rank -- the
+   * id space, because an `MPI_Allreduce` aligns element k of every rank's buffer
+   * and the body id is the only index two ranks holding different bodies agree
+   * about. Moving that indexing inside MFTLEnsembleReduceBodies() is what makes
+   * the per-rank memory follow the holding rather than the ensemble.
+   *
+   * In this driver a body is normally held by exactly ONE rank when this runs --
+   * step 3 centred it -- so the reduction is the identity and costs the message
+   * and nothing else. It is taken anyway because "normally" is not "always": a
+   * rank can still hold an EMPTY object for a body, and such a rank goes on to a
+   * redistribution that sizes its arrival table from `next_*_gid`. An empty
+   * holder is also exactly what makes MFTLEnsembleBodyHoldersFitTheGraph() veto,
+   * so that case takes the global route and gets the right answer there. */
   t_mark = MFTLRemeshWallTime();
-  MFTLRemeshAgreeIntMax(dom, counters, 2 * n + 1);
+  MFTLEnsembleReduceBodies(ens, counters, 2, cops, MFTL_BODY_REDUCE_SCOPE_AUTO);
+
+  /* One int of pure latency, and it cannot ride the per-body message: it is a
+   * maximum over RANKS, not over the holders of any one body. */
+  int busiest = local_ops;
+  MFTLRemeshAgreeIntMax(dom, &busiest, 1);
   st->t_reduce += MFTLRemeshWallTime() - t_mark;
 
-  for (int o = 0; o < n; ++o)
+  for (int o = 0; o < n_held; ++o)
   {
-    MFTL_Object *const obj = ens->objects[o];
-    obj->next_vertex_gid = counters[2 * o + 0];
-    obj->next_triangle_gid = counters[2 * o + 1];
+    MFTL_Object *const obj = ens->local_objects[o];
+    obj->next_vertex_gid = (int) counters[2 * o + 0];
+    obj->next_triangle_gid = (int) counters[2 * o + 1];
     obj->next_halfedge_gid = 3 * obj->next_triangle_gid;
   }
 
@@ -833,7 +1062,7 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
    * holds any entity of a body, so no two ranks operate on the same body and the
    * maximum is the busiest rank's count. It is reported as such -- see the
    * locality note on MFTL_RemeshStats. */
-  st->n_ops_busiest_rank = counters[2 * n];
+  st->n_ops_busiest_rank = busiest;
   free(counters);
 
   /* One pass over whole bodies IS the serial answer, so there is nothing left
@@ -859,9 +1088,9 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
    * MFTLRemeshObject promises its caller current triangle geometry. This entry
    * point promises the same thing rather than being a different contract. */
   t_mark = MFTLRemeshWallTime();
-  for (int o = 0; o < n; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    MFTL_Object *const obj = ens->objects[o];
+    MFTL_Object *const obj = ens->local_objects[o];
     if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
     MFTLComputeTriangleGeometry(obj, obj->tris.n);
   }

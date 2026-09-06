@@ -1631,8 +1631,10 @@ MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategy(MFTL_Ensemble *ens, const M
  * question: the plan's ensemble-rebalancing scheme (§6) is exactly "measure the
  * bodies, then decide", and deciding is the caller's business.
  *
- * Both must be global. A rank's share of a body has a centroid somewhere inside
- * its own box, so a per-rank answer would centre nothing and measure nothing.
+ * Both are reduced over the body's HOLDERS and are therefore global answers about
+ * each body, even though the buffers are local. A rank's own share of a body has
+ * a centroid somewhere inside its own box, so an unreduced answer would centre
+ * nothing and measure nothing.
  *
  * ── Periodicity is not a detail here ───────────────────────────────────────
  *
@@ -1654,27 +1656,58 @@ MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategy(MFTL_Ensemble *ens, const M
  * @p weight is each body's GLOBAL owned-triangle count, and it is produced by
  * widening this function's existing per-body reduction by one slot rather than
  * by taking a second one. That matters more than it sounds: this is the module's
- * only O(num_objects) collective, so how many of them a pass takes is what
- * decides its cost at ten thousand droplets -- and the number is one. Asking for
- * the weights separately would have made it two.
+ * only per-body collective, so how many of them a pass takes is what decides its
+ * cost at ten thousand droplets -- and the number is one. Asking for the weights
+ * separately would have made it two.
  *
  * A count rather than an area, because it is a proxy for SWEEP TIME: the
  * operators iterate over half-edges, and a body of many small triangles costs
  * more to remesh than one of few large ones covering the same area.
  *
+ * ── THE OUTPUTS ARE INDEXED BY LOCAL SLOT, NOT BY BODY ID ──────────────────
+ *
+ * Row `o` describes `ens->local_objects[o]`. The arrays used to be
+ * `[n_bodies_global]` and replicated, because an `MPI_Allreduce` aligns element
+ * k of every rank's buffer and the body id is the only index two ranks holding
+ * different bodies agree about -- 72 bytes per body on every rank, to learn
+ * about the handful it holds. The reduction now goes through
+ * MFTLEnsembleReduceBodies(), which moves that indexing inside itself and only
+ * onto the route that still needs it.
+ *
+ * @p r_max is what the replication was mostly FOR: the largest body in the
+ * ensemble, which the strategy ratio and the dispersed admission test are both
+ * taken against and which every rank must therefore agree about to the bit. One
+ * `MPI_MAX` of one double gives it, at a cost that does not grow with the body
+ * count.
+ *
+ * A caller that genuinely needs a replicated per-body array -- the dispersed
+ * load balancer is the only one, because its assignment must be identical on
+ * every rank -- has to broadcast these rows itself and pay the `O(bodies)` for
+ * it explicitly.
+ *
  * @param      ens      The ensemble.
- * @param[out] centroid [3*num_objects], may be #MFTL_NULL.
- * @param radius   [num_objects] out, may be MFTL_NULL. Skipping it skips the
- *                 second collective.
- * @param[out] weight [num_objects] global owned-triangle count per body, as a
- *                    double so it rides the same reduction. May be #MFTL_NULL,
- *                    which costs nothing either way -- the slot is reduced
- *                    regardless.
- * @note Collective: one MPI_Allreduce of 8*num_objects doubles, then one of
- *       num_objects. Reads `tris.area` and `tris.center`, so the caller owes a
- *       current geometry pass.
+ * @param[out] centroid `[3 * n_local_objects]`, may be #MFTL_NULL.
+ * @param[out] radius   `[n_local_objects]` max corner distance from the centroid,
+ *                      may be #MFTL_NULL.
+ * @param[out] weight   `[n_local_objects]` global owned-triangle count per body,
+ *                      as a double so it rides the same reduction. May be
+ *                      #MFTL_NULL, which costs nothing either way -- the slot is
+ *                      reduced regardless.
+ * @param[out] r_max    The largest radius over the WHOLE ensemble, or #MFTL_NULL.
+ * @param[out] lowest_holder `[n_local_objects]` the lowest-numbered rank holding
+ *                      each body, or #MFTL_NULL. It is the answer to "may I count
+ *                      this body": every holder gets the same reduced values, so
+ *                      summing a per-body verdict over ranks counts a shared body
+ *                      once per holder unless one of them is designated. Free --
+ *                      it is a MIN slot on the reduction already being taken.
+ * @note Collective: one per-body reduction of 8 values, then one of 1 value when
+ *       @p radius or @p r_max is asked for, plus one scalar `MPI_MAX` for
+ *       @p r_max. Which of them are taken depends only on which POINTERS are
+ *       null, so it must be the same on every rank -- it is a property of the
+ *       call and never of this rank's data. Reads `tris.area` and `tris.center`,
+ *       so the caller owes a current geometry pass.
  */
-void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radius, double *weight);
+void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radius, double *weight, double *r_max, double *lowest_holder);
 
 /**
  * @brief How many flow ranks would have to be grouped into one remeshing rank

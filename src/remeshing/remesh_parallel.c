@@ -419,9 +419,9 @@ static void count_hidden_edges(const MFTL_Object *obj, const MFTL_RemeshParamete
  */
 static void clear_frozen(MFTL_Ensemble *ens)
 {
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    MFTL_Object *const obj = ens->objects[o];
+    MFTL_Object *const obj = ens->local_objects[o];
     for (int v = 0; v < obj->verts.n; ++v) obj->verts.rec[v].flags &= ~MFTL_FLAG_FROZEN;
     for (int t = 0; t < obj->tris.n; ++t) obj->tris.rec[t].flags &= ~MFTL_FLAG_FROZEN;
   }
@@ -439,12 +439,15 @@ static void clear_frozen(MFTL_Ensemble *ens)
  * four ints per body, against a message of two.
  */
 /**
- * @brief Convergence counters that ride the id Allreduce rather than paying for
- *        a collective of their own.
+ * @brief The convergence certificate, summed over ranks once per phase.
  *
  * A 3-int Allreduce is pure latency and does not get cheaper for being small, so
- * anything the driver needs summed over ranks goes here. The order is fixed
- * because the driver reads `total[n2 + MFTL_REMESH_EXTRA_*]` by name.
+ * everything the driver needs summed over ranks shares one. It used to ride the
+ * id Allreduce instead, which was free while the ids were themselves a
+ * `comm_world` reduction of `2 * bodies` ints; now that they go over the
+ * 26-neighbour graph, appending three ensemble-wide ints to them would put a
+ * `comm_world` reduction back on every phase. The array is read back IN PLACE by
+ * the driver, by name.
  */
 /** @brief Trailing slot: operations performed this phase, summed over ranks. */
 #define MFTL_REMESH_EXTRA_OPS 0
@@ -457,71 +460,117 @@ static void clear_frozen(MFTL_Ensemble *ens)
 
 typedef struct
 {
-  int *local;  ///< [2*n]   what this rank contributes: {vertices, triangles} per body.
-  int *send;  ///< [2*n+E] `local` plus the convergence counters.
-  int *prefix;  ///< [2*n]   MPI_Exscan of `send`: this rank's offset.
-  int *total;  ///< [2*n+E] MPI_Allreduce of `send`: the global block length, and the counters.
-  int *base;  ///< [n]     per-object vertex id base, as MFTLRemeshSyncGhostIds wants it.
-  int *watermark;  ///< [2*n]   the id counters as they stood BEFORE a phase's sweeps.
-  int n;  ///< Bodies in the ensemble.
+  double *local;  ///< [2*b] what this rank contributes: {vertices, triangles} per LOCAL SLOT.
+  double *prefix;  ///< [2*b] exclusive prefix over the body's holders: this rank's offset.
+  double *total;  ///< [2*b] sum over the body's holders: the block length.
+  int *base;  ///< [b]   per-LOCAL-SLOT vertex id base, as MFTLRemeshSyncGhostIds wants it.
+  int *watermark;  ///< [2*b] the id counters as they stood BEFORE a phase's sweeps.
+  int cap;  ///< Local slots the arrays are sized for.
 } gid_scratch;
 
 /**
- * @brief Allocates all six arrays as ONE block, so a phase mallocs once.
- * @param g           The scratch handle.
- * @param num_objects Bodies in the ensemble.
+ * @brief Sizes the scratch for @p b local bodies, never shrinking.
+ *
+ * ── IT IS INDEXED BY LOCAL SLOT, AND THAT IS THE POINT ────────────────────
+ *
+ * The version this replaces was `11 * n_bodies_global + 2E` ints, allocated once
+ * per pass on every rank -- 44 MB at a million droplets, to hand out ids for the
+ * handful a rank holds. Every one of those arrays was the payload of an
+ * `MPI_Exscan` or an `MPI_Allreduce` over `comm_world`, which is the only place
+ * the body id has to be the index: `MPI_Exscan` aligns element k of every rank's
+ * buffer. MFTLEnsembleExscanBodies() moves that indexing inside itself, and only
+ * on the route that still needs it.
+ *
+ * A ratchet, and re-sized per PHASE rather than per pass, because a phase
+ * migrates and a migration changes how many bodies this rank holds. Growth only:
+ * the counts move by a few percent between phases, so after the first one every
+ * later phase reuses warm pages.
+ *
+ * @param g The scratch handle.
+ * @param b Local bodies this phase.
  */
-static void gid_scratch_init(gid_scratch *g, int num_objects)
+static void gid_scratch_reserve(gid_scratch *g, int b)
 {
-  const int n = MFTL_MAX(num_objects, 1);
-  const int e = MFTL_REMESH_EXTRA_INTS;
-  g->n = num_objects;
+  /* At least one slot even for a rank holding nothing: under a coarsened
+   * placement that is the common case, and the arrays are still HANDED to a
+   * collective (MFTLRemeshSyncGhostIds) that has no use for a null pointer it
+   * will never dereference. */
+  if (b < 1) b = 1;
+  if (b <= g->cap) return;
 
-  /* 2n + (2n+E) + 2n + (2n+E) + n + 2n = 11n + 2E */
-  g->local = (int *) MFTLCallocOrDie((size_t) (11 * n + 2 * e), sizeof(int), "remesh id scratch");
-  g->send = g->local + 2 * n;
-  g->prefix = g->send + 2 * n + e;
-  g->total = g->prefix + 2 * n;
-  g->base = g->total + 2 * n + e;
-  g->watermark = g->base + n;
+  int cap = (g->cap > 0) ? g->cap : 8;
+  while (cap < b) cap *= 2;
+
+  free(g->local);
+  free(g->base);
+
+  /* 2 + 2 + 2 doubles and 1 + 2 ints per slot, as two blocks so that a phase
+   * takes two mallocs however many bodies it holds. */
+  g->local = (double *) MFTLCallocOrDie((size_t) (6 * cap), sizeof(double), "remesh id scratch");
+  g->prefix = g->local + 2 * cap;
+  g->total = g->prefix + 2 * cap;
+
+  g->base = (int *) MFTLCallocOrDie((size_t) (3 * cap), sizeof(int), "remesh id watermarks");
+  g->watermark = g->base + cap;
+
+  g->cap = cap;
 }
 
 /**
- * @brief Releases the block.
- * @param g The scratch handle.
+ * @brief Zeroes the handle. @param g The scratch handle.
  */
-static void gid_scratch_free(gid_scratch *g) { free(g->local); }
+static void gid_scratch_init(gid_scratch *g)
+{
+  g->local = MFTL_NULL;
+  g->prefix = MFTL_NULL;
+  g->total = MFTL_NULL;
+  g->base = MFTL_NULL;
+  g->watermark = MFTL_NULL;
+  g->cap = 0;
+}
 
 /**
- * @brief One Exscan and one Allreduce of the same counts, with their latencies
- *        overlapped.
+ * @brief Releases the two blocks.
+ * @param g The scratch handle.
+ */
+static void gid_scratch_free(gid_scratch *g)
+{
+  free(g->local);
+  free(g->base);
+  gid_scratch_init(g);
+}
+
+/**
+ * @brief The per-body exclusive prefix sum, plus the total.
  *
- * Two collectives rather than one because they are different reductions of the
- * same input: the Exscan says where this rank's block starts, the Allreduce says
- * how long the global block is (and carries the convergence counters along, so
- * the phase pays no third latency for them). They are independent, so both are
- * posted before either is waited on and the two O(log P) latencies overlap
- * instead of adding.
+ * ── THE SCOPE IS AUTO, AND IT IS NOT A DETAIL ─────────────────────────────
  *
- * Deadlock freedom: both are posted unconditionally, in the same order, by every
- * rank -- the order comes from this function, never from the data.
+ * #MFTL_BODY_REDUCE_SCOPE_AUTO lets MFTLEnsembleExscanBodies() take the route
+ * the partition actually permits: the body's HOLDERS over the 26-neighbour
+ * graph when every holder set fits inside one neighbourhood, and `comm_world`
+ * when it does not -- which is exactly what a COARSENED placement makes normal,
+ * because a coarse representative is `group` fine cells away and no local test
+ * would call it a neighbour. The same condition MFTLRemeshSyncGhostIds() falls
+ * back on, decided by the same one int.
  *
- * @param      dom   The MPI/physical world.
- * @param      g     The scratch handle; `send` must be filled in.
- * @param      extra `[MFTL_REMESH_EXTRA_INTS]` the convergence counters to carry
- *                   along, or NULL for zeros.
+ * Pinning this to #MFTL_BODY_REDUCE_SCOPE_GLOBAL is a scaling regression THAT NO
+ * TEST OF THE MESH CAN SEE. The two routes agree to the bit by construction, so
+ * every digest in docs/parallel-remeshing-analysis.md reproduces either way; the
+ * cost is `3 * n_bodies_global * 2` doubles of staging and two `comm_world`
+ * collectives over a third of that, ONCE PER PHASE, on a rank that may hold a
+ * hundred of a million bodies. `test_a_droplet_remesh_takes_no_global_reduction`
+ * (tests/test_body_reduce.c) counts the routes rather than the answer, and is
+ * the only thing in the suite that would notice.
+ *
+ * @param      ens The ensemble.
+ * @param      g   The scratch handle; `local` must be filled in.
  * @collective
  */
-static void gid_reduce(const MFTL_Domain *dom, gid_scratch *g, const int *extra)
+static void gid_reduce(MFTL_Ensemble *ens, gid_scratch *g)
 {
-  const int n2 = 2 * g->n;
-
-  /* The Allreduce wants the extras appended to the counts and the Exscan wants
-   * the counts alone: one buffer, read to two different lengths. */
-  memcpy(g->send, g->local, (size_t) n2 * sizeof(int));
-  memcpy(g->send + n2, extra, (size_t) MFTL_REMESH_EXTRA_INTS * sizeof(int));
-
-  MFTLRemeshIdReduce(dom, g->send, g->prefix, g->total, n2, MFTL_REMESH_EXTRA_INTS);
+  const int b = ens->n_local_objects;
+  if (b > 0) memcpy(g->prefix, g->local, (size_t) (2 * b) * sizeof(double));
+  MFTLEnsembleExscanBodies(ens, g->prefix, g->total, 2, MFTL_BODY_REDUCE_SCOPE_AUTO);
 }
 
 /**
@@ -547,13 +596,16 @@ static void gid_reduce(const MFTL_Domain *dom, gid_scratch *g, const int *extra)
  * @param extra `[MFTL_REMESH_EXTRA_INTS]` convergence counters to carry along in
  *              the same reduction, or NULL.
  */
-static void assign_phase_gids(MFTL_Ensemble *ens, gid_scratch *g, const int *extra)
+static void assign_phase_gids(MFTL_Ensemble *ens, gid_scratch *g, int *extra)
 {
+  const int b = ens->n_local_objects;
   const int *const watermark = g->watermark;
 
-  for (int o = 0; o < ens->num_objects; ++o)
+  gid_scratch_reserve(g, b);
+
+  for (int o = 0; o < b; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
+    const MFTL_Object *const obj = ens->local_objects[o];
     int cv = 0, ct = 0;
 
     for (int v = 0; v < obj->verts.n_local; ++v)
@@ -561,25 +613,36 @@ static void assign_phase_gids(MFTL_Ensemble *ens, gid_scratch *g, const int *ext
     for (int t = 0; t < obj->tris.n_local; ++t)
       if (obj->tris.rec[t].global_id >= watermark[2 * o + 1]) ct++;
 
-    g->local[2 * o + 0] = cv;
-    g->local[2 * o + 1] = ct;
+    g->local[2 * o + 0] = (double) cv;
+    g->local[2 * o + 1] = (double) ct;
   }
 
-  gid_reduce(&ens->domain, g, extra);
+  gid_reduce(ens, g);
 
-  for (int o = 0; o < ens->num_objects; ++o)
+  /* ── The convergence counters no longer ride along, and that is a TRADE ───
+   *
+   * They used to be appended to the id Allreduce, so the phase paid no third
+   * latency for them -- a good trade while the id payload was `2 * bodies` ints
+   * on `comm_world` and three more cost nothing. It is the wrong trade now: the
+   * ids go over the 26-neighbour graph and are `O(local bodies)`, so appending
+   * three ensemble-wide ints to them would put a `comm_world` reduction back on
+   * the phase. Three ints of pure latency, once per phase, buys removing an
+   * `O(bodies in the ensemble)` payload from every phase. */
+  MFTLRemeshSumInts(&ens->domain, extra, MFTL_REMESH_EXTRA_INTS);
+
+  for (int o = 0; o < b; ++o)
   {
-    MFTL_Object *const obj = ens->objects[o];
+    MFTL_Object *const obj = ens->local_objects[o];
     const int wv = watermark[2 * o + 0];
     const int wt = watermark[2 * o + 1];
 
-    int next_v = wv + g->prefix[2 * o + 0];
+    int next_v = wv + (int) g->prefix[2 * o + 0];
     for (int v = 0; v < obj->verts.n_local; ++v)
     {
       if (obj->verts.rec[v].global_id >= wv) obj->verts.rec[v].global_id = next_v++;
     }
 
-    int next_t = wt + g->prefix[2 * o + 1];
+    int next_t = wt + (int) g->prefix[2 * o + 1];
     for (int t = 0; t < obj->tris.n_local; ++t)
     {
       if (obj->tris.rec[t].global_id < wt) continue;
@@ -592,11 +655,11 @@ static void assign_phase_gids(MFTL_Ensemble *ens, gid_scratch *g, const int *ext
       for (int k = 0; k < 3; ++k) obj->tris.he[3 * t + k].global_id = 3 * gid + k;
     }
 
-    /* The watermark advances by the GLOBAL creation count on every rank, so it
-     * stays a value all ranks agree on -- which is what the next phase's
+    /* The watermark advances by the GLOBAL creation count on every holder, so it
+     * stays a value all of them agree on -- which is what the next phase's
      * "created this phase" test and redistribution's table sizing both rest on. */
-    obj->next_vertex_gid = wv + g->total[2 * o + 0];
-    obj->next_triangle_gid = wt + g->total[2 * o + 1];
+    obj->next_vertex_gid = wv + (int) g->total[2 * o + 0];
+    obj->next_triangle_gid = wt + (int) g->total[2 * o + 1];
     obj->next_halfedge_gid = 3 * obj->next_triangle_gid;
   }
 }
@@ -627,24 +690,29 @@ static void assign_phase_gids(MFTL_Ensemble *ens, gid_scratch *g, const int *ext
  */
 static int redensify_global_ids(MFTL_Ensemble *ens, gid_scratch *g)
 {
-  for (int o = 0; o < ens->num_objects; ++o)
+  const int b = ens->n_local_objects;
+
+  gid_scratch_reserve(g, b);
+
+  for (int o = 0; o < b; ++o)
   {
-    g->local[2 * o + 0] = ens->objects[o]->verts.n_local;
-    g->local[2 * o + 1] = ens->objects[o]->tris.n_local;
+    const MFTL_Object *const obj = ens->local_objects[o];
+    g->local[2 * o + 0] = (double) obj->verts.n_local;
+    g->local[2 * o + 1] = (double) obj->tris.n_local;
   }
 
-  const int no_extra[MFTL_REMESH_EXTRA_INTS] = {0};
-  gid_reduce(&ens->domain, g, no_extra);
+  gid_reduce(ens, g);
 
-  for (int o = 0; o < ens->num_objects; ++o) g->base[o] = g->prefix[2 * o + 0];
+  /* `base` is indexed by LOCAL SLOT, as MFTLRemeshSyncGhostIds() reads it. */
+  for (int o = 0; o < b; ++o) g->base[o] = (int) g->prefix[2 * o + 0];
 
   const int status = MFTLRemeshSyncGhostIds(ens, g->base);
 
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < b; ++o)
   {
-    MFTL_Object *const obj = ens->objects[o];
-    const int base_v = g->prefix[2 * o + 0];
-    const int base_t = g->prefix[2 * o + 1];
+    MFTL_Object *const obj = ens->local_objects[o];
+    const int base_v = (int) g->prefix[2 * o + 0];
+    const int base_t = (int) g->prefix[2 * o + 1];
 
     for (int v = 0; v < obj->verts.n_local; ++v) obj->verts.rec[v].global_id = base_v + v;
 
@@ -655,8 +723,8 @@ static int redensify_global_ids(MFTL_Ensemble *ens, gid_scratch *g)
       for (int k = 0; k < 3; ++k) obj->tris.he[3 * t + k].global_id = 3 * gid + k;
     }
 
-    obj->next_vertex_gid = g->total[2 * o + 0];
-    obj->next_triangle_gid = g->total[2 * o + 1];
+    obj->next_vertex_gid = (int) g->total[2 * o + 0];
+    obj->next_triangle_gid = (int) g->total[2 * o + 1];
     obj->next_halfedge_gid = 3 * obj->next_triangle_gid;
 
     /* The ids of entities other ranks hold copies of have just been rewritten,
@@ -1115,25 +1183,31 @@ static void report_cap_bound(const MFTL_Domain *dom, const MFTL_RemeshParameters
  */
 static bool watermarks_agree(MFTL_Ensemble *ens)
 {
-  const int n = ens->num_objects;
-  if (n == 0) return MFTL_TRUE;
+  if (ens->n_bodies_global == 0) return MFTL_TRUE;
 
-  int *const mine = (int *) MFTLMallocOrDie((size_t) (4 * n) * sizeof(int), "remesh watermark check");
-  int *const agreed = mine + 2 * n;
+  /* Per body, over that body's HOLDERS -- the only ranks that have a counter to
+   * agree about. A rank holding none of a body is not part of the question, and
+   * the check is exactly "does my value survive a MAX over the others". */
+  const int b = ens->n_local_objects;
+  MFTL_BodyReduceOp ops[2] = {MFTL_BODY_REDUCE_MAX, MFTL_BODY_REDUCE_MAX};
 
-  for (int o = 0; o < n; ++o)
+  double *const mine = (double *) MFTLCallocOrDie((size_t) MFTL_MAX(4 * b, 1), sizeof(double), "remesh watermark check");
+  double *const agreed = mine + 2 * b;
+
+  for (int o = 0; o < b; ++o)
   {
-    mine[2 * o + 0] = ens->objects[o]->next_vertex_gid;
-    mine[2 * o + 1] = ens->objects[o]->next_triangle_gid;
+    const MFTL_Object *const obj = ens->local_objects[o];
+    mine[2 * o + 0] = (double) obj->next_vertex_gid;
+    mine[2 * o + 1] = (double) obj->next_triangle_gid;
   }
 
-  memcpy(agreed, mine, (size_t) (2 * n) * sizeof(int));
-  MFTLRemeshAgreeIntMax(&ens->domain, agreed, 2 * n);
+  if (b > 0) memcpy(agreed, mine, (size_t) (2 * b) * sizeof(double));
+  MFTLEnsembleReduceBodies(ens, agreed, 2, ops, MFTL_BODY_REDUCE_SCOPE_AUTO);
 
   bool ok = MFTL_TRUE;
-  for (int i = 0; i < 2 * n; ++i)
+  for (int o = 0; o < b; ++o)
   {
-    if (mine[i] != agreed[i]) ok = MFTL_FALSE;
+    if (mine[2 * o + 0] != agreed[2 * o + 0] || mine[2 * o + 1] != agreed[2 * o + 1]) ok = MFTL_FALSE;
   }
 
   free(mine);
@@ -1185,9 +1259,9 @@ static void accumulate_stats(MFTL_RemeshStats *dst, const MFTL_RemeshStats *src)
  */
 static void prepare_for_migration(MFTL_Ensemble *ens)
 {
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    MFTL_Object *const obj = ens->objects[o];
+    MFTL_Object *const obj = ens->local_objects[o];
     if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
     MFTLComputeTriangleGeometry(obj, obj->tris.n);
   }
@@ -1204,7 +1278,8 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
   memset(st, 0, sizeof(*st));
   st->strategy = MFTL_REMESH_PARALLEL_SPANNING;
 
-  if (ens->num_objects == 0) return MFTL_SUCCESS;
+  /* GLOBAL: everything below is collective. */
+  if (ens->n_bodies_global == 0) return MFTL_SUCCESS;
 
   MFTL_ASSERT(watermarks_agree(ens) &&
               "MFTLRemeshEnsembleParallel: the ranks disagree about an object's next_*_gid. New ids are carved out "
@@ -1258,12 +1333,12 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
     double probe[2] = {0.0, 0.0};
     double counts[2] = {0.0, 0.0};
     const double no_shift[3] = {0.0, 0.0, 0.0};
-    for (int o = 0; o < ens->num_objects; ++o)
+    for (int o = 0; o < ens->n_local_objects; ++o)
     {
-      MFTLRemeshMarkFrozen(ens->objects[o]);
-      MFTLDilateFrozenBand(ens->objects[o], params->freeze_dilation_rings);
-      local_band_probe(ens->objects[o], dom, no_shift, probe);
-      local_frozen_count(ens->objects[o], counts);
+      MFTLRemeshMarkFrozen(ens->local_objects[o]);
+      MFTLDilateFrozenBand(ens->local_objects[o], params->freeze_dilation_rings);
+      local_band_probe(ens->local_objects[o], dom, no_shift, probe);
+      local_frozen_count(ens->local_objects[o], counts);
     }
     MFTLRemeshAgreeDoubleMax(dom, probe, 2);
 
@@ -1357,7 +1432,11 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
   st->n_coarse_groups = group[0] * group[1] * group[2];
 
   gid_scratch gid;
-  gid_scratch_init(&gid, ens->num_objects);
+  /* Indexed by LOCAL SLOT and re-sized per phase, because a phase migrates and a
+   * migration changes how many bodies this rank holds. MFTLEnsembleExscanBodies()
+   * is what makes that possible: the body-id indexing an `MPI_Exscan` needs now
+   * lives inside the collective and only on the route that still requires it. */
+  gid_scratch_init(&gid);
 
   /* One arena for every migration this pass makes, grown once and reused: a
    * pass migrates up to `budget` times, and re-allocating a destination array
@@ -1409,7 +1488,6 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
   st->n_distinct_placements = n_distinct;
 
   const int budget = (params->parallel_phase_budget > 0) ? params->parallel_phase_budget : 4 * MFTL_REMESH_NUM_PHASES;
-  const int n2 = 2 * ens->num_objects;
 
   int clean_streak = 0;
   int status = MFTL_SUCCESS;
@@ -1468,11 +1546,11 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
      * Nothing here communicates. */
     t_mark = MFTLRemeshWallTime();
     int extra[MFTL_REMESH_EXTRA_INTS] = {0};
-    for (int o = 0; o < ens->num_objects; ++o)
+    for (int o = 0; o < ens->n_local_objects; ++o)
     {
-      MFTLRemeshMarkFrozen(ens->objects[o]);
-      MFTLDilateFrozenBand(ens->objects[o], params->freeze_dilation_rings);
-      count_hidden_edges(ens->objects[o], params, &extra[MFTL_REMESH_EXTRA_HIDDEN_LONG], &extra[MFTL_REMESH_EXTRA_HIDDEN_SHORT]);
+      MFTLRemeshMarkFrozen(ens->local_objects[o]);
+      MFTLDilateFrozenBand(ens->local_objects[o], params->freeze_dilation_rings);
+      count_hidden_edges(ens->local_objects[o], params, &extra[MFTL_REMESH_EXTRA_HIDDEN_LONG], &extra[MFTL_REMESH_EXTRA_HIDDEN_SHORT]);
     }
 
     /* A RUNNING MAXIMUM over every phase, accumulated locally and reduced once on
@@ -1486,16 +1564,18 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
      * Costing nothing extra is what makes the running maximum affordable: the
      * two doubles ride the profile reduction at the end of the call, so the pass
      * pays no collective for them at all. */
-    for (int o = 0; o < ens->num_objects; ++o) local_band_probe(ens->objects[o], dom, shift, band_probe);
+    for (int o = 0; o < ens->n_local_objects; ++o) local_band_probe(ens->local_objects[o], dom, shift, band_probe);
     st->t_freeze += MFTLRemeshWallTime() - t_mark;
 
     /* The id counters BEFORE the sweeps -- everything at or above these was
      * created by this phase, which is how step 4 finds them without the
      * operators having to keep a list. */
-    for (int o = 0; o < ens->num_objects; ++o)
+    gid_scratch_reserve(&gid, ens->n_local_objects);
+    for (int o = 0; o < ens->n_local_objects; ++o)
     {
-      gid.watermark[2 * o + 0] = ens->objects[o]->next_vertex_gid;
-      gid.watermark[2 * o + 1] = ens->objects[o]->next_triangle_gid;
+      const MFTL_Object *const obj = ens->local_objects[o];
+      gid.watermark[2 * o + 0] = obj->next_vertex_gid;
+      gid.watermark[2 * o + 1] = obj->next_triangle_gid;
     }
 
     /* ── 3. The untouched serial kernel, on the interior ────────────────────
@@ -1508,12 +1588,12 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
     t_mark = MFTLRemeshWallTime();
     int local_ops = 0;
 
-    for (int o = 0; o < ens->num_objects; ++o)
+    for (int o = 0; o < ens->n_local_objects; ++o)
     {
       MFTL_RemeshStats one;
       memset(&one, 0, sizeof(one));
 
-      local_ops += MFTLRemeshIterate(ens->objects[o], params, &one, params->iterations);
+      local_ops += MFTLRemeshIterate(ens->local_objects[o], params, &one, params->iterations);
       accumulate_stats(st, &one);
     }
     st->t_sweep += MFTLRemeshWallTime() - t_mark;
@@ -1530,9 +1610,9 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
     assign_phase_gids(ens, &gid, extra);
     st->t_reduce += MFTLRemeshWallTime() - t_mark;
 
-    const int global_ops = gid.total[n2 + MFTL_REMESH_EXTRA_OPS];
-    const int global_hidden_long = gid.total[n2 + MFTL_REMESH_EXTRA_HIDDEN_LONG];
-    const int global_hidden_short = gid.total[n2 + MFTL_REMESH_EXTRA_HIDDEN_SHORT];
+    const int global_ops = extra[MFTL_REMESH_EXTRA_OPS];
+    const int global_hidden_long = extra[MFTL_REMESH_EXTRA_HIDDEN_LONG];
+    const int global_hidden_short = extra[MFTL_REMESH_EXTRA_HIDDEN_SHORT];
     const int global_hidden = global_hidden_long + global_hidden_short;
 
     /* Reported as the GLOBAL residual of the last phase, not as a sum over
@@ -1640,9 +1720,9 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
    * triangle geometry, so this one promises the same thing rather than making
    * the parallel entry point a different contract. */
   t_mark = MFTLRemeshWallTime();
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    MFTL_Object *const obj = ens->objects[o];
+    MFTL_Object *const obj = ens->local_objects[o];
     if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
     MFTLComputeTriangleGeometry(obj, obj->tris.n);
   }

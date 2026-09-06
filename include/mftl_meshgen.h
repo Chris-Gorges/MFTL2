@@ -8,8 +8,14 @@
  *
  * All generators are collective and share one contract: geometry is built on
  * rank 0 only, the global ID counters are broadcast so every rank continues the
- * same numbering scheme, and MFTLObjectUpdateGlobalStats() has run by the time
- * the call returns. Spreading the mesh across ranks is redistribution's job.
+ * same numbering scheme, and the global entity counts have been reduced by the
+ * time the call returns. Spreading the mesh across ranks is redistribution's job.
+ *
+ * Each generator also comes in a LOCAL form (MFTLGenerateSphereLocal()) that
+ * makes no MPI call, paired with MFTLPublishGeneratedBodies() which does the
+ * collective half for every body at once. Building N bodies through the
+ * collective form costs 2N collectives in strict sequence; through the split
+ * form it costs 2. Use the split form for anything past a handful of bodies.
  *
  * Every generator leaves the object with:
  *   - twins linked (MFTLRebuildTwins) and the mesh boundary recorded
@@ -115,5 +121,51 @@ int MFTLBuildTopologyFromIndexList(MFTL_Object *object, const int *tri_verts, in
  * @return MFTL_SUCCESS on success, MFTL_ERROR on failure.
  */
 int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int refinements);
+
+/**
+ * @brief The LOCAL half of MFTLGenerateSphere(): builds the mesh, makes no MPI call.
+ *
+ * Identical to MFTLGenerateSphere() except that the ID counters are left as rank
+ * 0 wrote them and `global_n_*` are not filled. Use it to build MANY bodies and
+ * settle all of them with ONE MFTLPublishGeneratedBodies():
+ *
+ * @code
+ * for (int b = 0; b < n_bodies; ++b) MFTLGenerateSphereLocal(objs[b], c[b], r, refine);
+ * MFTLPublishGeneratedBodies(ens);
+ * @endcode
+ *
+ * against the same loop over MFTLGenerateSphere(), which puts one MPI_Bcast and
+ * one MPI_Allreduce per body in strict sequence on rank 0's critical path.
+ *
+ * @rank_local No MPI. Every rank must still call it, because rank 0 does the
+ *             work and the others must reach the publication with the object in
+ *             the state it expects (empty, derived arrays marked valid).
+ *
+ * @param object      The object to generate into. Must already be in an ensemble.
+ * @param center      Sphere centre.
+ * @param radius      Sphere radius, >= 0.
+ * @param refinements Subdivision levels, >= 0.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on failure.
+ */
+int MFTLGenerateSphereLocal(MFTL_Object *object, double center[3], double radius, int refinements);
+
+/**
+ * @brief The COLLECTIVE half: settles ID counters and global counts for a whole
+ *        ensemble in two messages rather than two per body.
+ *
+ * Broadcasts every object's three ID counters from rank 0 -- so a rank that
+ * later receives or creates entities cannot collide with the generated IDs --
+ * and reduces every object's owned entity counts into `global_n_vertices` and
+ * `global_n_triangles`. Exactly what MFTLGenerateSphere() does for one body,
+ * for the whole object list at once.
+ *
+ * @note Collective. Every rank must hold the same object list in the same order.
+ *       An empty ensemble is a no-op, not an error, but every rank must still
+ *       call: the two collectives happen regardless of what this rank holds.
+ *
+ * @param ens The ensemble. Every object's counters and `global_n_*` are settled.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on a NULL ensemble.
+ */
+int MFTLPublishGeneratedBodies(MFTL_Ensemble *ens);
 
 #endif  // MFTL_MESHGEN_H

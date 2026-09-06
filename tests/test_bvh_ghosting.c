@@ -400,9 +400,9 @@ static MFTL_Object *add_patch(int gid, const double origin[3], const double u[3]
 /** @brief The per-timestep preamble every consumer of triangle geometry owes. */
 static void refresh(void)
 {
-  for (int i = 0; i < g_ens->num_objects; ++i)
+  for (int i = 0; i < g_ens->n_local_objects; ++i)
   {
-    MFTLComputeTriangleGeometry(g_ens->objects[i], g_ens->objects[i]->tris.n);
+    MFTLComputeTriangleGeometry(g_ens->local_objects[i], g_ens->local_objects[i]->tris.n);
   }
 }
 
@@ -509,10 +509,45 @@ static void brute_contacts(const MFTL_Object *A, const MFTL_Object *B, double to
 typedef struct
 {
   double tolerance;
+  /**
+   * @brief Could this rank have reported anything at all?
+   *
+   * True iff both trees have a node, i.e. this rank owns an A-side primitive AND
+   * holds or was sent a B-side one. False makes MFTL_IntersectObjects return
+   * before it looks at a box, so nothing about this rank's envelope is
+   * observable -- which is why the envelope comparison below is conditioned on
+   * it rather than taken over every rank.
+   */
+  int active;
   int halo_tris;  ///< Triangles this rank received for body B.
   int patch_defect;
   int self_pairs;
 } run_info;
+
+/**
+ * @brief Body @p gid as an object, or a shared EMPTY one if this rank holds none.
+ *
+ * A rank holds an MFTL_Object only for the bodies it has entities of, so
+ * `local_objects[b]` is body `b` only before the first redistribution. Contact
+ * detection needs every body anyway -- its request list drives collectives and
+ * must be identical on every rank -- so it reads them through the ensemble's
+ * dense view, and so does this test.
+ */
+static MFTL_Object *bodyv(int gid) { return MFTLEnsembleAcquireDenseView(g_ens)[gid]; }
+
+/**
+ * @brief MFTL_FOREACH_OWNED_VERTEX over body @p gid, re-resolved at the point of use.
+ *
+ * A redistribution destroys the object of a body a rank keeps nothing of, so a
+ * pointer cached before one is dangling after it. On a rank that holds none of
+ * the body this iterates the shared empty placeholder, i.e. nothing.
+ */
+#define FOREACH_BODY_VERTEX(gid, ...)                   \
+  do                                                    \
+  {                                                     \
+    MFTL_Object *const _b = bodyv(gid);                 \
+    MFTL_FOREACH_OWNED_VERTEX(_b, __VA_ARGS__);         \
+  } while (0)
 
 /**
  * @brief The explicit two-body contact pipeline, in the order the header states.
@@ -523,16 +558,16 @@ typedef struct
  */
 static void run_pipeline(int ia, int ib, const MFTL_BVHBuildParams *p, keyset *local_out, run_info *info)
 {
-  MFTL_Object *const a = g_ens->objects[ia];
-  MFTL_Object *const b = g_ens->objects[ib];
+  MFTL_Object *const a = bodyv(ia);
+  MFTL_Object *const b = bodyv(ib);
 
   MFTL_SpatialHalo *halo = MFTLSpatialHaloCreate(g_ens);
   MFTLSpatialHaloResolveRadii(g_ens, halo);
 
   MFTL_BVH *const ba = MFTL_GenerateLBVH(a, p);
   MFTL_BVH *const bb = MFTL_GenerateLBVH(b, p);
-  MFTL_BVHSetGlobalRadius(ba, halo->global_radius[ia]);
-  MFTL_BVHSetGlobalRadius(bb, halo->global_radius[ib]);
+  MFTL_BVHSetGlobalRadius(ba, MFTLSpatialHaloRadius(halo, ia));
+  MFTL_BVHSetGlobalRadius(bb, MFTLSpatialHaloRadius(halo, ib));
 
   MFTL_SpatialHaloRequest req;
   req.body_a = ia;
@@ -553,6 +588,7 @@ static void run_pipeline(int ia, int ib, const MFTL_BVHBuildParams *p, keyset *l
   MFTL_IntersectObjects(a, ba, b, bb, collect, &c);
 
   info->tolerance = MFTL_MAX(ba->tolerance, bb->tolerance);
+  info->active = (ba->nodes_used > 0 && bb->nodes_used > 0);
   info->self_pairs = c.self_pairs;
   info->halo_tris = MFTLSpatialHaloCount(halo, ib);
   info->patch_defect = 0;
@@ -607,7 +643,14 @@ static void run_pipeline(int ia, int ib, const MFTL_BVHBuildParams *p, keyset *l
  */
 static int *owner_table(const MFTL_Object *obj)
 {
-  const int n = obj->global_n_triangles;
+  /* The LENGTH has to be agreed before the reduction is posted. `obj` may be the
+   * dense view's shared empty object on a rank that holds none of this body, and
+   * that one reports a global triangle count of zero -- so sizing the buffer from
+   * it locally gives two ranks two different message lengths, which MPI reports
+   * as a truncation rather than as the disagreement it is. */
+  int n = obj->global_n_triangles;
+  MPI_Allreduce(MPI_IN_PLACE, &n, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+
   int *const mine = (int *) malloc((size_t) MFTL_MAX(n, 1) * sizeof(int));
   int *const all = (int *) malloc((size_t) MFTL_MAX(n, 1) * sizeof(int));
 
@@ -881,7 +924,9 @@ static int test_the_distributed_answer_matches_the_unpartitioned_one(void)
     build_case(c);
     refresh();
 
-    if (g_ens->objects[0]->global_n_triangles >= KEY_LIMIT || g_ens->objects[1]->global_n_triangles >= KEY_LIMIT) ok = 0;
+    int gt[2] = {bodyv(0)->global_n_triangles, bodyv(1)->global_n_triangles};
+    MPI_Allreduce(MPI_IN_PLACE, gt, 2, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    if (gt[0] >= KEY_LIMIT || gt[1] >= KEY_LIMIT) ok = 0;
 
     /* ── Phase 1: the reference, while rank 0 holds everything ───────────── */
     keyset local_ref = {MFTL_NULL, 0, 0};
@@ -894,8 +939,8 @@ static int test_the_distributed_answer_matches_the_unpartitioned_one(void)
     /* ...checked against a sweep that shares none of the pipeline's machinery. */
     if (g_rank == 0)
     {
-      const MFTL_Object *const a = g_ens->objects[0];
-      const MFTL_Object *const b = g_ens->objects[1];
+      const MFTL_Object *const a = bodyv(0);
+      const MFTL_Object *const b = bodyv(1);
       if ((double) a->tris.n_local * (double) b->tris.n_local <= 4.0e5)
       {
         keyset brute = {MFTL_NULL, 0, 0};
@@ -937,19 +982,30 @@ static int test_the_distributed_answer_matches_the_unpartitioned_one(void)
     }
     if (got_info.self_pairs != 0) ok = 0;
 
-    /* The envelope must not have moved when the mesh was partitioned -- that is
-     * the DIVERGENT failure mode, and it would change the set for a reason that
-     * has nothing to do with ghosting. */
-    if (fabs(got_info.tolerance - ref_info.tolerance) > 1e-12 * MFTL_MAX(ref_info.tolerance, 1.0))
+    /* ── The envelope must not have moved when the mesh was partitioned ─────
+     *
+     * That is the DIVERGENT failure mode, and it would change the set for a
+     * reason that has nothing to do with ghosting.
+     *
+     * ON THE RANKS THAT CAN REPORT, which is the whole of the property and not a
+     * weakening of it. A body's global radius reaches the ranks that hold it
+     * (the per-body reduction) and their graph neighbours (the radius publish),
+     * because those are exactly the ranks the halo can ever deliver to -- a rank
+     * two hops from body B receives no patch of it, holds none of it, and so
+     * returns from the traversal before it looks at a single box. Its envelope
+     * is unobservable. Asserting it everywhere is asserting that every rank in
+     * the job knows the size of every body in the ensemble, which is the
+     * `O(bodies)` property this pipeline deliberately no longer has. */
+    if (got_info.active && fabs(got_info.tolerance - ref_info.tolerance) > 1e-12 * MFTL_MAX(ref_info.tolerance, 1.0))
     {
-      if (g_rank == 0) printf("\n  [%s] tolerance moved: %.17g -> %.17g\n  ", c->name, ref_info.tolerance, got_info.tolerance);
+      printf("\n  [%s] rank %d: tolerance moved: %.17g -> %.17g\n  ", c->name, g_rank, ref_info.tolerance, got_info.tolerance);
       ok = 0;
     }
 
     int cross = 0;
     {
-      int *const ownA = owner_table(g_ens->objects[0]);
-      int *const ownB = owner_table(g_ens->objects[1]);
+      int *const ownA = owner_table(bodyv(0));
+      int *const ownB = owner_table(bodyv(1));
       if (g_rank == 0) cross = count_cross_rank(&ref, ownA, ownB);
       MPI_Bcast(&cross, 1, MPI_INT, 0, MPI_COMM_WORLD);
       free(ownA);
@@ -1050,8 +1106,8 @@ static int test_a_seam_straddling_body_is_not_measured_as_domain_sized(void)
   MFTL_SpatialHalo *halo = MFTLSpatialHaloCreate(g_ens);
   MFTLSpatialHaloResolveRadii(g_ens, halo);
 
-  const double r_seam = halo->global_radius[0];
-  const double r_inside = halo->global_radius[1];
+  const double r_seam = MFTLSpatialHaloRadius(halo, 0);
+  const double r_inside = MFTLSpatialHaloRadius(halo, 1);
 
   /* The interior sphere is the control: whatever an icosphere's half-extent is,
    * the straddling one must agree with it. Comparing against 1.0 instead would
@@ -1213,8 +1269,8 @@ static int test_tunnelling_between_two_timesteps_is_a_known_miss(void)
   /* Step n: A approaching from the left, B from the right, 4 radii apart. */
   const double ca[3] = {3.0, 5.0, 5.0};
   const double cb[3] = {7.0, 5.0, 5.0};
-  MFTL_Object *const a = add_sphere(0, ca, 1.0, 2);
-  MFTL_Object *const b = add_sphere(1, cb, 1.0, 2);
+  add_sphere(0, ca, 1.0, 2);
+  add_sphere(1, cb, 1.0, 2);
   refresh();
   TEST_ASSERT(agreed(MFTLRedistribute(g_ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
   refresh();
@@ -1230,11 +1286,11 @@ static int test_tunnelling_between_two_timesteps_is_a_known_miss(void)
   }
 
   /* Step n+1: they have swapped sides. Nothing sampled the crossing. */
-  MFTL_FOREACH_OWNED_VERTEX(a, { pos[0] += 4.0; });
-  MFTL_FOREACH_OWNED_VERTEX(b, { pos[0] -= 4.0; });
+  FOREACH_BODY_VERTEX(0, { pos[0] += 4.0; });
+  FOREACH_BODY_VERTEX(1, { pos[0] -= 4.0; });
 
   MFTLUpdateGhostPositions(g_ens);
-  for (int i = 0; i < g_ens->num_objects; ++i) MFTLComputeTriangleGeometry(g_ens->objects[i], g_ens->objects[i]->tris.n);
+  for (int i = 0; i < g_ens->n_local_objects; ++i) MFTLComputeTriangleGeometry(g_ens->local_objects[i], g_ens->local_objects[i]->tris.n);
   TEST_ASSERT(agreed(MFTLRedistribute(g_ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
   refresh();
 
@@ -1304,8 +1360,8 @@ static int test_a_body_that_migrates_wholesale_keeps_the_answer(void)
 
   /* ── The same configuration, reached by migrating into it ───────────────── */
   plain_ensemble(10.0, false);
-  MFTL_Object *const a = add_sphere(0, start_a, 1.0, 2);
-  MFTL_Object *const b = add_sphere(1, start_b, 1.0, 2);
+  add_sphere(0, start_a, 1.0, 2);
+  add_sphere(1, start_b, 1.0, 2);
   refresh();
   TEST_ASSERT(agreed(MFTLRedistribute(g_ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
   refresh();
@@ -1313,16 +1369,16 @@ static int test_a_body_that_migrates_wholesale_keeps_the_answer(void)
   /* Sanity: the scene really did start somewhere else. */
   int moved_ranks = 0;
   {
-    const int held = (a->tris.n_local > 0) ? 1 : 0;
+    const int held = (bodyv(0)->tris.n_local > 0) ? 1 : 0;
     MPI_Allreduce(&held, &moved_ranks, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
   }
 
-  MFTL_FOREACH_OWNED_VERTEX(a, {
+  FOREACH_BODY_VERTEX(0, {
     pos[0] += step;
     pos[1] += step;
     pos[2] += step;
   });
-  MFTL_FOREACH_OWNED_VERTEX(b, {
+  FOREACH_BODY_VERTEX(1, {
     pos[0] += step;
     pos[1] += step;
     pos[2] += step;
@@ -1333,7 +1389,7 @@ static int test_a_body_that_migrates_wholesale_keeps_the_answer(void)
    * routes ghosts by their cached centre, so refreshing only the owned ones
    * makes two ranks disagree about where a ghost is going -- then repartition. */
   MFTLUpdateGhostPositions(g_ens);
-  for (int i = 0; i < g_ens->num_objects; ++i) MFTLComputeTriangleGeometry(g_ens->objects[i], g_ens->objects[i]->tris.n);
+  for (int i = 0; i < g_ens->n_local_objects; ++i) MFTLComputeTriangleGeometry(g_ens->local_objects[i], g_ens->local_objects[i]->tris.n);
   TEST_ASSERT(agreed(MFTLRedistribute(g_ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
   refresh();
 
@@ -1483,10 +1539,10 @@ static int test_two_length_scales_share_the_larger_envelope(void)
   MFTL_SpatialHalo *halo = MFTLSpatialHaloCreate(g_ens);
   MFTLSpatialHaloResolveRadii(g_ens, halo);
 
-  MFTL_BVH *const ba = MFTL_GenerateLBVH(g_ens->objects[0], &p);
-  MFTL_BVH *const bb = MFTL_GenerateLBVH(g_ens->objects[1], &p);
-  MFTL_BVHSetGlobalRadius(ba, halo->global_radius[0]);
-  MFTL_BVHSetGlobalRadius(bb, halo->global_radius[1]);
+  MFTL_BVH *const ba = MFTL_GenerateLBVH(bodyv(0), &p);
+  MFTL_BVH *const bb = MFTL_GenerateLBVH(bodyv(1), &p);
+  MFTL_BVHSetGlobalRadius(ba, MFTLSpatialHaloRadius(halo, 0));
+  MFTL_BVHSetGlobalRadius(bb, MFTLSpatialHaloRadius(halo, 1));
 
   /* Each body's OWN envelope is a fixed fraction of itself -- three orders of
    * magnitude apart, which is exactly what a single hardcoded length cannot do. */
@@ -1512,7 +1568,7 @@ static int test_two_length_scales_share_the_larger_envelope(void)
   c.ba = ba;
   c.bb = bb;
   c.self_pairs = 0;
-  MFTL_IntersectObjects(g_ens->objects[0], ba, g_ens->objects[1], bb, collect, &c);
+  MFTL_IntersectObjects(bodyv(0), ba, bodyv(1), bb, collect, &c);
 
   int total = 0;
   MPI_Allreduce(&c.ks.n, &total, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
@@ -1572,7 +1628,7 @@ static int test_degenerate_partitions_build_and_traverse(void)
 
   for (int i = 0; i < 2; ++i)
   {
-    MFTL_Object *const o = g_ens->objects[i];
+    MFTL_Object *const o = bodyv(i);
     int gids[3] = {o->next_vertex_gid, o->next_triangle_gid, o->next_halfedge_gid};
     MPI_Bcast(gids, 3, MPI_INT, 0, MPI_COMM_WORLD);
     o->next_vertex_gid = gids[0];
@@ -1728,6 +1784,170 @@ static int test_a_body_wider_than_a_subdomain_is_still_exact(void)
 }
 
 /**
+ * @brief Many bodies, few of them near each other: the ANSWER is the all-pairs
+ *        answer and the WORK is not.
+ *
+ * ══ WHAT THIS REPLACES, AND WHY IT NEEDED REPLACING ═══════════════════════
+ *
+ * MFTLEnsembleIntersectObjects used to enumerate `B*(B-1)/2` ordered pairs into
+ * a request array, on every rank, every call -- 134 million records and two
+ * gigabytes at 16 384 bodies, before a triangle was looked at. The pairs are now
+ * DERIVED from the body extents the halo exchange already carries, so the
+ * question this test asks is the one that matters about that change: does the
+ * cheaper enumeration still find every contact, and is it actually cheaper?
+ *
+ * ══ THE FIXTURE ═══════════════════════════════════════════════════════════
+ *
+ * Six well-separated COUPLES. Bodies 2k and 2k+1 overlap; nothing else is within
+ * reach of anything. So of the 66 unordered pairs exactly 6 are contacts, which
+ * makes both halves of the statement checkable:
+ *
+ *   COMPLETE   the total contact count must equal an exhaustive O(nA*nB) sweep
+ *              over ALL 66 pairs, run on one rank while it still holds the whole
+ *              ensemble. That oracle shares no code with the BVH, the halo or
+ *              the broad phase, so a bug in what they have in common cannot hide
+ *              by appearing on both sides.
+ *   TIGHT      every candidate pair the broad phase kept must be one of the six.
+ *              A grid that admitted a far-apart pair would still give the right
+ *              answer -- the traversal would reject it -- so counting hits alone
+ *              cannot see it, and the all-pairs enumeration passes that half
+ *              trivially.
+ *
+ * And the directory is asserted to be SPARSE: summed over ranks it must be below
+ * `nproc * bodies`, which is what the `[n_bodies_global]` table it replaced
+ * always was.
+ */
+static int test_the_broad_phase_finds_the_pairs_without_enumerating_them(void)
+{
+  enum
+  {
+    N_COUPLES = 6,
+    N_BODIES = 2 * N_COUPLES
+  };
+
+  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  p.proximity_factor = 1.0e-3;
+  p.proximity_floor = 0.0;
+
+  plain_ensemble(12.0, true);
+
+  /* Couple k at (2 + 4*(k%3), 2 + 4*(k/3), 6). The two spheres of a couple are
+   * 1.5 apart with radius 0.8, so they overlap; the nearest body of another
+   * couple is 4 - 2*1.55 = 0.9 away, which is three orders above the envelope. */
+  for (int k = 0; k < N_COUPLES; ++k)
+  {
+    const double cx = 2.0 + 4.0 * (double) (k % 3);
+    const double cy = 2.0 + 4.0 * (double) (k / 3);
+
+    const double a[3] = {cx - 0.75, cy, 6.0};
+    const double b[3] = {cx + 0.75, cy, 6.0};
+    add_sphere(2 * k, a, 0.8, 1);
+    add_sphere(2 * k + 1, b, 0.8, 1);
+  }
+  refresh();
+
+  /* ── The oracle, while rank 0 holds everything ─────────────────────────── */
+  int ref_hits = 0;
+  if (g_rank == 0)
+  {
+    /* The envelope each body would be judged at. Every body is the same size
+     * here, so this is one number, but it is READ off a BVH rather than assumed
+     * -- the point of the comparison is that the pipeline and the oracle test
+     * against the same threshold. */
+    MFTL_BVH *const probe = MFTL_GenerateLBVH(bodyv(0), &p);
+    const double tol = probe->tolerance;
+    MFTL_DestroyBVH(probe);
+
+    for (int i = 0; i < N_BODIES; ++i)
+    {
+      for (int j = i + 1; j < N_BODIES; ++j)
+      {
+        keyset one = {MFTL_NULL, 0, 0};
+        brute_contacts(bodyv(i), bodyv(j), tol, &one);
+        ref_hits += one.n;
+        ks_free(&one);
+      }
+    }
+  }
+  MPI_Bcast(&ref_hits, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  TEST_ASSERT(agreed(ref_hits > 0, MPI_COMM_WORLD));
+
+  TEST_ASSERT(agreed(MFTLRedistribute(g_ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  refresh();
+
+  /* ── COMPLETE: the distributed pipeline finds exactly those ────────────── */
+  {
+    tally t = {0, 0};
+    TEST_ASSERT(agreed(MFTLEnsembleIntersectObjects(g_ens, &p, count_pairs, &t) == MFTL_SUCCESS, MPI_COMM_WORLD));
+
+    int got = 0, self = 0;
+    MPI_Allreduce(&t.hits, &got, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(&t.self, &self, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+
+    if (g_rank == 0 && got != ref_hits) printf("\n  [broad-phase] exhaustive sweep %d contacts, pipeline %d\n  ", ref_hits, got);
+    TEST_ASSERT(agreed(got == ref_hits, MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(self == 0, MPI_COMM_WORLD));
+  }
+
+  /* ── TIGHT: what the broad phase actually proposed ─────────────────────── */
+  {
+    MFTL_SpatialHalo *halo = MFTLSpatialHaloCreate(g_ens);
+    MFTLSpatialHaloResolveRadii(g_ens, halo);
+
+    const int nb = g_ens->n_local_objects;
+    double *const tol = (double *) calloc((size_t) (nb > 0 ? nb : 1), sizeof(double));
+    for (int o = 0; o < nb; ++o)
+    {
+      MFTL_BVH *const one = MFTL_GenerateLBVH(g_ens->local_objects[o], &p);
+      MFTL_BVHSetGlobalRadius(one, MFTLSpatialHaloRadius(halo, g_ens->local_objects[o]->global_id));
+      tol[o] = one->tolerance;
+      MFTL_DestroyBVH(one);
+    }
+
+    TEST_ASSERT(agreed(MFTLExtendSpatialHaloNearBodies(g_ens, tol, halo) == MFTL_SUCCESS, MPI_COMM_WORLD));
+    free(tol);
+
+    /* Every kept pair must be a couple: `2k` with `2k+1`. */
+    int stray = 0;
+    int found = 0;  // bitmask of the couples this rank proposed
+    for (int i = 0; i < halo->n_pairs; ++i)
+    {
+      const int a = halo->pair[i].body_a;
+      const int b = halo->pair[i].body_b;
+      if (b == a + 1 && (a % 2) == 0)
+        found |= 1 << (a / 2);
+      else
+        stray++;
+    }
+
+    int stray_total = 0, found_all = 0, dir_total = 0, pairs_total = 0;
+    MPI_Allreduce(&stray, &stray_total, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(&found, &found_all, 1, MPI_INT, MPI_BOR, MPI_COMM_WORLD);
+    MPI_Allreduce(&halo->num_objects, &dir_total, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(&halo->n_pairs, &pairs_total, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+
+    if (g_rank == 0)
+    {
+      printf("\n    np=%d: %d candidate pairs over all ranks (all-pairs would be %d), directory %d slots (dense would be %d)\n  ", g_nproc, pairs_total,
+             g_nproc * N_BODIES * (N_BODIES - 1) / 2, dir_total, g_nproc * N_BODIES);
+    }
+
+    /* No pair between two couples was ever proposed... */
+    TEST_ASSERT(agreed(stray_total == 0, MPI_COMM_WORLD));
+    /* ...and every couple WAS, so the tightness above is not the tightness of an
+     * empty list. */
+    TEST_ASSERT(agreed(found_all == (1 << N_COUPLES) - 1, MPI_COMM_WORLD));
+    /* And the directory is sparse: the table this replaced was `n_bodies_global`
+     * slots on every rank, unconditionally. */
+    TEST_ASSERT(agreed(g_nproc == 1 || dir_total < g_nproc * N_BODIES, MPI_COMM_WORLD));
+
+    MFTLSpatialHaloDestroy(&halo);
+  }
+
+  return 0;
+}
+
+/**
  * @brief The refit fast path must agree with a full rebuild, on a PARTITIONED mesh.
  *
  * tests/test_bvh.c already checks that refit == rebuild after small motion on
@@ -1751,7 +1971,7 @@ static int test_refit_matches_rebuild_on_a_partitioned_mesh(void)
 
   const double ca[3] = {cx - 0.8, 5.0, 5.0};
   const double cb[3] = {cx + 0.8, 5.0, 5.0};
-  MFTL_Object *const a = add_sphere(0, ca, 1.0, 2);
+  add_sphere(0, ca, 1.0, 2);
   add_sphere(1, cb, 1.0, 2);
   refresh();
   TEST_ASSERT(agreed(MFTLRedistribute(g_ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
@@ -1760,10 +1980,10 @@ static int test_refit_matches_rebuild_on_a_partitioned_mesh(void)
   MFTL_SpatialHalo *halo = MFTLSpatialHaloCreate(g_ens);
   MFTLSpatialHaloResolveRadii(g_ens, halo);
 
-  MFTL_BVH *const ba = MFTL_GenerateLBVH(g_ens->objects[0], &p);
-  MFTL_BVH *const bb = MFTL_GenerateLBVH(g_ens->objects[1], &p);
-  MFTL_BVHSetGlobalRadius(ba, halo->global_radius[0]);
-  MFTL_BVHSetGlobalRadius(bb, halo->global_radius[1]);
+  MFTL_BVH *const ba = MFTL_GenerateLBVH(bodyv(0), &p);
+  MFTL_BVH *const bb = MFTL_GenerateLBVH(bodyv(1), &p);
+  MFTL_BVHSetGlobalRadius(ba, MFTLSpatialHaloRadius(halo, 0));
+  MFTL_BVHSetGlobalRadius(bb, MFTLSpatialHaloRadius(halo, 1));
 
   MFTL_SpatialHaloRequest req = {0, 1, MFTL_MAX(ba->tolerance, bb->tolerance)};
   MFTLExtendSpatialHalo(g_ens, &req, 1, halo);
@@ -1771,11 +1991,11 @@ static int test_refit_matches_rebuild_on_a_partitioned_mesh(void)
 
   /* A motion small against the tolerance, so the stale remote geometry is still
    * within the regime the refit path documents. */
-  MFTL_FOREACH_OWNED_VERTEX(a, { pos[0] += 1.0e-4; });
+  FOREACH_BODY_VERTEX(0, { pos[0] += 1.0e-4; });
   MFTLUpdateGhostPositions(g_ens);
   refresh();
 
-  TEST_ASSERT(agreed(MFTL_RefitLBVH(ba, g_ens->objects[0]) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTL_RefitLBVH(ba, bodyv(0)) == MFTL_SUCCESS, MPI_COMM_WORLD));
 
   collector cr;
   cr.ks.k = MFTL_NULL;
@@ -1784,12 +2004,12 @@ static int test_refit_matches_rebuild_on_a_partitioned_mesh(void)
   cr.ba = ba;
   cr.bb = bb;
   cr.self_pairs = 0;
-  MFTL_IntersectObjects(g_ens->objects[0], ba, g_ens->objects[1], bb, collect, &cr);
+  MFTL_IntersectObjects(bodyv(0), ba, bodyv(1), bb, collect, &cr);
   ks_sort(&cr.ks);
 
   /* The same query from a tree built from scratch on the moved geometry. */
-  MFTL_BVH *const ba2 = MFTL_GenerateLBVH(g_ens->objects[0], &p);
-  MFTL_BVHSetGlobalRadius(ba2, halo->global_radius[0]);
+  MFTL_BVH *const ba2 = MFTL_GenerateLBVH(bodyv(0), &p);
+  MFTL_BVHSetGlobalRadius(ba2, MFTLSpatialHaloRadius(halo, 0));
 
   collector cf;
   cf.ks.k = MFTL_NULL;
@@ -1798,7 +2018,7 @@ static int test_refit_matches_rebuild_on_a_partitioned_mesh(void)
   cf.ba = ba2;
   cf.bb = bb;
   cf.self_pairs = 0;
-  MFTL_IntersectObjects(g_ens->objects[0], ba2, g_ens->objects[1], bb, collect, &cf);
+  MFTL_IntersectObjects(bodyv(0), ba2, bodyv(1), bb, collect, &cf);
   ks_sort(&cf.ks);
 
   int same = (cr.ks.n == cf.ks.n);
@@ -1864,6 +2084,8 @@ int main(int argc, char **argv)
   RUN_TEST(test_a_body_wider_than_a_subdomain_is_still_exact);
 
   if (g_ens != MFTL_NULL) MFTLEnsembleDestroy(&g_ens);
+  RUN_TEST(test_the_broad_phase_finds_the_pairs_without_enumerating_them);
+
   RUN_TEST(test_refit_matches_rebuild_on_a_partitioned_mesh);
 
   if (g_rank == 0) TEST_REPORT();

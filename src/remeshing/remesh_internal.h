@@ -407,44 +407,81 @@ int MFTLRemeshIterate(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFT
  *
  * The public pair -- MFTLRemeshChooseStrategy then MFTLRemeshEnsembleDispersed
  * -- measures the bodies TWICE, and the first measurement throws away the
- * centroids the second one recomputes. That is four Allreduces where two do, and
- * two of them carry 7*n_bodies doubles: at ten thousand droplets, 560 kB per
- * rank that nobody reads.
+ * centroids the second one recomputes. That is four per-body reductions where
+ * two do.
  *
  * These two take the measurement as an argument instead. The public functions
  * become thin wrappers that measure and forward, so an external caller sees no
  * change; MFTLRemeshEnsemble uses these and pays for one measurement.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @struct MFTL_RemeshMeasurement
+ * @brief What MFTLRemeshMeasureBodies() produced, BY LOCAL SLOT, plus the one
+ *        number that has to be ensemble-wide.
  *
+ * Row `o` describes `ens->local_objects[o]` at the moment the measurement was
+ * taken, so it is invalidated by anything that changes the local list -- which
+ * in this module means the first migration. Every consumer reads it before one.
+ *
+ * `r_max` is separate because it is the only quantity here that every rank must
+ * agree about: the strategy ratio and the dispersed admission test are both
+ * taken against it, and two ranks answering differently is two ranks entering
+ * different drivers.
  */
+typedef struct
+{
+  double *centroid;  ///< [3*n_local] area-weighted, seam-consistent, per local slot.
+  double *radius;  ///< [n_local] max corner distance from it.
+  double *weight;  ///< [n_local] global owned-triangle count.
+  /**
+   * @brief [n_local] lowest-numbered rank holding each body.
+   *
+   * `lowest_holder[o] == domain->rank` designates THIS rank as the one that may
+   * count body `o` in a sum over ranks. Every holder reduces to the same radius
+   * and the same weight, so without it a body held by four ranks is counted four
+   * times -- which is what made the dispersed driver report "4 of 1 bodies are
+   * wider than a rank box".
+   */
+  double *lowest_holder;
+  double r_max;  ///< Largest radius over the WHOLE ensemble.
+  int n_local;  ///< Local bodies when the measurement was taken.
+} MFTL_RemeshMeasurement;
+
+/**
+ * @brief Allocates the three arrays for @p ens's current local list.
+ * @param m   Receives the arrays; release with MFTLRemeshMeasurementFree().
+ * @param ens The ensemble.
+ */
+void MFTLRemeshMeasurementInit(MFTL_RemeshMeasurement *m, const MFTL_Ensemble *ens);
+
+/**
+ * @brief Releases the arrays. Safe on an already-freed handle.
+ * @param m The handle.
+ */
+void MFTLRemeshMeasurementFree(MFTL_RemeshMeasurement *m);
 
 /**
  * @brief MFTLRemeshChooseStrategy() with the body measurement returned as well.
- * @param      ens      The ensemble.
- * @param      params   May be #MFTL_NULL for the default radius fraction.
- * @param[out] centroid `[3*num_objects]` area-weighted, seam-consistent, replicated.
- * @param[out] radius   `[num_objects]` max corner distance from it, replicated.
- * @param[out] weight   `[num_objects]` global owned-triangle count, replicated.
- *                      The dispersed balancer's input; may be #MFTL_NULL.
+ * @param      ens    The ensemble.
+ * @param      params May be #MFTL_NULL for the default radius fraction.
+ * @param[out] m      Filled in by MFTLRemeshMeasureBodies(); must have been
+ *                    initialised for @p ens's current local list.
  * @return The resolved strategy, never #MFTL_REMESH_PARALLEL_AUTO.
  * @collective
  */
-MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategyMeasured(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, double *centroid, double *radius,
-                                                             double *weight);
+MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategyMeasured(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshMeasurement *m);
 
 /**
  * @brief MFTLRemeshEnsembleDispersed() with the body measurement supplied.
- * @param      ens      The ensemble, remeshed in place.
- * @param      params   The parameter block.
- * @param[out] stats    May be #MFTL_NULL.
- * @param      centroid `[3*num_objects]` from MFTLRemeshChooseStrategyMeasured().
- * @param      radius   `[num_objects]` from the same call.
- * @param      weight   `[num_objects]` from the same call, or #MFTL_NULL, in
- *                      which case every body counts as one unit and the balancer
- *                      equalises body COUNT rather than triangle count.
+ * @param      ens    The ensemble, remeshed in place.
+ * @param      params The parameter block.
+ * @param[out] stats  May be #MFTL_NULL.
+ * @param      m      From MFTLRemeshChooseStrategyMeasured(), describing the
+ *                    local list as it stands now.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR if a migration failed.
  * @collective
  */
-int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats, const double *centroid,
-                                        const double *radius, const double *weight);
+int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats, const MFTL_RemeshMeasurement *m);
 
 #endif  // MFTL_REMESH_INTERNAL_H

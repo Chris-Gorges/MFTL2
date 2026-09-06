@@ -57,6 +57,7 @@
 #include "bvh_internal.h"
 #include "mftl_communication.h"
 #include "mftl_constants.h"
+#include "mftl_ensemble.h"
 #include "mftl_memory.h"
 #include "mftl_object.h"
 
@@ -378,74 +379,128 @@ void MFTL_IntersectObjects(const MFTL_Object *objA, MFTL_BVH *bvhA, const MFTL_O
 
 int MFTLEnsembleIntersectObjects(MFTL_Ensemble *ens, const MFTL_BVHBuildParams *params, IntersectionCallback callback, void *user_data)
 {
-  if (ens == MFTL_NULL || ens->objects == MFTL_NULL || callback == MFTL_NULL) return MFTL_ERROR;
+  if (ens == MFTL_NULL || callback == MFTL_NULL) return MFTL_ERROR;
 
-  const int n_obj = ens->num_objects;
-  if (n_obj < 2) return MFTL_SUCCESS;  // one body cannot collide with another
+  /* THE GLOBAL count, because everything below is collective. One body in the
+   * whole ensemble cannot collide with another, and that is a statement every
+   * rank makes identically; the LOCAL count is not, and returning early on it
+   * would leave the ranks that still held two bodies inside a collective on
+   * their own. */
+  if (ens->n_bodies_global < 2) return MFTL_SUCCESS;
 
-  MFTL_BVH **const bvhs = (MFTL_BVH **) MFTLCallocOrDie((size_t) n_obj, sizeof(MFTL_BVH *), "BVH list");
-  for (int i = 0; i < n_obj; ++i) bvhs[i] = MFTL_GenerateLBVH(ens->objects[i], params);
+  const int nb = ens->n_local_objects;
 
-  /* ── The body scales, then one halo exchange for every pair ──────────────
+  /* ── One hierarchy per body THIS RANK HOLDS ─────────────────────────────
    *
-   * Two collectives for the whole ensemble, neither of which grows with the
-   * number of bodies. The version this replaces ran a full neighbour alltoall
-   * PER OBJECT PAIR, so 500 droplets meant 124 750 rounds of collectives per
-   * timestep before a single triangle moved.
+   * The version this replaces built one per body in the ENSEMBLE, over a dense
+   * view in which a body this rank held nothing of was a shared empty object --
+   * so a rank near ten droplets out of a million allocated a million empty
+   * hierarchies per timestep, and then enumerated 5*10^11 pairs of them. Both
+   * terms are gone: the trees are `O(local bodies)` and the pairs come from the
+   * halo's broad phase. */
+  MFTL_BVH **const bvhs = (MFTL_BVH **) MFTLCallocOrDie((size_t) MFTL_MAX(nb, 1), sizeof(MFTL_BVH *), "BVH list");
+  for (int o = 0; o < nb; ++o) bvhs[o] = MFTL_GenerateLBVH(ens->local_objects[o], params);
+
+  /* ── The body scales, then ONE halo exchange for the whole ensemble ──────
    *
-   * The radii come first because the margin is a fraction of the body and the
+   * Two collectives, neither of which grows with the body count: a per-body
+   * reduction over each body's holders for the radii, and one neighbourhood
+   * exchange for the extents and the payload. The version before that ran a full
+   * neighbour alltoall PER OBJECT PAIR, so 500 droplets meant 124 750 rounds of
+   * collectives per timestep before a single triangle moved.
+   *
+   * The radii come first because the envelope is a fraction of the body and the
    * body's size is only knowable collectively -- see MFTL_BVH::radius_hint for
    * why using this rank's share instead would make detection depend on the
    * process count. */
   MFTL_SpatialHalo *halo = MFTLSpatialHaloCreate(ens);
   MFTLSpatialHaloResolveRadii(ens, halo);
 
-  for (int i = 0; i < n_obj; ++i) MFTL_BVHSetGlobalRadius(bvhs[i], halo->global_radius[i]);
-
+  double *const tol = (double *) MFTLCallocOrDie((size_t) MFTL_MAX(nb, 1), sizeof(double), "BVH pair envelopes");
+  for (int o = 0; o < nb; ++o)
   {
-    int n_req = 0;
-    MFTL_SpatialHaloRequest *const reqs =
-        (MFTL_SpatialHaloRequest *) MFTLMallocOrDie((size_t) (n_obj * (n_obj - 1) / 2) * sizeof(MFTL_SpatialHaloRequest) + 1, "BVH halo requests");
+    MFTL_BVHSetGlobalRadius(bvhs[o], MFTLSpatialHaloRadius(halo, ens->local_objects[o]->global_id));
+    tol[o] = bvhs[o]->tolerance;
+  }
 
-    /* EVERY pair goes in, unconditionally. The list has to be identical on every
-     * rank -- MFTLExtendSpatialHalo is collective and derives its sequence of
-     * collectives from it -- so it may depend only on the object list, which all
-     * ranks hold in the same order, and never on what this rank happens to hold
-     * geometrically. That is exactly why MFTL_GenerateLBVH returns an empty
-     * hierarchy for an empty partition instead of MFTL_NULL: a NULL here would
-     * make the list rank-dependent and hang the ranks that still had work.
-     *
-     * The margin is the LARGER of the two bodies' envelopes, matching what
-     * MFTL_IntersectObjects will test the pair against -- fetching less than the
-     * narrow phase is willing to accept would lose contacts at the rank boundary
-     * and nowhere else, which is the worst possible place for a bug to live. */
-    for (int i = 0; i < n_obj; ++i)
+  /* The envelopes go ON THE WIRE, and that is what removes the request list. A
+   * rank deciding whether its droplet B is worth sending towards a neighbour's
+   * droplet A needs A's envelope, and the envelope scales with A; published
+   * alongside the extent, it costs one double per body per rank and replaces an
+   * `O(bodies^2)` array that every rank built and every rank agreed on. */
+  MFTLExtendSpatialHaloNearBodies(ens, tol, halo);
+  free(tol);
+
+  /* ── A hierarchy for every body in the directory ─────────────────────────
+   *
+   * The directory is wider than the local list by exactly the bodies this rank
+   * received a patch of and holds nothing of -- which is the whole point of a
+   * spatial halo, and which is why those need a B-side tree with NO local
+   * primitives. They share one empty object: `n_local_prims` is zero, so every
+   * primitive resolves through the patch and the object is never read. */
+  const int ne = halo->num_objects;
+  MFTL_BVH **const by_entry = (MFTL_BVH **) MFTLCallocOrDie((size_t) MFTL_MAX(ne, 1), sizeof(MFTL_BVH *), "BVH directory");
+  const MFTL_Object **const obj_by_entry = (const MFTL_Object **) MFTLCallocOrDie((size_t) MFTL_MAX(ne, 1), sizeof(MFTL_Object *), "BVH object directory");
+
+  MFTL_Object *empty = MFTLObjectCreate(MFTL_ERROR);
+  empty->domain = &ens->domain;
+
+  for (int e = 0; e < ne; ++e)
+  {
+    const int gid = halo->body_gid[e];
+    const int slot = MFTLEnsembleFindLocalSlot(ens, gid);
+
+    if (slot != MFTL_ERROR)
     {
-      for (int j = i + 1; j < n_obj; ++j)
-      {
-        reqs[n_req].body_a = i;
-        reqs[n_req].body_b = j;
-        reqs[n_req].margin = MFTL_MAX(bvhs[i]->tolerance, bvhs[j]->tolerance);
-        n_req++;
-      }
+      by_entry[e] = bvhs[slot];
+      obj_by_entry[e] = ens->local_objects[slot];
+    }
+    else if (halo->patch[e] != MFTL_NULL)
+    {
+      by_entry[e] = MFTL_GenerateLBVH(empty, params);
+      obj_by_entry[e] = empty;
+    }
+    else
+    {
+      continue;
     }
 
-    MFTLExtendSpatialHalo(ens, reqs, n_req, halo);
-    free(reqs);
+    /* Only when there IS one: MFTL_BVHSetHalo rebuilds the hierarchy, so calling
+     * it with a null patch would rebuild every local body's tree to arrive at
+     * the tree it already had. */
+    if (halo->patch[e] != MFTL_NULL) MFTL_BVHSetHalo(by_entry[e], halo->patch[e]);
+
+    /* AFTER the halo, and after the exchange: a patch is this rank's only handle
+     * on a body it holds nothing of, so the radius that sets that body's
+     * envelope arrives with it. Refitting last is what makes the envelope the
+     * same number on every rank that can report the pair -- the property
+     * test_tolerance_is_independent_of_the_partition exists to pin. */
+    MFTL_BVHSetGlobalRadius(by_entry[e], MFTLSpatialHaloRadius(halo, gid));
   }
 
-  /* Only the B side of a pair ever receives a patch, and body j is B for every
-   * pair (i, j) with i < j -- so attaching every body's patch is correct and the
-   * A-side filter in the traversal keeps the halo primitives from being reported
-   * as if this rank owned them. */
-  for (int i = 0; i < n_obj; ++i) MFTL_BVHSetHalo(bvhs[i], MFTLSpatialHaloPatch(halo, i));
-
-  for (int i = 0; i < n_obj; ++i)
+  /* ── The pairs the broad phase kept ──────────────────────────────────────
+   *
+   * `body_a < body_b` and A is held here, so the A-side filter in the traversal
+   * still decides who reports: exactly the rank owning the A-side primitive. */
+  for (int i = 0; i < halo->n_pairs; ++i)
   {
-    for (int j = i + 1; j < n_obj; ++j) MFTL_IntersectObjects(ens->objects[i], bvhs[i], ens->objects[j], bvhs[j], callback, user_data);
+    const int ea = MFTLSpatialHaloFindBody(halo, halo->pair[i].body_a);
+    const int eb = MFTLSpatialHaloFindBody(halo, halo->pair[i].body_b);
+    if (ea == MFTL_ERROR || eb == MFTL_ERROR) continue;
+    if (by_entry[ea] == MFTL_NULL || by_entry[eb] == MFTL_NULL) continue;
+
+    MFTL_IntersectObjects(obj_by_entry[ea], by_entry[ea], obj_by_entry[eb], by_entry[eb], callback, user_data);
   }
 
-  for (int i = 0; i < n_obj; ++i) MFTL_DestroyBVH(bvhs[i]);
+  for (int e = 0; e < ne; ++e)
+  {
+    if (obj_by_entry[e] == empty) MFTL_DestroyBVH(by_entry[e]);
+  }
+  for (int o = 0; o < nb; ++o) MFTL_DestroyBVH(bvhs[o]);
+
+  MFTLObjectDestroy(&empty);
+  free(obj_by_entry);
+  free(by_entry);
   free(bvhs);
   MFTLSpatialHaloDestroy(&halo);
 

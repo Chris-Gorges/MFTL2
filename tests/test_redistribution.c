@@ -102,12 +102,41 @@ static MFTL_Object *add_sphere(MFTL_Ensemble *ens, int id, double cx, double cy,
   return obj;
 }
 
+/**
+ * @brief The body with @p gid, or MFTL_NULL if this rank now holds nothing of it.
+ *
+ * A REDISTRIBUTION DOES NOT PRESERVE MFTL_Object POINTERS. A rank that ends up
+ * holding no entity of a body destroys its object, and one that receives a body
+ * it had nothing of creates a new one -- so a pointer cached before the call may
+ * be dangling after it, and the body may be at a different slot. The body id is
+ * the handle that survives, which is the same rule global ids and pool indices
+ * already follow across a remesh.
+ *
+ * Every test below re-resolves through this after every redistribution, and that
+ * is not defensive style: it is the contract being exercised.
+ */
+static MFTL_Object *body(const MFTL_Ensemble *ens, int gid) { return MFTLEnsembleFindLocalObject(ens, gid); }
+
+/**
+ * @brief MFTL_FOREACH_OWNED_VERTEX over body @p gid, re-resolved, no-op if absent.
+ *
+ * The shape a solver actually has to use: the object is looked up by id at the
+ * point of use rather than cached across the redistribution that may have
+ * destroyed it, and a rank that holds none of the body simply moves nothing.
+ */
+#define FOREACH_BODY_VERTEX(ens, gid, ...)                     \
+  do                                                           \
+  {                                                            \
+    MFTL_Object *const _b = body((ens), (gid));                \
+    if (_b != MFTL_NULL) MFTL_FOREACH_OWNED_VERTEX(_b, __VA_ARGS__); \
+  } while (0)
+
 /** @brief Refreshes geometry for every local triangle. */
 static void refresh_geometry(MFTL_Ensemble *ens)
 {
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    MFTL_Object *obj = ens->objects[o];
+    MFTL_Object *obj = ens->local_objects[o];
     MFTLComputeTriangleGeometry(obj, obj->tris.n);
   }
 }
@@ -116,9 +145,9 @@ static void refresh_geometry(MFTL_Ensemble *ens)
 static void owned_totals(const MFTL_Ensemble *ens, double out[3])
 {
   out[0] = out[1] = out[2] = 0.0;
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *obj = ens->objects[o];
+    const MFTL_Object *obj = ens->local_objects[o];
     out[0] += (double) obj->tris.n_local;
     out[1] += (double) obj->verts.n_local;
     for (int t = 0; t < obj->tris.n_local; ++t) out[2] += obj->tris.area[t];
@@ -135,9 +164,14 @@ static void global_totals(const MFTL_Ensemble *ens, double out[3])
 /** @brief 1 if every object of the ensemble satisfies inv_partition_is_sound. */
 static int ensemble_is_sound(const MFTL_Ensemble *ens)
 {
-  for (int o = 0; o < ens->num_objects; ++o)
+  /* The directory itself, before the meshes in it: sorted, no empty object, every
+   * id inside the space. A redistribution that failed to destroy a departed body
+   * leaves every per-object check below passing. */
+  if (!inv_local_directory_is_sound(ens)) return 0;
+
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    if (!inv_partition_is_sound(ens->objects[o], g_rank)) return 0;
+    if (!inv_partition_is_sound(ens->local_objects[o], g_rank)) return 0;
   }
   return 1;
 }
@@ -152,10 +186,19 @@ static int ensemble_is_sound(const MFTL_Ensemble *ens)
  *
  * @note Collective.
  */
-static int ownership_is_exclusive(const MFTL_Object *obj)
+static int ownership_is_exclusive(const MFTL_Ensemble *ens, int gid)
 {
-  const int nt = obj->next_triangle_gid;
-  const int nv = obj->next_vertex_gid;
+  const MFTL_Object *const obj = body(ens, gid);
+
+  /* The id RANGES have to be agreed before anything is sized by them. A rank
+   * holding nothing of the body knows neither, and every path below is
+   * collective, so deriving them locally would have that rank size its buffers
+   * differently -- or return early and leave the others in the Allreduce. */
+  int range[2] = {obj ? obj->next_triangle_gid : 0, obj ? obj->next_vertex_gid : 0};
+  MPI_Allreduce(MPI_IN_PLACE, range, 2, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+
+  const int nt = range[0];
+  const int nv = range[1];
   const int n = (nt > nv) ? nt : nv;
   if (n <= 0) return 1;
 
@@ -170,7 +213,7 @@ static int ownership_is_exclusive(const MFTL_Object *obj)
 
   int ok = 1;
 
-  for (int t = 0; t < obj->tris.n_local; ++t)
+  for (int t = 0; obj != MFTL_NULL && t < obj->tris.n_local; ++t)
   {
     const int g = obj->tris.rec[t].global_id;
     if (g < 0 || g >= nt) ok = 0;
@@ -181,7 +224,7 @@ static int ownership_is_exclusive(const MFTL_Object *obj)
     if (total[g] != 1) ok = 0;
 
   memset(mine, 0, (size_t) n * sizeof(int));
-  for (int v = 0; v < obj->verts.n_local; ++v)
+  for (int v = 0; obj != MFTL_NULL && v < obj->verts.n_local; ++v)
   {
     const int g = obj->verts.rec[v].global_id;
     if (g < 0 || g >= nv) ok = 0;
@@ -244,9 +287,9 @@ static void partition_digest(const MFTL_Ensemble *ens, uint64_t out[2])
 {
   uint64_t mine[2] = {0, 0x243f6a8885a308d3ULL};
 
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
+    const MFTL_Object *const obj = ens->local_objects[o];
     const uint64_t body = (uint64_t) obj->global_id;
 
     for (int v = 0; v < obj->verts.n; ++v)
@@ -306,13 +349,13 @@ static void advect_one_step(MFTL_Ensemble *ens, const double vel[3], double dt)
 {
   /* `vel` rather than `v`: MFTL_FOREACH_OWNED_VERTEX names its loop index `v`. */
   const double dx = vel[0] * dt, dy = vel[1] * dt, dz = vel[2] * dt;
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    MFTL_Object *obj = ens->objects[o];
-    MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += dx; pos[1] += dy; pos[2] += dz; MFTLApplyPeriodicity(&ens->domain, pos););
+    MFTL_Object *obj = ens->local_objects[o];
+    FOREACH_BODY_VERTEX(ens, 0, pos[0] += dx; pos[1] += dy; pos[2] += dz; MFTLApplyPeriodicity(&ens->domain, pos););
   }
   MFTLUpdateGhostPositions(ens);
-  for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
 }
 
 /** @brief Sorted list of the global ids this rank OWNS. Caller frees. */
@@ -394,7 +437,7 @@ static int test_scatter_from_rank0(void)
 
   TEST_ASSERT(agreed(MFTLRedistribute(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
-  TEST_ASSERT(agreed(ownership_is_exclusive(obj), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ownership_is_exclusive(ens, 0), MPI_COMM_WORLD));
 
   double totals[3];
   refresh_geometry(ens);
@@ -474,7 +517,7 @@ static int test_twin_repair_matches_full_rebuild(void)
 
   /* A second round after motion, so the repair set contains both "my twin left"
    * and "a new neighbour arrived" rather than only freshly received triangles. */
-  MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += 0.11; pos[1] += 0.07; pos[2] -= 0.05; MFTLApplyPeriodicity(&ens->domain, pos););
+  FOREACH_BODY_VERTEX(ens, 0, pos[0] += 0.11; pos[1] += 0.07; pos[2] -= 0.05; MFTLApplyPeriodicity(&ens->domain, pos););
   MFTLUpdateGhostPositions(ens);
   refresh_geometry(ens);
   MFTLRedistribute(ens);
@@ -524,7 +567,7 @@ static int test_derived_arrays_match_a_full_rebuild(void)
   /* A second round after motion, so the mesh contains all four kinds of slot the
    * emission has to cover: kept owned, kept ghost, arrived owned, arrived ghost
    * -- plus a repair set with genuinely re-paired twins. */
-  MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += 0.11; pos[1] += 0.07; pos[2] -= 0.05; MFTLApplyPeriodicity(&ens->domain, pos););
+  FOREACH_BODY_VERTEX(ens, 0, pos[0] += 0.11; pos[1] += 0.07; pos[2] -= 0.05; MFTLApplyPeriodicity(&ens->domain, pos););
   MFTLUpdateGhostPositions(ens);
   refresh_geometry(ens);
   MFTLRedistribute(ens);
@@ -583,7 +626,7 @@ static int test_advection_conserves_entities(void)
   int ok = 1;
   for (int step = 0; step < 12; ++step)
   {
-    MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += vel[0] * dt; pos[1] += vel[1] * dt; pos[2] += vel[2] * dt; MFTLApplyPeriodicity(&ens->domain, pos););
+    FOREACH_BODY_VERTEX(ens, 0, pos[0] += vel[0] * dt; pos[1] += vel[1] * dt; pos[2] += vel[2] * dt; MFTLApplyPeriodicity(&ens->domain, pos););
 
     if (MFTLUpdateGhostPositions(ens) != MFTL_SUCCESS) ok = 0;
     refresh_geometry(ens);
@@ -595,7 +638,7 @@ static int test_advection_conserves_entities(void)
     if (fabs(totals[2] - reference[2]) > 1e-9 * reference[2]) ok = 0;
 
     if (!ensemble_is_sound(ens)) ok = 0;
-    if (!ownership_is_exclusive(obj)) ok = 0;
+    if (!ownership_is_exclusive(ens, 0)) ok = 0;
 
     if (MFTLRedistribute(ens) != MFTL_SUCCESS) ok = 0;
   }
@@ -630,7 +673,7 @@ static int test_ghost_positions_are_synced(void)
 
   MFTLRedistribute(ens);
 
-  MFTL_FOREACH_OWNED_VERTEX(obj, positions_from_gid(rec->global_id, pos););
+  FOREACH_BODY_VERTEX(ens, 0, positions_from_gid(rec->global_id, pos););
 
   const int rc = MFTLUpdateGhostPositions(ens);
 
@@ -867,32 +910,48 @@ static int test_multibody_round(void)
     expect_v[o] = obj->global_n_vertices;
   }
 
-  TEST_ASSERT_EQUAL_INT(5, ens->num_objects);
+  TEST_ASSERT_EQUAL_INT(5, ens->n_local_objects);
   TEST_ASSERT(agreed(MFTLRedistribute(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
 
+  /* By BODY ID from here on. The list is this rank's, so slot `o` is body `o`
+   * only while the rank still holds all five -- which is exactly what a
+   * redistribution stops being true. */
   int ok = 1;
-  for (int o = 0; o < 5; ++o)
+  for (int b = 0; b < 5; ++b)
   {
-    MFTL_Object *obj = ens->objects[o];
-    int local[2] = {obj->tris.n_local, obj->verts.n_local};
+    const MFTL_Object *const obj = body(ens, b);
+    int local[2] = {obj ? obj->tris.n_local : 0, obj ? obj->verts.n_local : 0};
     int total[2] = {0, 0};
     MPI_Allreduce(local, total, 2, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-    if (total[0] != expect_t[o] || total[1] != expect_v[o]) ok = 0;
-    if (!ownership_is_exclusive(obj)) ok = 0;
+    if (total[0] != expect_t[b] || total[1] != expect_v[b]) ok = 0;
+    if (!ownership_is_exclusive(ens, b)) ok = 0;
 
-    /* The body id must survive the round trip -- it is what identifies the body
-     * to the application, and the wire names bodies by list INDEX instead. */
-    if (obj->global_id != 100 + o) ok = 0;
+    /* The body id must survive the round trip -- it is the identity the body
+     * travels under, so a redistribution that lost or permuted it would merge
+     * entities into the wrong body. MFTLEnsembleAddObject() hands the ids out
+     * densely in add order, so it is `b` whatever add_sphere() was passed. */
+    if (obj != MFTL_NULL && obj->global_id != b) ok = 0;
   }
   TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
 
+  /* NON-VACUITY: the whole point of five small bodies on four ranks is that not
+   * every rank holds every body. If it did, nothing above would be testing the
+   * sparse list at all. */
+  {
+    int somebody_is_missing = (ens->n_local_objects < 5);
+    MPI_Allreduce(MPI_IN_PLACE, &somebody_is_missing, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
+    int nproc = 1;
+    MPI_Comm_size(MPI_COMM_WORLD, &nproc);
+    TEST_ASSERT(nproc == 1 || somebody_is_missing);
+  }
+
   /* A second round after motion: now every body has kept entities AND arrivals,
    * which is the state the run reconstruction actually has to get right. */
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    MFTL_Object *obj = ens->objects[o];
-    MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += 0.31; pos[1] -= 0.23; MFTLApplyPeriodicity(&ens->domain, pos););
+    MFTL_Object *lb = ens->local_objects[o];
+    MFTL_FOREACH_OWNED_VERTEX(lb, pos[0] += 0.31; pos[1] -= 0.23; MFTLApplyPeriodicity(&ens->domain, pos););
   }
   TEST_ASSERT(agreed(MFTLUpdateGhostPositions(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
   refresh_geometry(ens);
@@ -900,12 +959,13 @@ static int test_multibody_round(void)
   TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
 
   ok = 1;
-  for (int o = 0; o < 5; ++o)
+  for (int b = 0; b < 5; ++b)
   {
-    int local[2] = {ens->objects[o]->tris.n_local, ens->objects[o]->verts.n_local};
+    const MFTL_Object *const obj = body(ens, b);
+    int local[2] = {obj ? obj->tris.n_local : 0, obj ? obj->verts.n_local : 0};
     int total[2] = {0, 0};
     MPI_Allreduce(local, total, 2, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-    if (total[0] != expect_t[o] || total[1] != expect_v[o]) ok = 0;
+    if (total[0] != expect_t[b] || total[1] != expect_v[b]) ok = 0;
   }
   TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
 
@@ -941,26 +1001,34 @@ static int test_body_can_leave_a_rank_entirely(void)
   const double x0 = -1.0 + 0.5 * cell[0];
   const double y0 = -1.0 + 0.5 * cell[1];
   const double z0 = -1.0 + 0.5 * cell[2];
-  MFTL_Object *obj = add_sphere(ens, 7, x0, y0, z0, 0.3 * smallest, 2);
+  add_sphere(ens, 7, x0, y0, z0, 0.3 * smallest, 2);
 
   MFTLRedistribute(ens);
   refresh_geometry(ens);
 
+  /* "Holds nothing of it" is now a STRONGER statement than it was: the rank does
+   * not merely have an empty pool, it has no object for the body at all. That is
+   * the property this whole test exists to pin, so it is asserted as the absence
+   * of the object rather than as a zero count. */
   const int home = ens->domain.rank_map[0];
   int ok = 1;
-  if (g_rank == home)
   {
-    if (obj->tris.n_local != obj->global_n_triangles) ok = 0;
-    if (obj->tris.n != obj->tris.n_local) ok = 0;  // no halo: nothing else holds any of it
-  }
-  else if (obj->tris.n != 0)
-  {
-    ok = 0;
+    const MFTL_Object *const b = body(ens, 0);
+    if (g_rank == home)
+    {
+      if (b == MFTL_NULL) ok = 0;
+      else if (b->tris.n_local != b->global_n_triangles) ok = 0;
+      else if (b->tris.n != b->tris.n_local) ok = 0;  // no halo: nothing else holds any of it
+    }
+    else if (b != MFTL_NULL)
+    {
+      ok = 0;
+    }
   }
   TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
 
   /* One cell to the right, in one step. */
-  MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += cell[0]; MFTLApplyPeriodicity(&ens->domain, pos););
+  FOREACH_BODY_VERTEX(ens, 0, pos[0] += cell[0]; MFTLApplyPeriodicity(&ens->domain, pos););
   refresh_geometry(ens);
 
   double probe[3] = {x0 + cell[0], y0, z0};
@@ -971,15 +1039,27 @@ static int test_body_can_leave_a_rank_entirely(void)
   TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
 
   ok = 1;
-  if (g_rank == dest)
   {
-    if (obj->tris.n_local != obj->global_n_triangles) ok = 0;
-  }
-  else if (obj->tris.n != 0)
-  {
-    ok = 0;
+    const MFTL_Object *const b = body(ens, 0);
+    if (g_rank == dest)
+    {
+      /* Created here on arrival: this rank held no object for the body a moment
+       * ago and holds all of it now. */
+      if (b == MFTL_NULL) ok = 0;
+      else if (b->tris.n_local != b->global_n_triangles) ok = 0;
+    }
+    else if (b != MFTL_NULL)
+    {
+      /* Destroyed here on departure -- including on `home`, which held the whole
+       * body before the move and must now hold no object at all. */
+      ok = 0;
+    }
   }
   TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+
+  /* NON-VACUITY: the move has to actually cross a rank boundary, or the test
+   * asserts nothing about create-on-arrival or destroy-on-departure. */
+  TEST_ASSERT(agreed(dest != home, MPI_COMM_WORLD));
 
   MFTLEnsembleDestroy(&ens);
   return 0;
@@ -1002,7 +1082,7 @@ static int test_body_straddling_a_periodic_seam(void)
 
   TEST_ASSERT(agreed(MFTLRedistribute(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
-  TEST_ASSERT(agreed(ownership_is_exclusive(obj), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ownership_is_exclusive(ens, 0), MPI_COMM_WORLD));
 
   refresh_geometry(ens);
   double totals[3];
@@ -1012,10 +1092,13 @@ static int test_body_straddling_a_periodic_seam(void)
   /* The sphere is centred on the seam, so both sides of the box must hold part
    * of it -- otherwise the wrap silently pushed everything to one side. */
   int has_low = 0, has_high = 0;
-  for (int v = 0; v < obj->verts.n_local; ++v)
   {
-    if (obj->verts.pos[3 * v] < -0.5) has_low = 1;
-    if (obj->verts.pos[3 * v] > 0.5) has_high = 1;
+    const MFTL_Object *const b = body(ens, 0);
+    for (int v = 0; b != MFTL_NULL && v < b->verts.n_local; ++v)
+    {
+      if (b->verts.pos[3 * v] < -0.5) has_low = 1;
+      if (b->verts.pos[3 * v] > 0.5) has_high = 1;
+    }
   }
   int flags[2] = {has_low, has_high};
   int any[2] = {0, 0};
@@ -1036,7 +1119,7 @@ static int test_non_periodic_domain(void)
 
   TEST_ASSERT(agreed(MFTLRedistribute(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
-  TEST_ASSERT(agreed(ownership_is_exclusive(obj), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ownership_is_exclusive(ens, 0), MPI_COMM_WORLD));
 
   refresh_geometry(ens);
   double totals[3];
@@ -1135,7 +1218,17 @@ static int test_skipping_reproduces_the_full_rebuild(void)
   MFTLRedistributeSetSkipUnchangedBodies(MFTL_TRUE);  // back to the library default
 
   TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
-  if (g_nproc > 1) TEST_ASSERT(agreed(skipped > 0, MPI_COMM_WORLD));
+
+  /* NON-VACUITY, as a SUM over ranks rather than as "every rank skipped
+   * something". It used to be the latter and passed for the wrong reason: every
+   * rank held an object for every body, so the ten bodies a rank had nothing of
+   * were counted as skipped every step. A rank now holds only the bodies it has
+   * entities of -- one or two of twelve at eight ranks -- and can legitimately
+   * have all of them cross a plane in a given step. The sum is what the claim
+   * "skipping happens, and the meshes still agree" actually rests on. */
+  long total_skipped = 0;
+  MPI_Allreduce(&skipped, &total_skipped, 1, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
+  if (g_nproc > 1) TEST_ASSERT(total_skipped > 0);
 
   MFTLEnsembleDestroy(&ens_on);
   MFTLEnsembleDestroy(&ens_off);
@@ -1183,13 +1276,23 @@ static int test_a_stamped_body_is_never_skipped(void)
   /* Same loop, same motion, but every body now says the partition no longer
    * describes it. Nothing may be skipped. */
   advect_one_step(ens, velocity, 1.0);
-  for (int o = 0; o < ens->num_objects; ++o) MFTLObjectMarkPartitionDirty(ens->objects[o]);
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLObjectMarkPartitionDirty(ens->local_objects[o]);
   before = skipped_so_far();
   MFTLRedistribute(ens);
   const long stamped = skipped_so_far() - before;
 
   TEST_ASSERT(agreed(stamped == 0, MPI_COMM_WORLD));
-  if (g_nproc > 1) TEST_ASSERT(agreed(baseline > 0, MPI_COMM_WORLD));  // else the comparison is vacuous
+
+  /* Non-vacuity as a SUM, for the same reason as in
+   * test_skipping_reproduces_the_full_rebuild: a rank holds only the bodies it
+   * has entities of, so at eight ranks it can hold one or two and legitimately
+   * have all of them cross a plane in the baseline step. "Somebody skipped
+   * something" is what makes `stamped == 0` a comparison rather than a tautology;
+   * "every rank did" used to hold only because every rank carried an empty object
+   * for every body it had nothing of. */
+  long total_baseline = 0;
+  MPI_Allreduce(&baseline, &total_baseline, 1, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
+  if (g_nproc > 1) TEST_ASSERT(total_baseline > 0);
   TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
 
   MFTLEnsembleDestroy(&ens);
@@ -1217,9 +1320,9 @@ static int test_a_stamped_body_is_never_skipped(void)
 static int bodies_over_the_bound(const MFTL_Ensemble *ens, double factor)
 {
   int bad = 0;
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
+    const MFTL_Object *const obj = ens->local_objects[o];
     if (obj->verts.n == 0 && obj->tris.n == 0) continue;
 
     const double v_bound = MFTL_MAX((double) MFTL_INIT_CAPACITY, factor * (double) obj->verts.n);
@@ -1233,7 +1336,7 @@ static int bodies_over_the_bound(const MFTL_Ensemble *ens, double factor)
 static long capacity_bytes(const MFTL_Ensemble *ens)
 {
   long bytes = 0;
-  for (int o = 0; o < ens->num_objects; ++o) bytes += (long) MFTLObjectPoolBytes(ens->objects[o]);
+  for (int o = 0; o < ens->n_local_objects; ++o) bytes += (long) MFTLObjectPoolBytes(ens->local_objects[o]);
   return bytes;
 }
 
@@ -1396,21 +1499,130 @@ static int test_shrinking_does_not_change_the_mesh(void)
   return 0;
 }
 
+/**
+ * @brief A body with no entities anywhere ends up held by nobody, and that is fine.
+ *
+ * The invariant is "a rank has an object for a body exactly when it has entities
+ * of it", so a body that is empty on every rank has no local representation
+ * anywhere -- its id stays allocated in the space, and nothing else of it exists.
+ * The old behaviour was an empty MFTL_Object on every rank, which is the
+ * per-body footprint this design removes.
+ *
+ * It also pins the pointer contract at its sharpest: `empty` is dangling the
+ * moment the redistribution returns, so the test may not look at it. Bodies are
+ * re-resolved by id, and this one resolves to nothing.
+ */
 static int test_empty_object_is_a_no_op(void)
 {
   MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 2);
 
-  MFTL_Object *empty = MFTLObjectCreate(0);
-  MFTLEnsembleAddObject(ens, empty);
-  MFTL_Object *real = add_sphere(ens, 1, 0.0, 0.0, 0.0, 0.4, 2);
+  MFTLEnsembleAddObject(ens, MFTLObjectCreate(0));  // body 0: never given any entities
+  add_sphere(ens, 1, 0.0, 0.0, 0.0, 0.4, 2);        // body 1: a real mesh
+
+  TEST_ASSERT_EQUAL_INT(2, ens->n_local_objects);
+  TEST_ASSERT_EQUAL_INT(2, ens->n_bodies_global);
 
   TEST_ASSERT(agreed(MFTLRedistribute(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
 
-  TEST_ASSERT_EQUAL_INT(0, empty->verts.n);
-  TEST_ASSERT_EQUAL_INT(0, empty->tris.n);
-  TEST_ASSERT(MFTLObjectHasTopology(empty));
+  /* Body 0 is gone from every rank; body 1 is wherever its entities went. The id
+   * space is untouched -- ids are retired with the ensemble, not with a
+   * partition. */
+  TEST_ASSERT(agreed(body(ens, 0) == MFTL_NULL, MPI_COMM_WORLD));
+  TEST_ASSERT_EQUAL_INT(2, ens->n_bodies_global);
+
   TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
-  TEST_ASSERT(agreed(ownership_is_exclusive(real), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ownership_is_exclusive(ens, 1), MPI_COMM_WORLD));
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/**
+ * @brief A body arrives on a rank, leaves it, and comes back -- repeatedly.
+ *
+ * The lifecycle a sparse object list introduces, exercised as a cycle rather than
+ * as a single transition, because the interesting failures are the ones that need
+ * a rank to have held the body BEFORE:
+ *
+ *   - a stale `body_state` reused for the arriving body, so the rebuild reads a
+ *     kept-list pointer belonging to whatever occupied that workspace slot last;
+ *   - a `partition_settled` flag surviving the destruction, so a body that has
+ *     just arrived is skipped on the next step and never gets its settling
+ *     rebuild;
+ *   - the id counters not travelling with the body, so a rank that created it
+ *     sizes its arrival tables from zero.
+ *
+ * A small sphere marched along x through every cell of the grid, one cell per
+ * step, so it visits every rank in the row and returns to the first.
+ */
+static int test_a_body_arrives_leaves_and_returns(void)
+{
+  if (g_nproc < 2) return 0;  // nowhere to go
+
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 1);
+
+  double cell[3];
+  for (int d = 0; d < 3; ++d) cell[d] = 2.0 / (double) ens->domain.cuts[d];
+  const double smallest = MFTL_MIN(cell[0], MFTL_MIN(cell[1], cell[2]));
+
+  add_sphere(ens, 0, -1.0 + 0.5 * cell[0], -1.0 + 0.5 * cell[1], -1.0 + 0.5 * cell[2], 0.3 * smallest, 2);
+  MFTLRedistribute(ens);
+  refresh_geometry(ens);
+
+  const int expect_t = ownership_is_exclusive(ens, 0);  // also the first structural check
+  TEST_ASSERT(agreed(expect_t, MPI_COMM_WORLD));
+
+  MFTL_RedistributeStats st0;
+  MFTLRedistributeGetStats(&st0);
+
+  /* Two full laps of the x row, so the body returns to ranks it has already been
+   * destroyed on -- which is the state a fresh arrival cannot reach. */
+  const int laps = 2 * ens->domain.cuts[0];
+
+  int ok = 1;
+  int steps_held = 0;
+  for (int step = 0; step < laps; ++step)
+  {
+    FOREACH_BODY_VERTEX(ens, 0, pos[0] += cell[0]; MFTLApplyPeriodicity(&ens->domain, pos););
+
+    if (MFTLUpdateGhostPositions(ens) != MFTL_SUCCESS) ok = 0;
+    refresh_geometry(ens);
+    if (MFTLRedistribute(ens) != MFTL_SUCCESS) ok = 0;
+    refresh_geometry(ens);
+
+    if (!ensemble_is_sound(ens)) ok = 0;
+    if (!ownership_is_exclusive(ens, 0)) ok = 0;
+
+    const MFTL_Object *const b = body(ens, 0);
+    if (b != MFTL_NULL)
+    {
+      steps_held++;
+
+      /* The counters travelled with the body: a rank that created it this step
+       * must still size an id table for the whole mesh. */
+      if (b->next_vertex_gid != b->global_n_vertices) ok = 0;
+      if (b->next_halfedge_gid != 3 * b->next_triangle_gid) ok = 0;
+    }
+  }
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+
+  /* NON-VACUITY, and it is two claims. Bodies really were created and destroyed
+   * -- without that the whole lifecycle is untested -- and this rank really did
+   * both hold the body and not hold it, without which "returns" is a word rather
+   * than a state that was reached. */
+  MFTL_RedistributeStats st1;
+  MFTLRedistributeGetStats(&st1);
+
+  long churn[2] = {st1.n_objects_created - st0.n_objects_created, st1.n_objects_destroyed - st0.n_objects_destroyed};
+  MPI_Allreduce(MPI_IN_PLACE, churn, 2, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
+  TEST_ASSERT(churn[0] > 0);
+  TEST_ASSERT(churn[1] > 0);
+
+  /* `anywhere`, not `agreed`: the body marches along x, so ranks off that row
+   * never hold it at all -- and requiring every rank to have both held and not
+   * held it would fail on precisely the grids where the test covers most. What
+   * has to be true of the RUN is that some rank went through the full cycle. */
+  TEST_ASSERT(anywhere(steps_held > 0 && steps_held < laps, MPI_COMM_WORLD));
 
   MFTLEnsembleDestroy(&ens);
   return 0;
@@ -1479,6 +1691,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_a_stamped_body_is_never_skipped);
   RUN_TEST(test_generation_capacity_does_not_stay_resident_on_rank_0);
   RUN_TEST(test_shrinking_does_not_change_the_mesh);
+  RUN_TEST(test_a_body_arrives_leaves_and_returns);
   RUN_TEST(test_empty_object_is_a_no_op);
   RUN_TEST(test_empty_ensemble_is_a_no_op);
   RUN_TEST(test_invalid_arguments);

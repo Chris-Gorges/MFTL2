@@ -253,7 +253,7 @@ static int test_radial_error_falls_under_refinement(void)
    * vacuously monotone -- so this only asserts where there is a mesh, and the
    * verdict is agreed across ranks either way. */
   int ok = 1;
-  if (g_open->objects[g_open->num_objects - 1]->verts.n > 0)
+  if (g_open->local_objects[g_open->n_local_objects - 1]->verts.n > 0)
   {
     if (!(err[1] < err[0] && err[2] < err[1])) ok = 0;
     if (!(err[2] < 0.3)) ok = 0;

@@ -65,6 +65,21 @@ $3\times3\times3$ grid is the smallest one with an **interior** rank whose 26
 neighbours are 26 *distinct* ranks. Below it, periodic aliasing collapses several
 offsets and the de-duplication is doing half the work by accident.
 
+@warning **The de-duplication removes duplicate offsets, not this rank.** The
+         collapse above can put this rank's OWN id in `domain->neighbors`, so
+         `comm_graph` carries a self-loop on any grid with a single cut on a
+         periodic axis. An exchange does not care — the block arrives and the
+         data is right. A **reduction** does: fold the self block in a second
+         time and MIN and MAX hide it while every SUM doubles.
+         `MFTLEnsembleReduceBodies` drops it explicitly, and shapes
+         $\{2,1,1\}$ and $\{2,2,1\}$ are where a test notices.
+
+Each neighbour's **cell offset** is kept beside its rank in
+`MFTL_Domain::neighbor_offset`. Relative rather than absolute: an offset needs no
+`MPI_Cart_coords` call and no seam correction, and "are these two cells
+26-neighbours" becomes "is every component of the difference within 1", which is
+the whole of the holder test below.
+
 ---
 
 ## The fused update pass {#ens_update}
@@ -118,17 +133,140 @@ With `fmin`/`fmax` that objection disappears.
       x86-64 they need extra NaN fixup around `minsd`/`maxsd`, so the 4–5 %
       measured is **not portable** and is worth re-measuring on the cluster.
 
-### Three collectives, not $3B$
+### One reduction, over each body's HOLDERS
 
-The nine slots per object are laid out contiguously — 3 MIN, 3 MAX, 5 SUM (the
-two extra SUM slots are the triangle and edge counts) — so the whole ensemble's
-statistics are **three `MPI_Allreduce` calls, one per operator**, regardless of
-how many bodies there are. At $B$ bodies that is 3 collectives instead of $3B$,
-and the message is $11B$ doubles either way.
+The eleven slots per object are laid out contiguously — 3 MIN, 3 MAX, 5 SUM (the
+two extra SUM slots are the triangle and edge counts) — as **one record per body
+this rank holds**, and the whole ensemble's statistics are a single call to
+`MFTLEnsembleReduceBodies`.
+
+The three operators in one record cost nothing there, and that is the point of
+the shape: the neighbourhood route is an *exchange* and combines in local memory,
+so mixing min, max and sum is one message rather than three. Only the
+`comm_world` fallback still issues one `MPI_Allreduce` per operator, which is
+what this used to be unconditionally.
 
 The averages are then taken against the **global** entity counts, never as an
 average of per-rank averages: a rank holding a tenth of the mesh must not
 contribute a tenth of the weight to a mean it computed over its own share.
+
+## Per-body reductions {#ens_reduce}
+
+`MFTLEnsembleReduceBodies` (`ensemble_reduce.c`) is the one place the library
+decides which communicator a per-body reduction uses. Its users are the quality
+statistics above, `MFTLEnsembleUpdateGlobalCounts`, redistribution's skip vote,
+the spatial halo's body radii, the distributed remesher's body measurement and its
+id counters.
+
+### The caller's buffer is indexed by LOCAL SLOT
+
+An `MPI_Allreduce` aligns element $k$ of every rank's buffer, so a per-body
+payload staged for one has to be indexed by body **id** — the only index two
+ranks holding different bodies agree about. That is the obvious shape, and the
+one that stops scaling: at $10^6$ bodies every rank allocates, fills with
+identities and reduces $10^6$ slots to learn about the hundred it holds.
+
+So `values` is `[n_local_objects][n_per_body]`, reduced in place. Moving the id
+indexing inside the function is most of the saving — otherwise the collective
+shrinks and the per-rank memory does not.
+
+### When the neighbourhood is enough
+
+A rank holds an entity of a body only if it **owns** one: redistribution sends a
+triangle to the owner of each of its three corners and each of its three edge
+neighbours, so a rank holding nothing but ghosts cannot exist. The holders of a
+body are therefore the cells its entities occupy, and the question is whether
+that set fits inside one 26-neighbourhood.
+
+Three local statements decide it, with no geometry and no body-global
+measurement. Let $V_R(X)$ be the holders rank $R$ can see for body $X$ — itself,
+plus the `owner_proc` of every ghost of $X$ in its pool:
+
+1. $R$ owns at least one entity of $X$;
+2. every member of $V_R(X)$ is a graph neighbour of $R$;
+3. their cell offsets span at most one cell per axis.
+
+`MPI_LAND` of that is exactly "the neighbourhood route is exact", and it reads
+only the **ghost suffix** — a body held whole costs nothing at all.
+
+Statement 1 is what makes $V$ complete. A rank holding an **empty** object owns
+nothing, appears in no other holder's halo, and can therefore neither be
+discovered nor served; it cannot be seen from outside, so it vetoes. That is not
+a corner case — it is the state a generated ensemble is in before its first
+redistribution, and it is what `test_ensemble_update_tolerates_empty_ranks`
+caught at $P = 4$.
+
+Given it, the converse holds. Take holders $c, c'$ two cells or more apart; the
+surface is connected, so there is a chain of holders from $c$ to $c'$ whose
+consecutive members share an entity and therefore see each other. If any step of
+that chain is two cells or more, statement 2 fails at its start. If every step is
+one cell, the chain covers at least two cells in unit steps, so some member has
+chain neighbours on **opposite sides** of it along one axis — both in its own $V$
+— and statement 3 fails there.
+
+@warning The converse rests on one assumption: a body is a **connected** surface.
+         Two components on ranks that neither see each other nor have anything
+         between them would pass every local test. Nothing in MFTL produces such
+         a body, but a caller that assembles one from an index list owes
+         `MFTL_BODY_REDUCE_SCOPE_GLOBAL`.
+
+The verdict is re-derived on every call and never cached: it is invalidated by
+any holder-set change anywhere in the job, and a stale one is a silently wrong
+reduction rather than a crash.
+
+### Redistribution takes the test itself, and has to
+
+`MFTLEnsembleBodyHoldersFitTheGraph` describes the pools **as they are**.
+`compute_owners` overwrites every entity's `owner_proc` with its *destination*
+rank while classifying, so after the object loop the pools describe the partition
+that is about to exist while the skip vote has to reach the ranks holding the
+body now. Redistribution therefore takes the answer before classifying, agrees
+it, and passes `MFTL_BODY_REDUCE_SCOPE_HOLDERS` or `..._GLOBAL` explicitly.
+
+### The answer is bitwise identical on every holder
+
+Contributions are folded in **ascending source-rank order**, with this rank
+spliced in at its own position. Floating-point addition is not associative and
+`domain->neighbors` is in an MPI-chosen order that differs from rank to rank, so
+receive order would leave two holders of one body with `quality` values differing
+in the last ulp — and a solver branching on such a value to decide whether to
+remesh would then have two ranks entering different collectives. `MPI_Allreduce`
+gives that guarantee for free; here it has to be arranged.
+
+## Per-body prefix sums {#ens_exscan}
+
+`MFTLEnsembleExscanBodies` is the reduction's sibling, and it exists because
+**handing out ids is a scan and not a combination**. Two holders of one body that
+both split an edge each create a vertex, and the two need *different* global ids,
+so each holder needs the count of what the holders **before** it created. No
+`MFTL_BodyReduceOp` produces that.
+
+It shares everything that can be shared: the same `(body id, payload)`
+neighbourhood allgatherv, the same ascending-source-rank total order — which is
+what "before" means — and the same route test and global fallback (`MPI_Exscan`
+plus `MPI_Allreduce`, both posted before either is waited on). The total comes out
+of the same records, so asking for it costs no extra collective.
+
+The property it has and the reduction does not is a **tiling**: over a body's
+holders in ascending rank order, each range must begin exactly where the previous
+one ended, and the last must close exactly on the total. That is what
+`test_the_scan_tiles_every_body_exactly_once` gathers and walks per body, and it
+is the statement that makes the ids provably disjoint.
+
+Its consumer is the distributed remesher, where it replaced an `MPI_Exscan` plus
+an `MPI_Allreduce` of `2 × n_bodies_global` ints **per phase** and `11 × bodies`
+ints of scratch per pass. See `src/remeshing/README.md` §rem_ids.
+
+### Counting a per-body verdict exactly once
+
+Every holder of a body comes out of a reduction with the same value, so summing a
+per-body verdict over ranks counts a shared body **once per holder**. The library
+learned this from a message that read "4 of 1 bodies are wider than a rank box".
+
+The fix costs one slot: a `MFTL_BODY_REDUCE_MIN` of the contributing rank is the
+body's **lowest-numbered holder**, and `lowest_holder[o] == rank` is the licence to
+count body `o`. It rides a reduction already being taken and needs nobody to know
+the holder set. `MFTLRemeshMeasureBodies` carries it as its ninth slot.
 
 ### Why the kernel is a file-static here rather than in `src/geometry/`
 

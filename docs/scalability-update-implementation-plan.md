@@ -15,7 +15,15 @@ analysis:
 3. every rank retains the complete object list, including empty mesh objects.
 
 It turns those findings into an implementation order and answers which parts can
-be changed independently without weakening correctness. It is a companion to
+be changed independently without weakening correctness.
+
+> **Status, 2026-09-04.** This is the PLAN as written on 2026-09-01 and is kept as
+> written. What was actually built, what it measurably bought and what is still
+> missing are in [`scalability-update-status.md`](scalability-update-status.md) —
+> read that first if you want the current state. Phases 7 and 8 carry a
+> "Delivered" note at the end of each; the one item of Phase 7 that was **not**
+> done is the dispersed balancer's distributed assignment, and the status document
+> says why and what has to be established first. It is a companion to
 [`redistribution-architecture-recommendation_final.md`](redistribution-architecture-recommendation_final.md),
 not a competing redistribution design. In particular, it keeps that document's
 requirements:
@@ -959,6 +967,38 @@ Exit gate:
 
 Difficulty: very high. Risk: very high.
 
+**Delivered, except one item.** See `docs/scalability-update-status.md` §Stage 4
+and §Stage 5. `MFTLRemeshMeasureBodies`, the per-phase GID block, the dispersed ID
+counters and the Debug watermark check are all keyed by local slot and reduced
+over each body's holders (`MFTLEnsembleReduceBodies`, and the new
+`MFTLEnsembleExscanBodies` for the scan the GID assignment needs). The exit gate's
+first and third clauses are met — `examples/leveque_remeshing_parallel` reproduces
+the mesh digests recorded before any of this work, bit for bit, at np = 1, 2
+and 4.
+
+**Two parts of this note were written before they were true, and a review against
+the tree found them; both are true now and §Stage 5 of the status document is the
+account.** The per-phase GID block reached `MFTLEnsembleExscanBodies` but pinned
+its scope to `MFTL_BODY_REDUCE_SCOPE_GLOBAL`, so the scan was staged and reduced
+on `comm_world` after all — invisible to every test, because the two routes agree
+to the bit. And work item 4 above, "explicit owner maps are a set of local
+records, not an array indexed by the global list", had not been done at all: the
+maps were `MAX(n_bodies_global, n_local)` entries keyed by `global_id`, cleared
+and refilled on every migration. The lesson registered with the first is a route
+test — `test_a_droplet_remesh_takes_no_global_reduction`, which counts
+communicators rather than values.
+
+The second clause is met **except for the dispersed assignment**: "replace
+dispersed global greedy assignment with a deterministic distributed algorithm" was
+not done. Its greedy is over rank *loads*, and a rank's load sums bodies held
+anywhere in the job, so it genuinely needs replicated per-body data — a property
+of the algorithm and not of the route. What was done instead is to make it the
+only thing that pays: the replication is explicit (`replicate_for_balancer`, one
+`Allreduce` of `4B` doubles rather than the measurement's `9B`), it runs only when
+`dispersed_balance_slack > 0`, and with the balancer off the driver is
+`O(local + P)` end to end. Status document §6 states what a local rule has to
+prove before it can replace this.
+
 ### Phase 8 -- spatial halo and BVH candidate-discovery redesign
 
 Work:
@@ -979,6 +1019,31 @@ Exit gate:
 
 Difficulty: very high. Risk: very high. This is algorithmically separate from
 redistribution even though it uses the same identity/catalog substrate.
+
+**Delivered.** See `docs/scalability-update-status.md` §Stage 4. Every work item
+above is in the tree: the halo's requests and directory are body-GID keyed
+(#MFTL_SpatialHalo is a sorted `body_gid` array, not a `[n_bodies_global]` table);
+the broad phase is a uniform grid over the body extents each rank publishes to its
+26 neighbours; the pair list is derived rather than enumerated
+(`MFTLExtendSpatialHaloNearBodies`); the pair owner is deterministic (`body_a <
+body_b` by id, reported by the holder of A); the payload is one exchange whatever
+the pair count; and the global radii come from a per-body reduction over each
+body's holders plus a one-hop publish.
+
+Exit gate, measured: candidate completeness is checked against an **exhaustive
+`O(nA·nB)` sweep over all pairs** that shares no code with the BVH, the halo or
+the grid (`test_the_broad_phase_finds_the_pairs_without_enumerating_them`, np = 1,
+2, 4, 8, 27); the same test asserts that every kept pair is a real one and that
+the directory summed over ranks is below `nproc × bodies`; and
+`test_the_distributed_answer_matches_the_unpartitioned_one` still compares the
+gathered contact SET against the unpartitioned answer over 30 placements at those
+five rank counts.
+
+One thing the plan did not anticipate and the status document records instead: the
+premise that the request list had to be identical on every rank — which is what
+made this phase look "very high risk" — was **false**. The halo's collectives are
+one neighbourhood allgatherv of extents and one of payload, and neither's count
+depends on the requests.
 
 ### Phase 9 -- I/O, examples, public cutover, and cleanup
 

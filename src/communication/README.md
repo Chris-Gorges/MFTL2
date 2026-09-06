@@ -209,8 +209,29 @@ instead:
 | | |
 |---|---|
 | pass 1a | classify ownership for **every** body; do the full analysis and packing for every body **this rank** saw change |
-| vote | one `MPI_Allreduce(MPI_BOR)` over a bitset of one bit per body |
+| vote | one `MFTLEnsembleReduceBodies` over each body's **holders** |
 | pass 1c | the bodies that were clean here and dirty somewhere else |
+
+**The vote used to be one `MPI_Allreduce(MPI_BOR)` over a bitset of one bit per
+body**, which is as small as that shape can be made and still `O(bodies in the
+ensemble)` on every rank — the last array here that grew with `P` in a weak sweep
+at constant work per rank. Only the ranks HOLDING a body can have seen it change,
+and only they will rebuild it, so the vote is exactly a per-holder reduction.
+@ref MFTLEnsembleReduceBodies "MFTLEnsembleReduceBodies" is where that decision
+lives; the workspace slices are now indexed by local slot.
+
+@warning The route test reads each body's ghost `owner_proc`, and
+         `compute_owners` **overwrites** `owner_proc` with the DESTINATION rank
+         while classifying. Asking one line later gives a plausible answer to the
+         wrong question — the partition that is about to exist, not the one the
+         vote has to reach — and it is wrong only when something moved far, i.e.
+         exactly when the vote matters. So it is taken before pass 1a, agreed on
+         the collective phase 1b was already paying for, and handed to the
+         reduction.
+
+An **arrival** has no vote slot and needs none: it is here because an entity of it
+crossed into this rank's cell, so some rank saw it change, and `MFTLObjectCreate`
+leaves `partition_settled` false — the skip clause is already decided.
 
 Pass 1c does not need pass 1a's owner arrays kept alive — which is what would
 otherwise cost `O(sum_verts + sum_tris)` of new storage. `compute_owners` is
@@ -302,8 +323,70 @@ A **different thing entirely** from the redistribution halo:
 | rebuilt by | `MFTLRedistribute` | `MFTLExtendSpatialHalo` |
 
 The patch is an ordinary object with `n_local == 0`, twins linked within the
-patch, derived arrays built. It is deliberately **not** in `ens->objects`, so
+patch, derived arrays built. It is deliberately **not** in `ens->local_objects`, so
 redistribution and both ghost syncs never see it.
+
+### The directory is sparse, and it is NOT the local object list {#comm_halo_dir}
+
+#MFTL_SpatialHalo keys its patches and radii on a sorted `body_gid` array —
+`MFTLSpatialHaloFindBody`, `MFTLSpatialHaloPatch` and `MFTLSpatialHaloRadius`
+binary-search it — rather than on a `[n_bodies_global]` table. It holds two sets,
+and the second is why it cannot simply *be* the ensemble's local list:
+
+- the bodies this rank **holds**, so a resolved radius has somewhere to live;
+- the bodies this rank **received a patch for**, which is precisely the set it
+  holds nothing of. A rank with droplet A and none of droplet B is exactly the
+  rank that must be told about B.
+
+Entries that are neither held nor patched are pruned at the end of every
+exchange, so the directory stays proportional to what is nearby rather than
+growing with every droplet that ever drifted past. **Measured** on twelve bodies:
+12 slots over all ranks at $P = 27$, against the 324 a dense table would have
+cost.
+
+### The candidate pairs are DERIVED, not enumerated {#comm_halo_pairs}
+
+`MFTLExtendSpatialHaloNearBodies` is the form contact detection uses, and it
+exists because the all-pairs request list its caller used to build was the last
+$O(B^2)$ term in the library: $B(B-1)/2$ ordered records on every rank every call,
+134 million of them at 16 384 bodies.
+
+The list was justified by *"the halo derives its sequence of collectives from the
+requests, so they must be identical on every rank"*. **They do not.** The halo's
+collectives are one neighbourhood allgatherv of body extents and one of payload,
+and neither's *count* depends on the requests — a request only says what THIS rank
+is willing to send. So:
+
+1. each rank publishes one record per body **it holds**: `(body id, centre,
+   half-width, global radius, contact envelope)`, nine doubles. The dense form
+   published `6 × n_bodies_global` doubles **to every neighbour**, i.e. 1.2 kB per
+   body per rank on a full 26-neighbourhood;
+2. the arrivals are binned into a **uniform grid** whose cell is at least
+   `2 × widest half-width + largest envelope` on every axis. That is what makes
+   "the extents overlap" imply "within one cell", so a query is the 27 cells
+   around a centre and the whole phase is $O(\text{bodies} + \text{records})$;
+3. body B travels towards body A only when `A < B` by body id — the existing
+   "reported once" rule, since the holder of the smaller id is the rank that
+   reports the pair and therefore the one that needs the copy;
+4. `halo->pair` comes back holding every `(A, B)` with `A < B` such that this rank
+   holds A and can see B, deduplicated.
+
+The envelope going **on the wire** is what makes step 3 decidable locally: a rank
+cannot judge whether its droplet is worth sending towards a neighbour's without
+knowing that body's envelope, and the envelope scales with the body.
+
+**Measured** on six well-separated touching couples, so 6 of the 66 unordered
+pairs are contacts: 6 / 6 / 9 / 18 / 6 candidate pairs over all ranks at
+$P = 1, 2, 4, 8, 27$, against 66 / 132 / 264 / 528 / 1782.
+
+@note `MFTLSpatialHaloResolveRadii` reduces over each body's **holders** and then
+      publishes `(gid, radius)` **one hop further**, to the 26 neighbours. That is
+      not redundancy: the reduction tells a body's holders how big it is, and the
+      rank that has to decide what to *send* needs the size of the body it is
+      sending *towards* and holds none of it. One hop is exactly right, because
+      the halo only ever ships along `comm_graph`. The corollary is that a rank
+      two hops from a body has no envelope for it **and can never report a contact
+      with it**, which is the same reach the exchange itself has.
 
 ### Why not append to the body's ghost suffix
 
@@ -361,7 +444,8 @@ needs so a droplet on the seam does not report a bounding radius of half the box
 
 **Measured** at $P = 27$ on a seam contact: **314 triangles ghosted with boxes
 against 56 with intervals**, and **320 against 0** for a placement with no
-cross-rank contact at all. Payload is six doubles per body per rank either way.
+cross-rank contact at all. Payload is nine doubles per body a rank **holds**
+either way — not per body in the ensemble.
 
 ### A pre-filter must be strictly MORE permissive than what it short-cuts
 
@@ -378,8 +462,9 @@ only a **proximity** contact at a rank boundary reveals it, which is what
 
 `collect_destinations` keeps only owned triangles, so a halo cannot survive a
 repartition **even in principle**, and the documented loop redistributes every
-step. Each `MFTLExtendSpatialHalo` **replaces** the previous patches rather than
-accumulating.
+step. Each `MFTLExtendSpatialHalo` **replaces** the patches of the bodies it was
+asked about rather than accumulating; `MFTLExtendSpatialHaloNearBodies`, which
+speaks for the whole directory, replaces all of them.
 
 @note The overlap list is rebuilt from scratch every call and could be cached when
       the decomposition is static — but every rank's extent for every body changes

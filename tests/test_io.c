@@ -99,9 +99,9 @@ static MFTL_Object *add_sphere(MFTL_Ensemble *ens, int id, double cx, double cy,
 static void global_owned(const MFTL_Ensemble *ens, double out[2])
 {
   double local[2] = {0.0, 0.0};
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *obj = ens->objects[o];
+    const MFTL_Object *obj = ens->local_objects[o];
     local[0] += (double) obj->tris.n_local;
     for (int t = 0; t < obj->tris.n_local; ++t) local[1] += obj->tris.area[t];
   }
@@ -402,7 +402,7 @@ static int test_cell_count_is_the_owned_count(void)
   MFTL_Ensemble *ens = make_ensemble(false, 1);
   add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.6, 3);
   MFTLRedistribute(ens);
-  for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
 
   MFTL_VtkOptions opt = MFTLVtkDefaults();
   TEST_ASSERT(agreed(MFTLWriteVtu(ens, prefix, &opt) == MFTL_SUCCESS, MPI_COMM_WORLD));
@@ -418,7 +418,7 @@ static int test_cell_count_is_the_owned_count(void)
   long long my_cells = ok ? f.n_cells : -1;
   long long my_points = ok ? f.n_points : -1;
   if (ok) ok = vtu_structure_is_sound(&f);
-  if (ok) ok = (f.n_cells == ens->objects[0]->tris.n_local);
+  if (ok) ok = (f.n_cells == ens->local_objects[0]->tris.n_local);
   vtu_free(&f);
 
   TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
@@ -449,7 +449,7 @@ static int test_area_from_file_matches_mesh(void)
   add_sphere(ens, 1, 0.4, 0.3, 0.1, 0.30, 2);
   add_sphere(ens, 2, 0.0, 0.5, -0.4, 0.20, 3);
   MFTLRedistribute(ens);
-  for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
 
   MFTL_VtkOptions opt = MFTLVtkDefaults();
   TEST_ASSERT(agreed(MFTLWriteVtu(ens, prefix, &opt) == MFTL_SUCCESS, MPI_COMM_WORLD));
@@ -494,7 +494,7 @@ static int test_periodic_seam_is_unwrapped(void)
   MFTL_Ensemble *ens = make_ensemble(true, 1);
   add_sphere(ens, 0, -0.98, 0.0, 0.0, 0.3, 3); /* centred on the x = -1 face */
   MFTLRedistribute(ens);
-  for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
 
   MFTL_VtkOptions opt = MFTLVtkDefaults();
   TEST_ASSERT(agreed(MFTLWriteVtu(ens, prefix, &opt) == MFTL_SUCCESS, MPI_COMM_WORLD));
@@ -516,7 +516,7 @@ static int test_periodic_seam_is_unwrapped(void)
     /* Private unwrapped corners are the only way a piece can hold more points
      * than the object has vertices, so this confirms the path was taken at all
      * rather than the test passing because nothing straddled. */
-    extra_points = f.n_points - ens->objects[0]->verts.n;
+    extra_points = f.n_points - ens->local_objects[0]->verts.n;
   }
   vtu_free(&f);
   TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
@@ -548,14 +548,14 @@ static int test_wrap_detection_paths_agree(void)
   MFTL_Ensemble *ens = make_ensemble(true, 1);
   add_sphere(ens, 0, -0.95, 0.9, 0.0, 0.35, 3);
   MFTLRedistribute(ens);
-  for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
 
   MFTL_VtkOptions opt = MFTLVtkDefaults();
 
-  TEST_ASSERT(agreed(MFTLObjectHasTopology(ens->objects[0]), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLObjectHasTopology(ens->local_objects[0]), MPI_COMM_WORLD));
   TEST_ASSERT(agreed(MFTLWriteVtu(ens, with, &opt) == MFTL_SUCCESS, MPI_COMM_WORLD));
 
-  for (int o = 0; o < ens->num_objects; ++o) MFTLObjectInvalidateDerived(ens->objects[o]);
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLObjectInvalidateDerived(ens->local_objects[o]);
   TEST_ASSERT(agreed(MFTLWriteVtu(ens, without, &opt) == MFTL_SUCCESS, MPI_COMM_WORLD));
 
   char pa[512], pb[512];
@@ -594,7 +594,7 @@ static int test_ghost_inclusion(void)
   MFTL_Ensemble *ens = make_ensemble(false, 1);
   add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
   MFTLRedistribute(ens);
-  for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
 
   MFTL_VtkOptions opt = MFTLVtkDefaults();
   TEST_ASSERT(agreed(MFTLWriteVtu(ens, a, &opt) == MFTL_SUCCESS, MPI_COMM_WORLD));
@@ -609,7 +609,7 @@ static int test_ghost_inclusion(void)
   int ok = vtu_load(pa, &fa) && vtu_load(pb, &fb);
   if (ok)
   {
-    ok = (fa.n_cells == ens->objects[0]->tris.n_local) && (fb.n_cells == ens->objects[0]->tris.n);
+    ok = (fa.n_cells == ens->local_objects[0]->tris.n_local) && (fb.n_cells == ens->local_objects[0]->tris.n);
   }
   vtu_free(&fa);
   vtu_free(&fb);
@@ -638,7 +638,7 @@ static int test_shared_file_equals_the_pieces(void)
   add_sphere(ens, 0, -0.9, 0.2, 0.0, 0.3, 3);
   add_sphere(ens, 1, 0.5, -0.4, 0.3, 0.25, 3);
   MFTLRedistribute(ens);
-  for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
 
   MFTL_VtkOptions opt = MFTLVtkDefaults();
   opt.write_global_id = true;
@@ -721,7 +721,7 @@ static int test_shared_file_is_truncated_on_rewrite(void)
   MFTL_Ensemble *small = make_ensemble(false, 1);
   add_sphere(small, 0, 0.0, 0.0, 0.0, 0.5, 1);
   MFTLRedistribute(small);
-  for (int o = 0; o < small->num_objects; ++o) MFTLComputeTriangleGeometry(small->objects[o], small->objects[o]->tris.n);
+  for (int o = 0; o < small->n_local_objects; ++o) MFTLComputeTriangleGeometry(small->local_objects[o], small->local_objects[o]->tris.n);
   TEST_ASSERT(agreed(MFTLWriteVtu(small, prefix, &opt) == MFTL_SUCCESS, MPI_COMM_WORLD));
 
   double expect[2];
@@ -766,7 +766,7 @@ static int test_ascii_agrees_with_binary(void)
   MFTL_Ensemble *ens = make_ensemble(true, 1);
   add_sphere(ens, 0, -0.9, 0.0, 0.0, 0.3, 2);
   MFTLRedistribute(ens);
-  for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
 
   MFTL_VtkOptions opt = MFTLVtkDefaults();
   TEST_ASSERT(agreed(MFTLWriteVtu(ens, ab, &opt) == MFTL_SUCCESS, MPI_COMM_WORLD));
@@ -824,9 +824,11 @@ static int test_body_id_partitions_the_cells(void)
   const int n_bodies = 4;
 
   MFTL_Ensemble *ens = make_ensemble(false, n_bodies);
+  /* The id argument is provisional: MFTLEnsembleAddObject() replaces it with the
+   * dense body id, so these four bodies come out as 0..3 in add order. */
   for (int o = 0; o < n_bodies; ++o) add_sphere(ens, 100 + o, -0.6 + 0.4 * o, 0.1 * o, 0.0, 0.15, 2);
   MFTLRedistribute(ens);
-  for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
 
   MFTL_VtkOptions opt = MFTLVtkDefaults();
   TEST_ASSERT(agreed(MFTLWriteVtu(ens, prefix, &opt) == MFTL_SUCCESS, MPI_COMM_WORLD));
@@ -844,7 +846,7 @@ static int test_body_id_partitions_the_cells(void)
     ok = bid && (nb == (unsigned long long) f.n_cells * 4u);
     for (long long t = 0; ok && t < f.n_cells; ++t)
     {
-      const int b = bid[t] - 100;
+      const int b = bid[t];
       ok = (b >= 0 && b < n_bodies);
       if (ok) per_body[b]++;
     }
@@ -854,7 +856,17 @@ static int test_body_id_partitions_the_cells(void)
 
   long long total[8] = {0};
   MPI_Allreduce(per_body, total, 8, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
-  for (int o = 0; o < n_bodies; ++o) TEST_ASSERT_EQUAL_INT(ens->objects[o]->global_n_triangles, (int) total[o]);
+
+  /* By BODY ID, and reduced: a rank holds only the bodies it has triangles of,
+   * so slot `b` is body `b` only before the redistribution, and the expected
+   * count has to come from a rank that still holds the body. */
+  for (int b = 0; b < n_bodies; ++b)
+  {
+    const MFTL_Object *const obj = MFTLEnsembleFindLocalObject(ens, b);
+    int expect = obj ? obj->global_n_triangles : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &expect, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    TEST_ASSERT_EQUAL_INT(expect, (int) total[b]);
+  }
 
   cleanup(prefix);
   MFTLEnsembleDestroy(&ens);

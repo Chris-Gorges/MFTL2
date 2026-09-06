@@ -179,12 +179,25 @@ int main(int argc, char **argv)
       break;
     }
 
-    double max_t, mean_t;
-    triangle_spread(obj, &max_t, &mean_t);
+    /* RE-RESOLVED, not the pointer MFTLObjectCreate returned: a remeshing pass
+     * ends in a redistribution, which destroys the object of a body a rank keeps
+     * nothing of and creates one for a body arriving. `obj` above is valid only
+     * until the opening MFTLRedistribute. MFTL_NULL means this rank holds none of
+     * the body, which is a legitimate state and not an error. */
+    const MFTL_Object *const held = MFTLEnsembleFindLocalObject(ens, 0);
+
+    double max_t = 0.0, mean_t = 0.0;
+    if (held != MFTL_NULL) triangle_spread(held, &max_t, &mean_t);
+
+    /* The global triangle count is the same number on every holder, so rank 0
+     * can only print it if it holds some of the body. It is reduced rather than
+     * read, which also covers the case where rank 0 holds none. */
+    int n_tri_global = (held != MFTL_NULL) ? held->global_n_triangles : 0;
+    MPI_Allreduce(MPI_IN_PLACE, &n_tri_global, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
 
     if (g_rank == 0)
     {
-      printf("%4d %6d %3d %3d %4d %5d %6d %6d %5d %6.3f  | %9.4f %9.4f %9.4f %9.4f %9.4f %9.4f  | %8d  %9.2f\n", pass, obj->global_n_triangles,
+      printf("%4d %6d %3d %3d %4d %5d %6d %6d %5d %6.3f  | %9.4f %9.4f %9.4f %9.4f %9.4f %9.4f  | %8d  %9.2f\n", pass, n_tri_global,
              st.n_phases, st.n_migrations, st.n_migrations_skipped, st.converged ? 1 : 0, st.n_edges_hidden_long, st.n_edges_hidden_short,
              st.n_coarse_groups, st.band_measured, st.t_total, st.t_migrate, st.t_geometry, st.t_freeze, st.t_sweep, st.t_reduce,
              st.n_entities_migrated, (mean_t > 0.0) ? max_t / mean_t : 0.0);

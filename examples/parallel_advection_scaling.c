@@ -166,7 +166,9 @@
  *     --repeat R            re-run the timed loop, report the min (default 1)
  *
  *   optional per-step work
- *     --quality             also MFTLEnsembleUpdate
+ *     --quality             also MFTLEnsembleUpdate (per-body statistics: eleven
+ *                           doubles reduced PER BODY, so the payload grows with
+ *                           the ensemble -- that is what the phase measures)
  *     --normals             also MFTLEnsembleUpdateVertexNormals
  *     --no-post-geom        drop the geometry pass redistribution defers
  *     --vtk N               write the surface every N steps      (default 0, off)
@@ -793,9 +795,9 @@ static void body_velocity(int body_index, const bool periodic[3], double speed, 
 static void local_totals(const MFTL_Ensemble *ens, double out[3])
 {
   out[0] = out[1] = out[2] = 0.0;
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *obj = ens->objects[o];
+    const MFTL_Object *obj = ens->local_objects[o];
     for (int i = 0; i < obj->tris.n_local; ++i) out[0] += obj->tris.area[i];
     out[1] += (double) obj->tris.n_local;
     out[2] += (double) obj->verts.n_local;
@@ -815,9 +817,9 @@ static void local_totals(const MFTL_Ensemble *ens, double out[3])
 static void local_halo(const MFTL_Ensemble *ens, long out[3])
 {
   out[0] = out[1] = out[2] = 0;
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *obj = ens->objects[o];
+    const MFTL_Object *obj = ens->local_objects[o];
     out[0] += obj->tris.n_local;
     out[1] += obj->tris.n - obj->tris.n_local;
     if (obj->tris.n_local > 0) out[2] += 1;
@@ -830,7 +832,7 @@ static void local_halo(const MFTL_Ensemble *ens, long out[3])
 static long local_ghost_bytes(const MFTL_Ensemble *ens)
 {
   long n = 0;
-  for (int o = 0; o < ens->num_objects; ++o) n += ens->objects[o]->verts.n - ens->objects[o]->verts.n_local;
+  for (int o = 0; o < ens->n_local_objects; ++o) n += ens->local_objects[o]->verts.n - ens->local_objects[o]->verts.n_local;
   return n * (long) sizeof(MFTL_GhostUpdatePayload);
 }
 
@@ -868,9 +870,9 @@ static void local_migration(const MFTL_Ensemble *ens, long out[2])
   const int me = dom->rank;
   long churn = 0, sends = 0;
 
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
+    const MFTL_Object *const obj = ens->local_objects[o];
     const int nt = obj->tris.n_local;
     if (nt < 1) continue;
 
@@ -975,12 +977,16 @@ static void run_step(MFTL_Ensemble *ens, const config *cfg, const double *vel, r
 
   /* 1. Move what we own, and only what we own. */
   double t0 = phase_begin(cfg->sync_phases, &wt[PH_ADVECT]);
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    MFTL_Object *obj = ens->objects[o];
-    const double dx = vel[3 * o + 0] * cfg->dt;
-    const double dy = vel[3 * o + 1] * cfg->dt;
-    const double dz = vel[3 * o + 2] * cfg->dt;
+    MFTL_Object *obj = ens->local_objects[o];
+
+    /* `vel` is per BODY and replicated; `o` is this rank's slot for it, and the
+     * two stopped coinciding when the object list became sparse. */
+    const int b = obj->global_id;
+    const double dx = vel[3 * b + 0] * cfg->dt;
+    const double dy = vel[3 * b + 1] * cfg->dt;
+    const double dz = vel[3 * b + 2] * cfg->dt;
     MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += dx; pos[1] += dy; pos[2] += dz; MFTLApplyPeriodicity(&ens->domain, pos););
   }
   ph[PH_ADVECT] += MPI_Wtime() - t0;
@@ -993,7 +999,7 @@ static void run_step(MFTL_Ensemble *ens, const config *cfg, const double *vel, r
 
   /* 3. Every triangle now has current vertices. ALL of them, ghosts included. */
   t0 = phase_begin(cfg->sync_phases, &wt[PH_GEOM]);
-  for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
   ph[PH_GEOM] += MPI_Wtime() - t0;
 
   if (reference)
@@ -1037,7 +1043,7 @@ static void run_step(MFTL_Ensemble *ens, const config *cfg, const double *vel, r
   if (cfg->post_geom)
   {
     t0 = phase_begin(cfg->sync_phases, &wt[PH_POST]);
-    for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+    for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
     ph[PH_POST] += MPI_Wtime() - t0;
   }
 
@@ -1373,11 +1379,19 @@ int main(int argc, char **argv)
     double centre[3];
     body_centre(&lat, gmin, size, cfg.periodic, o, n_bodies, cfg.jitter, radius, centre);
 
-    MFTLGenerateSphere(obj, centre, radius, cfg.refinements);
+    /* The LOCAL half: no MPI. The collective half is hoisted out of the loop
+     * below, because MFTLGenerateSphere() would put one MPI_Bcast and one
+     * MPI_Allreduce per body in strict sequence on rank 0's critical path --
+     * 2N collectives for O(N) bytes. In WEAK mode N grows with the rank count,
+     * so that alone would make setup grow linearly with P. */
+    MFTLGenerateSphereLocal(obj, centre, radius, cfg.refinements);
 
     /* Ownership is decided from the cached centre, and a fresh mesh has none. */
     MFTLComputeTriangleGeometry(obj, obj->tris.n);
   }
+
+  /* Two collectives for the whole ensemble, whatever the body count. */
+  MFTLPublishGeneratedBodies(ens);
 
   const long rss_after_gen = current_rss_bytes();
 
@@ -1413,7 +1427,7 @@ int main(int argc, char **argv)
     MPI_Reduce(rss, rsum, 3, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
     long cap_bytes = 0;
-    for (int o = 0; o < ens->num_objects; ++o) cap_bytes += (long) MFTLObjectPoolBytes(ens->objects[o]);
+    for (int o = 0; o < ens->n_local_objects; ++o) cap_bytes += (long) MFTLObjectPoolBytes(ens->local_objects[o]);
     long cap_max = 0, cap_sum = 0;
     MPI_Reduce(&cap_bytes, &cap_max, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
     MPI_Reduce(&cap_bytes, &cap_sum, 1, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
@@ -1447,18 +1461,31 @@ int main(int argc, char **argv)
   for (int o = 0; o < n_bodies; ++o) body_velocity(o, cfg.periodic, cfg.speed, &vel[3 * o]);
 
   MFTLEnsembleUpdateGlobalCounts(ens);
+
+  /* Summed from the OWNED PREFIXES and reduced, not from this rank's bodies'
+   * `global_n_*`: a rank holds an object only for the bodies it has entities of,
+   * so that sum would cover part of the ensemble. Ownership partitions the mesh
+   * exactly, so a plain SUM over owned counts is the whole of it and nothing is
+   * counted twice. */
   long global_tris = 0, global_verts = 0;
-  for (int o = 0; o < ens->num_objects; ++o)
   {
-    global_tris += ens->objects[o]->global_n_triangles;
-    global_verts += ens->objects[o]->global_n_vertices;
+    long mine[2] = {0, 0};
+    for (int o = 0; o < ens->n_local_objects; ++o)
+    {
+      mine[0] += ens->local_objects[o]->tris.n_local;
+      mine[1] += ens->local_objects[o]->verts.n_local;
+    }
+    long all[2] = {0, 0};
+    MPI_Allreduce(mine, all, 2, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
+    global_tris = all[0];
+    global_verts = all[1];
   }
 
   double reference[3] = {0.0, 0.0, 0.0};
   const double *ref_ptr = MFTL_NULL;
   if (cfg.verify)
   {
-    for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+    for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
     double local[3];
     local_totals(ens, local);
     MPI_Allreduce(local, reference, 3, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
@@ -1495,11 +1522,19 @@ int main(int argc, char **argv)
   MFTL_RedistributeStats best_rstats;
   memset(&best_rstats, 0, sizeof best_rstats);
 
+  /* The per-body reductions, kept beside the redistribution counters because
+   * they answer the same weak-scaling question from the other side: `per_body`
+   * below says how much MEMORY a rank holds per body in the ensemble, and this
+   * says whether a per-body COLLECTIVE still has a payload proportional to it. */
+  MFTL_BodyReduceStats best_breduce;
+  memset(&best_breduce, 0, sizeof best_breduce);
+
   for (int rep = 0; rep < cfg.repeat; ++rep)
   {
     run_state st;
     memset(&st, 0, sizeof st);
     MFTLRedistributeStatsReset();
+    MFTLEnsembleResetBodyReduceStats();
 
     MPI_Barrier(MPI_COMM_WORLD);
     const double w0 = MPI_Wtime();
@@ -1509,6 +1544,9 @@ int main(int argc, char **argv)
 
     MFTL_RedistributeStats rstats_this;
     MFTLRedistributeGetStats(&rstats_this);
+
+    MFTL_BodyReduceStats breduce_this;
+    MFTLEnsembleGetBodyReduceStats(&breduce_this);
 
     /* The selection criterion must be bit-identical on every rank, or two ranks
      * would keep different repeats and the reductions below would mix them. */
@@ -1520,6 +1558,7 @@ int main(int argc, char **argv)
       best = st;
       best_wall = wall;
       best_rstats = rstats_this;
+      best_breduce = breduce_this;
       have_best = true;
       memcpy(best_series, series, series_n * sizeof(double));
     }
@@ -1562,6 +1601,38 @@ int main(int argc, char **argv)
   long counters_sum[4] = {0, 0, 0, 0};
   MPI_Reduce(counters, counters_sum, 4, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
 
+  /* ── The per-body reductions, and the one that must stay at zero ────────
+   *
+   * `global` counts the per-body reductions whose payload and staging buffer
+   * were BOTH proportional to the ensemble's body count on every rank. In a weak
+   * sweep that is the shape that grows linearly with P at constant work per
+   * rank, so a droplet ensemble on a decomposition coarser than the droplets
+   * must report zero here -- and if it does not, `bytes_per_step` says what that
+   * cost before anything else is read.
+   *
+   * SUM over ranks, like the other counters: every rank takes the same route in
+   * the same call, so the sum is the call count times the rank count and the
+   * split is what carries the information. */
+  const long breduce[3] = {best_breduce.n_holders, best_breduce.n_global, best_breduce.n_bytes};
+  long breduce_sum[3] = {0, 0, 0};
+  MPI_Reduce(breduce, breduce_sum, 3, MPI_LONG, MPI_SUM, 0, MPI_COMM_WORLD);
+
+  /* ── The workspace, split by what it is proportional to ─────────────────
+   *
+   * MAX over ranks, not SUM: these are footprints a single rank carries, and the
+   * question is whether any rank's grows. They are kept out of rstats_reduce()
+   * because they are HIGH-WATER MARKS rather than accumulated counters, and that
+   * function sums.
+   *
+   * `per_body` is the one to watch across a weak sweep: it is what every rank
+   * pays for every body in the ensemble whether it holds any of it or not, so it
+   * grows linearly with P at constant work per rank. `per_entity` is the control
+   * -- it should be flat, and if it is not, the comparison says nothing. */
+  const long ws_local[3] = {best_rstats.ws_bytes_per_body, best_rstats.ws_bytes_per_rank, best_rstats.ws_bytes_per_entity};
+  long ws_max[3] = {0, 0, 0}, ws_min[3] = {0, 0, 0};
+  MPI_Reduce(ws_local, ws_max, 3, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
+  MPI_Reduce(ws_local, ws_min, 3, MPI_LONG, MPI_MIN, 0, MPI_COMM_WORLD);
+
   const long rss = peak_rss_bytes();
   long rss_max = 0, rss_sum = 0;
   MPI_Reduce(&rss, &rss_max, 1, MPI_LONG, MPI_MAX, 0, MPI_COMM_WORLD);
@@ -1577,9 +1648,9 @@ int main(int argc, char **argv)
    * to see what the ratchet cost, and against `live` to see what is stranded. */
   {
     long end_cap = 0, live = 0;
-    for (int o = 0; o < ens->num_objects; ++o)
+    for (int o = 0; o < ens->n_local_objects; ++o)
     {
-      const MFTL_Object *ob = ens->objects[o];
+      const MFTL_Object *ob = ens->local_objects[o];
       end_cap += (long) MFTLObjectPoolBytes(ob);
       live += (long) ob->verts.n * 88L + (long) ob->tris.n * 212L;
     }
@@ -1728,6 +1799,16 @@ int main(int argc, char **argv)
       printf("  route neighbour / global   %10ld / %ld calls\n", rstat_c[13], rstat_c[14]);
       printf("  bodies visited / EMPTY     %10.0f / %.0f per step   (%.1f %% of the per-body work is on nothing)\n", (double) rstat_c[15] / per_step,
              (double) rstat_c[16] / per_step, (rstat_c[15] > 0) ? 100.0 * (double) rstat_c[16] / (double) rstat_c[15] : 0.0);
+      /* MIN and MAX, and the gap between them is the interesting part. Capacity
+       * is a ratchet and rank 0 held the WHOLE ensemble during the opening
+       * scatter, so its per-entity high-water mark is the whole mesh's and never
+       * falls -- in weak mode that alone makes the maximum track P. The minimum
+       * is the figure a steady rank actually carries and is the one a weak sweep
+       * is asking about. Reading only the maximum would blame the library for
+       * the harness's serial generation. */
+      printf("  workspace min..max/rank    per-body %.1f..%.1f kB   per-rank %.1f..%.1f kB   per-entity %.1f..%.1f kB\n", (double) ws_min[0] / 1024.0,
+             (double) ws_max[0] / 1024.0, (double) ws_min[1] / 1024.0, (double) ws_max[1] / 1024.0, (double) ws_min[2] / 1024.0,
+             (double) ws_max[2] / 1024.0);
       printf("  allocations                %10.0f /step        %.3f MB/step requested\n", (double) rstat_c[17] / per_step,
              (double) rstat_c[19] * mb / per_step);
       printf("  of which the id tables     %10.3f MB/step      <- sized from the GLOBAL id range, not the local one\n",
@@ -1812,6 +1893,11 @@ int main(int argc, char **argv)
         fprintf(fp, "  \"churn_tris_per_step\": %.17g,\n  \"wire_tris_per_step\": %.17g,\n", (double) counters_sum[1] / per_step,
                 (double) counters_sum[2] / per_step);
         fprintf(fp, "  \"maxrss_bytes_max\": %ld,\n  \"maxrss_bytes_sum\": %ld,\n", rss_max, rss_sum);
+        fprintf(fp, "  \"body_reductions\": {\"holders\": %ld, \"global\": %ld, \"bytes_per_step\": %.17g},\n", breduce_sum[0], breduce_sum[1],
+                (double) breduce_sum[2] / per_step);
+        fprintf(fp, "  \"workspace_bytes\": {\"per_body\": {\"min\": %ld, \"max\": %ld}, \"per_rank\": {\"min\": %ld, \"max\": %ld}, "
+                    "\"per_entity\": {\"min\": %ld, \"max\": %ld}},\n",
+                ws_min[0], ws_max[0], ws_min[1], ws_max[1], ws_min[2], ws_max[2]);
         fprintf(fp, "  \"redist_p50_s\": %.17g,\n  \"redist_p95_s\": %.17g,\n", quantile(step_redist, cfg.steps, 0.50), quantile(step_redist, cfg.steps, 0.95));
         fprintf(fp, "  \"step_p50_s\": %.17g,\n  \"step_p95_s\": %.17g,\n", quantile(step_total, cfg.steps, 0.50), quantile(step_total, cfg.steps, 0.95));
         fprintf(fp, "  \"io\": {\"dumps\": %ld, \"bytes\": %ld},\n", best.io_dumps, counters_sum[3]);

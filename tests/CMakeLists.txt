@@ -181,6 +181,17 @@ mftl_add_mpi_test(test_meshgen_parallel 2)
 # same rank, which is the case the de-duplication in domain_init_comm exists for.
 mftl_add_mpi_test_at(test_meshgen_parallel_np4 test_meshgen_parallel 4)
 
+# The per-body reduction: two routes to one answer, plus a third written in the
+# test to check both against. The rank counts are chosen by what each REACHES,
+# and the reasons are in the file banner -- 2 and 4 are the grids whose
+# comm_graph carries a self-loop, 8 is the first with a corner, and 27 is the
+# first with an interior rank whose 26 neighbours are 26 distinct ranks.
+mftl_add_mpi_test(test_body_reduce 1)
+mftl_add_mpi_test_at(test_body_reduce_np2 test_body_reduce 2)
+mftl_add_mpi_test_at(test_body_reduce_np4 test_body_reduce 4)
+mftl_add_mpi_test_at(test_body_reduce_np8 test_body_reduce 8)
+mftl_add_mpi_test_oversub(test_body_reduce_np27 test_body_reduce 27)
+
 # Redistribution is the one module whose behaviour is a FUNCTION of the process
 # grid, so it is registered at four counts and each is genuinely different:
 #
@@ -231,4 +242,19 @@ if(BUILD_EXAMPLES)
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
                    $<TARGET_FILE:parallel_advection_scaling>
                    --spheres 8 --refine 1 --steps 3 --warmup 1 --verify ${MPIEXEC_POSTFLAGS})
+
+  # The SOLVER-SIDE half of the same rule, and it is the half no library test can
+  # reach: a caller that holds an MFTL_Object* across a redistribution advects a
+  # pointer the redistribution invalidated. Every structural invariant survives
+  # it -- the mesh stays a valid closed sphere with good triangles -- and the
+  # enclosed volume is the only thing that moves, so nothing short of a physical
+  # measurement over several timesteps sees it.
+  #
+  # np = 2 because it is invisible at np = 1: nothing is ever destroyed there,
+  # and the same code is correct. Twelve steps is enough for the failure to be a
+  # factor of thirteen rather than a tolerance question.
+  add_test(NAME test_leveque_parallel_conserves
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:leveque_remeshing_parallel>
+                   -steps 12 -budget 4 -quiet -verify ${MPIEXEC_POSTFLAGS})
 endif()

@@ -49,7 +49,7 @@ static MFTL_Ensemble *g_ens = MFTL_NULL;
 
 static MFTL_Object *fixture_new(void)
 {
-  MFTL_Object *obj = MFTLObjectCreate(g_ens->num_objects);
+  MFTL_Object *obj = MFTLObjectCreate(g_ens->n_local_objects);
   MFTLEnsembleAddObject(g_ens, obj);
   return obj;
 }

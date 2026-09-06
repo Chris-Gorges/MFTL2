@@ -48,6 +48,7 @@
 
 #include "comm_internal.h"
 #include "mftl_constants.h"
+#include "mftl_ensemble.h"
 #include "mftl_memory.h"
 #include "mftl_object.h"
 #include "mftl_topology.h"
@@ -168,16 +169,21 @@ static void answer_object_requests(const MFTL_Object *obj, ghost_field field, co
  */
 static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
 {
-  if (ens == MFTL_NULL || ens->objects == MFTL_NULL) return MFTL_ERROR;
+  if (ens == MFTL_NULL || ens->local_objects == MFTL_NULL) return MFTL_ERROR;
   MFTL_ASSERT(MFTL_MPI_GhostUpdatePayload != MPI_DATATYPE_NULL && "ghost sync: call MFTLRegisterMpiTypes() first");
 
   MFTL_Domain *const domain = &ens->domain;
-  MFTL_Object *const *const objects = ens->objects;
-  const int num_objects = ens->num_objects;
+  MFTL_Object *const *const objects = ens->local_objects;
+  const int num_objects = ens->n_local_objects;
   const int nproc = domain->nproc;
   const int nn = domain->num_neighbors;
 
-  if (num_objects == 0 || nn == 0 || nproc == 1) return MFTL_SUCCESS;
+  /* The body-count guard is GLOBAL: three neighbourhood collectives follow, so a
+   * rank holding nothing must still enter them and exchange zero bytes. `nn` and
+   * `nproc` are safe to test locally -- a rank with no graph neighbours has no
+   * ghosts to sync and nobody is expecting a message from it, and nproc == 1 is
+   * the same number everywhere. */
+  if (ens->n_bodies_global == 0 || nn == 0 || nproc == 1) return MFTL_SUCCESS;
 
   CS_BEGIN(ts_total);
   MFTLCommStats.g_n_calls++;
@@ -236,7 +242,11 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
         continue;
       }
 
-      ib_add2(&requests[n_idx], o, vr[v].global_id);
+      /* The REQUEST names the body by its global id -- the owner has its own
+       * slot for it and no reason for it to be the same one. The TARGET never
+       * leaves this rank, so it keeps the local slot and the apply phase stays a
+       * direct indexed write. */
+      ib_add2(&requests[n_idx], obj->global_id, vr[v].global_id);
       ib_add2(&targets[n_idx], o, v);
       MFTLCommStats.g_n_ghosts_requested++;
     }
@@ -319,26 +329,35 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
   int unserved = 0;
 
   {
+    /* Resolve each request's body id to THIS rank's slot for it, ONCE, in place.
+     * Everything downstream then buckets by local slot, so the counting sort and
+     * its cursors stay sized by what this rank holds rather than by the
+     * ensemble. `flat_recv[2k+1]` -- the vertex id -- is left alone.
+     *
+     * A request for a body this rank has nothing of is a routing error, not a
+     * partition this rank is simply not part of: the requester named this rank
+     * as the vertex's OWNER, so it must hold the body. */
     int dropped = 0;
     for (int k = 0; k < n_replies; ++k)
     {
-      const int o = flat_recv[2 * k];
-      if (o >= 0 && o < num_objects)
-        obj_off[o + 1]++;
+      const int slot = MFTLEnsembleFindLocalSlot(ens, flat_recv[2 * k]);
+      flat_recv[2 * k] = slot;
+      if (slot != MFTL_ERROR)
+        obj_off[slot + 1]++;
       else
         dropped++;
     }
     for (int o = 0; o < num_objects; ++o) obj_off[o + 1] += obj_off[o];
 
-    int *const cursor = (int *) MFTLMallocOrDie((size_t) num_objects * sizeof(int), "ghost grouping cursors");
+    int *const cursor = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(num_objects, 1) * sizeof(int), "ghost grouping cursors");
     for (int o = 0; o < num_objects; ++o) cursor[o] = obj_off[o];
 
     for (int k = 0; k < n_replies; ++k)
     {
       const int o = flat_recv[2 * k];
-      if (o < 0 || o >= num_objects)
+      if (o == MFTL_ERROR)
       {
-        MFTL_ASSERT(0 && "ghost sync: request names an object index outside the list -- ranks disagree about the object list");
+        MFTL_ASSERT(0 && "ghost sync: request names a body this rank does not hold, but claims this rank owns the vertex");
         memset(&replies[k], 0, sizeof replies[k]);
         replies[k].global_id = MFTL_ERROR;
         continue;

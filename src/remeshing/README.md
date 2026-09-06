@@ -32,7 +32,8 @@ communication layer and the shifted ownership rules.
 | $\delta$ | half-width of the frozen band | `stats.band_measured` / `band_bound` |
 | $g_k$, $G$ | per-axis coarsening factors and their product | `MFTLRemeshCoarseningFactors`, `stats.n_coarse_groups` |
 | $R_b$, $\mathbf{c}_b$, $w_b$ | body $b$'s radius, centroid, triangle count | `MFTLRemeshMeasureBodies` |
-| $N_b$ | bodies in the ensemble | `ens->num_objects` |
+| $N_b$ | bodies THIS RANK holds | `ens->n_local_objects` |
+| $B$ | bodies in the ENSEMBLE | `ens->n_bodies_global` |
 | $s \in \{0,1\}^3$ | one phase of the shift schedule | `MFTL_REMESH_PHASES` |
 
 ---
@@ -526,7 +527,7 @@ Two answers that remove the problem instead of managing it:
 | phases | 4–17 measured ($P = 1..8$) | 1 |
 | migrations | one per phase, plus one | exactly **2** |
 | frozen | $O(\delta/h)$ of the mesh | **nothing** |
-| id cost | one Exscan + Allreduce per phase | one `Allreduce(MAX)`, total |
+| id cost | one per-body scan over the holders per phase | one per-body `MAX`, total |
 | ranks used | all of them | $\min(N_b, P)$ |
 | weakness | phase count at large $P$ | **unfixable** idleness at $N_b < P$ |
 
@@ -561,7 +562,7 @@ flowchart TD
   P -->|AUTO| M["MFTLRemeshChooseStrategyMeasured — COLLECTIVE"]
 
   M --> M1["prepare_for_migration: triangle geometry"]
-  M1 --> M2["MFTLRemeshMeasureBodies — 2 Allreduce, centroid and radius and weight"]
+  M1 --> M2["MFTLRemeshMeasureBodies — 2 per-body reductions plus one scalar MAX"]
   M2 --> M3["dispersed_box_min — the yardstick, local"]
   M3 --> R{"r_max greater than dispersed_radius_fraction times the box?"}
   R -->|yes| SP
@@ -588,7 +589,7 @@ MFTLRemeshEnsemble(ens, params, stats)                          COLLECTIVE
           │
           ├─ MFTLRemeshChooseStrategyMeasured                     COLLECTIVE
           │    ├─ prepare_for_migration        triangle geometry          local
-          │    ├─ MFTLRemeshMeasureBodies      Allreduce(SUM) 8*N_b doubles
+          │    ├─ MFTLRemeshMeasureBodies      9 SUM/MIN values per LOCAL body
           │    │                               Allreduce(MAX)   N_b doubles
           │    │                               ▸ centroid[3N] radius[N] weight[N]
           │    └─ dispersed_box_min            the yardstick             local
@@ -656,7 +657,7 @@ flowchart TD
   SK --> FZ
   RD --> FZ["MFTLRemeshMarkFrozen, MFTLDilateFrozenBand, count_hidden_edges"]
   FZ --> IT["MFTLRemeshIterate — THE UNTOUCHED SERIAL KERNEL, gated by MFTL_FLAG_FROZEN"]
-  IT --> ID["assign_phase_gids — Exscan and Allreduce, both posted before either is waited on"]
+  IT --> ID["assign_phase_gids — a per-body scan over the holders, plus 3 ints of certificate"]
 
   ID --> CV{"global_ops == 0?"}
   CV -->|no| RS["streak = 0, next phase"]
@@ -670,7 +671,7 @@ flowchart TD
   PL -->|budget exhausted| CL
   OK --> CL["CLOSING SEQUENCE — the order is forced, every constraint is silent"]
 
-  CL --> C1["redensify_global_ids: MFTLRemeshIdReduce"]
+  CL --> C1["redensify_global_ids: MFTLEnsembleExscanBodies"]
   C1 --> C2["MFTLRemeshSyncGhostIds — keyed on the OLD id, so it runs BEFORE the overwrite"]
   C2 --> C3["overwrite by SLOT: gid = base + slot, he_gid = 3 tri_gid + k"]
   C3 --> C4["MFTLRedistribute — back to the CANONICAL planes, the production rule"]
@@ -744,8 +745,9 @@ MFTLRemeshEnsembleParallel(ens, params, stats)                   COLLECTIVE
 │   │                    ▲ THE UNTOUCHED SERIAL KERNEL, gated by MFTL_FLAG_FROZEN
 │   │                    ▲ the FULL iteration count, not one iteration   t_sweep
 │   │
-│   ├─ assign_phase_gids ─ MFTLRemeshIdReduce                      t_reduce
-│   │    1 Exscan + 1 Allreduce over 2*N_b counts + 3 convergence ints,
+│   ├─ assign_phase_gids ─ MFTLEnsembleExscanBodies               t_reduce
+│   │    a per-body scan over the HOLDERS, 2 values per local body, plus
+│   │    MFTLRemeshSumInts over 3 convergence ints,
 │   │    both posted before either is waited on (the latencies overlap)
 │   │
 │   └─◆ CONVERGENCE  (global_ops, hidden_long, hidden_short from that Allreduce)
@@ -757,7 +759,7 @@ MFTLRemeshEnsembleParallel(ens, params, stats)                   COLLECTIVE
 │
 └─ 4 ── CLOSING SEQUENCE ─── the order is forced; every constraint is silent ───
     ├─ redensify_global_ids                                        t_reduce
-    │    1. MFTLRemeshIdReduce over the OWNED counts    Exscan + Allreduce
+    │    1. MFTLEnsembleExscanBodies over the OWNED counts        per body
     │    2. MFTLRemeshSyncGhostIds        request/reply over comm_graph
     │       ▲ keyed on the OLD id, so it must run BEFORE the overwrite
     │    3. overwrite by SLOT:  gid = base + slot,  he_gid = 3*tri_gid + k
@@ -779,9 +781,9 @@ $$
   2\,n_{\text{phases}} + 3
 $$
 
-small collectives, of which $2 n_{\text{phases}}$ are the overlapped Exscan and
-Allreduce pair. **Everything else in the pass is local**, including the whole
-freeze classification and every approval predicate.
+small collectives, of which $2 n_{\text{phases}}$ are the per-body scan and the
+3-int convergence certificate. **Everything else in the pass is local**, including
+the whole freeze classification and every approval predicate.
 
 ### The geometric guarantee {#rem_covering}
 
@@ -1047,7 +1049,8 @@ makes them locally unique and globally ambiguous — and that is harmless, becau
 *nothing communicates between the sweeps and the fix-up*. Entities created this
 phase are exactly those with $\texttt{gid} \ge w$, the watermark recorded before
 the sweeps, so no operator had to keep a list. With $c_r$ the number this rank
-created and $\mathrm{Exscan}$ the exclusive prefix sum,
+created and $\mathrm{Exscan}$ the exclusive prefix sum **over that body's holders,
+in ascending rank order** (`MFTLEnsembleExscanBodies`),
 
 $$
   \texttt{gid} \leftarrow w + \mathrm{Exscan}(c_r) + (\text{rank-local ordinal}),
@@ -1055,9 +1058,22 @@ $$
   w' = w + \sum_{r} c_r .
 $$
 
-The watermark advances by the **global** count on every rank, so it stays a value
-all ranks agree on — which is what the next phase's "created this phase" test and
-redistribution's table sizing both rest on.
+The watermark advances by the count summed over that body's **holders**, so it
+stays a value all of them agree on — which is what the next phase's "created this
+phase" test and redistribution's table sizing both rest on. A rank that holds none
+of the body has no watermark to agree about and no ids to hand out.
+
+@note The scan is a **different operation from the reduction**, not a special case
+      of it, and that is why `MFTLEnsembleExscanBodies` exists next to
+      `MFTLEnsembleReduceBodies` rather than inside it. Two holders that both
+      split an edge each create a vertex and the two need *different* ids, so a
+      holder needs the count of what the holders **before** it created — which no
+      combination can produce. It reuses the reduction's record exchange and its
+      ascending-source-rank order, and falls back to `MPI_Exscan` +
+      `MPI_Allreduce` on the same test. The property it has and a reduction does
+      not — every holder's range abutting the previous one and the last closing
+      exactly on the total — is what `test_the_scan_tiles_every_body_exactly_once`
+      gathers and walks.
 
 **At the end.** `redensify_global_ids` runs one more Exscan, over the OWNED
 counts, and renumbers **by slot**:
@@ -1073,7 +1089,8 @@ $$
 which is a dense permutation of $[0,N)$ by construction. Its three steps are
 ordered and **every ordering constraint is silent when violated**:
 
-1. **Reduce first** — the Exscan is what "base + slot" means.
+1. **Scan first** — the exclusive prefix over the holders is what "base + slot"
+   means.
 2. **Exchange before overwriting** — `MFTLRemeshSyncGhostIds` is keyed on the OLD
    id, so the owner must still be holding old ids when it answers. Renumbering
    first makes every request unanswerable, and an unanswerable request is treated
@@ -1298,7 +1315,7 @@ Control flow first; the call tree with the per-step cost follows it.
 
 ```mermaid
 flowchart TD
-  A["MFTLRemeshEnsembleDispersed — the PUBLIC entry, owes its own measurement"] --> A1["prepare_for_migration, MFTLRemeshMeasureBodies — 2 Allreduce"]
+  A["MFTLRemeshEnsembleDispersed — the PUBLIC entry, owes its own measurement"] --> A1["prepare_for_migration, MFTLRemeshMeasureBodies — 2 per-body reductions"]
   A1 --> B["MFTLRemeshEnsembleDispersedMeasured(centroid, radius, weight)"]
   X["MFTLRemeshEnsemble on AUTO — already measured, hands it on"] --> B
   B --> G["GUARDS: the edge-length band, MFTLRemeshParamsAgree"]
@@ -1326,7 +1343,7 @@ flowchart TD
   MG["MFTLRemeshMigrateToRanks — ONE destination for the WHOLE body"] --> MG1["Debug ASSERT: no ghosts anywhere, on any body"]
   MG1 --> SW["per object with tris.n greater than 0: MFTLRemeshObject — the untouched SERIAL entry point"]
   SW --> SW1["MFTLRemeshRenumberGlobalIds — UNCONDITIONAL"]
-  SW1 --> RE["MFTLRemeshAgreeIntMax — ONE Allreduce MAX over 2 N_b + 1 counters"]
+  SW1 --> RE["MFTLEnsembleReduceBodies MAX over 2 counters per LOCAL body, plus 1 scalar"]
   RE --> CL["prepare_for_migration, MFTLRedistribute back to the geometric partition"]
   CL --> CL1["MFTLEnsembleUpdateGlobalCounts, MFTLComputeTriangleGeometry, 1 Allreduce MAX for the profile"]
 ```
@@ -1343,7 +1360,7 @@ MFTLRemeshEnsembleDispersed(ens, params, stats)                  COLLECTIVE
 │   the PUBLIC entry point owes its own measurement; MFTLRemeshEnsemble does not
 │   come through here — it measured once for the strategy choice and hands it on
 │   ├─ prepare_for_migration
-│   └─ MFTLRemeshMeasureBodies                       2 Allreduce
+│   └─ MFTLRemeshMeasureBodies                  2 per-body reductions
 │   ▼
 MFTLRemeshEnsembleDispersedMeasured(ens, params, stats, centroid, radius, weight)
 │
@@ -1385,7 +1402,7 @@ MFTLRemeshEnsembleDispersedMeasured(ens, params, stats, centroid, radius, weight
 │        │      returns immediately, so the loop needs no ownership test
 │        └─ MFTLRemeshRenumberGlobalIds(obj)     UNCONDITIONAL — see below
 │
-├─ 5 ── MFTLRemeshAgreeIntMax(counters, 2*N_b + 1)   ONE Allreduce(MAX)  t_reduce
+├─ 5 ── MFTLEnsembleReduceBodies(counters, 2, MAX) + 1 scalar MAX       t_reduce
 │        {next_vertex_gid, next_triangle_gid} per body, plus the op count
 │        ▸ stats.converged = true, n_phases = 1, n_edges_hidden = 0
 │        ▸ stats.n_ops_busiest_rank  (MAX, not SUM — one rank per body)
@@ -1430,8 +1447,19 @@ this pass must not have modified anything yet — the fallback hands the whole
 ensemble to the spanning driver, and a half-remeshed ensemble entering it would
 carry per-rank id blocks that no Exscan agreed on.
 
-The ordering costs **nothing**: the radii it tests were already reduced for the
-strategy decision, so the check is a loop over replicated data.
+The ordering costs **almost** nothing: the radii it tests were already reduced for
+the strategy decision, so the check is a loop over this rank's own rows plus one
+`Allreduce` of a single int.
+
+@note The count is taken **once per body, not once per holder**. Every holder of a
+      body comes out of the reduction with the same radius, so an unqualified sum
+      over ranks reports a body held by four ranks four times — it printed "4 of 1
+      bodies are wider than a rank box". `MFTLRemeshMeasureBodies` therefore
+      carries a ninth slot, a `MIN` of the contributing rank, i.e. the body's
+      lowest-numbered holder; `lowest_holder[o] == rank` is the licence to count
+      body `o`. It costs one double per local body on a reduction already being
+      taken, and it is the general answer whenever a per-body verdict has to be
+      counted exactly once across the job.
 
 ### Why the ids need almost nothing
 
@@ -1502,7 +1530,7 @@ $4.00 \to 1.25$, $8.00 \to 1.25$, $27.00 \to 1.25$ at $P = 4, 8, 27$, with
 @warning **It costs no collective, and that is a constraint rather than a bonus.**
          The assignment is a pure function of the reduced centroids and the
          per-body triangle counts — which ride the reduction
-         `MFTLRemeshMeasureBodies` already takes, its stride having gone 7 → 8 for
+         `MFTLRemeshMeasureBodies` already takes, its stride having gone 7 → 8 → 9 for
          exactly this — so every rank derives the same answer without
          communicating. #MFTL_OwnerMap is *undefined* if two ranks name different
          destinations for one entity, so every tie-break is total: ranks by id,
@@ -1558,11 +1586,41 @@ Every MPI call the remesher makes is in `remesh_comm.c`:
 |---|---|---|
 | `MFTLRemeshMigrateShifted` | LOR + `MFTLRedistributeWithOwners` | the band |
 | `MFTLRemeshMigrateToRanks` | `MFTLRedistributeWithOwners` | whole bodies |
-| `MFTLRemeshIdReduce` | Exscan + Allreduce, overlapped | $2N_b + 3$ ints |
-| `MFTLRemeshAgreeIntMax` / `AgreeDouble` / `AgreeDoubleMax` | Allreduce | $O(N_b)$ |
-| `MFTLRemeshMeasureBodies` | Allreduce(SUM) + Allreduce(MAX) | $8N_b + N_b$ doubles |
+| `MFTLRemeshSumInts` | Allreduce(SUM) | 3 ints, once per phase |
+| `MFTLRemeshAgreeIntMax` / `AgreeDouble` / `AgreeDoubleMax` | Allreduce | $O(P)$ or $O(1)$, except the balancer's $4B$ |
+| `MFTLRemeshMeasureBodies` | 2 × `MFTLEnsembleReduceBodies` + 1 scalar `MPI_MAX` | $9 + 1$ doubles per **local** body |
 | `MFTLRemeshSyncGhostIds` | request/reply over `comm_graph` | 4 B per ghost vertex |
 | `MFTLRemeshParamsAgree` | Allreduce | Debug only |
+
+Three entries left this table when the ensemble grew a sparse local object list,
+and all three were `O(\text{bodies in the ensemble})` per rank:
+
+- **`MFTLRemeshIdReduce`** — an `MPI_Exscan` plus an `MPI_Allreduce` of $2B$ ints
+  per phase, with the convergence certificate riding along for free. It is now
+  `MFTLEnsembleExscanBodies`, a per-body exclusive prefix sum over that body's
+  **holders** indexed by local slot (`mftl_ensemble.h`), and the certificate pays
+  its own 3-int `Allreduce`. That is the trade: one small latency per phase, to
+  remove an ensemble-sized payload from every phase and $11B + 6$ ints of scratch
+  from every pass.
+- **the dispersed id counters** — `MFTLRemeshAgreeIntMax` over $2B + 1$ ints, now
+  two `MFTLEnsembleReduceBodies` slots per local body plus one scalar.
+- **the explicit owner maps** — not a message at all, which is why it outlived
+  the other two. `migrator_reserve` sized `MFTL_RemeshMigrator.maps` by the id
+  space and keyed it by `global_id`, so every migration cleared and filled two
+  pointers for every body in the *job* on a rank that might hold none of them:
+  16 B per body per rank, four to eight times per remesh. It is now indexed by
+  **local slot**, and so is #MFTL_OwnerMap itself. The argument for the gid key
+  was the wire's — a list position is only an identity while every rank holds
+  every body — and it does not apply, because the map never crosses a rank: the
+  caller fills it walking `ens->local_objects` and `MFTLRedistributeWithOwners`
+  reads it walking the same list in the same order on the same rank.
+
+What did **not** move is the dispersed load balancer's replication
+(`replicate_for_balancer`, one `Allreduce` of $4B$ doubles). Its greedy is over
+rank *loads* and a rank's load sums bodies held anywhere in the job, so it needs
+replicated per-body data as a matter of algorithm rather than of route. It runs
+only when `dispersed_balance_slack > 0`; with the balancer off the driver is
+$O(\text{local} + P)$ end to end.
 
 `test_remeshing_mpi_is_confined` — a **CMake source check**, not a runtime one —
 fails the build if that stops being true, because no runtime test can see it.

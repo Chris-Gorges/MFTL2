@@ -144,6 +144,78 @@ static int test_reorder_is_a_local_operation(void)
   return 0;
 }
 
+/**
+ * The batched publication must produce EXACTLY what the per-body form produces.
+ *
+ * Both halves are checked, and they fail differently. The ID counters are rank
+ * 0's answer BROADCAST, so a wrong batch there leaves non-root ranks numbering
+ * from zero and the collision only surfaces when one of them first creates an
+ * entity -- many timesteps later, as two entities with the same global id. The
+ * global counts are everybody's answer REDUCED, so a wrong batch there is a
+ * wrong denominator in every average that uses it.
+ *
+ * Four bodies of three different sizes, so a fold that mixed up the per-body
+ * slices (an off-by-one in the stride, say) cannot pass by symmetry.
+ */
+static int test_batched_publication_matches_the_per_body_form(void)
+{
+  enum { N = 4 };
+  const int refine[N] = {0, 1, 2, 1};
+
+  int cuts[3] = {g_nproc, 1, 1};
+  double lo[3] = {-4.0, -4.0, -4.0};
+  double hi[3] = {4.0, 4.0, 4.0};
+
+  MFTL_Ensemble *a = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, lo, hi, MFTL_NULL, N);
+  MFTL_Ensemble *b = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, lo, hi, MFTL_NULL, N);
+  TEST_ASSERT(a != MFTL_NULL && b != MFTL_NULL);
+
+  double c[3] = {0.0, 0.0, 0.0};
+
+  // Reference: one Bcast and one Allreduce per body, inside MFTLGenerateSphere.
+  for (int o = 0; o < N; ++o)
+  {
+    MFTL_Object *obj = MFTLObjectCreate(o);
+    MFTLEnsembleAddObject(a, obj);
+    MFTLGenerateSphere(obj, c, 1.0, refine[o]);
+  }
+
+  // Under test: N local builds, then two collectives for the whole list.
+  for (int o = 0; o < N; ++o)
+  {
+    MFTL_Object *obj = MFTLObjectCreate(o);
+    MFTLEnsembleAddObject(b, obj);
+    MFTLGenerateSphereLocal(obj, c, 1.0, refine[o]);
+  }
+  MFTLPublishGeneratedBodies(b);
+
+  int ok = 1;
+  for (int o = 0; o < N; ++o)
+  {
+    const MFTL_Object *x = a->local_objects[o];
+    const MFTL_Object *y = b->local_objects[o];
+
+    ok = ok && (x->next_vertex_gid == y->next_vertex_gid);
+    ok = ok && (x->next_triangle_gid == y->next_triangle_gid);
+    ok = ok && (x->next_halfedge_gid == y->next_halfedge_gid);
+    ok = ok && (x->global_n_vertices == y->global_n_vertices);
+    ok = ok && (x->global_n_triangles == y->global_n_triangles);
+
+    /* Non-vacuity: the counters must be the WHOLE mesh's, not this rank's. Off
+     * rank 0 the pools are empty, so a publication that never happened would
+     * leave zeros here and every equality above would still hold. */
+    ok = ok && (y->global_n_triangles == 20 * (1 << (2 * refine[o])));
+    ok = ok && (y->next_vertex_gid == y->global_n_vertices);
+    ok = ok && (y->next_halfedge_gid == 3 * y->next_triangle_gid);
+  }
+
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+
+  MFTLEnsembleDestroy(&a);
+  MFTLEnsembleDestroy(&b);
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
@@ -169,6 +241,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_global_stats_see_the_whole_mesh_from_every_rank);
   RUN_TEST(test_ensemble_update_tolerates_empty_ranks);
   RUN_TEST(test_reorder_is_a_local_operation);
+  RUN_TEST(test_batched_publication_matches_the_per_body_form);
 
   if (g_rank == 0) TEST_REPORT();
 

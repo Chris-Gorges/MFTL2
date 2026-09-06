@@ -49,6 +49,18 @@
 #include "test_mesh_invariants.h"
 #include "test_utils.h"
 
+/**
+ * @brief Body @p gid as an object, or a shared EMPTY one if this rank holds none.
+ *
+ * A rank holds an MFTL_Object only for the bodies it has entities of, so a
+ * pointer cached before a redistribution -- which every remeshing pass ends with
+ * -- may be dangling after it. Re-resolving through the ensemble's dense view
+ * gives back either the body or a permanently empty stand-in, which is exactly
+ * what a rank holding none of it used to have and so leaves every read below
+ * meaning what it did.
+ */
+static MFTL_Object *body(MFTL_Ensemble *e, int gid) { return MFTLEnsembleAcquireDenseView(e)[gid]; }
+
 static int g_rank = 0;
 static int g_nproc = 1;
 
@@ -169,9 +181,9 @@ static void measure(const MFTL_Ensemble *ens, const MFTL_RemeshParameters *param
 {
   double s[5] = {0, 0, 0, 0, 0};
 
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
+    const MFTL_Object *const obj = ens->local_objects[o];
 
     s[0] += (double) obj->verts.n_local;
     s[1] += (double) obj->tris.n_local;
@@ -220,27 +232,33 @@ static void measure(const MFTL_Ensemble *ens, const MFTL_RemeshParameters *param
 static int count_split_bodies(const MFTL_Ensemble *ens)
 {
   int shares = 0;
-  for (int o = 0; o < ens->num_objects; ++o) shares += (ens->objects[o]->tris.n_local > 0) ? 1 : 0;
+  for (int o = 0; o < ens->n_local_objects; ++o) shares += (ens->local_objects[o]->tris.n_local > 0) ? 1 : 0;
 
   int total = 0;
   MPI_Allreduce(&shares, &total, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-  return total - ens->num_objects;
+
+  /* Minus the number of bodies in the ENSEMBLE, not the number this rank holds:
+   * `total` is a global sum of (body, rank) pairs, so subtracting a local count
+   * would give a different answer on every rank. */
+  return total - ens->n_bodies_global;
 }
 
 /** @brief Puts the ensemble on the grid and gives it current geometry. */
 static int partition(MFTL_Ensemble *ens)
 {
-  for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
   if (MFTLRedistribute(ens) != MFTL_SUCCESS) return 0;
-  for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
   return 1;
 }
 
 static int ensemble_is_sound(const MFTL_Ensemble *ens)
 {
-  for (int o = 0; o < ens->num_objects; ++o)
+  if (!inv_local_directory_is_sound(ens)) return 0;
+
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    if (!inv_partition_is_sound(ens->objects[o], g_rank)) return 0;
+    if (!inv_partition_is_sound(ens->local_objects[o], g_rank)) return 0;
   }
   return 1;
 }
@@ -257,53 +275,62 @@ static int ensemble_is_sound(const MFTL_Ensemble *ens)
  * arrival tables from `next_*_gid`, so a pass that leaves holes grows those
  * tables without bound over a run of constant mesh size.
  */
+/**
+ * @brief Body @p gid as an object, or a shared EMPTY one if this rank holds none.
+ *
+ * A rank holds an MFTL_Object only for the bodies it has entities of, and a
+ * remeshing pass ends in a redistribution -- so `local_objects[b]` is body `b`
+ * only before the first one, and a pointer cached across one may be dangling.
+ */
+static MFTL_Object *bodyv(MFTL_Ensemble *e, int gid) { return MFTLEnsembleAcquireDenseView(e)[gid]; }
+
 static int global_ids_are_dense(const MFTL_Object *obj)
 {
-  const int nv = obj->next_vertex_gid;
-  const int nt = obj->next_triangle_gid;
-  if (nv < 0 || nt < 0) return 0;
+  /* Two things this has to get right now that a rank may hold none of the body.
+   *
+   * The LENGTH is agreed first: `obj` may be the dense view's shared empty, whose
+   * counters are zero, and a locally-sized reduction would then truncate rather
+   * than report the disagreement.
+   *
+   * And nothing returns early. Every exit used to be a bare `return 0`, which on
+   * one rank leaves the others waiting in the Allreduce -- a hang instead of a
+   * failure, which is exactly what the suite's `agreed()` discipline exists to
+   * prevent. The verdict is accumulated and the collective always runs. */
+  int range[2] = {obj->next_vertex_gid, obj->next_triangle_gid};
+  MPI_Allreduce(MPI_IN_PLACE, range, 2, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+
+  const int nv = range[0];
+  const int nt = range[1];
+  if (nv < 0 || nt < 0) return 0;  // agreed on every rank, so returning here is safe
 
   char *const mark = (char *) calloc((size_t) (nv + nt) + 2, 1);
   char *const got = (char *) calloc((size_t) (nv + nt) + 2, 1);
+
+  int ok = 1;
 
   for (int v = 0; v < obj->verts.n_local; ++v)
   {
     const int g = obj->verts.rec[v].global_id;
     if (g < 0 || g >= nv)
-    {
-      free(mark);
-      free(got);
-      return 0;
-    }
-    if (mark[g])  // owned twice: two ranks claim the same id
-    {
-      free(mark);
-      free(got);
-      return 0;
-    }
-    mark[g] = 1;
+      ok = 0;
+    else if (mark[g])  // owned twice: two ranks claim the same id
+      ok = 0;
+    else
+      mark[g] = 1;
   }
   for (int t = 0; t < obj->tris.n_local; ++t)
   {
     const int g = obj->tris.rec[t].global_id;
     if (g < 0 || g >= nt)
-    {
-      free(mark);
-      free(got);
-      return 0;
-    }
-    if (mark[nv + g])
-    {
-      free(mark);
-      free(got);
-      return 0;
-    }
-    mark[nv + g] = 1;
+      ok = 0;
+    else if (mark[nv + g])
+      ok = 0;
+    else
+      mark[nv + g] = 1;
   }
 
   MPI_Allreduce(mark, got, nv + nt, MPI_CHAR, MPI_MAX, MPI_COMM_WORLD);
 
-  int ok = 1;
   for (int i = 0; i < nv + nt; ++i)
   {
     if (!got[i]) ok = 0;
@@ -398,7 +425,7 @@ static int test_a_seam_straddling_droplet_is_not_measured_as_domain_sized(void)
   TEST_ASSERT(agreed(MFTLRemeshEnsembleDispersed(ens, &params, &stats) == MFTL_SUCCESS, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
   TEST_ASSERT(agreed(stats.n_bodies_not_centred == 0, MPI_COMM_WORLD));
-  TEST_ASSERT(agreed(global_ids_are_dense(ens->objects[0]), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(global_ids_are_dense(bodyv(ens, 0)), MPI_COMM_WORLD));
 
   MFTLEnsembleDestroy(&ens);
   return 0;
@@ -440,18 +467,27 @@ static int test_four_split_droplets_are_centred_and_remeshed(void)
 
   /* ── Structure ─────────────────────────────────────────────────────────── */
   TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
-  for (int o = 0; o < ens->num_objects; ++o)
+
+  /* ONE agreed() for the whole ensemble, not one per local object. The loop bound
+   * is now this rank's body count, so an agreed() inside it would make a
+   * rank-dependent number of Allreduces -- a hang, and exactly the failure the
+   * `agreed()` discipline exists to avoid. */
   {
-    TEST_ASSERT(agreed(MFTLCheckMeshIntegrity(ens->objects[o]) == MFTL_SUCCESS, MPI_COMM_WORLD));
+    int sound = 1;
+    for (int o = 0; o < ens->n_local_objects; ++o)
+    {
+      if (MFTLCheckMeshIntegrity(ens->local_objects[o]) != MFTL_SUCCESS) sound = 0;
+    }
+    TEST_ASSERT(agreed(sound, MPI_COMM_WORLD));
   }
 
   /* MFTL_FLAG_FROZEN is the spanning driver's transient state and this driver
    * never sets it. Asserting it anyway is what would catch a future refactor
    * that routed the dispersed path through the gated sweeps and left it behind. */
   int leaked = 0;
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
+    const MFTL_Object *const obj = ens->local_objects[o];
     for (int v = 0; v < obj->verts.n; ++v) leaked += MFTLVertexIsFrozen(obj, v) ? 1 : 0;
     for (int t = 0; t < obj->tris.n; ++t) leaked += MFTLTriangleIsFrozen(obj, t) ? 1 : 0;
   }
@@ -469,10 +505,12 @@ static int test_four_split_droplets_are_centred_and_remeshed(void)
   TEST_ASSERT(agreed(stats.n_phases == 1, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(stats.converged, MPI_COMM_WORLD));
 
-  /* ── Identity ──────────────────────────────────────────────────────────── */
-  for (int o = 0; o < ens->num_objects; ++o)
+  /* ── Identity ──────────────────────────────────────────────────────────────
+   * Over the BODY-ID space, not this rank's list: the check is collective, so
+   * every rank has to run it for the same bodies in the same order. */
+  for (int b = 0; b < ens->n_bodies_global; ++b)
   {
-    TEST_ASSERT(agreed(global_ids_are_dense(ens->objects[o]), MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(global_ids_are_dense(bodyv(ens, b)), MPI_COMM_WORLD));
   }
 
   mesh_measure after;
@@ -482,10 +520,25 @@ static int test_four_split_droplets_are_centred_and_remeshed(void)
    * sees a triangle lost between two ranks or counted twice: both leave a
    * perfectly valid local mesh everywhere and only the GLOBAL count is wrong. */
   const double chi = after.n_vertices - after.n_edges + after.n_triangles;
-  TEST_ASSERT(agreed(fabs(chi - 2.0 * ens->num_objects) < 0.5, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(fabs(chi - 2.0 * ens->n_bodies_global) < 0.5, MPI_COMM_WORLD));
 
+  /* Over every body, and REDUCED. `global_n_triangles` is a property of the whole
+   * body, but only a rank holding some of it carries the value -- the dense
+   * view's stand-in reports zero -- so the per-body maximum over ranks is what
+   * "the ensemble's triangle count" actually is. */
   double global_tris = 0.0;
-  for (int o = 0; o < ens->num_objects; ++o) global_tris += (double) ens->objects[o]->global_n_triangles;
+  {
+    const int nb = ens->n_bodies_global;
+    int *const per_body = (int *) calloc((size_t) MFTL_MAX(nb, 1), sizeof(int));
+    for (int b = 0; b < nb; ++b)
+    {
+      const MFTL_Object *const o = MFTLEnsembleFindLocalObject(ens, b);
+      per_body[b] = o ? o->global_n_triangles : 0;
+    }
+    MPI_Allreduce(MPI_IN_PLACE, per_body, MFTL_MAX(nb, 1), MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    for (int b = 0; b < nb; ++b) global_tris += (double) per_body[b];
+    free(per_body);
+  }
   TEST_ASSERT(agreed(fabs(after.n_triangles - global_tris) < 0.5, MPI_COMM_WORLD));
 
   /* ── Convergence ───────────────────────────────────────────────────────── */
@@ -604,8 +657,8 @@ static int test_a_spanning_body_forced_dispersed_falls_back_cleanly(void)
 
   /* And the answer is right anyway. That is the whole point of the fallback. */
   TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
-  TEST_ASSERT(agreed(MFTLCheckMeshIntegrity(ens->objects[0]) == MFTL_SUCCESS, MPI_COMM_WORLD));
-  TEST_ASSERT(agreed(global_ids_are_dense(ens->objects[0]), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLCheckMeshIntegrity(bodyv(ens, 0)) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(global_ids_are_dense(bodyv(ens, 0)), MPI_COMM_WORLD));
   TEST_ASSERT(agreed(stats.converged, MPI_COMM_WORLD));
 
   mesh_measure after;

@@ -145,12 +145,22 @@ static void make_pair(MFTL_Object **a, MFTL_Object **b, double sep, int refine)
   MFTLGenerateSphere(*b, cb, 1.0, refine);
 }
 
+/**
+ * @brief Body @p gid as an object, or a shared EMPTY one if this rank holds none.
+ *
+ * A rank holds an MFTL_Object only for the bodies it has entities of, so a
+ * pointer cached before a redistribution may be dangling after it. Contact
+ * detection reads bodies through the ensemble's dense view for the same reason,
+ * and so does this test.
+ */
+static MFTL_Object *bodyv(int gid) { return MFTLEnsembleAcquireDenseView(g_ens)[gid]; }
+
 /** @brief The per-timestep preamble every consumer of triangle geometry owes. */
 static void refresh(MFTL_Ensemble *ens)
 {
-  for (int i = 0; i < ens->num_objects; ++i)
+  for (int i = 0; i < ens->n_local_objects; ++i)
   {
-    MFTLComputeTriangleGeometry(ens->objects[i], ens->objects[i]->tris.n);
+    MFTLComputeTriangleGeometry(ens->local_objects[i], ens->local_objects[i]->tris.n);
   }
 }
 
@@ -169,8 +179,8 @@ static MFTL_SpatialHalo *prepare_pair(MFTL_BVH *ba, MFTL_BVH *bb)
   MFTL_SpatialHalo *const halo = MFTLSpatialHaloCreate(g_ens);
   MFTLSpatialHaloResolveRadii(g_ens, halo);
 
-  MFTL_BVHSetGlobalRadius(ba, halo->global_radius[0]);
-  MFTL_BVHSetGlobalRadius(bb, halo->global_radius[1]);
+  MFTL_BVHSetGlobalRadius(ba, MFTLSpatialHaloRadius(halo, 0));
+  MFTL_BVHSetGlobalRadius(bb, MFTLSpatialHaloRadius(halo, 1));
 
   MFTL_SpatialHaloRequest req;
   req.body_a = 0;
@@ -235,6 +245,8 @@ static int test_distributed_contacts_match_the_serial_answer(void)
 
   /* ── Spread the mesh, then ask again ──────────────────────────────────── */
   TEST_ASSERT(agreed(MFTLRedistribute(g_ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  a = bodyv(0);  /* the pointers do not survive a redistribution */
+  b = bodyv(1);
   refresh(g_ens);
 
   MFTL_BVH *const ba = MFTL_GenerateLBVH(a, &p);
@@ -328,6 +340,10 @@ static int test_halo_patch_is_a_valid_object(void)
   refresh(g_ens);
 
   TEST_ASSERT(agreed(MFTLRedistribute(g_ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+
+  a = bodyv(0);  /* the pointers do not survive a redistribution */
+
+  b = bodyv(1);
   refresh(g_ens);
 
   MFTL_BVH *const ba = MFTL_GenerateLBVH(a, &p);
@@ -409,6 +425,10 @@ static int test_tolerance_is_independent_of_the_partition(void)
   refresh(g_ens);
 
   TEST_ASSERT(agreed(MFTLRedistribute(g_ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+
+  a = bodyv(0);  /* the pointers do not survive a redistribution */
+
+  b = bodyv(1);
   refresh(g_ens);
 
   MFTL_BVH *const ba = MFTL_GenerateLBVH(a, &p);
@@ -451,6 +471,10 @@ static int test_separated_bodies_are_silent_and_do_not_hang(void)
   refresh(g_ens);
 
   TEST_ASSERT(agreed(MFTLRedistribute(g_ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+
+  a = bodyv(0);  /* the pointers do not survive a redistribution */
+
+  b = bodyv(1);
   refresh(g_ens);
 
   MFTL_BVH *const ba = MFTL_GenerateLBVH(a, &p);
@@ -492,6 +516,10 @@ static int test_ensemble_pipeline_matches_the_explicit_one(void)
   refresh(g_ens);
 
   TEST_ASSERT(agreed(MFTLRedistribute(g_ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+
+  a = bodyv(0);  /* the pointers do not survive a redistribution */
+
+  b = bodyv(1);
   refresh(g_ens);
 
   int n_explicit = 0;
@@ -544,6 +572,10 @@ static int test_halo_does_not_touch_the_bodies(void)
   refresh(g_ens);
 
   TEST_ASSERT(agreed(MFTLRedistribute(g_ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+
+  a = bodyv(0);  /* the pointers do not survive a redistribution */
+
+  b = bodyv(1);
   refresh(g_ens);
 
   const int va = a->verts.n, ta = a->tris.n, vla = a->verts.n_local, tla = a->tris.n_local;

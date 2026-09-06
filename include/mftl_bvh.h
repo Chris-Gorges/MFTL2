@@ -100,8 +100,9 @@
  *   - only object B's triangles ever travel. MFTLExtendSpatialHalo is
  *     one-directional per ordered pair, which halves what a symmetric exchange
  *     would send;
- *   - `MFTLEnsembleIntersectObjects` iterates j > i, so "A" and "B" are
- *     well-defined and every unordered pair is visited once.
+ *   - a candidate pair carries `body_a < body_b` by BODY ID (MFTL_SpatialHaloPair),
+ *     so "A" and "B" are well-defined, the larger id is the one that travels, and
+ *     every unordered pair is visited once.
  *
  * A serial run satisfies all of this trivially -- everything is owned and there
  * are no remote prims.
@@ -337,11 +338,18 @@ typedef struct MFTL_BVH
    * smaller radius, so the same simulation detects contact later at np = 8 than
    * at np = 1. A physical predicate must not do that.
    *
-   * MFTLSpatialHaloResolveRadii measures it in one MPI_Allreduce over the
-   * body's global extent, covering every body in its request list in a single
-   * collective, and MFTLBVHRefit prefers it whenever it is set. At nproc == 1 it
-   * equals the local radius, so the serial and parallel answers agree by
-   * construction rather than by luck.
+   * MFTLSpatialHaloResolveRadii measures it as a PER-BODY REDUCTION over each
+   * body's holders -- twelve MIN slots per body this rank holds, covering the raw
+   * and half-domain-shifted frames -- and MFTLBVHRefit prefers it whenever it is
+   * set. At nproc == 1 it equals the local radius, so the serial and parallel
+   * answers agree by construction rather than by luck.
+   *
+   * It reaches ONE HOP FURTHER than it reduces: each rank also publishes
+   * `(body id, radius)` to its 26 neighbours, because a rank deciding what to
+   * SEND needs the size of the body it is sending TOWARDS and holds none of it.
+   * One hop is exactly the right distance, since the halo only ever ships along
+   * `comm_graph`. A rank further than that has no radius for the body -- and can
+   * never report a contact with it either, so nothing observable depends on it.
    *
    * A caller using MFTL_GenerateLBVH on its own gets the partition-local radius
    * and should set this itself if that distinction matters to it.
@@ -431,9 +439,11 @@ int MFTL_BVHPrimOwner(const MFTL_BVH *bvh, int p);
  * @note An object with NO local triangles yields a valid EMPTY hierarchy rather
  *       than MFTL_NULL, and that is deliberate. A rank can legitimately hold
  *       part of body A and none of body B while still needing B's triangles from
- *       its neighbours -- there has to be somewhere to put them, and a NULL
- *       return would also make the request list rank-dependent and desynchronise
- *       the collective in MFTLExtendSpatialHalo.
+ *       its neighbours -- there has to be somewhere to put them.
+ *       MFTLEnsembleIntersectObjects relies on exactly that: a body it received a
+ *       patch of but holds nothing of gets a B-side tree over a shared empty
+ *       object, where `n_local_prims == 0` makes every primitive resolve through
+ *       the patch.
  * @note The bounding radius, and therefore the tolerance, is measured over THIS
  *       RANK's primitives. MFTL_BVHSetGlobalRadius replaces it with the body's
  *       global radius; see MFTL_BVH::radius_hint for why that matters.
@@ -596,18 +606,55 @@ typedef void (*IntersectionCallback)(const MFTL_Object *objA, int primA, const M
 void MFTL_IntersectObjects(const MFTL_Object *objA, MFTL_BVH *bvhA, const MFTL_Object *objB, MFTL_BVH *bvhB, IntersectionCallback callback, void *user_data);
 
 /**
- * @brief The whole pipeline for an ensemble: ghost, build, traverse, destroy.
+ * @brief The whole pipeline for an ensemble: measure, ghost, build, traverse, destroy.
  *
- * @param ens      The ensemble. Collective; all ranks, same object list.
+ * ── WHAT IT COSTS, AND WHAT IT NO LONGER COSTS ─────────────────────────────
+ *
+ * `O(bodies this rank holds)` trees and `O(candidate pairs)` traversals. Neither
+ * term is the ensemble's body count, and both used to be:
+ *
+ *   - one hierarchy was built per body in the ENSEMBLE, over a dense view in
+ *     which an absent body was a shared empty object. A rank near ten droplets
+ *     out of a million allocated a million empty hierarchies per timestep;
+ *   - `B*(B-1)/2` ordered requests were enumerated into an array on every rank,
+ *     every call -- 134 million records at 16 384 bodies -- because the request
+ *     list was believed to drive a sequence of collectives and therefore to need
+ *     to be identical everywhere. It does not: see
+ *     MFTLExtendSpatialHaloNearBodies(), which derives the pairs from the body
+ *     extents it already exchanges.
+ *
+ * ── The order, and why each step is where it is ────────────────────────────
+ *
+ *   1. one MFTL_GenerateLBVH per LOCAL body;
+ *   2. MFTLSpatialHaloResolveRadii, then MFTL_BVHSetGlobalRadius -- the envelope
+ *      is a fraction of the body and a body's size is only knowable
+ *      collectively (MFTL_BVH::radius_hint);
+ *   3. MFTLExtendSpatialHaloNearBodies with those envelopes. They go ON THE WIRE,
+ *      which is what lets each rank decide locally whether its body is worth
+ *      sending towards a neighbour's;
+ *   4. MFTL_BVHSetHalo per patched body -- a body this rank holds nothing of but
+ *      received a patch for gets a tree over a shared empty object;
+ *   5. one MFTL_IntersectObjects per candidate pair.
+ *
+ * @param ens      The ensemble. Collective; every rank must call.
  * @param params   Build parameters, MFTL_NULL for the defaults.
  * @param callback Invoked per contacting pair.
  * @param user_data Passed through.
  * @return MFTL_SUCCESS, or MFTL_ERROR on invalid arguments.
  *
- * @note Tests every unordered pair i < j of distinct objects. A single object is
- *       therefore a no-op: self-intersection of one surface is a different
- *       algorithm (adjacent triangles share vertices and always "touch"), and it
- *       is deliberately not what this does.
+ * @note Tests every unordered pair of distinct bodies whose extents are within
+ *       `MAX(tol_A, tol_B)` of each other, with the smaller body id as A. A
+ *       single body is therefore a no-op: self-intersection of one surface is a
+ *       different algorithm (adjacent triangles share vertices and always
+ *       "touch"), and it is deliberately not what this does.
+ * @note The guard is on `n_bodies_global`, never on the local count: everything
+ *       below it is collective, so the test has to be one every rank makes
+ *       identically.
+ * @note A contact between two bodies whose holders are more than one cell apart
+ *       is NOT found. The halo only ships along `comm_graph`, so nothing can
+ *       deliver B to a rank that far from it. That is the same reach the per-body
+ *       reduction's holder route assumes and the distributed remesher dispatches
+ *       on, and it has no diagnostic.
  * @note Collective.
  */
 int MFTLEnsembleIntersectObjects(MFTL_Ensemble *ens, const MFTL_BVHBuildParams *params, IntersectionCallback callback, void *user_data);

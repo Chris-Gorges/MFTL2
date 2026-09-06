@@ -194,12 +194,12 @@ static int generate_icosahedron(MFTL_Object *object)
   return MFTLBuildIndexedMesh(object, positions, 12, tri_verts, 20);
 }
 
-int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int refinements)
+int MFTLGenerateSphereLocal(MFTL_Object *object, double center[3], double radius, int refinements)
 {
   MFTL_ASSERT(object != MFTL_NULL);
-  MFTL_ASSERT(object->domain != MFTL_NULL && "MFTLGenerateSphere: object has no domain -- add it to an ensemble first");
-  MFTL_ASSERT(radius >= 0.0 && "MFTLGenerateSphere: radius must not be negative");
-  MFTL_ASSERT(refinements >= 0 && "MFTLGenerateSphere: refinements must not be negative");
+  MFTL_ASSERT(object->domain != MFTL_NULL && "MFTLGenerateSphereLocal: object has no domain -- add it to an ensemble first");
+  MFTL_ASSERT(radius >= 0.0 && "MFTLGenerateSphereLocal: radius must not be negative");
+  MFTL_ASSERT(refinements >= 0 && "MFTLGenerateSphereLocal: refinements must not be negative");
 
   if (object == MFTL_NULL || object->domain == MFTL_NULL || center == MFTL_NULL) return MFTL_ERROR;
   if (radius < 0.0 || refinements < 0) return MFTL_ERROR;
@@ -211,8 +211,7 @@ int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int
    *
    * Generation is inherently serial and cheap next to a timestep, so it is not
    * worth partitioning: redistribution spreads the result afterwards, and it has
-   * to run anyway. The only collective content here is the three ID counters and
-   * the global-count reduction, which is O(1) messages. */
+   * to run anyway. */
   if (domain->rank == 0)
   {
     rc = generate_icosahedron(object);
@@ -241,7 +240,7 @@ int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int
        * that branches on it behaves identically on closed and open surfaces
        * without having to ask which it was handed. */
       const int n_boundary = MFTLMarkMeshBoundary(object);
-      MFTL_ASSERT(n_boundary == 0 && "MFTLGenerateSphere: the generated sphere is not closed");
+      MFTL_ASSERT(n_boundary == 0 && "MFTLGenerateSphereLocal: the generated sphere is not closed");
       (void) n_boundary;
     }
   }
@@ -253,17 +252,123 @@ int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int
     MFTLObjectBuildDerived(object);
   }
 
-  /* Every rank continues the same numbering scheme, so a rank that later
-   * receives entities or creates new ones does not collide with rank 0's IDs.
-   * One broadcast of three ints -- fused, because three separate Bcasts would be
-   * three latencies for twelve bytes. */
-  int gids[3] = {object->next_vertex_gid, object->next_triangle_gid, object->next_halfedge_gid};
-  MPI_Bcast(gids, 3, MPI_INT, 0, domain->comm_world);
-  object->next_vertex_gid = gids[0];
-  object->next_triangle_gid = gids[1];
-  object->next_halfedge_gid = gids[2];
+  return rc;
+}
 
-  MFTLObjectUpdateGlobalStats(object);
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Publication: the collective half, and why it is a separate call
+ *
+ * A generator produces two pieces of cross-rank state per body -- the three ID
+ * counters, which every rank must continue from so a later arrival cannot
+ * collide with rank 0's ids, and the global entity counts. Both used to be
+ * settled inside MFTLGenerateSphere(), which put ONE MPI_Bcast and ONE
+ * MPI_Allreduce on the critical path PER BODY, in strict sequence, on the one
+ * rank doing all the building.
+ *
+ * That is O(bodies) latencies for O(bodies) *bytes*. At a thousand droplets it
+ * is two thousand collectives before the first timestep; in a weak-scaling sweep
+ * the body count grows with the rank count, so it is two million at a million
+ * bodies -- setup time that grows linearly with P while the timed loop does not.
+ *
+ * Batched it is TWO collectives for the whole ensemble whatever the body count.
+ * The payload is 3 ints per body broadcast and 2 ints per body reduced, which is
+ * still O(bodies) of volume; that is the honest remaining cost and it is the
+ * shape a message SHOULD have. Latency in series is the shape it should not.
+ *
+ * ── WHAT THIS MACHINE CAN AND CANNOT SHOW ─────────────────────────────────
+ *
+ * On the development laptop the change measures NOTHING, and that is worth
+ * recording rather than quietly omitting: at 512 bodies, np = 4, setup is
+ * 0.0119-0.0131 s batched against 0.0136-0.0142 s per body, and at 2048 bodies
+ * the two are indistinguishable (0.029-0.032 s either way). Four ranks on one
+ * node put every collective in shared memory, where a Bcast of twelve bytes
+ * costs about what the surrounding loop iteration does, and setup is dominated
+ * by rank 0 actually subdividing the icospheres.
+ *
+ * So this is a MESSAGE-COUNT change justified structurally, not a measured
+ * speed-up. The count is what stops being free on a real network: 2N collectives
+ * in strict sequence at even 5 us each is 20 ms at 2048 bodies and 10 s at a
+ * million, none of it overlappable, all of it on the critical path before the
+ * first timestep. Re-measure on the cluster before quoting a number.
+ *
+ * The two halves stay separate operations rather than one fused reduction on
+ * purpose. The counters are rank 0's answer and are BROADCAST; the counts are
+ * everybody's answer and are REDUCED. Folding them into one MPI_SUM would give
+ * the same numbers only while every non-root object is empty -- which is this
+ * generator's precondition, not a property of the publication step, and a caller
+ * that publishes a body some other rank already holds would get silently wrong
+ * counters instead of a merely redundant broadcast.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Settles the ID counters and global counts of @p n bodies in two collectives.
+ *
+ * @param domain  The MPI world. All of @p objects must share it.
+ * @param objects [n] bodies to publish, in the same order on every rank.
+ * @param n       Bodies. Zero is a no-op, but every rank must still call.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on an allocation-free invalid argument.
+ */
+static int publish_bodies(MFTL_Domain *domain, MFTL_Object *const *objects, int n)
+{
+  if (domain == MFTL_NULL || (n > 0 && objects == MFTL_NULL)) return MFTL_ERROR;
+  if (n <= 0) return MFTL_SUCCESS;
+
+  /* One allocation, two slices: [3n counters | 2n local counts | 2n global]. */
+  int *const buf = (int *) MFTLMallocOrDie((size_t) (7 * n) * sizeof(int), "generated body publication");
+  int *const gids = buf;
+  int *const local_counts = buf + 3 * n;
+  int *const global_counts = buf + 5 * n;
+
+  for (int o = 0; o < n; ++o)
+  {
+    const MFTL_Object *const obj = objects[o];
+    MFTL_ASSERT(obj != MFTL_NULL);
+    gids[3 * o + 0] = obj->next_vertex_gid;
+    gids[3 * o + 1] = obj->next_triangle_gid;
+    gids[3 * o + 2] = obj->next_halfedge_gid;
+
+    /* Ownership is a prefix, so the local counts ARE the answer -- no scan over
+     * the entities testing a flag, which is what an `is_ghost` field would need. */
+    local_counts[2 * o + 0] = obj->tris.n_local;
+    local_counts[2 * o + 1] = obj->verts.n_local;
+  }
+
+  MPI_Bcast(gids, 3 * n, MPI_INT, 0, domain->comm_world);
+  MPI_Allreduce(local_counts, global_counts, 2 * n, MPI_INT, MPI_SUM, domain->comm_world);
+
+  for (int o = 0; o < n; ++o)
+  {
+    MFTL_Object *const obj = objects[o];
+    obj->next_vertex_gid = gids[3 * o + 0];
+    obj->next_triangle_gid = gids[3 * o + 1];
+    obj->next_halfedge_gid = gids[3 * o + 2];
+
+    obj->global_n_triangles = global_counts[2 * o + 0];
+    obj->global_n_vertices = global_counts[2 * o + 1];
+  }
+
+  free(buf);
+  return MFTL_SUCCESS;
+}
+
+int MFTLPublishGeneratedBodies(MFTL_Ensemble *ens)
+{
+  MFTL_ASSERT(ens != MFTL_NULL);
+  if (ens == MFTL_NULL) return MFTL_ERROR;
+
+  return publish_bodies(&ens->domain, ens->local_objects, ens->n_local_objects);
+}
+
+int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int refinements)
+{
+  const int rc = MFTLGenerateSphereLocal(object, center, radius, refinements);
+  if (rc == MFTL_ERROR && (object == MFTL_NULL || object->domain == MFTL_NULL)) return rc;
+
+  /* One body, so this is the Bcast and the Allreduce the old body of this
+   * function made inline. Generating MANY bodies should call
+   * MFTLGenerateSphereLocal() in a loop and MFTLPublishGeneratedBodies() once. */
+  MFTL_Object *one = object;
+  (void) publish_bodies(object->domain, &one, 1);
 
   return rc;
 }

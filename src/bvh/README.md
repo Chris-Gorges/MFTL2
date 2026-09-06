@@ -32,23 +32,22 @@ not free — every arrow below is a dependency, not a preference:
 
 ```mermaid
 flowchart TD
-  E["MFTLEnsembleIntersectObjects — collective"] --> N{"num_objects >= 2?"}
+  E["MFTLEnsembleIntersectObjects — collective"] --> N{"n_bodies_global >= 2?"}
   N -->|no| Z["MFTL_SUCCESS, nothing can collide"]
-  N -->|yes| G["MFTL_GenerateLBVH for every body"]
+  N -->|yes| G["MFTL_GenerateLBVH for every body THIS RANK HOLDS"]
   G --> H["MFTLSpatialHaloCreate"]
-  H --> R["MFTLSpatialHaloResolveRadii — one Allreduce, GLOBAL radius per body"]
+  H --> R["MFTLSpatialHaloResolveRadii — per-body reduction over the HOLDERS"]
   R --> S["MFTL_BVHSetGlobalRadius — refit, envelope no longer depends on nproc"]
-  S --> Q["request list: every pair i before j, margin = the larger tolerance"]
-  Q --> X["MFTLExtendSpatialHalo — ONE collective for the whole ensemble"]
+  S --> X["MFTLExtendSpatialHaloNearBodies — extents out, patches AND pairs back"]
   X --> P["MFTL_BVHSetHalo — REBUILD each tree over local plus received prims"]
-  P --> L["for every pair i before j: MFTL_IntersectObjects"]
+  P --> L["for every pair the BROAD PHASE kept: MFTL_IntersectObjects"]
   L --> D["MFTL_DestroyBVH, MFTLSpatialHaloDestroy"]
 ```
 
-Three orderings in that graph are load-bearing:
+Four things in that graph are load-bearing:
 
-- **The radii come before the request list.** The margin is a *fraction of the
-  body*, and a body's size is only knowable collectively. Using this rank's share
+- **The radii come before the exchange.** The margin is a *fraction of the body*,
+  and a body's size is only knowable collectively. Using this rank's share
   instead would make the separation at which contact is detected a function of
   the process count — see `MFTL_BVH::radius_hint`.
 - **One halo exchange, not one per pair.** Two collectives serve the whole
@@ -56,19 +55,35 @@ Three orderings in that graph are load-bearing:
   replaces ran a full neighbour `alltoall` **per object pair**, so 500 droplets
   meant 124 750 rounds of collectives per timestep before a single triangle
   moved.
+- **The pairs come OUT of the exchange, not into it.** See the note below.
 - **`MFTL_BVHSetHalo` rebuilds; it does not append.** The Morton order, the tree
   and the fit are all functions of the *full* primitive set, so leaves cannot be
   bolted onto a tree built over the local half — the sorted order the leaves
   address would no longer be sorted. See @ref bvh_setphalo.
 
-@note **Every pair goes into the request list, unconditionally.**
-      `MFTLExtendSpatialHalo` is collective and derives its sequence of
-      collectives from that list, so the list may depend only on the object list
-      — which every rank holds in the same order — and never on what this rank
-      happens to hold geometrically. That is also why `MFTL_GenerateLBVH` returns
-      an **empty hierarchy** for an empty partition rather than `MFTL_NULL`: a
-      `NULL` here would make the list rank-dependent and hang the ranks that
-      still had work.
+@note **There is no all-pairs request list, and the reason there used to be one
+      was wrong.** The list was `B*(B-1)/2` ordered pairs built on every rank
+      every call — 134 million records and two gigabytes at 16 384 bodies —
+      justified by "`MFTLExtendSpatialHalo` derives its sequence of collectives
+      from the list, so the list must be identical on every rank". It does not:
+      the halo's collectives are one neighbourhood allgatherv of body extents and
+      one of payload, and neither's *count* depends on the requests. A request
+      only ever says what THIS rank is willing to send.
+      `MFTLExtendSpatialHaloNearBodies` therefore derives the pairs from the
+      extents it already exchanges, with a uniform grid over them, and returns
+      them in `halo->pair`. Measured on six well-separated touching couples (6 of
+      66 pairs real): **6 / 6 / 9 / 18 / 6 candidate pairs over all ranks at
+      np = 1 / 2 / 4 / 8 / 27**, against 66 / 132 / 264 / 528 / 1782.
+
+@note **The trees are built for the bodies this rank HOLDS, plus one per arriving
+      patch.** The version that built one per body in the ensemble had a rank near
+      ten droplets out of a million allocating a million empty hierarchies per
+      timestep. A body this rank holds nothing of but received a patch for still
+      needs a B-side tree, and gets one over a shared empty object:
+      `n_local_prims` is zero, so every primitive resolves through the patch and
+      the object is never read. That is also the last reason `MFTL_GenerateLBVH`
+      returns an **empty hierarchy** rather than `MFTL_NULL` for an empty
+      partition.
 
 ### The same pipeline as a call tree {#bvh_ensembletree}
 
@@ -79,41 +94,50 @@ step costs and whether it communicates. `◆` marks a decision, the same convent
 ```
 MFTLEnsembleIntersectObjects(ens, params, callback, user_data)   COLLECTIVE
 │
-├─◆ ens->num_objects < 2 ?
+├─◆ ens->n_bodies_global < 2 ?
 │    └─ yes ─▶ return MFTL_SUCCESS — one body cannot collide with another
+│       ◆ the GLOBAL count. Everything below is collective, so the guard has
+│         to be a statement every rank makes identically; the local count is
+│         not one, and returning early on it strands the ranks that held two
 │
-├─ 1 ── ONE TREE PER BODY ────────────────────────────────────────────────────
-│   └─ for each body:  MFTL_GenerateLBVH(obj, params)                   local
+├─ 1 ── ONE TREE PER BODY THIS RANK HOLDS ────────────────────────────────────
+│   └─ for each LOCAL body:  MFTL_GenerateLBVH(obj, params)             local
 │        └─ MFTLBVHBuildFromPrims                                       local
 │             ├─ centroids ▸ MFTL_BVHPrimVerts   gathered current corners O(n)
 │             ├─ MFTLMorton3D ▸ MFTLSortPairs64  stable radix sort      O(n)
 │             ├─ build_topology                  recursive radix split  O(n)
 │             └─ MFTLBVHRefit                    three linear passes    O(nodes)
-│      ◆ an EMPTY partition yields an EMPTY hierarchy, never NULL — a NULL
-│        would make the request list below rank-dependent, and hang the
-│        ranks that still had work
+│      ◆ O(local bodies), not O(bodies in the ensemble)
+│      ◆ an EMPTY partition yields an EMPTY hierarchy, never NULL — a body
+│        held nowhere locally but PATCHED still needs a B-side tree
 │
 ├─ 2 ── THE BODY SCALES, BEFORE ANYTHING USES A MARGIN ───────────────────────
 │   ├─ MFTLSpatialHaloCreate(ens)                                       local
-│   ├─ MFTLSpatialHaloResolveRadii(ens, halo)       1 Allreduce    COLLECTIVE
-│   └─ for each body: MFTL_BVHSetGlobalRadius(bvh, halo->global_radius[i])
+│   ├─ MFTLSpatialHaloResolveRadii(ens, halo)                      COLLECTIVE
+│   │    ├─ MFTLEnsembleReduceBodies, 12 MIN slots per LOCAL body
+│   │    └─ (gid, radius) allgatherv to the 26 neighbours — a rank deciding
+│   │       what to SEND needs the size of what it sends TOWARDS
+│   └─ for each local body: MFTL_BVHSetGlobalRadius(bvh, Radius(halo, gid))
 │        └─ MFTLBVHRefit        only the boxes move; tree and order are kept
 │
 ├─ 3 ── ONE HALO EXCHANGE FOR THE WHOLE ENSEMBLE ─────────────────────────────
-│   ├─ request list: every pair i < j, margin = MAX(tol_i, tol_j)
-│   │    ◆ the list must be IDENTICAL on every rank, so it may depend only
-│   │      on the object list — never on what this rank holds geometrically
-│   │    ◆ the margin matches what the traversal will test the pair against;
-│   │      fetching less loses contacts at the rank boundary and nowhere else
-│   └─ MFTLExtendSpatialHalo(ens, reqs, n_req, halo)               COLLECTIVE
+│   └─ MFTLExtendSpatialHaloNearBodies(ens, tol, halo)             COLLECTIVE
+│        ├─ publish (gid, centre, half, radius, envelope) per HELD body
+│        ├─ uniform grid over the arrivals ▸ candidate partners   O(bodies)
+│        ├─ pack, exchange, rebuild one patch per arriving body
+│        └─ halo->pair: every (A < B) with A held here and B visible here
+│           ◆ the envelope goes ON THE WIRE, and that is what removes the
+│             O(bodies^2) request array the caller used to build
 │
 ├─ 4 ── ATTACH THE PATCHES, WHICH REBUILDS ───────────────────────────────────
-│   └─ for each body: MFTL_BVHSetHalo(bvh, MFTLSpatialHaloPatch(halo, i))
-│        └─ MFTLBVHBuildFromPrims over local AND received prims         local
-│           ◆ a rebuild, not an append — see §1, "Attaching the halo"
+│   └─ for each DIRECTORY entry: MFTL_BVHSetHalo(bvh, halo->patch[e])
+│        ├─ a patched body this rank holds nothing of gets a tree over a
+│        │  shared EMPTY object: n_local_prims == 0, so every prim is halo
+│        └─ MFTL_BVHSetGlobalRadius LAST — a patch is the only handle on such
+│           a body, so its radius arrives with it
 │
 ├─ 5 ── THE QUERY ───────────────────────────────────────────────────────────
-│   └─ for i, for j > i:  MFTL_IntersectObjects(objA, bvhA, objB, bvhB)  local
+│   └─ for each halo->pair:  MFTL_IntersectObjects(objA, bvhA, objB, bvhB) local
 │        ├─ tolerance = MAX(tol_A, tol_B)
 │        ├─◆ for each periodic image of B: root-AABB test        <= 27 images
 │        └─ traverse_image  ─▶  batch_add  ─▶  flush_batch
@@ -681,10 +705,13 @@ descended.
 - The traversal **skips any leaf pair whose A side is remote** — one compare,
   `pa >= n_local_a`, against a value already in a register and hoisted out of the
   inner loop.
-- `MFTLEnsembleIntersectObjects` iterates $j > i$, so "A" and "B" are well
-  defined and every unordered pair is visited exactly once. Body $j$ is B for
-  every pair $(i,j)$ with $i<j$, which is why attaching every body's patch is
-  correct.
+- `MFTL_SpatialHaloPair` carries `body_a < body_b` by BODY ID, so "A" and "B" are
+  well defined and every unordered pair is visited exactly once. The larger id is
+  the one that travels, which is what makes attaching every directory entry's
+  patch correct, and the list is deduplicated before it is returned — a pair can
+  be found twice, once because both bodies are local and once because a patch of
+  the larger one also arrived, and traversing it twice would report every contact
+  in it twice.
 
 Get it wrong in one direction and cross-rank contacts are missed; wrong in the
 other and every cross-rank contact force is applied twice.

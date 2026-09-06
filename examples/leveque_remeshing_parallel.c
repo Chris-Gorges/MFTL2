@@ -61,6 +61,8 @@
  *     -dt step      timestep                          (default 0.02)
  *     -steps N      stop after N steps                (default: all of T)
  *     -strategy S   auto | spanning | dispersed       (default spanning)
+ *     -verify       exit non-zero if the enclosed volume, the winding or the
+ *                   Euler characteristic moved. Registered as a CTest at np = 2
  *     -feature DEG  feature angle, >=180 disables     (default 180)
  *     -every N      remesh every N steps              (default 1)
  *     -quiet        final summary only
@@ -179,9 +181,9 @@ static void measure(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, rep
   double s[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   double min_q = 1.0;
 
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    MFTL_Object *const obj = ens->objects[o];
+    MFTL_Object *const obj = ens->local_objects[o];
     if (obj->tris.n == 0) continue;
 
     MFTLComputeVertexNormals(obj);
@@ -276,14 +278,19 @@ static uint64_t mesh_digest(const MFTL_Ensemble *ens)
 {
   uint64_t local = 0;
 
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
+    const MFTL_Object *const obj = ens->local_objects[o];
 
     for (int v = 0; v < obj->verts.n_local; ++v)
     {
       uint64_t h = (uint64_t) (uint32_t) obj->verts.rec[v].global_id * 0x9E3779B97F4A7C15ull;
-      h ^= (uint64_t) (uint32_t) o * 0xC2B2AE3D27D4EB4Full;
+      /* The BODY ID, not the list slot `o`. A rank holds a sparse subset of the
+       * ensemble, so a slot names a different body on every rank and a digest
+       * keyed on it would differ between two runs that produced the identical
+       * mesh. With one body the two agree, which is why the recorded digests are
+       * unchanged. */
+      h ^= (uint64_t) (uint32_t) obj->global_id * 0xC2B2AE3D27D4EB4Full;
 
       for (int k = 0; k < 3; ++k)
       {
@@ -355,6 +362,7 @@ int main(int argc, char *argv[])
   int phase_budget = 0;
   int smooth_iterations = 3;
   MFTL_RemeshParallelStrategy strategy = MFTL_REMESH_PARALLEL_SPANNING;
+  bool verify = MFTL_FALSE;
 
   for (int i = 1; i < argc; ++i)
   {
@@ -372,6 +380,8 @@ int main(int argc, char *argv[])
       feature_angle = atof(argv[++i]);
     else if (!strcmp(argv[i], "-quiet"))
       quiet = MFTL_TRUE;
+    else if (!strcmp(argv[i], "-verify"))
+      verify = MFTL_TRUE;
     else if (!strcmp(argv[i], "-digest"))
       want_digest = MFTL_TRUE;
     else if (!strcmp(argv[i], "-vtu"))
@@ -439,7 +449,7 @@ int main(int argc, char *argv[])
 
   MFTLComputeTriangleGeometry(obj, obj->tris.n);
   if (MFTLRedistribute(ens) != MFTL_SUCCESS) MPI_Abort(MPI_COMM_WORLD, 1);
-  for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
   MFTLEnsembleUpdateGlobalCounts(ens);
 
   report r0;
@@ -490,7 +500,15 @@ int main(int argc, char *argv[])
   for (double t = 0.0; t < T - 0.5 * dt; t += dt)
   {
     double a = now();
-    advect(obj, t, dt, T);
+    /* THE LOCAL LIST, RE-READ EVERY STEP, not the pointer MFTLObjectCreate
+     * returned. A redistribution destroys the object of a body a rank keeps
+     * nothing of and creates one for a body arriving, so `obj` above is valid
+     * only until the opening MFTLRedistribute -- and advecting through it leaves
+     * this rank's real share of the sphere standing still while the other rank's
+     * moves. The surface then loses volume every step with every structural
+     * invariant intact, which is exactly how invisible this failure is: at
+     * np = 1 nothing is ever destroyed and the same code is correct. */
+    for (int o = 0; o < ens->n_local_objects; ++o) advect(ens->local_objects[o], t, dt, T);
     t_advect += now() - a;
 
     /* The ghost sync is NOT optional and it is not an optimisation. A triangle's
@@ -503,7 +521,7 @@ int main(int argc, char *argv[])
     t_ghost += now() - a;
 
     a = now();
-    for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+    for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
     t_geom += now() - a;
 
     MFTL_RemeshStats st;
@@ -537,7 +555,7 @@ int main(int argc, char *argv[])
        * be re-decided -- the mesh moved. */
       a = now();
       if (MFTLRedistribute(ens) != MFTL_SUCCESS) MPI_Abort(MPI_COMM_WORLD, 1);
-      for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+      for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
       t_remesh += now() - a;
     }
 
@@ -617,8 +635,41 @@ int main(int argc, char *argv[])
     printf("==============================================\n");
   }
 
+  /* ── --verify: the example guards itself ─────────────────────────────────
+   *
+   * A benchmark whose whole purpose is to report timings has to be right before
+   * its numbers mean anything, and this one has a failure mode that no library
+   * test can see: the CALLER holding an MFTL_Object* across a redistribution.
+   * That pointer is invalidated -- a rank keeping nothing of a body destroys its
+   * object and one receiving a body creates a new one -- so advecting through it
+   * leaves part of the surface standing still. Every structural invariant holds,
+   * the mesh stays a valid closed sphere with good triangles, and the ENCLOSED
+   * VOLUME is the only thing that moves.
+   *
+   * It is also invisible at np = 1, where nothing is ever destroyed. So the
+   * check is registered at np = 2, and the threshold is loose on purpose: over
+   * twelve steps the correct answer loses well under a percent, and the bug this
+   * exists for lost 93 %.
+   */
+  int failed = 0;
+  if (verify)
+  {
+    const double v_ratio = rf.volume / r0.volume;
+    const double a_ratio = rf.area / r0.area;
+
+    if (!(v_ratio > 0.95 && v_ratio < 1.05)) failed = 1;
+    if (rf.n_inverted != 0.0) failed = 1;
+    if (rf.n_vert - rf.n_edge + rf.n_tri != 2.0) failed = 1;
+
+    if (rank == 0)
+    {
+      printf("VERIFY: V/V0 %.6f  A/A0 %.6f  inverted %.0f  Euler %.0f  -> %s\n", v_ratio, a_ratio, rf.n_inverted, rf.n_vert - rf.n_edge + rf.n_tri,
+             failed ? "FAILED" : "ok");
+    }
+  }
+
   MFTLEnsembleDestroy(&ens);
   MFTLFreeMpiTypes();
   MPI_Finalize();
-  return 0;
+  return failed;
 }

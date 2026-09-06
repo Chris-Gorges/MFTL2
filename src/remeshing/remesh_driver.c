@@ -217,9 +217,9 @@ double MFTLEnsembleMeanEdgeLength(MFTL_Ensemble *ens)
 
   double acc[2] = {0.0, 0.0};
 
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
+    const MFTL_Object *const obj = ens->local_objects[o];
     const int n_he = 3 * obj->tris.n;
 
     for (int h = 0; h < n_he; ++h)
@@ -370,21 +370,21 @@ int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, 
     /* AUTO measures the bodies to decide, and the dispersed driver needs exactly
      * the same measurement to route them -- so it is taken ONCE here and handed
      * on. Doing it the obvious way (choose, then call the public driver) makes
-     * the pass pay four Allreduces where two do, two of them carrying
-     * 7*num_objects doubles that the first caller then discards. */
-    const int n_bodies = ens->num_objects;
-    if (n_bodies < 1) return MFTLRemeshEnsembleParallel(ens, params, stats);
+     * the pass pay four per-body reductions where two do, and the first caller
+     * then discards the centroids the second one recomputes.
+     *
+     * GLOBAL body count for the guard: everything below is collective. The
+     * measurement itself is indexed by LOCAL SLOT -- see MFTL_RemeshMeasurement. */
+    if (ens->n_bodies_global < 1) return MFTLRemeshEnsembleParallel(ens, params, stats);
 
-    double *const measure = (double *) MFTLMallocOrDie((size_t) (5 * n_bodies) * sizeof(double), "remesh strategy measurement");
-    double *const centroid = measure;
-    double *const radius = measure + 3 * n_bodies;
-    double *const weight = measure + 4 * n_bodies;
+    MFTL_RemeshMeasurement measure;
+    MFTLRemeshMeasurementInit(&measure, ens);
 
-    strategy = MFTLRemeshChooseStrategyMeasured(ens, params, centroid, radius, weight);
+    strategy = MFTLRemeshChooseStrategyMeasured(ens, params, &measure);
 
-    const int rc = (strategy == MFTL_REMESH_PARALLEL_DISPERSED) ? MFTLRemeshEnsembleDispersedMeasured(ens, params, stats, centroid, radius, weight)
+    const int rc = (strategy == MFTL_REMESH_PARALLEL_DISPERSED) ? MFTLRemeshEnsembleDispersedMeasured(ens, params, stats, &measure)
                                                                 : MFTLRemeshEnsembleParallel(ens, params, stats);
-    free(measure);
+    MFTLRemeshMeasurementFree(&measure);
     return rc;
   }
 
@@ -406,12 +406,12 @@ int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, 
 
   int status = MFTL_SUCCESS;
 
-  for (int i = 0; i < ens->num_objects; ++i)
+  for (int i = 0; i < ens->n_local_objects; ++i)
   {
     MFTL_RemeshStats one;
     memset(&one, 0, sizeof(one));
 
-    if (MFTLRemeshObject(ens->objects[i], params, &one) != MFTL_SUCCESS) status = MFTL_ERROR;
+    if (MFTLRemeshObject(ens->local_objects[i], params, &one) != MFTL_SUCCESS) status = MFTL_ERROR;
 
     if (!stats) continue;
 

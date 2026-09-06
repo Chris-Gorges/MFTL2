@@ -152,7 +152,7 @@ static double g_body_centre[8][3];
 static MFTL_Object *add_sphere(MFTL_Ensemble *ens, int id, double cx, double cy, double cz, double r, int refine)
 {
   MFTL_Object *obj = MFTLObjectCreate(id);
-  const int slot = ens->num_objects;
+  const int slot = ens->n_local_objects;
   MFTLEnsembleAddObject(ens, obj);
 
   double centre[3] = {cx, cy, cz};
@@ -195,6 +195,18 @@ static void standard_params(MFTL_RemeshParameters *p, double target)
  * ─────────────────────────────────────────────────────────────────────────── */
 
 /** @brief Does this rank own the right to count the undirected edge at @p h? */
+/**
+ * @brief Body @p gid as an object, or a shared EMPTY one if this rank holds none.
+ *
+ * A rank holds an MFTL_Object only for the bodies it has entities of, so a
+ * pointer cached before a redistribution -- which every remeshing pass ends with
+ * -- may be dangling after it. Re-resolving through the ensemble's dense view
+ * gives back either the body or a permanently empty stand-in, which is exactly
+ * what a rank holding none of it used to have and so leaves every read below
+ * meaning what it did.
+ */
+static MFTL_Object *body(MFTL_Ensemble *e, int gid) { return MFTLEnsembleAcquireDenseView(e)[gid]; }
+
 static int counts_this_edge(const MFTL_Object *obj, int h)
 {
   const int t = MFTLHeTriIdx(h);
@@ -240,9 +252,9 @@ static void measure(const MFTL_Ensemble *ens, const MFTL_RemeshParameters *param
   double lo = MFTL_DBL_MAX;
   double hi = 0.0;
 
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
+    const MFTL_Object *const obj = ens->local_objects[o];
 
     sums[0] += (double) obj->verts.n_local;
     sums[1] += (double) obj->tris.n_local;
@@ -306,19 +318,21 @@ static void measure(const MFTL_Ensemble *ens, const MFTL_RemeshParameters *param
 /** @brief Puts the ensemble on the grid and gives it current geometry. */
 static int partition(MFTL_Ensemble *ens)
 {
-  for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
 
   if (MFTLRedistribute(ens) != MFTL_SUCCESS) return 0;
 
-  for (int o = 0; o < ens->num_objects; ++o) MFTLComputeTriangleGeometry(ens->objects[o], ens->objects[o]->tris.n);
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
   return 1;
 }
 
 static int ensemble_is_sound(const MFTL_Ensemble *ens)
 {
-  for (int o = 0; o < ens->num_objects; ++o)
+  if (!inv_local_directory_is_sound(ens)) return 0;
+
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    if (!inv_partition_is_sound(ens->objects[o], g_rank)) return 0;
+    if (!inv_partition_is_sound(ens->local_objects[o], g_rank)) return 0;
   }
   return 1;
 }
@@ -343,9 +357,9 @@ static int partition_matches_canonical_planes(const MFTL_Ensemble *ens)
   const MFTL_Domain *const dom = &ens->domain;
   if (dom->nproc < 2) return 1;
 
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
+    const MFTL_Object *const obj = ens->local_objects[o];
 
     for (int v = 0; v < obj->verts.n_local; ++v)
     {
@@ -410,8 +424,15 @@ static int partition_matches_canonical_planes(const MFTL_Ensemble *ens)
  */
 static int frozen_matches_replication(const MFTL_Object *obj)
 {
-  const int nv = obj->next_vertex_gid;
-  const int nt = obj->next_triangle_gid;
+  /* The LENGTHS are agreed first. `obj` may be the dense view's shared empty on a
+   * rank holding none of this body, and that one reports zero counters -- sizing
+   * the reduction from it locally gives two ranks two different message lengths,
+   * which MPI reports as a truncation rather than as the disagreement it is. */
+  int range[2] = {obj->next_vertex_gid, obj->next_triangle_gid};
+  MPI_Allreduce(MPI_IN_PLACE, range, 2, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+
+  const int nv = range[0];
+  const int nt = range[1];
   const int n = MFTL_MAX(MFTL_MAX(nv, nt), 1);
 
   char *const held_v = (char *) calloc((size_t) n, 1);
@@ -480,6 +501,7 @@ static int test_frozen_is_exactly_the_replicated_set(void)
 
   MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
   TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
   MFTLRemeshMarkFrozen(obj);
 
@@ -523,6 +545,7 @@ static int test_dilation_only_grows_the_band(void)
 
   MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
   TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
   MFTLRemeshMarkFrozen(obj);
 
@@ -581,6 +604,7 @@ static int test_compaction_restores_the_ownership_prefix(void)
 
   MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
   TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
   MFTLRemeshMarkFrozen(obj);
 
@@ -681,15 +705,15 @@ static int test_compaction_restores_the_ownership_prefix(void)
 static int ghosts_agree_with_owners(MFTL_Ensemble *ens)
 {
   int n_ghost = 0;
-  for (int o = 0; o < ens->num_objects; ++o) n_ghost += ens->objects[o]->verts.n - ens->objects[o]->verts.n_local;
+  for (int o = 0; o < ens->n_local_objects; ++o) n_ghost += ens->local_objects[o]->verts.n - ens->local_objects[o]->verts.n_local;
 
   double *const snapshot = (double *) malloc((size_t) MFTL_MAX(3 * n_ghost, 1) * sizeof(double));
   if (!snapshot) return 0;
 
   int k = 0;
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
+    const MFTL_Object *const obj = ens->local_objects[o];
     for (int v = obj->verts.n_local; v < obj->verts.n; ++v)
     {
       snapshot[3 * k + 0] = obj->verts.pos[3 * v + 0];
@@ -702,9 +726,9 @@ static int ghosts_agree_with_owners(MFTL_Ensemble *ens)
   int ok = (MFTLUpdateGhostPositions(ens) == MFTL_SUCCESS);
 
   k = 0;
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
+    const MFTL_Object *const obj = ens->local_objects[o];
     for (int v = obj->verts.n_local; v < obj->verts.n; ++v)
     {
       for (int c = 0; c < 3; ++c)
@@ -734,8 +758,14 @@ static int ghosts_agree_with_owners(MFTL_Ensemble *ens)
  */
 static int global_ids_are_dense(const MFTL_Object *obj)
 {
-  const int nv = obj->next_vertex_gid;
-  const int nt = obj->next_triangle_gid;
+  /* Lengths agreed first, for the same reason as in frozen_matches_replication:
+   * the dense view's shared empty reports zero counters, and a locally-sized
+   * reduction then truncates instead of reporting a disagreement. */
+  int range[2] = {obj->next_vertex_gid, obj->next_triangle_gid};
+  MPI_Allreduce(MPI_IN_PLACE, range, 2, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+
+  const int nv = range[0];
+  const int nt = range[1];
   const int n = MFTL_MAX(MFTL_MAX(nv, nt), 1);
 
   int *const mine = (int *) calloc((size_t) n, sizeof(int));
@@ -749,7 +779,7 @@ static int global_ids_are_dense(const MFTL_Object *obj)
 
   int ok = 1;
 
-  if (obj->next_halfedge_gid != 3 * nt) ok = 0;
+  if (obj->tris.n > 0 && obj->next_halfedge_gid != 3 * nt) ok = 0;
 
   for (int t = 0; t < obj->tris.n_local; ++t)
   {
@@ -810,6 +840,7 @@ static int remesh_and_check(bool periodic, double target, double cx)
 
   MFTL_Object *obj = add_sphere(ens, 0, cx, 0.0, 0.0, 0.7, 3);
   TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
   MFTL_RemeshParameters params;
   standard_params(&params, target);
@@ -824,6 +855,7 @@ static int remesh_and_check(bool periodic, double target, double cx)
 
   MFTL_RemeshStats stats;
   TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &params, &stats) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
   /* ── Structure ─────────────────────────────────────────────────────────── */
   TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
@@ -858,8 +890,16 @@ static int remesh_and_check(bool periodic, double target, double cx)
    * wrong. */
   const double chi = after.n_vertices - after.n_edges + after.n_triangles;
   TEST_ASSERT(agreed(fabs(chi - 2.0) < 0.5, MPI_COMM_WORLD));
-  TEST_ASSERT(agreed(fabs(after.n_vertices - (double) obj->global_n_vertices) < 0.5, MPI_COMM_WORLD));
-  TEST_ASSERT(agreed(fabs(after.n_triangles - (double) obj->global_n_triangles) < 0.5, MPI_COMM_WORLD));
+
+  /* Reduced: `global_n_*` describes the whole body, but only a rank holding some
+   * of it carries the value -- the dense view's stand-in reports zero. At 27
+   * ranks a single sphere legitimately misses several of them. */
+  {
+    int g[2] = {obj->global_n_vertices, obj->global_n_triangles};
+    MPI_Allreduce(MPI_IN_PLACE, g, 2, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+    TEST_ASSERT(fabs(after.n_vertices - (double) g[0]) < 0.5);
+    TEST_ASSERT(fabs(after.n_triangles - (double) g[1]) < 0.5);
+  }
 
   /* ── Convergence ───────────────────────────────────────────────────────── */
 
@@ -956,6 +996,7 @@ static int test_a_permanently_frozen_band_is_not_certified(void)
 
   MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 2);
   TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
   MFTL_RemeshParameters params;
   standard_params(&params, 0.40);
@@ -989,6 +1030,7 @@ static int test_a_permanently_frozen_band_is_not_certified(void)
 
   MFTL_RemeshStats stats;
   TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &params, &stats) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
   /* The mesh is still perfect. This is the half of the contract that must hold
    * whatever the bands did. */
@@ -1080,12 +1122,23 @@ static int test_two_bodies_keep_separate_id_spaces(void)
   MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE);
   TEST_ASSERT(ens != MFTL_NULL);
 
-  MFTL_Object *a = add_sphere(ens, 0, -0.45, 0.0, 0.0, 0.35, 2);
-  MFTL_Object *b = add_sphere(ens, 1, 0.45, 0.0, 0.0, 0.30, 2);
+  add_sphere(ens, 0, -0.45, 0.0, 0.0, 0.35, 2);
+  add_sphere(ens, 1, 0.45, 0.0, 0.0, 0.30, 2);
   TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
 
-  const int a_before = a->global_n_triangles;
-  const int b_before = b->global_n_triangles;
+  /* Re-resolved after the partition, and by BODY ID: a rank holds an object only
+   * for the bodies it has entities of, and these two are small enough that at
+   * eight ranks most ranks hold one of them or neither. */
+  MFTL_Object *a = body(ens, 0);
+  MFTL_Object *b = body(ens, 1);
+
+  /* Reduced, because `global_n_triangles` is a property of the whole body and a
+   * rank holding none of it reads the dense view's empty stand-in, which reports
+   * zero. Same for every comparison against these below. */
+  int before[2] = {a->global_n_triangles, b->global_n_triangles};
+  MPI_Allreduce(MPI_IN_PLACE, before, 2, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+  const int a_before = before[0];
+  const int b_before = before[1];
 
   MFTL_RemeshParameters params;
   /* Well below both spheres' generated edge length (~0.10 at refine 2), so both
@@ -1096,20 +1149,26 @@ static int test_two_bodies_keep_separate_id_spaces(void)
   MFTL_RemeshStats stats;
   TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &params, &stats) == MFTL_SUCCESS, MPI_COMM_WORLD));
 
+  a = body(ens, 0);  /* the pass ends in a redistribution; the pointers do not survive it */
+  b = body(ens, 1);
+
   TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
   TEST_ASSERT(agreed(global_ids_are_dense(a), MPI_COMM_WORLD));
   TEST_ASSERT(agreed(global_ids_are_dense(b), MPI_COMM_WORLD));
   TEST_ASSERT(agreed(ghosts_agree_with_owners(ens), MPI_COMM_WORLD));
 
+  int after[2] = {a->global_n_triangles, b->global_n_triangles};
+  MPI_Allreduce(MPI_IN_PLACE, after, 2, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+
   /* Both bodies must have been remeshed -- an id-space bug that left one of them
    * untouched, or merged the two, would pass every check above. */
-  TEST_ASSERT(agreed(a->global_n_triangles > a_before, MPI_COMM_WORLD));
-  TEST_ASSERT(agreed(b->global_n_triangles > b_before, MPI_COMM_WORLD));
+  TEST_ASSERT(after[0] > a_before);
+  TEST_ASSERT(after[1] > b_before);
 
   /* The two bodies stay two bodies. Their id spaces are independent, so the
    * larger sphere must end up with more triangles -- a merge would give both the
    * same count. */
-  TEST_ASSERT(agreed(a->global_n_triangles > b->global_n_triangles, MPI_COMM_WORLD));
+  TEST_ASSERT(after[0] > after[1]);
 
   MFTLEnsembleDestroy(&ens);
   return 0;
@@ -1176,9 +1235,9 @@ static void edge_histogram(const MFTL_Ensemble *ens, double target, MPI_Comm com
   double local[HIST_BINS];
   for (int b = 0; b < HIST_BINS; ++b) local[b] = 0.0;
 
-  for (int o = 0; o < ens->num_objects; ++o)
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    const MFTL_Object *const obj = ens->objects[o];
+    const MFTL_Object *const obj = ens->local_objects[o];
     for (int h = 0; h < 3 * obj->tris.n; ++h)
     {
       if (!counts_this_edge(obj, h)) continue;
@@ -1381,6 +1440,7 @@ static int test_the_edge_length_band_is_a_collective_measurement(void)
 
   const double before_scatter = MFTLEnsembleMeanEdgeLength(ens);
   TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
   /* 1. The collective form is PARTITION-INDEPENDENT and equals the whole-mesh
    *    answer. Both halves matter: equal to the reference says it measures the
@@ -1416,7 +1476,9 @@ static int test_the_edge_length_band_is_a_collective_measurement(void)
 
   MFTL_RemeshStats st;
   TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &bad, &st) == MFTL_ERROR, MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
   TEST_ASSERT(agreed(MFTLRemeshEnsembleDispersed(ens, &bad, &st) == MFTL_ERROR, MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
   /* Refused means UNTOUCHED, not half-done. A driver that rejected the band
    * after its first migration would leave the mesh somewhere else entirely. */
@@ -1443,17 +1505,25 @@ static int test_a_second_pass_is_stable(void)
 
   MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
   TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
   MFTL_RemeshParameters params;
   standard_params(&params, 0.06);
 
   MFTL_RemeshStats first, second;
   TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &params, &first) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
-  const int n_after_first = obj->global_n_triangles;
-  const int gid_range_after_first = obj->next_vertex_gid;
+  /* Reduced, here and below: `global_n_*` and the id counters describe the whole
+   * body, and a rank holding none of it reads the dense view's stand-in, which
+   * reports zero. At 27 ranks a single sphere misses several of them. */
+  int st1[2] = {obj->global_n_triangles, obj->next_vertex_gid};
+  MPI_Allreduce(MPI_IN_PLACE, st1, 2, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+  const int n_after_first = st1[0];
+  const int gid_range_after_first = st1[1];
 
   TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &params, &second) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
   TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
   TEST_ASSERT(agreed(global_ids_are_dense(obj), MPI_COMM_WORLD));
@@ -1462,14 +1532,17 @@ static int test_a_second_pass_is_stable(void)
 
   /* An already-converged mesh must not keep growing: the second pass should
    * change the triangle count by a few percent, not by tens. */
-  const double drift = fabs((double) (obj->global_n_triangles - n_after_first)) / (double) n_after_first;
-  TEST_ASSERT(agreed(drift < 0.15, MPI_COMM_WORLD));
+  int st2[3] = {obj->global_n_triangles, obj->next_vertex_gid, obj->global_n_vertices};
+  MPI_Allreduce(MPI_IN_PLACE, st2, 3, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+
+  const double drift = fabs((double) (st2[0] - n_after_first)) / (double) n_after_first;
+  TEST_ASSERT(drift < 0.15);
 
   /* Density is what keeps the id RANGE proportional to the mesh, and the range
    * is what sizes redistribution's arrival table. A range growing faster than
    * the mesh is deferred issue 15 coming back. */
-  TEST_ASSERT(agreed(obj->next_vertex_gid < gid_range_after_first * 2, MPI_COMM_WORLD));
-  TEST_ASSERT(agreed(obj->next_vertex_gid == obj->global_n_vertices, MPI_COMM_WORLD));
+  TEST_ASSERT(st2[1] < gid_range_after_first * 2);
+  TEST_ASSERT(st2[1] == st2[2]);
 
   MFTLEnsembleDestroy(&ens);
   return 0;
@@ -1514,6 +1587,7 @@ static int test_a_coarsened_pass_rescues_a_partition_that_is_too_fine(void)
 
   MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 2);
   TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
   MFTL_RemeshParameters params;
   standard_params(&params, 0.40);
@@ -1525,6 +1599,7 @@ static int test_a_coarsened_pass_rescues_a_partition_that_is_too_fine(void)
 
   MFTL_RemeshStats stats;
   TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &params, &stats) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
   /* NON-VACUITY 1: the factors were not {1,1,1}. */
   TEST_ASSERT(agreed(stats.n_coarse_groups > 1, MPI_COMM_WORLD));
@@ -1565,6 +1640,7 @@ static int test_a_coarsened_pass_rescues_a_partition_that_is_too_fine(void)
 
   MFTL_RemeshStats plain_stats;
   TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(plain, &plain_params, &plain_stats) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
   TEST_ASSERT(agreed(!(plain_stats.converged && plain_stats.n_edges_hidden == 0), MPI_COMM_WORLD));
 
   /* And it is CHEAPER, not merely more correct: the uncoarsened run spends its
@@ -1610,6 +1686,7 @@ static int test_the_budget_is_honoured_exactly(void)
 
     MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
     TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+    obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
     MFTL_RemeshParameters params;
     standard_params(&params, 0.06);
@@ -1617,6 +1694,7 @@ static int test_the_budget_is_honoured_exactly(void)
 
     MFTL_RemeshStats stats;
     TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &params, &stats) == MFTL_SUCCESS, MPI_COMM_WORLD));
+    obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
     TEST_ASSERT(agreed(stats.n_phases >= 1 && stats.n_phases <= budgets[b], MPI_COMM_WORLD));
     TEST_ASSERT(agreed(stats.n_migrations + stats.n_migrations_skipped == stats.n_phases + 1, MPI_COMM_WORLD));
@@ -1696,6 +1774,7 @@ static int test_two_passes_are_bit_identical(void)
 
     MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
     TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+    obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
     MFTL_RemeshParameters params;
     standard_params(&params, 0.06);
@@ -1703,6 +1782,7 @@ static int test_two_passes_are_bit_identical(void)
 
     MFTL_RemeshStats stats;
     TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &params, &stats) == MFTL_SUCCESS, MPI_COMM_WORLD));
+    obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
     digest[run] = mesh_digest(obj);
     MFTLEnsembleDestroy(&ens);
@@ -1743,6 +1823,7 @@ static int test_only_the_distinct_placements_are_visited(void)
   MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
   (void) obj;
   TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
   int expected = 1;
   for (int k = 0; k < 3; ++k)
@@ -1754,6 +1835,7 @@ static int test_only_the_distinct_placements_are_visited(void)
 
   MFTL_RemeshStats stats;
   TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &params, &stats) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
   TEST_ASSERT(agreed(stats.n_distinct_placements == expected, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(stats.n_distinct_placements >= 1 && stats.n_distinct_placements <= MFTL_REMESH_NUM_PHASES, MPI_COMM_WORLD));
@@ -1810,6 +1892,7 @@ static int test_the_fallback_stays_off_on_a_healthy_partition(void)
 
     MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
     TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+    obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
     /* Target 0.10 on a refine-3 sphere: the mesh is near its target, so the band
      * is small against the rank box on every grid this suite runs. Measured
@@ -1828,6 +1911,7 @@ static int test_the_fallback_stays_off_on_a_healthy_partition(void)
     }
 
     TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &params, &stats[armed]) == MFTL_SUCCESS, MPI_COMM_WORLD));
+    obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
     digest[armed] = mesh_digest(obj);
     MFTLEnsembleDestroy(&ens);
@@ -1892,6 +1976,7 @@ static int test_a_frozen_majority_triggers_the_fallback(void)
 
   MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
   TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
   MFTL_RemeshParameters params;
   standard_params(&params, 0.10);
@@ -1905,6 +1990,7 @@ static int test_a_frozen_majority_triggers_the_fallback(void)
 
   MFTL_RemeshStats stats;
   TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &params, &stats) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
   /* ── THE CLAIM: it fired, and the correctness trigger did not ──────────── */
   TEST_ASSERT(agreed((stats.coarsen_trigger & MFTL_REMESH_COARSEN_FROZEN) != 0, MPI_COMM_WORLD));
@@ -1927,7 +2013,7 @@ static int test_a_frozen_majority_triggers_the_fallback(void)
   TEST_ASSERT(agreed(MFTLCheckMeshIntegrity(obj) == MFTL_SUCCESS, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(ghosts_agree_with_owners(ens), MPI_COMM_WORLD));
   TEST_ASSERT(agreed(partition_matches_canonical_planes(ens), MPI_COMM_WORLD));
-  TEST_ASSERT(agreed(global_ids_are_dense(ens->objects[0]), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(global_ids_are_dense(body(ens, 0)), MPI_COMM_WORLD));
 
   mesh_measure after;
   measure(ens, &params, &after);
@@ -1986,6 +2072,7 @@ static int test_a_gathered_pass_matches_the_distributed_answer(void)
 
     MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
     TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+    obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
     /* 0.06 on a refine-3 sphere, so the pass REFINES 1280 -> about 3800. At the
      * mesh's own resolution both runs would return it unchanged and the
@@ -2007,6 +2094,7 @@ static int test_a_gathered_pass_matches_the_distributed_answer(void)
     }
 
     TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &params, &stats[gather]) == MFTL_SUCCESS, MPI_COMM_WORLD));
+    obj = body(ens, 0);  /* the pointer does not survive a repartition */
 
     /* The postconditions are the driver's, gathered or not -- in particular the
      * partition that comes back is the canonical one, because the closing

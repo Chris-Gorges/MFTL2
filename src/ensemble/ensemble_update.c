@@ -39,10 +39,11 @@
 /**
  * @name Reduction slot counts
  *
- * Per object, kept in one contiguous block so that the whole ensemble's
- * statistics are THREE `MPI_Allreduce` calls -- one per operator -- rather than
- * three per object. At \f$B\f$ bodies that is 3 collectives instead of
- * \f$3B\f$, and the message is \f$11B\f$ doubles either way.
+ * The eleven values one body contributes, kept in one contiguous record so that
+ * the whole ensemble's statistics are ONE call to MFTLEnsembleReduceBodies()
+ * rather than one per body. Mixing the three operators inside one record is what
+ * lets the holder route send a single message; see the banner above
+ * unpack_slot().
  * @{
  */
 /** @brief MIN slots per object: area, quality, squared edge length. */
@@ -51,6 +52,8 @@
 #define MFTL_UPD_N_MAX 3
 /** @brief SUM slots per object: area, quality, squared edge length, triangle count, edge count. */
 #define MFTL_UPD_N_SUM 5
+/** @brief Slots in one body's reduction record: the three groups, laid out MIN, MAX, SUM. */
+#define MFTL_UPD_N_SLOTS (MFTL_UPD_N_MIN + MFTL_UPD_N_MAX + MFTL_UPD_N_SUM)
 /** @} */
 
 /**
@@ -180,110 +183,152 @@ static void update_kernel(MFTL_Object *obj, int n_tris, update_accumulators *acc
   acc->sum_esq = sum_esq;
 }
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * The statistics are PER BODY, and the reduction is over that body's HOLDERS
+ *
+ * Eleven doubles per body, every timestep. An ensemble-wide aggregate would be
+ * eleven doubles full stop, and it is the wrong answer: per-body quality is what
+ * a solver reads to decide whether THIS droplet needs remeshing. A single number
+ * over every triangle of every body cannot answer that -- one degenerating
+ * interface among a thousand healthy ones moves the ensemble minimum and nothing
+ * else, so the caller learns that something is wrong and not which body it is.
+ *
+ * So the payload stays per body. What does NOT have to stay is the set of ranks
+ * each body's eleven doubles are reduced over, and that is where this used to
+ * cost: three MPI_Allreduce calls over comm_world on a buffer indexed by BODY ID,
+ * on every rank, whether or not it held any of that body. The message COUNT was 3
+ * regardless of the body count, which is the property that made it look fine --
+ * but the VOLUME and the staging memory were both O(bodies in the ensemble) per
+ * rank, and in a weak-scaling sweep the body count grows with the rank count.
+ *
+ * Only the holders of a body have anything to contribute to it, so the reduction
+ * goes through MFTLEnsembleReduceBodies(), whose buffer is indexed by LOCAL SLOT
+ * and whose collective is a neighbourhood one whenever every body's holders fit
+ * inside one 26-neighbourhood. Three consequences worth stating:
+ *
+ *   - the eleven slots carry THREE DIFFERENT OPERATORS and that is now free. A
+ *     neighbourhood exchange combines in local memory, so mixing min, max and sum
+ *     costs one message rather than three; the comm_world fallback still needs
+ *     one Allreduce per operator, which is exactly what this used to be.
+ *   - the identity fill moved inside the reduction. It used to be O(bodies) of
+ *     DBL_MAX on every rank so that a body it did not hold contributed nothing to
+ *     a minimum; on the holder route no such slot exists to fill.
+ *   - a rank holding no bodies still enters every collective, and the guard below
+ *     therefore reads n_bodies_global rather than the local count.
+ * ════════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Turns one reduced slot into the nine public statistics.
+ *
+ * @param[out] qs  Destination.
+ * @param      mn  MFTL_UPD_N_MIN reduced minima for this body.
+ * @param      mx  MFTL_UPD_N_MAX reduced maxima for this body.
+ * @param      sm  MFTL_UPD_N_SUM reduced sums for this body.
+ */
+static void unpack_slot(MFTL_ObjectQualityStatistics *qs, const double *mn, const double *mx, const double *sm)
+{
+  const double n_tris_g = sm[3];
+  const double n_edges_g = sm[4];
+
+  /* Averages against the GLOBAL counts, never an average of per-rank averages:
+   * ranks hold wildly different triangle counts and the two differ. */
+  qs->avg_triangle_area = (n_tris_g > 0.0) ? sm[0] / n_tris_g : 0.0;
+  qs->avg_aspect_ratio = (n_tris_g > 0.0) ? sm[1] / n_tris_g : 0.0;
+  qs->avg_edge_length_sq = (n_edges_g > 0.0) ? sm[2] / n_edges_g : 0.0;
+
+  /* A body with no triangles anywhere leaves the identities in place; zero them
+   * so a caller does not read DBL_MAX as a measurement. */
+  const bool empty = (n_tris_g <= 0.0);
+  qs->min_triangle_area = empty ? 0.0 : mn[0];
+  qs->max_triangle_area = empty ? 0.0 : mx[0];
+  qs->min_aspect_ratio = empty ? 0.0 : mn[1];
+  qs->max_aspect_ratio = empty ? 0.0 : mx[1];
+  qs->min_edge_length_sq = empty ? 0.0 : mn[2];
+  qs->max_edge_length_sq = empty ? 0.0 : mx[2];
+}
+
 void MFTLEnsembleUpdate(MFTL_Ensemble *ensemble)
 {
   MFTL_ASSERT(ensemble != MFTL_NULL);
-  if (ensemble == MFTL_NULL || ensemble->num_objects == 0) return;
+  if (ensemble == MFTL_NULL) return;
 
-  const int n_obj = ensemble->num_objects;
+  /* GLOBAL, not local. A collective follows, so the guard has to be a number
+   * every rank agrees about: returning on the local body count would have a rank
+   * holding nothing skip a reduction the others are inside. */
+  if (ensemble->n_bodies_global == 0) return;
 
-  /* One allocation for six logical arrays. Layout:
-   *   [ local_min | local_max | local_sum | global_min | global_max | global_sum ]
-   * so each reduction reads one contiguous range and writes another. */
-  const size_t block = (size_t) n_obj * (MFTL_UPD_N_MIN + MFTL_UPD_N_MAX + MFTL_UPD_N_SUM);
-  double *buf = (double *) MFTLMallocOrDie(2 * block * sizeof(double), "MFTLEnsembleUpdate accumulators");
+  const int n_local = ensemble->n_local_objects;
 
-  double *const local_min = buf;
-  double *const local_max = local_min + (size_t) n_obj * MFTL_UPD_N_MIN;
-  double *const local_sum = local_max + (size_t) n_obj * MFTL_UPD_N_MAX;
-  double *const global_min = local_sum + (size_t) n_obj * MFTL_UPD_N_SUM;
-  double *const global_max = global_min + (size_t) n_obj * MFTL_UPD_N_MIN;
-  double *const global_sum = global_max + (size_t) n_obj * MFTL_UPD_N_MAX;
+  /* One record per LOCAL body, eleven slots wide:
+   *
+   *   [0..2]  MIN  area, quality, squared edge length
+   *   [3..5]  MAX  the same three
+   *   [6..10] SUM  area, quality, squared edge length, triangle count, edge count
+   *
+   * Indexed by this rank's slot, not by body id, which is the entire scaling
+   * argument -- see the banner above unpack_slot(). */
+  static const MFTL_BodyReduceOp ops[MFTL_UPD_N_SLOTS] = {
+      MFTL_BODY_REDUCE_MIN, MFTL_BODY_REDUCE_MIN, MFTL_BODY_REDUCE_MIN, MFTL_BODY_REDUCE_MAX, MFTL_BODY_REDUCE_MAX, MFTL_BODY_REDUCE_MAX,
+      MFTL_BODY_REDUCE_SUM, MFTL_BODY_REDUCE_SUM, MFTL_BODY_REDUCE_SUM, MFTL_BODY_REDUCE_SUM, MFTL_BODY_REDUCE_SUM};
 
-  /* ── The hot loop, once per object ─────────────────────────────────────── */
-  for (int o = 0; o < n_obj; ++o)
+  double *const rows =
+      (double *) MFTLMallocOrDie((size_t) MFTL_MAX(n_local * MFTL_UPD_N_SLOTS, 1) * sizeof(double), "MFTLEnsembleUpdate accumulators");
+
+  /* ── The hot loop, once per LOCAL object ───────────────────────────────── */
+  for (int o = 0; o < n_local; ++o)
   {
-    MFTL_Object *obj = ensemble->objects[o];
+    MFTL_Object *obj = ensemble->local_objects[o];
     MFTL_ASSERT(obj != MFTL_NULL);
 
     const int n_tris = obj->tris.n_local;
 
-    /* Identities for MIN and MAX, so a rank holding none of this object
-     * contributes nothing to the reduction rather than a zero that would win
-     * every minimum. */
     update_accumulators acc = {MFTL_DBL_MAX, -MFTL_DBL_MAX, 0.0, MFTL_DBL_MAX, -MFTL_DBL_MAX, 0.0, MFTL_DBL_MAX, -MFTL_DBL_MAX, 0.0};
 
+    /* A body with no owned triangles here keeps the kernel's identities, so it
+     * contributes nothing to its own reduction rather than a zero that would win
+     * every minimum. There is no longer a slot for a body this rank does not
+     * hold at all -- that is the point -- so this is the only such case left. */
     if (n_tris > 0) update_kernel(obj, n_tris, &acc);
 
-    local_min[o * MFTL_UPD_N_MIN + 0] = acc.min_area;
-    local_min[o * MFTL_UPD_N_MIN + 1] = acc.min_q;
-    local_min[o * MFTL_UPD_N_MIN + 2] = acc.min_esq;
-
-    local_max[o * MFTL_UPD_N_MAX + 0] = acc.max_area;
-    local_max[o * MFTL_UPD_N_MAX + 1] = acc.max_q;
-    local_max[o * MFTL_UPD_N_MAX + 2] = acc.max_esq;
-
-    local_sum[o * MFTL_UPD_N_SUM + 0] = acc.sum_area;
-    local_sum[o * MFTL_UPD_N_SUM + 1] = acc.sum_q;
-    local_sum[o * MFTL_UPD_N_SUM + 2] = acc.sum_esq;
-    local_sum[o * MFTL_UPD_N_SUM + 3] = (double) n_tris;
-    local_sum[o * MFTL_UPD_N_SUM + 4] = (double) (3 * n_tris); /* edges visited */
+    double *const r = &rows[(size_t) o * MFTL_UPD_N_SLOTS];
+    r[0] = acc.min_area;
+    r[1] = acc.min_q;
+    r[2] = acc.min_esq;
+    r[3] = acc.max_area;
+    r[4] = acc.max_q;
+    r[5] = acc.max_esq;
+    r[6] = acc.sum_area;
+    r[7] = acc.sum_q;
+    r[8] = acc.sum_esq;
+    r[9] = (double) n_tris;
+    r[10] = (double) (3 * n_tris); /* edges visited */
   }
 
-  /* ── Three reductions, issued together ──────────────────────────────────
+  /* ── One reduction, over each body's holders ─────────────────────────────
    *
-   * Every object of the ensemble is inside each of them, so the MESSAGE COUNT is
-   * 3 whether the ensemble holds one droplet or ten thousand. That is the number
-   * that decides how this scales; the volume (11 doubles per object) is
-   * negligible next to the latency at any realistic P.
+   * BLOCKING, and there is nothing left to overlap it with: the loop above is
+   * what produces the values, and the unpack below consumes them. The three
+   * MPI_Iallreduce calls this replaces were non-blocking for a reason that no
+   * longer applies -- they were three independent comm_world reductions whose
+   * latencies would otherwise have been in series. Mixing the operators is free
+   * on the holder route because it combines in local memory, so there is one
+   * message rather than three; the comm_world fallback inside still issues one
+   * Iallreduce per operator and waits on them together, which is the old
+   * behaviour exactly.
    *
-   * Non-blocking, and that is the whole point of this block. The three
-   * reductions are independent -- different operators
-   * over disjoint buffers -- so issuing them back to back as blocking calls puts
-   * three O(log P) latencies in series for no reason. MPI_Iallreduce lets the
-   * progress engine pipeline them, so the cost tends towards one collective's
-   * latency rather than three. At P = 8 that is not measurable; at P = 10k, where
-   * an Allreduce is tens of microseconds and this runs every timestep, it is the
-   * difference between 3x and 1x that cost.
-   *
-   * There is deliberately no attempt to overlap them with the geometry loop
-   * itself: the loop is what produces the values being reduced, so the only
-   * available overlap would be per-object (start object o's reduction while
-   * computing object o+1), and that trades the message count -- the thing that
-   * actually scales -- for a little latency hiding. Wrong trade. */
-  MPI_Comm comm = ensemble->domain.comm_world;
-  MPI_Request reqs[3];
-  MPI_Iallreduce(local_min, global_min, n_obj * MFTL_UPD_N_MIN, MPI_DOUBLE, MPI_MIN, comm, &reqs[0]);
-  MPI_Iallreduce(local_max, global_max, n_obj * MFTL_UPD_N_MAX, MPI_DOUBLE, MPI_MAX, comm, &reqs[1]);
-  MPI_Iallreduce(local_sum, global_sum, n_obj * MFTL_UPD_N_SUM, MPI_DOUBLE, MPI_SUM, comm, &reqs[2]);
-  MPI_Waitall(3, reqs, MPI_STATUSES_IGNORE);
+   * There is deliberately no attempt to overlap it with the geometry loop
+   * itself: the only available overlap would be per body (start body o's
+   * reduction while computing body o+1), and that trades the message count --
+   * the thing that actually scales -- for a little latency hiding. Wrong trade. */
+  MFTLEnsembleReduceBodies(ensemble, rows, MFTL_UPD_N_SLOTS, ops, MFTL_BODY_REDUCE_SCOPE_AUTO);
 
-  /* ── Unpack ─────────────────────────────────────────────────────────────── */
-  for (int o = 0; o < n_obj; ++o)
+  for (int o = 0; o < n_local; ++o)
   {
-    const double n_tris_g = global_sum[o * MFTL_UPD_N_SUM + 3];
-    const double n_edges_g = global_sum[o * MFTL_UPD_N_SUM + 4];
-
-    MFTL_ObjectQualityStatistics *qs = &ensemble->objects[o]->quality;
-
-    /* Averages against the GLOBAL counts, never an average of per-rank averages:
-     * ranks hold wildly different triangle counts and the two differ. */
-    qs->avg_triangle_area = (n_tris_g > 0.0) ? global_sum[o * MFTL_UPD_N_SUM + 0] / n_tris_g : 0.0;
-    qs->avg_aspect_ratio = (n_tris_g > 0.0) ? global_sum[o * MFTL_UPD_N_SUM + 1] / n_tris_g : 0.0;
-    qs->avg_edge_length_sq = (n_edges_g > 0.0) ? global_sum[o * MFTL_UPD_N_SUM + 2] / n_edges_g : 0.0;
-
-    /* An object with no triangles anywhere leaves the identities in place; zero
-     * them so a caller does not read DBL_MAX as a measurement. */
-    const bool empty = (n_tris_g <= 0.0);
-    qs->min_triangle_area = empty ? 0.0 : global_min[o * MFTL_UPD_N_MIN + 0];
-    qs->max_triangle_area = empty ? 0.0 : global_max[o * MFTL_UPD_N_MAX + 0];
-    qs->min_aspect_ratio = empty ? 0.0 : global_min[o * MFTL_UPD_N_MIN + 1];
-    qs->max_aspect_ratio = empty ? 0.0 : global_max[o * MFTL_UPD_N_MAX + 1];
-    qs->min_edge_length_sq = empty ? 0.0 : global_min[o * MFTL_UPD_N_MIN + 2];
-    qs->max_edge_length_sq = empty ? 0.0 : global_max[o * MFTL_UPD_N_MAX + 2];
+    const double *const r = &rows[(size_t) o * MFTL_UPD_N_SLOTS];
+    unpack_slot(&ensemble->local_objects[o]->quality, &r[0], &r[3], &r[6]);
   }
 
-  free(buf);
+  free(rows);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -310,12 +355,14 @@ int MFTLEnsembleUpdateVertexNormals(MFTL_Ensemble *ensemble)
 {
   MFTL_ASSERT(ensemble != MFTL_NULL);
   if (ensemble == MFTL_NULL) return MFTL_ERROR;
-  if (ensemble->num_objects == 0) return MFTL_SUCCESS;
+  /* GLOBAL, not local: MFTLUpdateGhostVertexNormals() below is collective, so a
+   * rank holding no bodies must still reach it. */
+  if (ensemble->n_bodies_global == 0) return MFTL_SUCCESS;
 
   /* Local, communication-free, exact for every OWNED vertex. Ghost vertices come
    * out of this holding a partial sum -- correctly normalised and quietly wrong,
    * which is precisely why the exchange below is not optional. */
-  for (int o = 0; o < ensemble->num_objects; ++o) MFTLComputeVertexNormals(ensemble->objects[o]);
+  for (int o = 0; o < ensemble->n_local_objects; ++o) MFTLComputeVertexNormals(ensemble->local_objects[o]);
 
   /* One request/reply over the graph communicator, 32 B per ghost vertex. It is
    * blocking inside, and there is nothing here to overlap it with: every object

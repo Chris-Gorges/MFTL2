@@ -502,6 +502,327 @@ here. The questions that need a cluster are unchanged, and one is now sharper:
 or is 39 % the floor?** A rank holding tens of thousands of triangles rather than
 1.3 million is the regime that answers it.
 
+# What every rank pays for bodies it does not hold {#scaling_replicated_bodies}
+
+Every rank keeps an `MFTL_Object` for every body in the ensemble, enters every
+per-body loop for it, and appears in every per-body collective for it — whether or
+not it holds a single triangle of it. In a **weak** sweep the body count grows
+with the rank count, so all of that grows linearly with P while the work per rank
+stays flat. This section is the instrumentation that makes it visible, and what
+has changed so far.
+
+## The instrument: three workspace classes and an empty-body count
+
+`MFTL_RedistributeStats` now carries the persistent redistribution workspace split
+by what it is proportional to — `ws_bytes_per_body`, `ws_bytes_per_rank`,
+`ws_bytes_per_entity`. They are HIGH-WATER MARKS read off the capacities, not the
+running `n_bytes_allocated` churn sum, so they are a footprint. The benchmark
+reports **min..max over ranks**, and the gap is load-bearing: capacity is a
+ratchet and rank 0 held the whole ensemble during the opening scatter, so its
+per-entity mark is the whole mesh's forever. Reading only the maximum blames the
+library for the harness's serial generation.
+
+`--mode weak --spheres-per-rank 32 --refine 1`, Apple M-series laptop
+(np = 8 is oversubscribed; these are byte counts, not timings, so that is fine):
+
+| np | bodies | empty bodies/step | per-body kB | per-rank kB | per-entity kB (min..max) |
+|---|---|---|---|---|---|
+| 2 | 64  | 3.4 %  | 11.0 | 0.2 | 18.2 .. 50.2 |
+| 4 | 128 | 18.1 % | 11.0 | 0.4 | 26.2 .. 98.2 |
+| 8 | 256 | 37.2 % | 20.5 | 0.8 | 26.2 .. 194.2 |
+
+Read the columns against each other, because only one of them is allowed to move:
+
+- **`per-entity` min is flat** (18 → 26 → 26 kB). That is the control. Weak scaling
+  holds the work per rank constant, so this figure is what "constant" looks like,
+  and without it the other columns say nothing.
+- **`per-body` has min == max** and steps up on the doubling ladder. Every rank
+  pays the identical amount, held or not — which is the whole shape of the defect
+  in one number.
+- **`per-rank` tracks P exactly** (0.2 → 0.4 → 0.8). Separate defect, same sweep.
+- **The empty-body fraction is the headline: 3.4 % → 18.1 % → 37.2 % over 4× of
+  ranks**, heading for 100 %. At np = 8, 762 of every 2048 per-body visits per step
+  are on a body this rank holds nothing of.
+- **`per-entity` max doubles with P** and it is NOT a library defect: it is rank 0's
+  ratchet from the opening scatter, the workspace analogue of the stranded pool
+  capacity in §scaling_trap_pools. It is why the minimum is reported at all.
+
+## What the per-body quality reduction costs, and why it stays
+
+`MFTLEnsembleUpdate` puts 11 doubles PER BODY into three `MPI_Allreduce`s every
+timestep — 1.4 MB per reduction at 16 384 bodies, 88 MB at a million. Measured
+here, `--spheres 16384 --refine 0`, np = 4, best of three: **0.110 ms/step, 28 %
+of the timestep.** An ensemble-wide aggregate instead — 11 doubles full stop —
+was measured at **0.091 ms/step and 24 %**, i.e. **1.21×** for a 16384× smaller
+payload, because four ranks on one node reduce through shared memory at
+~200 GB/s. On this machine the payload is nearly free; on a real network it is
+the whole cost.
+
+**The aggregate is not the fix, and it was reverted.** Per-body quality is what a
+solver reads to decide whether a GIVEN droplet needs remeshing; a single number
+over every triangle of every body says that something degenerated and not which
+body it was. So the payload stays per body, and what has to change is the set of
+ranks each body's slot is reduced over — only its holders have anything to
+contribute. That converts O(bodies) into O(bodies held locally) without giving up
+a number the caller wants, and it is the same mechanism every other per-body
+reduction in the library needs. **The 1.21× above is therefore the upper bound on
+what a holder-set reduction can win here, and it is small precisely because this
+laptop cannot see message volume.** Re-measure on the cluster.
+
+**Generation's collectives are batched.** `MFTLGenerateSphere` did one `MPI_Bcast`
+of three ints and one `MPI_Allreduce` of two, PER BODY, in strict sequence on the
+one rank building everything. `MFTLGenerateSphereLocal` + `MFTLPublishGeneratedBodies`
+is 2 collectives for the whole ensemble.
+
+**And it measures nothing here, which is worth recording rather than omitting.**
+Setup at 512 bodies, np = 4: 0.0119–0.0131 s batched against 0.0136–0.0142 s per
+body; at 2048 bodies the two are indistinguishable (0.029–0.032 s either way).
+Shared-memory collectives cost about what the surrounding loop iteration does, and
+setup is dominated by rank 0 actually subdividing the icospheres. It is a
+message-COUNT change justified structurally: 2N collectives in strict sequence at
+even 5 µs each is 20 ms at 2048 bodies and 10 s at a million, none of it
+overlappable, all of it before the first timestep. Re-measure on the cluster
+before quoting a number.
+
+## Body identity has moved; the storage has not
+
+Bodies are now named on the wire by `MFTL_Object.global_id`, handed out densely by
+`MFTLEnsembleAddObject`, rather than by their position in `MFTL_Ensemble.objects`.
+`MFTL_OwnerMap` is keyed the same way, `slot_of_body` in `redistribute.c` is the
+one place a wire id becomes a local index, and the redistribution's Debug checksum
+now reduces `(num_objects, n_bodies_global, skip switch)` instead of hashing every
+id — because hashing the id list asserts exactly the property being removed.
+
+**It changes no measurement, and that is the point.** Every rank still holds every
+body, so `global_id ==` the list position and every number in the table above is
+unchanged to the byte. Splitting the identity change from the storage change is
+what makes each of them testable on its own: the whole suite had to pass
+unmodified, and the only two edits it needed were assertions that had hard-coded
+the *old* identity scheme (`test_multibody_round`'s `100 + o`, `test_io`'s
+`bid[t] - 100`).
+
+One piece of state moved as part of it. The "has this body's layout settled" bit
+was the third slice of redistribution's vote bitset, indexed by list position, and
+is now `MFTL_Object.partition_settled`. A workspace bitset indexed by position has
+to be discarded whenever the list changes, so **adding one body un-settled every
+body** and cost the whole ensemble a rebuild; on the object, a body carries its own
+answer and one created on arrival simply starts unsettled. It fits in padding that
+was already there, so `sizeof(MFTL_Object)` is still 264 B.
+
+## The object list is sparse, and the per-rank body work is flat
+
+A rank now holds an `MFTL_Object` exactly for the bodies it holds entities of:
+`MFTL_Ensemble.local_objects` is a gid-sorted subset, redistribution destroys a
+body whose entities have all left and creates one arriving where the rank held
+nothing, and `n_local_objects` is a local quantity while `n_bodies_global` is the
+ensemble.
+
+### Measured against the old code, in one session {#scaling_before_after}
+
+Everything below is a **differential**: `cd7fcd2` (the replicated object list and
+the `comm_world` per-body reductions) built and run against the current tree, on
+the same laptop, in the same session, with byte-identical benchmark flags —
+`--steps 60 --repeat 3 --quality`, best of three repeats after three warm-up
+steps. The older tables in this document were taken at different commits and are
+kept only for their trends.
+
+**Weak: `--mode weak --spheres-per-rank 32 --refine 1`.** The body count grows
+with the rank count, which is the sweep the whole change exists for.
+
+| np | bodies | body visits/rank/step | empty bodies | ms/step | quality ms/step |
+|---|---|---|---|---|---|
+| 2 | 64  | 64 → **36.4** (1.76x) | 2.4 % → **2.1 %**  | 0.096 → 0.074 | 0.0266 → 0.0203 |
+| 4 | 128 | 128 → **41.0** (3.12x) | 18.5 % → **4.3 %** | 0.127 → 0.129 | 0.0332 → 0.0356 |
+| 8 | 256 | 256 → **46.8** (5.48x) | 34.6 % → **6.3 %** | 0.410 → 0.415 | 0.1409 → 0.1392 |
+
+**The reduction factor is the point, not the absolute.** It rises 1.76x → 3.12x →
+5.48x over 4x of ranks, i.e. per-rank body work went from *tracking P* to nearly
+flat — 36.4, 41.0, 46.8 against 64, 128, 256. The residual rise is halo sharing
+(a rank holds its own ~32 bodies plus a sliver of its neighbours'), not the
+ensemble growing, and the empty-body fraction says the same thing from the other
+side: it was heading for 100 % and now sits under 7 %.
+
+**Body count at fixed np = 4, `--refine 0`.** The other axis: hold the ranks
+still and grow the ensemble.
+
+| bodies | body visits/rank/step | empty bodies | ms/step | quality ms/step |
+|---|---|---|---|---|
+| 256   | 256 → **79.4** (3.22x)     | 12.4 % → **2.2 %** | 0.081 → 0.081 | 0.0223 → 0.0207 |
+| 1024  | 1024 → **298.3** (3.43x)   | 9.6 % → **2.3 %**  | 0.260 → 0.260 | 0.0735 → 0.0696 |
+| 4096  | 4096 → **1123.1** (3.65x)  | 7.8 % → **2.3 %**  | 1.554 → 1.342 | 0.4155 → 0.3776 |
+| 16384 | 16384 → **4353.1** (3.76x) | 6.5 % → **2.4 %**  | 11.60 → 11.15 | 3.174 → 2.939 |
+
+**Strong: 256 bodies x refine 3 = 327,680 triangles.** The regression check — a
+fixed problem on more ranks, where the change must cost nothing.
+
+| P | ms/step | quality ms/step | body visits/rank/step | halo % | imbalance |
+|---|---|---|---|---|---|
+| 1 | 4.590 → 4.583 (1.00x) | 1.9235 → 1.9162 | 256 → 256 (1.00x) | 0.00 | 1.000 |
+| 2 | 3.488 → 3.535 (0.99x) | 1.0286 → 1.0238 | 256 → **145.2** (1.76x) | 0.86 | 1.013 |
+| 4 | 2.847 → 2.809 (1.01x) | 0.6900 → 0.6622 | 256 → **85.2** (3.00x) | 1.77 | 1.026 |
+| 8 | 3.922 → 3.943 (0.99x) | 1.4882 → 1.3822 | 256 → **46.9** (5.46x) | 2.72 | 1.091 |
+
+### The honest reading: the counted quantities moved, the clock did not
+
+**Wall clock is a wash on this machine — 0.98x to 1.16x, and the noise floor is
+wider than most of that.** Five independent np = 2 weak runs of the current tree
+give step medians of 0.092, 0.075, 0.073, 0.073 and 0.072 ms, a **±28 % spread**,
+so every "win" under about 1.3x in the tables above is unmeasurable here and the
+1.30x at np = 2 in the weak table is noise. What IS reproducible to the digit is
+every counted column: body visits, empty fraction, workspace bytes and the
+reduction routes are bit-stable across runs.
+
+That is the expected outcome and not a disappointment. Four performance cores
+reduce through shared memory at ~200 GB/s and a per-body loop iteration on a body
+this rank holds nothing of is a handful of predicted branches; the cost this
+change removes is **memory per rank and message volume per rank**, and neither is
+on the critical path of a four-core laptop. The measurement that would show it
+needs P in the hundreds — the same conclusion §scaling_shakedown reached about
+the scaling curves themselves.
+
+**RSS barely moves either, and the reason is worth stating.** 280.9 → 281.4 MB at
+16 384 bodies. The per-body arrays this change made local are tens of bytes per
+body against the ~5 kB of mesh each body carries at refine 0, so at any body
+count that fits on a laptop the pools dominate. The arrays that were removed
+scale with `bodies x ranks`, which is the axis a laptop cannot grow.
+
+## Per-body reductions go to the body's HOLDERS {#scaling_holder_reductions}
+
+Three collectives in a timestep reduce one record per body: the redistribution's
+skip vote (1 value), `MFTLEnsembleUpdateGlobalCounts` (2), and
+`MFTLEnsembleUpdate`'s quality statistics (11). All three staged into a buffer
+indexed by BODY ID and called `MPI_Allreduce` on `comm_world`, because that is
+the only index that means the same thing on two ranks holding different bodies.
+
+`MFTLEnsembleReduceBodies` (`src/ensemble/ensemble_reduce.c`) replaces the
+communicator rather than the payload. The caller's buffer is indexed by LOCAL
+SLOT, and the reduction is one `MPI_Neighbor_allgatherv` of `(body id, payload)`
+records over the 26-neighbour graph whenever every body's holders provably fit
+inside one 26-neighbourhood, with the old `comm_world` reduction as the fallback.
+
+**Three separate things changed, and only one of them is bytes.**
+
+**1. The per-rank staging memory is gone.** `MFTLEnsembleUpdate` allocated
+`22 x bodies` doubles on every rank on every call — the six logical arrays are
+local and global min, max and sum, i.e. 176 B/body, so **148 kB at 864 bodies and
+176 MB at a million** — to learn eleven numbers about the bodies it holds. It
+is now `11 x bodies held`, a few kilobytes at any ensemble size. Same for the
+counts and for the vote bitset. This one is exact, not measured, and it is the
+largest of the three.
+
+**2. A global synchronisation became a neighbourhood one.** What remains on
+`comm_world` per reduction is one `MPI_Allreduce` of a SINGLE int, agreeing which
+route to take; the data moves over `comm_graph`. At `P` in the thousands that is
+the difference between a payload-carrying global tree and 26 point-to-point
+messages, and it is the part this laptop cannot measure at all.
+
+**3. Bytes: WORSE below about 45 ranks, better above, and the crossover is
+arithmetic rather than a guess.** Weak sweep, `--spheres-per-rank 32 --refine 1
+--quality`, all three reductions live, payload bytes per rank per step:
+
+| np | bodies | bodies held | holder route | previous `comm_world` model | ratio |
+|---|---|---|---|---|---|
+| 2  | 64  | ≤ 38 | 12.1 kB | 6.2 kB  | **1.97** |
+| 4  | 128 | ≤ 47 | 23.0 kB | 12.3 kB | **1.87** |
+| 8  | 256 | ≤ 52 | 42.3 kB | 24.6 kB | **1.72** |
+| 27 | 864 | ≤ 60 | 141 kB  | 83.1 kB | **1.70** |
+
+The neighbourhood route sends every held body to every neighbour, so its payload
+is `b_local x (1+d)` records against the old route's `B_global`. With `d` capped
+at 26 the ratio is `1.4 x (1+s) x (1+d) / P`, where `(1+s)` is the sharing factor
+(`b_local x P / B_global`, measured at 1.19 here). Setting it to 1 gives a
+crossover at **P ~ 45**, i.e. anything past a 3x3x3 grid, and the advantage then
+grows LINEARLY with P: 22x fewer bytes at P = 1000, 220x at P = 10 000. The
+measured ratios above fall from 1.97 to 1.70 exactly as `(1+d)/P` saturates.
+
+**Per consumer the crossover differs by two orders of magnitude, and the vote is
+the awkward one.** Quality (11 slots against 88 B/body) crosses at P ~ 35;
+counts (2 slots against 8 B/body) at P ~ 96; the vote (1 slot against **one BIT**
+per body) at P ~ 4100. A bitset is simply a very good encoding, and nothing with
+a `(gid, value)` record beats it at small `B`. It is kept on the same mechanism
+anyway, for the two reasons above and because at the design point it wins on
+bytes too: at `P = 10 000, B = 10^6` the bitset is 125 kB per rank per step
+against 43 kB — and `b_local` stays at ~100 while `B` does not. A narrower record
+type for one-slot reductions is the obvious optimisation if a measurement ever
+asks for it; it was not taken, because two payload encodings is two mechanisms.
+
+### Stage 3 in isolation: the route changed, the clock did not {#scaling_holder_ab}
+
+The table above bundles the sparse list with the holder route. Forcing the three
+call sites to `MFTL_BODY_REDUCE_SCOPE_GLOBAL` isolates the route alone — same
+sparse directory, same everything, only the communicator differs:
+
+| case | bodies | P | quality ms/step | redistribute ms/step | reduce kB/rank/step |
+|---|---|---|---|---|---|
+| weak  | 64   | 2 | 0.0277 → 0.0203 | 0.0351 → 0.0261 | 6.0 → **11.9** |
+| weak  | 128  | 4 | 0.0378 → 0.0356 | 0.0677 → 0.0600 | 12.0 → **22.4** |
+| weak  | 256  | 8 | 0.1336 → 0.1392 | 0.1929 → 0.1980 | 24.0 → **40.9** |
+| fixed | 256  | 4 | 0.0220 → 0.0207 | 0.0344 → 0.0353 | 24.0 → **43.4** |
+| fixed | 1024 | 4 | 0.0735 → 0.0696 | 0.1002 → 0.1052 | 96.0 → **163.1** |
+| fixed | 4096 | 4 | 0.3677 → 0.3776 | 0.4885 → 0.5245 | 384.0 → **614.2** |
+
+**Nothing here is outside the noise floor** (0.93x–1.37x against a ±28 % spread),
+and the byte column is *worse* by 1.5x–2.0x exactly as the model predicts at these
+rank counts. So this is not a measured speed-up; it is a measured **shape change**
+whose payoff is off the end of this machine. What the experiment does confirm is
+that both routes are live, that the droplet fixtures never fall back
+(`global = 0` in every run above), and that the byte ratio tracks
+`1.4 x (1+s) x (1+d)/P` rather than drifting.
+
+**The route is decided, not assumed, and the test is local.** A rank checks that
+every body it holds owns at least one entity here, that every OTHER holder named
+by its ghosts' `owner_proc` is a graph neighbour, and that those neighbours' cell
+offsets span at most one cell per axis; `MPI_LAND` of that is exactly "the
+neighbourhood route is exact". It reads only the ghost suffix, so a body held
+whole costs nothing, and it is re-derived on every call rather than cached — a
+stale verdict is a silently wrong reduction, and the invalidation rule would have
+to be maintained by every future holder-set change.
+
+**Two failures the shakedown found, both silent, both worth recording.**
+
+*A generated ensemble vetoes, and has to.* Right after `MFTLGenerateSphere` rank 0
+holds every entity and every other rank holds an EMPTY object. Such a rank owns
+nothing, so it appears in no other holder's halo and cannot be discovered from
+outside — it would sit out the exchange and keep whatever was in its buffer. At
+np = 4 on a 4x1x1 grid rank 2 is not even a neighbour of rank 0, and
+`test_ensemble_update_tolerates_empty_ranks` failed on exactly that. The empty
+holder therefore vetoes for the whole ensemble. After a redistribution no empty
+object exists, so this costs nothing in the steady state.
+
+*`comm_graph` carries a SELF-LOOP on a thin grid.* `domain_init_comm` skips the
+`(0,0,0)` offset, not the own RANK: on an axis with a single cut and periodicity
+every offset along it wraps back onto this cell, so the 26-stencil legitimately
+resolves to this rank. An exchange does not care; a REDUCTION does, because the
+self block is then folded in twice — invisibly for MIN and MAX, and doubling
+every SUM. Grids of shape `{2,1,1}` and `{2,2,1}` have the self-loop and
+`{2,2,2}` and `{3,3,3}` do not, which is precisely the set of rank counts at
+which the remeshing suite failed.
+
+## What none of this fixes yet
+
+~~Contact detection is untouched and still enumerates every body pair.~~ ~~The
+remesher's own per-body reductions still stage by body id on `comm_world`.~~ Both
+were done in a second pass; the account is in `docs/scalability-update-status.md`
+§Stage 4 (a status document, read in place — it is deliberately not a manual
+page), and none of it is measured here in TIME — it is counted quantities and bit-for-bit digest
+comparisons, because on a four-core laptop none of these paths is on the critical
+one. In short: the all-pairs request list and the `48 x B x nn`-byte extent table
+are gone (a neighbourhood exchange of 9 doubles per HELD body, plus a uniform grid
+over the arrivals); `MFTLRemeshMeasureBodies`, the per-phase `2B` Exscan and
+Allreduce, the dispersed id counters and the Debug watermark check all go through
+`MFTLEnsembleReduceBodies` or its new sibling `MFTLEnsembleExscanBodies`.
+
+**What remains, and it is one thing:** the dispersed balancer's `O(P x B)`
+replicated greedy. Its assignment must be identical on every rank and its greedy
+is over rank *loads*, so it genuinely needs replicated per-body data — that is a
+property of the algorithm, not of the route. It is now explicit
+(`replicate_for_balancer`, one `Allreduce` of `4B` doubles rather than the
+measurement's `9B`), attributable to one switch, and skipped entirely when
+`dispersed_balance_slack <= 0`.
+
+Generation is still rank-0 serial, so the peak of §scaling_trap_pools stands and
+setup time still grows linearly with `nproc` in a weak sweep.
+
 # Cluster {#scaling_cluster}
 
 Not yet run. The open questions this harness exists to answer:

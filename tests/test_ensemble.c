@@ -116,17 +116,65 @@ static int test_add_object_links_the_domain(void)
   TEST_ASSERT(a->domain == MFTL_NULL);
   TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLEnsembleAddObject(e, a));
   TEST_ASSERT(a->domain == &e->domain);
-  TEST_ASSERT_EQUAL_INT(1, e->num_objects);
+  TEST_ASSERT_EQUAL_INT(1, e->n_local_objects);
 
   // The list grows past its initial capacity of one.
   for (int i = 0; i < 10; ++i) MFTLEnsembleAddObject(e, MFTLObjectCreate(200 + i));
-  TEST_ASSERT_EQUAL_INT(11, e->num_objects);
+  TEST_ASSERT_EQUAL_INT(11, e->n_local_objects);
   TEST_ASSERT(e->capacity_objects >= 11);
 
   TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLEnsembleAddObject(e, MFTL_NULL));
   TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLEnsembleAddObject(MFTL_NULL, a));
 
   // Destroying the ensemble destroys every object it owns (checked by ASan/LSan).
+  MFTLEnsembleDestroy(&e);
+  return 0;
+}
+
+/**
+ * The ensemble hands out body ids, densely, in add order.
+ *
+ * This is the identity bodies travel under: redistribution puts `global_id` on
+ * the wire and `slot_of_body` turns it back into an index, so an id that was not
+ * dense, or not agreed between ranks, merges entities into the wrong body without
+ * anything crashing. Whatever the caller passed to MFTLObjectCreate() is
+ * provisional and must be overwritten -- checked here with ids that are
+ * deliberately neither dense nor ordered nor distinct from each other's
+ * positions.
+ */
+static int test_add_object_hands_out_dense_body_ids(void)
+{
+  MFTL_Ensemble *e = MFTLEnsembleCreate(MPI_COMM_WORLD, (int[3]){1, 1, 1}, (double[3]){0, 0, 0}, (double[3]){1, 1, 1}, MFTL_NULL, 1);
+  TEST_ASSERT(e != MFTL_NULL);
+  TEST_ASSERT_EQUAL_INT(0, e->n_bodies_global);
+
+  const int provisional[5] = {999, -3, 0, 7, 999};
+  for (int i = 0; i < 5; ++i)
+  {
+    MFTL_Object *obj = MFTLObjectCreate(provisional[i]);
+    TEST_ASSERT_EQUAL_INT(provisional[i], obj->global_id);  // provisional until it joins
+    TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLEnsembleAddObject(e, obj));
+    TEST_ASSERT_EQUAL_INT(i, obj->global_id);  // and overwritten on the way in
+  }
+
+  TEST_ASSERT_EQUAL_INT(5, e->n_local_objects);
+  TEST_ASSERT_EQUAL_INT(5, e->n_bodies_global);
+
+  /* Dense in list order, which is what makes a gid an array index rather than a
+   * lookup -- the property src/communication/ sizes its per-body arrays from. */
+  for (int i = 0; i < e->n_local_objects; ++i) TEST_ASSERT_EQUAL_INT(i, e->local_objects[i]->global_id);
+
+  /* A rejected add hands out no id: n_bodies_global must not drift, or two ranks
+   * that disagree only about a failed call would disagree about the id space. */
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLEnsembleAddObject(e, MFTL_NULL));
+  TEST_ASSERT_EQUAL_INT(5, e->n_bodies_global);
+
+  /* An object that never joins an ensemble keeps what it was given -- that is the
+   * spatial halo's shadow patches and every serial test fixture. */
+  MFTL_Object *loose = MFTLObjectCreate(4242);
+  TEST_ASSERT_EQUAL_INT(4242, loose->global_id);
+  MFTLObjectDestroy(&loose);
+
   MFTLEnsembleDestroy(&e);
   return 0;
 }
@@ -325,6 +373,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_create_rejects_a_mismatched_process_grid);
   RUN_TEST(test_destroy_is_null_safe);
   RUN_TEST(test_add_object_links_the_domain);
+  RUN_TEST(test_add_object_hands_out_dense_body_ids);
   RUN_TEST(test_global_counts_sum_the_owned_prefix);
   RUN_TEST(test_global_counts_on_an_empty_ensemble);
   RUN_TEST(test_update_computes_geometry_and_quality);

@@ -1137,7 +1137,7 @@ int MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix, const MFT
   const MFTL_Domain *const dom = &ensemble->domain;
   const int rank = dom->rank;
   const int nproc = dom->nproc;
-  const int n_obj = ensemble->num_objects;
+  const int n_obj = ensemble->n_local_objects;
   const bool binary = (opt.encoding == MFTL_VTK_BINARY);
   const bool shared = (opt.layout == MFTL_IO_SINGLE_FILE);
 
@@ -1156,7 +1156,7 @@ int MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix, const MFT
   long long my_points = 0, my_cells = 0;
   for (int o = 0; o < n_obj; ++o)
   {
-    const MFTL_Object *obj = ensemble->objects[o];
+    const MFTL_Object *obj = ensemble->local_objects[o];
     const int nv = obj->verts.n;
     const int nt = opt.include_ghosts ? obj->tris.n : obj->tris.n_local;
 
@@ -1217,7 +1217,7 @@ int MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix, const MFT
 
     for (int o = 0; o < n_obj; ++o)
     {
-      const MFTL_Object *obj = ensemble->objects[o];
+      const MFTL_Object *obj = ensemble->local_objects[o];
       const piece *p = &pieces[o];
       const long long lp = p_off - base[0];  /* this object's slice within my blocks */
       const long long lc = c_off - base[1];
