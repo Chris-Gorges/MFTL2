@@ -11,6 +11,7 @@
 #include "mftl_memory.h"
 #include <stdlib.h>  // for malloc/free
 #include <stdio.h>  // for fprintf
+#include <string.h>  // for memcpy
 
 // Helper to get the start vertex of a half-edge
 // (Assumes triangular mesh where prev == next->next)
@@ -488,6 +489,65 @@ void MFTLFlattenConnectivity(MFTL_Object *obj)
     v_offsets[i] = v_offsets[i - 1];
   }
   v_offsets[0] = 0;
+}
+
+void MFTLBuildTopologyFromTriples(MFTL_Object* obj, int nV, const double positions[][3], int nF, const int triples[][3])
+{
+  MFTL_ASSERT(obj != MFTL_NULL);
+  MFTL_ASSERT(positions != MFTL_NULL && triples != MFTL_NULL);
+  MFTL_ASSERT(obj->n_vertices == 0 && "MFTLBuildTopologyFromTriples: object must be empty");
+  MFTL_Domain* domain = obj->domain;
+
+  MFTL_RESERVE_ADDITIONAL(obj->vertices, &obj->n_vertices, &obj->capacity_vertices, nV, MFTL_Vertex);
+  MFTL_RESERVE_ADDITIONAL(obj->triangles, &obj->n_triangles, &obj->capacity_triangles, nF, MFTL_Triangle);
+  MFTL_RESERVE_ADDITIONAL(obj->half_edges, &obj->n_half_edges, &obj->capacity_half_edges, 3 * nF, MFTL_HalfEdge);
+
+  obj->n_vertices = nV;
+  obj->n_triangles = nF;
+  obj->n_half_edges = 3 * nF;
+
+  for (int i = 0; i < nV; ++i)
+  {
+    MFTL_Vertex* v = &obj->vertices[i];
+    v->global_id = i;
+    v->owner_proc = domain->rank;
+    v->is_ghost = MFTL_FALSE;
+    memcpy(v->pos, positions[i], 3 * sizeof(double));
+    v->out_he_idx = MFTL_ERROR;
+  }
+
+  for (int t = 0; t < nF; ++t)
+  {
+    MFTL_Triangle* tri = &obj->triangles[t];
+    tri->global_id = t;
+    tri->owner_proc = domain->rank;
+    tri->is_ghost = MFTL_FALSE;
+    tri->he_idx = 3 * t;
+
+    for (int j = 0; j < 3; ++j)
+    {
+      int a = triples[t][j];
+      int b = triples[t][(j + 1) % 3];  // half-edge target = next vertex
+
+      MFTL_HalfEdge* he = &obj->half_edges[3 * t + j];
+      he->global_id = 3 * t + j;
+      he->triangle_idx = t;
+      he->vertex_idx = b;
+      he->next_idx = 3 * t + ((j + 1) % 3);
+      he->twin_idx = MFTL_ERROR;
+      he->boundary = MFTL_TRUE;
+      he->flags = 0;
+
+      obj->vertices[a].out_he_idx = 3 * t + j;
+    }
+  }
+
+  obj->next_vertex_gid = nV;
+  obj->next_triangle_gid = nF;
+  obj->next_halfedge_gid = 3 * nF;
+
+  MFTLRebuildTwins(obj);
+  MFTLFlattenConnectivity(obj);
 }
 
 /**

@@ -5,6 +5,7 @@
 #include "mftl_topology.h"
 #include "mftl_memory.h"  // For memory macros
 #include <mpi.h>
+#include <math.h>
 
 // Mocking/Reusing allocation helpers if they are static in remeshing.c
 // Since we are linking against MFTL, we can't access static functions.
@@ -501,6 +502,50 @@ int TestCollapseBoundary()
 }
 
 // -----------------------------------------------------------------------------
+// Stage 08: full driver pass over a sphere keeps a valid closed mesh.
+// -----------------------------------------------------------------------------
+int TestFullRemeshPass()
+{
+  int cuts[3] = {1, 1, 1};
+  double xmin[3] = {-2, -2, -2};
+  double xmax[3] = {2, 2, 2};
+  bool per[3] = {false, false, false};
+  MFTL_Ensemble* ens = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, xmin, xmax, per, 1);
+  MFTL_Object* obj = MFTLObjectCreate(1);
+  MFTLEnsembleAddObject(ens, obj);
+
+  double center[3] = {0.0, 0.0, 0.0};
+  MFTLGenerateSphere(obj, center, 1.0, 3);
+  MFTLComputeTriangleProperties(obj);
+
+  int v_before = obj->n_vertices;
+  int t_before = obj->n_triangles;
+  double vol_before = fabs(MFTLObjectVolume(obj));
+
+  MFTL_RemeshParameters params;
+  MFTLInitRemeshParams(&params, MFTL_REMESH_ISOTROPIC, 0.28, 6, MFTL_SMOOTH_VERTEX_BASED, 30.0);
+  MFTLRemeshEnsemble(ens, &params);
+
+  // After the full pass: valid, closed, integrity-passing, live entities only.
+  TEST_ASSERT(MFTLCheckMeshIntegrity(obj) == MFTL_SUCCESS);
+  TEST_ASSERT(obj->n_vertices > 0 && obj->n_triangles > 0);
+  TEST_ASSERT(obj->n_triangles != t_before || obj->n_vertices != v_before);  // the pass did something
+
+  // No dead entities may remain after finalization.
+  for (int i = 0; i < obj->n_vertices; ++i)
+    TEST_ASSERT(!(obj->vertices[i].flags & MFTL_FLAG_DEAD));
+  for (int i = 0; i < obj->n_triangles; ++i)
+    TEST_ASSERT(!(obj->triangles[i].flags & MFTL_FLAG_DEAD));
+
+  double v = fabs(MFTLObjectVolume(obj));
+  if (obj->domain->rank == 0) printf("  full pass: V %.6f -> %.6f (drift %.3e)\n", vol_before, v, fabs(v - vol_before) / vol_before);
+  TEST_ASSERT(fabs(v - vol_before) / vol_before < 0.05);  // bounded drift pre-Stage-09
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+// -----------------------------------------------------------------------------
 // MAIN
 // -----------------------------------------------------------------------------
 int main(int argc, char** argv)
@@ -511,6 +556,7 @@ int main(int argc, char** argv)
   RUN_TEST(TestSplitInternal);
   RUN_TEST(TestCollapseInternal);
   RUN_TEST(TestCollapseBoundary);
+  RUN_TEST(TestFullRemeshPass);
 
   TEST_REPORT();
   MPI_Finalize();

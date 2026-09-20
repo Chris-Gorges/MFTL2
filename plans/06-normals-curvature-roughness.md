@@ -1,10 +1,10 @@
 # 06 — Vertex normals, curvature (mean/Gaussian), roughness
 
-Status: NOT STARTED
+Status: COMPLETE
 Depends on: 01 (uses existing one-ring traversal)
-Implemented by:
-Reviewed by:
-Acceptance: NOT PASSED
+Implemented by: Kimi Code
+Reviewed by: Claude Code
+Acceptance: PASSED
 
 ## Objective
 Compute per-vertex normals, mean & Gaussian curvature (discrete cotangent Laplace–Beltrami),

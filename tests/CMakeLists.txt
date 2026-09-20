@@ -62,3 +62,71 @@ add_test(NAME UnitIntersection COMMAND unit_tests_intersection)
 # MFTL's own allocations must remain leak-clean.
 set(MFTL_LSAN_ENV "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/lsan.supp:print_suppressions=0")
 set_tests_properties(MPIGhostSync MPIStressTest MPIGhostLayers UnitRemeshing UnitSphereGen PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+
+# --- Phase 7: Object Integrals (Stage 02) ---
+add_executable(test_object_integrals test_object_integrals.c)
+target_link_libraries(test_object_integrals PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_object_integrals PRIVATE ${CMAKE_SOURCE_DIR}/include)
+
+# Rank-independence: the same binary is registered at 1/2/4/8 ranks
+# (each run also asserts pre/post-redistribution equality internally).
+foreach(NP 1 2 4 8)
+    add_test(NAME ObjectIntegrals-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_object_integrals>)
+endforeach()
+set_tests_properties(ObjectIntegrals-np1 ObjectIntegrals-np2 ObjectIntegrals-np4 ObjectIntegrals-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+
+# --- Stage 03: Rigid-body transforms ---
+add_executable(test_transforms test_transforms.c)
+target_link_libraries(test_transforms PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_transforms PRIVATE ${CMAKE_SOURCE_DIR}/include)
+foreach(NP 1 2 4 8)
+    add_test(NAME Transforms-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_transforms>)
+endforeach()
+set_tests_properties(Transforms-np1 Transforms-np2 Transforms-np4 Transforms-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+
+# --- Stage 04: Object generators ---
+add_executable(test_generators test_generators.c)
+target_link_libraries(test_generators PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_generators PRIVATE ${CMAKE_SOURCE_DIR}/include)
+foreach(NP 1 2 4 8)
+    add_test(NAME Generators-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_generators>)
+endforeach()
+set_tests_properties(Generators-np1 Generators-np2 Generators-np4 Generators-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+
+# --- Stage 05: Mesh I/O (GTS reader/writer + PVTU) ---
+# Fixture location of the MFTL1 tree (GTS test meshes); override with
+# -DMFTL1_ROOT=/path/to/mftl if checked out elsewhere.
+set(MFTL1_ROOT "/home/berend/git/Code/mftl" CACHE PATH "Root of the MFTL1 source tree (GTS fixtures)")
+add_executable(test_io test_io.c)
+target_link_libraries(test_io PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_io PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_compile_definitions(test_io PRIVATE MFTL_GTS_DIR="${MFTL1_ROOT}")
+foreach(NP 1 2 4 8)
+    add_test(NAME MeshIO-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_io>)
+endforeach()
+set_tests_properties(MeshIO-np1 MeshIO-np2 MeshIO-np4 MeshIO-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+
+# --- Stage 06: Normals, curvatures, roughness ---
+add_executable(test_curvature test_curvature.c)
+target_link_libraries(test_curvature PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_curvature PRIVATE ${CMAKE_SOURCE_DIR}/include)
+foreach(NP 1 2 4 8)
+    add_test(NAME Curvature-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_curvature>)
+endforeach()
+set_tests_properties(Curvature-np1 Curvature-np2 Curvature-np4 Curvature-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+
+# --- Stage 07: Point queries (point-in-object, point-triangle distance, AABB) ---
+add_executable(test_point_query test_point_query.c)
+target_link_libraries(test_point_query PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_point_query PRIVATE ${CMAKE_SOURCE_DIR}/include)
+foreach(NP 1 2 4 8)
+    add_test(NAME PointQuery-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_point_query>)
+endforeach()
+set_tests_properties(PointQuery-np1 PointQuery-np2 PointQuery-np4 PointQuery-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+
+# --- Stage 08: Serial remeshing A (np1 serial operators) ---
+add_executable(test_remesh_quality test_remesh_quality.c)
+target_link_libraries(test_remesh_quality PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_remesh_quality PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME RemeshQuality-np1 COMMAND mpirun -np 1 $<TARGET_FILE:test_remesh_quality>)
+set_tests_properties(RemeshQuality-np1 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")

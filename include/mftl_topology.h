@@ -441,4 +441,21 @@ static inline void MFTLFreeNeighborhood(MFTL_Neighborhood *nb)
 void MFTLGetNeighborhood(MFTL_Object *restrict obj, int *restrict seed_indices, int n_seeds, bool use_vertex_seeds, int steps,
                          MFTL_Neighborhood *restrict out_result);
 
+/**
+ * @brief Builds complete half-edge topology from a vertex list and a list of
+ *        triangle index triples (generators and mesh I/O share this path).
+ *
+ * Wiring convention (matches generate_icosahedron/generators): for a triangle
+ * triple (a, b, c), the three half-edges target the NEXT vertex (b, c, a) and
+ * cycle within the triangle. The caller is responsible for consistent
+ * (e.g. outward) winding of the triples — see MFTLObjectVolume's sign.
+ *
+ * Fills vertices/triangles/half_edges, assigns sequential global ids and sets
+ * the next_*_gid counters, links one outgoing half-edge per vertex, then runs
+ * MFTLRebuildTwins + MFTLFlattenConnectivity. Positions are stored verbatim
+ * (NO periodic wrapping — callers apply MFTLApplyPeriodicity beforehand if
+ * desired). The object must be empty.
+ */
+void MFTLBuildTopologyFromTriples(MFTL_Object* obj, int nV, const double positions[][3], int nF, const int triples[][3]);
+
 #endif  // MFTL_TOPOLOGY_H

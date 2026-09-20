@@ -1,10 +1,15 @@
 # 07 — Point queries (point-in-object, point-triangle distance) + OBB tree
 
-Status: NOT STARTED
+Status: COMPLETE
 Depends on: 01
-Implemented by:
-Reviewed by:
-Acceptance: NOT PASSED
+Implemented by: Kimi Code
+Reviewed by: Claude Code
+Acceptance: PASSED
+
+> **Follow-up (resolved):** `MFTLPointInsideObject` now builds the candidate LBVH once
+> before the ray-cast retry loop and reuses it across all attempts (was rebuilt per
+> attempt). Regression `test_bvh_built_once` forces a degenerate retry via a
+> vertex-grazing probe and asserts BVH builds == query count.
 
 ## Objective
 Provide point-in-object classification (ray casting), point-triangle distance, and an

@@ -517,12 +517,51 @@ int CountFeatureEdges(MFTL_Object *obj, int v_idx)
   return feat_count;
 }
 
+// Stage 08: unit normal of a triangle from current vertex positions.
+static void mftlUnitNormalFromTri(MFTL_Object* obj, int tri_idx, double n[3])
+{
+  MFTL_Vertex* vv[3];
+  MFTLGetTriangleVertices(obj, &obj->triangles[tri_idx], vv);
+  double e0[3] = {vv[1]->pos[0] - vv[0]->pos[0], vv[1]->pos[1] - vv[0]->pos[1], vv[1]->pos[2] - vv[0]->pos[2]};
+  double e1[3] = {vv[2]->pos[0] - vv[0]->pos[0], vv[2]->pos[1] - vv[0]->pos[1], vv[2]->pos[2] - vv[0]->pos[2]};
+  n[0] = e0[1] * e1[2] - e0[2] * e1[1];
+  n[1] = e0[2] * e1[0] - e0[0] * e1[2];
+  n[2] = e0[0] * e1[1] - e0[1] * e1[0];
+  double len = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+  if (len < MFTL_VERYSMALL)
+  {
+    n[0] = n[1] = n[2] = 0.0;
+    return;
+  }
+  n[0] /= len;
+  n[1] /= len;
+  n[2] /= len;
+}
+
+// Geometric sharp-edge test: the angle between the two adjacent triangle
+// normals exceeds the feature threshold (flag-independent, so protection
+// holds even when the caller never ran MFTLDetectFeatures).
+static int mftlEdgeIsGeometricallySharp(MFTL_Object* obj, int he_idx, double angle_degrees)
+{
+  const MFTL_HalfEdge* he = &obj->half_edges[he_idx];
+  if (he->twin_idx == MFTL_ERROR) return 1;  // boundary: treat as feature
+  double n1[3], n2[3];
+  mftlUnitNormalFromTri(obj, he->triangle_idx, n1);
+  mftlUnitNormalFromTri(obj, obj->half_edges[he->twin_idx].triangle_idx, n2);
+  double dot = n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2];
+  return dot < MFTL_COS(angle_degrees * MFTL_PI / 180.0);
+}
+
 int CollapseApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params)
 {
   MFTL_HalfEdge *he = &obj->half_edges[he_idx];
 
   // 1. Status Checks
   if (he->flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) return MFTL_FALSE;
+
+  // 1.2 Geometric feature protection (Stage 08 review): a sharp edge must
+  // never be collapsed, regardless of pre-set feature flags.
+  if (mftlEdgeIsGeometricallySharp(obj, he_idx, params->feature_angle_threshold)) return MFTL_FALSE;
 
   // --- CHECK VERTEX FLAGS ---
   // Prevent chained collapses by checking if vertices are already dirty
@@ -539,9 +578,25 @@ int CollapseApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params
   // Boundary Edge Detection
   bool is_boundary_edge = (he->twin_idx == MFTL_ERROR);
 
-  // 2. Length Check (Squared distance optimization)
-  double len_sq = MFTLGetEdgeLengthSquared(obj, he);
-  if (len_sq > params->min_edge_length_sq) return MFTL_FALSE;
+  // 2. Criterion Check (Stage 08): reject unless the criterion says the edge
+  // is short enough to collapse.
+  if (params->criterion == MFTL_CRITERION_TRIANGLE_AREA)
+  {
+    double a1 = obj->triangles[he->triangle_idx].area;
+    double a2 = 0.0;
+    if (he->twin_idx != MFTL_ERROR) a2 = obj->triangles[obj->half_edges[he->twin_idx].triangle_idx].area;
+    double amin = a1 < a2 ? a1 : a2;
+    if (amin > params->min_area_threshold) return MFTL_FALSE;
+  }
+  else if (params->criterion == MFTL_CRITERION_BOTSCH_KOBBELT_CURVATURE)
+  {
+    if (!MFTLBotschKobbeltCurvatureThreshold(obj, he_idx, params, 2)) return MFTL_FALSE;
+  }
+  else
+  {
+    double len_sq0 = MFTLGetEdgeLengthSquared(obj, he);
+    if (len_sq0 > params->min_edge_length_sq) return MFTL_FALSE;
+  }
 
   // 3. Topology: Link Condition (The Intersection Test)
   // We need to ensure A and B share exactly 2 neighbors (for interior edge).
@@ -652,11 +707,37 @@ static inline int SplitApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParamet
   if (obj->vertices[v_a].flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) return MFTL_FALSE;
   if (obj->vertices[v_b].flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) return MFTL_FALSE;
 
-  // Check if edge is too long
-  double len_sq = MFTLGetEdgeLengthSquared(obj, he);
-  if (len_sq > params->max_edge_length_sq)
+  // 2. Criterion check (Stage 08: MFTL1 RemeshCriteria parity)
+  switch (params->criterion)
   {
-    approved = MFTL_TRUE;
+    case MFTL_CRITERION_TRIANGLE_AREA:
+    {
+      // Split when an adjacent triangle exceeds the max-area threshold.
+      double a1 = obj->triangles[he->triangle_idx].area;
+      double a2 = 0.0;
+      if (he->twin_idx != MFTL_ERROR) a2 = obj->triangles[obj->half_edges[he->twin_idx].triangle_idx].area;
+      approved = (a1 > params->max_area_threshold || a2 > params->max_area_threshold);
+      break;
+    }
+    case MFTL_CRITERION_BOTSCH_KOBBELT_CURVATURE:
+      approved = MFTLBotschKobbeltCurvatureThreshold(obj, he_idx, params, 1);
+      break;
+    case MFTL_CRITERION_JIAO:
+    {
+      // Jiao 2010: relative longness floor + absolute max-length split.
+      double len_sq = MFTLGetEdgeLengthSquared(obj, he);
+      if (len_sq < params->reference_length * params->reference_length) break;
+      approved = (len_sq > params->max_edge_length_sq);
+      break;
+    }
+    case MFTL_CRITERION_BOTSCH_KOBBELT:
+    default:
+    {
+      // Check if edge is too long
+      double len_sq = MFTLGetEdgeLengthSquared(obj, he);
+      if (len_sq > params->max_edge_length_sq) approved = MFTL_TRUE;
+      break;
+    }
   }
 
   return approved;
@@ -711,10 +792,12 @@ void MFTLFlipEdge(MFTL_Object *obj, int he_idx)
   obj->half_edges[he_ba_idx].vertex_idx = v_d;
 }
 
+// Stage 08 gated flip (defined below; declared here for the driver).
+int FlipApprovedWithParams(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params);
+
 int FlipApproved(MFTL_Object *obj, int he_idx)
 {
   MFTL_HalfEdge *he_ab = &obj->half_edges[he_idx];
-
   int he_ba_idx = he_ab->twin_idx;
 
   MFTL_HalfEdge *he_ba = &obj->half_edges[he_ba_idx];
@@ -1223,14 +1306,6 @@ void MFTLDetectFeatures(MFTL_Object *obj, double angle_degrees)
 
 void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
 {
-  for (int i = 0; i < ens->num_objects; i++)
-  {
-    MFTL_Object *obj = ens->objects[i];
-
-    // DETECT FEATURES
-    MFTLDetectFeatures(obj, params->feature_angle_threshold);
-  }
-
   int iter = 0;
 
   bool collapses_occurred[ens->num_objects];
@@ -1268,12 +1343,27 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
       int obj_collapse = 0;
       int obj_swap = 0;
 
+      // Stage 08: refresh geometry for the criteria, fitting and smoothing,
+      // and re-detect features EVERY iteration: the ops change the geometry
+      // and feature protection must track it without the caller pre-setting
+      // flags. Detection consumes triangle normals, so it runs after the
+      // property refresh.
+      MFTLComputeTriangleProperties(obj);
+      MFTLDetectFeatures(obj, params->feature_angle_threshold);
+      if (params->vertex_fit != MFTL_FIT_NONE || params->criterion == MFTL_CRITERION_BOTSCH_KOBBELT_CURVATURE ||
+          params->smooth_mode == MFTL_SMOOTH_CURVATURE_BASED)
+      {
+        MFTLComputeVertexNormals(obj);
+        if (params->criterion == MFTL_CRITERION_BOTSCH_KOBBELT_CURVATURE || params->smooth_mode == MFTL_SMOOTH_CURVATURE_BASED)
+          MFTLComputeVertexCurvatures(obj);
+      }
+
       // 1. SPLIT
       for (int j = obj->n_half_edges - 1; j >= 0; j--)
       {
         if (SplitApproved(obj, j, params))
         {
-          MFTLSplitEdge(obj, j);
+          MFTLSplitEdgeWithFit(obj, j, params);
           obj_split++;
         }
       }
@@ -1283,13 +1373,13 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
       {
         if (CollapseApproved(obj, j, params))
         {
-          MFTLCollapseEdge(obj, j);
+          MFTLCollapseEdgeWithFit(obj, j, params);
           collapses_occurred[i] = MFTL_TRUE;
           obj_collapse++;
         }
       }
 
-      // 3. SWAP / FLIP (Valence Optimization)
+      // 3. SWAP / FLIP (Valence Optimization + quality/dihedral gates)
       for (int j = 0; j < obj->n_half_edges; ++j)
       {
         MFTL_HalfEdge *he = &obj->half_edges[j];
@@ -1307,17 +1397,15 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
         if (he->flags & MFTL_FLAG_FEATURE) continue;
 
         // Now evaluate for flip
-        if (FlipApproved(obj, j))
+        if (FlipApprovedWithParams(obj, j, params))
         {
           MFTLFlipEdge(obj, j);
           obj_swap++;
         }
       }
 
-      // 4. SMOOTH (Tangential)
-      // Usually, it's beneficial to run multiple smoothing iterations per pass
-      // to really relax the mesh before the next split/collapse phase.
-      MFTLSmoothTangential(obj, params->smooth_mode, 1.0);
+      // 4. SMOOTH (Tangential; mode/iterations from params)
+      MFTLSmoothTangentialWithParams(obj, params);
 
       // Reset visited flags
       for (int j = 0; j < obj->n_half_edges; ++j)
@@ -1366,4 +1454,309 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
     MFTL_Object *obj = ens->objects[i];
     MFTLFinalizeRemeshing(obj, start_n_vertices[i], start_n_triangles[i], start_n_halfedges[i], collapses_occurred[i]);
   }
+}
+
+/* ========================================================================== */
+/* Stage 08 — criteria support, gated flips, params-driven smoothing          */
+/* ========================================================================== */
+
+// MFTL1 triangle quality: q = (perimeter^2 / area) / 20.78460969.
+// 1.0 = equilateral; LARGER is worse.
+double MFTL_TriangleQuality(const MFTL_Object* obj, int tri_idx)
+{
+  MFTL_Vertex* vv[3];
+  MFTLGetTriangleVertices(obj, &obj->triangles[tri_idx], vv);
+  double e0 = 0.0, e1 = 0.0, e2 = 0.0;
+  for (int k = 0; k < 3; ++k)
+  {
+    double d;
+    d = vv[1]->pos[k] - vv[0]->pos[k];
+    e0 += d * d;
+    d = vv[2]->pos[k] - vv[1]->pos[k];
+    e1 += d * d;
+    d = vv[0]->pos[k] - vv[2]->pos[k];
+    e2 += d * d;
+  }
+  double a = sqrt(e0), b = sqrt(e1), c = sqrt(e2);
+  double p = a + b + c;
+  double c0[3] = {vv[1]->pos[0] - vv[0]->pos[0], vv[1]->pos[1] - vv[0]->pos[1], vv[1]->pos[2] - vv[0]->pos[2]};
+  double c1[3] = {vv[2]->pos[0] - vv[0]->pos[0], vv[2]->pos[1] - vv[0]->pos[1], vv[2]->pos[2] - vv[0]->pos[2]};
+  double cx = c0[1] * c1[2] - c0[2] * c1[1];
+  double cy = c0[2] * c1[0] - c0[0] * c1[2];
+  double cz = c0[0] * c1[1] - c0[1] * c1[0];
+  double A = 0.5 * sqrt(cx * cx + cy * cy + cz * cz);
+  if (A < MFTL_VERYSMALL) return 1e9;  // degenerate: worst quality
+  return (p * p / A) / 20.78460969;
+}
+
+// Botsch-Kobbelt curvature-adaptive thresholds (MFTL1 edgesplit.c parity).
+// kappa_max = mean + sqrt(mean^2 - gauss) at both endpoints;
+// L = sqrt(6*eps/kappa - 3*eps^2) clamped to [min, max] edge length;
+// split (flag 1) above 4L/3, collapse (flag 2) below 0.8L.
+int MFTLBotschKobbeltCurvatureThreshold(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params, int split_or_collapse)
+{
+  MFTL_HalfEdge* he = &obj->half_edges[he_idx];
+  int he_next = he->next_idx;
+  int he_prev = obj->half_edges[he_next].next_idx;
+  int v1 = obj->half_edges[he_prev].vertex_idx;
+  int v2 = he->vertex_idx;
+
+  double k1 = obj->vertices[v1].meancurvature + sqrt(MFTL_MAX(0.0, MFTL_SQ(obj->vertices[v1].meancurvature) - obj->vertices[v1].gaussiancurvature));
+  double k2 = obj->vertices[v2].meancurvature + sqrt(MFTL_MAX(0.0, MFTL_SQ(obj->vertices[v2].meancurvature) - obj->vertices[v2].gaussiancurvature));
+  k1 = MFTL_MAX(k1, MFTL_VERYSMALL);
+  k2 = MFTL_MAX(k2, MFTL_VERYSMALL);
+
+  double L1 = sqrt(MFTL_MAX(0.0, (6.0 * params->epsilon / k1) - 3.0 * MFTL_SQ(params->epsilon)));
+  double L2 = sqrt(MFTL_MAX(0.0, (6.0 * params->epsilon / k2) - 3.0 * MFTL_SQ(params->epsilon)));
+  double L = MFTL_MIN(L1, L2);
+  L = MFTL_MIN(L, params->max_edge_length);
+  L = MFTL_MAX(L, params->min_edge_length);
+
+  double high = 4.0 * L / 3.0;
+  double low = 0.8 * L;
+  double edge_length = sqrt(MFTLGetEdgeLengthSquared(obj, he));
+
+  if (split_or_collapse == 1) return edge_length > high;
+  return edge_length < low;
+}
+
+static inline double mftlTriQualityFromPos(const double a[3], const double b[3], const double c[3])
+{
+  double e0 = 0.0, e1 = 0.0, e2 = 0.0;
+  for (int k = 0; k < 3; ++k)
+  {
+    double d;
+    d = b[k] - a[k];
+    e0 += d * d;
+    d = c[k] - b[k];
+    e1 += d * d;
+    d = a[k] - c[k];
+    e2 += d * d;
+  }
+  double p = sqrt(e0) + sqrt(e1) + sqrt(e2);
+  double c0[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+  double c1[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
+  double cx = c0[1] * c1[2] - c0[2] * c1[1];
+  double cy = c0[2] * c1[0] - c0[0] * c1[2];
+  double cz = c0[0] * c1[1] - c0[1] * c1[0];
+  double A = 0.5 * sqrt(cx * cx + cy * cy + cz * cz);
+  if (A < MFTL_VERYSMALL) return 1e9;
+  return (p * p / A) / 20.78460969;
+}
+
+// FlipApproved extended with the Stage-08 gate stack: MFTL1 quality threshold
+// and the max-angle-between-triangles (dihedral) gate. params == NULL keeps
+// the legacy valence-only behaviour.
+int FlipApprovedWithParams(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
+{
+  if (!FlipApproved(obj, he_idx)) return MFTL_FALSE;
+  if (!params) return MFTL_TRUE;
+
+  MFTL_HalfEdge* he_ab = &obj->half_edges[he_idx];
+  int he_ba_idx = he_ab->twin_idx;
+  int v_b = he_ab->vertex_idx;
+  int v_a = obj->half_edges[he_ba_idx].vertex_idx;
+  int v_c = obj->half_edges[he_ab->next_idx].vertex_idx;
+  int v_d = obj->half_edges[obj->half_edges[he_ba_idx].next_idx].vertex_idx;
+
+  const double* pa = obj->vertices[v_a].pos;
+  const double* pb = obj->vertices[v_b].pos;
+  const double* pc = obj->vertices[v_c].pos;
+  const double* pd = obj->vertices[v_d].pos;
+
+  // Quality gate: reject when a created triangle would be worse than the
+  // configured worst quality.
+  double q1 = mftlTriQualityFromPos(pc, pd, pa);
+  double q2 = mftlTriQualityFromPos(pc, pd, pb);
+  if (q1 > params->max_quality_threshold || q2 > params->max_quality_threshold) return MFTL_FALSE;
+
+  // Dihedral gate: reject when the angle between the new triangle normals
+  // exceeds max_angle_between_tris (degrees).
+  if (params->max_angle_between_tris < 179.0)
+  {
+    double n1[3], n2[3];
+    double u1[3] = {pd[0] - pc[0], pd[1] - pc[1], pd[2] - pc[2]};
+    double u2[3] = {pa[0] - pc[0], pa[1] - pc[1], pa[2] - pc[2]};
+    n1[0] = u1[1] * u2[2] - u1[2] * u2[1];
+    n1[1] = u1[2] * u2[0] - u1[0] * u2[2];
+    n1[2] = u1[0] * u2[1] - u1[1] * u2[0];
+    double w1[3] = {pd[0] - pc[0], pd[1] - pc[1], pd[2] - pc[2]};
+    double w2[3] = {pb[0] - pc[0], pb[1] - pc[1], pb[2] - pc[2]};
+    n2[0] = w1[1] * w2[2] - w1[2] * w2[1];
+    n2[1] = w1[2] * w2[0] - w1[0] * w2[2];
+    n2[2] = w1[0] * w2[1] - w1[1] * w2[0];
+    double l1 = sqrt(n1[0] * n1[0] + n1[1] * n1[1] + n1[2] * n1[2]);
+    double l2 = sqrt(n2[0] * n2[0] + n2[1] * n2[1] + n2[2] * n2[2]);
+    if (l1 > MFTL_VERYSMALL && l2 > MFTL_VERYSMALL)
+    {
+      double dot = (n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2]) / (l1 * l2);
+      if (dot > 1.0) dot = 1.0;
+      if (dot < -1.0) dot = -1.0;
+      double angle = acos(dot) * 180.0 / MFTL_PI;
+      if (angle > params->max_angle_between_tris) return MFTL_FALSE;
+    }
+  }
+
+  return MFTL_TRUE;
+}
+
+// Tangential smoothing driven by params. QUALITY_DRIVEN accepts a move only
+// when the local minimum triangle quality improves; CURVATURE_BASED weights
+// the centroid by area * L_target(curvature) (MFTL1 tangentialrelaxation.c).
+// Feature vertices and corners are left fixed in the Stage-08 modes.
+void MFTLSmoothTangentialWithParams(MFTL_Object* obj, MFTL_RemeshParameters* params)
+{
+  if (obj->n_vertices == 0) return;
+  double relaxation = 1.0;
+  int iters = params && params->max_smoothing_iter > 0 ? params->max_smoothing_iter : 3;
+  MFTL_SmoothMode mode = params ? params->smooth_mode : MFTL_SMOOTH_VERTEX_BASED;
+
+  double (*new_pos)[3] = malloc(obj->n_vertices * sizeof(double[3]));
+  assert(new_pos != MFTL_NULL);
+  MFTL_Vertex* ring_verts[64];
+  MFTL_Triangle* ring_tris[32];
+
+  for (int s = 0; s < iters; ++s)
+  {
+    for (int i = 0; i < obj->n_vertices; ++i)
+    {
+      MFTL_Vertex* v = &obj->vertices[i];
+      if ((v->flags & MFTL_FLAG_DEAD) || v->out_he_idx == MFTL_ERROR) continue;
+      new_pos[i][0] = v->pos[0];
+      new_pos[i][1] = v->pos[1];
+      new_pos[i][2] = v->pos[2];
+
+      // feature / boundary census
+      int bnd_count = 0;
+      int feat_count = 0;
+      int he = v->out_he_idx;
+      int start = he;
+      do
+      {
+        MFTL_HalfEdge* curr = &obj->half_edges[he];
+        if (curr->twin_idx == MFTL_ERROR)
+          bnd_count++;
+        else if (curr->flags & MFTL_FLAG_FEATURE)
+          feat_count++;
+        if (curr->twin_idx == MFTL_ERROR) break;
+        he = obj->half_edges[curr->twin_idx].next_idx;
+      } while (he != start && he != MFTL_ERROR);
+
+      int locked = (bnd_count > 0 || feat_count > 0);
+      if (mode == MFTL_SMOOTH_QUALITY_DRIVEN || mode == MFTL_SMOOTH_CURVATURE_BASED)
+      {
+        // Stage-08 modes: feature vertices are fixed
+        if (locked) continue;
+      }
+      else if (locked)
+      {
+        continue;  // legacy modes keep the existing ridge/corner handling elsewhere
+      }
+
+      // candidate centroid
+      double center[3] = {0, 0, 0};
+      double denom = 0.0;
+      if (mode == MFTL_SMOOTH_CURVATURE_BASED)
+      {
+        // area * L_target weighted triangle centres (MFTL1 CurvatureBased)
+        int nt = MFTLGetVertexOneRing(obj, v, ring_tris, 32, MFTL_TRUE);
+        for (int k = 0; k < nt; ++k)
+        {
+          MFTL_Triangle* t = ring_tris[k];
+          double Lavg = 0.0;
+          MFTL_Vertex* tv[3];
+          MFTLGetTriangleVertices(obj, t, tv);
+          for (int j = 0; j < 3; ++j)
+          {
+            double mc = tv[j]->meancurvature;
+            double gc = tv[j]->gaussiancurvature;
+            double kmax = mc + sqrt(MFTL_MAX(0.0, MFTL_SQ(mc) - gc));
+            kmax = MFTL_MAX(kmax, MFTL_VERYSMALL);
+            double Lv = sqrt(MFTL_MAX(0.0, 6.0 * params->epsilon / kmax - 3.0 * MFTL_SQ(params->epsilon)));
+            Lv = MFTL_MIN(Lv, params->max_edge_length);
+            Lv = MFTL_MAX(Lv, params->min_edge_length);
+            Lavg += Lv / 3.0;
+          }
+          double w = t->area * Lavg;
+          center[0] += w * t->center[0];
+          center[1] += w * t->center[1];
+          center[2] += w * t->center[2];
+          denom += w;
+        }
+      }
+      else
+      {
+        int degree = MFTLGetVertexOneRingVertices(obj, v, ring_verts, 64, MFTL_TRUE);
+        for (int k = 0; k < degree; ++k)
+        {
+          center[0] += ring_verts[k]->pos[0];
+          center[1] += ring_verts[k]->pos[1];
+          center[2] += ring_verts[k]->pos[2];
+        }
+        denom = degree;
+      }
+      if (denom <= 0) continue;
+      center[0] /= denom;
+      center[1] /= denom;
+      center[2] /= denom;
+
+      // vertex normal for the tangential projection
+      double nx = 0, ny = 0, nz = 0;
+      int degree = MFTLGetVertexOneRingVertices(obj, v, ring_verts, 64, MFTL_TRUE);
+      for (int k = 0; k < degree; ++k)
+      {
+        MFTL_Vertex* v1 = ring_verts[k];
+        MFTL_Vertex* v2 = ring_verts[(k + 1) % degree];
+        double d1[3] = {v1->pos[0] - v->pos[0], v1->pos[1] - v->pos[1], v1->pos[2] - v->pos[2]};
+        double d2[3] = {v2->pos[0] - v->pos[0], v2->pos[1] - v->pos[1], v2->pos[2] - v->pos[2]};
+        nx += (d1[1] * d2[2] - d1[2] * d2[1]);
+        ny += (d1[2] * d2[0] - d1[0] * d2[2]);
+        nz += (d1[0] * d2[1] - d1[1] * d2[0]);
+      }
+      double n_len = sqrt(nx * nx + ny * ny + nz * nz);
+      if (n_len < 1e-12) continue;
+      nx /= n_len;
+      ny /= n_len;
+      nz /= n_len;
+
+      double disp[3] = {center[0] - v->pos[0], center[1] - v->pos[1], center[2] - v->pos[2]};
+      double dot = disp[0] * nx + disp[1] * ny + disp[2] * nz;
+      double cand[3] = {v->pos[0] + relaxation * (disp[0] - dot * nx), v->pos[1] + relaxation * (disp[1] - dot * ny),
+                        v->pos[2] + relaxation * (disp[2] - dot * nz)};
+
+      if (mode == MFTL_SMOOTH_QUALITY_DRIVEN)
+      {
+        // accept only when the local minimum quality improves
+        MFTL_Triangle* tris[32];
+        int nt = MFTLGetVertexOneRing(obj, v, tris, 32, MFTL_TRUE);
+        double q_before = 0.0, q_after = 0.0;
+        for (int k = 0; k < nt; ++k)
+        {
+          MFTL_Vertex* tv[3];
+          MFTLGetTriangleVertices(obj, tris[k], tv);
+          double qb = mftlTriQualityFromPos(tv[0]->pos, tv[1]->pos, tv[2]->pos);
+          double p0[3], p1[3], p2[3];
+          memcpy(p0, tv[0]->pos, sizeof(p0));
+          memcpy(p1, tv[1]->pos, sizeof(p1));
+          memcpy(p2, tv[2]->pos, sizeof(p2));
+          if (tv[0] == v) memcpy(p0, cand, sizeof(p0));
+          if (tv[1] == v) memcpy(p1, cand, sizeof(p1));
+          if (tv[2] == v) memcpy(p2, cand, sizeof(p2));
+          double qa = mftlTriQualityFromPos(p0, p1, p2);
+          if (qb > q_before) q_before = qb;
+          if (qa > q_after) q_after = qa;
+        }
+        if (q_after >= q_before) continue;  // no improvement: keep position
+      }
+
+      memcpy(new_pos[i], cand, sizeof(cand));
+    }
+
+    for (int i = 0; i < obj->n_vertices; ++i)
+    {
+      if ((obj->vertices[i].flags & MFTL_FLAG_DEAD) || obj->vertices[i].out_he_idx == MFTL_ERROR) continue;
+      memcpy(obj->vertices[i].pos, new_pos[i], 3 * sizeof(double));
+    }
+  }
+  free(new_pos);
 }

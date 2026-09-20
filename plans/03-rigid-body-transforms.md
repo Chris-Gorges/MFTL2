@@ -1,10 +1,10 @@
 # 03 — Rigid-body transforms (scale, translate, rotate) + optional periodic wrap
 
-Status: NOT STARTED
+Status: COMPLETE
 Depends on: 02
-Implemented by:
-Reviewed by:
-Acceptance: NOT PASSED
+Implemented by: Kimi Code
+Reviewed by: Claude Code
+Acceptance: PASSED
 
 ## Objective
 Provide in-place object transforms — uniform/per-axis scale, translation, and rotation about a

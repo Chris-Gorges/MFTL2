@@ -1,10 +1,10 @@
 # 04 — Object generators (cylinder, box, cube, face) to sphere parity
 
-Status: NOT STARTED
+Status: COMPLETE
 Depends on: 02
-Implemented by:
-Reviewed by:
-Acceptance: NOT PASSED
+Implemented by: Kimi Code
+Reviewed by: Claude Code
+Acceptance: PASSED
 
 ## Objective
 Bring MFTL2's built-in geometry generators to MFTL1 parity. MFTL2 today has only

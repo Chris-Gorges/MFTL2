@@ -119,8 +119,27 @@ typedef enum
 typedef enum
 {
   MFTL_SMOOTH_VERTEX_BASED,
-  MFTL_SMOOTH_TRIANGLE_BASED
+  MFTL_SMOOTH_TRIANGLE_BASED,
+  MFTL_SMOOTH_QUALITY_DRIVEN,  // Stage 08: move only if local quality improves
+  MFTL_SMOOTH_CURVATURE_BASED  // Stage 08: curvature-scaled tangential move
 } MFTL_SmoothMode;
+
+// Remeshing criteria (MFTL1 RemeshCriteria parity, mftl-constants.h).
+typedef enum
+{
+  MFTL_CRITERION_TRIANGLE_AREA = 0,
+  MFTL_CRITERION_BOTSCH_KOBBELT = 1,
+  MFTL_CRITERION_BOTSCH_KOBBELT_CURVATURE = 2,
+  MFTL_CRITERION_JIAO = 3
+} MFTL_RemeshCriterion;
+
+// Vertex fitting mode for new/moved vertices (MFTL1 MFTL_VertexFit parity).
+typedef enum
+{
+  MFTL_FIT_NONE = 0,
+  MFTL_FIT_PARABOLOID = 1,
+  MFTL_FIT_BARYCENTRIC = 2
+} MFTL_VertexFitMode;
 
 typedef struct
 {
@@ -136,6 +155,18 @@ typedef struct
   double max_edge_length_sq;
 
   double feature_angle_threshold;
+
+  // --- Stage 08: criteria, thresholds, fitting, smoothing ---
+  MFTL_RemeshCriterion criterion;   // which split/collapse criterion drives the pass
+  MFTL_VertexFitMode vertex_fit;    // fitting for new/moved vertices (feature edges excluded)
+  double epsilon;                   // curvature criterion: max deviation from the surface
+  double reference_length;          // Jiao/standard relative reference length
+  double min_area_threshold;        // triangle-area criterion
+  double max_area_threshold;
+  double max_angle_between_tris;    // flip gate: max dihedral (degrees) of created triangles
+  double min_quality_threshold;     // smoothing quality window (MFTL1 quality, 1 = perfect)
+  double max_quality_threshold;     // flip/smoothing gate: reject worse-than-this quality
+  int max_smoothing_iter;           // tangential smoothing iterations per pass
 
   // ... any other parameters like smoothing weights, boundary locks, etc.
 } MFTL_RemeshParameters;
@@ -182,6 +213,20 @@ static inline void MFTLInitRemeshParams(MFTL_RemeshParameters *params, MFTL_Reme
   // Pre-calculate squared values for fast distance checks
   params->min_edge_length_sq = params->min_edge_length * params->min_edge_length;
   params->max_edge_length_sq = params->max_edge_length * params->max_edge_length;
+
+  // --- Stage 08 defaults (MFTL1 RemeshParameter parity) ---
+  params->criterion = MFTL_CRITERION_BOTSCH_KOBBELT;
+  params->vertex_fit = MFTL_FIT_PARABOLOID;
+  params->epsilon = 0.02 * target_length;                 // deviation bound; ~good default
+  params->reference_length = target_length;
+  // Triangle-area criterion: equilateral area for the target length.
+  params->min_area_threshold = 0.25 * sqrt(3.0) * params->min_edge_length * params->min_edge_length;
+  params->max_area_threshold = 0.25 * sqrt(3.0) * params->max_edge_length * params->max_edge_length;
+  params->max_angle_between_tris = feature_angle_threshold;  // degrees
+  // MFTL1 quality q = (p^2 / A) / 20.78460969: 1.0 = equilateral, larger = worse.
+  params->min_quality_threshold = 1.2;
+  params->max_quality_threshold = 2.0;
+  params->max_smoothing_iter = 3;
 }
 
 // --- Core Topological Operators ---
@@ -191,6 +236,50 @@ static inline void MFTLInitRemeshParams(MFTL_RemeshParameters *params, MFTL_Reme
 int MFTLSplitEdge(MFTL_Object *obj, int he_ab_idx);
 void MFTLCollapseEdge(MFTL_Object *obj, int he_ab_idx);
 int MFTLSwapEdge(MFTL_Object *obj, int he_idx);
+
+// --- Stage 08: criteria, fitting, smoothing ---
+
+/**
+ * @brief MFTL1 triangle quality q = (perimeter^2 / area) / 20.78460969.
+ * 1.0 = equilateral; LARGER is worse. Used by the flip and smoothing gates.
+ */
+double MFTL_TriangleQuality(const MFTL_Object* obj, int tri_idx);
+
+/**
+ * @brief Botsch-Kobbelt curvature-adaptive edge threshold (MFTL1 parity):
+ * kappa_max = mean + sqrt(mean^2 - gauss) per endpoint; L = sqrt(6*eps/kappa
+ * - 3*eps^2) clamped to [min_edge_length, max_edge_length]; split above
+ * 4L/3 (flag 1), collapse below 0.8L (flag 2). Requires current curvatures.
+ */
+int MFTLBotschKobbeltCurvatureThreshold(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params, int split_or_collapse);
+
+/**
+ * @brief Reposition vertex v_idx (created on he_idx, or the surviving vertex
+ * of a collapse) onto the fitted surface. Dispatches on params->vertex_fit:
+ * paraboloid least squares (LAPACK dgelsy when MFTL_HAVE_LAPACK; without it,
+ * or when the fit is rank-deficient, the barycentric butterfly; ultimate
+ * fallback keeps the midpoint). SKIPPED for feature edges.
+ */
+void MFTLFitVertex(MFTL_Object* obj, int v_idx, int he_idx, MFTL_RemeshParameters* params);
+
+/** @brief MFTLSplitEdge followed by MFTLFitVertex on the new midpoint. */
+int MFTLSplitEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParameters* params);
+
+/** @brief MFTLCollapseEdge followed by MFTLFitVertex on the surviving vertex. */
+void MFTLCollapseEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParameters* params);
+
+/** @brief MFTLSmoothTangential driven by params (mode, max_smoothing_iter, quality gates). */
+void MFTLSmoothTangentialWithParams(MFTL_Object* obj, MFTL_RemeshParameters* params);
+
+/** @brief Flag half-edges whose adjacent triangle normals differ by more than angle_degrees as MFTL_FLAG_FEATURE. */
+void MFTLDetectFeatures(MFTL_Object *obj, double angle_degrees);
+
+/**
+ * @brief Collapse gate (MFTL1 thresholds + Stage 08 geometric feature
+ * protection): status/one-touch checks, criterion length test, link
+ * condition, boundary and stretch guards, feature-endpoint rules.
+ */
+int CollapseApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params);
 
 // --- High Level Routine ---
 void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params);

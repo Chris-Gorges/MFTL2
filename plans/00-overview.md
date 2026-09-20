@@ -74,6 +74,21 @@ Historical record — HEAD `f4795fe` did not build for two reasons, both fixed i
 2. **Volume** = `⅙ Σ_tri v₁·(v₂×v₃)` about the coordinate origin (MFTL1
    `parallel/objectvolume.c:VolumeFace`). This is the ground truth for all conservation
    checks. Requires closed, consistently-oriented surface.
+   **⚠ Winding caveat (open cross-cutting item, discovered in the Stage 02–06 review):**
+   each object is internally consistently oriented, but the sign is **not uniform across
+   mesh sources** — `MFTLGenerateSphere` winds **inward** (signed volume `V < 0`, inward
+   normals), while the Stage-04 generators (box/cube/cylinder) and the canonicalized GTS
+   reader wind **outward** (`V > 0`). Stages 02–06 handle this correctly (magnitude-based
+   comparisons; tests pin the actual sign per source), so it does not block their
+   acceptance. But it is a latent hazard for anything that uses normal **direction** or
+   inter-object relative orientation — point-in-object (07), overlap normal `½(N_A−N_B)`
+   (11), periodic image tests (13), and especially the front-tracking surface-tension /
+   indicator coupling in the CFD migration (14/15), where inward-normal interfaces would
+   give wrong-signed forces. **Recommended resolution:** standardize on outward winding by
+   flipping `generate_icosahedron`'s triangle table (a small production change) and updating
+   the `V < 0` assertions in `test_object_integrals.c` / `test_transforms.c` to `V > 0`;
+   re-verify the pre-existing intersection and LeVeque examples, which currently assume the
+   inward sphere. Deferred here to avoid a broad, coordinated change during a stage review.
 3. **Surface centroid** = area-weighted vertex-sum ÷ (3·total area) (MFTL1
    `objectcentre.c`). **Moment of inertia** = lumped tetra approximation about the volume
    centroid, uniform density (MFTL1 `momentofinertia.c`) — **not** the exact
@@ -138,6 +153,21 @@ terminal velocity — plus explicit coverage of the opaque `CellData` byte-trans
 currently-disabled periodic/clamping advection behavior.
 
 ## Stage list & dependency order
+
+**Progress (2026-09-20):** Stages **01–08 COMPLETE / Acceptance PASSED** (implemented by
+Kimi Code, reviewed by Claude Code; Release + ASan/UBSan clean — incl. LAPACK/OpenBLAS
+for Stage 08's paraboloid fit — full suite green on 1/2/4/8 ranks). Stages 09–15 NOT
+STARTED. See the winding caveat in invariant #2 below — a cross-cutting item to resolve
+before Stages 11/13/14 rely on normal direction. The two Stage 07/08 follow-up items are
+now **RESOLVED** (reviewed by Claude Code; Release + ASan/UBSan clean incl. LAPACK):
+(a) Stage 07 — `MFTLPointInsideObject` builds the LBVH ONCE before the retry loop and
+reuses it (regression `test_bvh_built_once` asserts builds == queries across a forced
+retry); (b) Stage 08 — the remesh driver auto-runs `MFTLDetectFeatures` every pass, and
+collapse is now feature-protected flag-independently (a geometric sharp-edge gate in
+`CollapseApproved` + feature-line/hard-corner gating; the fit paths use the geometric
+`mftlEdgeIsFeatureEx`), so sharp features survive even without caller pre-flagging
+(regression `test_collapse_geometric_gate_no_flags`). Geometric feature detection is a
+no-op on smooth surfaces and MFTL1-consistent on coarse curved ones.
 
 `01` build/harness → everything.
 `02` integrals → `03` transforms, `04` generators, `09` volume-conserving smoothing, `11` overlap.

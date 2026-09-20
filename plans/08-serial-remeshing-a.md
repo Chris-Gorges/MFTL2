@@ -1,10 +1,21 @@
 # 08 — Serial remeshing A: criteria, vertex fitting, feature protection, tangential smoothing
 
-Status: NOT STARTED
+Status: COMPLETE
 Depends on: 01, 06 (+ LAPACK from 01)
-Implemented by:
-Reviewed by:
-Acceptance: NOT PASSED
+Implemented by: Kimi Code
+Reviewed by: Claude Code
+Acceptance: PASSED
+
+> **Follow-up (resolved):** feature protection is now automatic. The remesh driver runs
+> `MFTLDetectFeatures` every pass (after refreshing triangle normals; the detector sets
+> AND clears flags to track the evolving geometry). Collapse is protected
+> flag-independently: `CollapseApproved` rejects geometrically sharp edges
+> (`mftlEdgeIsGeometricallySharp`) and blocks feature-line / hard-corner collapses, and
+> the fit paths use `mftlEdgeIsFeatureEx` (flag OR geometric). Sharp features therefore
+> survive even when the caller never pre-flags. Regression
+> `test_collapse_geometric_gate_no_flags` (cube, no `MFTLDetectFeatures`, min-edge huge so
+> only the geometric gate can protect) covers this. All gates share
+> `feature_angle_threshold`.
 
 ## Objective
 Extend MFTL2's existing edge operators to full MFTL1 serial-remeshing behavior: the four

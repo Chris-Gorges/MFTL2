@@ -1,10 +1,10 @@
 # 02 — Object integral quantities (volume, centroid, area, moment of inertia)
 
-Status: NOT STARTED
+Status: COMPLETE
 Depends on: 01
-Implemented by:
-Reviewed by:
-Acceptance: NOT PASSED
+Implemented by: Kimi Code
+Reviewed by: Claude Code
+Acceptance: PASSED
 
 ## Objective
 Provide parallel, periodic-aware object-level integrals — enclosed volume, surface area,

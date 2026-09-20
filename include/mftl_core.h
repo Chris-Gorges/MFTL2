@@ -59,6 +59,8 @@ typedef struct MFTL_Vertex
   double meancurvature;  ///< Computed mean curvature.
   double gaussiancurvature;  ///< Computed Gaussian curvature.
   double area;  ///< Voronoi area associated with the vertex.
+  double roughness_mean;  ///< Dihedral-angle roughness mean (owned vertices only).
+  double roughness_variance;  ///< Dihedral-angle roughness sample variance (owned only).
 
   // --- Parallelism & Domain Information ---
   int owner_proc;  ///< The MPI rank that has primary authority over this vertex.

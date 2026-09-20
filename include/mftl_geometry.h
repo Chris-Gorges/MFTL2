@@ -219,8 +219,143 @@ static inline void MFTLComputeTriangleProperties(const MFTL_Object *object)
   for (size_t i = 0; i < object->n_triangles; i++)
   {
     MFTL_Triangle *tri = &tri_base[i];
+    if (tri->flags & MFTL_FLAG_DEAD) continue;  // remeshing leftovers until finalization
     if (tri->owner_proc == object->domain->rank) MFTLGetTriangleProperties(object, tri, &tri->area, tri->normal, tri->center);
   }
 }
+
+// =============================================================================
+// OBJECT INTEGRAL QUANTITIES (see src/general/geometry_object.c)
+// MFTL1-compatible definitions; parallel (Allreduce over comm_cart); owned
+// triangles only (owner_proc == rank), ghosts never counted. Periodic-aware:
+// vertices are re-imaged into one contiguous image (anchored at a globally
+// agreed body vertex) before integrating — exact for bodies smaller than half
+// the domain. The SIGN of the volume follows the mesh winding convention.
+// =============================================================================
+
+/**
+ * @brief Enclosed volume of a closed object: 1/6 * sum_owned v1.(v2 x v3).
+ * Requires a closed, consistently-oriented surface (MFTLCheckMeshIntegrity is
+ * asserted in debug builds). Returns 0 for an empty object.
+ */
+double MFTLObjectVolume(MFTL_Object* obj);
+
+/**
+ * @brief Area-weighted SURFACE centroid (NOT the volume centroid):
+ * sum_owned Area*(v1+v2+v3) / (3*total_area). Returns the total surface area.
+ * The centroid is expressed in the periodic image anchored at the object's
+ * first owned vertex (may lie outside the domain for seam-straddling bodies).
+ */
+double MFTLSurfaceCenter(MFTL_Object* obj, double cm[3]);
+
+/**
+ * @brief MFTL1 lumped-tetrahedron moment of inertia about `center` with
+ * uniform `density` (mass lumped at each tetrahedron centroid; NOT the exact
+ * tetrahedron-covariance formula). `center` must be expressed in the same
+ * periodic image as the mesh — e.g. the centroid returned by
+ * MFTLSurfaceCenter.
+ */
+void MFTLMomentOfInertia(MFTL_Object* obj, double I[3][3], const double center[3], double density);
+
+// =============================================================================
+// RIGID-BODY TRANSFORMS (see src/general/transform.c)
+// Operate on LOCAL (owned, non-ghost) vertices only; refresh ghosts afterwards
+// via MFTLUpdateGhostPositions. Each transform recomputes triangle properties.
+// Storage stays unwrapped — use MFTLWrapObjectIntoDomain explicitly if needed.
+// =============================================================================
+
+/** @brief In-place per-axis scale about the origin: pos[d] *= s[d] (MFTL1 MFTLScaleSurface). */
+void MFTLScaleObject(MFTL_Object* obj, const double s[3]);
+
+/** @brief In-place rigid translation: pos += d (MFTL1 MFTLMoveBody). */
+void MFTLTranslateObject(MFTL_Object* obj, const double d[3]);
+
+/** @brief In-place rotation about `centre`: pos = centre + R.(pos - centre).
+ * R must be orthonormal (asserted in debug builds, det R = 1). */
+void MFTLRotateObject(MFTL_Object* obj, const double R[3][3], const double centre[3]);
+
+/** @brief Explicitly wrap local vertex positions back into the periodic domain. */
+void MFTLWrapObjectIntoDomain(MFTL_Object* obj);
+
+// =============================================================================
+// OBJECT GENERATORS (see src/general/generators.c)
+// Mirror MFTLGenerateSphere's lifecycle: rank 0 builds the mesh, the gid
+// counters are broadcast, the caller redistributes. Closed generators
+// (cylinder/box/cube) are outward-wound: MFTLObjectVolume is positive, the
+// surface is closed (Euler chi = 2). MFTLGenerateFace is an OPEN patch.
+// =============================================================================
+
+/**
+ * @brief Capped cylinder along +Z, z in [0, L], cross-section in the XY plane.
+ * MFTL1 parameterization: Np = round(radius^0.9 / (pi*dr)) circumferential
+ * segments, Nz = round(L/(10*dr) + 1) rings; ellipticity in [0,1) scales the
+ * x semi-axis by sqrt(1-e^2), (-1,0) scales y (MFTL1 convention). Flat cap
+ * fans close both ends (MFTL1's own cylinder is an open tube; the closed form
+ * is per plans/04-generators.md).
+ */
+void MFTLGenerateCylinder(MFTL_Object* obj, double dr, double radius, double L, double ellipticity);
+
+/** @brief Closed axis-aligned box with corners lo and hi (2 triangles per face). */
+void MFTLGenerateBox(MFTL_Object* obj, const double lo[3], const double hi[3]);
+
+/** @brief Closed cube [-1,1]^3, refined `refine` times by flat 1-to-4 subdivision. */
+void MFTLGenerateCube(MFTL_Object* obj, int refine);
+
+/** @brief Open quad patch (2 triangles, diagonal v0-v3). Volume undefined. */
+void MFTLGenerateFace(MFTL_Object* obj, const double v[4][3]);
+
+// =============================================================================
+// VERTEX NORMALS / CURVATURES / ROUGHNESS (see src/general/curvature.c)
+// One-ring quantities in MFTL1's conventions: mean curvature 2/R, Gaussian
+// 2/R^2 on a sphere. PRECONDITION: every owned vertex's 1-ring of triangles
+// must be stored (after redistribution: MFTLUpdateGhostPositions +
+// MFTLExtendGhostLayer(ens, >=1)); triangle properties must be current.
+// Ghost copies of normal/curvature/area refresh via MFTLUpdateGhostPositions.
+// =============================================================================
+
+/** @brief Angle/edge-length-weighted average of incident triangle normals (unit length). */
+void MFTLComputeVertexNormals(MFTL_Object* obj);
+
+/** @brief Cotangent Laplace-Beltrami curvatures + mixed-Voronoi area per owned vertex. */
+void MFTLComputeVertexCurvatures(MFTL_Object* obj);
+
+/**
+ * @brief Surface roughness: returns the GLOBAL geometric-Laplacian average
+ * (MFTL1 parity); stores per-vertex dihedral mean/variance in
+ * roughness_mean / roughness_variance.
+ */
+double MFTLComputeRoughness(MFTL_Object* obj);
+
+// =============================================================================
+// POINT QUERIES (see src/general/point_query.c)
+// Point-in-object is COLLECTIVE (broadcast ray + Allreduce); requires a
+// closed surface and current triangle properties. No OBB is provided: the
+// only consumer box (multiflow moveIBM) is axis-aligned (see MFTLObjectAABB)
+// and candidate acceleration uses the existing per-object LBVH.
+// =============================================================================
+
+/**
+ * @brief Exact point-triangle distance (6-region Voronoi classification,
+ * MFTL1 port): nearest-feature distance for vertex/edge/interior regions.
+ */
+double MFTLPointTriangleDistance(const MFTL_Object* obj, int tri_idx, const double p[3]);
+
+/**
+ * @brief Collective point-in-object classification by ray casting (MFTL1
+ * parity): 1 inside, 0 outside, -1 on the surface. One random direction is
+ * broadcast from rank 0; grazing vertex/edge hits make ALL ranks retry (max
+ * 100). On periodic domains the probe is re-imaged next to the object.
+ */
+int MFTLPointInsideObject(MFTL_Object* obj, const double p[3]);
+
+/** @brief Orthogonal containment test with MFTL_VERYSMALL slack (MFTL1 MFTLPointInsideObjectBox parity). */
+int MFTLPointInsideAABB(const double center[3], const double dims[3], const double p[3]);
+
+/** @brief Collective object axis-aligned bounding box: center + half-dimensions over owned vertices. */
+void MFTLObjectAABB(MFTL_Object* obj, double center[3], double dims[3]);
+
+// Test/debug instrumentation for the point-in-object BVH lifecycle.
+int MFTLDebugPointQueryBVHBuilds(void);      // BVH builds performed by MFTLPointInsideObject so far
+int MFTLDebugPointQueryLastIterations(void); // ray-casting attempts in the most recent call
 
 #endif

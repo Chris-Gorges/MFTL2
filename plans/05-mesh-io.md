@@ -1,10 +1,10 @@
 # 05 — Mesh I/O: GTS reader + writer + PVTU
 
-Status: NOT STARTED
+Status: COMPLETE
 Depends on: 01 (02 for volume-based regression)
-Implemented by:
-Reviewed by:
-Acceptance: NOT PASSED
+Implemented by: Kimi Code
+Reviewed by: Claude Code
+Acceptance: PASSED
 
 ## Objective
 Give MFTL2 the ability to **load meshes from disk** (GTS) and write GTS/PVTU. This is the top
