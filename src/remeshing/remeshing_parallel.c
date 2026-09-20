@@ -42,11 +42,11 @@ double MFTLEnsembleGetTypicalRadius(MFTL_Ensemble *ens)
   MFTL_Domain *dom = &ens->domain;
   double local_max = 0.0;
 
-  MFTL_Object *object_base = ens->objects;
+  MFTL_Object **object_base = ens->objects;
 
   for (int o = 0; o < ens->num_objects; ++o)
   {
-    MFTL_Object *obj = &object_base[o];
+    MFTL_Object *obj = object_base[o];
     MFTL_ASSERT(obj != MFTL_NULL && "MFTLEnsembleGetTypicalRadius: object is NULL\n");
 
     double bbox_min[3] = {MFTL_DBL_MAX, MFTL_DBL_MAX, MFTL_DBL_MAX};
@@ -410,7 +410,7 @@ int MFTLRemeshWithCoarsening(MFTL_Ensemble *ens, MFTL_RemeshParameters *params, 
 }
 
 /* ══════════════════════════════════════════════════════════════════════
- * MFTLRemeshEnsemble
+ * MFTLRemeshEnsembleParallel
  *
  * Top-level dispatch for a single ensemble.  Decision tree:
  *
@@ -430,7 +430,7 @@ int MFTLRemeshWithCoarsening(MFTL_Ensemble *ens, MFTL_RemeshParameters *params, 
  *
  * Collective: all ranks in ens->domain.comm_cart must call this.
  * ══════════════════════════════════════════════════════════════════════ */
-int MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
+int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
 {
   MFTL_ASSERT(ens != MFTL_NULL);
   MFTL_ASSERT(params != MFTL_NULL);
@@ -480,6 +480,6 @@ int MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
        * Precondition h_min > 4*delta is guaranteed by G==1 above. */
       return MFTLRemeshEnsembleShiftScheme(ens, params);
 
-    default: assert(0 && "MFTLRemeshEnsemble: unknown algorithm"); return MFTL_ERROR;
+    default: assert(0 && "MFTLRemeshEnsembleParallel: unknown algorithm"); return MFTL_ERROR;
   }
 }

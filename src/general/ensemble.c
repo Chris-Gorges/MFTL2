@@ -251,6 +251,7 @@ void MFTLEnsembleDestroy(MFTL_Ensemble** p_ens)
   if (dom->comm_cart != MPI_COMM_NULL) MPI_Comm_free(&dom->comm_cart);
   if (dom->comm_world != MPI_COMM_NULL) MPI_Comm_free(&dom->comm_world);
   if (dom->neighbors) free(dom->neighbors);
+  if (dom->rank_map) free(dom->rank_map);
 
   // 3. Free Ensemble
   free(ens);

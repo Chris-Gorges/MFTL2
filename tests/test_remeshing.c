@@ -514,5 +514,5 @@ int main(int argc, char** argv)
 
   TEST_REPORT();
   MPI_Finalize();
-  return 0;
+  return (g_tests_failed > 0);
 }

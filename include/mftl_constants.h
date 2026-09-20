@@ -51,6 +51,24 @@
 #define MFTL_INIT_CAPACITY 128
 
 // =============================================================================
+// ENSEMBLE CLASSIFICATION & PARALLEL REMESHING
+// (Defined here, not in mftl_remeshing.h, because MFTL_Ensemble in
+// mftl_core.h needs these types and must not include mftl_remeshing.h —
+// that would create a circular include.)
+// =============================================================================
+typedef enum
+{
+  MFTL_ENSEMBLE_DISPERSED = 0, /* bubbles/droplets; R_obj expected << h  */
+  MFTL_ENSEMBLE_SPANNING = 1 /* jets, films, large interfaces; R >> h  */
+} MFTL_EnsembleType;
+
+typedef enum
+{
+  MFTL_ALGO_CENTERING = 0, /* object-center migration + serial kern  */
+  MFTL_ALGO_SHIFT_SCHEME = 1 /* spatial shift / freeze / migrate loop  */
+} MFTL_RemeshAlgorithm;
+
+// =============================================================================
 // MESH FLAGS (Bitmask values - must be powers of 2)
 // =============================================================================
 #define MFTL_FLAG_NONE 0  // 0000 0000

@@ -56,3 +56,9 @@ add_executable(unit_tests_intersection test_intersection.c)
 target_link_libraries(unit_tests_intersection PRIVATE MFTL m)
 target_include_directories(unit_tests_intersection PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_test(NAME UnitIntersection COMMAND unit_tests_intersection)
+
+# --- LeakSanitizer suppressions for MPI-linked tests ---
+# MPICH internals leak small bookkeeping allocations (see tests/lsan.supp);
+# MFTL's own allocations must remain leak-clean.
+set(MFTL_LSAN_ENV "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/lsan.supp:print_suppressions=0")
+set_tests_properties(MPIGhostSync MPIStressTest MPIGhostLayers UnitRemeshing UnitSphereGen PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")

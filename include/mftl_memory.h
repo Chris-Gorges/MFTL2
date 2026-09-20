@@ -8,6 +8,7 @@
 
 #include <stdlib.h>
 #include <stdio.h>
+#include <string.h>
 #include "mftl_constants.h"
 
 /**
@@ -16,6 +17,12 @@
  * This macro implements a geometric growth strategy (x2) to amortize allocation costs.
  * It strictly handles allocation failures by printing an error and exiting,
  * which is standard practice for HPC applications where recovery from OOM is impractical.
+ *
+ * The newly grown region is always zeroed, so slots handed out from fresh
+ * capacity never inherit garbage from realloc'd memory (in particular stray
+ * flag bits such as MFTL_FLAG_VISITED, which silently corrupt flag-based
+ * traversals like MFTLGetNeighborhood and get transported to ghost copies on
+ * other ranks).
  *
  * @param ptr      Pointer to the dynamic array (will be updated).
  * @param capacity Pointer to the current capacity (will be updated).
@@ -29,6 +36,7 @@
     /* Safety: Only realloc if we actually need more space */                                                          \
     if (_req_cap > (*(capacity)))                                                                                      \
     {                                                                                                                  \
+      int _old_cap = (*(capacity));                                                                                    \
       void *_new_ptr = realloc((ptr), _req_cap * sizeof(type));                                                        \
       if (!_new_ptr && _req_cap > 0) /* Allow 0-size reallocs if valid */                                              \
       {                                                                                                                \
@@ -37,6 +45,11 @@
       }                                                                                                                \
       (ptr) = (type *) _new_ptr;                                                                                       \
       (*(capacity)) = _req_cap;                                                                                        \
+      /* Zero the grown region so entities handed out from fresh capacity (verts,  */                                 \
+      /* tris, half-edges, ...) never inherit garbage from realloc'd memory — in    */                                 \
+      /* particular stray flag bits (e.g. MFTL_FLAG_VISITED) which corrupt          */                                 \
+      /* flag-based traversals and are transported to ghost copies on other ranks.  */                                 \
+      memset((ptr) + _old_cap, 0, ((size_t) _req_cap - (size_t) _old_cap) * sizeof(type));                             \
     }                                                                                                                  \
   } while (0)
 

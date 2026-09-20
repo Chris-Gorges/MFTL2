@@ -1777,7 +1777,7 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lo
   int num_neighbors = domain->num_neighbors;
   int num_objects = ens->num_objects;
 
-  if (num_neighbors == 0 || nproc == 1) return MFTL_SUCCESS;
+  if (num_neighbors <= 0 || nproc < 2) return MFTL_SUCCESS;
 
   // --- 1. Setup Buffers ---
   IntBuffer* req_send_bufs = calloc(num_neighbors, sizeof(IntBuffer));
@@ -1916,7 +1916,14 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lo
     GhostUpdatePayload* p = &reply_payloads[reply_idx++];
     p->global_id = req_gid;
 
-    assert(found_v);
+    if (found_v == MFTL_NULL)
+    {
+      // A requester only asks for vertices this rank owns. A miss therefore
+      // means the mesh is inconsistent — fail loudly (in Debug AND Release),
+      // never fabricate a zeroed payload that would silently corrupt ghosts.
+      fprintf(stderr, "FATAL ERROR: MFTLUpdateGhostPositions: owned vertex GID %d (body %d) not found on owner rank %d\n", req_gid, req_body_id, my_rank);
+      exit(EXIT_FAILURE);
+    }
 
     memcpy(p->pos, found_v->pos, 3 * sizeof(double));
     memcpy(p->normal, found_v->normal, 3 * sizeof(double));
@@ -2103,6 +2110,66 @@ void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc)
 
     k = kh_put(halfedge_map, obj->halfedge_lookup, he->global_id, &ret);
     kh_value(obj->halfedge_lookup, k) = he_idx;
+  }
+}
+
+/**
+ * @brief Remaps the GID-based references of ghosts appended during ONE
+ * extension round (local indices >= v_mark / he_mark) to local indices.
+ *
+ * MFTLConvertGlobalToLocalIndices cannot be used here: it assumes the ENTIRE
+ * mesh still stores global IDs, but the pre-existing (local and previously
+ * ghosted) entities already store rank-local indices. Re-converting the whole
+ * mesh would interpret those local indices as GIDs, corrupt connectivity or
+ * trigger the "missing vertex GID" fatal check. Only the freshly appended
+ * entities carry GIDs, so only they are remapped; twins are recomputed
+ * topologically by MFTLRebuildTwins afterwards anyway.
+ */
+static void MFTLRemapAppendedGhostIndices(MFTL_Object* obj, int v_mark, int he_mark)
+{
+  // --- 1. Remap appended vertices' outgoing half-edge: GID -> local index ---
+  for (int i = v_mark; i < obj->n_vertices; ++i)
+  {
+    MFTL_Vertex* v = &obj->vertices[i];
+    khiter_t k = kh_get(halfedge_map, obj->halfedge_lookup, v->out_he_idx);  // still a GID here
+    v->out_he_idx = (k != kh_end(obj->halfedge_lookup)) ? kh_value(obj->halfedge_lookup, k) : MFTL_ERROR;
+  }
+
+  // --- 2. Remap appended half-edges' target vertex: GID -> local index ---
+  for (int i = he_mark; i < obj->n_half_edges; ++i)
+  {
+    MFTL_HalfEdge* he = &obj->half_edges[i];
+
+    // This assertion MUST hold: every corner of an appended ghost triangle
+    // is shipped together with that triangle.
+    khiter_t k = kh_get(vertex_map, obj->vertex_lookup, he->vertex_idx);  // still a GID here
+    if (k == kh_end(obj->vertex_lookup))
+    {
+      fprintf(stderr, "FATAL ERROR: Half-edge %d references missing vertex GID %d\n", he->global_id, he->vertex_idx);
+      he->vertex_idx = MFTL_ERROR;
+      exit(EXIT_FAILURE);
+    }
+    he->vertex_idx = kh_value(obj->vertex_lookup, k);
+
+    // Twin was packed as a GID (or MFTL_ERROR). Resolve it if the twin half-edge
+    // lives on this rank; otherwise leave MFTL_ERROR for MFTLRebuildTwins.
+    if (he->twin_idx != MFTL_ERROR)
+    {
+      khiter_t kt = kh_get(halfedge_map, obj->halfedge_lookup, he->twin_idx);
+      he->twin_idx = (kt != kh_end(obj->halfedge_lookup)) ? kh_value(obj->halfedge_lookup, kt) : MFTL_ERROR;
+    }
+  }
+
+  // --- 3. Repair out-he of appended vertices whose packed out half-edge is
+  // not present locally: 'he' points TO v, so 'he->next' must start FROM v.
+  for (int i = he_mark; i < obj->n_half_edges; ++i)
+  {
+    MFTL_HalfEdge* he = &obj->half_edges[i];
+    int v_idx = he->vertex_idx;
+    if (v_idx >= 0 && v_idx < obj->n_vertices && obj->vertices[v_idx].out_he_idx == MFTL_ERROR)
+    {
+      obj->vertices[v_idx].out_he_idx = he->next_idx;
+    }
   }
 }
 
@@ -2381,6 +2448,17 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
   // PHASE 4: INTEGRATION
   // =========================================================================
 
+  // Record per-object array sizes BEFORE appending so Phase 5 can restrict
+  // the GID->local remap to the entities appended in THIS round. The
+  // pre-existing entities already store rank-local indices.
+  int* v_marks = malloc(ens->num_objects * sizeof(int));
+  int* he_marks = malloc(ens->num_objects * sizeof(int));
+  for (int o = 0; o < ens->num_objects; ++o)
+  {
+    v_marks[o] = ens->objects[o]->n_vertices;
+    he_marks[o] = ens->objects[o]->n_half_edges;
+  }
+
   // Integrate Vertices
   for (int i = 0; i < tot_recv_v; ++i)
   {
@@ -2439,14 +2517,19 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
 
   // =========================================================================
   // PHASE 5: REPAIR TOPOLOGY
+  // Only the ghosts appended in THIS round carry global IDs; remap exactly
+  // those and leave the pre-existing (already local) entities untouched.
   // =========================================================================
   for (int o = 0; o < ens->num_objects; ++o)
   {
     MFTL_Object* obj = ens->objects[o];
-    MFTLConvertGlobalToLocalIndices(obj);
+    MFTLRemapAppendedGhostIndices(obj, v_marks[o], he_marks[o]);
     MFTLRebuildTwins(obj);
     MFTLFlattenConnectivity(obj);
   }
+
+  free(v_marks);
+  free(he_marks);
 
   return MFTL_SUCCESS;
 }

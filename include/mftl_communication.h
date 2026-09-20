@@ -277,4 +277,12 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lo
  */
 int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps);
 
+/**
+ * @brief Bulk spatial ghosting using pure Domain-Boundary overlap and deduplication.
+ * @param ens The MFTL ensemble.
+ * @param proximity_tolerance Expansion envelope for near-field interaction tracking.
+ * @return MFTL_SUCCESS on completion.
+ */
+int MFTLEnsembleCreateSpatialGhosts(MFTL_Ensemble* ens, double proximity_tolerance);
+
 #endif

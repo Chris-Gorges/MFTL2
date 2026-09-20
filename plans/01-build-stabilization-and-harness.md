@@ -1,10 +1,14 @@
 # 01 — Build stabilization & test-harness hardening
 
-Status: NOT STARTED
+Status: IMPLEMENTED
 Depends on: —
-Implemented by:
-Reviewed by:
-Acceptance: NOT PASSED
+Implemented by: Kimi Code CLI
+Reviewed by: Claude (review pass 1: no correctness must-fixes; the four follow-up fixes from that review are applied)
+Acceptance: PASSED
+
+> **Baseline decision (2026-09-20):** the project baseline is the current HEAD code commit
+> `f4795fe`, accepted consciously per `plans/00-overview.md` §Build baseline. This stage was
+> implemented on top of it; the pre-existing `1327579`-revert plan is superseded.
 
 ## Objective
 Establish a green, buildable MFTL2 trunk from commit `1327579`, fix the defects that break

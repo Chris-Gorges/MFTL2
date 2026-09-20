@@ -241,6 +241,14 @@ static int generate_icosahedron(MFTL_Object *object)
   MFTL_RESERVE_ADDITIONAL(object->triangles, &object->n_triangles, &object->capacity_triangles, 20, MFTL_Triangle);
   MFTL_RESERVE_ADDITIONAL(object->half_edges, &object->n_half_edges, &object->capacity_half_edges, 60, MFTL_HalfEdge);
 
+  // The reserve macros hand back realloc'd, UNINITIALIZED memory. Zero every
+  // field first — in particular 'flags': garbage flag bits (e.g. a stray
+  // MFTL_FLAG_VISITED) are transported to ghost copies on other ranks and
+  // corrupt flag-based traversals such as MFTLGetNeighborhood.
+  memset(object->vertices, 0, 12 * sizeof(MFTL_Vertex));
+  memset(object->triangles, 0, 20 * sizeof(MFTL_Triangle));
+  memset(object->half_edges, 0, 60 * sizeof(MFTL_HalfEdge));
+
   object->n_vertices = 12;
   object->n_triangles = 20;
   object->n_half_edges = 60;

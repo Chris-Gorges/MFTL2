@@ -44,19 +44,27 @@ leave the tree compiling and testable. This file is the shared design contract; 
 
 ## Build baseline
 
-Work branches from **commit `1327579`** — the last commit that compiles cleanly and passes
-the suite under AddressSanitizer. HEAD (`f4795fe`) and the two preceding commits do **not**
-build:
+**Decision (recorded 2026-09-20, Stage 01 review): the project consciously accepts the
+current HEAD code commit `f4795fe` as the baseline.** The original plan — branch from
+`1327579`, treating `d248554…f4795fe` as discardable WIP — was rejected. Stage 01 instead
+fixed the defects that broke HEAD directly on top of it and established the green trunk
+there (0 build warnings; full ctest green on 1/2/4/8 ranks in Release and ASan/UBSan
+builds). `1327579` is of historical interest only. The parallel-remeshing WIP in
+`d248554…f4795fe` is still to be **finished deliberately in Stage 10**: the Stage-01
+touches of `remeshing_parallel.c` are mechanical build fixes only (dispatcher renamed to
+`MFTLRemeshEnsembleParallel` to resolve the duplicate/conflicting `MFTLRemeshEnsemble`;
+prototypes added for the not-yet-implemented Stage-10 kernels; one `MFTL_Object**` type
+fix). No parallel-remeshing logic was implemented.
+
+Historical record — HEAD `f4795fe` did not build for two reasons, both fixed in Stage 01:
 1. **Circular header include**: `mftl_core.h`→`mftl_remeshing.h`→`mftl_communication.h`→
    `mftl_core.h`; a `static inline` (`MFTLGetOwnerProc`) dereferences `MFTL_Domain` before it
-   is defined.
+   is defined. Fixed by moving `MFTL_EnsembleType`/`MFTL_RemeshAlgorithm` into
+   `mftl_constants.h` and dropping the remeshing include from `mftl_core.h`.
 2. **Incomplete parallel-remeshing WIP** in `remeshing_parallel.c`: `MFTLRemeshEnsemble`
    defined twice (conflicting `void`/`int`), `MFTLRemeshEnsembleShiftScheme` and
    `MFTLRemeshEnsembleDispersedCentering` called but never implemented, `MFTL_Object**`
    assigned to `MFTL_Object*`.
-
-The `d248554…HEAD` commits are treated as a source to finish deliberately in **Stage 10**,
-not as a working base. Stage 01 establishes the green trunk.
 
 ## Cross-cutting invariants (enforced by tests in every stage)
 

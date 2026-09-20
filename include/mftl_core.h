@@ -17,7 +17,6 @@
 #include <limits.h>
 #include "mftl_constants.h"
 #include "mftl_memory.h"
-#include "mftl_remeshing.h"
 #include "khash.h"
 
 KHASH_MAP_INIT_INT(vertex_map, int)

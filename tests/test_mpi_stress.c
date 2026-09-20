@@ -2,6 +2,7 @@
 #include "mftl_core.h"
 #include "mftl_communication.h"
 #include "mftl_geometry.h"  // For periodicity
+#include "mftl_topology.h"  // MFTLGetTriangleVertices
 #include <mpi.h>
 #include <stdlib.h>
 #include <math.h>
@@ -53,6 +54,58 @@ int GetValidCutConfigurations(int nproc, CutConfig* configs, int max_configs)
   }
 
   return count;
+}
+
+// Signed tetrahedron volume of one triangle about the origin:
+//   V = (1/6) * v0 . (v1 x v2)
+// (Stage-02 conservation formula, computed inline until the integrals API
+// lands. Sums over owned, non-ghost triangles only.)
+//
+// Sets *straddled when an owned triangle crosses a periodic boundary (raw
+// corner-to-corner span larger than half the domain): the plain triple
+// product is only meaningful for a consistently embedded surface, so callers
+// must skip the comparison on such steps. Minimum-image integral handling is
+// Stage 02/13 work.
+static double compute_owned_volume(MFTL_Object* obj, int rank, const MFTL_Domain* dom, int* straddled)
+{
+  double vol = 0.0;
+  for (int t = 0; t < obj->n_triangles; ++t)
+  {
+    MFTL_Triangle* tri = &obj->triangles[t];
+    if (tri->is_ghost || tri->owner_proc != rank) continue;
+
+    MFTL_Vertex* vv[3];
+    MFTLGetTriangleVertices(obj, tri, vv);
+
+    for (int k = 0; k < 3; ++k)
+    {
+      if (!dom->is_periodic[k]) continue;
+      double half = 0.5 * dom->domain_size[k];
+      if (fabs(vv[1]->pos[k] - vv[0]->pos[k]) > half || fabs(vv[2]->pos[k] - vv[0]->pos[k]) > half) *straddled = 1;
+    }
+
+    const double* a = vv[0]->pos;
+    const double* b = vv[1]->pos;
+    const double* c = vv[2]->pos;
+
+    double bc[3] = {b[1] * c[2] - b[2] * c[1], b[2] * c[0] - b[0] * c[2], b[0] * c[1] - b[1] * c[0]};
+    vol += (a[0] * bc[0] + a[1] * bc[1] + a[2] * bc[2]) / 6.0;
+  }
+  return vol;
+}
+
+static double compute_global_volume(MFTL_Ensemble* ens, int rank, int* straddled)
+{
+  double local = 0.0;
+  int local_straddled = 0;
+  for (int o = 0; o < ens->num_objects; ++o) local += compute_owned_volume(ens->objects[o], rank, &ens->domain, &local_straddled);
+
+  double global = 0.0;
+  int global_straddled = 0;
+  MPI_Allreduce(&local, &global, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+  MPI_Allreduce(&local_straddled, &global_straddled, 1, MPI_INT, MPI_LOR, MPI_COMM_WORLD);
+  *straddled = global_straddled;
+  return global;
 }
 
 int test_redistribution_stress()
@@ -115,6 +168,8 @@ int test_redistribution_stress()
     MFTLEnsembleUpdateGlobalCounts(ens);
 
     int initial_tris = ens->total_global_triangles;
+    int ignored = 0;
+    double initial_volume = compute_global_volume(ens, rank, &ignored);
 
     if (rank == 0) printf("    Initial Tris: %lld\n", (long long) initial_tris);
 
@@ -122,6 +177,12 @@ int test_redistribution_stress()
     double dt = 0.2;
     double velocity[3] = {1.0, 0.5, -0.5};  // Move diagonally
     int steps = 25;
+
+    // Volume-conservation bookkeeping: a configuration whose steps ALL get
+    // skipped (periodic-wall crossings) must NOT report conservation as
+    // passed — require at least one real comparison per configuration.
+    int vol_checks = 0;
+    int vol_skips = 0;
 
     for (int t = 0; t < steps; t++)
     {
@@ -162,9 +223,48 @@ int test_redistribution_stress()
         MFTLEnsembleDestroy(&ens);
         return 1;  // Immediate Fail
       }
+
+      // Volume must be conserved as well: the mesh is rigidly advected, so
+      // the signed tetrahedron sum may only drift by round-off. Steps where a
+      // body crosses a periodic wall are skipped: the raw triple product is
+      // not defined for a boundary-straddling embedding (minimum-image
+      // integrals arrive with Stage 02/13).
+      int straddled = 0;
+      double volume = compute_global_volume(ens, rank, &straddled);
+      if (!straddled)
+      {
+        vol_checks++;
+        double vol_tol = 1e-9 * fmax(1.0, fabs(initial_volume));
+        if (fabs(volume - initial_volume) > vol_tol)
+        {
+          if (rank == 0)
+          {
+            printf("    [FAIL] Step %d: Volume not conserved! Expected %.15e, Got %.15e (diff %.3e)\n", t, initial_volume, volume,
+                   fabs(volume - initial_volume));
+          }
+          MFTLEnsembleDestroy(&ens);
+          return 1;  // Immediate Fail
+        }
+      }
+      else
+      {
+        vol_skips++;
+        if (rank == 0) printf("    [SKIP] Step %d: body crossing periodic wall, volume comparison not defined.\n", t);
+      }
     }
 
-    if (rank == 0) printf("    [PASS] Config %d conserved mass over %d steps.\n", c, steps);
+    if (vol_checks == 0)
+    {
+      if (rank == 0)
+      {
+        printf("    [FAIL] Config %d: volume conservation was never checked (all %d steps skipped due to periodic-wall crossings)!\n", c, steps);
+      }
+      MFTLEnsembleDestroy(&ens);
+      return 1;  // A fully skipped configuration must not count as conserved.
+    }
+
+    if (rank == 0)
+      printf("    [PASS] Config %d conserved mass over %d steps (%d volume checks, %d boundary-skips).\n", c, steps, vol_checks, vol_skips);
 
     MFTLEnsembleDestroy(&ens);
   }

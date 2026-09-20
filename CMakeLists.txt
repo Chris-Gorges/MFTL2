@@ -5,6 +5,7 @@ project(MFTL C)
 # --- Options ---
 option(ENABLE_SANITIZERS "Enable Address and Undefined sanitizers in Debug mode" ON)
 option(BUILD_EXAMPLES "Build example executables" ON)
+option(MFTL_USE_LAPACK "Build with LAPACK/BLAS support (consumed by Stage 08 remeshing; falls back gracefully when off)" OFF)
 
 # --- Dependencies ---
 find_package(MPI REQUIRED)
@@ -69,6 +70,20 @@ file(GLOB_RECURSE MFTL_SOURCES "src/*.c")
 add_library(MFTL STATIC ${MFTL_SOURCES})
 target_link_libraries(MFTL PUBLIC MPI::MPI_C)
 
+# --- Optional LAPACK/BLAS (Stage 08 paraboloid least-squares fit) ---
+# Off by default: the library builds and functions without LAPACK. When
+# requested and found, consumers of the MFTL target get the link interface
+# and the MFTL_HAVE_LAPACK compile definition.
+if(MFTL_USE_LAPACK)
+    find_package(LAPACK)
+    if(LAPACK_FOUND)
+        target_link_libraries(MFTL PUBLIC LAPACK::LAPACK)
+        target_compile_definitions(MFTL PUBLIC MFTL_HAVE_LAPACK)
+    else()
+        message(WARNING "MFTL_USE_LAPACK=ON but LAPACK/BLAS was not found; building without LAPACK support")
+    endif()
+endif()
+
 set_target_properties(MFTL PROPERTIES 
     ARCHIVE_OUTPUT_DIRECTORY ${MFTL_LIB_DIR}
 )
@@ -95,6 +110,11 @@ message(STATUS "Build Type       : ${CMAKE_BUILD_TYPE}")
 message(STATUS "Sanitizers       : ${ENABLE_SANITIZERS}")
 message(STATUS "LTO (Release)    : ${IPO_SUPPORTED}")
 message(STATUS "Build Examples   : ${BUILD_EXAMPLES}")
+if(MFTL_USE_LAPACK AND LAPACK_FOUND)
+    message(STATUS "LAPACK           : ON")
+else()
+    message(STATUS "LAPACK           : OFF")
+endif()
 message(STATUS "Output Directory : ${MFTL_LIB_DIR}")
 message(STATUS "-------------------------------------------------")
 

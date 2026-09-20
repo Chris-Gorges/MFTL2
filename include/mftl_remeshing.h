@@ -111,18 +111,6 @@ static const int MFTL_SHIFT_PHASES[8][3] = {
 
 typedef enum
 {
-  MFTL_ENSEMBLE_DISPERSED = 0, /* bubbles/droplets; R_obj expected << h  */
-  MFTL_ENSEMBLE_SPANNING = 1 /* jets, films, large interfaces; R >> h  */
-} MFTL_EnsembleType;
-
-typedef enum
-{
-  MFTL_ALGO_CENTERING = 0, /* object-center migration + serial kern  */
-  MFTL_ALGO_SHIFT_SCHEME = 1 /* spatial shift / freeze / migrate loop  */
-} MFTL_RemeshAlgorithm;
-
-typedef enum
-{
   MFTL_REMESH_ISOTROPIC,  // Botsch & Kobbelt (4/5 and 4/3 limits)
   MFTL_REMESH_ANISOTROPIC,  // Metric-driven remeshing
   MFTL_REMESH_CUSTOM  // Manual user-defined limits
@@ -206,6 +194,19 @@ int MFTLSwapEdge(MFTL_Object *obj, int he_idx);
 
 // --- High Level Routine ---
 void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params);
+
+// --- Parallel Remeshing (WIP — Stage 10 completes the implementation) ---
+// Parallel dispatcher. Deliberately distinct from the serial MFTLRemeshEnsemble:
+// the serial entry point (remeshing_core.c) keeps the void signature used by
+// existing examples; the parallel dispatcher reports success/failure via its
+// return code.
+int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, MFTL_RemeshParameters *params);
+// Shift-scheme kernel: spatial shift / freeze / migrate loop.
+// Declared here so the WIP dispatcher type-checks; implemented in Stage 10.
+int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *params);
+// Centering kernel: object-center migration + ungated serial kernel.
+// Declared here so the WIP dispatcher type-checks; implemented in Stage 10.
+int MFTLRemeshEnsembleDispersedCentering(MFTL_Ensemble *ens, MFTL_RemeshParameters *params);
 
 /* ══════════════════════════════════════════════════════════════════════
  * MFTLDomainGetHMin
