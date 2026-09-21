@@ -154,11 +154,33 @@ currently-disabled periodic/clamping advection behavior.
 
 ## Stage list & dependency order
 
-**Progress (2026-09-20):** Stages **01–08 COMPLETE / Acceptance PASSED** (implemented by
+**Progress (2026-09-21):** Stages **01–10 COMPLETE / Acceptance PASSED** (implemented by
 Kimi Code, reviewed by Claude Code; Release + ASan/UBSan clean — incl. LAPACK/OpenBLAS
-for Stage 08's paraboloid fit — full suite green on 1/2/4/8 ranks). Stages 09–15 NOT
+for Stage 08's paraboloid fit — full suite green on 1/2/4/8 ranks). Stages 11–15 NOT
 STARTED. See the winding caveat in invariant #2 below — a cross-cutting item to resolve
-before Stages 11/13/14 rely on normal direction. The two Stage 07/08 follow-up items are
+before Stages 11/13/14 rely on normal direction.
+
+**Stage 10** (parallel remeshing + x-only load balancing) is accepted: MFTL1-style two-pass
+shift-scheme + centering (gather-to-rank-0) dispatcher, single-owner interior gates,
+disjoint per-rank GID blocks, deterministic slab optimizer. Volume rank-independent
+(drift ≤ ~7e-11 on 1/2/4/8); Release + ASan/UBSan clean; no regressions. It **resolved the
+Stage-09 carry-forwards**: serial edge-local smoothers now fail loudly on distributed
+meshes and the driver uses parallel-safe `*Parallel` variants gated to the interior rule;
+`roughness_mean/variance` now cross ranks (`PackedVertex`/`GhostUpdatePayload`).
+**Stage 10 carry-forward (should-fix, not blocking):** (a) remeshed triangle count is
+rank-count-dependent (~13% np1→np8) — the interior-only gate under-remeshes
+partition-boundary regions; MFTL1's `MFTL_RemeshBoundaryCleanup` (gather-to-one-rank final
+pass) is the fix, deferred — address or flag before **Stage 15** (front-tracking boundary
+uniformity); (b) transient non-neighbour-owner ghosts during LB passes are kept stale until
+the next redistribution (negligible volume impact, no topology corruption).
+
+**Stage 09** (volume-conserving smoothing) is accepted: TSUR3D / Kuprat / VolumeRecovery /
+roughness smoothing, MFTL1-consistent, full remesh cycle conserves volume to ~6e-12 (the
+driver always ends with `VolumeRecovery`). For **Stage 13**: TSUR's `[global_min,global_max]`
+endpoint clamp is periodic-unaware. (Mean-curvature-flow `LaplacianSmoothing`, which needs
+the signed Laplace–Beltrami vector, was out of Stage-09 scope and not implemented.)
+
+The two Stage 07/08 follow-up items are
 now **RESOLVED** (reviewed by Claude Code; Release + ASan/UBSan clean incl. LAPACK):
 (a) Stage 07 — `MFTLPointInsideObject` builds the LBVH ONCE before the retry loop and
 reuses it (regression `test_bvh_built_once` asserts builds == queries across a forced
@@ -168,6 +190,21 @@ collapse is now feature-protected flag-independently (a geometric sharp-edge gat
 `mftlEdgeIsFeatureEx`), so sharp features survive even without caller pre-flagging
 (regression `test_collapse_geometric_gate_no_flags`). Geometric feature detection is a
 no-op on smooth surfaces and MFTL1-consistent on coarse curved ones.
+
+**Stage 10 is accepted** (parallel remeshing + x-only load balancing + two-pass boundary
+shift; full details and acceptance record in `plans/10`). Carry-forward items for
+**Stages 11–15**: (a) load balancing requires an x-only decomposition (`cuts={nproc,1,1}`);
+other grids fall back to interior-only remeshing with a rank-0 note. (b) The WIP
+freeze-band/coarsening scaffolding from HEAD was removed rather than completed — its
+constraint system conflicts with the approved MFTL1 design (recorded in plan 10). (c)
+Ghost contract change: `MFTLUpdateGhostPositions` no longer fabricates zero payloads or
+dies on a missing owned GID — it reports `found == 0` for entities killed by parallel
+remesh ops and skips ghosts whose owners are temporarily non-neighbouring (transient
+slab-spanning edges); both refresh at the next redistribution. (d) `VolumeRecovery` is
+parallel-exact (corner-weighted area, secant slope, consensus loop exits) but still
+serial-bit-identical at np1. (e) Deferred: MFTL1's `MFTL_RemeshBoundaryCleanup`
+(gather-to-one-rank); per-object centroid ranks for the centering kernel; the winding
+caveat above; TSUR's periodic-unaware endpoint clamp (Stage 13).
 
 `01` build/harness → everything.
 `02` integrals → `03` transforms, `04` generators, `09` volume-conserving smoothing, `11` overlap.

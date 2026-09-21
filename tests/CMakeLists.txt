@@ -130,3 +130,21 @@ target_link_libraries(test_remesh_quality PRIVATE MFTL MPI::MPI_C m)
 target_include_directories(test_remesh_quality PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_test(NAME RemeshQuality-np1 COMMAND mpirun -np 1 $<TARGET_FILE:test_remesh_quality>)
 set_tests_properties(RemeshQuality-np1 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+
+# --- Stage 09: Volume-conserving smoothing ---
+add_executable(test_volume_smoothing test_volume_smoothing.c)
+target_link_libraries(test_volume_smoothing PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_volume_smoothing PRIVATE ${CMAKE_SOURCE_DIR}/include)
+foreach(NP 1 2 4 8)
+    add_test(NAME VolSmooth-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_volume_smoothing>)
+endforeach()
+set_tests_properties(VolSmooth-np1 VolSmooth-np2 VolSmooth-np4 VolSmooth-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+
+# --- Stage 10: Parallel remeshing + load balancing (x-only decomposition) ---
+add_executable(test_remesh_parallel test_remesh_parallel.c)
+target_link_libraries(test_remesh_parallel PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_remesh_parallel PRIVATE ${CMAKE_SOURCE_DIR}/include)
+foreach(NP 1 2 4 8)
+    add_test(NAME RemeshParallel-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_remesh_parallel>)
+endforeach()
+set_tests_properties(RemeshParallel-np1 RemeshParallel-np2 RemeshParallel-np4 RemeshParallel-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")

@@ -1,10 +1,23 @@
 # 09 — Volume-conserving smoothing (TSUR3D, Kuprat, VolumeRecovery, roughness smoothing)
 
-Status: NOT STARTED
+Status: COMPLETE
 Depends on: 02, 08
-Implemented by:
-Reviewed by:
-Acceptance: NOT PASSED
+Implemented by: Kimi Code
+Reviewed by: Claude Code
+Acceptance: PASSED
+
+> **Review note (accepted):** TSUR3D / Kuprat Alg-4 / VolumeRecovery / roughness smoothing
+> all implemented and MFTL1-consistent; conservation verified (TSUR local drift ~4e-15,
+> Kuprat first-order + `VolumeRecovery` → ~1e-13, full remesh cycle ~6e-12 ≤ 1e-8). The
+> remesh driver now always ends with `VolumeRecovery` against the pre-remesh volume +
+> ghost refresh. Feature protection reuses the Stage-08 geometric dihedral check.
+> Release + ASan/UBSan clean, suite green on 1/2/4/8. **Scope/deferrals:** the edge-local
+> smoothers run on the serial (rank-0-local / ghost-complete) workflow only — fully
+> parallel edge-local smoothing is Stage 10 (they currently lack an owner-guard/precondition
+> assertion, so must not be called on a distributed mesh); TSUR's `[global_min,global_max]`
+> clamp is periodic-unaware → Stage 13; `roughness_mean` ghost transport → Stage 10. The
+> mean-curvature-flow `LaplacianSmoothing` (needs the signed Laplace–Beltrami vector) was
+> out of scope and not implemented.
 
 ## Objective
 Add the volume-preserving smoothing machinery that makes remeshing conservative: Jiao's TSUR3D

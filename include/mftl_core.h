@@ -223,8 +223,20 @@ typedef struct MFTL_Domain
   int *rank_map;  // Linear array: rank_map[i + j*nx + k*nx*ny] = rank
   double grid_factors[3];  // Pre-calculated: cuts[i] / domain_size[i]
 
-  // --- Parallel Remeshing ---
-  double decomp_shift[3];  // current shift: 0 or h_k/2 per axis
+  // --- Parallel Remeshing (Stage 10): x-only load-balanced ownership ---
+  // When lb_nprocs > 0, MFTLGetOwnerProc ignores the Cartesian rank_map and
+  // maps a position to the x-slab (slab index == owning rank) selected by the
+  // sorted cut array lb_xcuts[0..lb_nprocs]. This implements MFTL1's x-only
+  // 1-D ownership ranges (Ycut=Zcut=1) on top of MFTL2's cell ownership.
+  // Slab boundaries are arbitrary x positions, so the load-balance optimizer
+  // can place cuts at sub-cell resolution. Ghost safety: with an x-only
+  // Cartesian grid (cuts[1]==cuts[2]==1) adjacent slabs are comm_graph
+  // neighbours, and mesh edges are assumed not to span a whole slab width
+  // (MFTL1's Sizethreshold guard). lb_nprocs == 0 disables the override.
+  int lb_nprocs;  // number of active x-slabs; 0 = native cell ownership
+  double lb_xmin;  // active window start (lb_xcuts[0])
+  double lb_xmax;  // active window end   (lb_xcuts[lb_nprocs])
+  double *lb_xcuts;  // lb_nprocs+1 sorted cut positions (NULL when disabled)
 
 } MFTL_Domain;
 

@@ -690,7 +690,7 @@ int CollapseApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params
   return MFTL_TRUE;
 }
 
-static inline int SplitApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params)
+int MFTLSplitApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params)
 {
   int approved = MFTL_FALSE;
   MFTL_HalfEdge *he = &obj->half_edges[he_idx];
@@ -1313,6 +1313,7 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
   int start_n_vertices[ens->num_objects];
   int start_n_triangles[ens->num_objects];
   int start_n_halfedges[ens->num_objects];
+  double start_volume[ens->num_objects];
 
   for (int i = 0; i < ens->num_objects; i++)
   {
@@ -1322,6 +1323,7 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
     start_n_vertices[i] = obj->n_vertices;
     start_n_triangles[i] = obj->n_triangles;
     start_n_halfedges[i] = obj->n_half_edges;
+    start_volume[i] = MFTLObjectVolume(obj);  // Stage 09 recovery target (collective)
   }
 
   // Loop continues IF:
@@ -1361,7 +1363,7 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
       // 1. SPLIT
       for (int j = obj->n_half_edges - 1; j >= 0; j--)
       {
-        if (SplitApproved(obj, j, params))
+        if (MFTLSplitApproved(obj, j, params))
         {
           MFTLSplitEdgeWithFit(obj, j, params);
           obj_split++;
@@ -1430,8 +1432,20 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
     printf("Operations -> Split: %d | Collapsed: %d | Swapped: %d\n", total_split, total_collapse, total_swap);
 
     // --- CONVERGENCE CHECK ---
-    int total_ops = total_split + total_collapse + total_swap;
-    if (total_ops < 10)
+    // On a single rank (or a ghost-complete mesh) the local op count is the
+    // whole story. When the serial kernel runs on a distributed ensemble
+    // (MFTLRemeshEnsembleDispersedCentering gathers to rank 0; other ranks
+    // hold empty objects), the decision must be collective — otherwise the
+    // empty ranks would exit the loop early and desynchronize the
+    // collectives in the Stage-09 stages below.
+    int converged = (total_split + total_collapse + total_swap) < 10;
+    if (ens->domain.nproc > 1)
+    {
+      int converged_g = 0;
+      MPI_Allreduce(&converged, &converged_g, 1, MPI_INT, MPI_MIN, ens->domain.comm_cart);
+      converged = converged_g;
+    }
+    if (converged)
     {
       printf("Remeshing converged successfully after %d iterations.\n", iter + 1);
       break;
@@ -1454,6 +1468,34 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
     MFTL_Object *obj = ens->objects[i];
     MFTLFinalizeRemeshing(obj, start_n_vertices[i], start_n_triangles[i], start_n_halfedges[i], collapses_occurred[i]);
   }
+
+  // --- Stage 09: volume-conserving post-remesh stages (finalized mesh) ---
+  // PRECONDITION for the edge-local smoothers: a complete one-ring around
+  // every processed vertex must be stored (rank-0-local mesh, or ghosts via
+  // MFTLExtendGhostLayer + MFTLUpdateGhostPositions); incomplete rings skip.
+  for (int i = 0; i < ens->num_objects; i++)
+  {
+    MFTL_Object *obj = ens->objects[i];
+    MFTLComputeTriangleProperties(obj);
+
+    if (params->volume_conserving_smoothing == MFTL_VCSMOOTH_KUPRAT)
+      MFTLVolumeConservingSmoothing(obj, params);
+    else if (params->volume_conserving_smoothing == MFTL_VCSMOOTH_TSUR)
+      MFTLTSUR3D(obj, params);
+
+    if (params->roughness_smoothing) MFTLRoughnessSmoothing(obj, params);
+  }
+
+  // ALWAYS finish a remesh cycle with global volume recovery against the
+  // pre-remesh volume: per-edge local conservation is first-order only and
+  // drift accumulates across the split/collapse/flip/smooth pipeline.
+  for (int i = 0; i < ens->num_objects; i++)
+  {
+    MFTL_Object *obj = ens->objects[i];
+    MFTLVolumeRecovery(obj, start_volume[i]);
+    MFTLComputeTriangleProperties(obj);
+  }
+  MFTLUpdateGhostPositions(ens, NULL);
 }
 
 /* ========================================================================== */
@@ -1621,6 +1663,7 @@ void MFTLSmoothTangentialWithParams(MFTL_Object* obj, MFTL_RemeshParameters* par
     for (int i = 0; i < obj->n_vertices; ++i)
     {
       MFTL_Vertex* v = &obj->vertices[i];
+      if (v->is_ghost) continue;  // Stage 10: ghosts live on their owner rank; never move them locally
       if ((v->flags & MFTL_FLAG_DEAD) || v->out_he_idx == MFTL_ERROR) continue;
       new_pos[i][0] = v->pos[0];
       new_pos[i][1] = v->pos[1];
@@ -1754,6 +1797,7 @@ void MFTLSmoothTangentialWithParams(MFTL_Object* obj, MFTL_RemeshParameters* par
 
     for (int i = 0; i < obj->n_vertices; ++i)
     {
+      if (obj->vertices[i].is_ghost) continue;  // Stage 10: ghosts are synced from their owner, never written here
       if ((obj->vertices[i].flags & MFTL_FLAG_DEAD) || obj->vertices[i].out_he_idx == MFTL_ERROR) continue;
       memcpy(obj->vertices[i].pos, new_pos[i], 3 * sizeof(double));
     }

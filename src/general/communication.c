@@ -30,8 +30,8 @@ void MFTLRegisterMpiTypes()
 {
   // --- 1. Create MPI Datatype for PackedVertex ---
   {
-#define NITEMS_VERTEX 11
-    int blocklengths[] = {1, 1, 3, 3, 1, 1, 1, 1, 1, 1, 1};
+#define NITEMS_VERTEX 13
+    int blocklengths[] = {1, 1, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1};
 
     MPI_Datatype types[] = {
         MPI_INT,  // global_id (was MPI_UINT64_T)
@@ -41,6 +41,8 @@ void MFTLRegisterMpiTypes()
         MPI_DOUBLE,  // meancurvature
         MPI_DOUBLE,  // gaussiancurvature
         MPI_DOUBLE,  // area
+        MPI_DOUBLE,  // roughness_mean (Stage 10)
+        MPI_DOUBLE,  // roughness_variance (Stage 10)
         MPI_C_BOOL,  // is_ghost
         MPI_INT,  // flags (was MPI_INT)
         MPI_INT,  // id_he_out (was MPI_UINT64_T)
@@ -55,10 +57,12 @@ void MFTLRegisterMpiTypes()
     offsets[4] = offsetof(PackedVertex, meancurvature);
     offsets[5] = offsetof(PackedVertex, gaussiancurvature);
     offsets[6] = offsetof(PackedVertex, area);
-    offsets[7] = offsetof(PackedVertex, is_ghost);
-    offsets[8] = offsetof(PackedVertex, flags);
-    offsets[9] = offsetof(PackedVertex, id_he_out);
-    offsets[10] = offsetof(PackedVertex, body_id);
+    offsets[7] = offsetof(PackedVertex, roughness_mean);
+    offsets[8] = offsetof(PackedVertex, roughness_variance);
+    offsets[9] = offsetof(PackedVertex, is_ghost);
+    offsets[10] = offsetof(PackedVertex, flags);
+    offsets[11] = offsetof(PackedVertex, id_he_out);
+    offsets[12] = offsetof(PackedVertex, body_id);
 
     MPI_Type_create_struct(NITEMS_VERTEX, blocklengths, offsets, types, &MPI_PackedVertex);
     MPI_Type_commit(&MPI_PackedVertex);
@@ -149,25 +153,31 @@ void MFTLRegisterMpiTypes()
 
   // --- 5. Create MPI Datatype for MFTL_GhostUpdatePayload ---
   {
-#define NITEMS_GHOST 6
-    int blocklengths[] = {1, 3, 3, 1, 1, 1};
+#define NITEMS_GHOST 9
+    int blocklengths[] = {1, 1, 3, 3, 1, 1, 1, 1, 1};
 
     MPI_Datatype types[] = {
         MPI_INT,  // global_id
+        MPI_INT,  // found (Stage 10)
         MPI_DOUBLE,  // pos[3]
         MPI_DOUBLE,  // normal[3]
         MPI_DOUBLE,  // meancurvature
         MPI_DOUBLE,  // gaussiancurvature
         MPI_DOUBLE,  // area
+        MPI_DOUBLE,  // roughness_mean (Stage 10)
+        MPI_DOUBLE,  // roughness_variance (Stage 10)
     };
 
     MPI_Aint offsets[NITEMS_GHOST];
     offsets[0] = offsetof(GhostUpdatePayload, global_id);
-    offsets[1] = offsetof(GhostUpdatePayload, pos);
-    offsets[2] = offsetof(GhostUpdatePayload, normal);
-    offsets[3] = offsetof(GhostUpdatePayload, meancurvature);
-    offsets[4] = offsetof(GhostUpdatePayload, gaussiancurvature);
-    offsets[5] = offsetof(GhostUpdatePayload, area);
+    offsets[1] = offsetof(GhostUpdatePayload, found);
+    offsets[2] = offsetof(GhostUpdatePayload, pos);
+    offsets[3] = offsetof(GhostUpdatePayload, normal);
+    offsets[4] = offsetof(GhostUpdatePayload, meancurvature);
+    offsets[5] = offsetof(GhostUpdatePayload, gaussiancurvature);
+    offsets[6] = offsetof(GhostUpdatePayload, area);
+    offsets[7] = offsetof(GhostUpdatePayload, roughness_mean);
+    offsets[8] = offsetof(GhostUpdatePayload, roughness_variance);
 
     MPI_Type_create_struct(NITEMS_GHOST, blocklengths, offsets, types, &MPI_GhostUpdatePayload);
     MPI_Type_commit(&MPI_GhostUpdatePayload);
@@ -272,6 +282,8 @@ void MFTLPackSingleVertex(MFTL_Object* obj, int vert_idx, PackedVertex* dst, boo
   dst->meancurvature = src->meancurvature;
   dst->gaussiancurvature = src->gaussiancurvature;
   dst->area = src->area;
+  dst->roughness_mean = src->roughness_mean;
+  dst->roughness_variance = src->roughness_variance;
   dst->is_ghost = is_ghost ? MFTL_TRUE : MFTL_FALSE;
   dst->flags = src->flags;
   dst->id_he_out = MFTLVOutHe(obj, src)->global_id;
@@ -591,11 +603,11 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
     last_size_tris = n_triangles;
     last_size_verts = n_vertices;
 
-    // Ensure topology is built. If NULL, build it now (Lazy Init).
-    if (!object->flat_tri_verts || !object->flat_tri_neighbors)
-    {
-      MFTLFlattenConnectivity(object);
-    }
+    // Rebuild the flattened connectivity: remeshing may have changed the
+    // topology since the arrays were last built (the previous lazy init
+    // only rebuilt when NULL, which silently shipped stale connectivity
+    // when redistributing a remeshed mesh — Stage 10).
+    MFTLFlattenConnectivity(object);
 
     // Direct pointers to object memory (Zero Copy)
     int* flat_tri_verts = object->flat_tri_verts;
@@ -793,6 +805,8 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
         memcpy(packed_vert->normal, vert_base[vert_idx].normal, 3 * sizeof(double));
         packed_vert->meancurvature = vert_base[vert_idx].meancurvature;
         packed_vert->gaussiancurvature = vert_base[vert_idx].gaussiancurvature;
+        packed_vert->roughness_mean = vert_base[vert_idx].roughness_mean;
+        packed_vert->roughness_variance = vert_base[vert_idx].roughness_variance;
         packed_vert->area = vert_base[vert_idx].area;
         packed_vert->is_ghost = MFTL_FALSE;
         packed_vert->flags = vert_base[vert_idx].flags;
@@ -1244,6 +1258,8 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
           dst->area = src->area;
           dst->meancurvature = src->meancurvature;
           dst->gaussiancurvature = src->gaussiancurvature;
+          dst->roughness_mean = src->roughness_mean;
+          dst->roughness_variance = src->roughness_variance;
 
           memcpy(dst->pos, src->pos, 3 * sizeof(double));
           memcpy(dst->normal, src->normal, 3 * sizeof(double));
@@ -1279,6 +1295,8 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
           dst->area = src->area;
           dst->meancurvature = src->meancurvature;
           dst->gaussiancurvature = src->gaussiancurvature;
+          dst->roughness_mean = src->roughness_mean;
+          dst->roughness_variance = src->roughness_variance;
           memcpy(dst->pos, src->pos, 3 * sizeof(double));
           memcpy(dst->normal, src->normal, 3 * sizeof(double));
           dst->out_he_idx = src->id_he_out;
@@ -1363,11 +1381,11 @@ int MFTLRedistributeObject(MFTL_Object* object)
   int* vert_owners = malloc(n_vertices * sizeof(int));
   int* tri_owners = malloc(n_triangles * sizeof(int));
 
-  // Ensure topology is built. If NULL, build it now (Lazy Init).
-  if (!object->flat_tri_verts || !object->flat_tri_neighbors)
-  {
-    MFTLFlattenConnectivity(object);
-  }
+  // Rebuild the flattened connectivity: remeshing may have changed the
+  // topology since the arrays were last built (the previous lazy init
+  // only rebuilt when NULL, which silently shipped stale connectivity
+  // when redistributing a remeshed mesh — Stage 10).
+  MFTLFlattenConnectivity(object);
 
   // Direct pointers to object memory (Zero Copy)
   int* flat_tri_verts = object->flat_tri_verts;
@@ -1704,6 +1722,8 @@ int MFTLRedistributeObject(MFTL_Object* object)
       dst->area = src->area;
       dst->meancurvature = src->meancurvature;
       dst->gaussiancurvature = src->gaussiancurvature;
+      dst->roughness_mean = src->roughness_mean;
+      dst->roughness_variance = src->roughness_variance;
       memcpy(dst->pos, src->pos, sizeof(double) * 3);
       memcpy(dst->normal, src->normal, sizeof(double) * 3);
       dst->out_he_idx = src->id_he_out;  // Fix later
@@ -1734,6 +1754,8 @@ int MFTLRedistributeObject(MFTL_Object* object)
       dst->area = src->area;
       dst->meancurvature = src->meancurvature;
       dst->gaussiancurvature = src->gaussiancurvature;
+      dst->roughness_mean = src->roughness_mean;
+      dst->roughness_variance = src->roughness_variance;
       memcpy(dst->pos, src->pos, sizeof(double) * 3);
       memcpy(dst->normal, src->normal, sizeof(double) * 3);
       dst->out_he_idx = src->id_he_out;
@@ -1788,6 +1810,8 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lo
   memset(rank_to_neigh_idx, -1, nproc * sizeof(int));
   for (int i = 0; i < num_neighbors; ++i) rank_to_neigh_idx[domain->neighbors[i]] = i;
 
+  int n_skipped_nonneighbor = 0;
+
   // --- 2. Build Requests (Iterate ALL objects) ---
   for (int o = 0; o < ens->num_objects; ++o)
   {
@@ -1803,14 +1827,40 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lo
         assert(owner >= 0 && owner < nproc && "Ghost owner rank out of bounds!");
         int n_idx = rank_to_neigh_idx[owner];
 
-        // Safety: Ghost owner MUST be a neighbor in the graph communicator
-        assert(n_idx != -1);
-
-        // Append (BodyID, GID) to the request buffer
-        buffer_add(&req_send_bufs[n_idx], obj->global_id);
-        buffer_add(&req_send_bufs[n_idx], v->global_id);
+        // Parallel remeshing can briefly put a ghost's owner two slabs away
+        // (a transient edge longer than a slab width during a split-heavy
+        // pass, or a knife-edge slab from the load-balance window). The
+        // graph communicator cannot serve those requests; keep the ghost
+        // stale instead — it is refreshed by the next redistribution, which
+        // runs at least once per remesh pass, and the remesh gates treat
+        // ghost-touching edges conservatively. (Writing into
+        // req_send_bufs[-1] would corrupt the heap — this must never be an
+        // unchecked Release-mode assert.)
+        if (n_idx != -1)
+        {
+          // Append (BodyID, GID) to the request buffer
+          buffer_add(&req_send_bufs[n_idx], obj->global_id);
+          buffer_add(&req_send_bufs[n_idx], v->global_id);
+        }
+        else
+        {
+          n_skipped_nonneighbor++;
+        }
       }
     }
+  }
+
+  {
+    // Unconditional consensus: a rank-local conditional Allreduce here
+    // would deadlock the ranks that skip it against the neighbour
+    // collectives below.
+    int skipped_g = 0;
+    MPI_Allreduce(&n_skipped_nonneighbor, &skipped_g, 1, MPI_INT, MPI_SUM, domain->comm_cart);
+    if (skipped_g > 0 && my_rank == 0)
+      fprintf(stderr,
+              "MFTLUpdateGhostPositions: %d ghost(s) have non-neighbour owners (transient slab-spanning edges or\n"
+              "knife-edge slabs during parallel remeshing); keeping them stale until the next redistribution.\n",
+              skipped_g);
   }
 
   // --- 3. Exchange Request Counts ---
@@ -1915,21 +1965,27 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lo
     // --- C. Pack Payload ---
     GhostUpdatePayload* p = &reply_payloads[reply_idx++];
     p->global_id = req_gid;
+    p->found = 1;
 
-    if (found_v == MFTL_NULL)
+    if (found_v == MFTL_NULL || (found_v->flags & MFTL_FLAG_DEAD))
     {
-      // A requester only asks for vertices this rank owns. A miss therefore
-      // means the mesh is inconsistent — fail loudly (in Debug AND Release),
-      // never fabricate a zeroed payload that would silently corrupt ghosts.
-      fprintf(stderr, "FATAL ERROR: MFTLUpdateGhostPositions: owned vertex GID %d (body %d) not found on owner rank %d\n", req_gid, req_body_id, my_rank);
-      exit(EXIT_FAILURE);
+      // Parallel remeshing legitimately kills entities whose ghosts other
+      // ranks still hold (MFTL1's two-pass scheme relies on this: the ghost
+      // copies become stale and are dropped by the next redistribution).
+      // Report the miss explicitly; the requester keeps its stale copy.
+      // (A zeroed/fabricated payload would silently corrupt ghost state.)
+      p->found = 0;
     }
-
-    memcpy(p->pos, found_v->pos, 3 * sizeof(double));
-    memcpy(p->normal, found_v->normal, 3 * sizeof(double));
-    p->meancurvature = found_v->meancurvature;
-    p->gaussiancurvature = found_v->gaussiancurvature;
-    p->area = found_v->area;
+    else
+    {
+      memcpy(p->pos, found_v->pos, 3 * sizeof(double));
+      memcpy(p->normal, found_v->normal, 3 * sizeof(double));
+      p->meancurvature = found_v->meancurvature;
+      p->gaussiancurvature = found_v->gaussiancurvature;
+      p->area = found_v->area;
+      p->roughness_mean = found_v->roughness_mean;
+      p->roughness_variance = found_v->roughness_variance;
+    }
   }
 
   free(flat_recv_reqs);
@@ -2006,12 +2062,21 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lo
         int local_idx = kh_value(current_obj->vertex_lookup, k_vert);
         MFTL_Vertex* v = &current_obj->vertices[local_idx];
 
+        if (!p->found)
+        {
+          // The owner killed this entity during remeshing; keep the stale
+          // ghost untouched (the next redistribution drops it).
+          continue;
+        }
+
         // Apply Update
         memcpy(v->pos, p->pos, 3 * sizeof(double));
         memcpy(v->normal, p->normal, 3 * sizeof(double));
         v->meancurvature = p->meancurvature;
         v->gaussiancurvature = p->gaussiancurvature;
         v->area = p->area;
+        v->roughness_mean = p->roughness_mean;
+        v->roughness_variance = p->roughness_variance;
       }
     }
   }
@@ -2059,6 +2124,8 @@ void MFTLAppendGhostVertex(MFTL_Object* obj, PackedVertex* pv)
   v->area = pv->area;
   v->meancurvature = pv->meancurvature;
   v->gaussiancurvature = pv->gaussiancurvature;
+  v->roughness_mean = pv->roughness_mean;
+  v->roughness_variance = pv->roughness_variance;
   v->out_he_idx = pv->id_he_out;  // GID, resolved later
 
   memcpy(v->pos, pv->pos, 3 * sizeof(double));
@@ -2459,6 +2526,17 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
     he_marks[o] = ens->objects[o]->n_half_edges;
   }
 
+  // Phase 4 remarks: a received ghost whose owner is NOT a graph neighbour
+  // of this rank is unusable — the ghost machinery (MFTLUpdateGhostPositions)
+  // can only exchange with neighbours. This happens when the expansion
+  // neighbourhood reaches ~2 edge-lengths on a decomposition whose slabs
+  // are narrower than that (e.g. after a large boundary shift). Skip such
+  // vertices, and skip every triangle that references a vertex we could
+  // not integrate (its GID->local remap would fail in Phase 5).
+  char* is_neigh_rank = calloc(nproc, sizeof(char));
+  for (int i = 0; i < num_neighbors; ++i) is_neigh_rank[domain->neighbors[i]] = 1;
+  int my_rank = domain->rank;
+
   // Integrate Vertices
   for (int i = 0; i < tot_recv_v; ++i)
   {
@@ -2480,6 +2558,7 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
       khiter_t it = kh_get(vertex_map, obj->vertex_lookup, pv->global_id);
       if (it == kh_end(obj->vertex_lookup))
       {
+        if (pv->owner_proc != my_rank && !is_neigh_rank[pv->owner_proc]) continue;
         MFTLAppendGhostVertex(obj, pv);
       }
     }
@@ -2505,10 +2584,22 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
       khiter_t it = kh_get(triangle_map, obj->triangle_lookup, ptc->triangle.global_id);
       if (it == kh_end(obj->triangle_lookup))
       {
+        int corners_present = 1;
+        for (int k = 0; k < 3; ++k)
+        {
+          if (kh_get(vertex_map, obj->vertex_lookup, ptc->half_edges[k].vertex_gid) == kh_end(obj->vertex_lookup))
+          {
+            corners_present = 0;
+            break;
+          }
+        }
+        if (!corners_present) continue;
         MFTLAppendGhostTriangle(obj, ptc);
       }
     }
   }
+
+  free(is_neigh_rank);
 
   free(recv_tris);
   free(recv_verts);

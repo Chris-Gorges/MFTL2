@@ -35,6 +35,8 @@ typedef struct
   double meancurvature;
   double gaussiancurvature;
   double area;
+  double roughness_mean;  // Stage 10: roughness data must cross ranks with the vertex
+  double roughness_variance;
 
   // --- State Information ---
   bool is_ghost;
@@ -118,11 +120,16 @@ typedef struct
 typedef struct
 {
   int global_id;
+  int found;  // Stage 10: 0 when the owner no longer holds this entity (legitimately
+  // killed by a remesh op since the last sync); the requester keeps its
+  // stale copy, which the next redistribution drops. Never fabricate data.
   double pos[3];
   double normal[3];
   double meancurvature;
   double gaussiancurvature;
   double area;
+  double roughness_mean;  // Stage 10: ghost payload carries roughness data
+  double roughness_variance;
 } GhostUpdatePayload;
 
 // A map from a neighbor rank (int) to a list of GIDs (int64_t*).
@@ -174,6 +181,33 @@ static inline int MFTLGetOwnerProc(const MFTL_Domain* domain, const double pos[3
   // Pre-check: Ensure the point is within the global domain.
   MFTL_ASSERT(pos[0] >= domain->global_min[0] && pos[0] <= domain->global_max[0] && pos[1] >= domain->global_min[1] && pos[1] <= domain->global_max[1] &&
               pos[2] >= domain->global_min[2] && pos[2] <= domain->global_max[2] && "Point is outside the global simulation box");
+
+  // Stage 10: x-only load-balanced ownership override (MFTL1 ownership
+  // ranges). Slab index == owning rank; cuts are arbitrary x positions.
+  // Out-of-window positions clamp to the end slabs (positions may drift by
+  // sub-edge amounts during remeshing; the window covers bbox +/- refLength).
+  if (domain->lb_nprocs > 0)
+  {
+    if (pos[0] <= domain->lb_xmin) return 0;
+    if (pos[0] >= domain->lb_xmax) return domain->lb_nprocs - 1;
+
+    // Binary search: largest s in [1, lb_nprocs-1] with lb_xcuts[s] <= x.
+    int lo = 1, hi = domain->lb_nprocs - 1, s = 0;
+    while (lo <= hi)
+    {
+      int mid = lo + (hi - lo) / 2;
+      if (domain->lb_xcuts[mid] <= pos[0])
+      {
+        s = mid;
+        lo = mid + 1;
+      }
+      else
+      {
+        hi = mid - 1;
+      }
+    }
+    return s;
+  }
 
   // 1. Math Optimization:
   // Use pre-calculated factors (multiplication is faster than division).

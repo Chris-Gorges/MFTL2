@@ -22,71 +22,6 @@ typedef enum
   MFTL_OP_SWAP
 } MFTL_RemeshOpType;
 
-// The "Command" packet sent from Owner to Neighbor
-typedef struct
-{
-  int8_t type;  // MFTL_RemeshOpType
-  int edge_gid;  // The global ID of the edge being operated on
-
-  // Payload for Split:
-  double new_pos[3];  // Exact position of the new vertex
-  int new_vert_gid;  // Pre-assigned GID for the new vertex (deterministic!)
-  int new_edge_gid;  // Pre-assigned GID for the new halfedge
-
-  // Payload for Collapse:
-  int keep_vert_gid;  // The GID of the vertex to keep
-
-} MFTL_RemeshAction;
-
-// Dynamic array (vector) helper for buffering actions
-typedef struct
-{
-  MFTL_RemeshAction *data;
-  size_t count;
-  size_t capacity;
-} ActionBuffer;
-
-// // Helper to determine edge ownership deterministically
-// // Rule: The rank with the lower ID owns the shared edge.
-// static inline bool MFTLIsEdgeOwner(int my_rank, int neighbor_rank) { return my_rank < neighbor_rank; }
-
-/* ── Per-entity flag additions ────────────────────────────────────────── */
-#define MFTL_FLAG_FROZEN (1 << 4) /* in freeze band; do not modify  */
-#define MFTL_FLAG_FROZEN_NEXT (1 << 5) /* staging flag for dilation pass */
-#define MFTL_FLAG_NEVER_INTERIOR (1 << 6) /* set at pass-start; cleared     */
-/* when entity becomes unfrozen   */
-/* even once — convergence cert.  */
-
-#define MFTL_FLAG_IMMUTABLE (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED | MFTL_FLAG_FROZEN)
-
-/* ── Phase schedule ────────────────────────────────────────────────────
- *
- * MFTL_SHIFT_PHASES[p][k]:
- *   0  →  no shift in axis k for phase p
- *   1  →  shift cut planes by h_k/2 in axis k for phase p
- *
- * The ordering maximises useful work in the fewest phases:
- *
- *   Phases 0–1  :  resolve O(δ/h)       slab   conflicts   (~95–99 %)
- *   Phases 2–4  :  resolve O((δ/h)²)    tube   conflicts   (even OA)
- *   Phases 5–7  :  resolve O((δ/h)³)    corner conflicts   (odd set)
- *
- * All 8 phases together form {0, h/2}³, which guarantees that every
- * entity is strictly interior (unfrozen) in at least one phase,
- * provided the hard constraint  δ < h_min/4  holds.
- * ─────────────────────────────────────────────────────────────────── */
-static const int MFTL_SHIFT_PHASES[8][3] = {
-    {0, 0, 0}, /* phase 0 – canonical / baseline                      */
-    {1, 1, 1}, /* phase 1 – full diagonal; resolves all slab conflicts */
-    {0, 1, 1}, /* phase 2 – even orthogonal-array member 1            */
-    {1, 0, 1}, /* phase 3 – even orthogonal-array member 2            */
-    {1, 1, 0}, /* phase 4 – even orthogonal-array member 3            */
-    {1, 0, 0}, /* phase 5 – odd set member 1                          */
-    {0, 1, 0}, /* phase 6 – odd set member 2                          */
-    {0, 0, 1} /* phase 7 – odd set member 3                          */
-};
-#define MFTL_NUM_SHIFT_PHASES 8
-
 /* ── Centering threshold ────────────────────────────────────────────────
  *
  * Object-centering migration uses ONLY 26-neighbour communication.
@@ -141,6 +76,14 @@ typedef enum
   MFTL_FIT_BARYCENTRIC = 2
 } MFTL_VertexFitMode;
 
+// Stage 09: volume-conserving smoothing mode (MFTL1 VertexSmoothing parity).
+typedef enum
+{
+  MFTL_VCSMOOTH_NONE = 0,
+  MFTL_VCSMOOTH_KUPRAT = 1,  // volume-conserving Laplacian (Kuprat Alg. 4)
+  MFTL_VCSMOOTH_TSUR = 2  // Jiao TSUR3D null-space smoothing
+} MFTL_VCSmoothMode;
+
 typedef struct
 {
   MFTL_RemeshType type;
@@ -167,6 +110,21 @@ typedef struct
   double min_quality_threshold;     // smoothing quality window (MFTL1 quality, 1 = perfect)
   double max_quality_threshold;     // flip/smoothing gate: reject worse-than-this quality
   int max_smoothing_iter;           // tangential smoothing iterations per pass
+
+  // --- Stage 09: volume-conserving smoothing (MFTL1 parity) ---
+  MFTL_VCSmoothMode volume_conserving_smoothing;  // post-remesh smoothing stage
+  int roughness_smoothing;                        // per-edge roughness-triggered smoothing (0/1)
+  double laplacian_smoothing_under_relaxation;    // Kuprat omega
+  int max_smoothing_laplacian_iter;               // Kuprat/TSUR iteration cap
+  double max_roughness;                           // dihedral-roughness trigger
+  double max_geometric_laplacian;                 // geometric-Laplacian trigger
+
+  // --- Stage 10: load balancing (MFTL1 RemeshParameter parity) ---
+  int min_triangles_per_proc;  // MinNoTriangles: lower bound for slab splitting (0 = use all ranks)
+  int max_balance_iter;        // maxBalanceIter: slab-width optimizer iteration cap
+  double size_threshold;       // Sizethreshold: minimum slab width; retry with fewer slabs below
+  double damping_factor;       // dampingfactor: slab-width optimizer damping in (0,1]
+  int load_balance;            // enable x-only load balancing + two-pass boundary shift
 
   // ... any other parameters like smoothing weights, boundary locks, etc.
 } MFTL_RemeshParameters;
@@ -227,6 +185,26 @@ static inline void MFTLInitRemeshParams(MFTL_RemeshParameters *params, MFTL_Reme
   params->min_quality_threshold = 1.2;
   params->max_quality_threshold = 2.0;
   params->max_smoothing_iter = 3;
+
+  // --- Stage 09 defaults (MFTL1 RemeshParameter parity) ---
+  params->volume_conserving_smoothing = MFTL_VCSMOOTH_NONE;
+  params->roughness_smoothing = 0;
+  params->laplacian_smoothing_under_relaxation = 0.5;
+  params->max_smoothing_laplacian_iter = 10;
+  params->max_roughness = 0.05;
+  params->max_geometric_laplacian = 0.05;
+
+  // --- Stage 10 defaults (MFTL1 RemeshParameter parity) ---
+  params->min_triangles_per_proc = 0;    // 0: use all ranks (MFTL1 MinNoTriangles disabled)
+  params->max_balance_iter = 10;         // MFTL1 Iterationsthreshold
+  // A slab should hold at least one full edge plus margin: redistribution
+  // and ghost updates assume mesh edges do not span a whole slab (owners
+  // stay graph neighbours). Transient slab-spanning edges during split-
+  // heavy passes are tolerated (their ghost updates are skipped until the
+  // next redistribution), so this is a soft floor, not a hard invariant.
+  params->size_threshold = 1.5 * params->max_edge_length;
+  params->damping_factor = 0.5;          // MFTL1 dampingfactor (0,1]
+  params->load_balance = 1;              // MFTL1 MFTL_LoadBalance = MFTL_YES
 }
 
 // --- Core Topological Operators ---
@@ -236,6 +214,18 @@ static inline void MFTLInitRemeshParams(MFTL_RemeshParameters *params, MFTL_Reme
 int MFTLSplitEdge(MFTL_Object *obj, int he_ab_idx);
 void MFTLCollapseEdge(MFTL_Object *obj, int he_ab_idx);
 int MFTLSwapEdge(MFTL_Object *obj, int he_idx);
+/** @brief In-place edge flip (valence optimization; no new entities). */
+void MFTLFlipEdge(MFTL_Object *obj, int he_idx);
+/** @brief Stage-08 flip gate stack: valence + quality + dihedral (params == NULL keeps the legacy valence-only behaviour). */
+int FlipApprovedWithParams(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params);
+
+/**
+ * @brief Compacts the object after a remesh pass (append-only fast path when
+ * only splits happened; full compaction + khash rebuild after collapses).
+ * Must run before any redistribution, which would otherwise ship dead
+ * entities.
+ */
+void MFTLFinalizeRemeshing(MFTL_Object *obj, int start_num_v, int start_num_t, int start_num_h, bool collapses_occurred);
 
 // --- Stage 08: criteria, fitting, smoothing ---
 
@@ -281,21 +271,112 @@ void MFTLDetectFeatures(MFTL_Object *obj, double angle_degrees);
  */
 int CollapseApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params);
 
+// --- Stage 09: volume-conserving smoothing (see src/remeshing/volume_conserving.c) ---
+
+/**
+ * @brief Global volume recovery (MFTL1 VolumeRecovery): shift every owned
+ * vertex along its one-ring normal by h = (V - target)/Area, iterated until
+ * the relative volume error is < 1e-12 or the iteration cap (5) is hit.
+ * Returns the final relative volume error. Collective (volume/area
+ * reductions over comm_cart); caller refreshes ghost positions afterwards.
+ * On distributed meshes the effective Area weights each owned triangle by
+ * its owned-corner fraction (boundary triangles share corners with ghost
+ * copies), so the first-order correction stays exact in parallel.
+ */
+double MFTLVolumeRecovery(MFTL_Object* obj, double target_volume);
+
+/** @brief Kuprat Algorithm-4 volume-conserving smoothing of one edge (exact first-order local volume correction). */
+void MFTLEdgeVolumeConservingSmoothing(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params);
+
+/** @brief Kuprat driver: per-edge volume-conserving Laplacian for max_smoothing_laplacian_iter iterations. */
+void MFTLVolumeConservingSmoothing(MFTL_Object* obj, MFTL_RemeshParameters* params);
+
+/** @brief Jiao TSUR3D null-space smoothing of one edge (volume-conserving tangent-plane projection). Returns MFTL_SUCCESS or MFTL_ERROR (degenerate/NaN). */
+int MFTLEdgeTSUR(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params);
+
+/** @brief TSUR3D driver over all interior edges. */
+void MFTLTSUR3D(MFTL_Object* obj, MFTL_RemeshParameters* params);
+
+/**
+ * @brief Roughness-triggered smoothing (MFTL1 Object_Roughness_Smoothing):
+ * per edge, when the dihedral roughness or geometric Laplacian exceeds the
+ * thresholds, dispatch to Kuprat or TSUR per params->volume_conserving_smoothing.
+ * Recomputes the roughness data (MFTLComputeRoughness) on entry.
+ */
+void MFTLRoughnessSmoothing(MFTL_Object* obj, MFTL_RemeshParameters* params);
+
 // --- High Level Routine ---
 void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params);
 
-// --- Parallel Remeshing (WIP — Stage 10 completes the implementation) ---
-// Parallel dispatcher. Deliberately distinct from the serial MFTLRemeshEnsemble:
-// the serial entry point (remeshing_core.c) keeps the void signature used by
-// existing examples; the parallel dispatcher reports success/failure via its
-// return code.
+// --- Stage 10: parallel remeshing + load balancing (MFTL1 parity) ---
+
+/**
+ * @brief Split predicate (Stage 08), exposed for the parallel driver: the
+ * parallel split phase counts candidates on every rank and assigns disjoint
+ * per-rank GID blocks BEFORE applying any split, so block assignment needs
+ * this predicate outside remeshing_core.c.
+ */
+int MFTLSplitApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params);
+
+/**
+ * @brief Parallel dispatcher (all ranks of ens->domain.comm_cart must call).
+ * Selects the remesh algorithm (centering for small dispersed objects, the
+ * MFTL1 two-pass shift scheme otherwise; serial kernel on a single rank) and
+ * returns MFTL_SUCCESS / MFTL_ERROR.
+ */
 int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, MFTL_RemeshParameters *params);
-// Shift-scheme kernel: spatial shift / freeze / migrate loop.
-// Declared here so the WIP dispatcher type-checks; implemented in Stage 10.
+
+/**
+ * @brief MFTL1's x-only load balancing with the two-pass boundary shift.
+ * Requires an x-only Cartesian decomposition (cuts[1] == cuts[2] == 1);
+ * on other decompositions it degrades to interior-only remeshing (no load
+ * balancing, no boundary shift) and prints a note on rank 0.
+ */
 int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *params);
-// Centering kernel: object-center migration + ungated serial kernel.
-// Declared here so the WIP dispatcher type-checks; implemented in Stage 10.
+
+/**
+ * @brief Gather the ensemble to rank 0 (temporary single-partition domain),
+ * run the ungated serial remesh kernel, restore the domain and redistribute.
+ * Used for dispersed objects small enough to center (W < 0.5 * h_min).
+ */
 int MFTLRemeshEnsembleDispersedCentering(MFTL_Ensemble *ens, MFTL_RemeshParameters *params);
+
+/**
+ * @brief MFTL1 MFTLRedistributeObjectLoadBalanced, ensemble-wide: computes an
+ * x-only slab decomposition (see MFTL_Domain.lb_*) that equalizes the OWNED
+ * triangle count per slab and redistributes. The optimizer state is built
+ * from Allreduced quantities only, so every rank computes identical cuts.
+ * Requires cuts[1] == cuts[2] == 1. Returns the number of active slabs.
+ */
+int MFTLRedistributeEnsembleLoadBalanced(MFTL_Ensemble *ens, MFTL_RemeshParameters *params);
+
+/**
+ * @brief MFTL1 ShiftOwnershipRanges: translate the x-cuts right by
+ * max(0.2 * min slab width, 3 * reference_length) so triangles that sat on a
+ * slab boundary in pass 1 become slab-interior for the second remeshing
+ * pass, then redistribute. Returns MFTL_ERROR when a shift is impossible
+ * (fewer than 2 active slabs) and the caller must skip pass 2.
+ */
+int MFTLShiftOwnershipRanges(MFTL_Ensemble *ens, MFTL_RemeshParameters *params);
+
+/**
+ * @brief Synchronize every object's next_*_gid counters across
+ * ens->domain.comm_cart (MPI_Allreduce MAX) and optionally store the common
+ * maximum on all ranks. Called by the parallel remesh driver after every
+ * redistribution so later GID allocation can never collide with entities
+ * created on other ranks.
+ */
+void MFTLSyncEnsembleGidCounters(MFTL_Ensemble *ens);
+
+// --- Stage 10: parallel-safe edge-local smoothers (src/remeshing/volume_conserving.c) ---
+// The serial drivers MFTLVolumeConservingSmoothing / MFTLTSUR3D /
+// MFTLRoughnessSmoothing fail loudly when called on a distributed mesh.
+// These variants gate every edge to the MFTL1 parallel-interior rule (both
+// endpoints owned by this rank, full local ghost-free fan), which makes the
+// per-edge steps exactly local; ghost copies are refreshed by the driver.
+void MFTLVolumeConservingSmoothingParallel(MFTL_Object *obj, MFTL_RemeshParameters *params);
+void MFTLTSUR3DParallel(MFTL_Object *obj, MFTL_RemeshParameters *params);
+void MFTLRoughnessSmoothingParallel(MFTL_Object *obj, MFTL_RemeshParameters *params);
 
 /* ══════════════════════════════════════════════════════════════════════
  * MFTLDomainGetHMin
@@ -330,41 +411,5 @@ static inline double MFTLDomainGetHMin(MFTL_Domain *dom)
   return h_min;
 }
 
-/* ══════════════════════════════════════════════════════════════════════
- * MFTLDomainSetShiftPhase
- *
- * Sets dom->decomp_shift[k] for each axis k according to the selected
- * phase from the MFTL_SHIFT_PHASES table:
- *
- *   decomp_shift[k] = MFTL_SHIFT_PHASES[phase_idx][k]  *  (h_k / 2)
- *
- * After this call, MFTLGetOwnerProc uses the updated decomp_shift to
- * determine which rank owns a given triangle centroid position.
- *
- * The shift causes all cut planes in axis k to translate by h_k/2
- * (when the table entry is 1), which is the core geometric operation
- * of the freeze/migrate scheme.
- *
- * Precondition : 0 <= phase_idx < MFTL_NUM_SHIFT_PHASES (= 8)
- * Postcondition: dom->decomp_shift is updated; no entity data is moved.
- *                The caller must follow this with
- *                MFTLRedistributeListOfObjects() to actually migrate
- *                entities to their new owning ranks.
- *
- * Complexity : O(1), no communication.
- * ══════════════════════════════════════════════════════════════════════ */
-static inline void MFTLDomainSetShiftPhase(MFTL_Domain *dom, int phase_idx)
-{
-  MFTL_ASSERT(dom != MFTL_NULL);
-  MFTL_ASSERT(phase_idx >= 0 && phase_idx < MFTL_NUM_SHIFT_PHASES);
-
-  for (int k = 0; k < 3; ++k)
-  {
-    double h = dom->domain_size[k] / (double) dom->cuts[k];
-
-    /* Ternary keeps branch-free in the common case. */
-    dom->decomp_shift[k] = MFTL_SHIFT_PHASES[phase_idx][k] ? 0.5 * h : 0.0;
-  }
-}
 
 #endif

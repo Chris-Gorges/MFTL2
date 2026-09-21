@@ -1,10 +1,79 @@
 # 10 — Parallel remeshing + load balancing
 
-Status: NOT STARTED
+Status: COMPLETE
 Depends on: 08, 09
-Implemented by:
-Reviewed by:
-Acceptance: NOT PASSED
+Implemented by: Kimi Code
+Reviewed by: Claude Code
+Acceptance: PASSED
+
+> **Review note (accepted):** Verified — single-owner interior gates prevent divergent
+> topology; GID uniqueness via disjoint per-rank blocks (confirmed by the ownership-stability
+> `n2==n1` re-redistribution check); load balancing deterministic (`lb_xcuts` from
+> `Allreduce`'d global counts) and effective; CENTERING gather-to-rank-0 exercised (advect
+> np2) and lossless; roughness data now crosses ranks; serial edge-local smoothers fail
+> loudly on distributed meshes (resolves the Stage-09 carry-forward). Volume rank-independent
+> (V=−4.17972146930, drift ≤ ~7e-11 on 1/2/4/8); Release + ASan/UBSan clean (0 sanitizer
+> hits) with repeats; no regressions to Stages 01–09. **Carry-forward (should-fix, not
+> blocking):** (a) triangle count is rank-count-dependent (~13% np1→np8) because the
+> interior-only gate under-remeshes partition-boundary regions — MFTL1's
+> `MFTL_RemeshBoundaryCleanup` (gather-to-one-rank final pass) would restore full
+> resolution-decomposition-independence; implement or flag before Stage 15. (b) transient
+> non-neighbour-owner ghosts during LB passes are kept stale until the next redistribution
+> (negligible ~1e-11 volume impact, no topology corruption). Periodic remeshing remains a
+> Stage-13 item (TSUR endpoint clamp).
+
+> **Implementation notes (for review):** the WIP freeze-band scaffolding
+> (`MFTL_SHIFT_PHASES`, `decomp_shift`, freeze flags, `MFTL_RemeshAction`,
+> coarsening `MFTLComputeCoarseningFactor`/`MFTLRemeshWithCoarsening`) was
+> **removed**, not completed: its hard constraint (h_min > 4δ) and the
+> dispatcher's `MFTL_ERROR` path (unreachable on np2 for typical cuts)
+> belong to a different design than the approved MFTL1-style scheme below.
+> What shipped:
+>
+> - **Single-owner rule** (MFTL1 `Boundary_Check`): split/flip act on edges
+>   with both endpoints owned and both adjacent triangles local and
+>   ghost-free; collapse additionally requires the whole edge fan local and
+>   ghost-free. Rings around owned vertices are complete by the
+>   redistribution fan-out, so no mid-pass topology communication is needed;
+>   killed entities may still have stale ghost copies on other ranks — that
+>   is expected (MFTL1 behaves the same) and `MFTLUpdateGhostPositions`
+>   reports them via `GhostUpdatePayload.found == 0`; they are dropped by
+>   the next redistribution.
+> - **Load balancing**: `MFTLRedistributeEnsembleLoadBalanced` — MFTL1's
+>   x-only equal-count slab optimizer (`NoOfProcs`, `DX += damping*(DX*ratio
+>   - DX)`, converge `max|1-ratio| < 0.2`, retry with fewer slabs below
+>   `Sizethreshold`), ensemble-wide because MFTL2 has one shared domain
+>   ownership function. Slab cuts are arbitrary x positions stored in
+>   `MFTL_Domain.lb_*` and honoured by `MFTLGetOwnerProc`; **requires an
+>   x-only decomposition** (`cuts = {nproc,1,1}`, MFTL1's production
+>   configuration). Other decompositions fall back to interior-only
+>   remeshing (MFTL1 `LoadBalance = NO` analog, with a rank-0 note).
+> - **Two-pass boundary shift**: `MFTLShiftOwnershipRanges` shifts cuts
+>   right by `max(0.2*minDX, 3*referenceLength)`; boundary coverage is
+>   complemented by a bounded split-cleanup under both the lb and the
+>   restored native decomposition (flip diagonals have no length gate and
+>   can leave long interior edges).
+> - **GID uniqueness**: per-pass disjoint per-rank GID blocks (prefix
+>   schedule over counted split candidates, base = Allreduce-MAX of the
+>   counters); counters re-synced after every redistribution
+>   (`MFTLSyncEnsembleGidCounters`).
+> - **Stage-09 follow-up**: the serial edge-local smoothers fail loudly on
+>   distributed meshes; the driver uses new `*Parallel` variants gating
+>   every edge to the interior rule. Roughness data now crosses ranks
+>   (`PackedVertex`/`GhostUpdatePayload` gained `roughness_mean/variance`).
+> - **Volume conservation**: per-pass `VolumeRecovery` (ghost-synced before
+>   it so it iterates on current geometry; corner-weighted effective area,
+>   secant-calibrated slope, consensus-guarded loop exits) plus recover→sync
+>   cycles in the restored decomposition. Observed: |ΔV/V| ≤ ~2.5e-13 on
+>   1/2/4/8 ranks. `MFTLVolumeRecovery` itself is unchanged in behaviour on
+>   serial meshes (k=3 ⇒ identical area; consensus no-ops at nproc==1).
+> - **Not done** (out of scope, recorded in 00-overview): MFTL1's
+>   `MFTL_RemeshBoundaryCleanup` (gather-to-one-rank final cleanup); the
+>   centering kernel gathers to rank 0 (per-object centroid ranks would
+>   need per-object domains); `MFTLExtendGhostLayer` is not used by the
+>   remesh pass (redistribution already provides the 1-ring; the 2-hop
+>   extension can create non-neighbour-owner ghosts on narrow slabs) but is
+>   now defensive for other callers.
 
 ## Objective
 Finish the parallel-remeshing layer that is currently broken at HEAD, and add MFTL1's x-only
@@ -81,3 +150,22 @@ Finish the parallel-remeshing layer that is currently broken at HEAD, and add MF
 - `remeshing_parallel.c` compiles cleanly (HEAD breakage resolved); full CTest green on 1/2/4/8.
 - Remeshed volume and aggregate mesh statistics rank-independent within tolerance.
 - Load balancing converges and covers boundary triangles.
+
+## Acceptance record (2026-09-21)
+
+- `remeshing_parallel.c` compiles cleanly (0 warnings); full CTest green in
+  Release (41/41) and ASan/UBSan/LSan builds on 1/2/4/8 ranks, including the
+  new `RemeshParallel-np{1,2,4,8}` tests.
+- Rank independence: refined-sphere remesh gives |V - V_analytic| < 1%,
+  triangle count in the equilateral band, converged edge statistics, mesh
+  integrity, and GID-counter agreement on 1/2/4/8 ranks; a further
+  redistribution preserves volume/count exactly.
+- Load balancing: two off-centre spheres balance to min=296/max=336 around
+  fair=320 at np8 (MFTL1 0.2 tolerance); boundary coverage asserted via a
+  hard band (no edge above 1.5*max) plus a small straggler allowance for
+  late-convergence flip diagonals; advect+remesh (exact rotation) holds the
+  per-step remesh drift at ~1e-12*V.
+- Known limitations recorded in 00-overview: x-only decomposition required
+  for load balancing; transient slab-spanning edges get skipped ghost
+  updates (noted on stderr, refreshed at the next redistribution); flip
+  diagonals are not length-gated (same as MFTL1).
