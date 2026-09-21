@@ -82,7 +82,7 @@ int test_rigid_invariance()
   double cm[3] = {0, 0, 0};
   double A0 = MFTLSurfaceCenter(obj, cm);
   double V0 = MFTLObjectVolume(obj);
-  TEST_ASSERT(V0 < 0.0);  // sphere generator winds inward: volume sign pinned
+  TEST_ASSERT(V0 > 0.0);  // sphere generator winds outward: volume sign pinned
 
   // Random rotation about a non-trivial centre
   double R[3][3];
@@ -137,7 +137,7 @@ int test_scale_laws()
 
   double A1 = MFTLSurfaceCenter(obj, cm);
   double V1 = MFTLObjectVolume(obj);
-  TEST_ASSERT(V0 < 0.0 && V1 < 0.0);  // sign preserved under scaling
+  TEST_ASSERT(V0 > 0.0 && V1 > 0.0);  // sign preserved under scaling
 
   if (g_rank == 0) printf("  V0=%.17g V1=%.17g (ratio %.12g)  A0=%.17g A1=%.17g (ratio %.12g)\n", V0, V1, V1 / V0, A0, A1, A1 / A0);
 
@@ -204,7 +204,7 @@ int test_rank_independence()
   double cm_pre[3] = {0, 0, 0};
   double A_pre = MFTLSurfaceCenter(obj, cm_pre);
   double V_pre = MFTLObjectVolume(obj);
-  TEST_ASSERT(V_pre < 0.0);  // sphere winding: sign pinned
+  TEST_ASSERT(V_pre > 0.0);  // sphere winding: sign pinned (outward)
 
   // Transform BEFORE redistribution: rank 0 moves the whole body locally.
   double R[3][3];

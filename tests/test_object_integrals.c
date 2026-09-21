@@ -81,11 +81,10 @@ int test_analytic_sphere()
     double A = MFTLSurfaceCenter(obj, cm);
     double V = MFTLObjectVolume(obj);
 
-    // The current sphere generator winds clockwise viewed from outside, so
-    // the MFTL1 formula yields a NEGATIVE volume for these meshes. Pin the
-    // sign (outward-oriented surfaces assert V > 0 — see generator/IO tests)
-    // so a winding flip is caught rather than absorbed by fabs checks.
-    TEST_ASSERT(V < 0.0);
+    // Generated spheres are outward-wound (project invariant): the MFTL1
+    // volume formula yields a POSITIVE volume. Pin the sign so a regression
+    // is caught rather than absorbed by fabs checks.
+    TEST_ASSERT(V > 0.0);
 
     // The triangulated sphere has its vertices exactly on the sphere but flat
     // chords as facets, so volume/area approach the analytic values from below.
@@ -214,7 +213,7 @@ int test_rank_independence()
 
   const double tol = 1e-9;
   TEST_ASSERT(fabs(V_post - V_pre) <= tol * fmax(1.0, fabs(V_pre)));
-  TEST_ASSERT(V_pre < 0.0 && V_post < 0.0);  // sign pinned: sphere winds inward (see analytic test)
+  TEST_ASSERT(V_pre > 0.0 && V_post > 0.0);  // sign pinned: sphere winds outward (see analytic test)
   TEST_ASSERT(fabs(A_post - A_pre) <= tol * fmax(1.0, A_pre));
   for (int k = 0; k < 3; ++k) TEST_ASSERT(fabs(cm_post[k] - cm_pre[k]) <= tol);
 
@@ -275,7 +274,7 @@ int test_periodic_seam_invariance()
       memcpy(cm0, cm, 3 * sizeof(double));
       memcpy(I0, I, sizeof(I0));
       TEST_ASSERT(fabs(cm[0]) + fabs(cm[1]) + fabs(cm[2]) < 1e-10);
-      TEST_ASSERT(V0 < 0.0);  // sphere winding: negative volume (see analytic test)
+      TEST_ASSERT(V0 > 0.0);  // sphere winding: positive volume (see analytic test)
     }
     else
     {

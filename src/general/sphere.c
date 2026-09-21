@@ -319,6 +319,64 @@ static int generate_icosahedron(MFTL_Object *object)
 }
 
 /**
+ * @brief Reverse the orientation of every triangle (flip the whole surface).
+ *
+ * Swaps the vertex targets of the first two half-edges of each triangle,
+ * turning the cycle v0->v1->v2->v0 into v0->v2->v1->v0, then repairs the
+ * vertex outgoing-edge assignments and the twin links.
+ */
+static void reverse_triangle_winding(MFTL_Object *object)
+{
+  for (int t = 0; t < object->n_triangles; ++t)
+  {
+    MFTL_HalfEdge *he0 = &object->half_edges[object->triangles[t].he_idx];
+    MFTL_HalfEdge *he1 = &object->half_edges[he0->next_idx];
+
+    // Swap the targets of the first two half-edges: this reverses the
+    // 3-cycle (verified by construction: afterwards he0 runs v0->v2,
+    // he1 runs v2->v1, he2 runs v1->v0).
+    int tmp = he0->vertex_idx;
+    he0->vertex_idx = he1->vertex_idx;
+    he1->vertex_idx = tmp;
+  }
+
+  // The reversal changed every half-edge's origin; out_he_idx must point
+  // to a half-edge ORIGINATING at the vertex (origin = target of prev(he)).
+  for (int i = 0; i < object->n_vertices; ++i) object->vertices[i].out_he_idx = MFTL_ERROR;
+  for (int h = 0; h < object->n_half_edges; ++h)
+  {
+    MFTL_HalfEdge *he = &object->half_edges[h];
+    int origin = object->half_edges[object->half_edges[he->next_idx].next_idx].vertex_idx;
+    if (object->vertices[origin].out_he_idx == MFTL_ERROR) object->vertices[origin].out_he_idx = h;
+  }
+
+  MFTLRebuildTwins(object);
+}
+
+/**
+ * @brief Canonicalize the surface to OUTWARD winding: compute the signed
+ * volume (same 1/6 * v0.(v1 x v2) formula as MFTLObjectVolume) and flip
+ * every triangle if it is negative — the exact approach of the GTS reader
+ * (src/general/io.c). Idempotent by construction.
+ */
+static void canonicalize_outward_winding(MFTL_Object *object)
+{
+  double S = 0.0;
+  for (int t = 0; t < object->n_triangles; ++t)
+  {
+    MFTL_HalfEdge *he0 = &object->half_edges[object->triangles[t].he_idx];
+    MFTL_HalfEdge *he1 = &object->half_edges[he0->next_idx];
+    MFTL_HalfEdge *he2 = &object->half_edges[he1->next_idx];
+    const double *p0 = object->vertices[he2->vertex_idx].pos;
+    const double *p1 = object->vertices[he0->vertex_idx].pos;
+    const double *p2 = object->vertices[he1->vertex_idx].pos;
+    S += p0[0] * (p1[1] * p2[2] - p1[2] * p2[1]) + p1[0] * (p2[1] * p0[2] - p2[2] * p0[1]) + p2[0] * (p0[1] * p1[2] - p0[2] * p1[1]);
+  }
+
+  if (S < 0.0) reverse_triangle_winding(object);
+}
+
+/**
  * @brief Public function to generate a sphere.
  * @param ensemble The ensemble containing the domain context (MPI, Periodicity).
  * @param object The object to generate the sphere on.
@@ -341,6 +399,11 @@ int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int
       // printf("Performing refinement level %d...\n", i + 1);
       tessellate_sphere(object);
     }
+
+    // Canonicalize to OUTWARD winding (project invariant: outward
+    // triangle/vertex normals, positive signed volume) — the icosahedron
+    // table happens to wind the other way; the check makes this idempotent.
+    canonicalize_outward_winding(object);
 
     for (size_t i = 0; i < object->n_vertices; ++i)
     {

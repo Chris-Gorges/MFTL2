@@ -74,21 +74,66 @@ Historical record — HEAD `f4795fe` did not build for two reasons, both fixed i
 2. **Volume** = `⅙ Σ_tri v₁·(v₂×v₃)` about the coordinate origin (MFTL1
    `parallel/objectvolume.c:VolumeFace`). This is the ground truth for all conservation
    checks. Requires closed, consistently-oriented surface.
-   **⚠ Winding caveat (open cross-cutting item, discovered in the Stage 02–06 review):**
-   each object is internally consistently oriented, but the sign is **not uniform across
-   mesh sources** — `MFTLGenerateSphere` winds **inward** (signed volume `V < 0`, inward
-   normals), while the Stage-04 generators (box/cube/cylinder) and the canonicalized GTS
-   reader wind **outward** (`V > 0`). Stages 02–06 handle this correctly (magnitude-based
-   comparisons; tests pin the actual sign per source), so it does not block their
-   acceptance. But it is a latent hazard for anything that uses normal **direction** or
-   inter-object relative orientation — point-in-object (07), overlap normal `½(N_A−N_B)`
-   (11), periodic image tests (13), and especially the front-tracking surface-tension /
-   indicator coupling in the CFD migration (14/15), where inward-normal interfaces would
-   give wrong-signed forces. **Recommended resolution:** standardize on outward winding by
-   flipping `generate_icosahedron`'s triangle table (a small production change) and updating
-   the `V < 0` assertions in `test_object_integrals.c` / `test_transforms.c` to `V > 0`;
-   re-verify the pre-existing intersection and LeVeque examples, which currently assume the
-   inward sphere. Deferred here to avoid a broad, coordinated change during a stage review.
+   **✅ Winding convention (RESOLVED 2026-09-21, before Stages 11/13):** MFTL2 standardizes
+   on **OUTWARD winding for every closed mesh** — outward-pointing triangle/vertex normals
+   and **positive signed volume (`V > 0`)**. This is the physical/CFD convention (surface
+   tension `F = σκn̂` and the indicator inside/outside test both assume outward normals),
+   the standard geometry convention, and what the Stage-04 generators and the canonicalized
+   GTS reader already produce. The inward-wound sphere was an **accident** of
+   `generate_icosahedron`'s hard-coded triangle table, not a deliberate design. Mixed
+   winding is explicitly *not* supported: it would force every direction-dependent
+   consumer — Stage-11 overlap, Stage-13 periodic image tests, Stage-14/15 coupling — to
+   carry a per-object sign.
+   **APPLIED (2026-09-21):** `MFTLGenerateSphere` now canonicalizes to outward winding
+   (`canonicalize_outward_winding` in `src/general/sphere.c`: signed-volume check, flip
+   only if negative — the GTS-reader approach; idempotent). All 9 pinned sign assertions
+   in `test_object_integrals.c` / `test_transforms.c` / `test_remesh_parallel.c` now
+   assert `V > 0`. Full Release + ASan/UBSan suites green on 1/2/4/8 ranks; conservation,
+   curvature (mean stored as LB *magnitude*), point queries (ray parity) and remeshing
+   are unchanged in magnitude, as predicted below.
+   **REVIEWED & ACCEPTED (2026-09-21, Claude Code):** `reverse_triangle_winding` verified
+   topologically correct (reverses each 3-cycle, `MFTLRebuildTwins` re-pairs); measured
+   sphere volume `V = +4.1797214693` (outward); all winding-agnostic consumers confirmed
+   unchanged. **Stage 11 is cleared to begin** on the single outward convention (no
+   per-object sign handling needed).
+
+   *Why this is safe / small:* everything downstream today is winding-**agnostic** and keeps
+   working after the flip — signed-volume conservation (`MFTLVolumeRecovery` is
+   winding-invariant: `V` and the ring normal flip together), curvature (mean stored as the
+   Laplace–Beltrami *magnitude*, Gaussian via the angle sum), point-in-object (ray parity),
+   remeshing/smoothing (geometric), periodicity (minimum-image), and intersection *detection*
+   (`MFTL_Orient3D` predicate). No consumer currently *relies* on the sphere being inward;
+   only test sign-assertions pin it. That is exactly why Stages 02–10 all pass with
+   magnitude/`fabs` checks.
+
+   **Adjustment set (APPLIED 2026-09-21, before Stage 11):**
+   - **Production (1 file):** `src/general/sphere.c` — make the generated sphere outward.
+     Preferred: after `generate_icosahedron` + refinement, canonicalize to `V > 0` by flipping
+     every triangle if the signed volume is negative (reuse the exact approach the GTS reader
+     already uses, `src/general/io.c:690`), or equivalently swap two indices in each row of the
+     20-entry `triangles_data` table. `tessellate_sphere` inherits the base orientation, so it
+     needs no change.
+   - **Tests — flip the pinned inward-sign assertions to `V > 0` (8 sites, 3 files):**
+     `tests/test_object_integrals.c` (lines 88, 217, 278; the `fabs(fabs(V)-V_true)` magnitude
+     checks at 92/113 stay valid but can be simplified), `tests/test_transforms.c` (lines 85,
+     140, 207; the `fabs` invariance checks at 96/106/144/226 stay valid),
+     `tests/test_remesh_parallel.c` (lines 229, 377, 436, and change `fabs(-v1 - analytic)` →
+     `fabs(v1 - analytic)` at 230).
+   - **Tests — no change (already winding-agnostic):** `test_volume_smoothing.c` (signed
+     differences + `fabs`; `VolumeRecovery` target sign flips harmlessly), `test_remesh_quality.c`
+     (uses `fabs(MFTLObjectVolume)`), `test_generators.c` / `test_io.c` (already assert `V > 0`),
+     `test_curvature.c`, `test_point_query.c`.
+   - **Examples — no change:** none assert a volume sign; `parallel_intersection_spheres`
+     uses winding-agnostic BVH detection. The only visible effect is that written VTK/VTU
+     sphere normals now point outward (cosmetic/correct).
+   - **Verification:** rebuild Release + ASan/UBSan and run the full suite on 1/2/4/8 — the
+     sphere must now report `V > 0`, and volume conservation / curvature / point-in-object /
+     remeshing results must be unchanged in magnitude.
+
+   **Stage impact:** only Stages 02, 03 and 10 have test-sign edits; Stages 05/06/07/08/09
+   need no change. Stages 11 (overlap normal `½(N_A−N_B)`, effective radius, "which side"),
+   13 (periodic image orientation) and 14/15 (front-tracking outward normals) are then built
+   directly on the single outward convention with no per-object sign handling.
 3. **Surface centroid** = area-weighted vertex-sum ÷ (3·total area) (MFTL1
    `objectcentre.c`). **Moment of inertia** = lumped tetra approximation about the volume
    centroid, uniform density (MFTL1 `momentofinertia.c`) — **not** the exact
@@ -157,8 +202,13 @@ currently-disabled periodic/clamping advection behavior.
 **Progress (2026-09-21):** Stages **01–10 COMPLETE / Acceptance PASSED** (implemented by
 Kimi Code, reviewed by Claude Code; Release + ASan/UBSan clean — incl. LAPACK/OpenBLAS
 for Stage 08's paraboloid fit — full suite green on 1/2/4/8 ranks). Stages 11–15 NOT
-STARTED. See the winding caveat in invariant #2 below — a cross-cutting item to resolve
-before Stages 11/13/14 rely on normal direction.
+STARTED. The **winding convention is now RESOLVED** (invariant #2): MFTL2 standardizes on
+**outward winding / `V > 0`** for all closed meshes. A small prerequisite commit — flip the
+sphere generator to outward (`src/general/sphere.c`) + flip 8 pinned inward-sign assertions
+in `test_object_integrals.c` / `test_transforms.c` / `test_remesh_parallel.c` — must land
+**before Stage 11** so its overlap-normal logic is built on the single convention. With that
+prerequisite applied, **Stage 11 can safely begin** (all other consumers are winding-agnostic;
+no rework of Stages 05–10 needed).
 
 **Stage 10** (parallel remeshing + x-only load balancing) is accepted: MFTL1-style two-pass
 shift-scheme + centering (gather-to-rank-0) dispatcher, single-owner interior gates,
@@ -167,12 +217,18 @@ disjoint per-rank GID blocks, deterministic slab optimizer. Volume rank-independ
 Stage-09 carry-forwards**: serial edge-local smoothers now fail loudly on distributed
 meshes and the driver uses parallel-safe `*Parallel` variants gated to the interior rule;
 `roughness_mean/variance` now cross ranks (`PackedVertex`/`GhostUpdatePayload`).
-**Stage 10 carry-forward (should-fix, not blocking):** (a) remeshed triangle count is
-rank-count-dependent (~13% np1→np8) — the interior-only gate under-remeshes
-partition-boundary regions; MFTL1's `MFTL_RemeshBoundaryCleanup` (gather-to-one-rank final
-pass) is the fix, deferred — address or flag before **Stage 15** (front-tracking boundary
-uniformity); (b) transient non-neighbour-owner ghosts during LB passes are kept stale until
-the next redistribution (negligible volume impact, no topology corruption).
+**Stage 10 carry-forward:** (a) **RESOLVED (2026-09-21, reviewed by Claude Code):** MFTL1's
+`MFTL_RemeshBoundaryCleanup` is now implemented (`params->boundary_cleanup`, default on →
+`MFTLRemeshEnsembleDispersedCentering` gather→serial-kernel→scatter, correctly forcing
+`lb_nprocs = 0` during the gather). It fixes both the boundary-coverage gap the winding flip
+exposed and the rank-count-dependent triangle count: the remeshed count is now
+decomposition-independent (1414/1436/1414/1436 on np1/2/4/8, ~1.5% spread vs the previous
+~13%) with exact boundary coverage (`hard==0` long edges on all rank counts). Residual
+**should-fix (not blocking):** the cleanup gathers all triangles to rank 0 each remesh call
+(MFTL1's default behaviour, togglable) — a rank-0 serialization/memory cost at large mesh ×
+rank counts; consider amortizing or a distributed variant later. (b) transient
+non-neighbour-owner ghosts during LB passes are kept stale until the next redistribution
+(negligible volume impact, no topology corruption).
 
 **Stage 09** (volume-conserving smoothing) is accepted: TSUR3D / Kuprat / VolumeRecovery /
 roughness smoothing, MFTL1-consistent, full remesh cycle conserves volume to ~6e-12 (the
@@ -202,9 +258,16 @@ dies on a missing owned GID — it reports `found == 0` for entities killed by p
 remesh ops and skips ghosts whose owners are temporarily non-neighbouring (transient
 slab-spanning edges); both refresh at the next redistribution. (d) `VolumeRecovery` is
 parallel-exact (corner-weighted area, secant slope, consensus loop exits) but still
-serial-bit-identical at np1. (e) Deferred: MFTL1's `MFTL_RemeshBoundaryCleanup`
-(gather-to-one-rank); per-object centroid ranks for the centering kernel; the winding
-caveat above; TSUR's periodic-unaware endpoint clamp (Stage 13).
+serial-bit-identical at np1. (e) Deferred: per-object centroid ranks for the centering
+kernel; TSUR's periodic-unaware endpoint clamp (Stage 13). **Update (2026-09-21, winding
+prerequisite):** MFTL1's `MFTL_RemeshBoundaryCleanup` is now implemented (the
+gather→serial-kernel→scatter path in `MFTLRemeshEnsembleDispersedCentering`, driven by
+`params->boundary_cleanup`, default on) — it covers the sliver edges that straddle both
+the old and the shifted cut, which the two-pass shift provably cannot reach. The same
+change fixed two latent defects in the centering path: the temp single-partition
+communicator now uses `MPI_Comm_dup` (a 1-cell `MPI_Cart_create` handed `MPI_COMM_NULL`
+to non-zero ranks), it clears any active `lb_*` slab ownership, and it syncs GID
+counters between gather and serial kernel (rank 0 could otherwise mint colliding GIDs).
 
 `01` build/harness → everything.
 `02` integrals → `03` transforms, `04` generators, `09` volume-conserving smoothing, `11` overlap.

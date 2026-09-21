@@ -865,8 +865,15 @@ int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *par
     free(snap_h);                                                     \
   } while (0)
 
-  MFTL_SPLIT_CLEANUP();
+  // MFTL1 boundary cleanup (MFTL_RemeshBoundaryCleanup): the two-pass shift
+  // cannot reach edges that straddle BOTH the old and the shifted cut (the
+  // sweep interval of a cut crosses their span). Gather the ensemble to
+  // rank 0 once and run the ungated serial kernel there — the sliver edges
+  // are interior to the whole mesh and get remeshed. The mesh comes back on
+  // the native decomposition.
+  if (params->boundary_cleanup) MFTLRemeshEnsembleDispersedCentering(ens, params);
 
+  MFTL_SPLIT_CLEANUP();
   // Restore the native decomposition and re-sync everything.
   dom->lb_nprocs = 0;
   MFTLRedistributeListOfObjects(ens);
@@ -913,7 +920,6 @@ int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *par
     }
   }
   MFTLUpdateGhostPositions(ens, NULL);
-
   free(start_volume);
   return MFTL_SUCCESS;
 }
@@ -939,12 +945,22 @@ int MFTLRemeshEnsembleDispersedCentering(MFTL_Ensemble *ens, MFTL_RemeshParamete
   tmp.cuts[1] = 1;
   tmp.cuts[2] = 1;
   for (int k = 0; k < 3; ++k) tmp.grid_factors[k] = 1.0 / tmp.domain_size[k];
+  // The single-partition ownership must not inherit an ACTIVE lb slab
+  // decomposition (e.g. when called mid-shift-scheme): clear it so
+  // MFTLGetOwnerProc maps everything to rank 0.
+  tmp.lb_nprocs = 0;
+  tmp.lb_xmin = 0.0;
+  tmp.lb_xmax = 0.0;
+  tmp.lb_xcuts = NULL;
 
   tmp.rank_map = (int *) malloc(sizeof(int));
   tmp.rank_map[0] = 0;
 
-  int periods[3] = {(int) tmp.is_periodic[0], (int) tmp.is_periodic[1], (int) tmp.is_periodic[2]};
-  MPI_Cart_create(tmp.comm_world, 3, tmp.cuts, periods, 0, &tmp.comm_cart);
+  // Single-partition communicator over ALL ranks: MPI_Comm_dup (NOT
+  // MPI_Cart_create with one cell — that would hand MPI_COMM_NULL to every
+  // rank but rank 0, and the collectives inside the serial kernel would
+  // deadlock).
+  MPI_Comm_dup(tmp.comm_world, &tmp.comm_cart);
   tmp.num_neighbors = 0;
   tmp.neighbors = NULL;
   MPI_Dist_graph_create_adjacent(tmp.comm_world, 0, NULL, MPI_UNWEIGHTED, 0, NULL, MPI_UNWEIGHTED, MPI_INFO_NULL, 0, &tmp.comm_graph);
@@ -953,6 +969,10 @@ int MFTLRemeshEnsembleDispersedCentering(MFTL_Ensemble *ens, MFTL_RemeshParamete
   *dom = tmp;
 
   MFTLRedistributeListOfObjects(ens);  // everything -> rank 0
+  // The gather moved entities minted on ALL ranks onto rank 0, but the
+  // gid counters still hold each rank's own high-water mark; sync BEFORE
+  // the serial kernel so it cannot mint colliding gids.
+  MFTLSyncEnsembleGidCounters(ens);
   MFTLRemeshEnsemble(ens, params);     // serial kernel (collective-safe on empty objects)
 
   // Restore the native domain and redistribute back.

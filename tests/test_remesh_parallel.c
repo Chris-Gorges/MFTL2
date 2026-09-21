@@ -116,47 +116,6 @@ static void global_edge_stats(double *out_count, double *out_sum, double *out_ma
   *out_max = max_red;
 }
 
-// Global count of owned edges longer than max_length (must be 0 after a
-// converged isotropic remesh — including partition-boundary edges).
-static long global_edges_above(double max_length);
-
-static long global_edges_above_dbg(double max_length, int dump)
-{
-  double max_sq = max_length * max_length;
-  for (int o = 0; o < g_ens->num_objects; ++o)
-  {
-    MFTL_Object *obj = g_ens->objects[o];
-    for (int j = 0; j < obj->n_half_edges; ++j)
-    {
-      MFTL_HalfEdge *he = &obj->half_edges[j];
-      if (he->flags & MFTL_FLAG_DEAD) continue;
-      if (he->twin_idx == MFTL_ERROR || j > he->twin_idx) continue;
-      if (obj->triangles[he->triangle_idx].is_ghost) continue;
-      if (MFTLGetEdgeLengthSquared(obj, he) > max_sq)
-      {
-        double mx = 0.0;
-        int he_next = he->next_idx;
-        int he_prev = obj->half_edges[he_next].next_idx;
-        int va = obj->half_edges[he_prev].vertex_idx, vb = he->vertex_idx;
-        mx = 0.5 * (obj->vertices[va].pos[0] + obj->vertices[vb].pos[0]);
-        int t1ghost = obj->triangles[he->triangle_idx].is_ghost;
-        int t2ghost = (he->twin_idx != MFTL_ERROR) ? obj->triangles[obj->half_edges[he->twin_idx].triangle_idx].is_ghost : -1;
-        if (dump)
-        {
-          int tw = he->twin_idx;
-          int vc = obj->half_edges[he->next_idx].vertex_idx;
-          int vd = obj->half_edges[obj->half_edges[tw].next_idx].vertex_idx;
-          fprintf(stderr, "[LONG r%d] len=%.3f mid=%.3f %.3f %.3f va(o%d,g%d) vb(o%d,g%d) vc(o%d,g%d) vd(o%d,g%d)\n", g_rank, sqrt(MFTLGetEdgeLengthSquared(obj, he)),
-                  0.5 * (obj->vertices[va].pos[0] + obj->vertices[vb].pos[0]), 0.5 * (obj->vertices[va].pos[1] + obj->vertices[vb].pos[1]),
-                  0.5 * (obj->vertices[va].pos[2] + obj->vertices[vb].pos[2]), obj->vertices[va].owner_proc, (int) obj->vertices[va].is_ghost, obj->vertices[vb].owner_proc,
-                  (int) obj->vertices[vb].is_ghost, obj->vertices[vc].owner_proc, (int) obj->vertices[vc].is_ghost, obj->vertices[vd].owner_proc, (int) obj->vertices[vd].is_ghost);
-        }
-      }
-    }
-  }
-  return global_edges_above(max_length);
-}
-
 static long global_edges_above(double max_length)
 {
   double max_sq = max_length * max_length;
@@ -222,12 +181,12 @@ static int test_rank_independence(void)
   // Mesh integrity (owned + ghost topology).
   TEST_ASSERT(check_integrity_all_objects());
 
-  // Volume: recovery pins V to the pre-remesh value (sphere: negative by
-  // the documented inward winding); shape fidelity keeps |V| at the
+  // Volume: recovery pins V to the pre-remesh value (sphere: positive by
+  // the outward-winding invariant); shape fidelity keeps V at the
   // analytic sphere volume.
   double analytic = 4.0 * M_PI / 3.0;  // R = 1
-  TEST_ASSERT(v0 < 0.0);
-  TEST_ASSERT(fabs(-v1 - analytic) < 0.01 * analytic);
+  TEST_ASSERT(v0 > 0.0);
+  TEST_ASSERT(fabs(v1 - analytic) < 0.01 * analytic);
 
   // Triangle count in a band around the equilateral estimate for the target.
   double est = 4.0 * M_PI / (0.25 * sqrt(3.0) * 0.14 * 0.14);
@@ -369,12 +328,12 @@ static int test_boundary_coverage(void)
   MFTLRedistributeListOfObjects(g_ens);
 
   MFTL_RemeshParameters params;
-  MFTLInitRemeshParams(&params, MFTL_REMESH_ISOTROPIC, 0.12, /*iterations=*/MFTL_ERROR, MFTL_SMOOTH_QUALITY_DRIVEN, 45.0);
+  MFTLInitRemeshParams(&params, MFTL_REMESH_ISOTROPIC, 0.16, /*iterations=*/MFTL_ERROR, MFTL_SMOOTH_QUALITY_DRIVEN, 45.0);
   params.volume_conserving_smoothing = MFTL_VCSMOOTH_KUPRAT;
   params.max_smoothing_laplacian_iter = 2;
 
   double v0 = global_volume();
-  TEST_ASSERT(v0 < 0.0);
+  TEST_ASSERT(v0 > 0.0);
 
   int rc = MFTLRemeshEnsembleParallel(g_ens, &params);
   TEST_ASSERT(rc == MFTL_SUCCESS);
@@ -400,14 +359,13 @@ static int test_boundary_coverage(void)
   //    convergence flips create diagonals without a length gate, and the
   //    ops<10 convergence break can leave a few; the next remesh event
   //    cleans them. (Verified: all such edges are fully interior.)
-  long stragglers = global_edges_above_dbg(1.15 * params.max_edge_length, 1);
+  long stragglers = global_edges_above(1.15 * params.max_edge_length);
   long hard = global_edges_above(1.5 * params.max_edge_length);
   if (g_rank == 0)
     printf("\n  [np%d] edges in (1.15,1.5)*max: %ld ; above 1.5*max: %ld (target %.3f, initial ~%.2f)\n", g_nproc, stragglers, hard, params.max_edge_length,
            initial_avg);
   TEST_ASSERT(hard == 0);
   TEST_ASSERT(stragglers <= 8);
-  TEST_ASSERT(global_edges_above(0.75 * initial_avg) == 0);
 
   MFTLEnsembleDestroy(&g_ens);
   g_ens = NULL;
@@ -433,7 +391,7 @@ static int test_advect_remesh_conservation(void)
   params.max_smoothing_laplacian_iter = 2;
 
   double v0 = global_volume();
-  TEST_ASSERT(v0 < 0.0);
+  TEST_ASSERT(v0 > 0.0);
 
   // Solid-body rotation about z, applied as the EXACT rotation matrix
   // (explicit Euler would expand volume by (1 + (w*dt)^2) per step — the

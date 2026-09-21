@@ -125,6 +125,9 @@ typedef struct
   double size_threshold;       // Sizethreshold: minimum slab width; retry with fewer slabs below
   double damping_factor;       // dampingfactor: slab-width optimizer damping in (0,1]
   int load_balance;            // enable x-only load balancing + two-pass boundary shift
+  int boundary_cleanup;        // MFTL_BoundaryCleanup: gather-to-rank-0 serial pass at the
+                               // end, remeshing slivers the two-pass shift cannot cover
+                               // (edges straddling both the old and the shifted cut)
 
   // ... any other parameters like smoothing weights, boundary locks, etc.
 } MFTL_RemeshParameters;
@@ -205,6 +208,7 @@ static inline void MFTLInitRemeshParams(MFTL_RemeshParameters *params, MFTL_Reme
   params->size_threshold = 1.5 * params->max_edge_length;
   params->damping_factor = 0.5;          // MFTL1 dampingfactor (0,1]
   params->load_balance = 1;              // MFTL1 MFTL_LoadBalance = MFTL_YES
+  params->boundary_cleanup = 1;          // MFTL1 MFTL_BoundaryCleanup = MFTL_YES
 }
 
 // --- Core Topological Operators ---

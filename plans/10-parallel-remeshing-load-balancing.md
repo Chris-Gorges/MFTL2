@@ -67,13 +67,30 @@ Acceptance: PASSED
 >   cycles in the restored decomposition. Observed: |ΔV/V| ≤ ~2.5e-13 on
 >   1/2/4/8 ranks. `MFTLVolumeRecovery` itself is unchanged in behaviour on
 >   serial meshes (k=3 ⇒ identical area; consensus no-ops at nproc==1).
-> - **Not done** (out of scope, recorded in 00-overview): MFTL1's
->   `MFTL_RemeshBoundaryCleanup` (gather-to-one-rank final cleanup); the
+> - **Not done** (out of scope, recorded in 00-overview): the
 >   centering kernel gathers to rank 0 (per-object centroid ranks would
 >   need per-object domains); `MFTLExtendGhostLayer` is not used by the
 >   remesh pass (redistribution already provides the 1-ring; the 2-hop
 >   extension can create non-neighbour-owner ghosts on narrow slabs) but is
 >   now defensive for other callers.
+>   **Update (2026-09-21, winding prerequisite):** MFTL1's
+>   `MFTL_RemeshBoundaryCleanup` IS now implemented (the
+>   gather→serial-kernel→scatter path, `params->boundary_cleanup`, default
+>   on) — the winding flip exposed that the two-pass shift provably cannot
+>   reach edges straddling both the old and the shifted cut.
+>   **REVIEWED & ACCEPTED (2026-09-21, Claude Code):** correct (reuses the
+>   proven `MFTLRemeshEnsembleDispersedCentering`, which forces `lb_nprocs=0`
+>   during the gather so it truly reaches rank 0 and the serial kernel runs
+>   ghost-free); it **resolves carry-forward (a)** — remeshed triangle count is
+>   now decomposition-independent (1414/1436/1414/1436 on np1/2/4/8, ~1.5% vs
+>   the prior ~13%) with exact boundary coverage (`hard==0` on all rank counts),
+>   and it improves (never harms) rank-independence. Release + ASan/UBSan clean
+>   on 1/2/4/8; full regression green; outward-winding flip verified (sphere
+>   `V=+4.1797214693`). Residual should-fix: the cleanup gathers all triangles
+>   to rank 0 each call (MFTL1 default, togglable) — a scalability cost to
+>   amortize/distribute later. The `test_remesh_parallel` straggler allowance
+>   (`stragglers ≤ 8`) is justified — the HARD `hard==0` band is the real
+>   coverage assertion and 0 stragglers are observed on all rank counts.
 
 ## Objective
 Finish the parallel-remeshing layer that is currently broken at HEAD, and add MFTL1's x-only
