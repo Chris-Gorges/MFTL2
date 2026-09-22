@@ -125,10 +125,10 @@ void MFTL_IntersectObjects(MFTL_Object* objA, MFTL_BVH* bvhA, MFTL_Object* objB,
 
 /**
  * @brief Performs a robust exact Triangle-Triangle intersection test.
- * 
- * Standard Guigue-Devillers triangle intersection. Uses the `flat_tri_verts` 
+ *
+ * Standard Guigue-Devillers triangle intersection. Uses the `flat_tri_verts`
  * for geometric lookups directly.
- * 
+ *
  * @param objA The first mesh object.
  * @param triA_id Index of the first triangle.
  * @param objB The second mesh object.
@@ -136,5 +136,12 @@ void MFTL_IntersectObjects(MFTL_Object* objA, MFTL_BVH* bvhA, MFTL_Object* objB,
  * @return 1 if they intersect, 0 if disjoint (or coplanar, if non-overlapping).
  */
 int MFTL_TriTriIntersect(MFTL_Object* objA, int triA_id, MFTL_Object* objB, int triB_id);
+
+/**
+ * @brief Scalable intersection pipeline for full ensembles: spatial ghosts,
+ * per-object LBVHs and pair traversal (self-intersection when ensB is NULL;
+ * object pairs i < j, so no pair is tested twice).
+ */
+void MFTLEnsembleIntersectObjects(MFTL_Ensemble* ensA, MFTL_Ensemble* ensB, IntersectionCallback callback, void* user_data);
 
 #endif  // MFTL_BVH_H

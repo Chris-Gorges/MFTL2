@@ -69,6 +69,35 @@ static inline void MFTLApplyPeriodicity(const MFTL_Domain *domain, double pos[3]
   }
 }
 
+/**
+ * @brief True when the domain has at least one periodic axis.
+ *
+ * Use this to branch between the raw (non-periodic) arithmetic and a
+ * periodic-safe formula when the two differ in floating point: the
+ * non-periodic path must stay bit-identical to the pre-Stage-13 behaviour.
+ */
+static inline int MFTLDomainAnyPeriodic(const MFTL_Domain *domain)
+{
+  return domain->is_periodic[0] || domain->is_periodic[1] || domain->is_periodic[2];
+}
+
+/**
+ * @brief Re-images v into the periodic image containing anchor:
+ * out[k] = v[k] + round((anchor[k]-v[k])/L)*L on periodic axes, a plain copy
+ * otherwise (so the non-periodic path is bit-identical to using v directly).
+ *
+ * Correct whenever the true distance |v - anchor| is < L/2 per periodic axis
+ * (the minimum-image constraint, see MFTLCheckMinimumImageConstraint).
+ */
+static inline void MFTLUnwrapToAnchor(const MFTL_Domain *domain, double out[3], const double v[3], const double anchor[3])
+{
+  for (int k = 0; k < 3; ++k)
+  {
+    out[k] = v[k];
+    if (domain->is_periodic[k]) out[k] += round((anchor[k] - v[k]) / domain->domain_size[k]) * domain->domain_size[k];
+  }
+}
+
 /*
  * @brief Calculate an edge's length.
  *
@@ -256,6 +285,21 @@ double MFTLSurfaceCenter(MFTL_Object* obj, double cm[3]);
  * MFTLSurfaceCenter.
  */
 void MFTLMomentOfInertia(MFTL_Object* obj, double I[3][3], const double center[3], double density);
+
+/**
+ * @brief Minimum-image constraint check (Stage 13): on a periodic domain the
+ * unambiguous "nearest image" requires the period on each periodic axis to
+ * exceed twice the largest feature extent. This collective routine verifies:
+ *   1. the longest (minimum-image) owned edge is < min over periodic axes of
+ *      domain_half_size[k]  (unambiguous min-image per edge), AND
+ *   2. the per-periodic-axis unwrapped body extent (about a collective
+ *      anchor) is < domain_half_size[k]  (the single-anchor unwraps used by
+ *      the integrals and point queries stay valid).
+ * No-op (MFTL_SUCCESS) when no axis is periodic. On violation a message is
+ * printed on rank 0 and MFTL_ERROR is returned (identically on all ranks).
+ * Never asserts: callers may probe.
+ */
+int MFTLCheckMinimumImageConstraint(const MFTL_Object* obj);
 
 // =============================================================================
 // RIGID-BODY TRANSFORMS (see src/general/transform.c)

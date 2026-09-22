@@ -44,8 +44,10 @@ static void mftlTriNormalFromPos(const MFTL_Object* obj, int tri_idx, double n[3
 {
   MFTL_Vertex* vv[3];
   MFTLGetTriangleVertices(obj, &obj->triangles[tri_idx], vv);
-  double e0[3] = {vv[1]->pos[0] - vv[0]->pos[0], vv[1]->pos[1] - vv[0]->pos[1], vv[1]->pos[2] - vv[0]->pos[2]};
-  double e1[3] = {vv[2]->pos[0] - vv[0]->pos[0], vv[2]->pos[1] - vv[0]->pos[1], vv[2]->pos[2] - vv[0]->pos[2]};
+  // minimum-image edges (raw differences when non-periodic)
+  double e0[3], e1[3];
+  MFTLGetMinimumImageVector(obj->domain, e0, vv[0]->pos, vv[1]->pos);
+  MFTLGetMinimumImageVector(obj->domain, e1, vv[0]->pos, vv[2]->pos);
   n[0] = e0[1] * e1[2] - e0[2] * e1[1];
   n[1] = e0[2] * e1[0] - e0[0] * e1[2];
   n[2] = e0[0] * e1[1] - e0[1] * e1[0];
@@ -205,11 +207,15 @@ static int mftlBarycentricFit(MFTL_Object* obj, int v_idx, int he_idx, double ou
   if (v5 < 0 || v6 < 0) return MFTL_ERROR;
 
   const double* pa = obj->vertices[va].pos;
-  const double* pb = obj->vertices[vb].pos;
-  const double* pc = obj->vertices[vc].pos;
-  const double* p5 = obj->vertices[v5].pos;
-  const double* p6 = obj->vertices[v6].pos;
-  for (int k = 0; k < 3; ++k) out[k] = 0.5 * (pa[k] + pb[k]) + 0.25 * pc[k] - 0.125 * (p5[k] + p6[k]);
+  // Re-image the stencil into pa's periodic image (plain copies when
+  // non-periodic, so the arithmetic below stays bit-identical there).
+  double pb_u[3], pc_u[3], p5_u[3], p6_u[3];
+  MFTLUnwrapToAnchor(obj->domain, pb_u, obj->vertices[vb].pos, pa);
+  MFTLUnwrapToAnchor(obj->domain, pc_u, obj->vertices[vc].pos, pa);
+  MFTLUnwrapToAnchor(obj->domain, p5_u, obj->vertices[v5].pos, pa);
+  MFTLUnwrapToAnchor(obj->domain, p6_u, obj->vertices[v6].pos, pa);
+  for (int k = 0; k < 3; ++k) out[k] = 0.5 * (pa[k] + pb_u[k]) + 0.25 * pc_u[k] - 0.125 * (p5_u[k] + p6_u[k]);
+  MFTLApplyPeriodicity(obj->domain, out);  // keep the wrapped-storage invariant
   (void) v_idx;
   return MFTL_SUCCESS;
 }
@@ -257,10 +263,12 @@ static int mftlParaboloidFitAt(MFTL_Object* obj, int v_idx, const int* nbr, int 
   double B2[MFTL_FIT_MAX_NBR];
   for (int i = 0; i < nvert; ++i)
   {
-    const double* xp = obj->vertices[nbr[i]].pos;
+    // re-image the neighbour into c's periodic image (plain copy otherwise)
+    double xu[3];
+    MFTLUnwrapToAnchor(obj->domain, xu, obj->vertices[nbr[i]].pos, c);
     double lp[3] = {0, 0, 0};
     for (int j = 0; j < 3; ++j)
-      for (int k = 0; k < 3; ++k) lp[j] += InvP1[j][k] * (xp[k] - c[k]);
+      for (int k = 0; k < 3; ++k) lp[j] += InvP1[j][k] * (xu[k] - c[k]);
     P2[i + 0 * N2] = lp[0] * lp[0];
     P2[i + 1 * N2] = lp[0] * lp[1];
     P2[i + 2 * N2] = lp[1] * lp[1];
@@ -294,8 +302,9 @@ static int mftlParaboloidFitAt(MFTL_Object* obj, int v_idx, const int* nbr, int 
   double scale = 0.0;
   for (int i = 0; i < nvert; ++i)
   {
-    const double* xp = obj->vertices[nbr[i]].pos;
-    double d0 = xp[0] - c[0], d1 = xp[1] - c[1], d2 = xp[2] - c[2];
+    double xu[3];
+    MFTLUnwrapToAnchor(obj->domain, xu, obj->vertices[nbr[i]].pos, c);
+    double d0 = xu[0] - c[0], d1 = xu[1] - c[1], d2 = xu[2] - c[2];
     double d = sqrt(d0 * d0 + d1 * d1 + d2 * d2);
     if (d > scale) scale = d;
   }
@@ -303,6 +312,7 @@ static int mftlParaboloidFitAt(MFTL_Object* obj, int v_idx, const int* nbr, int 
   double f0 = newpos[0] - c[0], f1 = newpos[1] - c[1], f2 = newpos[2] - c[2];
   if (sqrt(f0 * f0 + f1 * f1 + f2 * f2) > 0.25 * scale) return MFTL_ERROR;  // ~half a local edge
 
+  MFTLApplyPeriodicity(obj->domain, newpos);  // keep the wrapped-storage invariant
   memcpy(obj->vertices[v_idx].pos, newpos, 3 * sizeof(double));
   return MFTL_SUCCESS;
 #else
@@ -345,7 +355,7 @@ void MFTLFitVertex(MFTL_Object* obj, int v_idx, int he_idx, MFTL_RemeshParameter
   int va = obj->half_edges[he_prev].vertex_idx;
   int vb = he->vertex_idx;
   double u_dir[3];
-  for (int k = 0; k < 3; ++k) u_dir[k] = obj->vertices[vb].pos[k] - obj->vertices[va].pos[k];
+  MFTLGetMinimumImageVector(obj->domain, u_dir, obj->vertices[va].pos, obj->vertices[vb].pos);
   double w_dir[3];
   if (mftlFitFrameNormal(obj, nbr, nvert, w_dir) != MFTL_SUCCESS)
   {
@@ -393,7 +403,18 @@ void MFTLCollapseEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParamet
       int va = obj->half_edges[he_prev].vertex_idx;
       double saved[3];
       memcpy(saved, obj->vertices[v_b].pos, 3 * sizeof(double));
-      for (int k = 0; k < 3; ++k) obj->vertices[v_b].pos[k] = 0.5 * (saved[k] + obj->vertices[va].pos[k]);
+      // seam-safe midpoint (raw average when non-periodic, bit-identical)
+      if (MFTLDomainAnyPeriodic(obj->domain))
+      {
+        double e_ba[3];
+        MFTLGetMinimumImageVector(obj->domain, e_ba, saved, obj->vertices[va].pos);
+        for (int k = 0; k < 3; ++k) obj->vertices[v_b].pos[k] = saved[k] + 0.5 * e_ba[k];
+        MFTLApplyPeriodicity(obj->domain, obj->vertices[v_b].pos);
+      }
+      else
+      {
+        for (int k = 0; k < 3; ++k) obj->vertices[v_b].pos[k] = 0.5 * (saved[k] + obj->vertices[va].pos[k]);
+      }
 
       int nbr[MFTL_FIT_MAX_NBR];
       int nvert = mftlGatherFitNeighbours(obj, he_ab_idx, nbr);
@@ -401,7 +422,7 @@ void MFTLCollapseEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParamet
       if (nvert >= 6 && mftlFitFrameNormal(obj, nbr, nvert, w_dir) == MFTL_SUCCESS)
       {
         double u_dir[3];
-        for (int k = 0; k < 3; ++k) u_dir[k] = saved[k] - obj->vertices[va].pos[k];
+        MFTLGetMinimumImageVector(obj->domain, u_dir, obj->vertices[va].pos, saved);
         if (mftlParaboloidFitAt(obj, v_b, nbr, nvert, u_dir, w_dir) == MFTL_SUCCESS)
         {
           memcpy(fitted, obj->vertices[v_b].pos, 3 * sizeof(double));

@@ -64,6 +64,47 @@ MFTL_Object* MFTLObjectCreate(int global_id)
 }
 
 /**
+ * @brief Initializes the opaque per-triangle user payload for an object.
+ *
+ * Sets object->data_size and allocates a zeroed blob of data_size bytes for
+ * every existing triangle (local and ghost) that does not already carry one.
+ * Must be called collectively with the SAME data_size on all ranks before
+ * any redistribution/ghosting (see the contract on MFTL_Object.data_size).
+ */
+int MFTLInitializeObjectData(MFTL_Object* object, size_t data_size)
+{
+  if (!object) return MFTL_ERROR;
+
+  if (data_size == object->data_size) return MFTL_SUCCESS;  // idempotent no-op
+
+  if (object->data_size != 0)
+  {
+    fprintf(stderr,
+            "MFTL Error: MFTLInitializeObjectData: object %d already has data_size=%zu; "
+            "re-initializing with a different size (%zu) is not supported.\n",
+            object->global_id, object->data_size, data_size);
+    return MFTL_ERROR;
+  }
+
+  object->data_size = data_size;
+  if (data_size == 0) return MFTL_SUCCESS;  // fast path: blobs stay NULL
+
+  for (int i = 0; i < object->n_triangles; ++i)
+  {
+    if (object->triangles[i].data == MFTL_NULL)  // don't leak an existing blob
+    {
+      object->triangles[i].data = calloc(1, data_size);
+      if (!object->triangles[i].data)
+      {
+        fprintf(stderr, "MFTL Error: Failed to allocate %zu bytes of triangle data.\n", data_size);
+        return MFTL_ERROR;
+      }
+    }
+  }
+  return MFTL_SUCCESS;
+}
+
+/**
  * @brief Frees all memory associated with an MFTL_Object mesh.
  *
  * This function cleans up all allocated data pools, the domain decomposition
@@ -76,6 +117,12 @@ void MFTLObjectDestroy(MFTL_Object** p_object)
 {
   if (!p_object || !(*p_object)) return;
   MFTL_Object* object = *p_object;
+
+  // Free per-triangle user payloads (Stage 12)
+  if (object->data_size > 0 && object->triangles)
+  {
+    for (int i = 0; i < object->n_triangles; ++i) free(object->triangles[i].data);
+  }
 
   // Free Data Pools
   free(object->vertices);

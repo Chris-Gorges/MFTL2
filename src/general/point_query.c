@@ -24,9 +24,11 @@
  * existing per-object LBVH. An oriented box would add the covariance+Jacobi
  * machinery with no current consumer.
  *
- * Periodicity: the probe is first re-imaged next to the object's (wrapped)
- * AABB centre so rays test against the stored image (Stage 13 refines the
- * multi-body case).
+ * Periodicity (Stage 13): on a periodic domain the whole local mesh is
+ * temporarily re-imaged into one contiguous image about a collective anchor
+ * (first owned vertex of the lowest-rank owner, broadcast), the probe is
+ * re-imaged next to it, and the wrapped storage is restored before returning.
+ * Exact under the minimum-image constraint (MFTLCheckMinimumImageConstraint).
  */
 
 #include <math.h>
@@ -382,6 +384,37 @@ int MFTLDebugPointQueryLastIterations(void)
   return g_mftl_pq_last_iterations;
 }
 
+// Collective unwrap anchor (same protocol as MFTLObjectUnwrapAnchor in
+// geometry_object.c): the wrapped position of the first owned triangle vertex
+// on the lowest-rank owner, broadcast so every rank re-images into the SAME
+// image. Returns 0 when the object has no owned triangles anywhere.
+static int mftlPQUnwrapAnchor(MFTL_Object* obj, double anchor[3])
+{
+  MFTL_Domain* dom = obj->domain;
+  int rank = dom->rank;
+
+  double local_anchor[3] = {0.0, 0.0, 0.0};
+  int have_local = 0;
+  for (int t = 0; t < obj->n_triangles && !have_local; ++t)
+  {
+    MFTL_Triangle* tri = &obj->triangles[t];
+    if (tri->owner_proc != rank) continue;
+    MFTL_Vertex* vv[3];
+    MFTLGetTriangleVertices(obj, tri, vv);
+    memcpy(local_anchor, vv[0]->pos, 3 * sizeof(double));
+    have_local = 1;
+  }
+
+  int local_root = have_local ? rank : dom->nproc;
+  int root = dom->nproc;
+  MPI_Allreduce(&local_root, &root, 1, MPI_INT, MPI_MIN, dom->comm_cart);
+  if (root == dom->nproc) return 0;  // empty object: nothing to stab
+
+  if (rank == root) memcpy(anchor, local_anchor, 3 * sizeof(double));
+  MPI_Bcast(anchor, 3, MPI_DOUBLE, root, dom->comm_cart);
+  return 1;
+}
+
 int MFTLPointInsideObject(MFTL_Object* obj, const double p_in[3])
 {
   MFTL_ASSERT(obj != MFTL_NULL);
@@ -393,9 +426,42 @@ int MFTLPointInsideObject(MFTL_Object* obj, const double p_in[3])
   int rank = domain->rank;
   int nproc = domain->nproc;
 
-  // Periodic: re-image the probe next to the object's wrapped AABB centre.
   double p[3] = {p_in[0], p_in[1], p_in[2]};
+
+  // Stage 13: on a periodic domain the wrapped storage of a seam-straddling
+  // body is torn across the domain faces, so neither its AABB nor the raw ray
+  // tests see the true geometry. Temporarily re-image ALL local vertex
+  // positions (owned and ghost) into one contiguous image about a collective
+  // anchor, re-image the probe next to it, ray-cast against the unwrapped
+  // mesh, then restore the wrapped storage. Exact under the minimum-image
+  // constraint (MFTLCheckMinimumImageConstraint). Non-periodic domains keep
+  // the legacy path untouched.
+  double* saved = NULL;
+  if (MFTLDomainAnyPeriodic(domain))
   {
+    double anchor[3];
+    if (mftlPQUnwrapAnchor(obj, anchor))  // collective
+    {
+      saved = malloc((size_t) obj->n_vertices * 3 * sizeof(double));
+      MFTL_ASSERT(saved != MFTL_NULL || obj->n_vertices == 0);
+      for (int i = 0; i < obj->n_vertices; ++i)
+      {
+        MFTL_Vertex* v = &obj->vertices[i];
+        memcpy(saved + 3 * i, v->pos, 3 * sizeof(double));
+        MFTLUnwrapToAnchor(domain, v->pos, v->pos, anchor);
+      }
+      // re-image the probe next to the anchor
+      for (int k = 0; k < 3; ++k)
+      {
+        if (!domain->is_periodic[k]) continue;
+        p[k] += round((anchor[k] - p[k]) / domain->domain_size[k]) * domain->domain_size[k];
+      }
+    }
+  }
+  else
+  {
+    // Non-periodic: legacy re-image next to the object's AABB centre
+    // (a no-op without periodic axes; kept for collective-call parity).
     double c[3], d[3];
     MFTLObjectAABB(obj, c, d);
     for (int k = 0; k < 3; ++k)
@@ -441,6 +507,13 @@ int MFTLPointInsideObject(MFTL_Object* obj, const double p_in[3])
   g_mftl_pq_last_iterations = i;
 
   MFTL_DestroyBVH(bvh);
+
+  // restore the wrapped storage
+  if (saved)
+  {
+    for (int i2 = 0; i2 < obj->n_vertices; ++i2) memcpy(obj->vertices[i2].pos, saved + 3 * i2, 3 * sizeof(double));
+    free(saved);
+  }
 
   if (i > maxiter) return 1;  // MFTL1: after 100 retries assume inside
   if (flag < 0) return -1;    // on the surface

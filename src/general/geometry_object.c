@@ -37,16 +37,16 @@
  * every rank re-images into the SAME image.
  * @return 0 if the object has no owned triangles anywhere (all sums are 0).
  */
-static int MFTLObjectUnwrapAnchor(MFTL_Object* obj, double anchor[3])
+static int MFTLObjectUnwrapAnchor(const MFTL_Object* obj, double anchor[3])
 {
-  MFTL_Domain* dom = obj->domain;
+  const MFTL_Domain* dom = obj->domain;
   int rank = dom->rank;
 
   double local_anchor[3] = {0.0, 0.0, 0.0};
   int have_local = 0;
   for (int t = 0; t < obj->n_triangles && !have_local; ++t)
   {
-    MFTL_Triangle* tri = &obj->triangles[t];
+    const MFTL_Triangle* tri = &obj->triangles[t];
     if (tri->owner_proc != rank) continue;
     MFTL_Vertex* vv[3];
     MFTLGetTriangleVertices(obj, tri, vv);
@@ -221,4 +221,88 @@ void MFTLMomentOfInertia(MFTL_Object* obj, double I[3][3], const double center[3
   MPI_Allreduce(Ilocal[0], I[0], 3, MPI_DOUBLE, MPI_SUM, dom->comm_cart);
   MPI_Allreduce(Ilocal[1], I[1], 3, MPI_DOUBLE, MPI_SUM, dom->comm_cart);
   MPI_Allreduce(Ilocal[2], I[2], 3, MPI_DOUBLE, MPI_SUM, dom->comm_cart);
+}
+
+int MFTLCheckMinimumImageConstraint(const MFTL_Object* obj)
+{
+  MFTL_ASSERT(obj != MFTL_NULL);
+  const MFTL_Domain* dom = obj->domain;
+  MFTL_ASSERT(dom != MFTL_NULL);
+
+  if (!MFTLDomainAnyPeriodic(dom)) return MFTL_SUCCESS;
+
+  double half_min = MFTL_DBL_MAX;  // smallest half-period over periodic axes
+  for (int k = 0; k < 3; ++k)
+    if (dom->is_periodic[k] && dom->domain_half_size[k] < half_min) half_min = dom->domain_half_size[k];
+
+  // --- 1. Longest minimum-image edge over owned triangles ---
+  double local_max_edge = 0.0;
+  for (int t = 0; t < obj->n_triangles; ++t)
+  {
+    const MFTL_Triangle* tri = &obj->triangles[t];
+    if (tri->owner_proc != dom->rank || tri->is_ghost) continue;
+    if (tri->flags & MFTL_FLAG_DEAD) continue;
+    MFTL_Vertex* vv[3];
+    MFTLGetTriangleVertices(obj, tri, vv);
+    for (int e = 0; e < 3; ++e)
+    {
+      double d[3];
+      MFTLGetMinimumImageVector(dom, d, vv[e]->pos, vv[(e + 1) % 3]->pos);
+      double len = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+      if (len > local_max_edge) local_max_edge = len;
+    }
+  }
+  double max_edge = 0.0;
+  MPI_Allreduce(&local_max_edge, &max_edge, 1, MPI_DOUBLE, MPI_MAX, dom->comm_cart);
+
+  if (max_edge >= half_min)
+  {
+    if (dom->rank == 0)
+      fprintf(stderr,
+              "ERROR: MFTLCheckMinimumImageConstraint: object %d violates the minimum-image constraint: "
+              "longest edge %.6g >= smallest half-period %.6g. Increase the domain or coarsen/shrink the body.\n",
+              obj->global_id, max_edge, half_min);
+    return MFTL_ERROR;
+  }
+
+  // --- 2. Unwrapped body extent per periodic axis ---
+  double anchor[3];
+  if (!MFTLObjectUnwrapAnchor(obj, anchor)) return MFTL_SUCCESS;  // no owned triangles anywhere: nothing to check
+
+  double lmin[3] = {MFTL_DBL_MAX, MFTL_DBL_MAX, MFTL_DBL_MAX};
+  double lmax[3] = {-MFTL_DBL_MAX, -MFTL_DBL_MAX, -MFTL_DBL_MAX};
+  for (int i = 0; i < obj->n_vertices; ++i)
+  {
+    const MFTL_Vertex* v = &obj->vertices[i];
+    if (v->is_ghost || v->owner_proc != dom->rank) continue;
+    if (v->flags & MFTL_FLAG_DEAD) continue;
+    double u[3];
+    mftlUnwrapToAnchor(dom, u, v->pos, anchor);
+    for (int k = 0; k < 3; ++k)
+    {
+      if (u[k] < lmin[k]) lmin[k] = u[k];
+      if (u[k] > lmax[k]) lmax[k] = u[k];
+    }
+  }
+  double gmin[3], gmax[3];
+  MPI_Allreduce(lmin, gmin, 3, MPI_DOUBLE, MPI_MIN, dom->comm_cart);
+  MPI_Allreduce(lmax, gmax, 3, MPI_DOUBLE, MPI_MAX, dom->comm_cart);
+
+  for (int k = 0; k < 3; ++k)
+  {
+    if (!dom->is_periodic[k]) continue;
+    double extent = gmax[k] - gmin[k];
+    if (extent >= dom->domain_half_size[k])
+    {
+      if (dom->rank == 0)
+        fprintf(stderr,
+                "ERROR: MFTLCheckMinimumImageConstraint: object %d violates the minimum-image constraint: "
+                "axis %d extent %.6g >= half-period %.6g. Single-anchor unwraps (integrals, point queries) are "
+                "ambiguous for bodies this large — increase the domain or shrink the body.\n",
+                obj->global_id, k, extent, dom->domain_half_size[k]);
+      return MFTL_ERROR;
+    }
+  }
+
+  return MFTL_SUCCESS;
 }

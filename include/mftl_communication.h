@@ -293,7 +293,15 @@ void MFTLPackSingleVertex(MFTL_Object* obj, int vert_idx, PackedVertex* dst, boo
 void MFTLPackSingleTriangle(MFTL_Object* obj, int tri_idx, PackedTriangleComplex* dst, bool is_ghost);
 
 void MFTLAppendGhostVertex(MFTL_Object* obj, PackedVertex* pv);
-void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc);
+void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc, const void* data);
+
+/**
+ * @brief Stage 12: collective contract check — obj->data_size must be identical
+ * on every rank before any triangle-payload transport. Prints a loud diagnostic
+ * and returns MFTL_ERROR on mismatch; MFTL_SUCCESS when all ranks agree.
+ * Called at the entry of every triangle-data transport path.
+ */
+int MFTLCheckTriangleDataSizeConsistency(MFTL_Object* obj);
 
 /**
  * @brief Synchronizes ghost vertex positions for a list of objects.
@@ -302,6 +310,25 @@ void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc);
  * @return MFTL_SUCCESS on success.
  */
 int MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lookup);
+
+/**
+ * @brief Refreshes ghost TRIANGLE user payloads (MFTL_Triangle.data) from their owners.
+ *
+ * Mirrors MFTLUpdateGhostPositions structurally, but ships the opaque
+ * per-triangle blobs (obj->data_size bytes, see MFTL_Object.data_size) instead
+ * of vertex geometry: for every local ghost triangle the owner is asked for
+ * the current blob (keyed by global id), and the reply overwrites the ghost
+ * copy. Ghosts whose owner no longer holds the triangle (e.g. killed by
+ * remeshing) keep their stale copy; the next redistribution drops them.
+ *
+ * No-op fast path when no object carries a payload (all data_size == 0).
+ * Must be called collectively by all ranks.
+ *
+ * @param ens The ensemble containing the objects.
+ * @param object_lookup Optional hash map (BodyID -> Index). Pass MFTL_NULL to use linear search fallback.
+ * @return MFTL_SUCCESS on success.
+ */
+int MFTLScatterTriangleData(MFTL_Ensemble* ens, khash_t(object_map) * object_lookup);
 
 /**
  * @brief Extends the ghost layer by a specified number of topological steps.

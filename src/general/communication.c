@@ -298,6 +298,12 @@ void MFTLPackSingleVertex(MFTL_Object* obj, int vert_idx, PackedVertex* dst, boo
  */
 static inline void MFTLResetObjectData(MFTL_Object* obj)
 {
+  // Free per-triangle user payloads before the triangle array itself (Stage 12)
+  if (obj->data_size > 0 && obj->triangles)
+  {
+    for (int i = 0; i < obj->n_triangles; ++i) free(obj->triangles[i].data);
+  }
+
   free(obj->triangles);
   free(obj->vertices);
   free(obj->half_edges);
@@ -439,6 +445,49 @@ static void MFTLMpiExchangeBuffers(MFTL_Domain* domain, MFTL_SendBuffer* send_bu
 }
 
 /**
+ * @brief Stage 12: collective contract check — obj->data_size must be identical
+ * on every rank before any triangle-payload transport. The payload streams
+ * derive their byte counts and offsets from the LOCAL data_size, so a
+ * cross-rank mismatch would silently corrupt them; refuse loudly instead.
+ *
+ * Cheap: two tiny Allreduces over obj->domain->comm_cart.
+ *
+ * @return MFTL_SUCCESS when all ranks agree, MFTL_ERROR on mismatch (nothing
+ *         has been communicated or modified in that case).
+ */
+int MFTLCheckTriangleDataSizeConsistency(MFTL_Object* obj)
+{
+  unsigned long long local = (unsigned long long) obj->data_size;
+  unsigned long long lo = 0, hi = 0;
+  MPI_Allreduce(&local, &lo, 1, MPI_UNSIGNED_LONG_LONG, MPI_MIN, obj->domain->comm_cart);
+  MPI_Allreduce(&local, &hi, 1, MPI_UNSIGNED_LONG_LONG, MPI_MAX, obj->domain->comm_cart);
+  if (lo != hi)
+  {
+    fprintf(stderr,
+            "FATAL ERROR: MFTLCheckTriangleDataSizeConsistency: object (global_id %d) has data_size "
+            "min=%llu / max=%llu across ranks (this rank: %llu) — MFTLInitializeObjectData must be called "
+            "with the SAME size on all ranks before any transport. Refusing to communicate.\n",
+            obj->global_id, lo, hi, local);
+    return MFTL_ERROR;
+  }
+  return MFTL_SUCCESS;
+}
+
+/**
+ * @brief Stage 12 helper: payload size (data_size) of the object with the given
+ * body id. Same linear-search idiom as the target_obj lookups in the
+ * redistribution rebuild passes.
+ */
+static inline size_t mftl_data_size_of_body(MFTL_Object** objects, int num_objects, int body_id)
+{
+  for (int o = 0; o < num_objects; ++o)
+  {
+    if (objects[o]->global_id == body_id) return objects[o]->data_size;
+  }
+  return 0;
+}
+
+/**
  * @brief Reorders the triangle array in-place based on the sorted indices.
  */
 static inline void permute_triangles(PackedTriangleComplex* array, const int* indices, int count)
@@ -511,8 +560,9 @@ static inline void permute_vertices(PackedVertex* array, const int* indices, int
  * @param object The MFTL object containing the mesh and MPI info.
  * @param base The geometric basis for determining ownership (VERTEX_BASED or CENTER_BASED).
  * @return 0 on success, -1 on failure.
- * 
- * @todo incorporate void data pointer to triangle communication & ghost layer
+ *
+ * Per-triangle user payloads (MFTL_Object.data_size > 0) ride in a parallel
+ * MPI_BYTE stream in the same element order as the packed triangles.
  */
 int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
 {
@@ -523,6 +573,15 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
   MFTL_Object** objects = ensemble->objects;
 
   if (domain->nproc < 2) return MFTL_SUCCESS;  // No redistribution needed if there is only one process.
+
+  // Stage 12: payload byte counts are derived from the LOCAL data_size of each
+  // object — a cross-rank mismatch would silently corrupt the streams. Refuse
+  // loudly before touching anything. (Per-object check: data_size may differ
+  // BETWEEN objects, but must be identical per object across ranks.)
+  for (int o = 0; o < num_objects; ++o)
+  {
+    if (MFTLCheckTriangleDataSizeConsistency(objects[o]) != MFTL_SUCCESS) return MFTL_ERROR;
+  }
 
   // --- Phase 0: Setup and MPI Queries ---
   int nproc = domain->nproc;
@@ -544,9 +603,11 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
 
   int* total_tris_all_objects = calloc(nproc, sizeof(int));
   int* total_verts_all_objects = calloc(nproc, sizeof(int));
+  int* total_data_bytes = calloc(nproc, sizeof(int));  // Stage 12: per-rank payload byte counts
 
   MFTL_SendBuffer* send_tri_bufs = calloc(nproc, sizeof(MFTL_SendBuffer));
   MFTL_SendBuffer* send_vert_bufs = calloc(nproc, sizeof(MFTL_SendBuffer));
+  MFTL_SendBuffer* send_data_bufs = calloc(nproc, sizeof(MFTL_SendBuffer));  // Stage 12: parallel MPI_BYTE stream
 
   // Pre-allocate to avoid early reallocs (Heuristic: 1024 ints)
   int total_global_tris = 0;
@@ -683,11 +744,38 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
       }
     }
 
+    // Authority completeness: a non-ghost vertex with NO non-ghost incident
+    // triangle (happens transiently near partition boundaries, and for
+    // seam-stretched rings on periodic domains) never enters any triangle's
+    // vertex list, so its ownership-authoritative copy would not ship and the
+    // receiver's local/ghost classification (which only trusts non-ghost
+    // sender copies) would leave it ownerless. Send such vertices explicitly
+    // to their recomputed owner.
+    if (n_vertices > 0)
+    {
+      char* covered = (char*) calloc((size_t) n_vertices, 1);
+      for (int i = 0; i < n_triangles; ++i)
+      {
+        if (tri_base[i].is_ghost) continue;
+        covered[flat_tri_verts[3 * i + 0]] = 1;
+        covered[flat_tri_verts[3 * i + 1]] = 1;
+        covered[flat_tri_verts[3 * i + 2]] = 1;
+      }
+      for (int i = 0; i < n_vertices; ++i)
+      {
+        if (vert_base[i].is_ghost || covered[i]) continue;
+        int dest_rank = vert_owners[i];
+        if (dest_rank != my_rank && !is_neighbor_map[dest_rank]) requires_global_comm_local = 1;
+        buffer_add(&trans_vert_bufs[dest_rank], i);
+      }
+      free(covered);
+    }
+
     // Sort -> Unique
     for (int r = 0; r < nproc; ++r)
     {
       // Skip if nothing to send to this rank
-      if (trans_tri_bufs[r].size == 0)
+      if (trans_tri_bufs[r].size == 0 && trans_vert_bufs[r].size == 0)
       {
         // We must still signal "0 items" for this object to keep alignment
         // if the receiver expects a stream of objects.
@@ -708,6 +796,7 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
       // 3. Append to master buf ({object_id, n_unique_tris, n_unique_verts, triangle_ids, vertex_ids})
       total_tris_all_objects[r] += n_unique_tris;
       total_verts_all_objects[r] += n_unique_verts;
+      total_data_bytes[r] += n_unique_tris * (int) object->data_size;  // Stage 12
       buffer_add(&master_buf[r], object->global_id);
       buffer_add(&master_buf[r], n_unique_tris);
       buffer_add(&master_buf[r], n_unique_verts);
@@ -735,6 +824,11 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
     send_vert_bufs[r].buffer = malloc(total_verts_all_objects[r] * sizeof(PackedVertex));
     send_vert_bufs[r].capacity = total_verts_all_objects[r];
     send_vert_bufs[r].count = 0;  // Initialize packing index to 0
+
+    // Stage 12: opaque payload bytes; 'count' doubles as the byte cursor during packing
+    send_data_bufs[r].buffer = malloc(total_data_bytes[r]);
+    send_data_bufs[r].capacity = total_data_bytes[r];
+    send_data_bufs[r].count = 0;
   }
 
   // Pack MFTL Send Buffers with help of master buffer
@@ -789,6 +883,22 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
           he->boundary = MFTL_TRUE;
           he->flags = t_he[j]->flags;
         }
+
+        // Stage 12: append the opaque payload to the parallel byte stream,
+        // in the exact same element order as the packed triangles.
+        if (object->data_size > 0)
+        {
+          if (tri_base[tri_idx].data == MFTL_NULL)
+          {
+            fprintf(stderr,
+                    "FATAL ERROR: MFTLRedistributeListOfObjects: triangle (gid %d, body %d) has NULL data "
+                    "but data_size=%zu — call MFTLInitializeObjectData on all ranks before redistributing.\n",
+                    tri_base[tri_idx].global_id, object->global_id, object->data_size);
+            exit(EXIT_FAILURE);
+          }
+          memcpy((char*) send_data_bufs[r].buffer + send_data_bufs[r].count, tri_base[tri_idx].data, object->data_size);
+          send_data_bufs[r].count += (int) object->data_size;
+        }
       }
 
       // 2. Pack Vertices
@@ -808,7 +918,12 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
         packed_vert->roughness_mean = vert_base[vert_idx].roughness_mean;
         packed_vert->roughness_variance = vert_base[vert_idx].roughness_variance;
         packed_vert->area = vert_base[vert_idx].area;
-        packed_vert->is_ghost = MFTL_FALSE;
+        // Truthful sender-side status: the receiver uses this to tell
+        // ownership-authoritative copies (sender holds the vertex as
+        // non-ghost, fresh position) from ghost-derived copies (possibly
+        // stale position => possibly wrong owner label). See the vertex
+        // reconstruction below.
+        packed_vert->is_ghost = vert_base[vert_idx].is_ghost;
         packed_vert->flags = vert_base[vert_idx].flags;
         packed_vert->id_he_out = MFTLVOutHe(object, &vert_base[vert_idx])->global_id;
         packed_vert->body_id = object->global_id;
@@ -835,7 +950,8 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
   // These will hold the data that stays on the current rank.
   PackedTriangleComplex* kept_tris = MFTL_NULL;
   PackedVertex* kept_verts = MFTL_NULL;
-  int kept_count_tris = 0, kept_count_verts = 0;
+  char* kept_data = MFTL_NULL;  // Stage 12
+  int kept_count_tris = 0, kept_count_verts = 0, kept_data_bytes = 0;
 
   // Look for our own rank in the triangle send buffer
   // Do the same for vertices
@@ -850,6 +966,10 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
       kept_count_tris = send_tri_bufs[r].count;
       kept_count_verts = send_vert_bufs[r].count;
 
+      // Stage 12: steal the kept payload bytes ('count' is the byte cursor)
+      kept_data = (char*) send_data_bufs[r].buffer;
+      kept_data_bytes = send_data_bufs[r].count;
+
       // Clear Triangles
       send_tri_bufs[r].buffer = MFTL_NULL;
       send_tri_bufs[r].count = 0;
@@ -859,6 +979,11 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
       send_vert_bufs[r].buffer = MFTL_NULL;
       send_vert_bufs[r].count = 0;
       send_vert_bufs[r].capacity = 0;
+
+      // Clear Data
+      send_data_bufs[r].buffer = MFTL_NULL;
+      send_data_bufs[r].count = 0;
+      send_data_bufs[r].capacity = 0;
     }
   }
 
@@ -869,7 +994,8 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
   // --- Phase 3: Execute Communication ---
   PackedTriangleComplex* recv_buf_tris = MFTL_NULL;
   PackedVertex* recv_buf_verts = MFTL_NULL;
-  int total_recv_tris = 0, total_recv_verts = 0;
+  char* recv_data = MFTL_NULL;  // Stage 12
+  int total_recv_tris = 0, total_recv_verts = 0, recv_data_bytes = 0;
 
   // Use the Generic MPI Exchange Helper
   MFTLMpiExchangeBuffers(domain, send_tri_bufs, MPI_PackedTriangleComplex, sizeof(PackedTriangleComplex), global_decision, (void**) &recv_buf_tris,
@@ -877,18 +1003,24 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
 
   MFTLMpiExchangeBuffers(domain, send_vert_bufs, MPI_PackedVertex, sizeof(PackedVertex), global_decision, (void**) &recv_buf_verts, &total_recv_verts);
 
+  // Stage 12: the payload byte stream uses the same path decision and element order
+  MFTLMpiExchangeBuffers(domain, send_data_bufs, MPI_BYTE, 1, global_decision, (void**) &recv_data, &recv_data_bytes);
+
   // --- Final Cleanup of Send Buffers ---
   // At this point, all data has been sent. We can free the send maps and the buffers they hold.
   for (int i = 0; i < nproc; ++i)
   {
     free(send_tri_bufs[i].buffer);
     free(send_vert_bufs[i].buffer);
+    free(send_data_bufs[i].buffer);
   }
 
   free(total_tris_all_objects);
   free(total_verts_all_objects);
+  free(total_data_bytes);
   free(send_tri_bufs);
   free(send_vert_bufs);
+  free(send_data_bufs);
   free(is_neighbor_map);
 
   // --- Phase 4: Unpack and Rebuild Local Mesh ---
@@ -922,6 +1054,19 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
   free(kept_tris);
   free(recv_buf_tris);
 
+  // Stage 12: concatenate the payload byte stream in the SAME element order
+  // as all_tris (kept first, then received).
+  char* all_data = MFTL_NULL;
+  int all_data_bytes = kept_data_bytes + recv_data_bytes;
+  if (all_data_bytes > 0)
+  {
+    all_data = (char*) malloc(all_data_bytes);
+    if (kept_data_bytes > 0) memcpy(all_data, kept_data, kept_data_bytes);
+    if (recv_data_bytes > 0) memcpy(all_data + kept_data_bytes, recv_data, recv_data_bytes);
+  }
+  free(kept_data);
+  free(recv_data);
+
   // 4.2. HIERARCHICAL RADIX SORT & REBUILD
   if (final_tris_count > 0)
   {
@@ -944,9 +1089,44 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
     // After this, 'indices' tells us how to reorder 'all_tris' so bodies are grouped
     MFTLSortPairs(keys, indices, final_tris_count);
 
+    // Stage 12: per-element payload byte offsets into all_data in the OLD
+    // element order, needed to permute the variable-size blobs with all_tris.
+    size_t* elem_off = MFTL_NULL;
+    if (all_data_bytes > 0)
+    {
+      elem_off = malloc(final_tris_count * sizeof(size_t));
+      size_t run = 0;
+      for (int i = 0; i < final_tris_count; ++i)
+      {
+        elem_off[i] = run;
+        run += mftl_data_size_of_body(objects, num_objects, all_tris[i].triangle.body_id);
+      }
+      assert(run == (size_t) all_data_bytes);
+    }
+
     // 4. Permute the main data array to match the sorted order
     // Now all_tris is physically grouped by object: [Obj1, Obj1, Obj2, Obj2...]
     permute_triangles(all_tris, indices, final_tris_count);
+
+    // Stage 12: gather the payload blobs into the permuted order and record
+    // per-element offsets (NEW order) for the fill passes below.
+    size_t* data_off = MFTL_NULL;
+    if (all_data_bytes > 0)
+    {
+      char* gathered = malloc(all_data_bytes);
+      data_off = malloc(final_tris_count * sizeof(size_t));
+      size_t run = 0;
+      for (int i = 0; i < final_tris_count; ++i)
+      {
+        size_t ds = mftl_data_size_of_body(objects, num_objects, all_tris[i].triangle.body_id);
+        data_off[i] = run;
+        if (ds > 0) memcpy(gathered + run, all_data + elem_off[indices[i]], ds);
+        run += ds;
+      }
+      free(all_data);
+      all_data = gathered;
+      free(elem_off);
+    }
 
     // =========================================================
     // PASS 2: PROCESS EACH OBJECT (Range -> Sort -> Unique)
@@ -1027,10 +1207,13 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
           int sorted_relative_idx = indices[k];
           PackedTriangleComplex* src = &all_tris[start_idx + sorted_relative_idx];
 
-          if (write_count > 0 && target_obj->triangles[write_count - 1].global_id == src->triangle.global_id)
-          {
-            continue;  // Skip Duplicate
-          }
+          // Hash-based dedup: robust even if copies of one gid were to carry
+          // conflicting owner labels (triangle copies are single-source — only
+          // the unique non-ghost holder ships a triangle — but the same
+          // invariant-violation heap overflow as in the vertex path below
+          // would result if that ever broke).
+          khiter_t k_dup = kh_get(triangle_map, target_obj->triangle_lookup, src->triangle.global_id);
+          if (k_dup != kh_end(target_obj->triangle_lookup)) continue;  // already written
 
           // Skip ghosts in pass 1 (Assume local if owner_proc matches my_rank)
           if (src->triangle.owner_proc != my_rank) continue;
@@ -1045,6 +1228,17 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
           memcpy(dst->center, src->triangle.center, sizeof(double) * 3);
           memcpy(dst->normal, src->triangle.normal, sizeof(double) * 3);
           dst->he_idx = write_count * 3;
+
+          // Stage 12: attach the opaque payload from the parallel byte stream
+          if (target_obj->data_size > 0)
+          {
+            dst->data = malloc(target_obj->data_size);
+            memcpy(dst->data, all_data + data_off[start_idx + sorted_relative_idx], target_obj->data_size);
+          }
+          else
+          {
+            dst->data = MFTL_NULL;
+          }
 
           int ret;
           khiter_t k_tr = kh_put(triangle_map, target_obj->triangle_lookup, dst->global_id, &ret);
@@ -1078,10 +1272,8 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
           int sorted_relative_idx = indices[k];
           PackedTriangleComplex* src = &all_tris[start_idx + sorted_relative_idx];
 
-          if (write_count > 0 && target_obj->triangles[write_count - 1].global_id == src->triangle.global_id)
-          {
-            continue;  // Skip Duplicate
-          }
+          khiter_t k_dup = kh_get(triangle_map, target_obj->triangle_lookup, src->triangle.global_id);
+          if (k_dup != kh_end(target_obj->triangle_lookup)) continue;  // already written
 
           // Skip locals in pass 2
           if (src->triangle.owner_proc == my_rank) continue;
@@ -1096,6 +1288,18 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
           memcpy(dst->center, src->triangle.center, sizeof(double) * 3);
           memcpy(dst->normal, src->triangle.normal, sizeof(double) * 3);
           dst->he_idx = write_count * 3;
+
+          // Stage 12: duplicate copies carry identical bytes; the duplicate-skip
+          // logic above is unchanged.
+          if (target_obj->data_size > 0)
+          {
+            dst->data = malloc(target_obj->data_size);
+            memcpy(dst->data, all_data + data_off[start_idx + sorted_relative_idx], target_obj->data_size);
+          }
+          else
+          {
+            dst->data = MFTL_NULL;
+          }
 
           int ret;
           khiter_t k_tr = kh_put(triangle_map, target_obj->triangle_lookup, dst->global_id, &ret);
@@ -1124,6 +1328,8 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
     free(keys);
     free(indices);
     free(all_tris);
+    free(all_data);  // Stage 12
+    free(data_off);  // Stage 12
   }
 
   // =========================================================================
@@ -1235,6 +1441,22 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
         target_obj->vertices = malloc(n_unique * sizeof(MFTL_Vertex));
 
         // F. Fill Target Object
+        // Ownership authority: a vertex becomes LOCAL here only when a copy
+        // arrives from a sender holding it as NON-ghost (authoritative copy —
+        // the sender recomputed the owner label from its own fresh position).
+        // Ghost-derived copies may carry stale positions — and hence WRONG
+        // owner labels — whenever a ghost's owner sits outside this rank's
+        // communication neighbourhood so no refresh was possible (Stage-10
+        // contract: such ghosts stay stale until the next redistribution).
+        // Periodic seam-straddlers make this systematic: wrapped storage
+        // stretches their triangles across the whole domain in raw
+        // coordinates, so their vertices are owned by ranks 2+ slabs away
+        // (never refreshed), and a vertex wrapped across the seam jumps a
+        // full period, flipping its slab label. Classifying such copies by
+        // their stale label wrote the same gid BOTH as local and as ghost,
+        // overflowing this n_unique-sized array (heap corruption) and
+        // clobbering vertex_lookup. Dedup is therefore hash-based and only
+        // authoritative copies can create locals.
         // ── PASS 1: Locals ──────────────────────────────────────────────────
         int write_count = 0;
         for (int k = 0; k < range_len; ++k)
@@ -1242,12 +1464,11 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
           int sorted_relative_idx = indices[k];
           PackedVertex* src = &all_verts[start_idx + sorted_relative_idx];
 
-          if (write_count > 0 && target_obj->vertices[write_count - 1].global_id == src->global_id)
-          {
-            continue;  // Skip Duplicate
-          }
+          if (src->is_ghost != MFTL_FALSE) continue;  // ghost-derived copy: not ownership-authoritative
+          if (src->owner_proc != my_rank) continue;   // owned elsewhere
 
-          if (src->owner_proc != my_rank) continue;  // Skip ghosts in pass 1
+          khiter_t k_dup = kh_get(vertex_map, target_obj->vertex_lookup, src->global_id);
+          if (k_dup != kh_end(target_obj->vertex_lookup)) continue;  // already written
 
           // Copy Data
           MFTL_Vertex* dst = &target_obj->vertices[write_count];
@@ -1275,37 +1496,41 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
         target_obj->n_local_vertices = write_count;
 
         // ── PASS 2: Ghosts ──────────────────────────────────────────────────
-        for (int k = 0; k < range_len; ++k)
+        // Data precedence: authoritative (sender-local) copies first, so a
+        // ghost's payload comes from the owner's fresh data whenever it is
+        // available; ghost-derived (possibly stale) copies fill the rest.
+        for (int authoritative = 1; authoritative >= 0; --authoritative)
         {
-          int sorted_relative_idx = indices[k];
-          PackedVertex* src = &all_verts[start_idx + sorted_relative_idx];
-
-          if (write_count > 0 && target_obj->vertices[write_count - 1].global_id == src->global_id)
+          for (int k = 0; k < range_len; ++k)
           {
-            continue;  // Skip Duplicate
+            int sorted_relative_idx = indices[k];
+            PackedVertex* src = &all_verts[start_idx + sorted_relative_idx];
+
+            if ((src->is_ghost == MFTL_FALSE) != (authoritative == 1)) continue;  // class filter
+
+            khiter_t k_dup = kh_get(vertex_map, target_obj->vertex_lookup, src->global_id);
+            if (k_dup != kh_end(target_obj->vertex_lookup)) continue;  // already written
+
+            MFTL_Vertex* dst = &target_obj->vertices[write_count];
+            dst->global_id = src->global_id;
+            dst->owner_proc = src->owner_proc;
+            dst->flags = src->flags;
+            dst->is_ghost = MFTL_TRUE;
+            dst->area = src->area;
+            dst->meancurvature = src->meancurvature;
+            dst->gaussiancurvature = src->gaussiancurvature;
+            dst->roughness_mean = src->roughness_mean;
+            dst->roughness_variance = src->roughness_variance;
+            memcpy(dst->pos, src->pos, 3 * sizeof(double));
+            memcpy(dst->normal, src->normal, 3 * sizeof(double));
+            dst->out_he_idx = src->id_he_out;
+
+            int ret;
+            khiter_t k_v = kh_put(vertex_map, target_obj->vertex_lookup, dst->global_id, &ret);
+            kh_value(target_obj->vertex_lookup, k_v) = write_count;
+
+            write_count++;
           }
-
-          if (src->owner_proc == my_rank) continue;  // Skip locals in pass 2
-
-          MFTL_Vertex* dst = &target_obj->vertices[write_count];
-          dst->global_id = src->global_id;
-          dst->owner_proc = src->owner_proc;
-          dst->flags = src->flags;
-          dst->is_ghost = MFTL_TRUE;
-          dst->area = src->area;
-          dst->meancurvature = src->meancurvature;
-          dst->gaussiancurvature = src->gaussiancurvature;
-          dst->roughness_mean = src->roughness_mean;
-          dst->roughness_variance = src->roughness_variance;
-          memcpy(dst->pos, src->pos, 3 * sizeof(double));
-          memcpy(dst->normal, src->normal, 3 * sizeof(double));
-          dst->out_he_idx = src->id_he_out;
-
-          int ret;
-          khiter_t k_v = kh_put(vertex_map, target_obj->vertex_lookup, dst->global_id, &ret);
-          kh_value(target_obj->vertex_lookup, k_v) = write_count;
-
-          write_count++;
         }
         MFTL_ASSERT(write_count == n_unique && "Error: write_count != n_unique\n");
       }
@@ -1348,6 +1573,10 @@ int MFTLRedistributeObject(MFTL_Object* object)
   int nproc = domain->nproc;
   if (nproc < 2) return MFTL_SUCCESS;
 
+  // Stage 12: payload byte counts derive from the LOCAL data_size — refuse
+  // loudly on a cross-rank mismatch before touching anything.
+  if (MFTLCheckTriangleDataSizeConsistency(object) != MFTL_SUCCESS) return MFTL_ERROR;
+
   int my_rank = domain->rank;
   int requires_global_comm_local = 0;
 
@@ -1361,6 +1590,9 @@ int MFTLRedistributeObject(MFTL_Object* object)
   IntBuffer* trans_vert_bufs = calloc(nproc, sizeof(IntBuffer));
   MFTL_SendBuffer* send_tri_bufs = calloc(nproc, sizeof(MFTL_SendBuffer));
   MFTL_SendBuffer* send_vert_bufs = calloc(nproc, sizeof(MFTL_SendBuffer));
+  MFTL_SendBuffer* send_data_bufs = calloc(nproc, sizeof(MFTL_SendBuffer));  // Stage 12: parallel MPI_BYTE stream
+
+  const size_t ds = object->data_size;  // Stage 12: uniform per-element payload size
 
   // Heuristic Allocation
   int tri_cap, vert_cap;
@@ -1447,6 +1679,30 @@ int MFTLRedistributeObject(MFTL_Object* object)
     }
   }
 
+  // Authority completeness (see MFTLRedistributeListOfObjects): a non-ghost
+  // vertex with no non-ghost incident triangle would not ship its
+  // ownership-authoritative copy; send such vertices explicitly to their
+  // recomputed owner.
+  if (n_vertices > 0)
+  {
+    char* covered = (char*) calloc((size_t) n_vertices, 1);
+    for (int i = 0; i < n_triangles; ++i)
+    {
+      if (tri_base[i].is_ghost) continue;
+      covered[flat_tri_verts[3 * i + 0]] = 1;
+      covered[flat_tri_verts[3 * i + 1]] = 1;
+      covered[flat_tri_verts[3 * i + 2]] = 1;
+    }
+    for (int i = 0; i < n_vertices; ++i)
+    {
+      if (vert_base[i].is_ghost || covered[i]) continue;
+      int dest_rank = vert_owners[i];
+      if (dest_rank != my_rank && !is_neighbor_map[dest_rank]) requires_global_comm_local = 1;
+      buffer_add(&trans_vert_bufs[dest_rank], i);
+    }
+    free(covered);
+  }
+
   // Cleanup helper arrays
   free(vert_owners);
   free(tri_owners);
@@ -1465,12 +1721,34 @@ int MFTLRedistributeObject(MFTL_Object* object)
       send_tri_bufs[r].capacity = n_unique;
       send_tri_bufs[r].count = n_unique;
 
+      // Stage 12: exact-size payload byte buffer for this rank
+      if (ds > 0)
+      {
+        send_data_bufs[r].buffer = malloc(n_unique * ds);
+        send_data_bufs[r].capacity = (int) (n_unique * ds);
+        send_data_bufs[r].count = (int) (n_unique * ds);  // byte count for the exchange
+      }
+
       // Pack Direct
       PackedTriangleComplex* buf = (PackedTriangleComplex*) send_tri_bufs[r].buffer;
       for (int i = 0; i < n_unique; ++i)
       {
         int tri_idx = trans_tri_bufs[r].data[i];
         MFTLPackSingleTriangle(object, tri_idx, &buf[i], MFTL_FALSE);
+
+        // Stage 12: append the payload in the exact same element order
+        if (ds > 0)
+        {
+          if (object->triangles[tri_idx].data == MFTL_NULL)
+          {
+            fprintf(stderr,
+                    "FATAL ERROR: MFTLRedistributeObject: triangle (gid %d) has NULL data but data_size=%zu — "
+                    "call MFTLInitializeObjectData on all ranks before redistributing.\n",
+                    object->triangles[tri_idx].global_id, ds);
+            exit(EXIT_FAILURE);
+          }
+          memcpy((char*) send_data_bufs[r].buffer + (size_t) i * ds, object->triangles[tri_idx].data, ds);
+        }
       }
     }
 
@@ -1485,12 +1763,13 @@ int MFTLRedistributeObject(MFTL_Object* object)
       send_vert_bufs[r].capacity = n_unique;
       send_vert_bufs[r].count = n_unique;
 
-      // Pack Direct
+      // Pack Direct (truthful sender-side ghost status: ownership authority,
+      // see the reconstruction below)
       PackedVertex* buf = (PackedVertex*) send_vert_bufs[r].buffer;
       for (int i = 0; i < n_unique; ++i)
       {
         int vert_idx = trans_vert_bufs[r].data[i];
-        MFTLPackSingleVertex(object, vert_idx, &buf[i], MFTL_FALSE);
+        MFTLPackSingleVertex(object, vert_idx, &buf[i], object->vertices[vert_idx].is_ghost);
       }
     }
 
@@ -1504,7 +1783,8 @@ int MFTLRedistributeObject(MFTL_Object* object)
   // --- 4. Separate Kept Data (Zero-Copy Steal) ---
   PackedTriangleComplex* kept_tris = MFTL_NULL;
   PackedVertex* kept_verts = MFTL_NULL;
-  int kept_count_tris = 0, kept_count_verts = 0;
+  char* kept_data = MFTL_NULL;  // Stage 12
+  int kept_count_tris = 0, kept_count_verts = 0, kept_data_bytes = 0;
 
   if (send_tri_bufs[my_rank].count > 0)
   {
@@ -1520,6 +1800,13 @@ int MFTLRedistributeObject(MFTL_Object* object)
     send_vert_bufs[my_rank].buffer = MFTL_NULL;
     send_vert_bufs[my_rank].count = 0;
   }
+  if (send_data_bufs[my_rank].count > 0)  // Stage 12 ('count' is a byte count here)
+  {
+    kept_data = (char*) send_data_bufs[my_rank].buffer;
+    kept_data_bytes = send_data_bufs[my_rank].count;
+    send_data_bufs[my_rank].buffer = MFTL_NULL;
+    send_data_bufs[my_rank].count = 0;
+  }
 
   // --- 5. Communication (Phase 2 & 3) ---
   int global_decision;
@@ -1527,21 +1814,27 @@ int MFTLRedistributeObject(MFTL_Object* object)
 
   PackedTriangleComplex* recv_tris;
   PackedVertex* recv_verts;
-  int n_recv_tris, n_recv_verts;
+  char* recv_data = MFTL_NULL;  // Stage 12
+  int n_recv_tris, n_recv_verts, n_recv_data = 0;
 
   // Use the Generic MPI Exchange Helper
   MFTLMpiExchangeBuffers(domain, send_tri_bufs, MPI_PackedTriangleComplex, sizeof(PackedTriangleComplex), global_decision, (void**) &recv_tris, &n_recv_tris);
 
   MFTLMpiExchangeBuffers(domain, send_vert_bufs, MPI_PackedVertex, sizeof(PackedVertex), global_decision, (void**) &recv_verts, &n_recv_verts);
 
+  // Stage 12: payload bytes, same path decision and element order
+  MFTLMpiExchangeBuffers(domain, send_data_bufs, MPI_BYTE, 1, global_decision, (void**) &recv_data, &n_recv_data);
+
   // Cleanup Send Buffers
   for (int i = 0; i < nproc; ++i)
   {
     if (send_tri_bufs[i].buffer) free(send_tri_bufs[i].buffer);
     if (send_vert_bufs[i].buffer) free(send_vert_bufs[i].buffer);
+    if (send_data_bufs[i].buffer) free(send_data_bufs[i].buffer);
   }
   free(send_tri_bufs);
   free(send_vert_bufs);
+  free(send_data_bufs);
   free(is_neighbor_map);
 
   // --- 6. Reconstruction ---
@@ -1558,6 +1851,17 @@ int MFTLRedistributeObject(MFTL_Object* object)
   }
   free(kept_tris);
   free(recv_tris);
+
+  // Stage 12: payload bytes in the SAME element order as all_tris (kept, then recv)
+  char* all_data = MFTL_NULL;
+  if (total_tris > 0 && ds > 0)
+  {
+    all_data = malloc((size_t) total_tris * ds);
+    if (kept_data_bytes > 0) memcpy(all_data, kept_data, kept_data_bytes);
+    if (n_recv_data > 0) memcpy(all_data + kept_data_bytes, recv_data, n_recv_data);
+  }
+  free(kept_data);
+  free(recv_data);
 
   // Combine Kept + Recv (Vertices)
   int total_verts = kept_count_verts + n_recv_verts;
@@ -1601,7 +1905,8 @@ int MFTLRedistributeObject(MFTL_Object* object)
       int sorted_idx = indices[k];
       PackedTriangleComplex* src = &all_tris[sorted_idx];
 
-      if (write_idx > 0 && object->triangles[write_idx - 1].global_id == src->triangle.global_id) continue;
+      khiter_t k_dup = kh_get(triangle_map, object->triangle_lookup, src->triangle.global_id);
+      if (k_dup != kh_end(object->triangle_lookup)) continue;  // already written
       if (src->triangle.owner_proc != my_rank) continue;  // Skip ghosts in pass 1
 
       // Copy Triangle
@@ -1614,6 +1919,17 @@ int MFTLRedistributeObject(MFTL_Object* object)
       memcpy(dst->center, src->triangle.center, sizeof(double) * 3);
       memcpy(dst->normal, src->triangle.normal, sizeof(double) * 3);
       dst->he_idx = write_idx * 3;
+
+      // Stage 12: uniform stride — element sorted_idx's blob sits at sorted_idx * ds
+      if (ds > 0)
+      {
+        dst->data = malloc(ds);
+        memcpy(dst->data, all_data + (size_t) sorted_idx * ds, ds);
+      }
+      else
+      {
+        dst->data = MFTL_NULL;
+      }
 
       int ret;
       khiter_t iter = kh_put(triangle_map, object->triangle_lookup, dst->global_id, &ret);
@@ -1646,7 +1962,8 @@ int MFTLRedistributeObject(MFTL_Object* object)
       int sorted_idx = indices[k];
       PackedTriangleComplex* src = &all_tris[sorted_idx];
 
-      if (write_idx > 0 && object->triangles[write_idx - 1].global_id == src->triangle.global_id) continue;
+      khiter_t k_dup = kh_get(triangle_map, object->triangle_lookup, src->triangle.global_id);
+      if (k_dup != kh_end(object->triangle_lookup)) continue;  // already written
       if (src->triangle.owner_proc == my_rank) continue;  // Skip locals in pass 2
 
       MFTL_Triangle* dst = &object->triangles[write_idx];
@@ -1658,6 +1975,17 @@ int MFTLRedistributeObject(MFTL_Object* object)
       memcpy(dst->center, src->triangle.center, sizeof(double) * 3);
       memcpy(dst->normal, src->triangle.normal, sizeof(double) * 3);
       dst->he_idx = write_idx * 3;
+
+      // Stage 12: duplicate copies carry identical bytes
+      if (ds > 0)
+      {
+        dst->data = malloc(ds);
+        memcpy(dst->data, all_data + (size_t) sorted_idx * ds, ds);
+      }
+      else
+      {
+        dst->data = MFTL_NULL;
+      }
 
       int ret;
       khiter_t iter = kh_put(triangle_map, object->triangle_lookup, dst->global_id, &ret);
@@ -1683,6 +2011,7 @@ int MFTLRedistributeObject(MFTL_Object* object)
     free(keys);
     free(indices);
     free(all_tris);
+    free(all_data);  // Stage 12
   }
 
   // Rebuild Vertices (Direct GID Sort)
@@ -1705,14 +2034,28 @@ int MFTLRedistributeObject(MFTL_Object* object)
     object->capacity_vertices = n_unique;
     object->vertices = malloc(n_unique * sizeof(MFTL_Vertex));
 
+    // Ownership authority: a vertex becomes LOCAL here only when a copy
+    // arrives from a sender holding it as NON-ghost (authoritative copy —
+    // fresh position, trustworthy owner label). Ghost-derived copies may be
+    // stale (ghosts whose owners are outside this rank's communication
+    // neighbourhood are never refreshed — systematic for periodic
+    // seam-straddlers in wrapped storage, whose stretched triangles reach
+    // vertices owned 2+ slabs away; a seam-wrapped vertex jumps a full
+    // period). Classifying such copies by their stale label wrote the same
+    // gid both as local and as ghost, overflowing the n_unique-sized array
+    // and clobbering vertex_lookup. Dedup is therefore hash-based and only
+    // authoritative copies can create locals.
     int write_idx = 0;
     for (int k = 0; k < total_verts; ++k)
     {
       int sorted_idx = indices[k];
       PackedVertex* src = &all_verts[sorted_idx];
 
-      if (write_idx > 0 && object->vertices[write_idx - 1].global_id == src->global_id) continue;
-      if (src->owner_proc != my_rank) continue;  // Skip ghosts in pass 1
+      if (src->is_ghost != MFTL_FALSE) continue;  // ghost-derived copy: not ownership-authoritative
+      if (src->owner_proc != my_rank) continue;   // owned elsewhere
+
+      khiter_t k_dup = kh_get(vertex_map, object->vertex_lookup, src->global_id);
+      if (k_dup != kh_end(object->vertex_lookup)) continue;  // already written
 
       MFTL_Vertex* dst = &object->vertices[write_idx];
       dst->global_id = src->global_id;
@@ -1738,33 +2081,40 @@ int MFTLRedistributeObject(MFTL_Object* object)
     object->n_local_vertices = write_idx;
 
     // ── PASS 2: Ghosts ──────────────────────────────────────────────────
-    for (int k = 0; k < total_verts; ++k)
+    // Data precedence: authoritative (sender-local) copies first, then
+    // ghost-derived (possibly stale) copies for gids not yet written.
+    for (int authoritative = 1; authoritative >= 0; --authoritative)
     {
-      int sorted_idx = indices[k];
-      PackedVertex* src = &all_verts[sorted_idx];
+      for (int k = 0; k < total_verts; ++k)
+      {
+        int sorted_idx = indices[k];
+        PackedVertex* src = &all_verts[sorted_idx];
 
-      if (write_idx > 0 && object->vertices[write_idx - 1].global_id == src->global_id) continue;
-      if (src->owner_proc == my_rank) continue;  // Skip locals in pass 2
+        if ((src->is_ghost == MFTL_FALSE) != (authoritative == 1)) continue;  // class filter
 
-      MFTL_Vertex* dst = &object->vertices[write_idx];
-      dst->global_id = src->global_id;
-      dst->owner_proc = src->owner_proc;
-      dst->flags = src->flags;
-      dst->is_ghost = MFTL_TRUE;
-      dst->area = src->area;
-      dst->meancurvature = src->meancurvature;
-      dst->gaussiancurvature = src->gaussiancurvature;
-      dst->roughness_mean = src->roughness_mean;
-      dst->roughness_variance = src->roughness_variance;
-      memcpy(dst->pos, src->pos, sizeof(double) * 3);
-      memcpy(dst->normal, src->normal, sizeof(double) * 3);
-      dst->out_he_idx = src->id_he_out;
+        khiter_t k_dup = kh_get(vertex_map, object->vertex_lookup, src->global_id);
+        if (k_dup != kh_end(object->vertex_lookup)) continue;  // already written
 
-      int ret;
-      khiter_t iter = kh_put(vertex_map, object->vertex_lookup, dst->global_id, &ret);
-      kh_value(object->vertex_lookup, iter) = write_idx;
+        MFTL_Vertex* dst = &object->vertices[write_idx];
+        dst->global_id = src->global_id;
+        dst->owner_proc = src->owner_proc;
+        dst->flags = src->flags;
+        dst->is_ghost = MFTL_TRUE;
+        dst->area = src->area;
+        dst->meancurvature = src->meancurvature;
+        dst->gaussiancurvature = src->gaussiancurvature;
+        dst->roughness_mean = src->roughness_mean;
+        dst->roughness_variance = src->roughness_variance;
+        memcpy(dst->pos, src->pos, sizeof(double) * 3);
+        memcpy(dst->normal, src->normal, sizeof(double) * 3);
+        dst->out_he_idx = src->id_he_out;
 
-      write_idx++;
+        int ret;
+        khiter_t iter = kh_put(vertex_map, object->vertex_lookup, dst->global_id, &ret);
+        kh_value(object->vertex_lookup, iter) = write_idx;
+
+        write_idx++;
+      }
     }
 
     MFTL_ASSERT(write_idx == n_unique && "Error: write_count != n_unique\n");
@@ -2103,6 +2453,404 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lo
   return MFTL_SUCCESS;
 }
 
+/**
+ * @brief Refreshes ghost TRIANGLE user payloads (MFTL_Triangle.data) from their owners.
+ *
+ * Mirrors MFTLUpdateGhostPositions structurally, but for ghost triangles and
+ * byte payloads (Stage 12): every ghost triangle requests (body_id, gid) from
+ * its owner; the owner replies with a found flag plus the obj->data_size blob
+ * bytes, shipped as two parallel streams (MPI_INT flags + MPI_BYTE payload).
+ * The requester computes the per-neighbor reply byte counts locally — it knows
+ * the data_size of every body it requested — so no extra count exchange is
+ * needed for the byte stream.
+ *
+ * Ghosts whose owner no longer holds the triangle (e.g. killed by remeshing
+ * since the last sync) keep their stale payload; the next redistribution drops
+ * them. Data is never fabricated.
+ *
+ * Must be called collectively by all ranks. No-op when no object carries a
+ * payload (data_size is set collectively via MFTLInitializeObjectData, so this
+ * early-out is rank-consistent) or when there are no neighbors / nproc < 2.
+ */
+int MFTLScatterTriangleData(MFTL_Ensemble* ens, khash_t(object_map) * object_lookup)
+{
+  if (ens->num_objects == 0 || ens->objects == MFTL_NULL) return MFTL_SUCCESS;
+
+  MFTL_Object** objects = ens->objects;
+  MFTL_Domain* domain = &ens->domain;
+  int nproc = domain->nproc;
+  int my_rank = domain->rank;
+
+  int num_neighbors = domain->num_neighbors;
+  int num_objects = ens->num_objects;
+
+  if (num_neighbors <= 0 || nproc < 2) return MFTL_SUCCESS;
+
+  // Stage 12: this check MUST run before the any_data early-out below — that
+  // early-out is only rank-consistent when data_size agrees everywhere, which
+  // is exactly what the check verifies. Refuse loudly on a mismatch.
+  for (int o = 0; o < num_objects; ++o)
+  {
+    if (MFTLCheckTriangleDataSizeConsistency(objects[o]) != MFTL_SUCCESS) return MFTL_ERROR;
+  }
+
+  // Fast path: no payload anywhere. data_size is collective and the object
+  // list is identical on all ranks, so this early-out is rank-consistent
+  // (a rank-local conditional skip of the collectives below would deadlock —
+  // cf. the note in MFTLUpdateGhostPositions).
+  int any_data = 0;
+  for (int o = 0; o < num_objects; ++o)
+  {
+    if (objects[o]->data_size > 0)
+    {
+      any_data = 1;
+      break;
+    }
+  }
+  if (!any_data) return MFTL_SUCCESS;
+
+  // --- 1. Setup Buffers ---
+  IntBuffer* req_send_bufs = calloc(num_neighbors, sizeof(IntBuffer));
+  for (int i = 0; i < num_neighbors; ++i) buffer_init(&req_send_bufs[i], 1024);
+
+  // Fast Map: Global Rank -> Neighbor Index
+  int* rank_to_neigh_idx = malloc(nproc * sizeof(int));
+  memset(rank_to_neigh_idx, -1, nproc * sizeof(int));
+  for (int i = 0; i < num_neighbors; ++i) rank_to_neigh_idx[domain->neighbors[i]] = i;
+
+  int n_skipped_nonneighbor = 0;
+
+  // --- 2. Build Requests (Iterate ALL objects carrying a payload) ---
+  for (int o = 0; o < num_objects; ++o)
+  {
+    MFTL_Object* obj = objects[o];
+    if (obj->data_size == 0) continue;
+
+    for (int i = 0; i < obj->n_triangles; ++i)
+    {
+      MFTL_Triangle* t = &obj->triangles[i];
+
+      if (t->is_ghost)
+      {
+        int owner = t->owner_proc;
+        assert(owner >= 0 && owner < nproc && "Ghost owner rank out of bounds!");
+        int n_idx = rank_to_neigh_idx[owner];
+
+        // Same non-neighbor-owner skip as MFTLUpdateGhostPositions: the graph
+        // communicator cannot serve those requests; keep the ghost payload
+        // stale until the next redistribution.
+        if (n_idx != -1)
+        {
+          buffer_add(&req_send_bufs[n_idx], obj->global_id);
+          buffer_add(&req_send_bufs[n_idx], t->global_id);
+        }
+        else
+        {
+          n_skipped_nonneighbor++;
+        }
+      }
+    }
+  }
+
+  {
+    // Unconditional consensus: a rank-local conditional Allreduce here
+    // would deadlock the ranks that skip it against the neighbour
+    // collectives below.
+    int skipped_g = 0;
+    MPI_Allreduce(&n_skipped_nonneighbor, &skipped_g, 1, MPI_INT, MPI_SUM, domain->comm_cart);
+    if (skipped_g > 0 && my_rank == 0)
+      fprintf(stderr,
+              "MFTLScatterTriangleData: %d ghost(s) have non-neighbour owners (transient slab-spanning edges or\n"
+              "knife-edge slabs during parallel remeshing); keeping their payloads stale until the next redistribution.\n",
+              skipped_g);
+  }
+
+  // --- 3. Exchange Request Counts ---
+  int* n_send_reqs = calloc(num_neighbors, sizeof(int));
+  int* n_recv_reqs = malloc(num_neighbors * sizeof(int));
+
+  for (int i = 0; i < num_neighbors; ++i)
+  {
+    n_send_reqs[i] = req_send_bufs[i].size;  // Actual count is size (2 * num_requests)
+  }
+
+  MPI_Neighbor_alltoall(n_send_reqs, 1, MPI_INT, n_recv_reqs, 1, MPI_INT, domain->comm_graph);
+
+  // --- 4. Exchange Requests ---
+  int* s_displs = calloc(num_neighbors + 1, sizeof(int));
+  int* r_displs = calloc(num_neighbors + 1, sizeof(int));
+  int total_send_ints = 0;
+  int total_recv_ints = 0;
+
+  for (int i = 0; i < num_neighbors; ++i)
+  {
+    s_displs[i + 1] = s_displs[i] + n_send_reqs[i];
+    r_displs[i + 1] = r_displs[i] + n_recv_reqs[i];
+    total_send_ints += n_send_reqs[i];
+    total_recv_ints += n_recv_reqs[i];
+  }
+
+  int* flat_send_reqs = malloc(total_send_ints * sizeof(int));
+  for (int i = 0; i < num_neighbors; ++i)
+  {
+    if (n_send_reqs[i] > 0)
+    {
+      memcpy(flat_send_reqs + s_displs[i], req_send_bufs[i].data, n_send_reqs[i] * sizeof(int));
+    }
+  }
+
+  int* flat_recv_reqs = malloc(total_recv_ints * sizeof(int));
+
+  MPI_Neighbor_alltoallv(flat_send_reqs, n_send_reqs, s_displs, MPI_INT, flat_recv_reqs, n_recv_reqs, r_displs, MPI_INT, domain->comm_graph);
+
+  free(flat_send_reqs);
+
+  // --- 5. Process Requests & Build Replies ---
+  // Two parallel reply streams per neighbor, in request order:
+  //  (a) int found flags — counts derivable receiver-side (n_recv_reqs/2)
+  //  (b) the payload bytes — per-neighbor byte counts tracked while building
+  int total_reply_count = total_recv_ints / 2;
+  int* reply_found = malloc((total_reply_count > 0 ? total_reply_count : 1) * sizeof(int));
+  int* n_send_reply_bytes = calloc(num_neighbors, sizeof(int));
+
+  size_t reply_bytes_cap = 0, reply_bytes_len = 0;
+  char* reply_bytes = MFTL_NULL;
+
+  int reply_idx = 0;
+
+  // Cache the last accessed object to speed up sequential access
+  int last_body_id = -1;
+  MFTL_Object* current_obj = MFTL_NULL;
+
+  for (int n = 0; n < num_neighbors; ++n)
+  {
+    int n_pairs = n_recv_reqs[n] / 2;
+    for (int j = 0; j < n_pairs; ++j)
+    {
+      int req_body_id = flat_recv_reqs[r_displs[n] + 2 * j];
+      int req_gid = flat_recv_reqs[r_displs[n] + 2 * j + 1];
+
+      // --- A. HYBRID OBJECT LOOKUP ---
+      if (req_body_id != last_body_id)
+      {
+        if (object_lookup != MFTL_NULL)
+        {
+          khiter_t k_obj = kh_get(object_map, object_lookup, req_body_id);
+          current_obj = (k_obj != kh_end(object_lookup)) ? objects[kh_value(object_lookup, k_obj)] : MFTL_NULL;
+        }
+        else
+        {
+          current_obj = MFTL_NULL;
+          for (int o = 0; o < num_objects; ++o)
+          {
+            if (objects[o]->global_id == req_body_id)
+            {
+              current_obj = objects[o];
+              break;
+            }
+          }
+        }
+        last_body_id = req_body_id;
+      }
+
+      assert(current_obj);
+      const size_t ds_r = current_obj->data_size;
+
+      // --- B. TRIANGLE LOOKUP (Using existing Hash Map) ---
+      MFTL_Triangle* found_t = MFTL_NULL;
+      khiter_t k_tri = kh_get(triangle_map, current_obj->triangle_lookup, req_gid);
+      if (k_tri != kh_end(current_obj->triangle_lookup))
+      {
+        found_t = &current_obj->triangles[kh_value(current_obj->triangle_lookup, k_tri)];
+      }
+
+      // --- C. Pack Reply ---
+      int found = 1;
+      if (found_t == MFTL_NULL || (found_t->flags & MFTL_FLAG_DEAD))
+      {
+        // Parallel remeshing legitimately kills entities whose ghosts other
+        // ranks still hold. Report the miss explicitly; the requester keeps
+        // its stale copy. (A zeroed/fabricated payload would silently corrupt
+        // ghost state.)
+        found = 0;
+      }
+      reply_found[reply_idx++] = found;
+
+      if (ds_r > 0)
+      {
+        if (reply_bytes_len + ds_r > reply_bytes_cap)
+        {
+          reply_bytes_cap = (reply_bytes_cap == 0) ? 1024 * ds_r : reply_bytes_cap;
+          while (reply_bytes_cap < reply_bytes_len + ds_r) reply_bytes_cap *= 2;
+          reply_bytes = realloc(reply_bytes, reply_bytes_cap);
+        }
+        if (found)
+        {
+          if (found_t->data == MFTL_NULL)
+          {
+            fprintf(stderr,
+                    "FATAL ERROR: MFTLScatterTriangleData: triangle (gid %d, body %d) has NULL data but data_size=%zu — "
+                    "call MFTLInitializeObjectData on all ranks before ghosting.\n",
+                    req_gid, req_body_id, ds_r);
+            exit(EXIT_FAILURE);
+          }
+          memcpy(reply_bytes + reply_bytes_len, found_t->data, ds_r);
+        }
+        else
+        {
+          memset(reply_bytes + reply_bytes_len, 0, (size_t) ds_r);  // placeholder; ignored by the requester (found==0)
+        }
+        reply_bytes_len += ds_r;
+        n_send_reply_bytes[n] += (int) ds_r;
+      }
+    }
+  }
+
+  free(flat_recv_reqs);
+
+  // --- 6. Exchange Replies ---
+  int* n_send_replies = calloc(num_neighbors, sizeof(int));
+  int* n_recv_replies = malloc(num_neighbors * sizeof(int));
+  int* s_rep_displs = calloc(num_neighbors + 1, sizeof(int));
+  int* r_rep_displs = calloc(num_neighbors + 1, sizeof(int));
+
+  for (int i = 0; i < num_neighbors; ++i)
+  {
+    n_send_replies[i] = n_recv_reqs[i] / 2;
+    n_recv_replies[i] = n_send_reqs[i] / 2;
+    s_rep_displs[i + 1] = s_rep_displs[i] + n_send_replies[i];
+    r_rep_displs[i + 1] = r_rep_displs[i] + n_recv_replies[i];
+  }
+
+  int total_recv_replies = total_send_ints / 2;
+  int* recv_found = malloc((total_recv_replies > 0 ? total_recv_replies : 1) * sizeof(int));
+
+  MPI_Neighbor_alltoallv(reply_found, n_send_replies, s_rep_displs, MPI_INT, recv_found, n_recv_replies, r_rep_displs, MPI_INT, domain->comm_graph);
+
+  free(reply_found);
+
+  // Payload byte stream: per-neighbor RECEIVE counts computed from our own
+  // requests (we know the data_size of every body we asked about).
+  int* n_recv_reply_bytes = calloc(num_neighbors, sizeof(int));
+  int* s_rep_byte_displs = calloc(num_neighbors + 1, sizeof(int));
+  int* r_rep_byte_displs = calloc(num_neighbors + 1, sizeof(int));
+  int total_recv_bytes = 0;
+
+  for (int n = 0; n < num_neighbors; ++n)
+  {
+    IntBuffer* buf = &req_send_bufs[n];
+    for (int k = 0; k < buf->size; k += 2)
+    {
+      n_recv_reply_bytes[n] += (int) mftl_data_size_of_body(objects, num_objects, buf->data[k]);
+    }
+    s_rep_byte_displs[n + 1] = s_rep_byte_displs[n] + n_send_reply_bytes[n];
+    r_rep_byte_displs[n + 1] = r_rep_byte_displs[n] + n_recv_reply_bytes[n];
+    total_recv_bytes += n_recv_reply_bytes[n];
+  }
+
+  char* recv_bytes = malloc(total_recv_bytes > 0 ? (size_t) total_recv_bytes : 1);
+
+  MPI_Neighbor_alltoallv(reply_bytes, n_send_reply_bytes, s_rep_byte_displs, MPI_BYTE, recv_bytes, n_recv_reply_bytes, r_rep_byte_displs, MPI_BYTE,
+                         domain->comm_graph);
+
+  free(reply_bytes);
+
+  // --- 7. Apply Updates ---
+  int current_reply_idx = 0;
+  size_t byte_cursor = 0;
+
+  // Reset cache for application phase
+  last_body_id = -1;
+  current_obj = MFTL_NULL;
+
+  for (int n = 0; n < num_neighbors; ++n)
+  {
+    IntBuffer* buf = &req_send_bufs[n];
+    int count = buf->size;
+
+    for (int k = 0; k < count; k += 2)
+    {
+      int req_body_id = buf->data[k];
+      int req_gid = buf->data[k + 1];
+      int found = recv_found[current_reply_idx++];
+
+      // --- A. HYBRID OBJECT LOOKUP ---
+      if (req_body_id != last_body_id)
+      {
+        if (object_lookup != MFTL_NULL)
+        {
+          khiter_t k_obj = kh_get(object_map, object_lookup, req_body_id);
+          current_obj = (k_obj != kh_end(object_lookup)) ? objects[kh_value(object_lookup, k_obj)] : MFTL_NULL;
+        }
+        else
+        {
+          current_obj = MFTL_NULL;
+          for (int o = 0; o < num_objects; ++o)
+          {
+            if (objects[o]->global_id == req_body_id)
+            {
+              current_obj = objects[o];
+              break;
+            }
+          }
+        }
+        last_body_id = req_body_id;
+      }
+
+      assert(current_obj);
+      const size_t ds_r = current_obj->data_size;
+
+      // --- B. TRIANGLE LOOKUP (O(1)) ---
+      khiter_t k_tri = kh_get(triangle_map, current_obj->triangle_lookup, req_gid);
+      if (k_tri != kh_end(current_obj->triangle_lookup))
+      {
+        MFTL_Triangle* t = &current_obj->triangles[kh_value(current_obj->triangle_lookup, k_tri)];
+
+        if (found)
+        {
+          if (t->data == MFTL_NULL)
+          {
+            fprintf(stderr,
+                    "FATAL ERROR: MFTLScatterTriangleData: ghost triangle (gid %d, body %d) has NULL data but data_size=%zu.\n",
+                    req_gid, req_body_id, ds_r);
+            exit(EXIT_FAILURE);
+          }
+          memcpy(t->data, recv_bytes + byte_cursor, ds_r);
+        }
+        // else: the owner killed this entity during remeshing; keep the stale
+        // ghost payload untouched (the next redistribution drops it).
+      }
+      byte_cursor += ds_r;  // ALWAYS advance, regardless of hit/miss
+    }
+  }
+
+  for (int i = 0; i < num_neighbors; ++i)
+  {
+    if (req_send_bufs[i].data) free(req_send_bufs[i].data);
+  }
+
+  // --- Cleanup ---
+  free(req_send_bufs);
+  free(recv_found);
+  free(recv_bytes);
+  free(rank_to_neigh_idx);
+
+  free(n_send_reqs);
+  free(n_recv_reqs);
+  free(n_send_replies);
+  free(n_recv_replies);
+  free(n_send_reply_bytes);
+  free(n_recv_reply_bytes);
+  free(s_displs);
+  free(r_displs);
+  free(s_rep_displs);
+  free(r_rep_displs);
+  free(s_rep_byte_displs);
+  free(r_rep_byte_displs);
+
+  return MFTL_SUCCESS;
+}
+
 /* -------------------------------------------------------------------------- */
 /* GHOST LAYER EXTENSION LOGIC                                                */
 /* -------------------------------------------------------------------------- */
@@ -2138,8 +2886,10 @@ void MFTLAppendGhostVertex(MFTL_Object* obj, PackedVertex* pv)
 
 /**
  * @brief Helper to append a new triangle (and its halfedges) during ghost integration.
+ * @param data Pointer to the obj->data_size payload bytes shipped alongside ptc
+ *             (may be NULL only when obj->data_size == 0).
  */
-void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc)
+void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc, const void* data)
 {
   MFTL_ENSURE_CAPACITY(obj->triangles, &obj->n_triangles, &obj->capacity_triangles, 1, MFTL_Triangle);
   MFTL_ENSURE_CAPACITY(obj->half_edges, &obj->n_half_edges, &obj->capacity_half_edges, 3, MFTL_HalfEdge);
@@ -2156,6 +2906,17 @@ void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc)
 
   memcpy(t->normal, ptc->triangle.normal, 3 * sizeof(double));
   memcpy(t->center, ptc->triangle.center, 3 * sizeof(double));
+
+  // Stage 12: attach the opaque user payload shipped with the triangle.
+  if (obj->data_size > 0)
+  {
+    t->data = malloc(obj->data_size);
+    memcpy(t->data, data, obj->data_size);
+  }
+  else
+  {
+    t->data = MFTL_NULL;
+  }
 
   int ret;
   khiter_t k = kh_put(triangle_map, obj->triangle_lookup, t->global_id, &ret);
@@ -2252,6 +3013,13 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
   int nproc = domain->nproc;
   if (nproc < 2) return MFTL_SUCCESS;
 
+  // Stage 12: refuse loudly on a cross-rank data_size mismatch before any
+  // packing/communication (payload byte counts derive from local data_size).
+  for (int o = 0; o < ens->num_objects; ++o)
+  {
+    if (MFTLCheckTriangleDataSizeConsistency(ens->objects[o]) != MFTL_SUCCESS) return MFTL_ERROR;
+  }
+
   int num_neighbors = domain->num_neighbors;
 
   // =========================================================================
@@ -2342,6 +3110,12 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
   PackedTriangleComplex** raw_send_tris = calloc(num_neighbors, sizeof(PackedTriangleComplex*));
   PackedVertex** raw_send_verts = calloc(num_neighbors, sizeof(PackedVertex*));
 
+  // Stage 12: parallel payload byte streams (byte counts NOT derivable from
+  // triangle counts when objects have different data_size — exchanged explicitly)
+  char** raw_send_data = calloc(num_neighbors, sizeof(char*));
+  int* cnt_send_data = calloc(num_neighbors, sizeof(int));
+  int* cap_send_data = calloc(num_neighbors, sizeof(int));
+
   int* cnt_send_tris = calloc(num_neighbors, sizeof(int));
   int* cap_send_tris = calloc(num_neighbors, sizeof(int));
 
@@ -2404,9 +3178,33 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
           cap_send_tris[n] = new_cap;
         }
 
+        // Stage 12: grow the parallel byte stream (same geometric pattern, in bytes)
+        if (obj->data_size > 0 && (size_t) cnt_send_data[n] + nb.n_tris * obj->data_size > (size_t) cap_send_data[n])
+        {
+          int new_cap_d = (cap_send_data[n] == 0) ? (int) (nb.n_tris * obj->data_size + 128 * obj->data_size)
+                                                  : (int) MFTL_MAX((size_t) cap_send_data[n] * 2, (size_t) cnt_send_data[n] + nb.n_tris * obj->data_size);
+          raw_send_data[n] = realloc(raw_send_data[n], new_cap_d);
+          cap_send_data[n] = new_cap_d;
+        }
+
         for (int t = 0; t < nb.n_tris; ++t)
         {
           MFTLPackSingleTriangle(obj, nb.tri_indices[t], &raw_send_tris[n][cnt_send_tris[n]++], false);
+
+          // Stage 12: append the payload in the exact same element order
+          if (obj->data_size > 0)
+          {
+            if (obj->triangles[nb.tri_indices[t]].data == MFTL_NULL)
+            {
+              fprintf(stderr,
+                      "FATAL ERROR: MFTLExtendGhostLayer: triangle (gid %d, body %d) has NULL data but data_size=%zu — "
+                      "call MFTLInitializeObjectData on all ranks before ghosting.\n",
+                      obj->triangles[nb.tri_indices[t]].global_id, obj->global_id, obj->data_size);
+              exit(EXIT_FAILURE);
+            }
+            memcpy(raw_send_data[n] + cnt_send_data[n], obj->triangles[nb.tri_indices[t]].data, obj->data_size);
+            cnt_send_data[n] += (int) obj->data_size;
+          }
         }
       }
 
@@ -2442,9 +3240,11 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
   // --- Exchange Counts ---
   int* n_recv_tris = malloc(num_neighbors * sizeof(int));
   int* n_recv_verts = malloc(num_neighbors * sizeof(int));
+  int* n_recv_data = malloc(num_neighbors * sizeof(int));  // Stage 12: payload byte counts
 
   MPI_Neighbor_alltoall(cnt_send_tris, 1, MPI_INT, n_recv_tris, 1, MPI_INT, domain->comm_graph);
   MPI_Neighbor_alltoall(cnt_send_verts, 1, MPI_INT, n_recv_verts, 1, MPI_INT, domain->comm_graph);
+  MPI_Neighbor_alltoall(cnt_send_data, 1, MPI_INT, n_recv_data, 1, MPI_INT, domain->comm_graph);  // Stage 12
 
   // --- Exchange Triangles ---
   int* s_disp_t = calloc(num_neighbors + 1, sizeof(int));
@@ -2475,6 +3275,34 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
   free(flat_send_tris);
   free(s_disp_t);
   // free(r_disp_t); // Keep for Phase 4 loops if needed, or just iterate recv buffer linearly
+
+  // --- Exchange Payload Bytes (Stage 12) ---
+  int* s_disp_d = calloc(num_neighbors + 1, sizeof(int));
+  int* r_disp_d = calloc(num_neighbors + 1, sizeof(int));
+  int tot_send_d = 0, tot_recv_d = 0;
+  for (int i = 0; i < num_neighbors; ++i)
+  {
+    s_disp_d[i + 1] = s_disp_d[i] + cnt_send_data[i];
+    r_disp_d[i + 1] = r_disp_d[i] + n_recv_data[i];
+    tot_send_d += cnt_send_data[i];
+    tot_recv_d += n_recv_data[i];
+  }
+
+  char* flat_send_data = malloc(tot_send_d);
+  for (int i = 0; i < num_neighbors; ++i)
+  {
+    if (cnt_send_data[i] > 0) memcpy(flat_send_data + s_disp_d[i], raw_send_data[i], cnt_send_data[i]);
+    free(raw_send_data[i]);  // Free individual buffers immediately
+  }
+  free(raw_send_data);
+
+  char* recv_data = malloc(tot_recv_d);
+  MPI_Neighbor_alltoallv(flat_send_data, cnt_send_data, s_disp_d, MPI_BYTE, recv_data, n_recv_data, r_disp_d, MPI_BYTE, domain->comm_graph);
+
+  free(flat_send_data);
+  free(s_disp_d);
+  free(r_disp_d);
+  free(n_recv_data);
 
   // --- Exchange Vertices ---
   int* s_disp_v = calloc(num_neighbors + 1, sizeof(int));
@@ -2508,6 +3336,8 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
   free(cap_send_tris);
   free(cnt_send_verts);
   free(cap_send_verts);
+  free(cnt_send_data);  // Stage 12
+  free(cap_send_data);  // Stage 12
   free(n_recv_tris);
   free(n_recv_verts);
 
@@ -2565,6 +3395,7 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
   }
 
   // Integrate Triangles
+  size_t data_cursor = 0;  // Stage 12: running byte offset into recv_data
   for (int i = 0; i < tot_recv_t; ++i)
   {
     PackedTriangleComplex* ptc = &recv_tris[i];
@@ -2578,6 +3409,9 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
         break;
       }
     }
+
+    // Stage 12: this element's payload occupies exactly ds_i bytes at data_cursor
+    const size_t ds_i = obj ? obj->data_size : 0;
 
     if (obj)
     {
@@ -2593,16 +3427,20 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
             break;
           }
         }
-        if (!corners_present) continue;
-        MFTLAppendGhostTriangle(obj, ptc);
+        if (corners_present)
+        {
+          MFTLAppendGhostTriangle(obj, ptc, ds_i > 0 ? (const void*) (recv_data + data_cursor) : MFTL_NULL);
+        }
       }
     }
+    data_cursor += ds_i;  // ALWAYS advance, regardless of skip/append
   }
 
   free(is_neigh_rank);
 
   free(recv_tris);
   free(recv_verts);
+  free(recv_data);  // Stage 12
   free(r_disp_t);
   free(r_disp_v);
 
@@ -2641,6 +3479,13 @@ int MFTLEnsembleCreateSpatialGhosts(MFTL_Ensemble* ens, double proximity_toleran
   int num_neighbors = domain->num_neighbors;
 
   if (nproc < 2 || num_neighbors == 0) return MFTL_SUCCESS;
+
+  // Stage 12: refuse loudly on a cross-rank data_size mismatch before any
+  // packing/communication (payload byte counts derive from local data_size).
+  for (int o = 0; o < ens->num_objects; ++o)
+  {
+    if (MFTLCheckTriangleDataSizeConsistency(ens->objects[o]) != MFTL_SUCCESS) return MFTL_ERROR;
+  }
 
   // =========================================================================
   // PHASE 1: DETERMINISTIC DOMAIN BOUNDARY CALCULATION
@@ -2702,6 +3547,9 @@ int MFTLEnsembleCreateSpatialGhosts(MFTL_Ensemble* ens, double proximity_toleran
   // Final Packed Send Buffers (Dynamically resized)
   PackedTriangleComplex** raw_send_tris = calloc(num_neighbors, sizeof(PackedTriangleComplex*));
   PackedVertex** raw_send_verts = calloc(num_neighbors, sizeof(PackedVertex*));
+  char** raw_send_data = calloc(num_neighbors, sizeof(char*));  // Stage 12: parallel payload byte streams
+  int* cnt_send_data = calloc(num_neighbors, sizeof(int));
+  int* cap_send_data = calloc(num_neighbors, sizeof(int));
   int* cnt_send_tris = calloc(num_neighbors, sizeof(int));
   int* cap_send_tris = calloc(num_neighbors, sizeof(int));
   int* cnt_send_verts = calloc(num_neighbors, sizeof(int));
@@ -2783,10 +3631,33 @@ int MFTLEnsembleCreateSpatialGhosts(MFTL_Ensemble* ens, double proximity_toleran
           raw_send_tris[n] = realloc(raw_send_tris[n], cap_send_tris[n] * sizeof(PackedTriangleComplex));
         }
 
+        // Stage 12: grow the parallel byte stream (same geometric pattern, in bytes)
+        if (obj->data_size > 0 && (size_t) cnt_send_data[n] + n_unique * obj->data_size > (size_t) cap_send_data[n])
+        {
+          cap_send_data[n] = (cap_send_data[n] == 0) ? (int) (n_unique * obj->data_size + 1024 * obj->data_size)
+                                                     : (int) MFTL_MAX((size_t) cap_send_data[n] * 2, (size_t) cnt_send_data[n] + n_unique * obj->data_size);
+          raw_send_data[n] = realloc(raw_send_data[n], cap_send_data[n]);
+        }
+
         for (int i = 0; i < n_unique; ++i)
         {
           int tri_idx = trans_tri_bufs[n].data[i];
           MFTLPackSingleTriangle(obj, tri_idx, &raw_send_tris[n][cnt_send_tris[n]++], true);
+
+          // Stage 12: append the payload in the exact same element order
+          if (obj->data_size > 0)
+          {
+            if (obj->triangles[tri_idx].data == MFTL_NULL)
+            {
+              fprintf(stderr,
+                      "FATAL ERROR: MFTLEnsembleCreateSpatialGhosts: triangle (gid %d, body %d) has NULL data but data_size=%zu — "
+                      "call MFTLInitializeObjectData on all ranks before ghosting.\n",
+                      obj->triangles[tri_idx].global_id, obj->global_id, obj->data_size);
+              exit(EXIT_FAILURE);
+            }
+            memcpy(raw_send_data[n] + cnt_send_data[n], obj->triangles[tri_idx].data, obj->data_size);
+            cnt_send_data[n] += (int) obj->data_size;
+          }
         }
       }
 
@@ -2826,6 +3697,7 @@ int MFTLEnsembleCreateSpatialGhosts(MFTL_Ensemble* ens, double proximity_toleran
   // =========================================================================
   int* n_recv_tris = malloc(num_neighbors * sizeof(int));
   int* n_recv_verts = malloc(num_neighbors * sizeof(int));
+  int* n_recv_data = malloc(num_neighbors * sizeof(int));  // Stage 12: payload byte counts
 
   // Note: MPI strictly expects 32-bit int for counts
   int* n_send_tris_int = calloc(num_neighbors, sizeof(int));
@@ -2838,46 +3710,59 @@ int MFTLEnsembleCreateSpatialGhosts(MFTL_Ensemble* ens, double proximity_toleran
 
   MPI_Neighbor_alltoall(n_send_tris_int, 1, MPI_INT, n_recv_tris, 1, MPI_INT, domain->comm_graph);
   MPI_Neighbor_alltoall(n_send_verts_int, 1, MPI_INT, n_recv_verts, 1, MPI_INT, domain->comm_graph);
+  MPI_Neighbor_alltoall(cnt_send_data, 1, MPI_INT, n_recv_data, 1, MPI_INT, domain->comm_graph);  // Stage 12
 
   int* s_disp_t = calloc(num_neighbors + 1, sizeof(int));
   int* r_disp_t = calloc(num_neighbors + 1, sizeof(int));
   int* s_disp_v = calloc(num_neighbors + 1, sizeof(int));
   int* r_disp_v = calloc(num_neighbors + 1, sizeof(int));
+  int* s_disp_d = calloc(num_neighbors + 1, sizeof(int));  // Stage 12
+  int* r_disp_d = calloc(num_neighbors + 1, sizeof(int));  // Stage 12
 
-  int tot_send_t = 0, tot_recv_t = 0, tot_send_v = 0, tot_recv_v = 0;
+  int tot_send_t = 0, tot_recv_t = 0, tot_send_v = 0, tot_recv_v = 0, tot_send_d = 0, tot_recv_d = 0;
   for (int i = 0; i < num_neighbors; ++i)
   {
     s_disp_t[i + 1] = s_disp_t[i] + n_send_tris_int[i];
     r_disp_t[i + 1] = r_disp_t[i] + n_recv_tris[i];
     s_disp_v[i + 1] = s_disp_v[i] + n_send_verts_int[i];
     r_disp_v[i + 1] = r_disp_v[i] + n_recv_verts[i];
+    s_disp_d[i + 1] = s_disp_d[i] + cnt_send_data[i];
+    r_disp_d[i + 1] = r_disp_d[i] + n_recv_data[i];
 
     tot_send_t += n_send_tris_int[i];
     tot_recv_t += n_recv_tris[i];
     tot_send_v += n_send_verts_int[i];
     tot_recv_v += n_recv_verts[i];
+    tot_send_d += cnt_send_data[i];
+    tot_recv_d += n_recv_data[i];
   }
 
   PackedTriangleComplex* flat_send_tris = malloc(tot_send_t * sizeof(PackedTriangleComplex));
   PackedVertex* flat_send_verts = malloc(tot_send_v * sizeof(PackedVertex));
+  char* flat_send_data = malloc(tot_send_d);  // Stage 12
 
   for (int i = 0; i < num_neighbors; ++i)
   {
     if (cnt_send_tris[i] > 0) memcpy(flat_send_tris + s_disp_t[i], raw_send_tris[i], cnt_send_tris[i] * sizeof(PackedTriangleComplex));
     if (cnt_send_verts[i] > 0) memcpy(flat_send_verts + s_disp_v[i], raw_send_verts[i], cnt_send_verts[i] * sizeof(PackedVertex));
+    if (cnt_send_data[i] > 0) memcpy(flat_send_data + s_disp_d[i], raw_send_data[i], cnt_send_data[i]);  // Stage 12
     free(raw_send_tris[i]);
     free(raw_send_verts[i]);
+    free(raw_send_data[i]);  // Stage 12
   }
   free(raw_send_tris);
   free(raw_send_verts);
+  free(raw_send_data);  // Stage 12
 
   PackedTriangleComplex* recv_tris = malloc(tot_recv_t * sizeof(PackedTriangleComplex));
   PackedVertex* recv_verts = malloc(tot_recv_v * sizeof(PackedVertex));
+  char* recv_data = malloc(tot_recv_d);  // Stage 12
 
   MPI_Neighbor_alltoallv(flat_send_tris, n_send_tris_int, s_disp_t, MPI_PackedTriangleComplex, recv_tris, n_recv_tris, r_disp_t, MPI_PackedTriangleComplex,
                          domain->comm_graph);
   MPI_Neighbor_alltoallv(flat_send_verts, n_send_verts_int, s_disp_v, MPI_PackedVertex, recv_verts, n_recv_verts, r_disp_v, MPI_PackedVertex,
                          domain->comm_graph);
+  MPI_Neighbor_alltoallv(flat_send_data, cnt_send_data, s_disp_d, MPI_BYTE, recv_data, n_recv_data, r_disp_d, MPI_BYTE, domain->comm_graph);  // Stage 12
 
   // =========================================================================
   // PHASE 4: O(1) UNPACK & HASH MAP INTEGRATION
@@ -2899,6 +3784,7 @@ int MFTLEnsembleCreateSpatialGhosts(MFTL_Ensemble* ens, double proximity_toleran
     }
   }
 
+  size_t data_cursor = 0;  // Stage 12: running byte offset into recv_data
   for (int i = 0; i < tot_recv_t; ++i)
   {
     PackedTriangleComplex* ptc = &recv_tris[i];
@@ -2908,8 +3794,10 @@ int MFTLEnsembleCreateSpatialGhosts(MFTL_Ensemble* ens, double proximity_toleran
       {
         if (kh_get(triangle_map, ens->objects[o]->triangle_lookup, ptc->triangle.global_id) == kh_end(ens->objects[o]->triangle_lookup))
         {
-          MFTLAppendGhostTriangle(ens->objects[o], ptc);
+          MFTLAppendGhostTriangle(ens->objects[o], ptc,
+                                  ens->objects[o]->data_size > 0 ? (const void*) (recv_data + data_cursor) : MFTL_NULL);
         }
+        data_cursor += ens->objects[o]->data_size;  // Stage 12: ALWAYS advance, regardless of skip/append
         break;
       }
     }
@@ -2918,20 +3806,27 @@ int MFTLEnsembleCreateSpatialGhosts(MFTL_Ensemble* ens, double proximity_toleran
   // Memory Cleanup
   free(flat_send_tris);
   free(flat_send_verts);
+  free(flat_send_data);  // Stage 12
   free(recv_tris);
   free(recv_verts);
+  free(recv_data);  // Stage 12
   free(cnt_send_tris);
   free(cap_send_tris);
   free(cnt_send_verts);
   free(cap_send_verts);
+  free(cnt_send_data);  // Stage 12
+  free(cap_send_data);  // Stage 12
   free(n_send_tris_int);
   free(n_send_verts_int);
   free(n_recv_tris);
   free(n_recv_verts);
+  free(n_recv_data);  // Stage 12
   free(s_disp_t);
   free(r_disp_t);
   free(s_disp_v);
   free(r_disp_v);
+  free(s_disp_d);  // Stage 12
+  free(r_disp_d);  // Stage 12
 
   // =========================================================================
   // PHASE 5: TOPOLOGY RESOLUTION

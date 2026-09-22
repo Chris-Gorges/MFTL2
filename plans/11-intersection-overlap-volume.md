@@ -1,10 +1,26 @@
 # 11 — Object–object intersection + overlap-volume quantification
 
-Status: NOT STARTED
+Status: COMPLETE
 Depends on: 02
-Implemented by:
-Reviewed by:
-Acceptance: NOT PASSED
+Implemented by: Kimi Code
+Reviewed by: Claude Code (2026-09-21)
+Acceptance: PASSED
+
+> **Review note (accepted, Claude Code 2026-09-21):** Faithful MFTL1 overlap-volume port.
+> Two-sphere lens converges to the analytic `π(4R+d)(2R−d)²/12` (ref4 0.26%, ref5 0.06%);
+> sign correct (`⅓·area·Σ(hA−hB)` positive in the overlap region, far-side/non-overlap → V=0);
+> `V(A,B)==V(B,A)` bit-identical; periodic seam == mid-domain bit-identical (bodies unwrapped
+> into a common frame without mutating the mesh). Rank-independent by A-ownership partition
+> (each pair once) + Allgatherv of the deterministic record list; identical on np 1/2/4/8.
+> Uses outward normals (`AverageSurfaceNorm = ½(nA−nB)`); convex hull (Graham scan) sound.
+> Release + ASan/UBSan/LSan clean on 1/2/4/8 (7/7); no unrelated regressions. **Carry-forward
+> (Stage 13, not blocking):** the BVH/spatial-ghost *detection* path (`mftl_bvh.c:624`,
+> `MFTLEnsembleIntersectObjects`) is NOT periodic-correct (the `IS THIS CORRECT FOR PERIODIC
+> DOMAINS?` flag remains) — the overlap-*volume* driver handles periodicity itself and does
+> not use the BVH, so the Stage-11 deliverable is unaffected; resolve detection periodicity in
+> Stage 13. **Optional:** `EffectiveRadiusOfCurvature` is MFTL1's osculating heuristic (accurate
+> only near the contact frame origin); the driver Allgatherv's all candidates to every rank
+> (MFTL1 parity — a scalability note for very large bodies).
 
 ## Objective
 Add MFTL1's overlap-**volume** quantification (for collision response) on top of MFTL2's
@@ -83,3 +99,44 @@ MFTL2's spatial-ghost mechanism (`MFTL_CreateSpatialGhosts`) — and address the
   mid-domain.
 - Reproduces MFTL1 `test5`/`test6` detection; parallel intersection example asserts correctly.
 - Rank-independent overlap volume.
+
+## As-implemented notes (2026-09, kimi-code)
+
+- **Driver**: `MFTLEnsembleCalculateOverlap` does NOT reuse `MFTL_IntersectObjects`/spatial
+  ghosts for the volume computation. Proximity-BVH pairs only touch within ~1e-6, which yields
+  sliver volumes; the prism integral needs sheet pairs far apart in 3D that overlap in the
+  projection plane. Instead the driver mirrors MFTL1 `MFTL_BodyOverlap`: owned triangles whose
+  AABB meets the other body's (globally reduced) big box are Allgatherv'd to every rank
+  (`MPI_BYTE` with BYTE counts/displacements), and each rank computes the pairs for the
+  body-A candidates it owns (each pair exactly once). Records are Allgatherv'd back so all
+  ranks return the identical, deterministically ordered list.
+- **Periodic**: candidate positions are packed in a common unwrapped frame (each body unwrapped
+  about its own surface centre, body B additionally shifted by the minimum image of
+  `cmB - cmA`). The mesh is never mutated — an earlier draft shifted owned vertices in place,
+  which mixed shifted/unshifted ghost vertices into candidate geometry at np>1. Seam-straddling
+  pair == mid-domain pair to 2e-12, bit-identical across np 1/2/4/8.
+- **Frame sign**: projection axis `w = +vecAB/|vecAB|` (A→B); the prism integrand
+  `h_A - h_B >= 0` then selects exactly the overlap region and far-side cross-pairs are
+  sign-rejected. Verified: two-sphere lens converges to the analytic value
+  (ref4: 0.26%, ref5: 0.06%; bit-identical `V(A,B) == V(B,A)`).
+- **Bug fixed during bring-up (restored MFTL1 semantics)**: the collinear branch of the 2D
+  segment intersection must return only EXISTING segment endpoints (MFTL1 between-tests).
+  Interpolating along the dominant axis mixes coordinates of different endpoints and injected
+  off-edge garbage corners into clip polygons (~50% volume inflation for identical
+  triangulations shifted along the projection axis, where corresponding edges are exactly
+  collinear — the common case for sphere pairs).
+- **Centre-of-volume**: the projected centre's out-of-plane component is stored in
+  `RelHeight = -h` units (MFTL1 convention); the real-space reconstruction must negate it.
+- **Effective radius of curvature**: MFTL1's `EffectiveRadiusOfCurvature_Actual` is always set
+  equal to `_Smooth`, so the documented 0.9/0.1 blend reduces to the smooth reduced radius
+  `1/(1/R_A + 1/R_B)`; this is reproduced. (The per-triangle osculating fit itself is MFTL1's
+  heuristic `r²/(h·sign)` with absolute frame heights — meaningful only for contacts near the
+  frame origin; tests assert only volume/area/centre/normal quantities.)
+- Detection regression: the MFTL1 test5 geometry is a unit sphere at the origin vs the unit
+  square `[0,1]^2` at z=0 (the sphere's equator pierces the square). A face fully inside the
+  ball produces no triangle crossings by construction — an earlier test draft used such a face
+  and correctly found 0 hits. Contact assertion now also checks detection counts
+  (0 hits at d=2.05, >0 at d=1.9), plus `V=0`/`V≈lens`.
+- Tests: `tests/test_overlap.c` (7 tests: analytic lens + convergence, symmetry, periodic seam,
+  detection regressions, contact assertion, normal direction, 2D convex hull API), registered
+  as `Overlap-np{1,2,4,8}` with the standard `lsan.supp` environment.

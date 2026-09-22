@@ -546,6 +546,261 @@ int TestFullRemeshPass()
 }
 
 // -----------------------------------------------------------------------------
+// Stage 12: opaque per-triangle payloads through the remeshing lifecycle.
+// Split reuses one triangle (blob rides along) and creates zeroed-blob
+// triangles; flip is in-place (byte-identical); collapse kills triangles
+// whose blobs the PATH B compaction in MFTLFinalizeRemeshing must free.
+// -----------------------------------------------------------------------------
+typedef struct
+{
+  int gid;
+  double scalar;
+  double vec[3];
+  unsigned char tag[8];
+} RemeshTriData;
+
+// Deterministic fill from the triangle global id. The memset pins the struct
+// padding bytes so memcmp comparisons are byte-exact.
+static void FillRemeshTriData(int gid, RemeshTriData* d)
+{
+  memset(d, 0, sizeof(RemeshTriData));
+  d->gid = gid;
+  d->scalar = 0.5 + 1e-3 * gid;
+  for (int k = 0; k < 3; ++k) d->vec[k] = sin(0.02 * gid * (k + 1));
+  for (int j = 0; j < 8; ++j) d->tag[j] = (unsigned char) (gid * 17 + j);
+}
+
+// The four vertices of an interior edge's quad: endpoints (a, b) and the two
+// wing tips (c, d). he->vertex_idx is the TARGET vertex of a half-edge.
+static void EdgeQuadVertices(MFTL_Object* obj, int he_idx, int* v_a, int* v_b, int* v_c, int* v_d)
+{
+  int he_bc = obj->half_edges[he_idx].next_idx;
+  int he_ca = obj->half_edges[he_bc].next_idx;
+  int he_ba = obj->half_edges[he_idx].twin_idx;
+  int he_ad = obj->half_edges[he_ba].next_idx;
+  *v_a = obj->half_edges[he_ca].vertex_idx;  // he_ca: C->A
+  *v_b = obj->half_edges[he_idx].vertex_idx;  // he_ab: A->B
+  *v_c = obj->half_edges[he_bc].vertex_idx;  // he_bc: B->C
+  *v_d = obj->half_edges[he_ad].vertex_idx;  // he_ad: A->D
+}
+
+static void SnapshotRemeshData(MFTL_Object* obj, int** out_gids, RemeshTriData** out_data, int* out_n)
+{
+  int n = obj->n_triangles;
+  int* gids = malloc(n * sizeof(int));
+  RemeshTriData* data = malloc(n * sizeof(RemeshTriData));
+  for (int i = 0; i < n; ++i)
+  {
+    gids[i] = obj->triangles[i].global_id;
+    memcpy(&data[i], obj->triangles[i].data, sizeof(RemeshTriData));
+  }
+  *out_gids = gids;
+  *out_data = data;
+  *out_n = n;
+}
+
+// Verify the Stage-12 data policy against a pre-op snapshot: every triangle
+// carries a blob; a gid present in the snapshot must be BYTE-IDENTICAL
+// (surviving / split-reused / flipped triangles); a gid absent from the
+// snapshot (created by splits) must be fully ZERO (documented zero-init
+// policy — remeshing does not repartition user data).
+static int VerifyRemeshData(MFTL_Object* obj, const int* snap_gids, const RemeshTriData* snap_data, int n_snap, int* out_surviving, int* out_new)
+{
+  RemeshTriData zero;
+  memset(&zero, 0, sizeof(RemeshTriData));
+
+  int fails = 0, n_surv = 0, n_new = 0;
+  for (int i = 0; i < obj->n_triangles; ++i)
+  {
+    MFTL_Triangle* t = &obj->triangles[i];
+    if (t->data == MFTL_NULL)
+    {
+      fails++;
+      continue;
+    }
+    int s = -1;
+    for (int j = 0; j < n_snap; ++j)
+      if (snap_gids[j] == t->global_id)
+      {
+        s = j;
+        break;
+      }
+    if (s >= 0)
+    {
+      if (memcmp(t->data, &snap_data[s], sizeof(RemeshTriData)) != 0) fails++;
+      else n_surv++;
+    }
+    else
+    {
+      if (memcmp(t->data, &zero, sizeof(RemeshTriData)) != 0) fails++;
+      else n_new++;
+    }
+  }
+  *out_surviving = n_surv;
+  *out_new = n_new;
+  return fails;
+}
+
+int TestRemeshingTriangleData()
+{
+  // np1: ensemble + generator path so obj->domain is valid (remeshing's
+  // new_triangle reads obj->domain->rank).
+  int cuts[3] = {1, 1, 1};
+  double xmin[3] = {-2, -2, -2};
+  double xmax[3] = {2, 2, 2};
+  bool per[3] = {false, false, false};
+  MFTL_Ensemble* ens = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, xmin, xmax, per, 1);
+  MFTL_Object* obj = MFTLObjectCreate(1);
+  MFTLEnsembleAddObject(ens, obj);
+
+  double center[3] = {0.0, 0.0, 0.0};
+  MFTLGenerateSphere(obj, center, 1.0, 2);
+  MFTLComputeTriangleProperties(obj);
+
+  TEST_ASSERT(MFTLInitializeObjectData(obj, sizeof(RemeshTriData)) == MFTL_SUCCESS);
+  for (int i = 0; i < obj->n_triangles; ++i)
+  {
+    RemeshTriData d;
+    FillRemeshTriData(obj->triangles[i].global_id, &d);
+    MFTLSetTriangleData(obj, &obj->triangles[i], &d);
+  }
+
+  int* snap_gids = NULL;
+  RemeshTriData* snap_data = NULL;
+  int n_snap = 0;
+  SnapshotRemeshData(obj, &snap_gids, &snap_data, &n_snap);
+
+  int start_v = obj->n_vertices;
+  int start_t = obj->n_triangles;
+  int start_h = obj->n_half_edges;
+
+  // Track the vertices each op touches so the next op works on an untouched,
+  // purely original neighborhood (the raw operators have no gates).
+  int v_mark_cap = obj->n_vertices + 16;  // the splits below add exactly 3
+  char* vtouched = calloc(v_mark_cap, sizeof(char));
+  int n_h0 = obj->n_half_edges;  // splits only APPEND; original indices stay valid
+
+  // --- 1. Several splits on disjoint interior edges ---
+  int n_splits = 0;
+  for (int he = 0; he < n_h0 && n_splits < 3; ++he)
+  {
+    MFTL_HalfEdge* e = &obj->half_edges[he];
+    if (e->flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) continue;
+    if (e->twin_idx == MFTL_ERROR) continue;
+    if (obj->half_edges[e->twin_idx].flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) continue;
+    int v_a, v_b, v_c, v_d;
+    EdgeQuadVertices(obj, he, &v_a, &v_b, &v_c, &v_d);
+    if (vtouched[v_a] || vtouched[v_b] || vtouched[v_c] || vtouched[v_d]) continue;
+    vtouched[v_a] = vtouched[v_b] = vtouched[v_c] = vtouched[v_d] = 1;
+    int v_new = MFTLSplitEdge(obj, he);
+    TEST_ASSERT(v_new >= 0 && v_new < v_mark_cap);
+    vtouched[v_new] = 1;
+    n_splits++;
+  }
+  TEST_ASSERT_EQUAL_INT(3, n_splits);
+
+  // --- 2. One in-place flip (keeps both triangle gids -> byte-identical) ---
+  int flipped = 0;
+  for (int he = 0; he < n_h0 && !flipped; ++he)
+  {
+    MFTL_HalfEdge* e = &obj->half_edges[he];
+    if (e->flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) continue;
+    if (e->twin_idx == MFTL_ERROR) continue;
+    if (obj->half_edges[e->twin_idx].flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) continue;
+    int v_a, v_b, v_c, v_d;
+    EdgeQuadVertices(obj, he, &v_a, &v_b, &v_c, &v_d);
+    if (vtouched[v_a] || vtouched[v_b] || vtouched[v_c] || vtouched[v_d]) continue;
+
+    // Same safety gates as FlipApproved: valence must stay >= 3 post-flip and
+    // C-D must not already be connected (non-manifold otherwise).
+    MFTL_Vertex* ring[32];
+    int val_a = MFTLGetVertexOneRingVertices(obj, &obj->vertices[v_a], ring, 32, MFTL_FALSE);
+    int val_b = MFTLGetVertexOneRingVertices(obj, &obj->vertices[v_b], ring, 32, MFTL_FALSE);
+    if (val_a <= 3 || val_b <= 3) continue;
+    int val_c = MFTLGetVertexOneRingVertices(obj, &obj->vertices[v_c], ring, 32, MFTL_FALSE);
+    int cd_connected = 0;
+    for (int k = 0; k < val_c; ++k)
+      if (ring[k] == &obj->vertices[v_d])
+      {
+        cd_connected = 1;
+        break;
+      }
+    if (cd_connected) continue;
+
+    MFTLFlipEdge(obj, he);
+    vtouched[v_a] = vtouched[v_b] = vtouched[v_c] = vtouched[v_d] = 1;
+    flipped = 1;
+  }
+  TEST_ASSERT_TRUE(flipped);
+
+  // --- 3. One collapse (kills 2 triangles -> PATH B must free their blobs) ---
+  int collapsed = 0;
+  for (int he = 0; he < n_h0 && !collapsed; ++he)
+  {
+    MFTL_HalfEdge* e = &obj->half_edges[he];
+    if (e->flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) continue;
+    if (e->twin_idx == MFTL_ERROR) continue;
+    if (obj->half_edges[e->twin_idx].flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) continue;
+    int v_a, v_b, v_c, v_d;
+    EdgeQuadVertices(obj, he, &v_a, &v_b, &v_c, &v_d);
+    if (vtouched[v_a] || vtouched[v_b] || vtouched[v_c] || vtouched[v_d]) continue;
+
+    int dead_before = 0;
+    for (int i = 0; i < obj->n_triangles; ++i)
+      if (obj->triangles[i].flags & MFTL_FLAG_DEAD) dead_before++;
+
+    MFTLCollapseEdge(obj, he);  // raw op: aborts cleanly only on dead entities
+
+    int dead_after = 0;
+    for (int i = 0; i < obj->n_triangles; ++i)
+      if (obj->triangles[i].flags & MFTL_FLAG_DEAD) dead_after++;
+
+    if (dead_after != dead_before + 2) continue;  // refused — try another edge
+    collapsed = 1;
+  }
+  TEST_ASSERT_TRUE(collapsed);
+
+  // --- 4. Finalize with PATH B compaction (frees the dead blobs) ---
+  MFTLFinalizeRemeshing(obj, start_v, start_t, start_h, MFTL_TRUE);
+  TEST_ASSERT(MFTLCheckMeshIntegrity(obj) == MFTL_SUCCESS);
+  TEST_ASSERT(obj->n_triangles > 0);
+
+  int n_surv = 0, n_new = 0;
+  int fails = VerifyRemeshData(obj, snap_gids, snap_data, n_snap, &n_surv, &n_new);
+  printf("  explicit ops: surviving=%d new(zeroed)=%d fails=%d\n", n_surv, n_new, fails);
+  TEST_ASSERT_EQUAL_INT(0, fails);
+  TEST_ASSERT(n_surv > 0);                        // non-vacuous: split-reused + flipped + untouched
+  TEST_ASSERT_EQUAL_INT(2 * n_splits, n_new);     // each interior split creates exactly 2
+
+  free(snap_gids);
+  free(snap_data);
+  free(vtouched);
+
+  // Clear the VISITED flags the explicit ops set; the driver gates on them.
+  for (int j = 0; j < obj->n_half_edges; ++j) obj->half_edges[j].flags &= ~MFTL_FLAG_VISITED;
+  for (int j = 0; j < obj->n_vertices; ++j) obj->vertices[j].flags &= ~MFTL_FLAG_VISITED;
+
+  // --- 5. Full serial driver pass with data attached; same invariants ---
+  SnapshotRemeshData(obj, &snap_gids, &snap_data, &n_snap);
+
+  MFTL_RemeshParameters params;
+  MFTLInitRemeshParams(&params, MFTL_REMESH_ISOTROPIC, 0.28, 2, MFTL_SMOOTH_VERTEX_BASED, 30.0);
+  MFTLRemeshEnsemble(ens, &params);
+
+  TEST_ASSERT(MFTLCheckMeshIntegrity(obj) == MFTL_SUCCESS);
+  TEST_ASSERT(obj->n_triangles > 0);
+
+  fails = VerifyRemeshData(obj, snap_gids, snap_data, n_snap, &n_surv, &n_new);
+  printf("  full pass:    surviving=%d new(zeroed)=%d fails=%d\n", n_surv, n_new, fails);
+  TEST_ASSERT_EQUAL_INT(0, fails);
+
+  free(snap_gids);
+  free(snap_data);
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+// -----------------------------------------------------------------------------
 // MAIN
 // -----------------------------------------------------------------------------
 int main(int argc, char** argv)
@@ -557,6 +812,7 @@ int main(int argc, char** argv)
   RUN_TEST(TestCollapseInternal);
   RUN_TEST(TestCollapseBoundary);
   RUN_TEST(TestFullRemeshPass);
+  RUN_TEST(TestRemeshingTriangleData);
 
   TEST_REPORT();
   MPI_Finalize();

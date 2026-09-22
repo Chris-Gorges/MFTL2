@@ -124,8 +124,11 @@ static void mftlVcTriNormal(const MFTL_Object* obj, int tri_idx, double n[3])
 {
   MFTL_Vertex* vv[3];
   MFTLGetTriangleVertices(obj, &obj->triangles[tri_idx], vv);
-  double e0[3] = {vv[1]->pos[0] - vv[0]->pos[0], vv[1]->pos[1] - vv[0]->pos[1], vv[1]->pos[2] - vv[0]->pos[2]};
-  double e1[3] = {vv[2]->pos[0] - vv[0]->pos[0], vv[2]->pos[1] - vv[0]->pos[1], vv[2]->pos[2] - vv[0]->pos[2]};
+  // minimum-image edge vectors: exact raw differences when non-periodic,
+  // seam-safe otherwise (wrapped storage stretches straddling triangles)
+  double e0[3], e1[3];
+  MFTLGetMinimumImageVector(obj->domain, e0, vv[0]->pos, vv[1]->pos);
+  MFTLGetMinimumImageVector(obj->domain, e1, vv[0]->pos, vv[2]->pos);
   n[0] = e0[1] * e1[2] - e0[2] * e1[1];
   n[1] = e0[2] * e1[0] - e0[0] * e1[2];
   n[2] = e0[0] * e1[1] - e0[1] * e1[0];
@@ -254,6 +257,12 @@ static double mftlVcLocalGL(MFTL_Object* obj, int vi)
   for (int m = 0; m < nn; ++m)
   {
     const double* op = obj->vertices[seen[m]].pos;
+    double ou[3];
+    if (MFTLDomainAnyPeriodic(obj->domain))
+    {
+      MFTLUnwrapToAnchor(obj->domain, ou, op, v->pos);  // seam-safe neighbour image
+      op = ou;
+    }
     double dx = v->pos[0] - op[0], dy = v->pos[1] - op[1], dz = v->pos[2] - op[2];
     double d = sqrt(dx * dx + dy * dy + dz * dz);
     if (d < MFTL_VERYVERYSMALL) continue;
@@ -375,6 +384,9 @@ double MFTLVolumeRecovery(MFTL_Object* obj, double target_volume)
       v->pos[0] -= n[0] * h;
       v->pos[1] -= n[1] * h;
       v->pos[2] -= n[2] * h;
+      // storage invariant: positions stay wrapped inside the domain (no-op
+      // when no axis is periodic)
+      MFTLApplyPeriodicity(obj->domain, v->pos);
     }
   }
 
@@ -390,12 +402,16 @@ double MFTLVolumeRecovery(MFTL_Object* obj, double target_volume)
 
 // Per-endpoint ring data: sum of ring-neighbour positions EXCLUDING the
 // other edge endpoint, the ring triangle count, and the sign-aligned vector
-// area of the ring.
-static int mftlVcEndpointData(MFTL_Object* obj, int vi, int v_other, double sum_x[3], double A[3], int* n_out)
+// area of the ring. Positions are re-imaged into `anchor`'s periodic image
+// (exact copies when non-periodic) so the sums are seam-safe; the caller
+// anchors BOTH endpoints' rings at the same vertex for a common frame.
+static int mftlVcEndpointData(MFTL_Object* obj, int vi, int v_other, const double anchor[3], double sum_x[3], double A[3], int* n_out)
 {
   int ring[MFTL_VC_MAX_RING];
   int n = mftlVcRingTris(obj, vi, ring);
   if (n == 0) return MFTL_ERROR;
+
+  const int any_periodic = MFTLDomainAnyPeriodic(obj->domain);
 
   sum_x[0] = sum_x[1] = sum_x[2] = 0.0;
   A[0] = A[1] = A[2] = 0.0;
@@ -406,8 +422,9 @@ static int mftlVcEndpointData(MFTL_Object* obj, int vi, int v_other, double sum_
     MFTLGetTriangleVertices(obj, tri, vv);
 
     // vector area of the triangle, oriented against the (position-based) normal
-    double e0[3] = {vv[1]->pos[0] - vv[0]->pos[0], vv[1]->pos[1] - vv[0]->pos[1], vv[1]->pos[2] - vv[0]->pos[2]};
-    double e1[3] = {vv[2]->pos[0] - vv[0]->pos[0], vv[2]->pos[1] - vv[0]->pos[1], vv[2]->pos[2] - vv[0]->pos[2]};
+    double e0[3], e1[3];
+    MFTLGetMinimumImageVector(obj->domain, e0, vv[0]->pos, vv[1]->pos);
+    MFTLGetMinimumImageVector(obj->domain, e1, vv[0]->pos, vv[2]->pos);
     double S[3] = {e0[1] * e1[2] - e0[2] * e1[1], e0[2] * e1[0] - e0[0] * e1[2], e0[0] * e1[1] - e0[1] * e1[0]};
     double tn[3];
     mftlVcTriNormal(obj, ring[r], tn);
@@ -445,9 +462,20 @@ static int mftlVcEndpointData(MFTL_Object* obj, int vi, int v_other, double sum_
       if (!found && nn < MFTL_VC_MAX_RING * 2)
       {
         seen[nn++] = wi;
-        sum_x[0] += vv[k]->pos[0];
-        sum_x[1] += vv[k]->pos[1];
-        sum_x[2] += vv[k]->pos[2];
+        if (any_periodic)
+        {
+          double u[3];
+          MFTLUnwrapToAnchor(obj->domain, u, vv[k]->pos, anchor);
+          sum_x[0] += u[0];
+          sum_x[1] += u[1];
+          sum_x[2] += u[2];
+        }
+        else
+        {
+          sum_x[0] += vv[k]->pos[0];
+          sum_x[1] += vv[k]->pos[1];
+          sum_x[2] += vv[k]->pos[2];
+        }
       }
     }
   }
@@ -469,16 +497,23 @@ void MFTLEdgeVolumeConservingSmoothing(MFTL_Object* obj, int he_idx, MFTL_Remesh
   if (mftlVcFeatureVertex(obj, v0, params->feature_angle_threshold)) return;
   if (mftlVcFeatureVertex(obj, v1, params->feature_angle_threshold)) return;
 
-  // opposite corners of the two adjacent triangles
+  // opposite corners of the two adjacent triangles (minimum-image edge
+  // vector: raw difference when non-periodic)
   int vt1 = obj->half_edges[he_next].vertex_idx;
   int vt2 = obj->half_edges[obj->half_edges[he->twin_idx].next_idx].vertex_idx;
   double v[3];
-  for (int k = 0; k < 3; ++k) v[k] = obj->vertices[vt2].pos[k] - obj->vertices[vt1].pos[k];
+  MFTLGetMinimumImageVector(obj->domain, v, obj->vertices[vt1].pos, obj->vertices[vt2].pos);
+
+  // Both endpoint rings are summed in ONE frame anchored at v0's image, so
+  // the coupled umbrella targets below mix compatible coordinates.
+  const double* anchor = obj->vertices[v0].pos;
+  double v1_img[3];
+  MFTLUnwrapToAnchor(obj->domain, v1_img, obj->vertices[v1].pos, anchor);
 
   double sum_x[2][3], A[2][3];
   int n[2];
-  if (mftlVcEndpointData(obj, v0, v1, sum_x[0], A[0], &n[0]) != MFTL_SUCCESS) return;
-  if (mftlVcEndpointData(obj, v1, v0, sum_x[1], A[1], &n[1]) != MFTL_SUCCESS) return;
+  if (mftlVcEndpointData(obj, v0, v1, anchor, sum_x[0], A[0], &n[0]) != MFTL_SUCCESS) return;
+  if (mftlVcEndpointData(obj, v1, v0, anchor, sum_x[1], A[1], &n[1]) != MFTL_SUCCESS) return;
 
   // coupled umbrella targets (Kuprat paper notation)
   double x_s[2][3];
@@ -492,7 +527,7 @@ void MFTLEdgeVolumeConservingSmoothing(MFTL_Object* obj, int he_idx, MFTL_Remesh
   for (int k = 0; k < 3; ++k)
   {
     dx[0][k] = omega * (x_s[0][k] - obj->vertices[v0].pos[k]);
-    dx[1][k] = omega * (x_s[1][k] - obj->vertices[v1].pos[k]);
+    dx[1][k] = omega * (x_s[1][k] - v1_img[k]);
   }
 
   double dx_subtract[3] = {dx[0][0] - dx[1][0], dx[0][1] - dx[1][1], dx[0][2] - dx[1][2]};
@@ -516,6 +551,8 @@ void MFTLEdgeVolumeConservingSmoothing(MFTL_Object* obj, int he_idx, MFTL_Remesh
       int vi = i == 0 ? v0 : v1;
       obj->vertices[vi].pos[k] += dx[i][k] + h * AA[k] / AA_MAG;
     }
+    // keep the storage invariant: wrapped positions (no-op when non-periodic)
+    MFTLApplyPeriodicity(obj->domain, obj->vertices[i == 0 ? v0 : v1].pos);
   }
 }
 
@@ -556,7 +593,11 @@ int MFTLEdgeTSUR(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
   int n1 = mftlVcRingTris(obj, v1, ring1);
   if (n0 == 0 || n1 == 0) return MFTL_ERROR;
 
-  // ring corner lists (two ordered corners per triangle, excluding the centre)
+  // ring corner lists (two ordered corners per triangle, excluding the
+  // centre). Positions are re-imaged into the centre vertex's periodic image
+  // (exact copies when non-periodic) so a seam-straddling ring is contiguous.
+  const MFTL_Domain* dom = obj->domain;
+  const int any_periodic = MFTLDomainAnyPeriodic(dom);
   double corner0[MFTL_VC_MAX_RING * 2][3], corner1[MFTL_VC_MAX_RING * 2][3];
   int c0 = 0, c1 = 0;
   for (int r = 0; r < n0; ++r)
@@ -567,7 +608,9 @@ int MFTLEdgeTSUR(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
     {
       int wi = (int) (vv[k] - obj->vertices);
       if (wi == v0) continue;
-      memcpy(corner0[c0++], vv[k]->pos, 3 * sizeof(double));
+      memcpy(corner0[c0], vv[k]->pos, 3 * sizeof(double));
+      if (any_periodic) MFTLUnwrapToAnchor(dom, corner0[c0], corner0[c0], obj->vertices[v0].pos);
+      c0++;
     }
   }
   for (int r = 0; r < n1; ++r)
@@ -578,7 +621,9 @@ int MFTLEdgeTSUR(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
     {
       int wi = (int) (vv[k] - obj->vertices);
       if (wi == v1) continue;
-      memcpy(corner1[c1++], vv[k]->pos, 3 * sizeof(double));
+      memcpy(corner1[c1], vv[k]->pos, 3 * sizeof(double));
+      if (any_periodic) MFTLUnwrapToAnchor(dom, corner1[c1], corner1[c1], obj->vertices[v1].pos);
+      c1++;
     }
   }
   if (c0 == 0 || c1 == 0) return MFTL_ERROR;
@@ -602,8 +647,9 @@ int MFTLEdgeTSUR(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
   {
     MFTL_Vertex* vv[3];
     MFTLGetTriangleVertices(obj, &obj->triangles[ring0[r]], vv);
-    double e0[3] = {vv[1]->pos[0] - vv[0]->pos[0], vv[1]->pos[1] - vv[0]->pos[1], vv[1]->pos[2] - vv[0]->pos[2]};
-    double e1[3] = {vv[2]->pos[0] - vv[0]->pos[0], vv[2]->pos[1] - vv[0]->pos[1], vv[2]->pos[2] - vv[0]->pos[2]};
+    double e0[3], e1[3];
+    MFTLGetMinimumImageVector(dom, e0, vv[0]->pos, vv[1]->pos);
+    MFTLGetMinimumImageVector(dom, e1, vv[0]->pos, vv[2]->pos);
     double cx = e0[1] * e1[2] - e0[2] * e1[1], cy = e0[2] * e1[0] - e0[0] * e1[2], cz = e0[0] * e1[1] - e0[1] * e1[0];
     double area = 0.5 * sqrt(cx * cx + cy * cy + cz * cz);
     double tn[3];
@@ -617,8 +663,9 @@ int MFTLEdgeTSUR(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
   {
     MFTL_Vertex* vv[3];
     MFTLGetTriangleVertices(obj, &obj->triangles[ring1[r]], vv);
-    double e0[3] = {vv[1]->pos[0] - vv[0]->pos[0], vv[1]->pos[1] - vv[0]->pos[1], vv[1]->pos[2] - vv[0]->pos[2]};
-    double e1[3] = {vv[2]->pos[0] - vv[0]->pos[0], vv[2]->pos[1] - vv[0]->pos[1], vv[2]->pos[2] - vv[0]->pos[2]};
+    double e0[3], e1[3];
+    MFTLGetMinimumImageVector(dom, e0, vv[0]->pos, vv[1]->pos);
+    MFTLGetMinimumImageVector(dom, e1, vv[0]->pos, vv[2]->pos);
     double cx = e0[1] * e1[2] - e0[2] * e1[1], cy = e0[2] * e1[0] - e0[0] * e1[2], cz = e0[0] * e1[1] - e0[1] * e1[0];
     double area = 0.5 * sqrt(cx * cx + cy * cy + cz * cz);
     double tn[3];
@@ -649,26 +696,49 @@ int MFTLEdgeTSUR(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
   normal[2] /= nlen;
 
   // 3-5. project the endpoints to the tangent plane
-  double m[3] = {0.5 * (tmp0[0] + tmp1[0]), 0.5 * (tmp0[1] + tmp1[1]), 0.5 * (tmp0[2] + tmp1[2])};
-  double t0[3] = {tmp0[0] - m[0], tmp0[1] - m[1], tmp0[2] - m[2]};
+  double m[3], t0[3], t1[3];
+  if (any_periodic)
+  {
+    // seam-safe midpoint: m = tmp0 + 0.5 * minimage(tmp0 -> tmp1)
+    double e01[3];
+    MFTLGetMinimumImageVector(dom, e01, tmp0, tmp1);
+    for (int k = 0; k < 3; ++k) m[k] = tmp0[k] + 0.5 * e01[k];
+  }
+  else
+  {
+    // raw arithmetic (bit-identical to the pre-periodic path)
+    m[0] = 0.5 * (tmp0[0] + tmp1[0]);
+    m[1] = 0.5 * (tmp0[1] + tmp1[1]);
+    m[2] = 0.5 * (tmp0[2] + tmp1[2]);
+  }
+  // v1's position re-imaged next to v0 (plain copy when non-periodic):
+  // t1/p1 must live in the same frame as m.
+  double tmp1_img[3];
+  MFTLUnwrapToAnchor(dom, tmp1_img, tmp1, tmp0);
+  for (int k = 0; k < 3; ++k) t0[k] = tmp0[k] - m[k];
   double h0 = t0[0] * normal[0] + t0[1] * normal[1] + t0[2] * normal[2];
-  double t1[3] = {tmp1[0] - m[0], tmp1[1] - m[1], tmp1[2] - m[2]};
+  for (int k = 0; k < 3; ++k) t1[k] = tmp1_img[k] - m[k];
   double h1 = t1[0] * normal[0] + t1[1] * normal[1] + t1[2] * normal[2];
   p0[0] = tmp0[0] - h0 * normal[0];
   p0[1] = tmp0[1] - h0 * normal[1];
   p0[2] = tmp0[2] - h0 * normal[2];
-  p1[0] = tmp1[0] - h1 * normal[0];
-  p1[1] = tmp1[1] - h1 * normal[1];
-  p1[2] = tmp1[2] - h1 * normal[2];
+  p1[0] = tmp1_img[0] - h1 * normal[0];
+  p1[1] = tmp1_img[1] - h1 * normal[1];
+  p1[2] = tmp1_img[2] - h1 * normal[2];
 
-  // 6. local one-ring volumes about the projected points
+  // 6. local one-ring volumes about the projected points (vertices re-imaged
+  // next to the projected point: a plain copy when non-periodic)
   double vol0 = 0.0, vol1 = 0.0, tetra[3][3];
   for (int r = 0; r < n0; ++r)
   {
     MFTL_Vertex* vv[3];
     MFTLGetTriangleVertices(obj, &obj->triangles[ring0[r]], vv);
     for (int i = 0; i < 3; ++i)
-      for (int k = 0; k < 3; ++k) tetra[i][k] = vv[i]->pos[k] - p0[k];
+    {
+      double u[3];
+      MFTLUnwrapToAnchor(dom, u, vv[i]->pos, p0);
+      for (int k = 0; k < 3; ++k) tetra[i][k] = u[k] - p0[k];
+    }
     vol0 += mftlVcDet3(tetra);
   }
   vol0 /= 6.0;
@@ -677,7 +747,11 @@ int MFTLEdgeTSUR(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
     MFTL_Vertex* vv[3];
     MFTLGetTriangleVertices(obj, &obj->triangles[ring1[r]], vv);
     for (int i = 0; i < 3; ++i)
-      for (int k = 0; k < 3; ++k) tetra[i][k] = vv[i]->pos[k] - p1[k];
+    {
+      double u[3];
+      MFTLUnwrapToAnchor(dom, u, vv[i]->pos, p1);
+      for (int k = 0; k < 3; ++k) tetra[i][k] = u[k] - p1[k];
+    }
     vol1 += mftlVcDet3(tetra);
   }
   vol1 /= 6.0;
@@ -687,7 +761,10 @@ int MFTLEdgeTSUR(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
   double h = (vol0 + vol1) / (vol0 / h0 + vol1 / h1);
   if (!isfinite(h)) return MFTL_ERROR;  // NaN guard (MFTL1 isnan path)
 
-  // 8. move + clamp into the domain
+  // 8. move + domain handling. Stage-13 resolution of the Stage-09
+  // carry-forward: on periodic axes the moved endpoint WRAPS back into the
+  // domain (clamping would pin the surface to the periodic face); on
+  // non-periodic axes the original clamp is kept exactly.
   double nh[3] = {normal[0] * h, normal[1] * h, normal[2] * h};
   double* pos0 = obj->vertices[v0].pos;
   double* pos1 = obj->vertices[v1].pos;
@@ -695,6 +772,12 @@ int MFTLEdgeTSUR(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
   {
     pos0[k] = p0[k] + nh[k];
     pos1[k] = p1[k] + nh[k];
+  }
+  MFTLApplyPeriodicity(dom, pos0);
+  MFTLApplyPeriodicity(dom, pos1);
+  for (int k = 0; k < 3; ++k)
+  {
+    if (dom->is_periodic[k]) continue;  // wrapped above
     double lo = obj->domain->global_min[k] + 1e-7;
     double hi = obj->domain->global_max[k] - 1e-7;
     pos0[k] = MFTL_MAX(lo, MFTL_MIN(pos0[k], hi));

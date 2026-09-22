@@ -148,3 +148,30 @@ foreach(NP 1 2 4 8)
     add_test(NAME RemeshParallel-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_remesh_parallel>)
 endforeach()
 set_tests_properties(RemeshParallel-np1 RemeshParallel-np2 RemeshParallel-np4 RemeshParallel-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+
+# --- Stage 11: Intersection + overlap volume ---
+add_executable(test_overlap test_overlap.c)
+target_link_libraries(test_overlap PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_overlap PRIVATE ${CMAKE_SOURCE_DIR}/include)
+foreach(NP 1 2 4 8)
+    add_test(NAME Overlap-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_overlap>)
+endforeach()
+set_tests_properties(Overlap-np1 Overlap-np2 Overlap-np4 Overlap-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+
+# --- Stage 12: Opaque per-triangle data transport ---
+add_executable(test_triangle_data test_triangle_data.c)
+target_link_libraries(test_triangle_data PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_triangle_data PRIVATE ${CMAKE_SOURCE_DIR}/include)
+foreach(NP 1 2 4 8)
+    add_test(NAME TriangleData-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_triangle_data>)
+endforeach()
+set_tests_properties(TriangleData-np1 TriangleData-np2 TriangleData-np4 TriangleData-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+
+# --- Stage 13: Periodicity completion (end-to-end battery) ---
+add_executable(test_periodic_endtoend test_periodic_endtoend.c)
+target_link_libraries(test_periodic_endtoend PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_periodic_endtoend PRIVATE ${CMAKE_SOURCE_DIR}/include)
+foreach(NP 1 2 4 8)
+    add_test(NAME PeriodicEndToEnd-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_periodic_endtoend>)
+endforeach()
+set_tests_properties(PeriodicEndToEnd-np1 PeriodicEndToEnd-np2 PeriodicEndToEnd-np4 PeriodicEndToEnd-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")

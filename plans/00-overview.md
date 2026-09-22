@@ -13,6 +13,20 @@ migrate the `multiflow` CFD solver onto it, in independently-reviewable stages t
 leave the tree compiling and testable. This file is the shared design contract; every stage
 `01…15` refers back to the invariants, conventions, and validation strategy defined here.
 
+## Design and migration principles
+
+**MFTL1 defines required numerical behaviour, not required implementation.** MFTL2
+implementations should exploit the MFTL2 data structures, ownership model, and communication
+design, and should not reproduce MFTL1 implementation patterns unless necessary for numerical
+correctness or compatibility.
+
+**During the initial migration, correctness and numerical parity take precedence over
+optimization.** Known performance compromises — including serial fallbacks, unnecessary global
+gathers, temporary representation conversions, redundant rebuilds, or other scalability
+limitations — must be documented explicitly so they can be revisited during subsequent profiling
+and optimization. Such compromises are acceptable when they provide a clear, tested path to
+correctness, but they must not become implicit architectural requirements.
+
 ## The two codebases
 
 - **MFTL1** — `/home/berend/git/Code/mftl`, ~28k LOC / 90 files. Data model: three `uthash`
@@ -39,7 +53,7 @@ leave the tree compiling and testable. This file is the shared design contract; 
 | `Edge->Triangle[k]`, one-ring by pointer | half-edge traversal (`MFTLHeTwin/Next/…`, `MFTLGetVertexOneRing*`) |
 | `HASH_FIND_INT(Obj->Vertexes,&id,..)` | `khash` id→index map (`vertex_map` etc.) |
 | entity `id` (sequential counter) | `global_id` (per-entity) + array index |
-| `Triangle->Data` + `Object->SizeOfData` | `MFTL_Triangle.data` (see Stage 12) |
+| `Triangle->Data` + `Object->SizeOfData` | `MFTL_Triangle.data` + `MFTL_Object.data_size` (Stage 12, implemented) |
 | `Object->globalxmin/max`, `ownershiprange*` | `MFTL_Domain.global_min/max`, `MPI_Cart` grid |
 
 ## Build baseline
@@ -152,7 +166,8 @@ Historical record — HEAD `f4795fe` did not build for two reasons, both fixed i
    1e-7`, `MFTL_VERYSMALL 1e-15`. Overlap uses its own `MFTL_REL_TOLERANCE 5e-7`.
 7. **Opaque per-triangle `Data`** is a flat POD, transported byte-exact as `MPI_BYTE` of
    `SizeOfData` (multiflow's `struct CellData`, `src/include/fronttracking.h`). No embedded
-   pointers — Stage 12.
+   pointers — Stage 12 (implemented: `MFTL_Object.data_size`, `MFTLInitializeObjectData`,
+   parallel `MPI_BYTE` streams alongside every triangle transport, `MFTLScatterTriangleData`).
 8. **Dual MPI decomposition** (migration): MFTL's per-object MPI-Cartesian grid is
    independent of multiflow's PETSc/DMPlex(DMForest/p4est) fluid partition; they are *adapted*
    to line up with the `CartesianOverlapMesh` particle-box grid but do not coincide, and the
@@ -199,16 +214,57 @@ currently-disabled periodic/clamping advection behavior.
 
 ## Stage list & dependency order
 
-**Progress (2026-09-21):** Stages **01–10 COMPLETE / Acceptance PASSED** (implemented by
+**Progress (2026-09-22):** Stages **01–13 COMPLETE / Acceptance PASSED** (implemented by
 Kimi Code, reviewed by Claude Code; Release + ASan/UBSan clean — incl. LAPACK/OpenBLAS
-for Stage 08's paraboloid fit — full suite green on 1/2/4/8 ranks). Stages 11–15 NOT
-STARTED. The **winding convention is now RESOLVED** (invariant #2): MFTL2 standardizes on
-**outward winding / `V > 0`** for all closed meshes. A small prerequisite commit — flip the
-sphere generator to outward (`src/general/sphere.c`) + flip 8 pinned inward-sign assertions
-in `test_object_integrals.c` / `test_transforms.c` / `test_remesh_parallel.c` — must land
-**before Stage 11** so its overlap-normal logic is built on the single convention. With that
-prerequisite applied, **Stage 11 can safely begin** (all other consumers are winding-agnostic;
-no rework of Stages 05–10 needed).
+for Stage 08's paraboloid fit — full suite green on 1/2/4/8 ranks). **Stage 13 ACCEPTED
+(2026-09-22, Claude Code):** end-to-end periodicity across integrals, curvature, point
+queries, remeshing and intersection, plus the runtime minimum-image constraint — default
+(LAPACK-off) build Release **53/53** and ASan/UBSan/LSan **53/53** on 1/2/4/8, independently
+reproduced; non-periodic behaviour verified **bit-identical** (LAPACK-off `RemeshQuality`
+deviation `3.051e-03` byte-matches the Stage-10 baseline; every periodic edit reduces to the
+raw formula when no axis is periodic). Its verification exposed and fixed a **redistribution
+heap-corruption bug** (both `MFTLRedistribute*` variants): stale ghost-vertex copies with
+wrong owner labels (systematic for periodic seam-straddlers — wrapped storage makes their
+owners non-neighbour ranks) could write one gid as both local and ghost, overflowing the
+rebuilt vertex array; the receiver now classifies ownership only from sender-authoritative
+copies with hash-based dedup (`write_count==n_unique`, exactly-once ownership), and non-ghost
+vertices without a non-ghost incident triangle are shipped explicitly. Fix stress-verified:
+wide seam-straddler `PeriodicEndToEnd` np8 ASan ×15 clean, non-periodic `RemeshParallel`/
+`TriangleData` np8 ASan clean. **Carry-forward (pre-existing, NOT a Stage-13 regression):**
+`test_vertex_fitting_validity` fails only under `-DMFTL_USE_LAPACK=ON` (paraboloid deviation
+`5.032e-02` vs the `0.05` gate) and leaks on its early return — identical at Stage-10 HEAD
+`8a58cb4`; loosen the paraboloid tolerance and make the test destroy-before-assert. Stages
+14–15 NOT STARTED. The **winding convention is RESOLVED and APPLIED** (invariant #2): MFTL2
+standardizes on **outward winding / `V > 0`** for all closed meshes; the sphere generator
+and the affected sign-pinned tests have been updated and independently reviewed.
+
+**Stage 11** (object–object intersection + overlap-volume) is accepted: faithful MFTL1
+overlap-volume port — two-sphere lens converges to analytic (ref5 0.06%), sign correct
+(far-side/non-overlap → V=0), `V(A,B)==V(B,A)` bit-identical, rank-independent (A-ownership
+partition + gathered deterministic list), periodic seam == mid-domain bit-identical (bodies
+unwrapped into a common frame without mutating the mesh; uses outward normals). Release +
+ASan/UBSan/LSan clean on 1/2/4/8 (7/7); no unrelated regressions. **Carry-forward (Stage 13):
+RESOLVED (2026-09-22, implemented):** the BVH/spatial-ghost *detection* path
+(`MFTLEnsembleIntersectObjects`, `mftl_bvh.c:535`) is
+now periodic-correct — spatial-ghost interval overlap and BVH pair traversal use
+periodic-aware interval overlap, and `MFTL_TriTriIntersect`/`Proximity` materialize a
+common per-triangle frame when periodic (verified by `PeriodicEndToEnd` seam intersection).
+
+**Stage 12** (opaque per-triangle `data` transport) is accepted: byte-exact `MPI_BYTE`
+transport across both redistribution routes, ghost extension, spatial ghosting and
+`MFTLScatterTriangleData`; per-triangle heap blobs with a correct alloc/free lifecycle
+(split→zeroed blob, PATH-B compaction frees dead-only, `Destroy` frees all); `data_size==0`
+no-op. Release + ASan/UBSan/LSan clean on 1/2/4/8; no regressions. **Carry-forwards RESOLVED
+(2026-09-21):** (a) `MFTLCheckTriangleDataSizeConsistency` — a cheap collective MIN/MAX
+Allreduce of `data_size` over `comm_cart` at the entry of every triangle-data transport path
+(both redistribution routes, ghost-layer extension, ensemble + pair spatial ghosting, scatter);
+a cross-rank mismatch now fails loudly with `MFTL_ERROR` before anything is communicated or
+modified (negative test: deliberate 56-vs-64-byte mismatch refused uniformly by all four
+entry points on all ranks, mesh untouched). (b) Remesh-with-data regression test
+(`TestRemeshingTriangleData` in `test_remeshing.c`, np1, under LSAN): explicit
+split×3/flip/collapse + PATH-B compaction sequence plus one full serial
+`MFTLRemeshEnsemble` pass with data attached — surviving gids byte-identical, new split
+gids fully zeroed, no leaks/double-frees.
 
 **Stage 10** (parallel remeshing + x-only load balancing) is accepted: MFTL1-style two-pass
 shift-scheme + centering (gather-to-rank-0) dispatcher, single-owner interior gates,
@@ -232,8 +288,10 @@ non-neighbour-owner ghosts during LB passes are kept stale until the next redist
 
 **Stage 09** (volume-conserving smoothing) is accepted: TSUR3D / Kuprat / VolumeRecovery /
 roughness smoothing, MFTL1-consistent, full remesh cycle conserves volume to ~6e-12 (the
-driver always ends with `VolumeRecovery`). For **Stage 13**: TSUR's `[global_min,global_max]`
-endpoint clamp is periodic-unaware. (Mean-curvature-flow `LaplacianSmoothing`, which needs
+driver always ends with `VolumeRecovery`). For **Stage 13** — **RESOLVED (2026-09-22,
+implemented):** TSUR's `[global_min,global_max]` endpoint clamp is now periodic-aware (the
+clamp is skipped on periodic axes; corner unwraps, ring areas, projection midpoint and tetra
+legs all use the minimum image). (Mean-curvature-flow `LaplacianSmoothing`, which needs
 the signed Laplace–Beltrami vector, was out of Stage-09 scope and not implemented.)
 
 The two Stage 07/08 follow-up items are
@@ -259,7 +317,8 @@ remesh ops and skips ghosts whose owners are temporarily non-neighbouring (trans
 slab-spanning edges); both refresh at the next redistribution. (d) `VolumeRecovery` is
 parallel-exact (corner-weighted area, secant slope, consensus loop exits) but still
 serial-bit-identical at np1. (e) Deferred: per-object centroid ranks for the centering
-kernel; TSUR's periodic-unaware endpoint clamp (Stage 13). **Update (2026-09-21, winding
+kernel; TSUR's periodic-unaware endpoint clamp (Stage 13 — RESOLVED 2026-09-22, clamp
+skipped on periodic axes). **Update (2026-09-21, winding
 prerequisite):** MFTL1's `MFTL_RemeshBoundaryCleanup` is now implemented (the
 gather→serial-kernel→scatter path in `MFTLRemeshEnsembleDispersedCentering`, driven by
 `params->boundary_cleanup`, default on) — it covers the sliver edges that straddle both

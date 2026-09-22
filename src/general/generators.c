@@ -276,6 +276,10 @@ static int mftlTessellateFlat(MFTL_Object* object)
   }
 
   free(object->vertices);
+  // Stage 12: free per-triangle payloads before replacing the triangle array
+  // wholesale (defensive; generation normally precedes MFTLInitializeObjectData).
+  if (object->data_size > 0)
+    for (int i = 0; i < old_nt; ++i) free(object->triangles[i].data);
   free(object->triangles);
   free(object->half_edges);
   free(midpoint_map);
@@ -324,6 +328,13 @@ void MFTLGenerateCube(MFTL_Object* obj, int refine)
   // (plus refreshed global stats) so every rank agrees, exactly the tail
   // MFTLGenerateSphere uses.
   mftlGeneratorFinish(obj);
+
+  // Stage 13: advisory minimum-image constraint check. MFTLGenerateCube is a
+  // void legacy generator, so a violation is a loud warning (the check itself
+  // prints the diagnostic on rank 0), not an error return.
+  if (MFTLDomainAnyPeriodic(domain) && MFTLCheckMinimumImageConstraint(obj) != MFTL_SUCCESS && domain->rank == 0)
+    fprintf(stderr, "WARNING: MFTLGenerateCube: the generated cube violates the periodic minimum-image constraint; "
+                    "periodic queries on it are unreliable. Increase the domain or shrink the body.\n");
 }
 
 // ---------------------------------------------------------------------------

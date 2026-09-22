@@ -107,6 +107,14 @@ static int mftlTriangleCorners(const MFTL_Object* obj, const MFTL_Triangle* tri,
     memcpy(corner_pos[k], obj->vertices[vidx[k]].pos, 3 * sizeof(double));
     if (vidx[k] == vi) kv = k;
   }
+  // Seam-straddling triangles are "stretched" in raw (wrapped) storage:
+  // re-image every corner into vi's periodic image so all angle/length
+  // differences below are seam-safe (exact copy when non-periodic).
+  if (MFTLDomainAnyPeriodic(obj->domain))
+  {
+    const double* anchor = obj->vertices[vi].pos;
+    for (int k = 0; k < 3; ++k) MFTLUnwrapToAnchor(obj->domain, corner_pos[k], corner_pos[k], anchor);
+  }
   return kv;
 }
 
@@ -222,11 +230,12 @@ void MFTLComputeVertexCurvatures(MFTL_Object* obj)
         double cotan = 0.25 * (L2[(eo + 1) % 3] + L2[(eo + 2) % 3] - L2[eo]) / A;
         if (!obtuse) area_voronoi += cotan * L2[eo];
 
-        int other = cyc[(kv + 3 - cc) % 3];  // the other endpoint of that edge
-        const double* op = obj->vertices[other].pos;
-        mean_sum[0] += cotan * (v->pos[0] - op[0]);
-        mean_sum[1] += cotan * (v->pos[1] - op[1]);
-        mean_sum[2] += cotan * (v->pos[2] - op[2]);
+        // the other endpoint of that edge: use the unwrapped corner
+        // positions (cp[kv] == v's image; seam-safe across the periodic wrap)
+        const double* op = cp[(kv + 3 - cc) % 3];
+        mean_sum[0] += cotan * (cp[kv][0] - op[0]);
+        mean_sum[1] += cotan * (cp[kv][1] - op[1]);
+        mean_sum[2] += cotan * (cp[kv][2] - op[2]);
       }
 
       if (obtuse) area_voronoi += (angle_at_v > 1.5708) ? 0.5 * A : 0.25 * A;
@@ -289,9 +298,18 @@ double MFTLComputeRoughness(MFTL_Object* obj)
     // --- geometric Laplacian: |V - sum(Vj/d)/sum(1/d)| ---
     double inv_sum = 0.0;
     double c[3] = {0.0, 0.0, 0.0};
+    const int any_periodic = MFTLDomainAnyPeriodic(obj->domain);
     for (int m = 0; m < nn; ++m)
     {
+      // re-image the neighbour into v's periodic image (exact copy when
+      // non-periodic), otherwise the average and distance cross the seam
+      double ou[3];
       const double* op = obj->vertices[nbr[m]].pos;
+      if (any_periodic)
+      {
+        MFTLUnwrapToAnchor(obj->domain, ou, op, v->pos);
+        op = ou;
+      }
       double dx = v->pos[0] - op[0];
       double dy = v->pos[1] - op[1];
       double dz = v->pos[2] - op[2];

@@ -38,6 +38,13 @@ static int new_triangle(MFTL_Object *obj)
   obj->triangles[idx].flags = MFTL_FLAG_NONE;
   obj->triangles[idx].owner_proc = obj->domain->rank;
   obj->triangles[idx].is_ghost = MFTL_FALSE;
+  // Stage 12: user data is NOT repartitioned by split/collapse — new triangles
+  // from splits carry a zeroed blob; callers that attach data must impose
+  // their own split/merge policy (per Stage 12 plan).
+  if (obj->data_size > 0)
+    obj->triangles[idx].data = calloc(1, obj->data_size);
+  else
+    obj->triangles[idx].data = MFTL_NULL;
   return idx;
 }
 
@@ -90,9 +97,25 @@ int MFTLSplitEdge(MFTL_Object *obj, int he_ab_idx)
   MFTL_Vertex *v_a = &obj->vertices[v_a_idx];
   MFTL_Vertex *v_b = &obj->vertices[v_b_idx];
 
-  for (int i = 0; i < 3; i++)
+  // Seam-safe midpoint (Stage 13): with wrapped storage the raw average of a
+  // seam-crossing edge lands half a domain away. Branch so the non-periodic
+  // arithmetic stays bit-identical.
+  if (MFTLDomainAnyPeriodic(obj->domain))
   {
-    v_m->pos[i] = 0.5 * (v_a->pos[i] + v_b->pos[i]);
+    double e_ab[3];
+    MFTLGetMinimumImageVector(obj->domain, e_ab, v_a->pos, v_b->pos);
+    for (int i = 0; i < 3; i++)
+    {
+      v_m->pos[i] = v_a->pos[i] + 0.5 * e_ab[i];
+    }
+    MFTLApplyPeriodicity(obj->domain, v_m->pos);
+  }
+  else
+  {
+    for (int i = 0; i < 3; i++)
+    {
+      v_m->pos[i] = 0.5 * (v_a->pos[i] + v_b->pos[i]);
+    }
   }
   v_m->owner_proc = obj->domain->rank;  // change this later because in parallel this might not be true
   v_m->is_ghost = MFTL_FALSE;  // change this later because in parallel this might not be true
@@ -403,10 +426,23 @@ void MFTLCollapseEdge(MFTL_Object *obj, int he_ab_idx)
   obj->half_edges[he_ab_idx].flags |= MFTL_FLAG_DEAD;
   if (he_ba_idx != MFTL_ERROR) obj->half_edges[he_ba_idx].flags |= MFTL_FLAG_DEAD;
 
-  // Update B's position
-  for (int k = 0; k < 3; ++k)
+  // Update B's position (seam-safe midpoint; raw average when non-periodic)
+  if (MFTLDomainAnyPeriodic(obj->domain))
   {
-    obj->vertices[v_b_idx].pos[k] = 0.5 * (obj->vertices[v_b_idx].pos[k] + obj->vertices[v_a_idx].pos[k]);
+    double e_ba[3];
+    MFTLGetMinimumImageVector(obj->domain, e_ba, obj->vertices[v_b_idx].pos, obj->vertices[v_a_idx].pos);
+    for (int k = 0; k < 3; ++k)
+    {
+      obj->vertices[v_b_idx].pos[k] = obj->vertices[v_b_idx].pos[k] + 0.5 * e_ba[k];
+    }
+    MFTLApplyPeriodicity(obj->domain, obj->vertices[v_b_idx].pos);
+  }
+  else
+  {
+    for (int k = 0; k < 3; ++k)
+    {
+      obj->vertices[v_b_idx].pos[k] = 0.5 * (obj->vertices[v_b_idx].pos[k] + obj->vertices[v_a_idx].pos[k]);
+    }
   }
 
   // --- SAFE POINTER UPDATE (Using the survivor we found in Step 2) ---
@@ -522,8 +558,10 @@ static void mftlUnitNormalFromTri(MFTL_Object* obj, int tri_idx, double n[3])
 {
   MFTL_Vertex* vv[3];
   MFTLGetTriangleVertices(obj, &obj->triangles[tri_idx], vv);
-  double e0[3] = {vv[1]->pos[0] - vv[0]->pos[0], vv[1]->pos[1] - vv[0]->pos[1], vv[1]->pos[2] - vv[0]->pos[2]};
-  double e1[3] = {vv[2]->pos[0] - vv[0]->pos[0], vv[2]->pos[1] - vv[0]->pos[1], vv[2]->pos[2] - vv[0]->pos[2]};
+  // minimum-image edges: raw differences when non-periodic, seam-safe else
+  double e0[3], e1[3];
+  MFTLGetMinimumImageVector(obj->domain, e0, vv[0]->pos, vv[1]->pos);
+  MFTLGetMinimumImageVector(obj->domain, e1, vv[0]->pos, vv[2]->pos);
   n[0] = e0[1] * e1[2] - e0[2] * e1[1];
   n[1] = e0[2] * e1[0] - e0[0] * e1[2];
   n[2] = e0[0] * e1[1] - e0[1] * e1[0];
@@ -640,11 +678,21 @@ int CollapseApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params
   if (a_bound && !b_bound) return MFTL_FALSE;
 
   // --- 5. Ping-Pong Prevention (The Stretch Check) ---
-  // Calculate proposed midpoint M
+  // Calculate proposed midpoint M (seam-safe; raw average when non-periodic)
   double pos_m[3];
-  for (int k = 0; k < 3; ++k)
+  if (MFTLDomainAnyPeriodic(obj->domain))
   {
-    pos_m[k] = 0.5 * (v_a_ptr->pos[k] + v_b_ptr->pos[k]);
+    double e_ba[3];
+    MFTLGetMinimumImageVector(obj->domain, e_ba, v_b_ptr->pos, v_a_ptr->pos);
+    for (int k = 0; k < 3; ++k) pos_m[k] = v_b_ptr->pos[k] + 0.5 * e_ba[k];
+    MFTLApplyPeriodicity(obj->domain, pos_m);
+  }
+  else
+  {
+    for (int k = 0; k < 3; ++k)
+    {
+      pos_m[k] = 0.5 * (v_a_ptr->pos[k] + v_b_ptr->pos[k]);
+    }
   }
 
   // Check neighbors of A
@@ -653,10 +701,9 @@ int CollapseApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params
     // Don't check B, it's collapsing
     if (ring_a[i] == v_b_ptr) continue;
 
-    double dx = ring_a[i]->pos[0] - pos_m[0];
-    double dy = ring_a[i]->pos[1] - pos_m[1];
-    double dz = ring_a[i]->pos[2] - pos_m[2];
-    double new_len_sq = dx * dx + dy * dy + dz * dz;
+    double dvec[3];
+    MFTLGetMinimumImageVector(obj->domain, dvec, pos_m, ring_a[i]->pos);
+    double new_len_sq = dvec[0] * dvec[0] + dvec[1] * dvec[1] + dvec[2] * dvec[2];
 
     // If the new edge will be longer than max allowed, reject the collapse!
     if (new_len_sq > params->max_edge_length_sq) return MFTL_FALSE;
@@ -667,10 +714,9 @@ int CollapseApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params
   {
     if (ring_b[i] == v_a_ptr) continue;
 
-    double dx = ring_b[i]->pos[0] - pos_m[0];
-    double dy = ring_b[i]->pos[1] - pos_m[1];
-    double dz = ring_b[i]->pos[2] - pos_m[2];
-    double new_len_sq = dx * dx + dy * dy + dz * dz;
+    double dvec[3];
+    MFTLGetMinimumImageVector(obj->domain, dvec, pos_m, ring_b[i]->pos);
+    double new_len_sq = dvec[0] * dvec[0] + dvec[1] * dvec[1] + dvec[2] * dvec[2];
 
     if (new_len_sq > params->max_edge_length_sq) return MFTL_FALSE;
   }
@@ -975,6 +1021,12 @@ void MFTLFinalizeRemeshing(MFTL_Object *obj, int start_num_v, int start_num_t, i
   {
     if (obj->triangles[i].flags & MFTL_FLAG_DEAD)
     {
+      // Stage 12: free the dead triangle's user payload. Live triangles move
+      // by struct assignment below, so their blob pointer rides along
+      // automatically (this is why the payload is a per-triangle heap blob
+      // rather than a contiguous pool, which would need an explicit
+      // permutation at every reorder/growth site).
+      if (obj->data_size > 0) free(obj->triangles[i].data);
       t_map[i] = MFTL_ERROR;
     }
     else
@@ -1122,6 +1174,8 @@ void MFTLSmoothTangential(MFTL_Object *obj, MFTL_SmoothMode mode, double relaxat
       int feat_count = 0;
       double line_center[3] = {0, 0, 0};
 
+      // Neighbour contributions are re-imaged into v's periodic image (exact
+      // copies when non-periodic), so a ring crossing a seam stays contiguous.
       MFTL_HalfEdge *curr = MFTLVOutHe(obj, v);
       MFTL_HalfEdge *start = curr;
 
@@ -1135,17 +1189,21 @@ void MFTLSmoothTangential(MFTL_Object *obj, MFTL_SmoothMode mode, double relaxat
             bnd_count++;
             // Add neighbor position
             int nbr_v = obj->half_edges[curr->next_idx].vertex_idx;
-            line_center[0] += obj->vertices[nbr_v].pos[0];
-            line_center[1] += obj->vertices[nbr_v].pos[1];
-            line_center[2] += obj->vertices[nbr_v].pos[2];
+            double u[3];
+            MFTLUnwrapToAnchor(obj->domain, u, obj->vertices[nbr_v].pos, v->pos);
+            line_center[0] += u[0];
+            line_center[1] += u[1];
+            line_center[2] += u[2];
           }
           else if (curr->flags & MFTL_FLAG_FEATURE)
           {
             feat_count++;
             int nbr_v = curr->vertex_idx;
-            line_center[0] += obj->vertices[nbr_v].pos[0];
-            line_center[1] += obj->vertices[nbr_v].pos[1];
-            line_center[2] += obj->vertices[nbr_v].pos[2];
+            double u[3];
+            MFTLUnwrapToAnchor(obj->domain, u, obj->vertices[nbr_v].pos, v->pos);
+            line_center[0] += u[0];
+            line_center[1] += u[1];
+            line_center[2] += u[2];
           }
 
           MFTL_HalfEdge *twin = MFTLHeTwin(obj, curr);
@@ -1181,9 +1239,11 @@ void MFTLSmoothTangential(MFTL_Object *obj, MFTL_SmoothMode mode, double relaxat
           degree = MFTLGetVertexOneRingVertices(obj, v, ring_verts, 32, MFTL_TRUE);
           for (int k = 0; k < degree; ++k)
           {
-            center[0] += ring_verts[k]->pos[0];
-            center[1] += ring_verts[k]->pos[1];
-            center[2] += ring_verts[k]->pos[2];
+            double u[3];
+            MFTLUnwrapToAnchor(obj->domain, u, ring_verts[k]->pos, v->pos);
+            center[0] += u[0];
+            center[1] += u[1];
+            center[2] += u[2];
           }
         }
         else  // MFTL_SMOOTH_TRIANGLE_BASED
@@ -1193,9 +1253,13 @@ void MFTLSmoothTangential(MFTL_Object *obj, MFTL_SmoothMode mode, double relaxat
           {
             MFTL_Vertex *t_verts[3];
             MFTLGetTriangleVertices(obj, ring_tris[k], t_verts);
-            center[0] += (t_verts[0]->pos[0] + t_verts[1]->pos[0] + t_verts[2]->pos[0]) / 3.0;
-            center[1] += (t_verts[0]->pos[1] + t_verts[1]->pos[1] + t_verts[2]->pos[1]) / 3.0;
-            center[2] += (t_verts[0]->pos[2] + t_verts[1]->pos[2] + t_verts[2]->pos[2]) / 3.0;
+            double u0[3], u1[3], u2[3];
+            MFTLUnwrapToAnchor(obj->domain, u0, t_verts[0]->pos, v->pos);
+            MFTLUnwrapToAnchor(obj->domain, u1, t_verts[1]->pos, v->pos);
+            MFTLUnwrapToAnchor(obj->domain, u2, t_verts[2]->pos, v->pos);
+            center[0] += (u0[0] + u1[0] + u2[0]) / 3.0;
+            center[1] += (u0[1] + u1[1] + u2[1]) / 3.0;
+            center[2] += (u0[2] + u1[2] + u2[2]) / 3.0;
           }
         }
 
@@ -1216,8 +1280,9 @@ void MFTLSmoothTangential(MFTL_Object *obj, MFTL_SmoothMode mode, double relaxat
             MFTL_Vertex *v1 = ring_verts[k];
             MFTL_Vertex *v2 = ring_verts[(k + 1) % degree];  // CCW neighbor
 
-            double d1[3] = {v1->pos[0] - v->pos[0], v1->pos[1] - v->pos[1], v1->pos[2] - v->pos[2]};
-            double d2[3] = {v2->pos[0] - v->pos[0], v2->pos[1] - v->pos[1], v2->pos[2] - v->pos[2]};
+            double d1[3], d2[3];
+            MFTLGetMinimumImageVector(obj->domain, d1, v->pos, v1->pos);
+            MFTLGetMinimumImageVector(obj->domain, d2, v->pos, v2->pos);
 
             nx += (d1[1] * d2[2] - d1[2] * d2[1]);
             ny += (d1[2] * d2[0] - d1[0] * d2[2]);
@@ -1254,6 +1319,8 @@ void MFTLSmoothTangential(MFTL_Object *obj, MFTL_SmoothMode mode, double relaxat
       obj->vertices[i].pos[0] = new_pos[i][0];
       obj->vertices[i].pos[1] = new_pos[i][1];
       obj->vertices[i].pos[2] = new_pos[i][2];
+      // keep the wrapped-storage invariant (no-op when non-periodic)
+      MFTLApplyPeriodicity(obj->domain, obj->vertices[i].pos);
     }
   }
   free(new_pos);
@@ -1508,24 +1575,20 @@ double MFTL_TriangleQuality(const MFTL_Object* obj, int tri_idx)
 {
   MFTL_Vertex* vv[3];
   MFTLGetTriangleVertices(obj, &obj->triangles[tri_idx], vv);
-  double e0 = 0.0, e1 = 0.0, e2 = 0.0;
-  for (int k = 0; k < 3; ++k)
-  {
-    double d;
-    d = vv[1]->pos[k] - vv[0]->pos[k];
-    e0 += d * d;
-    d = vv[2]->pos[k] - vv[1]->pos[k];
-    e1 += d * d;
-    d = vv[0]->pos[k] - vv[2]->pos[k];
-    e2 += d * d;
-  }
+  // minimum-image edge vectors (raw differences when non-periodic)
+  double v01[3], v12[3], v20[3], v02[3];
+  MFTLGetMinimumImageVector(obj->domain, v01, vv[0]->pos, vv[1]->pos);
+  MFTLGetMinimumImageVector(obj->domain, v12, vv[1]->pos, vv[2]->pos);
+  MFTLGetMinimumImageVector(obj->domain, v20, vv[2]->pos, vv[0]->pos);
+  MFTLGetMinimumImageVector(obj->domain, v02, vv[0]->pos, vv[2]->pos);
+  double e0 = v01[0] * v01[0] + v01[1] * v01[1] + v01[2] * v01[2];
+  double e1 = v12[0] * v12[0] + v12[1] * v12[1] + v12[2] * v12[2];
+  double e2 = v20[0] * v20[0] + v20[1] * v20[1] + v20[2] * v20[2];
   double a = sqrt(e0), b = sqrt(e1), c = sqrt(e2);
   double p = a + b + c;
-  double c0[3] = {vv[1]->pos[0] - vv[0]->pos[0], vv[1]->pos[1] - vv[0]->pos[1], vv[1]->pos[2] - vv[0]->pos[2]};
-  double c1[3] = {vv[2]->pos[0] - vv[0]->pos[0], vv[2]->pos[1] - vv[0]->pos[1], vv[2]->pos[2] - vv[0]->pos[2]};
-  double cx = c0[1] * c1[2] - c0[2] * c1[1];
-  double cy = c0[2] * c1[0] - c0[0] * c1[2];
-  double cz = c0[0] * c1[1] - c0[1] * c1[0];
+  double cx = v01[1] * v02[2] - v01[2] * v02[1];
+  double cy = v01[2] * v02[0] - v01[0] * v02[2];
+  double cz = v01[0] * v02[1] - v01[1] * v02[0];
   double A = 0.5 * sqrt(cx * cx + cy * cy + cz * cz);
   if (A < MFTL_VERYSMALL) return 1e9;  // degenerate: worst quality
   return (p * p / A) / 20.78460969;
@@ -1562,25 +1625,25 @@ int MFTLBotschKobbeltCurvatureThreshold(MFTL_Object* obj, int he_idx, MFTL_Remes
   return edge_length < low;
 }
 
-static inline double mftlTriQualityFromPos(const double a[3], const double b[3], const double c[3])
+static inline double mftlTriQualityFromPos(const MFTL_Domain* dom, const double a[3], const double b[3], const double c[3])
 {
+  // minimum-image edge vectors (raw differences when non-periodic)
+  double v01[3], v12[3], v20[3], v02[3];
+  MFTLGetMinimumImageVector(dom, v01, a, b);
+  MFTLGetMinimumImageVector(dom, v12, b, c);
+  MFTLGetMinimumImageVector(dom, v20, c, a);
+  MFTLGetMinimumImageVector(dom, v02, a, c);
   double e0 = 0.0, e1 = 0.0, e2 = 0.0;
   for (int k = 0; k < 3; ++k)
   {
-    double d;
-    d = b[k] - a[k];
-    e0 += d * d;
-    d = c[k] - b[k];
-    e1 += d * d;
-    d = a[k] - c[k];
-    e2 += d * d;
+    e0 += v01[k] * v01[k];
+    e1 += v12[k] * v12[k];
+    e2 += v20[k] * v20[k];
   }
   double p = sqrt(e0) + sqrt(e1) + sqrt(e2);
-  double c0[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
-  double c1[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
-  double cx = c0[1] * c1[2] - c0[2] * c1[1];
-  double cy = c0[2] * c1[0] - c0[0] * c1[2];
-  double cz = c0[0] * c1[1] - c0[1] * c1[0];
+  double cx = v01[1] * v02[2] - v01[2] * v02[1];
+  double cy = v01[2] * v02[0] - v01[0] * v02[2];
+  double cz = v01[0] * v02[1] - v01[1] * v02[0];
   double A = 0.5 * sqrt(cx * cx + cy * cy + cz * cz);
   if (A < MFTL_VERYSMALL) return 1e9;
   return (p * p / A) / 20.78460969;
@@ -1608,8 +1671,8 @@ int FlipApprovedWithParams(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* 
 
   // Quality gate: reject when a created triangle would be worse than the
   // configured worst quality.
-  double q1 = mftlTriQualityFromPos(pc, pd, pa);
-  double q2 = mftlTriQualityFromPos(pc, pd, pb);
+  double q1 = mftlTriQualityFromPos(obj->domain, pc, pd, pa);
+  double q2 = mftlTriQualityFromPos(obj->domain, pc, pd, pb);
   if (q1 > params->max_quality_threshold || q2 > params->max_quality_threshold) return MFTL_FALSE;
 
   // Dihedral gate: reject when the angle between the new triangle normals
@@ -1617,13 +1680,15 @@ int FlipApprovedWithParams(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* 
   if (params->max_angle_between_tris < 179.0)
   {
     double n1[3], n2[3];
-    double u1[3] = {pd[0] - pc[0], pd[1] - pc[1], pd[2] - pc[2]};
-    double u2[3] = {pa[0] - pc[0], pa[1] - pc[1], pa[2] - pc[2]};
+    // minimum-image legs (raw differences when non-periodic)
+    double u1[3], u2[3], w1[3], w2[3];
+    MFTLGetMinimumImageVector(obj->domain, u1, pc, pd);
+    MFTLGetMinimumImageVector(obj->domain, u2, pc, pa);
+    MFTLGetMinimumImageVector(obj->domain, w1, pc, pd);
+    MFTLGetMinimumImageVector(obj->domain, w2, pc, pb);
     n1[0] = u1[1] * u2[2] - u1[2] * u2[1];
     n1[1] = u1[2] * u2[0] - u1[0] * u2[2];
     n1[2] = u1[0] * u2[1] - u1[1] * u2[0];
-    double w1[3] = {pd[0] - pc[0], pd[1] - pc[1], pd[2] - pc[2]};
-    double w2[3] = {pb[0] - pc[0], pb[1] - pc[1], pb[2] - pc[2]};
     n2[0] = w1[1] * w2[2] - w1[2] * w2[1];
     n2[1] = w1[2] * w2[0] - w1[0] * w2[2];
     n2[2] = w1[0] * w2[1] - w1[1] * w2[0];
@@ -1721,9 +1786,12 @@ void MFTLSmoothTangentialWithParams(MFTL_Object* obj, MFTL_RemeshParameters* par
             Lavg += Lv / 3.0;
           }
           double w = t->area * Lavg;
-          center[0] += w * t->center[0];
-          center[1] += w * t->center[1];
-          center[2] += w * t->center[2];
+          // re-image the stored (wrapped) centroid into v's periodic image
+          double tc[3];
+          MFTLUnwrapToAnchor(obj->domain, tc, t->center, v->pos);
+          center[0] += w * tc[0];
+          center[1] += w * tc[1];
+          center[2] += w * tc[2];
           denom += w;
         }
       }
@@ -1732,9 +1800,12 @@ void MFTLSmoothTangentialWithParams(MFTL_Object* obj, MFTL_RemeshParameters* par
         int degree = MFTLGetVertexOneRingVertices(obj, v, ring_verts, 64, MFTL_TRUE);
         for (int k = 0; k < degree; ++k)
         {
-          center[0] += ring_verts[k]->pos[0];
-          center[1] += ring_verts[k]->pos[1];
-          center[2] += ring_verts[k]->pos[2];
+          // neighbour re-imaged into v's periodic image (plain copy otherwise)
+          double u[3];
+          MFTLUnwrapToAnchor(obj->domain, u, ring_verts[k]->pos, v->pos);
+          center[0] += u[0];
+          center[1] += u[1];
+          center[2] += u[2];
         }
         denom = degree;
       }
@@ -1750,8 +1821,9 @@ void MFTLSmoothTangentialWithParams(MFTL_Object* obj, MFTL_RemeshParameters* par
       {
         MFTL_Vertex* v1 = ring_verts[k];
         MFTL_Vertex* v2 = ring_verts[(k + 1) % degree];
-        double d1[3] = {v1->pos[0] - v->pos[0], v1->pos[1] - v->pos[1], v1->pos[2] - v->pos[2]};
-        double d2[3] = {v2->pos[0] - v->pos[0], v2->pos[1] - v->pos[1], v2->pos[2] - v->pos[2]};
+        double d1[3], d2[3];
+        MFTLGetMinimumImageVector(obj->domain, d1, v->pos, v1->pos);
+        MFTLGetMinimumImageVector(obj->domain, d2, v->pos, v2->pos);
         nx += (d1[1] * d2[2] - d1[2] * d2[1]);
         ny += (d1[2] * d2[0] - d1[0] * d2[2]);
         nz += (d1[0] * d2[1] - d1[1] * d2[0]);
@@ -1777,7 +1849,7 @@ void MFTLSmoothTangentialWithParams(MFTL_Object* obj, MFTL_RemeshParameters* par
         {
           MFTL_Vertex* tv[3];
           MFTLGetTriangleVertices(obj, tris[k], tv);
-          double qb = mftlTriQualityFromPos(tv[0]->pos, tv[1]->pos, tv[2]->pos);
+          double qb = mftlTriQualityFromPos(obj->domain, tv[0]->pos, tv[1]->pos, tv[2]->pos);
           double p0[3], p1[3], p2[3];
           memcpy(p0, tv[0]->pos, sizeof(p0));
           memcpy(p1, tv[1]->pos, sizeof(p1));
@@ -1785,7 +1857,7 @@ void MFTLSmoothTangentialWithParams(MFTL_Object* obj, MFTL_RemeshParameters* par
           if (tv[0] == v) memcpy(p0, cand, sizeof(p0));
           if (tv[1] == v) memcpy(p1, cand, sizeof(p1));
           if (tv[2] == v) memcpy(p2, cand, sizeof(p2));
-          double qa = mftlTriQualityFromPos(p0, p1, p2);
+          double qa = mftlTriQualityFromPos(obj->domain, p0, p1, p2);
           if (qb > q_before) q_before = qb;
           if (qa > q_after) q_after = qa;
         }
@@ -1800,6 +1872,8 @@ void MFTLSmoothTangentialWithParams(MFTL_Object* obj, MFTL_RemeshParameters* par
       if (obj->vertices[i].is_ghost) continue;  // Stage 10: ghosts are synced from their owner, never written here
       if ((obj->vertices[i].flags & MFTL_FLAG_DEAD) || obj->vertices[i].out_he_idx == MFTL_ERROR) continue;
       memcpy(obj->vertices[i].pos, new_pos[i], 3 * sizeof(double));
+      // keep the wrapped-storage invariant (no-op when non-periodic)
+      MFTLApplyPeriodicity(obj->domain, obj->vertices[i].pos);
     }
   }
   free(new_pos);

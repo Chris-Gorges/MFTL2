@@ -1,12 +1,71 @@
 #include "mftl_bvh.h"
 #include "mftl_communication.h"
 #include "mftl_arrayfunctions.h"
+#include "mftl_geometry.h"
 #include <stdlib.h>
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 // Forward declaration
 int MFTL_TriTriProximity(MFTL_Object* objA, int triA_id, MFTL_Object* objB, int triB_id, double proximity_tolerance);
+
+/* ------------------------------------------------------------------------- */
+/* Stage 13: periodic-aware box overlap                                      */
+/*                                                                           */
+/* On a periodic axis two intervals [a0,a1], [b0,b1] (wrapped storage)      */
+/* overlap iff B shifted by k*L, k in {-1,0,1}, overlaps A in the raw real  */
+/* line sense. This is conservative (a seam-straddling body whose raw box   */
+/* spans the whole period simply never prunes) and exact under the          */
+/* minimum-image constraint (true feature extents < L/2). Non-periodic axes */
+/* use the plain raw comparison, so the non-periodic path is bit-identical  */
+/* to the pre-Stage-13 code.                                                */
+/* ------------------------------------------------------------------------- */
+
+static inline int mftlIntervalOverlap1DPeriodic(double L, double amin, double amax, double bmin, double bmax)
+{
+  for (int s = -1; s <= 1; ++s)
+  {
+    double shift = s * L;
+    double bs0 = bmin + shift;
+    double bs1 = bmax + shift;
+    if (!(amax < bs0 || amin > bs1)) return 1;
+  }
+  return 0;
+}
+
+static int mftlIntervalOverlapDom(const MFTL_Domain* dom, const double minA[3], const double maxA[3], const double minB[3], const double maxB[3])
+{
+  for (int k = 0; k < 3; ++k)
+  {
+    if (dom->is_periodic[k])
+    {
+      if (!mftlIntervalOverlap1DPeriodic(dom->domain_size[k], minA[k], maxA[k], minB[k], maxB[k])) return 0;
+    }
+    else
+    {
+      if (maxA[k] < minB[k] || minA[k] > maxB[k]) return 0;
+    }
+  }
+  return 1;
+}
+
+// float variant for the LBVH node boxes (float->double promotion is exact)
+static int mftlAABBOverlapDom(const MFTL_Domain* dom, const float minA[3], const float maxA[3], const float minB[3], const float maxB[3])
+{
+  for (int k = 0; k < 3; ++k)
+  {
+    if (dom->is_periodic[k])
+    {
+      if (!mftlIntervalOverlap1DPeriodic(dom->domain_size[k], (double) minA[k], (double) maxA[k], (double) minB[k], (double) maxB[k])) return 0;
+    }
+    else
+    {
+      if (maxA[k] < minB[k] || minA[k] > maxB[k]) return 0;
+    }
+  }
+  return 1;
+}
 
 // Expands a 10-bit integer into 30 bits by inserting 2 zeros after each bit.
 static inline uint32_t MFTL_ExpandBits(uint32_t v)
@@ -195,6 +254,11 @@ int MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
   int num_neighbors = domain->num_neighbors;
   if (num_neighbors == 0) return MFTL_SUCCESS;
 
+  // Stage 12: payload byte streams derive their counts from the local
+  // data_size — refuse to transport on a cross-rank mismatch.
+  if (MFTLCheckTriangleDataSizeConsistency(objA) != MFTL_SUCCESS) return MFTL_ERROR;
+  if (objB != objA && MFTLCheckTriangleDataSizeConsistency(objB) != MFTL_SUCCESS) return MFTL_ERROR;
+
   // 1. Compute Macro-AABBs
   double local_aabbA_min[3] = {1e30, 1e30, 1e30}, local_aabbA_max[3] = {-1e30, -1e30, -1e30};
   double local_aabbB_min[3] = {1e30, 1e30, 1e30}, local_aabbB_max[3] = {-1e30, -1e30, -1e30};
@@ -267,9 +331,7 @@ int MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
     double* remoteB_min = &recv_aabb_both[n * 12 + 6];
     double* remoteB_max = &recv_aabb_both[n * 12 + 9];
 
-    int overlap_A_my_B_remote = 1;
-    for (int k = 0; k < 3; ++k)
-      if (local_aabbA_max[k] < remoteB_min[k] || local_aabbA_min[k] > remoteB_max[k]) overlap_A_my_B_remote = 0;
+    int overlap_A_my_B_remote = mftlIntervalOverlapDom(domain, local_aabbA_min, local_aabbA_max, remoteB_min, remoteB_max);
 
     if (overlap_A_my_B_remote)
     {
@@ -287,9 +349,7 @@ int MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
             if (p > tmax[d]) tmax[d] = p;
           }
         }
-        int tri_overlap = 1;
-        for (int k = 0; k < 3; ++k)
-          if (tmax[k] < remoteB_min[k] || tmin[k] > remoteB_max[k]) tri_overlap = 0;
+        int tri_overlap = mftlIntervalOverlapDom(domain, tmin, tmax, remoteB_min, remoteB_max);
 
         if (tri_overlap)
         {
@@ -299,9 +359,7 @@ int MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
       }
     }
 
-    int overlap_B_my_A_remote = 1;
-    for (int k = 0; k < 3; ++k)
-      if (local_aabbB_max[k] < remoteA_min[k] || local_aabbB_min[k] > remoteA_max[k]) overlap_B_my_A_remote = 0;
+    int overlap_B_my_A_remote = mftlIntervalOverlapDom(domain, local_aabbB_min, local_aabbB_max, remoteA_min, remoteA_max);
 
     if (overlap_B_my_A_remote)
     {
@@ -319,9 +377,7 @@ int MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
             if (p > tmax[d]) tmax[d] = p;
           }
         }
-        int tri_overlap = 1;
-        for (int k = 0; k < 3; ++k)
-          if (tmax[k] < remoteA_min[k] || tmin[k] > remoteA_max[k]) tri_overlap = 0;
+        int tri_overlap = mftlIntervalOverlapDom(domain, tmin, tmax, remoteA_min, remoteA_max);
 
         if (tri_overlap)
         {
@@ -380,6 +436,16 @@ int MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
   PackedTriangleComplex* sendbuf_triB = malloc(total_send_triB * sizeof(PackedTriangleComplex));
   PackedVertex* sendbuf_vertB = malloc(total_send_vertB * sizeof(PackedVertex));
 
+  // Stage 12: parallel payload byte streams. Byte counts ARE derivable here
+  // (n_recv_triA * objA->data_size, and data_size is collective), so no extra
+  // count exchange is needed.
+  const size_t dsA = objA->data_size;
+  const size_t dsB = objB->data_size;
+  char* sendbuf_dataA = MFTL_NULL;
+  char* sendbuf_dataB = MFTL_NULL;
+  if (dsA > 0) sendbuf_dataA = malloc((size_t) total_send_triA * dsA);
+  if (dsB > 0) sendbuf_dataB = malloc((size_t) total_send_triB * dsB);
+
   for (int n = 0; n < num_neighbors; n++)
   {
     int ptr_tA = sdispls_triA[n];
@@ -391,6 +457,20 @@ int MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
       MFTLPackSingleVertex(objA, objA->flat_tri_verts[3 * tri_idx + 0], &sendbuf_vertA[ptr_vA++], true);
       MFTLPackSingleVertex(objA, objA->flat_tri_verts[3 * tri_idx + 1], &sendbuf_vertA[ptr_vA++], true);
       MFTLPackSingleVertex(objA, objA->flat_tri_verts[3 * tri_idx + 2], &sendbuf_vertA[ptr_vA++], true);
+
+      // Stage 12: blob of the triangle in slot (sdispls_triA[n] + i)
+      if (dsA > 0)
+      {
+        if (objA->triangles[tri_idx].data == MFTL_NULL)
+        {
+          fprintf(stderr,
+                  "FATAL ERROR: MFTL_CreateSpatialGhosts: triangle (gid %d, body %d) has NULL data but data_size=%zu — "
+                  "call MFTLInitializeObjectData on all ranks before ghosting.\n",
+                  objA->triangles[tri_idx].global_id, objA->global_id, dsA);
+          exit(EXIT_FAILURE);
+        }
+        memcpy(sendbuf_dataA + (size_t) (sdispls_triA[n] + i) * dsA, objA->triangles[tri_idx].data, dsA);
+      }
     }
 
     int ptr_tB = sdispls_triB[n];
@@ -402,6 +482,20 @@ int MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
       MFTLPackSingleVertex(objB, objB->flat_tri_verts[3 * tri_idx + 0], &sendbuf_vertB[ptr_vB++], true);
       MFTLPackSingleVertex(objB, objB->flat_tri_verts[3 * tri_idx + 1], &sendbuf_vertB[ptr_vB++], true);
       MFTLPackSingleVertex(objB, objB->flat_tri_verts[3 * tri_idx + 2], &sendbuf_vertB[ptr_vB++], true);
+
+      // Stage 12: blob of the triangle in slot (sdispls_triB[n] + i)
+      if (dsB > 0)
+      {
+        if (objB->triangles[tri_idx].data == MFTL_NULL)
+        {
+          fprintf(stderr,
+                  "FATAL ERROR: MFTL_CreateSpatialGhosts: triangle (gid %d, body %d) has NULL data but data_size=%zu — "
+                  "call MFTLInitializeObjectData on all ranks before ghosting.\n",
+                  objB->triangles[tri_idx].global_id, objB->global_id, dsB);
+          exit(EXIT_FAILURE);
+        }
+        memcpy(sendbuf_dataB + (size_t) (sdispls_triB[n] + i) * dsB, objB->triangles[tri_idx].data, dsB);
+      }
     }
   }
 
@@ -419,9 +513,55 @@ int MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
   MPI_Neighbor_alltoallv(sendbuf_vertB, n_send_vertB, sdispls_vertB, MPI_PackedVertex, recvbuf_vertB, n_recv_vertB, rdispls_vertB, MPI_PackedVertex,
                          domain->comm_graph);
 
+  // Stage 12: exchange the payload byte streams (counts derived from the
+  // triangle counts; data_size is collective, so both sides agree).
+  char* recvbuf_dataA = MFTL_NULL;
+  char* recvbuf_dataB = MFTL_NULL;
+  if (dsA > 0)
+  {
+    int* cnt_s = calloc(num_neighbors, sizeof(int));
+    int* cnt_r = calloc(num_neighbors, sizeof(int));
+    int* sd = calloc(num_neighbors + 1, sizeof(int));
+    int* rd = calloc(num_neighbors + 1, sizeof(int));
+    for (int i = 0; i < num_neighbors; ++i)
+    {
+      cnt_s[i] = n_send_triA[i] * (int) dsA;
+      cnt_r[i] = n_recv_triA[i] * (int) dsA;
+      sd[i + 1] = sd[i] + cnt_s[i];
+      rd[i + 1] = rd[i] + cnt_r[i];
+    }
+    recvbuf_dataA = malloc((size_t) total_recv_triA * dsA);
+    MPI_Neighbor_alltoallv(sendbuf_dataA, cnt_s, sd, MPI_BYTE, recvbuf_dataA, cnt_r, rd, MPI_BYTE, domain->comm_graph);
+    free(cnt_s);
+    free(cnt_r);
+    free(sd);
+    free(rd);
+  }
+  if (dsB > 0)
+  {
+    int* cnt_s = calloc(num_neighbors, sizeof(int));
+    int* cnt_r = calloc(num_neighbors, sizeof(int));
+    int* sd = calloc(num_neighbors + 1, sizeof(int));
+    int* rd = calloc(num_neighbors + 1, sizeof(int));
+    for (int i = 0; i < num_neighbors; ++i)
+    {
+      cnt_s[i] = n_send_triB[i] * (int) dsB;
+      cnt_r[i] = n_recv_triB[i] * (int) dsB;
+      sd[i + 1] = sd[i] + cnt_s[i];
+      rd[i + 1] = rd[i] + cnt_r[i];
+    }
+    recvbuf_dataB = malloc((size_t) total_recv_triB * dsB);
+    MPI_Neighbor_alltoallv(sendbuf_dataB, cnt_s, sd, MPI_BYTE, recvbuf_dataB, cnt_r, rd, MPI_BYTE, domain->comm_graph);
+    free(cnt_s);
+    free(cnt_r);
+    free(sd);
+    free(rd);
+  }
+
   int old_tris_A = objA->n_triangles;
   for (int i = 0; i < total_recv_vertA; i++) MFTLAppendGhostVertex(objA, &recvbuf_vertA[i]);
-  for (int i = 0; i < total_recv_triA; i++) MFTLAppendGhostTriangle(objA, &recvbuf_triA[i]);
+  for (int i = 0; i < total_recv_triA; i++)
+    MFTLAppendGhostTriangle(objA, &recvbuf_triA[i], dsA > 0 ? (const void*) (recvbuf_dataA + (size_t) i * dsA) : MFTL_NULL);
 
   if (total_recv_triA > 0)
   {
@@ -447,7 +587,8 @@ int MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
 
   int old_tris_B = objB->n_triangles;
   for (int i = 0; i < total_recv_vertB; i++) MFTLAppendGhostVertex(objB, &recvbuf_vertB[i]);
-  for (int i = 0; i < total_recv_triB; i++) MFTLAppendGhostTriangle(objB, &recvbuf_triB[i]);
+  for (int i = 0; i < total_recv_triB; i++)
+    MFTLAppendGhostTriangle(objB, &recvbuf_triB[i], dsB > 0 ? (const void*) (recvbuf_dataB + (size_t) i * dsB) : MFTL_NULL);
 
   if (total_recv_triB > 0)
   {
@@ -495,10 +636,14 @@ int MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB)
   free(sendbuf_vertA);
   free(sendbuf_triB);
   free(sendbuf_vertB);
+  free(sendbuf_dataA);  // Stage 12
+  free(sendbuf_dataB);  // Stage 12
   free(recvbuf_triA);
   free(recvbuf_vertA);
   free(recvbuf_triB);
   free(recvbuf_vertB);
+  free(recvbuf_dataA);  // Stage 12
+  free(recvbuf_dataB);  // Stage 12
 
   return MFTL_SUCCESS;
 }
@@ -531,8 +676,15 @@ MFTL_BVH* MFTL_GenerateLBVH(MFTL_Object* obj)
   float global_min[3] = {1e30f, 1e30f, 1e30f};
   float global_max[3] = {-1e30f, -1e30f, -1e30f};
 
-  // First pass compute centroids and bounds
-  /* ATTENTION: IS THIS CORRECT FOR PERIODIC DOMAINS ?*/
+  // First pass compute centroids and bounds.
+  // Periodicity (Stage 13 resolution of the old "IS THIS CORRECT?" note): with
+  // wrapped storage the raw centroids/bounds describe the STRETCHED embedding
+  // of seam-crossing triangles, which yields conservative (never too small)
+  // node boxes — safe for both ray casting and pair traversal. Periodic
+  // correctness is provided at the query level: per-pair minimum-image
+  // unwrapping (mftlTriCommonFrame) and shifted interval overlap
+  // (mftlAABBOverlapDom); point queries unwrap the whole body about a
+  // collective anchor before building the BVH (MFTLPointInsideObject).
   float* centroids = (float*) malloc(3 * obj->n_triangles * sizeof(float));
 
   for (int i = 0; i < obj->n_triangles; i++)
@@ -611,10 +763,46 @@ static inline int AABB_Overlap(const float minA[3], const float maxA[3], const f
   return 1;
 }
 
+// Domain-aware node overlap: raw comparison when non-periodic (bit-identical),
+// shifted-image test on periodic axes. A NULL domain (hand-built unit-test
+// objects) is treated as non-periodic.
+static inline int mftlNodeOverlap(const MFTL_Domain* dom, const float minA[3], const float maxA[3], const float minB[3], const float maxB[3])
+{
+  if (!dom || !MFTLDomainAnyPeriodic(dom)) return AABB_Overlap(minA, maxA, minB, maxB);
+  return mftlAABBOverlapDom(dom, minA, maxA, minB, maxB);
+}
+
+// Stage 13: materialize both triangles into ONE contiguous coordinate frame.
+// Each triangle is unwrapped about its own first vertex (resolving internal
+// seam stretching), then B is shifted by the integer period multiple that
+// places its centroid nearest A's centroid. Correct under the minimum-image
+// constraint (MFTLCheckMinimumImageConstraint).
+static void mftlTriCommonFrame(const MFTL_Domain* dom, const double* A0, const double* A1, const double* A2, const double* B0, const double* B1,
+                               const double* B2, double a[3][3], double b[3][3])
+{
+  memcpy(a[0], A0, 3 * sizeof(double));
+  MFTLUnwrapToAnchor(dom, a[1], A1, A0);
+  MFTLUnwrapToAnchor(dom, a[2], A2, A0);
+  memcpy(b[0], B0, 3 * sizeof(double));
+  MFTLUnwrapToAnchor(dom, b[1], B1, B0);
+  MFTLUnwrapToAnchor(dom, b[2], B2, B0);
+
+  double ca[3] = {(a[0][0] + a[1][0] + a[2][0]) / 3.0, (a[0][1] + a[1][1] + a[2][1]) / 3.0, (a[0][2] + a[1][2] + a[2][2]) / 3.0};
+  double cb[3] = {(b[0][0] + b[1][0] + b[2][0]) / 3.0, (b[0][1] + b[1][1] + b[2][1]) / 3.0, (b[0][2] + b[1][2] + b[2][2]) / 3.0};
+  for (int k = 0; k < 3; ++k)
+  {
+    if (!dom->is_periodic[k]) continue;
+    double s = dom->domain_size[k] * round((ca[k] - cb[k]) / dom->domain_size[k]);
+    if (s == 0.0) continue;
+    for (int i = 0; i < 3; ++i) b[i][k] += s;
+  }
+}
+
 static void TraverseBVHPair(MFTL_Object* objA, MFTL_BVH* bvhA, int nodeA, MFTL_Object* objB, MFTL_BVH* bvhB, int nodeB, IntersectionCallback callback,
                             void* user_data)
 {
-  if (!AABB_Overlap(bvhA->nodes[nodeA].aabb_min, bvhA->nodes[nodeA].aabb_max, bvhB->nodes[nodeB].aabb_min, bvhB->nodes[nodeB].aabb_max))
+  if (!mftlNodeOverlap(objA->domain, bvhA->nodes[nodeA].aabb_min, bvhA->nodes[nodeA].aabb_max, bvhB->nodes[nodeB].aabb_min,
+                       bvhB->nodes[nodeB].aabb_max))
   {
     return;
   }
@@ -692,7 +880,8 @@ void MFTL_IntersectObjects(MFTL_Object* objA, MFTL_BVH* bvhA, MFTL_Object* objB,
   {
     int rootA = bvhA->root_index;
     int rootB = bvhB->root_index;
-    if (!AABB_Overlap(bvhA->nodes[rootA].aabb_min, bvhA->nodes[rootA].aabb_max, bvhB->nodes[rootB].aabb_min, bvhB->nodes[rootB].aabb_max))
+    if (!mftlNodeOverlap(objA->domain, bvhA->nodes[rootA].aabb_min, bvhA->nodes[rootA].aabb_max, bvhB->nodes[rootB].aabb_min,
+                         bvhB->nodes[rootB].aabb_max))
     {
       return;  // The objects do not collide globally.
     }
@@ -814,6 +1003,22 @@ int MFTL_TriTriIntersect(MFTL_Object* objA, int triA_id, MFTL_Object* objB, int 
   const double* B0 = objB->vertices[b0_idx].pos;
   const double* B1 = objB->vertices[b1_idx].pos;
   const double* B2 = objB->vertices[b2_idx].pos;
+
+  // Stage 13: on periodic domains re-image both triangles into one contiguous
+  // frame (raw storage is torn across periodic faces). Non-periodic keeps the
+  // raw pointers — bit-identical. A NULL domain (hand-built unit-test objects)
+  // is treated as non-periodic.
+  double af[3][3], bf[3][3];
+  if (objA->domain && MFTLDomainAnyPeriodic(objA->domain))
+  {
+    mftlTriCommonFrame(objA->domain, A0, A1, A2, B0, B1, B2, af, bf);
+    A0 = af[0];
+    A1 = af[1];
+    A2 = af[2];
+    B0 = bf[0];
+    B1 = bf[1];
+    B2 = bf[2];
+  }
 
   // 1. Signed distances of Tri B's vertices to Tri A's plane
   double dB0 = MFTL_Orient3D(B0, A0, A1, A2);
@@ -1012,6 +1217,20 @@ int MFTL_TriTriProximity(MFTL_Object* objA, int triA_id, MFTL_Object* objB, int 
   const double* A[3] = {objA->vertices[a0_idx].pos, objA->vertices[a1_idx].pos, objA->vertices[a2_idx].pos};
   const double* B[3] = {objB->vertices[b0_idx].pos, objB->vertices[b1_idx].pos, objB->vertices[b2_idx].pos};
 
+  // Stage 13: one contiguous frame for both triangles on periodic domains
+  // (non-periodic keeps the raw pointers — bit-identical). A NULL domain
+  // (hand-built unit-test objects) is treated as non-periodic.
+  double af[3][3], bf[3][3];
+  if (objA->domain && MFTLDomainAnyPeriodic(objA->domain))
+  {
+    mftlTriCommonFrame(objA->domain, A[0], A[1], A[2], B[0], B[1], B[2], af, bf);
+    for (int i = 0; i < 3; ++i)
+    {
+      A[i] = af[i];
+      B[i] = bf[i];
+    }
+  }
+
   double min_dist_sq = 1e30;
 
   // 3. Evaluate 9 Edge-to-Edge Distances
@@ -1054,15 +1273,29 @@ void MFTLEnsembleIntersectObjects(MFTL_Ensemble* ensA, MFTL_Ensemble* ensB, Inte
   if (!ensA || ensA->num_objects == 0) return;
 
   // 1. Bulk Spatial Ghosting
+  // MFTL_CreateSpatialGhosts fails collective-consistently (its pre-communication
+  // contract check reduces over comm_cart), so all ranks bail at the same pair.
   if (ensB)
   {
     for (int i = 0; i < ensA->num_objects; i++)
-      for (int j = 0; j < ensB->num_objects; j++) MFTL_CreateSpatialGhosts(ensA->objects[i], ensB->objects[j]);
+      for (int j = 0; j < ensB->num_objects; j++)
+        if (MFTL_CreateSpatialGhosts(ensA->objects[i], ensB->objects[j]) != MFTL_SUCCESS)
+        {
+          fprintf(stderr, "ERROR: MFTLEnsembleIntersectObjects: spatial ghosting failed for object pair (%d, %d) — aborting intersection.\n",
+                  ensA->objects[i]->global_id, ensB->objects[j]->global_id);
+          return;
+        }
   }
   else
   {
     for (int i = 0; i < ensA->num_objects; i++)
-      for (int j = i + 1; j < ensA->num_objects; j++) MFTL_CreateSpatialGhosts(ensA->objects[i], ensA->objects[j]);
+      for (int j = i + 1; j < ensA->num_objects; j++)
+        if (MFTL_CreateSpatialGhosts(ensA->objects[i], ensA->objects[j]) != MFTL_SUCCESS)
+        {
+          fprintf(stderr, "ERROR: MFTLEnsembleIntersectObjects: spatial ghosting failed for object pair (%d, %d) — aborting intersection.\n",
+                  ensA->objects[i]->global_id, ensA->objects[j]->global_id);
+          return;
+        }
   }
 
   // 2. Generate Acceleration Structures (LBVH)

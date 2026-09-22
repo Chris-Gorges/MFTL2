@@ -190,6 +190,10 @@ static int tessellate_sphere(MFTL_Object *object)
 
   // --- 6. Swap and Cleanup ---
   free(object->vertices);
+  // Stage 12: free per-triangle payloads before replacing the triangle array
+  // wholesale (defensive; generation normally precedes MFTLInitializeObjectData).
+  if (object->data_size > 0)
+    for (size_t i = 0; i < old_nt; ++i) free(object->triangles[i].data);
   free(object->triangles);
   free(object->half_edges);
   free(midpoint_map);  // Done with the map!
@@ -422,6 +426,10 @@ int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int
   MFTLObjectUpdateGlobalStats(object);
 
   MFTLFlattenConnectivity(object);
+
+  // Stage 13: refuse periodic meshes that violate the minimum-image
+  // constraint (collective; empty on non-root ranks, so all ranks agree).
+  if (MFTLCheckMinimumImageConstraint(object) != MFTL_SUCCESS) return MFTL_ERROR;
 
   return MFTL_SUCCESS;
 }

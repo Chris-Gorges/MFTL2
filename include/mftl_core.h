@@ -179,6 +179,19 @@ typedef struct MFTL_Object
 
   int global_id;  ///< A unique ID across all processors for tracking.
 
+  /* Size in bytes of the opaque per-triangle user payload (MFTL_Triangle.data).
+   *
+   * CONTRACT (mirrors MFTL1's Object->SizeOfData):
+   * - The blob MUST be a flat POD: no embedded pointers — a pointer stored in
+   *   the blob would only be a valid address on the rank that wrote it.
+   * - data_size MUST be set collectively and identically on all ranks via
+   *   MFTLInitializeObjectData() BEFORE any redistribution/ghosting. The
+   *   transport layer ships data_size bytes per triangle as MPI_BYTE without
+   *   any size negotiation; a mismatch across ranks SILENTLY CORRUPTS data.
+   * - data_size == 0 (default) disables the payload entirely (fast path:
+   *   every triangle's data pointer stays NULL). */
+  size_t data_size;
+
   // Pointer to the domain this object lives in.
   struct MFTL_Domain *domain;
 
@@ -278,6 +291,40 @@ typedef struct MFTL_Ensemble
  * @return A pointer to the newly allocated mesh, or NULL on failure.
  */
 MFTL_Object *MFTLObjectCreate(int global_id);
+
+/**
+ * @brief Returns the opaque user payload of a triangle (MFTL_Triangle.data).
+ * @return The blob pointer, or NULL when the object has no payload (data_size == 0).
+ */
+static inline void *MFTLGetTriangleData(const MFTL_Object *obj, const MFTL_Triangle *tri)
+{
+  return (obj->data_size == 0) ? MFTL_NULL : tri->data;
+}
+
+/**
+ * @brief Copies obj->data_size bytes from src into the triangle's payload blob.
+ * No-op when obj->data_size == 0. The blob must be a flat POD (see MFTL_Object.data_size).
+ */
+static inline void MFTLSetTriangleData(MFTL_Object *obj, MFTL_Triangle *tri, const void *src)
+{
+  if (obj->data_size == 0) return;
+  memcpy(tri->data, src, obj->data_size);
+}
+
+/**
+ * @brief Initializes the opaque per-triangle user payload for an object.
+ *
+ * Sets object->data_size and allocates a zeroed blob of data_size bytes for
+ * every existing triangle (local and ghost). Must be called collectively with
+ * the SAME data_size on all ranks before any redistribution/ghosting.
+ * Idempotent for the same size; re-initializing with a DIFFERENT non-zero
+ * size is rejected (no re-init).
+ *
+ * @param object The object.
+ * @param data_size Payload size in bytes per triangle (0 = disable).
+ * @return MFTL_SUCCESS on success, MFTL_ERROR on a re-init mismatch.
+ */
+int MFTLInitializeObjectData(MFTL_Object *object, size_t data_size);
 
 /**
  * @brief Frees all memory associated with an MFTL_Object mesh.
