@@ -230,11 +230,30 @@ rebuilt vertex array; the receiver now classifies ownership only from sender-aut
 copies with hash-based dedup (`write_count==n_unique`, exactly-once ownership), and non-ghost
 vertices without a non-ghost incident triangle are shipped explicitly. Fix stress-verified:
 wide seam-straddler `PeriodicEndToEnd` np8 ASan ×15 clean, non-periodic `RemeshParallel`/
-`TriangleData` np8 ASan clean. **Carry-forward (pre-existing, NOT a Stage-13 regression):**
-`test_vertex_fitting_validity` fails only under `-DMFTL_USE_LAPACK=ON` (paraboloid deviation
-`5.032e-02` vs the `0.05` gate) and leaks on its early return — identical at Stage-10 HEAD
-`8a58cb4`; loosen the paraboloid tolerance and make the test destroy-before-assert. Stages
-14–15 NOT STARTED. The **winding convention is RESOLVED and APPLIED** (invariant #2): MFTL2
+`TriangleData` np8 ASan clean. **Carry-forward RESOLVED (2026-09-22):** the LAPACK-on
+`test_vertex_fitting_validity` failure (`5.032e-02` vs `0.05`) was a genuine Stage-08 port
+bug, not a tolerance issue: the paraboloid fit stencil (`mftlGatherFitNeighbours`) excluded
+the edge endpoints and used the asymmetric one-ring union, while MFTL1's `ParaboloidFit`
+fits the symmetric diamond stencil (both endpoints + adjacent/complementary triangle
+vertices) gathered from the intact edge BEFORE the split. Restored to MFTL1 parity in
+`vertex_fit.c` (split path gathers stencil/frame pre-split); deviation is now `5.5e-05`
+(barycentric: `3.1e-03`) and the tolerance stays `0.05`. The test now also destroys the
+ensemble before asserting (no misleading LSan leak on failure). Verified: Release +
+ASan/UBSan/LSan 53/53 in BOTH LAPACK-off and LAPACK-on builds. Stages
+14–15 NOT STARTED.
+
+**Stage 16 (code-quality/documentation cleanup + MFTL2 manual) — PLANNED, NOT STARTED.** Runs
+**only after Stage 15 is complete and fully accepted**, when the code, public API, and multiflow
+coupling are stable. Purpose: a repository-wide, **behaviour-preserving** cleanup —
+(16A) comments/file-header standardization and terminology, (16B) internal naming/style
+(public API, types, macros, struct fields and MPI packed layouts frozen), (16C) directory/file
+reorganization, large-file splits and de-duplication (bit-identical), public/private header
+separation, and (16D) a new LaTeX MFTL2 manual under `doc/` conceptually modelled on MFTL1's
+`mftl-doc/MFTL.tex` but describing the actual half-edge/array/`khash`/periodic MFTL2, closed by
+(16E) a full consistency + regression gate. No intended numerical change; no public-API change
+without explicit approval; behaviour/perf fixes surfaced during cleanup (linear-search→hash,
+boundary-cleanup distributed variant, point-query BVH cache, paraboloid tolerance) are
+**documented and deferred**, not performed. Details in `plans/16`. The **winding convention is RESOLVED and APPLIED** (invariant #2): MFTL2
 standardizes on **outward winding / `V > 0`** for all closed meshes; the sphere generator
 and the affected sign-pinned tests have been updated and independently reviewed.
 
@@ -335,9 +354,11 @@ counters between gather and serial kernel (rank 0 could otherwise mint colliding
 `12` opaque Data transport (front-tracking prereq).
 `{02,06,07,10,11}` → `13` periodicity completion.
 `14` CFD adapter (early, vs MFTL1) → `15` MFTL1→MFTL2 swap (depends on 02–14).
+`15` (complete + accepted) → `16` code-quality/documentation cleanup + MFTL2 manual.
 
 **Critical path to a usable, faster, periodic library**: 01→02→05→06→08→09→10→13.
 **Migration path**: 14 (early, low-risk) then 15 (last).
+**Polish path**: 16 (after migration is done and stable — behaviour-preserving cleanup + manual).
 
 ## Top technical risks
 

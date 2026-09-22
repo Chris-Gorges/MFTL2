@@ -260,7 +260,7 @@ int test_vertex_fitting_validity()
     MFTLSplitEdgeWithFit(obj, j, &params);
   }
 
-  TEST_ASSERT(MFTLCheckMeshIntegrity(obj) == MFTL_SUCCESS);
+  int mesh_ok = (MFTLCheckMeshIntegrity(obj) == MFTL_SUCCESS);
 
   // Fitted midpoints must stay close to the unit sphere.
   double max_dev = 0.0;
@@ -273,9 +273,12 @@ int test_vertex_fitting_validity()
     if (dev > max_dev) max_dev = dev;
   }
   if (g_rank == 0) printf("  max radial deviation after fit-split: %.3e\n", max_dev);
-  TEST_ASSERT(max_dev < 0.05);
 
+  // Destroy BEFORE asserting: a failing assert must not leak the ensemble
+  // (LSan would report a misleading leak on top of the real failure).
   MFTLEnsembleDestroy(&ens);
+  TEST_ASSERT(mesh_ok);
+  TEST_ASSERT(max_dev < 0.05);
   return 0;
 }
 

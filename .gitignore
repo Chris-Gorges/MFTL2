@@ -28,3 +28,4 @@ lib/
 info
 poltergeist.config.json
 run_mpi.sh
+build*/

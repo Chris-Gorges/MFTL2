@@ -92,3 +92,42 @@ harness (as MFTL2's `test_remeshing` does). No PETSc.
 - All operators keep a valid, closed, integrity-passing half-edge mesh (np1) under ASan.
 - Isotropic remesh converges edge lengths to target and improves quality; bounded volume drift.
 - Feature edges preserved; LAPACK-on and LAPACK-off builds both pass.
+
+## Follow-up (2026-09-22): paraboloid-fit stencil + timing corrected — MFTL1 porting defect
+
+> **Reviewed & ACCEPTED (Claude Code, 2026-09-22).** A genuine MFTL1→MFTL2 porting defect in the
+> paraboloid fit (surfaced by the Stage-13 review's LAPACK-on run) was root-caused and fixed in
+> `src/remeshing/vertex_fit.c`. It was **not** a test-tolerance issue.
+>
+> **Defect.** The paraboloid neighbourhood was gathered as `one-ring(A) ∪ one-ring(B)` **with the
+> two edge endpoints A,B explicitly excluded**, and it was gathered **after** `MFTLSplitEdge`
+> (from the already-rewired topology). MFTL1 (`vertexfitting.c:FindNeighbourhoodVertices`,
+> `edgesplit.c`) instead fits on the **intact** diamond, using a stencil **symmetric about the
+> edge midpoint** (where the paraboloid is evaluated): the vertices of the two edge-adjacent
+> triangles **including both endpoints**, plus the vertices of the up-to-four complementary
+> triangles across the diamond's outer edges. Excluding the endpoints and gathering post-split
+> left the fit with no data near the evaluation centre, so it extrapolated — mis-placing fitted
+> vertices (radial error `5.03e-2` on a unit sphere, vs the `0.05` gate).
+>
+> **Fix.** `mftlGatherFitNeighbours` now reconstructs MFTL1's symmetric diamond+complementary
+> stencil (endpoints included), falling back to the endpoint one-ring union only for degenerate
+> diamonds (missing twin/complementary), mirroring MFTL1's `FindNeighbourhoodVertices` growth
+> fallback. `MFTLSplitEdgeWithFit` gathers the stencil **and** the {u,w} frame from the **intact**
+> edge **before** `MFTLSplitEdge`, then applies the fit to the new midpoint vertex — correct
+> because the split only appends the new vertex and rewires half-edges, leaving every stencil
+> vertex's index and position unchanged (MFTL1 `edgesplit.c` fits before the rewire, equivalently).
+> `MFTLCollapseEdgeWithFit` already gathers the intact-edge stencil before the collapse and now
+> benefits from the same corrected stencil (matches MFTL1 `edgecollapse.c`: midvertex at the
+> midpoint, fit on the intact edge, then collapse). `mftlParaboloidFitAt` centre `c = midpoint`,
+> frame `w = Σ one-ring normals` (from current geometry), design matrix and evaluation reproduce
+> MFTL1.
+>
+> **Result (genuine, not overfitting).** Radial deviation `5.03e-2 → 5.46e-5` (~920× better) —
+> the accuracy a 2nd-order fit of a smooth sphere is expected to achieve, and ~50× better than the
+> linear barycentric fit (`3.05e-3`), the correct ordering. The test threshold (`0.05`) was
+> **kept** (not loosened); `test_vertex_fitting_validity` also now destroys the ensemble **before**
+> asserting so a failure can no longer produce a misleading LSan leak. Bounds safe
+> (`MFTL_FIT_MAX_NBR = 96` ≫ the ≤18 the gather can append; every append is guarded).
+> **Verified:** Release + ASan/UBSan/LSan, **LAPACK-on and LAPACK-off**, full suite **53/53** on
+> 1/2/4/8; periodic paraboloid path (Stage 13) clean on seam-straddlers (np8 ASan). No public API
+> change; non-paraboloid and non-periodic behaviour unaffected.

@@ -271,11 +271,14 @@ corner unwrap breaks the curvature gate; disabling the common frame yields 200 v
 hits) corroborate.
 
 **Should-fix (not blocking; pre-existing, independent of Stage 13):**
-- `test_vertex_fitting_validity` fails under `MFTL_USE_LAPACK=ON` (`5.032e-02` vs `0.05`) and
-  leaks on the early return. Either loosen the paraboloid tolerance to reflect the actual fit
-  accuracy (or investigate why the paraboloid fit is less accurate than barycentric here), and
-  restructure the test so a failing assert still runs `MFTLEnsembleDestroy` (goto-cleanup /
-  destroy-before-assert). Present identically at Stage 10; carried forward.
+- ~~`test_vertex_fitting_validity` fails under `MFTL_USE_LAPACK=ON` (`5.032e-02` vs `0.05`)~~
+  **RESOLVED (2026-09-22):** genuine Stage-08 port bug — the fit stencil excluded the edge
+  endpoints and was asymmetric around the evaluation point; restored MFTL1's symmetric
+  diamond stencil, gathered from the intact edge pre-split (`vertex_fit.c`). Deviation now
+  `5.5e-05`; tolerance unchanged; the test destroys the ensemble before asserting.
+  Independently reviewed & accepted (full write-up in `plans/08`, "Follow-up 2026-09-22"):
+  Release + ASan/UBSan/LSan, LAPACK-on **and** LAPACK-off, full suite **53/53** on 1/2/4/8;
+  periodic paraboloid path clean on seam-straddlers. No public-API or non-periodic change.
 
 **Optional improvements:**
 - Consolidate the duplicated collective-anchor helpers (`MFTLObjectUnwrapAnchor` in

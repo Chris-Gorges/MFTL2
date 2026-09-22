@@ -5,10 +5,15 @@
  * midpoints and collapse survivors back onto the surface.
  *
  * Port notes:
- *  - Neighbour set = union of the one-ring vertices of the edge endpoints
- *    (MFTL1 lists the corners of the two adjacent triangles plus the four
- *    complementary triangles — the same set). If fewer than 6 neighbours
- *    are available the vertex keeps its midpoint position.
+ *  - Neighbour set = vertices of the two triangles adjacent to the edge
+ *    (endpoints included) plus the vertices of the up-to-four complementary
+ *    triangles across the diamond's outer edges — MFTL1's stencil, symmetric
+ *    about the edge midpoint where the paraboloid is evaluated; the ring
+ *    union is only a fallback for degenerate diamonds (MFTL1
+ *    FindNeighbourhoodVertices). The split path gathers the stencil and
+ *    frame from the INTACT edge, before the topological split (MFTL1
+ *    edgesplit.c timing). If fewer than 6 neighbours are available the
+ *    vertex keeps its midpoint position.
  *  - Local frame {u, v, w}: w = normalized sum of neighbour vertex normals
  *    (vertex normals must be current — the driver computes them), u =
  *    edge direction made orthogonal to w, v = w x u.
@@ -131,18 +136,18 @@ static int mftlEdgeIsFeatureEx(MFTL_Object* obj, int he_idx, double angle_degree
   return dot < MFTL_COS(angle_degrees * MFTL_PI / 180.0);
 }
 
-// Union of the endpoint one-rings (by vertex index). Returns the count.
-static int mftlGatherFitNeighbours(MFTL_Object* obj, int he_idx, int* nbr)
+// Dedup-append a vertex index to nbr[] (capacity MFTL_FIT_MAX_NBR).
+static inline void mftlFitNbrAdd(int* nbr, int* nn, int vi)
 {
-  const MFTL_HalfEdge* he = &obj->half_edges[he_idx];
-  int he_next = he->next_idx;
-  int he_prev = obj->half_edges[he_next].next_idx;
-  int va = obj->half_edges[he_prev].vertex_idx;
-  int vb = he->vertex_idx;
+  for (int m = 0; m < *nn; ++m)
+    if (nbr[m] == vi) return;
+  if (*nn < MFTL_FIT_MAX_NBR) nbr[(*nn)++] = vi;
+}
 
+// Union of the endpoint one-rings (by vertex index). Returns the count.
+static int mftlGatherRingNeighbours(MFTL_Object* obj, int va, int vb, int* nbr)
+{
   int nn = 0;
-  int mark[MFTL_FIT_MAX_NBR];
-
   MFTL_Vertex* ring[64];
   int seeds[2] = {va, vb};
   for (int s = 0; s < 2; ++s)
@@ -152,17 +157,62 @@ static int mftlGatherFitNeighbours(MFTL_Object* obj, int he_idx, int* nbr)
     {
       int vi = (int) (ring[i] - obj->vertices);
       if (vi == va || vi == vb) continue;
-      int found = 0;
-      for (int m = 0; m < nn; ++m)
-        if (mark[m] == vi)
-        {
-          found = 1;
-          break;
-        }
-      if (!found && nn < MFTL_FIT_MAX_NBR) mark[nn++] = vi;
+      mftlFitNbrAdd(nbr, &nn, vi);
     }
   }
-  memcpy(nbr, mark, (size_t) nn * sizeof(int));
+  return nn;
+}
+
+// Fit stencil for the paraboloid (MFTL1 vertexfitting.c:ParaboloidFit): the
+// vertices of the two triangles adjacent to the edge — INCLUDING both edge
+// endpoints — plus the vertices of the up-to-four complementary triangles
+// across the diamond's outer edges. The stencil is symmetric around the edge
+// midpoint, which is exactly where the paraboloid is evaluated. (An earlier
+// port used ring(A) u ring(B) WITHOUT the endpoints — asymmetric around the
+// evaluation point, which extrapolated and mis-placed fitted vertices.)
+// Falls back to the ring union when the diamond stencil is degenerate
+// (missing twin/complementary triangles), mirroring MFTL1's
+// FindNeighbourhoodVertices fallback.
+static int mftlGatherFitNeighbours(MFTL_Object* obj, int he_idx, int* nbr)
+{
+  const MFTL_HalfEdge* he = &obj->half_edges[he_idx];
+  int he_next = he->next_idx;
+  int he_prev = obj->half_edges[he_next].next_idx;
+  int va = obj->half_edges[he_prev].vertex_idx;
+  int vb = he->vertex_idx;
+
+  int nn = 0;
+  int tri_he[6];  // the two edges' triangle half-edge triples
+  int ntri = 0;
+  tri_he[0] = he_idx;
+  tri_he[1] = he_next;
+  tri_he[2] = he_prev;
+  ntri = 3;
+  if (he->twin_idx != MFTL_ERROR)
+  {
+    int tw = he->twin_idx;
+    int tw_next = obj->half_edges[tw].next_idx;
+    tri_he[3] = tw;
+    tri_he[4] = tw_next;
+    tri_he[5] = obj->half_edges[tw_next].next_idx;
+    ntri = 6;
+  }
+  // Vertices of the adjacent triangles (endpoints included).
+  for (int i = 0; i < ntri; ++i) mftlFitNbrAdd(nbr, &nn, obj->half_edges[tri_he[i]].vertex_idx);
+  // Vertices of the complementary triangles across the diamond's outer edges.
+  for (int i = 1; i < ntri; ++i)
+  {
+    if (i == 3) continue;  // the twin of the split edge itself
+    int twin = obj->half_edges[tri_he[i]].twin_idx;
+    if (twin == MFTL_ERROR) continue;
+    int ct = twin;
+    for (int k = 0; k < 3; ++k)
+    {
+      mftlFitNbrAdd(nbr, &nn, obj->half_edges[ct].vertex_idx);
+      ct = obj->half_edges[ct].next_idx;
+    }
+  }
+  if (nn < 6) nn = mftlGatherRingNeighbours(obj, va, vb, nbr);  // expansion fallback
   return nn;
 }
 
@@ -373,8 +423,40 @@ void MFTLFitVertex(MFTL_Object* obj, int v_idx, int he_idx, MFTL_RemeshParameter
 
 int MFTLSplitEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParameters* params)
 {
+  // Paraboloid path: gather the stencil and frame from the INTACT edge,
+  // BEFORE the topological split (MFTL1 edgesplit.c calls ParaboloidFit
+  // before the edge is rewired; the stencil vertex positions are untouched
+  // by the split, so the precomputed set stays valid).
+  int have_stencil = 0, nvert = 0;
+  int nbr[MFTL_FIT_MAX_NBR];
+  double u_dir[3] = {0, 0, 0}, w_dir[3] = {0, 0, 0};
+  if (params && params->vertex_fit == MFTL_FIT_PARABOLOID &&
+      !mftlEdgeIsFeatureEx(obj, he_ab_idx, params->feature_angle_threshold))
+  {
+    nvert = mftlGatherFitNeighbours(obj, he_ab_idx, nbr);
+    if (nvert >= 6 && mftlFitFrameNormal(obj, nbr, nvert, w_dir) == MFTL_SUCCESS)
+    {
+      const MFTL_HalfEdge* he = &obj->half_edges[he_ab_idx];
+      int he_next = he->next_idx;
+      int he_prev = obj->half_edges[he_next].next_idx;
+      int va = obj->half_edges[he_prev].vertex_idx;
+      int vb = he->vertex_idx;
+      MFTLGetMinimumImageVector(obj->domain, u_dir, obj->vertices[va].pos, obj->vertices[vb].pos);
+      have_stencil = 1;
+    }
+  }
+
   int v_new = MFTLSplitEdge(obj, he_ab_idx);
-  if (v_new != MFTL_ERROR && v_new >= 0) MFTLFitVertex(obj, v_new, he_ab_idx, params);
+  if (v_new == MFTL_ERROR || v_new < 0) return v_new;
+
+  if (have_stencil)
+  {
+    if (mftlParaboloidFitAt(obj, v_new, nbr, nvert, u_dir, w_dir) == MFTL_SUCCESS) return v_new;
+    double fit[3];
+    if (mftlBarycentricFit(obj, v_new, he_ab_idx, fit) == MFTL_SUCCESS) memcpy(obj->vertices[v_new].pos, fit, 3 * sizeof(double));
+    return v_new;
+  }
+  MFTLFitVertex(obj, v_new, he_ab_idx, params);
   return v_new;
 }
 
