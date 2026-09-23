@@ -239,8 +239,67 @@ vertices) gathered from the intact edge BEFORE the split. Restored to MFTL1 pari
 `vertex_fit.c` (split path gathers stencil/frame pre-split); deviation is now `5.5e-05`
 (barycentric: `3.1e-03`) and the tolerance stays `0.05`. The test now also destroys the
 ensemble before asserting (no misleading LSan leak on failure). Verified: Release +
-ASan/UBSan/LSan 53/53 in BOTH LAPACK-off and LAPACK-on builds. Stages
-14–15 NOT STARTED.
+ASan/UBSan/LSan 53/53 in BOTH LAPACK-off and LAPACK-on builds. **Stage 14 IMPLEMENTED (2026-09-23, incl. final-fix round)** — redesigned
+MFTL-facing architecture, awaiting independent acceptance (see the Stage 14 paragraph below and
+`plans/14`, "Stage 14 completion"). Stage 15 NOT STARTED; it starts only after Stage 14 is
+accepted.
+
+**Stage 14** (front-tracking integration layer in multiflow, branch `berend-matrix`) —
+**IMPLEMENTED, pending review.** The 2026-09-22 review (M1–M3, S1–S5) is addressed by a
+redesign rather than a wrapper: `src/include/mftl_adapter.h` is a backend-independent contract
+(multiflow physics → integration layer → backend), bound to MFTL1 today through
+`mftl_adapter_mftl1{.h,_inline.h,.c}`; Stage 15 supplies the same three files for MFTL2.
+- *Object model:* `MFAdapterDecomposition` (multiflow-owned rectilinear rank boxes built from
+  the DMDA overlap mesh → MFTL2 `MFTL_Domain`), `MFAdapterBodyList` (bodies sharing one
+  decomposition/payload size → one `MFTL_Ensemble`), `MFAdapterMesh` (opaque body; standalone
+  bodies for serial IBM marker meshes). multiflow no longer stores `struct MFTL_Object` or
+  chains bodies through MFTL1 hashes.
+- *Handles:* MFTL2 tri/vert handles are pointers into the object arrays, edges the canonical
+  half-edge; mesh-context accessors where the record is insufficient (`TriCentreProc`);
+  canonical undirected edge id incl. the ghost rim; explicit invalidation rules.
+- *Decomposition/communication, mutation/construction, point queries, remeshing:* all 71
+  `ownershiprange*`, 16 `globalx*`, 25 `OBJECT_COMM_WORLD` reach-ins removed; vertex writes via
+  `MFAdapterVertPosMut`; builder + component copy/merge + neighbour completion + ghost-position
+  refresh as layer operations; build-once/query-many batch point queries and plain AABBs
+  (aligned/orthogonal no longer an API choice); backend-independent remesh settings.
+- *MFTL2 CMake:* target-scoped flags; portable by default (`-march=native` opt-in, GCC fat-LTO
+  objects), sanitizers only for Debug dev builds with an exported INTERFACE link flag,
+  tests/examples only when top-level; `find_package(MFTL2)` verified from build tree, install
+  prefix and an instrumented Debug archive, `add_subdirectory` verified; 53/53 Release and
+  Debug+ASan/UBSan; two latent `-Walloc-size-larger-than` sites fixed behaviour-identically.
+- *Verification (MFTL1 backend):* all golden baselines pass with the working tree (FT, FT_Sharp_CSF,
+  FT_Sharp_Integral, IBM np1/np4 without MFTL); HEAD-vs-working-tree A/B bit-identical on
+  np1 and np4 for FT, FT_Sharp_CSF, FT_Sharp_Integral and both IBM-MFTL marker paths (MoveIBM
+  body creation also identical); new integration-layer unit tests
+  (`multiflow/tools/mftladapter_tests`) 748 checks pass on 1–4 ranks. *Coverage gap:* the
+  marching-cubes reconstruction and `IsPointInsideOfParticle` could not be A/B-tested end to
+  end (the topology-change example stalls in `ExecuteMarchingCubes` identically at HEAD; MoveIBM
+  runs exceed 25 min per step) — covered by unit tests and review only.
+
+**Explicit Stage-15 carry-forwards (from Stage 14):**
+1. MFTL2 backend files + MFTL2 library items: L1 rectilinear per-axis cuts/rank map in
+   `MFTL_Domain`; L2 caller-held point-query BVH (batch); L3 retain `twin_gid` in
+   `MFTL_HalfEdge`; L4 detach an object from an ensemble; L5 single-vertex normal /
+   Laplace–Beltrami; optional L6 spatial ghosts for cross-rank proximity (behaviour change).
+2. Convert the remaining per-element reach-ins in ≈25 FT files (each has an adapter
+   equivalent) and move math/memory helpers to a shim; `polygonise.c` onto the builder;
+   `printfrontmesh.c` output.
+3. **L7 — conserved surface scalar (PRESERVE current behaviour):** MFTL1's `scalarconcentration`
+   is real solver state, now the adapter concept `MFAdapterTriSurfaceScalar` (all 20 multiflow
+   sites converted). MFTL2 needs either a native library-maintained triangle scalar or
+   payload-remapping hooks that reproduce MFTL1 exactly: transport with the triangle,
+   mass-conserving remap in split/flip/collapse/TSUR/volume-conserving smoothing, restart I/O.
+   Not ordinary zero-initialised payload semantics; not a physics change.
+4. Dual decomposition stays top risk #2 (now an explicit, tested value type); MFTL1-only
+   `mftl1_init_grid` / replicated placement to be dropped. Periodic default = MFTL1 behaviour:
+   the front decomposition is non-periodic (`periodic` = 0); enabling periodic fronts is a
+   separate, explicit change (risk 7). Remeshing mode is an explicit enum
+   (serial / parallel / parallel + load balancing).
+5. Build/link: switch multiflow to `find_package(MFTL2)`/`MFTL2::MFTL2`; MFTL1 and MFTL2 export
+   same-named symbols, so the swap is atomic (never link both).
+6. Validation: iteration order changes break bit-exact goldens → the analytic FT regressions
+   (Lamb droplet, rising bubble, LeVeque) must exist before the swap; the topology-change
+   example is too slow for routine A/B at full resolution.
 
 **Stage 16 (code-quality/documentation cleanup + MFTL2 manual) — PLANNED, NOT STARTED.** Runs
 **only after Stage 15 is complete and fully accepted**, when the code, public API, and multiflow
@@ -353,7 +412,7 @@ counters between gather and serial kernel (rank 0 could otherwise mint colliding
 `{01,06,LAPACK}` → `08` serial remeshing A → `09` volume-conserving smoothing → `10` parallel remeshing.
 `12` opaque Data transport (front-tracking prereq).
 `{02,06,07,10,11}` → `13` periodicity completion.
-`14` CFD adapter (early, vs MFTL1) → `15` MFTL1→MFTL2 swap (depends on 02–14).
+`14` CFD adapter (early, vs MFTL1) → `15` MFTL1→MFTL2 swap (depends on 02–14; **Stage 14 must be accepted first** — implemented 2026-09-23, awaiting independent review).
 `15` (complete + accepted) → `16` code-quality/documentation cleanup + MFTL2 manual.
 
 **Critical path to a usable, faster, periodic library**: 01→02→05→06→08→09→10→13.

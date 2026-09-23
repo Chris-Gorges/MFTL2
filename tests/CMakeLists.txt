@@ -175,3 +175,13 @@ foreach(NP 1 2 4 8)
     add_test(NAME PeriodicEndToEnd-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_periodic_endtoend>)
 endforeach()
 set_tests_properties(PeriodicEndToEnd-np1 PeriodicEndToEnd-np2 PeriodicEndToEnd-np4 PeriodicEndToEnd-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+
+# Sanitizer / debug options for every test executable of this directory (see
+# mftl2_dev_target_options in the top-level CMakeLists.txt).
+get_property(_mftl2_test_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+foreach(_t ${_mftl2_test_targets})
+    get_target_property(_type ${_t} TYPE)
+    if(_type STREQUAL "EXECUTABLE")
+        mftl2_dev_target_options(${_t})
+    endif()
+endforeach()

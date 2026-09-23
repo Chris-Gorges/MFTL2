@@ -3712,12 +3712,13 @@ int MFTLEnsembleCreateSpatialGhosts(MFTL_Ensemble* ens, double proximity_toleran
   MPI_Neighbor_alltoall(n_send_verts_int, 1, MPI_INT, n_recv_verts, 1, MPI_INT, domain->comm_graph);
   MPI_Neighbor_alltoall(cnt_send_data, 1, MPI_INT, n_recv_data, 1, MPI_INT, domain->comm_graph);  // Stage 12
 
-  int* s_disp_t = calloc(num_neighbors + 1, sizeof(int));
-  int* r_disp_t = calloc(num_neighbors + 1, sizeof(int));
-  int* s_disp_v = calloc(num_neighbors + 1, sizeof(int));
-  int* r_disp_v = calloc(num_neighbors + 1, sizeof(int));
-  int* s_disp_d = calloc(num_neighbors + 1, sizeof(int));  // Stage 12
-  int* r_disp_d = calloc(num_neighbors + 1, sizeof(int));  // Stage 12
+  const size_t n_disp = (size_t) (num_neighbors > 0 ? num_neighbors : 0) + 1;  // counts are never negative
+  int* s_disp_t = calloc(n_disp, sizeof(int));
+  int* r_disp_t = calloc(n_disp, sizeof(int));
+  int* s_disp_v = calloc(n_disp, sizeof(int));
+  int* r_disp_v = calloc(n_disp, sizeof(int));
+  int* s_disp_d = calloc(n_disp, sizeof(int));  // Stage 12
+  int* r_disp_d = calloc(n_disp, sizeof(int));  // Stage 12
 
   int tot_send_t = 0, tot_recv_t = 0, tot_send_v = 0, tot_recv_v = 0, tot_send_d = 0, tot_recv_d = 0;
   for (int i = 0; i < num_neighbors; ++i)

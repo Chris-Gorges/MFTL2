@@ -1299,7 +1299,7 @@ void MFTLEnsembleIntersectObjects(MFTL_Ensemble* ensA, MFTL_Ensemble* ensB, Inte
   }
 
   // 2. Generate Acceleration Structures (LBVH)
-  MFTL_BVH** bvhsA = malloc(ensA->num_objects * sizeof(MFTL_BVH*));
+  MFTL_BVH** bvhsA = malloc((size_t) (ensA->num_objects > 0 ? ensA->num_objects : 0) * sizeof(MFTL_BVH*));
   for (int i = 0; i < ensA->num_objects; i++)
   {
     bvhsA[i] = MFTL_GenerateLBVH(ensA->objects[i]);
