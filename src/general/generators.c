@@ -265,6 +265,7 @@ static int mftlTessellateFlat(MFTL_Object* object)
         he->vertex_idx = sub[j][(k + 1) % 3];
         he->next_idx = new_he_idx + ((k + 1) % 3);
         he->twin_idx = MFTL_ERROR;
+        he->twin_gid = MFTL_ERROR;
         he->boundary = MFTL_TRUE;
         he->flags = 0;
 

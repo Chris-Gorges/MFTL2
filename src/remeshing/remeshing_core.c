@@ -38,6 +38,7 @@ static int new_triangle(MFTL_Object *obj)
   obj->triangles[idx].flags = MFTL_FLAG_NONE;
   obj->triangles[idx].owner_proc = obj->domain->rank;
   obj->triangles[idx].is_ghost = MFTL_FALSE;
+  obj->triangles[idx].surface_scalar = 0.0;  // set by the operator's mass remap (Stage 15, L7)
   // Stage 12: user data is NOT repartitioned by split/collapse — new triangles
   // from splits carry a zeroed blob; callers that attach data must impose
   // their own split/merge policy (per Stage 12 plan).
@@ -54,6 +55,7 @@ static int new_halfedge(MFTL_Object *obj)
   int idx = obj->n_half_edges++;
 
   obj->half_edges[idx].twin_idx = MFTL_ERROR;
+  obj->half_edges[idx].twin_gid = MFTL_ERROR;
   obj->half_edges[idx].next_idx = MFTL_ERROR;
   obj->half_edges[idx].vertex_idx = MFTL_ERROR;
   obj->half_edges[idx].triangle_idx = MFTL_ERROR;
@@ -144,6 +146,7 @@ int MFTLSplitEdge(MFTL_Object *obj, int he_ab_idx)
   obj->half_edges[he_ab_idx].next_idx = he_mc_idx;
   // twin_idx for he_am will be set in the bottom half logic
   obj->half_edges[he_ab_idx].twin_idx = MFTL_ERROR;
+  obj->half_edges[he_ab_idx].twin_gid = MFTL_ERROR;  // A->M is a new edge (re-derived in MFTLFinalizeRemeshing)
 
   // HE M->C
   MFTL_HalfEdge *he_mc = &obj->half_edges[he_mc_idx];
@@ -594,6 +597,9 @@ int CollapseApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params
 {
   MFTL_HalfEdge *he = &obj->half_edges[he_idx];
 
+  // Stage 15: MFTL1 criteria (with the parallel drivers' locks)
+  if (params && params->mftl1_criteria) return MFTL1CollapseApproved(obj, he_idx, params, 1);
+
   // 1. Status Checks
   if (he->flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) return MFTL_FALSE;
 
@@ -753,6 +759,9 @@ int MFTLSplitApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *param
   if (obj->vertices[v_a].flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) return MFTL_FALSE;
   if (obj->vertices[v_b].flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) return MFTL_FALSE;
 
+  // Stage 15: MFTL1 criteria
+  if (params->mftl1_criteria) return MFTL1SplitCriterion(obj, he_idx, params);
+
   // 2. Criterion check (Stage 08: MFTL1 RemeshCriteria parity)
   switch (params->criterion)
   {
@@ -795,6 +804,15 @@ void MFTLFlipEdge(MFTL_Object *obj, int he_idx)
   int tri1_idx = obj->half_edges[he_idx].triangle_idx;
   int tri2_idx = obj->half_edges[obj->half_edges[he_idx].twin_idx].triangle_idx;  // ensure this is not a boundary edge
 
+  // Stage 15 (L7, MFTL1 edgeflip.c parity): mass and area of the two triangles before the
+  // flip; afterwards the mass is split in proportion new_area / (sum of the OLD areas),
+  // the second triangle taking the remainder.
+  MFTLGetTriangleProperties(obj, &obj->triangles[tri1_idx], &obj->triangles[tri1_idx].area, MFTL_NULL, MFTL_NULL);
+  MFTLGetTriangleProperties(obj, &obj->triangles[tri2_idx], &obj->triangles[tri2_idx].area, MFTL_NULL, MFTL_NULL);
+  const double ss_mass_sum =
+      obj->triangles[tri1_idx].surface_scalar * obj->triangles[tri1_idx].area + obj->triangles[tri2_idx].surface_scalar * obj->triangles[tri2_idx].area;
+  const double ss_area_sum = obj->triangles[tri1_idx].area + obj->triangles[tri2_idx].area;
+
   // get the halfedges involved
   int he_ab_idx = he_idx;
   int he_bc_idx = obj->half_edges[he_ab_idx].next_idx;
@@ -836,6 +854,15 @@ void MFTLFlipEdge(MFTL_Object *obj, int he_idx)
   // update the vertex indices
   obj->half_edges[he_ab_idx].vertex_idx = v_c;
   obj->half_edges[he_ba_idx].vertex_idx = v_d;
+
+  // Stage 15 (L7): remap the conserved surface scalar (see above).
+  MFTL_Triangle *t1 = &obj->triangles[tri1_idx], *t2 = &obj->triangles[tri2_idx];
+  MFTLGetTriangleProperties(obj, t1, &t1->area, MFTL_NULL, MFTL_NULL);
+  MFTLGetTriangleProperties(obj, t2, &t2->area, MFTL_NULL, MFTL_NULL);
+  const double ss_mass1 = (ss_area_sum > 0.0) ? ss_mass_sum * (t1->area / ss_area_sum) : 0.0;
+  const double ss_mass2 = ss_mass_sum - ss_mass1;
+  t1->surface_scalar = (t1->area > 0.0) ? ss_mass1 / t1->area : 0.0;
+  t2->surface_scalar = (t2->area > 0.0) ? ss_mass2 / t2->area : 0.0;
 }
 
 // Stage 08 gated flip (defined below; declared here for the driver).
@@ -924,6 +951,17 @@ int FlipApproved(MFTL_Object *obj, int he_idx)
  * @param start_num_h The number of half-edges BEFORE the remeshing pass.
  * @param collapses_occurred Set to true if ANY collapse operation was performed.
  */
+// Stage 15 (L3): re-derive the retained twin gid of every half-edge whose twin is stored.
+// The edge operators relink twins by index only; rim half-edges (no local twin) keep theirs.
+static void mftlRefreshTwinGids(MFTL_Object *obj)
+{
+  for (int i = 0; i < obj->n_half_edges; ++i)
+  {
+    MFTL_HalfEdge *he = &obj->half_edges[i];
+    if (he->twin_idx != MFTL_ERROR) he->twin_gid = obj->half_edges[he->twin_idx].global_id;
+  }
+}
+
 void MFTLFinalizeRemeshing(MFTL_Object *obj, int start_num_v, int start_num_t, int start_num_h, bool collapses_occurred)
 {
   // ---------------------------------------------------------
@@ -971,6 +1009,7 @@ void MFTLFinalizeRemeshing(MFTL_Object *obj, int start_num_v, int start_num_t, i
       }
     }
 
+    mftlRefreshTwinGids(obj);
     return;  // DONE! (Fast exit)
   }
 
@@ -1132,6 +1171,7 @@ void MFTLFinalizeRemeshing(MFTL_Object *obj, int start_num_v, int start_num_t, i
       kh_value(obj->halfedge_lookup, iter) = i;
     }
   }
+  mftlRefreshTwinGids(obj);
 }
 
 /**
@@ -1398,7 +1438,7 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
   // 2. OR we haven't reached the user-defined iteration limit
   while (params->iterations == MFTL_ERROR || iter < params->iterations)
   {
-    printf("--- Iteration %d ---\n", iter + 1);
+    if (!params->quiet) printf("--- Iteration %d ---\n", iter + 1);
 
     int total_split = 0;
     int total_collapse = 0;
@@ -1427,8 +1467,15 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
           MFTLComputeVertexCurvatures(obj);
       }
 
+      if (params->mftl1_criteria)
+      {
+        // Stage 15: MFTL1's sweeps (MFTL_Refining / MFTL_Coarsening / MFTL_Flipping)
+        MFTL1Sweeps(obj, params, &obj_split, &obj_collapse, &obj_swap);
+        if (obj_collapse > 0) collapses_occurred[i] = MFTL_TRUE;
+      }
+
       // 1. SPLIT
-      for (int j = obj->n_half_edges - 1; j >= 0; j--)
+      for (int j = obj->n_half_edges - 1; j >= 0 && !params->skip_split && !params->mftl1_criteria; j--)
       {
         if (MFTLSplitApproved(obj, j, params))
         {
@@ -1438,7 +1485,7 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
       }
 
       // 2. COLLAPSE
-      for (int j = 0; j < obj->n_half_edges; ++j)
+      for (int j = 0; j < obj->n_half_edges && !params->skip_collapse && !params->mftl1_criteria; ++j)
       {
         if (CollapseApproved(obj, j, params))
         {
@@ -1449,7 +1496,7 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
       }
 
       // 3. SWAP / FLIP (Valence Optimization + quality/dihedral gates)
-      for (int j = 0; j < obj->n_half_edges; ++j)
+      for (int j = 0; j < obj->n_half_edges && !params->skip_flip && !params->mftl1_criteria; ++j)
       {
         MFTL_HalfEdge *he = &obj->half_edges[j];
 
@@ -1474,7 +1521,7 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
       }
 
       // 4. SMOOTH (Tangential; mode/iterations from params)
-      MFTLSmoothTangentialWithParams(obj, params);
+      if (!params->skip_tangential_smoothing) MFTLSmoothTangentialWithParams(obj, params);
 
       // Reset visited flags
       for (int j = 0; j < obj->n_half_edges; ++j)
@@ -1488,6 +1535,9 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
       }
 
       // Accumulate totals
+      params->stat_splits += obj_split;
+      params->stat_collapses += obj_collapse;
+      params->stat_flips += obj_swap;
       total_split += obj_split;
       total_collapse += obj_collapse;
       total_swap += obj_swap;
@@ -1496,7 +1546,7 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
     // WE NEED TO UPDATE THE GEOMETRIC PROPERTIES HERE!!!!!
     // NORMALS AREA ETC
 
-    printf("Operations -> Split: %d | Collapsed: %d | Swapped: %d\n", total_split, total_collapse, total_swap);
+    if (!params->quiet) printf("Operations -> Split: %d | Collapsed: %d | Swapped: %d\n", total_split, total_collapse, total_swap);
 
     // --- CONVERGENCE CHECK ---
     // On a single rank (or a ghost-complete mesh) the local op count is the
@@ -1505,7 +1555,7 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
     // hold empty objects), the decision must be collective — otherwise the
     // empty ranks would exit the loop early and desynchronize the
     // collectives in the Stage-09 stages below.
-    int converged = (total_split + total_collapse + total_swap) < 10;
+    int converged = !params->fixed_iterations && (total_split + total_collapse + total_swap) < 10;
     if (ens->domain.nproc > 1)
     {
       int converged_g = 0;
@@ -1514,7 +1564,7 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
     }
     if (converged)
     {
-      printf("Remeshing converged successfully after %d iterations.\n", iter + 1);
+      if (!params->quiet) printf("Remeshing converged successfully after %d iterations.\n", iter + 1);
       break;
     }
 
@@ -1522,7 +1572,7 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
     // Prevent infinite loops if floating-point drift causes non-convergence
     if (iter >= 15 && params->iterations == MFTL_ERROR)
     {
-      printf("Warning: Remeshing reached failsafe limit (15 iterations). Exiting to prevent hang.\n");
+      if (!params->quiet) printf("Warning: Remeshing reached failsafe limit (15 iterations). Exiting to prevent hang.\n");
       break;
     }
 
@@ -1559,7 +1609,7 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
   for (int i = 0; i < ens->num_objects; i++)
   {
     MFTL_Object *obj = ens->objects[i];
-    MFTLVolumeRecovery(obj, start_volume[i]);
+    if (!params->skip_volume_recovery) MFTLVolumeRecovery(obj, start_volume[i]);
     MFTLComputeTriangleProperties(obj);
   }
   MFTLUpdateGhostPositions(ens, NULL);
@@ -1654,6 +1704,7 @@ static inline double mftlTriQualityFromPos(const MFTL_Domain* dom, const double 
 // the legacy valence-only behaviour.
 int FlipApprovedWithParams(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
 {
+  if (params && params->mftl1_criteria) return MFTL1FlipApproved(obj, he_idx, params);  // Stage 15
   if (!FlipApproved(obj, he_idx)) return MFTL_FALSE;
   if (!params) return MFTL_TRUE;
 

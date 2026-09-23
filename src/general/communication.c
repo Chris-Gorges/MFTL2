@@ -26,6 +26,18 @@ MPI_Datatype MPI_PackedHalfEdge;
 MPI_Datatype MPI_PackedTriangleComplex;
 MPI_Datatype MPI_GhostUpdatePayload;
 
+// Stage 15: fix every packed datatype's extent to the C struct size. The MPI extent of a
+// struct type is implementation-defined in the presence of trailing padding; arrays of
+// packed records are exchanged with counts > 1, so the stride MUST equal sizeof(record).
+static void mftlResizeToSizeof(MPI_Datatype* type, size_t size)
+{
+  MPI_Datatype resized;
+  MPI_Type_create_resized(*type, 0, (MPI_Aint) size, &resized);
+  MPI_Type_free(type);
+  MPI_Type_commit(&resized);
+  *type = resized;
+}
+
 void MFTLRegisterMpiTypes()
 {
   // --- 1. Create MPI Datatype for PackedVertex ---
@@ -65,13 +77,13 @@ void MFTLRegisterMpiTypes()
     offsets[12] = offsetof(PackedVertex, body_id);
 
     MPI_Type_create_struct(NITEMS_VERTEX, blocklengths, offsets, types, &MPI_PackedVertex);
-    MPI_Type_commit(&MPI_PackedVertex);
+    mftlResizeToSizeof(&MPI_PackedVertex, sizeof(PackedVertex));
   }
 
   // --- 2. Create MPI Datatype for PackedTriangle ---
   {
-#define NITEMS_TRIANGLE 9
-    int blocklengths[] = {1, 1, 1, 3, 1, 3, 1, 1, 1};
+#define NITEMS_TRIANGLE 10
+    int blocklengths[] = {1, 1, 1, 3, 1, 3, 1, 1, 1, 1};
 
     MPI_Datatype types[] = {
         MPI_INT,  // global_id
@@ -82,7 +94,8 @@ void MFTLRegisterMpiTypes()
         MPI_DOUBLE,  // center[3]
         MPI_C_BOOL,  // is_ghost
         MPI_INT,  // flags
-        MPI_INT  // body_id
+        MPI_INT,  // body_id
+        MPI_DOUBLE  // surface_scalar (Stage 15)
     };
 
     MPI_Aint offsets[NITEMS_TRIANGLE];
@@ -95,9 +108,10 @@ void MFTLRegisterMpiTypes()
     offsets[6] = offsetof(PackedTriangle, is_ghost);
     offsets[7] = offsetof(PackedTriangle, flags);
     offsets[8] = offsetof(PackedTriangle, body_id);
+    offsets[9] = offsetof(PackedTriangle, surface_scalar);
 
     MPI_Type_create_struct(NITEMS_TRIANGLE, blocklengths, offsets, types, &MPI_PackedTriangle);
-    MPI_Type_commit(&MPI_PackedTriangle);
+    mftlResizeToSizeof(&MPI_PackedTriangle, sizeof(PackedTriangle));
   }
 
   // --- 3. Create MPI Datatype for PackedHalfEdge ---
@@ -125,7 +139,7 @@ void MFTLRegisterMpiTypes()
     offsets[6] = offsetof(PackedHalfEdge, flags);
 
     MPI_Type_create_struct(NITEMS_HALFEDGE, blocklengths, offsets, types, &MPI_PackedHalfEdge);
-    MPI_Type_commit(&MPI_PackedHalfEdge);
+    mftlResizeToSizeof(&MPI_PackedHalfEdge, sizeof(PackedHalfEdge));
   }
 
   // --- 4. PackedTriangleComplex (Nested) ---
@@ -148,7 +162,7 @@ void MFTLRegisterMpiTypes()
     offsets[1] = MPI_Aint_diff(he_addr, base_addr);
 
     MPI_Type_create_struct(NITEMS_COMPLEX, blocklengths, offsets, types, &MPI_PackedTriangleComplex);
-    MPI_Type_commit(&MPI_PackedTriangleComplex);
+    mftlResizeToSizeof(&MPI_PackedTriangleComplex, sizeof(PackedTriangleComplex));
   }
 
   // --- 5. Create MPI Datatype for MFTL_GhostUpdatePayload ---
@@ -180,7 +194,7 @@ void MFTLRegisterMpiTypes()
     offsets[8] = offsetof(GhostUpdatePayload, roughness_variance);
 
     MPI_Type_create_struct(NITEMS_GHOST, blocklengths, offsets, types, &MPI_GhostUpdatePayload);
-    MPI_Type_commit(&MPI_GhostUpdatePayload);
+    mftlResizeToSizeof(&MPI_GhostUpdatePayload, sizeof(GhostUpdatePayload));
   }
 }
 
@@ -250,6 +264,7 @@ void MFTLPackSingleTriangle(MFTL_Object* obj, int tri_idx, PackedTriangleComplex
   dst->triangle.is_ghost = is_ghost ? MFTL_TRUE : MFTL_FALSE;
   dst->triangle.flags = src->flags;
   dst->triangle.body_id = obj->global_id;
+  dst->triangle.surface_scalar = src->surface_scalar;
   memcpy(dst->triangle.normal, src->normal, 3 * sizeof(double));
   memcpy(dst->triangle.center, src->center, 3 * sizeof(double));
 
@@ -262,7 +277,7 @@ void MFTLPackSingleTriangle(MFTL_Object* obj, int tri_idx, PackedTriangleComplex
     dst->half_edges[j].global_id = t_he[j]->global_id;
     dst->half_edges[j].vertex_gid = MFTLHeTarget(obj, t_he[j])->global_id;
     // If twin exists (not boundary), save twin's GID. Else -1.
-    dst->half_edges[j].twin_gid = (t_he[j]->boundary == MFTL_FALSE) ? MFTLHeTwin(obj, t_he[j])->global_id : -1;
+    dst->half_edges[j].twin_gid = MFTLHeTwinGid(obj, t_he[j]);  // retained on the rim (Stage 15, L3)
     dst->half_edges[j].next_gid = MFTLHeNext(obj, t_he[j])->global_id;
     dst->half_edges[j].triangle_gid = MFTLHeTriangle(obj, t_he[j])->global_id;
     dst->half_edges[j].boundary = MFTL_TRUE;  // Will be re-evaluated at destination
@@ -869,6 +884,7 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
         packed_tri->triangle.is_ghost = MFTL_FALSE;
         packed_tri->triangle.flags = tri_base[tri_idx].flags;
         packed_tri->triangle.body_id = object->global_id;
+        packed_tri->triangle.surface_scalar = tri_base[tri_idx].surface_scalar;
 
         MFTL_HalfEdge* t_he[3];
         MFTLGetTriangleHalfedges(object, &tri_base[tri_idx], t_he);
@@ -877,7 +893,7 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
           PackedHalfEdge* he = &packed_tri->half_edges[j];
           he->global_id = t_he[j]->global_id;
           he->vertex_gid = MFTLHeTarget(object, t_he[j])->global_id;
-          he->twin_gid = (t_he[j]->boundary == MFTL_FALSE) ? MFTLHeTwin(object, t_he[j])->global_id : -1;
+          he->twin_gid = MFTLHeTwinGid(object, t_he[j]);  // retained on the rim (Stage 15, L3)
           he->next_gid = MFTLHeNext(object, t_he[j])->global_id;
           he->triangle_gid = MFTLHeTriangle(object, t_he[j])->global_id;
           he->boundary = MFTL_TRUE;
@@ -1225,6 +1241,7 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
           dst->flags = src->triangle.flags;
           dst->is_ghost = MFTL_FALSE;
           dst->area = src->triangle.area;
+          dst->surface_scalar = src->triangle.surface_scalar;
           memcpy(dst->center, src->triangle.center, sizeof(double) * 3);
           memcpy(dst->normal, src->triangle.normal, sizeof(double) * 3);
           dst->he_idx = write_count * 3;
@@ -1252,6 +1269,7 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
             he->flags = src->half_edges[i].flags;
             he->triangle_idx = write_count;
             he->next_idx = write_count * 3 + (i + 1) % 3;
+            he->twin_gid = src->half_edges[i].twin_gid;
             he->twin_idx = src->half_edges[i].twin_gid;  // needs to be converted to local index
             he->vertex_idx = src->half_edges[i].vertex_gid;  // needs to be converted to local index
             he->boundary = MFTL_TRUE;  // set later
@@ -1285,6 +1303,7 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
           dst->flags = src->triangle.flags;
           dst->is_ghost = MFTL_TRUE;
           dst->area = src->triangle.area;
+          dst->surface_scalar = src->triangle.surface_scalar;
           memcpy(dst->center, src->triangle.center, sizeof(double) * 3);
           memcpy(dst->normal, src->triangle.normal, sizeof(double) * 3);
           dst->he_idx = write_count * 3;
@@ -1312,6 +1331,7 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
             he->flags = src->half_edges[i].flags;
             he->triangle_idx = write_count;
             he->next_idx = write_count * 3 + (i + 1) % 3;
+            he->twin_gid = src->half_edges[i].twin_gid;
             he->twin_idx = src->half_edges[i].twin_gid;
             he->vertex_idx = src->half_edges[i].vertex_gid;
             he->boundary = MFTL_TRUE;
@@ -1916,6 +1936,7 @@ int MFTLRedistributeObject(MFTL_Object* object)
       dst->flags = src->triangle.flags;
       dst->is_ghost = MFTL_FALSE;
       dst->area = src->triangle.area;
+      dst->surface_scalar = src->triangle.surface_scalar;
       memcpy(dst->center, src->triangle.center, sizeof(double) * 3);
       memcpy(dst->normal, src->triangle.normal, sizeof(double) * 3);
       dst->he_idx = write_idx * 3;
@@ -1943,6 +1964,7 @@ int MFTLRedistributeObject(MFTL_Object* object)
         he->flags = src->half_edges[j].flags;
         he->triangle_idx = write_idx;
         he->next_idx = write_idx * 3 + (j + 1) % 3;
+        he->twin_gid = src->half_edges[j].twin_gid;
         he->twin_idx = src->half_edges[j].twin_gid;  // Fix later
         he->vertex_idx = src->half_edges[j].vertex_gid;  // Fix later
         he->boundary = MFTL_TRUE;
@@ -1972,6 +1994,7 @@ int MFTLRedistributeObject(MFTL_Object* object)
       dst->flags = src->triangle.flags;
       dst->is_ghost = MFTL_TRUE;
       dst->area = src->triangle.area;
+      dst->surface_scalar = src->triangle.surface_scalar;
       memcpy(dst->center, src->triangle.center, sizeof(double) * 3);
       memcpy(dst->normal, src->triangle.normal, sizeof(double) * 3);
       dst->he_idx = write_idx * 3;
@@ -1998,6 +2021,7 @@ int MFTLRedistributeObject(MFTL_Object* object)
         he->flags = src->half_edges[j].flags;
         he->triangle_idx = write_idx;
         he->next_idx = write_idx * 3 + (j + 1) % 3;
+        he->twin_gid = src->half_edges[j].twin_gid;
         he->twin_idx = src->half_edges[j].twin_gid;
         he->vertex_idx = src->half_edges[j].vertex_gid;
         he->boundary = MFTL_TRUE;
@@ -2902,6 +2926,7 @@ void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc, const
   t->is_ghost = MFTL_TRUE;
   t->flags = ptc->triangle.flags;
   t->area = ptc->triangle.area;
+  t->surface_scalar = ptc->triangle.surface_scalar;
   t->he_idx = obj->n_half_edges;
 
   memcpy(t->normal, ptc->triangle.normal, 3 * sizeof(double));
@@ -2931,6 +2956,7 @@ void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc, const
     he->global_id = phe->global_id;
     he->triangle_idx = t_idx;
     he->vertex_idx = phe->vertex_gid;  // GID, resolved later
+    he->twin_gid = phe->twin_gid;
     he->twin_idx = phe->twin_gid;  // GID, resolved later
     he->next_idx = t->he_idx + ((i + 1) % 3);
     he->boundary = MFTL_TRUE;
@@ -3470,6 +3496,8 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
  * @param proximity_tolerance Expansion envelope for near-field interaction tracking.
  * @return MFTL_SUCCESS on completion.
  */
+static void mftlRankBox(const MFTL_Domain* dom, int rank, double bmin[3], double bmax[3]);
+
 int MFTLEnsembleCreateSpatialGhosts(MFTL_Ensemble* ens, double proximity_tolerance)
 {
   if (!ens || ens->num_objects == 0) return MFTL_SUCCESS;
@@ -3499,43 +3527,10 @@ int MFTLEnsembleCreateSpatialGhosts(MFTL_Ensemble* ens, double proximity_toleran
 
   double* neighbor_bounds = malloc(num_neighbors * 6 * sizeof(double));
 
-  for (int n = 0; n < num_neighbors; ++n)
-  {
-    int n_rank = domain->neighbors[n];
-    int found_i = 0, found_j = 0, found_k = 0;
+  // Stage 15 (L6): the neighbour boxes come from the domain's (possibly rectilinear) slabs.
+  (void) dx;
+  for (int n = 0; n < num_neighbors; ++n) mftlRankBox(domain, domain->neighbors[n], &neighbor_bounds[n * 6 + 0], &neighbor_bounds[n * 6 + 3]);
 
-    // Fast mapping to find the Cartesian i, j, k of the neighbor rank
-    for (int k = 0; k < domain->cuts[2]; ++k)
-    {
-      for (int j = 0; j < domain->cuts[1]; ++j)
-      {
-        for (int i = 0; i < domain->cuts[0]; ++i)
-        {
-          int idx = i + (j * domain->cuts[0]) + (k * domain->cuts[0] * domain->cuts[1]);
-          if (domain->rank_map[idx] == n_rank)
-          {
-            found_i = i;
-            found_j = j;
-            found_k = k;
-            goto found_rank_coords;
-          }
-        }
-      }
-    }
-  found_rank_coords:
-
-    // Exact geometric bounding box of the neighbor's domain partition
-    neighbor_bounds[n * 6 + 0] = domain->global_min[0] + found_i * dx[0];
-    neighbor_bounds[n * 6 + 1] = domain->global_min[1] + found_j * dx[1];
-    neighbor_bounds[n * 6 + 2] = domain->global_min[2] + found_k * dx[2];
-    neighbor_bounds[n * 6 + 3] = domain->global_min[0] + (found_i + 1) * dx[0];
-    neighbor_bounds[n * 6 + 4] = domain->global_min[1] + (found_j + 1) * dx[1];
-    neighbor_bounds[n * 6 + 5] = domain->global_min[2] + (found_k + 1) * dx[2];
-  }
-
-  // =========================================================================
-  // PHASE 2: LOCAL EVALUATION & DEDUPLICATION PACKING
-  // =========================================================================
   IntBuffer* trans_tri_bufs = calloc(num_neighbors, sizeof(IntBuffer));
   IntBuffer* trans_vert_bufs = calloc(num_neighbors, sizeof(IntBuffer));
   for (int n = 0; n < num_neighbors; ++n)
@@ -3839,5 +3834,150 @@ int MFTLEnsembleCreateSpatialGhosts(MFTL_Ensemble* ens, double proximity_toleran
     MFTLFlattenConnectivity(ens->objects[o]);
   }
 
+  return MFTL_SUCCESS;
+}
+
+/* ========================================================================== */
+/* Stage 15 (L6): distance-based ghosting to ALL ranks                        */
+/* ========================================================================== */
+
+// Box of `rank` in the domain (rectilinear or uniform slabs).
+static void mftlRankBox(const MFTL_Domain* dom, int rank, double bmin[3], double bmax[3])
+{
+  int idx = 0;
+  for (idx = 0; idx < dom->nproc; ++idx)
+    if (dom->rank_map[idx] == rank) break;
+  const int ijk[3] = {idx % dom->cuts[0], (idx / dom->cuts[0]) % dom->cuts[1], idx / (dom->cuts[0] * dom->cuts[1])};
+  for (int d = 0; d < 3; ++d)
+  {
+    if (dom->axis_cuts[d])
+    {
+      bmin[d] = dom->axis_cuts[d][ijk[d]];
+      bmax[d] = dom->axis_cuts[d][ijk[d] + 1];
+    }
+    else
+    {
+      const double w = dom->domain_size[d] / (double) dom->cuts[d];
+      bmin[d] = dom->global_min[d] + ijk[d] * w;
+      bmax[d] = dom->global_min[d] + (ijk[d] + 1) * w;
+    }
+  }
+}
+
+int MFTLObjectSendLocalTrianglesToAll(MFTL_Object* obj, double distance)
+{
+  MFTL_Domain* domain = obj->domain;
+  const int nproc = domain->nproc, me = domain->rank;
+  if (nproc < 2) return MFTL_SUCCESS;
+  if (MFTLCheckTriangleDataSizeConsistency(obj) != MFTL_SUCCESS) return MFTL_ERROR;
+  const size_t ds = obj->data_size;
+
+  double* boxes = (double*) malloc((size_t) nproc * 6 * sizeof(double));
+  for (int r = 0; r < nproc; ++r) mftlRankBox(domain, r, &boxes[6 * r], &boxes[6 * r + 3]);
+
+  MFTLFlattenConnectivity(obj);
+  IntBuffer* tri_sel = calloc(nproc, sizeof(IntBuffer));
+  IntBuffer* vert_sel = calloc(nproc, sizeof(IntBuffer));
+  for (int r = 0; r < nproc; ++r)
+  {
+    buffer_init(&tri_sel[r], 64);
+    buffer_init(&vert_sel[r], 192);
+  }
+  for (int i = 0; i < obj->n_triangles; ++i)
+  {
+    if (obj->triangles[i].is_ghost || obj->triangles[i].owner_proc != me) continue;
+    double tmin[3] = {MFTL_DBL_MAX, MFTL_DBL_MAX, MFTL_DBL_MAX}, tmax[3] = {-MFTL_DBL_MAX, -MFTL_DBL_MAX, -MFTL_DBL_MAX};
+    for (int j = 0; j < 3; ++j)
+    {
+      const double* p = obj->vertices[obj->flat_tri_verts[3 * i + j]].pos;
+      for (int d = 0; d < 3; ++d)
+      {
+        tmin[d] = MFTL_MIN(tmin[d], p[d] - distance);
+        tmax[d] = MFTL_MAX(tmax[d], p[d] + distance);
+      }
+    }
+    for (int r = 0; r < nproc; ++r)
+    {
+      if (r == me) continue;
+      const double* b = &boxes[6 * r];
+      if (tmax[0] < b[0] || tmin[0] > b[3] || tmax[1] < b[1] || tmin[1] > b[4] || tmax[2] < b[2] || tmin[2] > b[5]) continue;
+      buffer_add(&tri_sel[r], i);
+      for (int j = 0; j < 3; ++j) buffer_add(&vert_sel[r], obj->flat_tri_verts[3 * i + j]);
+    }
+  }
+  free(boxes);
+
+  MFTL_SendBuffer* send_tris = calloc(nproc, sizeof(MFTL_SendBuffer));
+  MFTL_SendBuffer* send_verts = calloc(nproc, sizeof(MFTL_SendBuffer));
+  MFTL_SendBuffer* send_data = calloc(nproc, sizeof(MFTL_SendBuffer));
+  for (int r = 0; r < nproc; ++r)
+  {
+    int nt = tri_sel[r].size;  // triangles are visited once each: already unique
+    if (nt > 0)
+    {
+      PackedTriangleComplex* buf = malloc((size_t) nt * sizeof(PackedTriangleComplex));
+      for (int k = 0; k < nt; ++k) MFTLPackSingleTriangle(obj, tri_sel[r].data[k], &buf[k], MFTL_TRUE);
+      send_tris[r].buffer = buf;
+      send_tris[r].count = send_tris[r].capacity = nt;
+      if (ds > 0)
+      {
+        char* db = malloc((size_t) nt * ds);
+        for (int k = 0; k < nt; ++k) memcpy(db + (size_t) k * ds, obj->triangles[tri_sel[r].data[k]].data, ds);
+        send_data[r].buffer = db;
+        send_data[r].count = send_data[r].capacity = (int) ((size_t) nt * ds);
+      }
+    }
+    if (vert_sel[r].size > 0)
+    {
+      MFTLSortIds(vert_sel[r].data, vert_sel[r].size);
+      int nv = MFTLUniqueIntArray(vert_sel[r].data, vert_sel[r].size);
+      PackedVertex* vb = malloc((size_t) nv * sizeof(PackedVertex));
+      for (int k = 0; k < nv; ++k) MFTLPackSingleVertex(obj, vert_sel[r].data[k], &vb[k], MFTL_TRUE);
+      send_verts[r].buffer = vb;
+      send_verts[r].count = send_verts[r].capacity = nv;
+    }
+    free(tri_sel[r].data);
+    free(vert_sel[r].data);
+  }
+  free(tri_sel);
+  free(vert_sel);
+
+  PackedTriangleComplex* recv_tris = MFTL_NULL;
+  PackedVertex* recv_verts = MFTL_NULL;
+  char* recv_data = MFTL_NULL;
+  int n_rt = 0, n_rv = 0, n_rd = 0;
+  MFTLMpiExchangeBuffers(domain, send_tris, MPI_PackedTriangleComplex, sizeof(PackedTriangleComplex), MFTL_TRUE, (void**) &recv_tris, &n_rt);
+  MFTLMpiExchangeBuffers(domain, send_verts, MPI_PackedVertex, sizeof(PackedVertex), MFTL_TRUE, (void**) &recv_verts, &n_rv);
+  MFTLMpiExchangeBuffers(domain, send_data, MPI_BYTE, 1, MFTL_TRUE, (void**) &recv_data, &n_rd);
+  for (int r = 0; r < nproc; ++r)
+  {
+    free(send_tris[r].buffer);
+    free(send_verts[r].buffer);
+    free(send_data[r].buffer);
+  }
+  free(send_tris);
+  free(send_verts);
+  free(send_data);
+
+  // append what is not stored yet (as ghosts), then resolve the appended references
+  const int v_mark = obj->n_vertices, he_mark = obj->n_half_edges;
+  for (int k = 0; k < n_rv; ++k)
+  {
+    khiter_t kv = kh_get(vertex_map, obj->vertex_lookup, recv_verts[k].global_id);
+    if (kv == kh_end(obj->vertex_lookup)) MFTLAppendGhostVertex(obj, &recv_verts[k]);
+  }
+  for (int k = 0; k < n_rt; ++k)
+  {
+    khiter_t kt = kh_get(triangle_map, obj->triangle_lookup, recv_tris[k].triangle.global_id);
+    if (kt != kh_end(obj->triangle_lookup)) continue;
+    MFTLAppendGhostTriangle(obj, &recv_tris[k], ds > 0 ? recv_data + (size_t) k * ds : MFTL_NULL);
+  }
+  free(recv_tris);
+  free(recv_verts);
+  free(recv_data);
+
+  MFTLRemapAppendedGhostIndices(obj, v_mark, he_mark);
+  MFTLRebuildTwins(obj);
+  MFTLFlattenConnectivity(obj);
   return MFTL_SUCCESS;
 }

@@ -129,6 +129,28 @@ typedef struct
                                // end, remeshing slivers the two-pass shift cannot cover
                                // (edges straddling both the old and the shifted cut)
 
+  // --- Stage 15: MFTL1 driver-parity switches. Every switch is ZERO by default, which keeps
+  //     the MFTL2 pipeline unchanged; multiflow's front tracking sets them to reproduce
+  //     MFTL1's MFTL_Remeshing (optional operators, fixed iteration count, no volume
+  //     recovery inside remeshing, quiet). ---
+  int skip_split;  // 1: no edge splits      (MFTL1 MFTL_Refine = NO)
+  int skip_collapse;  // 1: no edge collapses   (MFTL1 MFTL_Coarse = NO)
+  int skip_flip;  // 1: no edge flips       (MFTL1 MFTL_Flip = NO)
+  int skip_tangential_smoothing;  // 1: no tangential smoothing (MFTL1 MFTL_VertexSmoothing = NO)
+  int skip_volume_recovery;  // 1: no global volume recovery inside the remesh drivers
+  int fixed_iterations;  // 1: run exactly `iterations` passes (no early convergence exit)
+  int skip_split_cleanup;  // 1: no final split-cleanup passes in the parallel driver
+  int quiet;  // 1: no per-iteration progress output on stdout
+  // 1: MFTL1 edge criteria (Stage 15 parity): MFTL1's split / collapse / flip tests
+  //    (edgesplit.c, edgecollapse.c, edgeflip.c) replace the MFTL2 ones, the serial driver
+  //    sweeps splits longest-first and collapses shortest-first (stopping at the reference
+  //    length for the JIAO / BOTSCH_KOBBELT criteria), and no vertex locking or feature-flag
+  //    protection is applied in that sweep (MFTL1 has neither).
+  int mftl1_criteria;
+  // Outputs: LOCAL operation counts of this rank, ACCUMULATED by every remesh driver call
+  // (the caller resets them).
+  long stat_splits, stat_collapses, stat_flips;
+
   // ... any other parameters like smoothing weights, boundary locks, etc.
 } MFTL_RemeshParameters;
 
@@ -209,6 +231,18 @@ static inline void MFTLInitRemeshParams(MFTL_RemeshParameters *params, MFTL_Reme
   params->damping_factor = 0.5;          // MFTL1 dampingfactor (0,1]
   params->load_balance = 1;              // MFTL1 MFTL_LoadBalance = MFTL_YES
   params->boundary_cleanup = 1;          // MFTL1 MFTL_BoundaryCleanup = MFTL_YES
+
+  // --- Stage 15 switches/outputs: off / zero (the MFTL2 pipeline) ---
+  params->skip_split = 0;
+  params->skip_collapse = 0;
+  params->skip_flip = 0;
+  params->skip_tangential_smoothing = 0;
+  params->skip_volume_recovery = 0;
+  params->fixed_iterations = 0;
+  params->skip_split_cleanup = 0;
+  params->quiet = 0;
+  params->mftl1_criteria = 0;
+  params->stat_splits = params->stat_collapses = params->stat_flips = 0;
 }
 
 // --- Core Topological Operators ---
@@ -322,6 +356,14 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params);
  */
 int MFTLSplitApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params);
 
+/* Stage 15: MFTL1 edge criteria (mftl1_criteria.c; see MFTL_RemeshParameters.mftl1_criteria).
+   The approval functions above delegate to them when mftl1_criteria is set; the serial driver
+   runs MFTL_Remeshing's three sweeps with MFTL1's edge order (operation counts returned). */
+int MFTL1SplitCriterion(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params);
+int MFTL1CollapseApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params, int honour_locks);
+int MFTL1FlipApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params);
+void MFTL1Sweeps(MFTL_Object *obj, MFTL_RemeshParameters *params, int *n_split, int *n_collapse, int *n_flip);
+
 /**
  * @brief Parallel dispatcher (all ranks of ens->domain.comm_cart must call).
  * Selects the remesh algorithm (centering for small dispersed objects, the
@@ -344,6 +386,20 @@ int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *par
  * Used for dispersed objects small enough to center (W < 0.5 * h_min).
  */
 int MFTLRemeshEnsembleDispersedCentering(MFTL_Ensemble *ens, MFTL_RemeshParameters *params);
+
+/**
+ * @brief Stage 15: serial bracket. MFTLEnsembleBeginSerial gathers every object of the
+ * ensemble onto rank 0 (single-partition domain, no ghosts, gid counters synced);
+ * MFTLEnsembleEndSerial restores the native domain and optionally redistributes back.
+ * Collective. Used for serial kernels on distributed ensembles (TSUR3D, volume-conserving
+ * smoothing, restart output, ...).
+ */
+typedef struct
+{
+  MFTL_Domain native;
+} MFTL_SerialBracket;
+int MFTLEnsembleBeginSerial(MFTL_Ensemble *ens, MFTL_SerialBracket *bracket);
+int MFTLEnsembleEndSerial(MFTL_Ensemble *ens, MFTL_SerialBracket *bracket, int redistribute);
 
 /**
  * @brief MFTL1 MFTLRedistributeObjectLoadBalanced, ensemble-wide: computes an

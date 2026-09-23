@@ -69,4 +69,14 @@ int MFTLWriteGTS(MFTL_Object* obj, const char* path);
  */
 void MFTLWritePvtu(MFTL_Ensemble* ens, const char* stem);
 
+/**
+ * @brief Stage 15: native restart mesh in the MFTL1 `.mesh` format (surface scalar with
+ * %.15e). MFTLWriteNativeMesh writes the LOCALLY stored entities of obj to `path` (gather
+ * the object to one rank first, e.g. MFTLEnsembleBeginSerial). MFTLReadNativeMesh builds an
+ * EMPTY object from the file (collective: ranks passing path == NULL contribute nothing;
+ * call MFTLRedistribute afterwards).
+ */
+int MFTLWriteNativeMesh(const MFTL_Object* obj, const char* path);
+int MFTLReadNativeMesh(MFTL_Object* obj, const char* path);
+
 #endif  // MFTL_IO_H

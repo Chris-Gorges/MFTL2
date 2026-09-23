@@ -169,14 +169,14 @@ double MFTLSurfaceCenter(MFTL_Object* obj, double cm[3])
   return area;
 }
 
-void MFTLMomentOfInertia(MFTL_Object* obj, double I[3][3], const double center[3], double density)
+void MFTLMomentOfInertia(MFTL_Object* obj, double inertia[3][3], const double center[3], double density)
 {
   MFTL_ASSERT(obj != MFTL_NULL);
   MFTL_Domain* dom = obj->domain;
   MFTL_ASSERT(dom != MFTL_NULL);
 
   for (int i = 0; i < 3; ++i)
-    for (int j = 0; j < 3; ++j) I[i][j] = 0.0;
+    for (int j = 0; j < 3; ++j) inertia[i][j] = 0.0;
 
   double anchor[3];
   if (!MFTLObjectUnwrapAnchor(obj, anchor)) return;
@@ -218,9 +218,9 @@ void MFTLMomentOfInertia(MFTL_Object* obj, double I[3][3], const double center[3
   }
 
   // One Allreduce per matrix row (MFTL1 layout).
-  MPI_Allreduce(Ilocal[0], I[0], 3, MPI_DOUBLE, MPI_SUM, dom->comm_cart);
-  MPI_Allreduce(Ilocal[1], I[1], 3, MPI_DOUBLE, MPI_SUM, dom->comm_cart);
-  MPI_Allreduce(Ilocal[2], I[2], 3, MPI_DOUBLE, MPI_SUM, dom->comm_cart);
+  MPI_Allreduce(Ilocal[0], inertia[0], 3, MPI_DOUBLE, MPI_SUM, dom->comm_cart);
+  MPI_Allreduce(Ilocal[1], inertia[1], 3, MPI_DOUBLE, MPI_SUM, dom->comm_cart);
+  MPI_Allreduce(Ilocal[2], inertia[2], 3, MPI_DOUBLE, MPI_SUM, dom->comm_cart);
 }
 
 int MFTLCheckMinimumImageConstraint(const MFTL_Object* obj)

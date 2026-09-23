@@ -1,6 +1,6 @@
 # 00 — Overview: reimplementing MFTL1 functionality in MFTL2
 
-Status: NOT STARTED
+Status: IN PROGRESS — Stages 01–13 accepted; 14 IMPLEMENTED (awaiting independent acceptance); 15 ACCEPTED (independent review 2026-09-23); 16 planned
 Depends on: —
 Implemented by:
 Reviewed by:
@@ -241,8 +241,10 @@ vertices) gathered from the intact edge BEFORE the split. Restored to MFTL1 pari
 ensemble before asserting (no misleading LSan leak on failure). Verified: Release +
 ASan/UBSan/LSan 53/53 in BOTH LAPACK-off and LAPACK-on builds. **Stage 14 IMPLEMENTED (2026-09-23, incl. final-fix round)** — redesigned
 MFTL-facing architecture, awaiting independent acceptance (see the Stage 14 paragraph below and
-`plans/14`, "Stage 14 completion"). Stage 15 NOT STARTED; it starts only after Stage 14 is
-accepted.
+`plans/14`, "Stage 14 completion"). **Stage 15 IMPLEMENTED (2026-09-23)** on the owner's
+instruction while the Stage-14 review is still pending — multiflow runs on MFTL2 only;
+**independently reviewed 2026-09-23, Acceptance: PASSED** (see the Stage 15 paragraph below and
+`plans/15`, "Independent review").
 
 **Stage 14** (front-tracking integration layer in multiflow, branch `berend-matrix`) —
 **IMPLEMENTED, pending review.** The 2026-09-22 review (M1–M3, S1–S5) is addressed by a
@@ -300,6 +302,43 @@ redesign rather than a wrapper: `src/include/mftl_adapter.h` is a backend-indepe
 6. Validation: iteration order changes break bit-exact goldens → the analytic FT regressions
    (Lamb droplet, rising bubble, LeVeque) must exist before the swap; the topology-change
    example is too slow for routine A/B at full resolution.
+
+**Stage 15** (MFTL1 → MFTL2 swap, multiflow branch `berend-mftl`) — **ACCEPTED (independent
+review 2026-09-23, `plans/15` §R1–R9); nothing committed.** multiflow links only `MFTL2::MFTL2` (`find_package(MFTL2)`,
+`MFTL2_ROOT`; MFTL2 must be built with `MFTL_USE_LAPACK=ON` — enforced at configure time); the
+MFTL1 backend of the integration layer is deleted and no MFTL1 identifier remains outside
+comments (math helpers are local, `ftvectorops.h`).
+- *Library:* Stage-14 carry-forwards L1–L5 and L7 implemented (L6 spatial ghosts deliberately not
+  enabled — MFTL1 behaviour); soup builder, triangle copy/clear, native mesh I/O, serial bracket,
+  remesh switches; **MFTL1 edge criteria and sweep order** (`mftl1_criteria.c`, opt-in) and a
+  paraboloid-fit parity mode. Bugs fixed with evidence: TSUR endpoint normals not normalised
+  (Stage 09 port; now 4e-16 vs MFTL1 with MFTL1's order), area/normal floor at front scales,
+  sphere-generator lookups, parallel split-phase gid blocks with neighbourhood-reading criteria,
+  soup-builder corruption, uninitialised remesh parameters, parallel TSUR scalar gate,
+  post-cleanup twin gids, `I` parameter vs complex.h.
+- *Validation:* MFTL2 ctest 57/57 Release and ASan/UBSan (LAPACK on); Stage-15 library test 78
+  checks on 1–4 ranks (LAPACK on and off); integration-layer tests 867 checks on 1–4 ranks;
+  multiflow vs MFTL1: FT_Sharp_CSF, FT_Sharp_Integral and IBM marker cases within the golden
+  tolerance on 1 and 4 ranks; FT (remeshing) within MFTL1's own np1-vs-np4 spread for volume,
+  rise velocity and centroid; initial front identical; the golden baselines fail — *corrected by the review:* not because of any MFTL1 Debug/Release
+  dependence (there is none: HEAD-MFTL1 Debug vs Release 3.6e-8 / 3.2e-7) but because of the
+  `origin/master` merge 10dce627 (pre-merge a7cb9179 on MFTL1 reproduces the goldens to 1e-8;
+  HEAD on MFTL1 fails them exactly as MFTL2 does) — baselines to be regenerated on MFTL2 (owner
+  decision); one full remesh pass identical to MFTL1 in
+  all refining configurations tested; wall time equal to MFTL1 (FT np1 274.7 s vs 276 s).
+- *Limitations / compromises:* collapse survivor and tie order follow MFTL1's convention only
+  for edges as MFTL1 builds them (per-pass collapse counts can differ in coarsening-heavy passes);
+  MFTL2 owns triangles by centre and always keeps one ghost layer; MFTL1's random-sign
+  second-order terms in Kuprat smoothing are not reproduced; the parallel remesh uses MFTL1's
+  criteria in MFTL2's sweep. Full list in `plans/15` §6–§8.
+- *Review (2026-09-23):* MFTL2 ≡ MFTL1 physically (FT volume/rise velocity within MFTL1's own
+  np1-vs-np4 spread on 1 and 4 ranks, serial and parallel remesh; FT_Sharp_Integral ≤ 5e-7);
+  exact collapse-survivor parity NOT needed; should-fix items (SERIAL mode ignores
+  boundary_cleanup, guaranteed ghost completion for assembled bodies, redundant redistribution,
+  test_stage15 instrumentation) and coverage gaps (marching cubes / MoveIBM end to end) listed in
+  `plans/15` §R6–R7 for Stage 16.
+- *Deferred to Stage 16:* remaining scale-dependent absolute thresholds, the pre-existing zero-mass result of
+  multiflow's surface-scalar solver in the FT test configuration, repository-wide formatting.
 
 **Stage 16 (code-quality/documentation cleanup + MFTL2 manual) — PLANNED, NOT STARTED.** Runs
 **only after Stage 15 is complete and fully accepted**, when the code, public API, and multiflow
@@ -412,7 +451,7 @@ counters between gather and serial kernel (rank 0 could otherwise mint colliding
 `{01,06,LAPACK}` → `08` serial remeshing A → `09` volume-conserving smoothing → `10` parallel remeshing.
 `12` opaque Data transport (front-tracking prereq).
 `{02,06,07,10,11}` → `13` periodicity completion.
-`14` CFD adapter (early, vs MFTL1) → `15` MFTL1→MFTL2 swap (depends on 02–14; **Stage 14 must be accepted first** — implemented 2026-09-23, awaiting independent review).
+`14` CFD adapter (early, vs MFTL1) → `15` MFTL1→MFTL2 swap (depends on 02–14; both implemented 2026-09-23; 15 accepted 2026-09-23, 14 awaiting independent acceptance).
 `15` (complete + accepted) → `16` code-quality/documentation cleanup + MFTL2 manual.
 
 **Critical path to a usable, faster, periodic library**: 01→02→05→06→08→09→10→13.

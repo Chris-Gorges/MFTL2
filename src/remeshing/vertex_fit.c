@@ -94,13 +94,23 @@ static int mftlRingNormal(MFTL_Object* obj, int vi, double n[3])
 // Frame normal for the fit: normalized sum of the FRESH one-ring normals of
 // the neighbour set (MFTL1 averages the neighbourhood vertex normals; stored
 // normals go stale within a remesh pass, so they are recomputed here).
-static int mftlFitFrameNormal(MFTL_Object* obj, const int* nbr, int nvert, double w[3])
+// mftl1 (Stage 15, MFTL_RemeshParameters.mftl1_criteria): MFTL1's ParaboloidFit sums the
+// sin(alpha)/(l0*l1)-weighted one-ring vertex normals (MFTL_OneRingVertexNormal, the L5
+// kernel MFTLComputeVertexNormalAt, which also stores them as MFTL1 did); otherwise the
+// unweighted average of the ring's triangle normals.
+static int mftlFitFrameNormal(MFTL_Object* obj, const int* nbr, int nvert, double w[3], int mftl1)
 {
   w[0] = w[1] = w[2] = 0.0;
   for (int i = 0; i < nvert; ++i)
   {
     double n[3];
-    if (mftlRingNormal(obj, nbr[i], n) != MFTL_SUCCESS) continue;
+    if (mftl1)
+    {
+      if (MFTLComputeVertexNormalAt(obj, nbr[i]) != MFTL_SUCCESS) continue;
+      memcpy(n, obj->vertices[nbr[i]].normal, 3 * sizeof(double));
+    }
+    else if (mftlRingNormal(obj, nbr[i], n) != MFTL_SUCCESS)
+      continue;
     w[0] += n[0];
     w[1] += n[1];
     w[2] += n[2];
@@ -273,7 +283,12 @@ static int mftlBarycentricFit(MFTL_Object* obj, int v_idx, int he_idx, double ou
 // Core paraboloid fit: frame from u_dir and the summed normals of nbr[],
 // least squares over the neighbour set. Returns MFTL_SUCCESS on a full-rank
 // fit (position updated), MFTL_ERROR otherwise (caller keeps position).
-static int mftlParaboloidFitAt(MFTL_Object* obj, int v_idx, const int* nbr, int nvert, const double u_dir[3], const double w_dir[3])
+// Paraboloid least-squares fit of the stencil nbr in the frame (u, v, w) centred at c; the
+// fitted surface point above c is returned in out. strict = 0 reproduces MFTL1 exactly (no
+// rank or displacement checks); strict = 1 rejects rank-deficient fits and fits that land
+// more than a quarter of the stencil radius away (caller falls back).
+static int mftlParaboloidFitPoint(MFTL_Object* obj, const double c_in[3], const int* nbr, int nvert, const double u_dir[3], const double w_dir[3], int strict,
+                                  double out[3])
 {
 #ifdef MFTL_HAVE_LAPACK
   // Frame normal supplied by the caller, computed from CURRENT triangle
@@ -286,7 +301,7 @@ static int mftlParaboloidFitAt(MFTL_Object* obj, int v_idx, const int* nbr, int 
   w[2] /= norm;
 
   double c[3];
-  memcpy(c, obj->vertices[v_idx].pos, 3 * sizeof(double));
+  memcpy(c, c_in, 3 * sizeof(double));
   double u[3] = {u_dir[0], u_dir[1], u_dir[2]};
   double dotp = u[0] * w[0] + u[1] * w[1] + u[2] * w[2];
   for (int k = 0; k < 3; ++k) u[k] -= w[k] * dotp;
@@ -330,11 +345,11 @@ static int mftlParaboloidFitAt(MFTL_Object* obj, int v_idx, const int* nbr, int 
   int jpvt[6] = {0, 0, 0, 0, 0, 0};
   double rcond = 1.0e-10, work[100];
   dgelsy_(&N2, &K2, &nrhs, P2, &lda, B2, &ldb, jpvt, &rcond, &lsRank, work, &lwork, &info);
-  if (info != 0 || lsRank < 6) return MFTL_ERROR;
+  if (info != 0 || (strict && lsRank < 6)) return MFTL_ERROR;
 
   double A = B2[0], B = B2[1], C = B2[2], D = B2[3], E = B2[4], F = B2[5];
   double localV[3] = {0, 0, 0};
-  const double* vp = obj->vertices[v_idx].pos;
+  const double* vp = c;  // the fitted point lies above the frame centre
   for (int j = 0; j < 3; ++j)
     for (int k = 0; k < 3; ++k) localV[j] += InvP1[j][k] * (vp[k] - c[k]);
 
@@ -358,22 +373,34 @@ static int mftlParaboloidFitAt(MFTL_Object* obj, int v_idx, const int* nbr, int 
     double d = sqrt(d0 * d0 + d1 * d1 + d2 * d2);
     if (d > scale) scale = d;
   }
-  if (scale < MFTL_VERYSMALL) return MFTL_ERROR;
+  if (strict && scale < MFTL_VERYSMALL) return MFTL_ERROR;
   double f0 = newpos[0] - c[0], f1 = newpos[1] - c[1], f2 = newpos[2] - c[2];
-  if (sqrt(f0 * f0 + f1 * f1 + f2 * f2) > 0.25 * scale) return MFTL_ERROR;  // ~half a local edge
+  if (strict && sqrt(f0 * f0 + f1 * f1 + f2 * f2) > 0.25 * scale) return MFTL_ERROR;  // ~half a local edge
 
   MFTLApplyPeriodicity(obj->domain, newpos);  // keep the wrapped-storage invariant
-  memcpy(obj->vertices[v_idx].pos, newpos, 3 * sizeof(double));
+  memcpy(out, newpos, 3 * sizeof(double));
   return MFTL_SUCCESS;
 #else
   (void) obj;
-  (void) v_idx;
+  (void) c_in;
+  (void) strict;
+  (void) out;
   (void) nbr;
   (void) nvert;
   (void) u_dir;
   (void) w_dir;
   return MFTL_ERROR;  // no LAPACK: caller falls back
 #endif
+}
+
+// Fit at vertex v_idx (the frame centre is its current position); on success the vertex moves.
+static int mftlParaboloidFitAt(MFTL_Object* obj, int v_idx, const int* nbr, int nvert, const double u_dir[3], const double w_dir[3], int strict)
+{
+  double c[3], out[3];
+  memcpy(c, obj->vertices[v_idx].pos, 3 * sizeof(double));
+  if (mftlParaboloidFitPoint(obj, c, nbr, nvert, u_dir, w_dir, strict, out) != MFTL_SUCCESS) return MFTL_ERROR;
+  memcpy(obj->vertices[v_idx].pos, out, 3 * sizeof(double));
+  return MFTL_SUCCESS;
 }
 
 void MFTLFitVertex(MFTL_Object* obj, int v_idx, int he_idx, MFTL_RemeshParameters* params)
@@ -407,22 +434,53 @@ void MFTLFitVertex(MFTL_Object* obj, int v_idx, int he_idx, MFTL_RemeshParameter
   double u_dir[3];
   MFTLGetMinimumImageVector(obj->domain, u_dir, obj->vertices[va].pos, obj->vertices[vb].pos);
   double w_dir[3];
-  if (mftlFitFrameNormal(obj, nbr, nvert, w_dir) != MFTL_SUCCESS)
+  if (mftlFitFrameNormal(obj, nbr, nvert, w_dir, params->mftl1_criteria) != MFTL_SUCCESS)
   {
     double fit[3];
     if (mftlBarycentricFit(obj, v_idx, he_idx, fit) == MFTL_SUCCESS) memcpy(obj->vertices[v_idx].pos, fit, 3 * sizeof(double));
     return;
   }
 
-  if (mftlParaboloidFitAt(obj, v_idx, nbr, nvert, u_dir, w_dir) != MFTL_SUCCESS)
+  if (mftlParaboloidFitAt(obj, v_idx, nbr, nvert, u_dir, w_dir, !params->mftl1_criteria) != MFTL_SUCCESS)
   {
     double fit[3];
     if (mftlBarycentricFit(obj, v_idx, he_idx, fit) == MFTL_SUCCESS) memcpy(obj->vertices[v_idx].pos, fit, 3 * sizeof(double));
   }
 }
 
+/* ------------------------------------------------------------------------- */
+/* Stage 15 (L7): conserved surface scalar through the edge operators          */
+/*                                                                           */
+/* MFTL1 (FRONTTRACKING build) parity, operator by operator:                  */
+/*  - split   : each parent's mass c*A (A from the current positions) is      */
+/*              divided between its two children in proportion to their      */
+/*              areas BEFORE the vertex fit; child c = child mass / child     */
+/*              area AFTER the fit (edgesplit.c).                             */
+/*  - collapse: the mass of the union of the two endpoint one-rings is        */
+/*              redistributed over the surviving ring triangles in            */
+/*              proportion to their new areas (edgecollapse.c).               */
+/*  - flip    : see MFTLFlipEdge (edgeflip.c).                                */
+/* The cached triangle area of every touched triangle is updated, as MFTL1    */
+/* did, so the TSUR/VCS rescaling (c *= A_cached / A_new) stays consistent.   */
+/* ------------------------------------------------------------------------- */
+static inline double mftlSSArea(const MFTL_Object* obj, int tri_idx)
+{
+  double area = 0.0;
+  MFTLGetTriangleProperties(obj, &obj->triangles[tri_idx], &area, MFTL_NULL, MFTL_NULL);
+  return area;
+}
+
 int MFTLSplitEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParameters* params)
 {
+  // Stage 15 (L7): parent triangles and their masses before the split.
+  const int ss_t1 = obj->half_edges[he_ab_idx].triangle_idx;
+  const int ss_he_ba = obj->half_edges[he_ab_idx].twin_idx;
+  const int ss_t3 = (ss_he_ba != MFTL_ERROR) ? obj->half_edges[ss_he_ba].triangle_idx : MFTL_ERROR;
+  const double ss_area1 = mftlSSArea(obj, ss_t1);
+  const double ss_mass1 = obj->triangles[ss_t1].surface_scalar * ss_area1;
+  const double ss_area3 = (ss_t3 != MFTL_ERROR) ? mftlSSArea(obj, ss_t3) : 0.0;
+  const double ss_mass3 = (ss_t3 != MFTL_ERROR) ? obj->triangles[ss_t3].surface_scalar * ss_area3 : 0.0;
+
   // Paraboloid path: gather the stencil and frame from the INTACT edge,
   // BEFORE the topological split (MFTL1 edgesplit.c calls ParaboloidFit
   // before the edge is rewired; the stencil vertex positions are untouched
@@ -434,7 +492,7 @@ int MFTLSplitEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParameters*
       !mftlEdgeIsFeatureEx(obj, he_ab_idx, params->feature_angle_threshold))
   {
     nvert = mftlGatherFitNeighbours(obj, he_ab_idx, nbr);
-    if (nvert >= 6 && mftlFitFrameNormal(obj, nbr, nvert, w_dir) == MFTL_SUCCESS)
+    if (nvert >= 6 && mftlFitFrameNormal(obj, nbr, nvert, w_dir, params->mftl1_criteria) == MFTL_SUCCESS)
     {
       const MFTL_HalfEdge* he = &obj->half_edges[he_ab_idx];
       int he_next = he->next_idx;
@@ -446,17 +504,48 @@ int MFTLSplitEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParameters*
     }
   }
 
+  const int ss_nt_before = obj->n_triangles;
   int v_new = MFTLSplitEdge(obj, he_ab_idx);
   if (v_new == MFTL_ERROR || v_new < 0) return v_new;
 
+  // Stage 15 (L7): pre-fit apportioning. MFTLSplitEdge keeps the parent index for the
+  // child containing A (T1 = A-M-C, T3 = B-M-D) and appends T2 = M-B-C, then T4 = M-A-D.
+  // As in MFTL1, the child sharing vertex A takes the area-proportional share and its
+  // sibling the remainder.
+  const int ss_t2 = ss_nt_before;
+  const int ss_t4 = (ss_t3 != MFTL_ERROR) ? ss_nt_before + 1 : MFTL_ERROR;
+  const double ss_m1 = (ss_area1 > 0.0) ? ss_mass1 * (mftlSSArea(obj, ss_t1) / ss_area1) : 0.0;
+  const double ss_m2 = ss_mass1 - ss_m1;
+  double ss_m4 = 0.0, ss_m3 = 0.0;
+  if (ss_t3 != MFTL_ERROR)
+  {
+    ss_m4 = (ss_area3 > 0.0) ? ss_mass3 * (mftlSSArea(obj, ss_t4) / ss_area3) : 0.0;
+    ss_m3 = ss_mass3 - ss_m4;
+  }
+
   if (have_stencil)
   {
-    if (mftlParaboloidFitAt(obj, v_new, nbr, nvert, u_dir, w_dir) == MFTL_SUCCESS) return v_new;
-    double fit[3];
-    if (mftlBarycentricFit(obj, v_new, he_ab_idx, fit) == MFTL_SUCCESS) memcpy(obj->vertices[v_new].pos, fit, 3 * sizeof(double));
-    return v_new;
+    if (mftlParaboloidFitAt(obj, v_new, nbr, nvert, u_dir, w_dir, !params->mftl1_criteria) != MFTL_SUCCESS)
+    {
+      double fit[3];
+      if (mftlBarycentricFit(obj, v_new, he_ab_idx, fit) == MFTL_SUCCESS) memcpy(obj->vertices[v_new].pos, fit, 3 * sizeof(double));
+    }
   }
-  MFTLFitVertex(obj, v_new, he_ab_idx, params);
+  else
+  {
+    MFTLFitVertex(obj, v_new, he_ab_idx, params);
+  }
+
+  // Stage 15 (L7): post-fit concentrations c = mass / area (cached areas refreshed).
+  const int ss_tris[4] = {ss_t1, ss_t2, ss_t3, ss_t4};
+  const double ss_mass[4] = {ss_m1, ss_m2, ss_m3, ss_m4};
+  for (int k = 0; k < 4; ++k)
+  {
+    if (ss_tris[k] == MFTL_ERROR) continue;
+    MFTL_Triangle* t = &obj->triangles[ss_tris[k]];
+    t->area = mftlSSArea(obj, ss_tris[k]);
+    t->surface_scalar = (t->area > 0.0) ? ss_mass[k] / t->area : 0.0;
+  }
   return v_new;
 }
 
@@ -464,6 +553,35 @@ void MFTLCollapseEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParamet
 {
   int feature = params ? mftlEdgeIsFeatureEx(obj, he_ab_idx, params->feature_angle_threshold) : mftlEdgeIsFeature(obj, he_ab_idx);
   int v_b = obj->half_edges[he_ab_idx].vertex_idx;  // survivor (he target)
+
+  // Stage 15 (L7): union of the two endpoint one-rings and its surface-scalar mass.
+  int ss_ring[2 * MFTL_FIT_MAX_NBR];
+  int ss_n = 0;
+  double ss_mass_start = 0.0;
+  {
+    const MFTL_HalfEdge* he = &obj->half_edges[he_ab_idx];
+    const int v_a = obj->half_edges[obj->half_edges[he->next_idx].next_idx].vertex_idx;
+    MFTL_Triangle* ring[MFTL_FIT_MAX_NBR];
+    const int ends[2] = {v_a, v_b};
+    for (int e = 0; e < 2; ++e)
+    {
+      int n = MFTLGetVertexOneRing(obj, &obj->vertices[ends[e]], ring, MFTL_FIT_MAX_NBR, MFTL_FALSE);
+      for (int r = 0; r < n; ++r)
+      {
+        int ti = (int) (ring[r] - obj->triangles);
+        int dup = 0;
+        for (int q = 0; q < ss_n; ++q)
+          if (ss_ring[q] == ti) dup = 1;
+        if (!dup && ss_n < 2 * MFTL_FIT_MAX_NBR) ss_ring[ss_n++] = ti;
+      }
+    }
+    for (int q = 0; q < ss_n; ++q)
+    {
+      MFTL_Triangle* t = &obj->triangles[ss_ring[q]];
+      t->area = mftlSSArea(obj, ss_ring[q]);
+      ss_mass_start += t->surface_scalar * t->area;
+    }
+  }
 
   // Fit BEFORE the collapse using the intact edge stencil: the collapse
   // moves the survivor to the raw midpoint, which we then overwrite with the
@@ -475,6 +593,22 @@ void MFTLCollapseEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParamet
     if (params->vertex_fit == MFTL_FIT_BARYCENTRIC)
     {
       have_fit = (mftlBarycentricFit(obj, v_b, he_ab_idx, fitted) == MFTL_SUCCESS);
+    }
+    else if (params->mftl1_criteria)
+    {
+      // Stage 15, MFTL1 edgecollapse.c: a separate mid vertex is fitted with both endpoints
+      // (and hence the stencil and its vertex normals) at their ORIGINAL positions.
+      const MFTL_HalfEdge* he = &obj->half_edges[he_ab_idx];
+      int va = obj->half_edges[obj->half_edges[he->next_idx].next_idx].vertex_idx;
+      double e_ab[3], mid[3];
+      MFTLGetMinimumImageVector(obj->domain, e_ab, obj->vertices[va].pos, obj->vertices[v_b].pos);
+      for (int k = 0; k < 3; ++k) mid[k] = obj->vertices[va].pos[k] + 0.5 * e_ab[k];
+      int nbr[MFTL_FIT_MAX_NBR];
+      int nvert = mftlGatherFitNeighbours(obj, he_ab_idx, nbr);
+      double w_dir[3];
+      if (nvert >= 6 && mftlFitFrameNormal(obj, nbr, nvert, w_dir, 1) == MFTL_SUCCESS)
+        have_fit = (mftlParaboloidFitPoint(obj, mid, nbr, nvert, e_ab, w_dir, 0, fitted) == MFTL_SUCCESS);
+      if (!have_fit && mftlBarycentricFit(obj, v_b, he_ab_idx, fitted) == MFTL_SUCCESS) have_fit = 1;
     }
     else
     {
@@ -501,11 +635,11 @@ void MFTLCollapseEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParamet
       int nbr[MFTL_FIT_MAX_NBR];
       int nvert = mftlGatherFitNeighbours(obj, he_ab_idx, nbr);
       double w_dir[3];
-      if (nvert >= 6 && mftlFitFrameNormal(obj, nbr, nvert, w_dir) == MFTL_SUCCESS)
+      if (nvert >= 6 && mftlFitFrameNormal(obj, nbr, nvert, w_dir, 0) == MFTL_SUCCESS)
       {
         double u_dir[3];
         MFTLGetMinimumImageVector(obj->domain, u_dir, obj->vertices[va].pos, saved);
-        if (mftlParaboloidFitAt(obj, v_b, nbr, nvert, u_dir, w_dir) == MFTL_SUCCESS)
+        if (mftlParaboloidFitAt(obj, v_b, nbr, nvert, u_dir, w_dir, 1) == MFTL_SUCCESS)
         {
           memcpy(fitted, obj->vertices[v_b].pos, 3 * sizeof(double));
           have_fit = 1;
@@ -518,4 +652,22 @@ void MFTLCollapseEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParamet
 
   MFTLCollapseEdge(obj, he_ab_idx);
   if (have_fit) memcpy(obj->vertices[v_b].pos, fitted, 3 * sizeof(double));
+
+  // Stage 15 (L7): redistribute the ring mass over the survivors by their new areas
+  // (nothing to do when MFTLCollapseEdge refused the collapse).
+  if (!(obj->half_edges[he_ab_idx].flags & MFTL_FLAG_DEAD)) return;
+  double ss_area_new = 0.0;
+  for (int q = 0; q < ss_n; ++q)
+  {
+    MFTL_Triangle* t = &obj->triangles[ss_ring[q]];
+    if (t->flags & MFTL_FLAG_DEAD) continue;
+    t->area = mftlSSArea(obj, ss_ring[q]);
+    ss_area_new += t->area;
+  }
+  for (int q = 0; q < ss_n; ++q)
+  {
+    MFTL_Triangle* t = &obj->triangles[ss_ring[q]];
+    if (t->flags & MFTL_FLAG_DEAD) continue;
+    t->surface_scalar = (ss_area_new > 0.0 && t->area > 0.0) ? (ss_mass_start * (t->area / ss_area_new)) / t->area : 0.0;
+  }
 }

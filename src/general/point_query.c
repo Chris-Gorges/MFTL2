@@ -521,6 +521,109 @@ int MFTLPointInsideObject(MFTL_Object* obj, const double p_in[3])
 }
 
 /* ------------------------------------------------------------------------- */
+/* Stage 15 (L2): caller-held point query (build once, query many)           */
+/* ------------------------------------------------------------------------- */
+
+struct MFTL_PointQuery
+{
+  MFTL_Object* obj;
+  MFTL_BVH* bvh;  // NULL on periodic domains (per-point fallback)
+  double ray_length;
+};
+
+MFTL_PointQuery* MFTLPointQueryCreate(MFTL_Object* obj)
+{
+  MFTL_ASSERT(obj != MFTL_NULL);
+  MFTL_ASSERT(MFTLCheckMeshIntegrity(obj) == MFTL_SUCCESS);
+  MFTL_PointQuery* q = (MFTL_PointQuery*) calloc(1, sizeof(MFTL_PointQuery));
+  q->obj = obj;
+  const MFTL_Domain* domain = obj->domain;
+  const double* ds = domain->domain_size;
+  q->ray_length = 50.0 * sqrt(ds[0] * ds[0] + ds[1] * ds[1] + ds[2] * ds[2]);
+  if (!MFTLDomainAnyPeriodic(domain))
+  {
+    q->bvh = MFTL_GenerateLBVH(obj);
+    g_mftl_pq_bvh_builds++;
+  }
+  return q;
+}
+
+void MFTLPointQueryDestroy(MFTL_PointQuery** q)
+{
+  if (!q || !*q) return;
+  if ((*q)->bvh) MFTL_DestroyBVH((*q)->bvh);
+  free(*q);
+  *q = MFTL_NULL;
+}
+
+int MFTLPointQueryInsideMany(MFTL_PointQuery* q, int n, const double* xyz, int* result)
+{
+  MFTL_Object* obj = q->obj;
+  MFTL_Domain* domain = obj->domain;
+  if (!q->bvh)
+  {
+    for (int m = 0; m < n; ++m) result[m] = MFTLPointInsideObject(obj, &xyz[3 * m]);
+    return MFTL_SUCCESS;
+  }
+
+  // Per-point state; `pending` lists the points still being classified. Every iteration
+  // uses ONE shared direction (rank 0 draws, all receive), exactly the direction sequence
+  // MFTLPointInsideObject uses for every single point, so each point gets the verdict it
+  // would get from a sequence of single-point calls.
+  int* pending = (int*) malloc((size_t) (n > 0 ? n : 1) * sizeof(int));
+  int* loc = (int*) malloc((size_t) (2 * (n > 0 ? n : 1)) * sizeof(int));
+  int* glob = (int*) malloc((size_t) (2 * (n > 0 ? n : 1)) * sizeof(int));
+  int np = n;
+  for (int m = 0; m < n; ++m) pending[m] = m;
+
+  const int maxiter = 100;
+  int i = 0;
+  while (np > 0 && i++ < maxiter)
+  {
+    double dir[3];
+    if (domain->rank == 0) mftlRandomRayLocal(i - 1, dir);
+    MPI_Bcast(dir, 3, MPI_DOUBLE, 0, domain->comm_cart);
+
+    for (int k = 0; k < np; ++k)
+    {
+      const double* p = &xyz[3 * pending[k]];
+      int degenerate = 0;
+      double ray_end[3] = {p[0] + dir[0] * q->ray_length, p[1] + dir[1] * q->ray_length, p[2] + dir[2] * q->ray_length};
+      loc[2 * k] = mftlStabbedTrianglesBVH(obj, q->bvh, p, &degenerate, ray_end);
+      loc[2 * k + 1] = degenerate;
+    }
+    MPI_Allreduce(loc, glob, 2 * np, MPI_INT, MPI_SUM, domain->comm_cart);
+
+    int still = 0;
+    for (int k = 0; k < np; ++k)
+    {
+      const int stabbed = glob[2 * k], flag = glob[2 * k + 1];
+      if (flag == 0)
+        result[pending[k]] = stabbed % 2;  // odd => inside
+      else if (flag < 0)
+        result[pending[k]] = -1;  // on the surface
+      else
+        pending[still++] = pending[k];  // grazing hit somewhere: retry with a fresh direction
+    }
+    np = still;
+  }
+  for (int k = 0; k < np; ++k) result[pending[k]] = 1;  // MFTL1: after 100 retries assume inside
+  g_mftl_pq_last_iterations = i;
+
+  free(pending);
+  free(loc);
+  free(glob);
+  return MFTL_SUCCESS;
+}
+
+int MFTLPointQueryInside(MFTL_PointQuery* q, const double p[3])
+{
+  int r = 0;
+  MFTLPointQueryInsideMany(q, 1, p, &r);
+  return r;
+}
+
+/* ------------------------------------------------------------------------- */
 /* Axis-aligned bounding boxes (multiflow moveIBM's ortho box)               */
 /* ------------------------------------------------------------------------- */
 

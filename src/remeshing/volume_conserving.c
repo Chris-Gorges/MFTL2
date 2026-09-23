@@ -113,6 +113,25 @@ static int mftlVcEdgeInteriorParallel(const MFTL_Object* obj, int he_idx)
   if (obj->vertices[obj->half_edges[tw_next].vertex_idx].is_ghost) return 0;
   if (obj->vertices[obj->half_edges[tw_prev].vertex_idx].is_ghost) return 0;
 
+  // Stage 15 (L7): the step moves both endpoints and rescales the surface scalar of every
+  // triangle in their one-rings; a ring triangle stored here only as a ghost would get its
+  // rescale on the ghost copy while its owner keeps the old value (mass loss). Require the
+  // full rings to be locally owned.
+  for (int e = 0; e < 2; ++e)
+  {
+    const MFTL_Vertex* v = &obj->vertices[e == 0 ? he->vertex_idx : tw->vertex_idx];
+    int h = v->out_he_idx, guard = 0;
+    if (h < 0) return 0;
+    do
+    {
+      if (obj->half_edges[h].flags & MFTL_FLAG_DEAD) return 0;
+      if (obj->triangles[obj->half_edges[h].triangle_idx].is_ghost) return 0;
+      int t = obj->half_edges[h].twin_idx;
+      if (t == MFTL_ERROR) return 0;
+      h = obj->half_edges[t].next_idx;
+      if (++guard > MFTL_VC_MAX_RING) return 0;
+    } while (h != v->out_he_idx);
+  }
   return 1;
 }
 
@@ -483,6 +502,22 @@ static int mftlVcEndpointData(MFTL_Object* obj, int vi, int v_other, const doubl
   return MFTL_SUCCESS;
 }
 
+// Stage 15 (L7, MFTL1 tsur3d.c / volumeconservation.c parity): after the library moved the
+// two edge endpoints, every triangle of their one-rings keeps its surface-scalar MASS:
+// c *= A_cached / A_new, and the cached area becomes A_new. A triangle in both rings is
+// visited twice; the second visit has ratio exactly 1.
+static void mftlSSRescaleRing(MFTL_Object* obj, const int* ring, int n)
+{
+  for (int r = 0; r < n; ++r)
+  {
+    MFTL_Triangle* t = &obj->triangles[ring[r]];
+    double a = 0.0;
+    MFTLGetTriangleProperties(obj, t, &a, MFTL_NULL, MFTL_NULL);
+    if (a > 0.0) t->surface_scalar = t->surface_scalar * (t->area / a);
+    t->area = a;
+  }
+}
+
 void MFTLEdgeVolumeConservingSmoothing(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
 {
   MFTL_HalfEdge* he = &obj->half_edges[he_idx];
@@ -554,6 +589,13 @@ void MFTLEdgeVolumeConservingSmoothing(MFTL_Object* obj, int he_idx, MFTL_Remesh
     // keep the storage invariant: wrapped positions (no-op when non-periodic)
     MFTLApplyPeriodicity(obj->domain, obj->vertices[i == 0 ? v0 : v1].pos);
   }
+
+  // Stage 15 (L7): conserve the surface-scalar mass of the moved rings.
+  int ss_ring[MFTL_VC_MAX_RING];
+  int ss_n = mftlVcRingTris(obj, v0, ss_ring);
+  mftlSSRescaleRing(obj, ss_ring, ss_n);
+  ss_n = mftlVcRingTris(obj, v1, ss_ring);
+  mftlSSRescaleRing(obj, ss_ring, ss_n);
 }
 
 void MFTLVolumeConservingSmoothing(MFTL_Object* obj, MFTL_RemeshParameters* params)
@@ -686,6 +728,15 @@ int MFTLEdgeTSUR(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
     normal0[k] /= area_sum0;
     normal1[k] /= area_sum1;
   }
+  // MFTL1 normalises each endpoint normal (MFTL_NormalizeVector, 1e-15 floor) BEFORE the
+  // sum; summing the unnormalised averages tilts n whenever |normal0| != |normal1|.
+  const double len0 = MFTL_MAX(1e-15, sqrt(normal0[0] * normal0[0] + normal0[1] * normal0[1] + normal0[2] * normal0[2]));
+  const double len1 = MFTL_MAX(1e-15, sqrt(normal1[0] * normal1[0] + normal1[1] * normal1[1] + normal1[2] * normal1[2]));
+  for (int k = 0; k < 3; ++k)
+  {
+    normal0[k] /= len0;
+    normal1[k] /= len1;
+  }
 
   // 2. common tangent normal
   double normal[3] = {normal0[0] + normal1[0], normal0[1] + normal1[1], normal0[2] + normal1[2]};
@@ -783,6 +834,10 @@ int MFTLEdgeTSUR(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
     pos0[k] = MFTL_MAX(lo, MFTL_MIN(pos0[k], hi));
     pos1[k] = MFTL_MAX(lo, MFTL_MIN(pos1[k], hi));
   }
+
+  // Stage 15 (L7): conserve the surface-scalar mass of the moved rings.
+  mftlSSRescaleRing(obj, ring0, n0);
+  mftlSSRescaleRing(obj, ring1, n1);
   return MFTL_SUCCESS;
 }
 

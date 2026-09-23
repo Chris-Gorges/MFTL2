@@ -118,6 +118,41 @@ static int mftlTriangleCorners(const MFTL_Object* obj, const MFTL_Triangle* tri,
   return kv;
 }
 
+// Angle/edge-length weighted normal of vertex i from its (closed) stored ring. Returns the
+// unnormalised accumulator in acc; when recompute_tri is set, every ring triangle's cached
+// normal is recomputed from the current positions first (MFTL1 MFTL_OneRingVertexNormal).
+static void mftlVertexNormalAccumulate(MFTL_Object* obj, int i, const int* ring, int n, int recompute_tri, double acc[3])
+{
+  acc[0] = acc[1] = acc[2] = 0.0;
+  for (int r = 0; r < n; ++r)
+  {
+    MFTL_Triangle* tri = &obj->triangles[ring[r]];
+    if (recompute_tri) MFTLGetTriangleProperties(obj, tri, MFTL_NULL, tri->normal, MFTL_NULL);
+    int cyc[3];
+    double cp[3][3];
+    int kv = mftlTriangleCorners(obj, tri, i, cyc, cp);
+    MFTL_ASSERT(kv >= 0);
+
+    // corner angle at v toward the other two corners
+    double e0[3] = {cp[(kv + 1) % 3][0] - cp[kv][0], cp[(kv + 1) % 3][1] - cp[kv][1], cp[(kv + 1) % 3][2] - cp[kv][2]};
+    double e1[3] = {cp[(kv + 2) % 3][0] - cp[kv][0], cp[(kv + 2) % 3][1] - cp[kv][1], cp[(kv + 2) % 3][2] - cp[kv][2]};
+    double l0 = sqrt(e0[0] * e0[0] + e0[1] * e0[1] + e0[2] * e0[2]);
+    double l1 = sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
+    double lprod = l0 * l1;
+    if (!(lprod > 0.0)) continue;  // degenerate corner (scale-free guard, Stage 15)
+
+    double c = (e0[0] * e1[0] + e0[1] * e1[1] + e0[2] * e1[2]) / lprod;
+    if (c > 1.0) c = 1.0;
+    if (c < -1.0) c = -1.0;
+    double alpha = acos(c);
+    double weight = sin(alpha) / lprod;
+
+    acc[0] += weight * tri->normal[0];
+    acc[1] += weight * tri->normal[1];
+    acc[2] += weight * tri->normal[2];
+  }
+}
+
 void MFTLComputeVertexNormals(MFTL_Object* obj)
 {
   MFTL_ASSERT(obj != MFTL_NULL);
@@ -132,33 +167,8 @@ void MFTLComputeVertexNormals(MFTL_Object* obj)
     int n = mftlGatherRing(obj, i, ring);
     if (n == 0) continue;  // incomplete stored ring: skip (ghosts cover owned)
 
-    double acc[3] = {0.0, 0.0, 0.0};
-    for (int r = 0; r < n; ++r)
-    {
-      MFTL_Triangle* tri = &obj->triangles[ring[r]];
-      int cyc[3];
-      double cp[3][3];
-      int kv = mftlTriangleCorners(obj, tri, i, cyc, cp);
-      MFTL_ASSERT(kv >= 0);
-
-      // corner angle at v toward the other two corners
-      double e0[3] = {cp[(kv + 1) % 3][0] - cp[kv][0], cp[(kv + 1) % 3][1] - cp[kv][1], cp[(kv + 1) % 3][2] - cp[kv][2]};
-      double e1[3] = {cp[(kv + 2) % 3][0] - cp[kv][0], cp[(kv + 2) % 3][1] - cp[kv][1], cp[(kv + 2) % 3][2] - cp[kv][2]};
-      double l0 = sqrt(e0[0] * e0[0] + e0[1] * e0[1] + e0[2] * e0[2]);
-      double l1 = sqrt(e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]);
-      double lprod = l0 * l1;
-      if (lprod < MFTL_VERYSMALL) continue;  // degenerate corner
-
-      double c = (e0[0] * e1[0] + e0[1] * e1[1] + e0[2] * e1[2]) / lprod;
-      if (c > 1.0) c = 1.0;
-      if (c < -1.0) c = -1.0;
-      double alpha = acos(c);
-      double weight = sin(alpha) / lprod;
-
-      acc[0] += weight * tri->normal[0];
-      acc[1] += weight * tri->normal[1];
-      acc[2] += weight * tri->normal[2];
-    }
+    double acc[3];
+    mftlVertexNormalAccumulate(obj, i, ring, n, 0, acc);
 
     double len = sqrt(acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]);
     if (len > MFTL_VERYSMALL)
@@ -168,6 +178,100 @@ void MFTLComputeVertexNormals(MFTL_Object* obj)
       v->normal[2] = acc[2] / len;
     }
   }
+}
+
+int MFTLComputeVertexNormalAt(MFTL_Object* obj, int vi)
+{
+  int ring[MFTL_CURVATURE_MAX_RING];
+  int n = mftlGatherRing(obj, vi, ring);
+  if (n == 0) return MFTL_ERROR;
+  double acc[3];
+  mftlVertexNormalAccumulate(obj, vi, ring, n, 1, acc);
+  // MFTL1 MFTL_NormalizeVector: floor on the magnitude, always normalised
+  double len = sqrt(acc[0] * acc[0] + acc[1] * acc[1] + acc[2] * acc[2]);
+  if (len < MFTL_VERYVERYSMALL) len = MFTL_VERYVERYSMALL;
+  MFTL_Vertex* v = &obj->vertices[vi];
+  v->normal[0] = acc[0] / len;
+  v->normal[1] = acc[1] / len;
+  v->normal[2] = acc[2] / len;
+  return MFTL_SUCCESS;
+}
+
+// Laplace-Beltrami curvatures of vertex i from its (closed) stored ring; recompute_area
+// refreshes every ring triangle's cached area first (MFTL1 MFTL_VertexLaplaceBeltrami).
+static int mftlVertexCurvatureKernel(MFTL_Object* obj, int i, const int* ring, int n, int recompute_area)
+{
+  MFTL_Vertex* v = &obj->vertices[i];
+  if (recompute_area)
+    for (int r = 0; r < n; ++r) MFTLGetTriangleProperties(obj, &obj->triangles[ring[r]], &obj->triangles[ring[r]].area, MFTL_NULL, MFTL_NULL);
+  double area_voronoi = 0.0;
+  double gauss_angle_sum = 0.0;
+  double mean_sum[3] = {0.0, 0.0, 0.0};
+
+  for (int r = 0; r < n; ++r)
+  {
+    MFTL_Triangle* tri = &obj->triangles[ring[r]];
+    int cyc[3];
+    double cp[3][3];
+    int kv = mftlTriangleCorners(obj, tri, i, cyc, cp);
+    MFTL_ASSERT(kv >= 0);
+
+    // squared edge lengths: L2[k] = edge opposite corner k
+    double L2[3];
+    for (int k = 0; k < 3; ++k)
+    {
+      double d0 = cp[(k + 1) % 3][0] - cp[(k + 2) % 3][0];
+      double d1 = cp[(k + 1) % 3][1] - cp[(k + 2) % 3][1];
+      double d2 = cp[(k + 1) % 3][2] - cp[(k + 2) % 3][2];
+      L2[k] = d0 * d0 + d1 * d1 + d2 * d2;
+    }
+
+    double A = tri->area;
+    if (!(A > 0.0)) continue;  // degenerate triangle guard (scale-free, Stage 15)
+
+    // corner angle at v (opposite corner kv's edge)
+    double f0[3] = {cp[(kv + 1) % 3][0] - cp[kv][0], cp[(kv + 1) % 3][1] - cp[kv][1], cp[(kv + 1) % 3][2] - cp[kv][2]};
+    double f1[3] = {cp[(kv + 2) % 3][0] - cp[kv][0], cp[(kv + 2) % 3][1] - cp[kv][1], cp[(kv + 2) % 3][2] - cp[kv][2]};
+    double lf0 = sqrt(f0[0] * f0[0] + f0[1] * f0[1] + f0[2] * f0[2]);
+    double lf1 = sqrt(f1[0] * f1[0] + f1[1] * f1[1] + f1[2] * f1[2]);
+    double cosv = (lf0 * lf1 > 0.0) ? (f0[0] * f1[0] + f0[1] * f1[1] + f0[2] * f1[2]) / (lf0 * lf1) : 1.0;
+    if (cosv > 1.0) cosv = 1.0;
+    if (cosv < -1.0) cosv = -1.0;
+    double angle_at_v = acos(cosv);
+    gauss_angle_sum += angle_at_v;
+
+    // obtuse test at every corner: angle k obtuse <=> L2[k] > L2[k+1] + L2[k+2]
+    int obtuse = (L2[0] > L2[1] + L2[2]) || (L2[1] > L2[2] + L2[0]) || (L2[2] > L2[0] + L2[1]);
+
+    // the two edges CONTAINING v are opposite corners (kv+1) and (kv+2)
+    for (int cc = 1; cc <= 2; ++cc)
+    {
+      int eo = (kv + cc) % 3;  // edge opposite corner eo contains v
+      double cotan = 0.25 * (L2[(eo + 1) % 3] + L2[(eo + 2) % 3] - L2[eo]) / A;
+      if (!obtuse) area_voronoi += cotan * L2[eo];
+
+      // the other endpoint of that edge: use the unwrapped corner
+      // positions (cp[kv] == v's image; seam-safe across the periodic wrap)
+      const double* op = cp[(kv + 3 - cc) % 3];
+      mean_sum[0] += cotan * (cp[kv][0] - op[0]);
+      mean_sum[1] += cotan * (cp[kv][1] - op[1]);
+      mean_sum[2] += cotan * (cp[kv][2] - op[2]);
+    }
+
+    if (obtuse) area_voronoi += (angle_at_v > 1.5708) ? 0.5 * A : 0.25 * A;
+  }
+
+  area_voronoi *= 0.125;
+  if (!(area_voronoi > 0.0)) return MFTL_ERROR;  // scale-free guard (Stage 15)
+
+  double lb0 = 0.5 * mean_sum[0] / area_voronoi;
+  double lb1 = 0.5 * mean_sum[1] / area_voronoi;
+  double lb2 = 0.5 * mean_sum[2] / area_voronoi;
+
+  v->area = area_voronoi;
+  v->meancurvature = sqrt(lb0 * lb0 + lb1 * lb1 + lb2 * lb2);
+  v->gaussiancurvature = 2.0 * (MFTL_TWO_PI - gauss_angle_sum) / area_voronoi;
+  return MFTL_SUCCESS;
 }
 
 void MFTLComputeVertexCurvatures(MFTL_Object* obj)
@@ -184,74 +288,16 @@ void MFTLComputeVertexCurvatures(MFTL_Object* obj)
     int n = mftlGatherRing(obj, i, ring);
     if (n == 0) continue;  // incomplete stored ring: skip (see header)
 
-    double area_voronoi = 0.0;
-    double gauss_angle_sum = 0.0;
-    double mean_sum[3] = {0.0, 0.0, 0.0};
-
-    for (int r = 0; r < n; ++r)
-    {
-      MFTL_Triangle* tri = &obj->triangles[ring[r]];
-      int cyc[3];
-      double cp[3][3];
-      int kv = mftlTriangleCorners(obj, tri, i, cyc, cp);
-      MFTL_ASSERT(kv >= 0);
-
-      // squared edge lengths: L2[k] = edge opposite corner k
-      double L2[3];
-      for (int k = 0; k < 3; ++k)
-      {
-        double d0 = cp[(k + 1) % 3][0] - cp[(k + 2) % 3][0];
-        double d1 = cp[(k + 1) % 3][1] - cp[(k + 2) % 3][1];
-        double d2 = cp[(k + 1) % 3][2] - cp[(k + 2) % 3][2];
-        L2[k] = d0 * d0 + d1 * d1 + d2 * d2;
-      }
-
-      double A = tri->area;
-      if (A < MFTL_VERYSMALL) continue;  // degenerate triangle guard
-
-      // corner angle at v (opposite corner kv's edge)
-      double f0[3] = {cp[(kv + 1) % 3][0] - cp[kv][0], cp[(kv + 1) % 3][1] - cp[kv][1], cp[(kv + 1) % 3][2] - cp[kv][2]};
-      double f1[3] = {cp[(kv + 2) % 3][0] - cp[kv][0], cp[(kv + 2) % 3][1] - cp[kv][1], cp[(kv + 2) % 3][2] - cp[kv][2]};
-      double lf0 = sqrt(f0[0] * f0[0] + f0[1] * f0[1] + f0[2] * f0[2]);
-      double lf1 = sqrt(f1[0] * f1[0] + f1[1] * f1[1] + f1[2] * f1[2]);
-      double cosv = (lf0 * lf1 > MFTL_VERYSMALL) ? (f0[0] * f1[0] + f0[1] * f1[1] + f0[2] * f1[2]) / (lf0 * lf1) : 1.0;
-      if (cosv > 1.0) cosv = 1.0;
-      if (cosv < -1.0) cosv = -1.0;
-      double angle_at_v = acos(cosv);
-      gauss_angle_sum += angle_at_v;
-
-      // obtuse test at every corner: angle k obtuse <=> L2[k] > L2[k+1] + L2[k+2]
-      int obtuse = (L2[0] > L2[1] + L2[2]) || (L2[1] > L2[2] + L2[0]) || (L2[2] > L2[0] + L2[1]);
-
-      // the two edges CONTAINING v are opposite corners (kv+1) and (kv+2)
-      for (int cc = 1; cc <= 2; ++cc)
-      {
-        int eo = (kv + cc) % 3;  // edge opposite corner eo contains v
-        double cotan = 0.25 * (L2[(eo + 1) % 3] + L2[(eo + 2) % 3] - L2[eo]) / A;
-        if (!obtuse) area_voronoi += cotan * L2[eo];
-
-        // the other endpoint of that edge: use the unwrapped corner
-        // positions (cp[kv] == v's image; seam-safe across the periodic wrap)
-        const double* op = cp[(kv + 3 - cc) % 3];
-        mean_sum[0] += cotan * (cp[kv][0] - op[0]);
-        mean_sum[1] += cotan * (cp[kv][1] - op[1]);
-        mean_sum[2] += cotan * (cp[kv][2] - op[2]);
-      }
-
-      if (obtuse) area_voronoi += (angle_at_v > 1.5708) ? 0.5 * A : 0.25 * A;
-    }
-
-    area_voronoi *= 0.125;
-    if (area_voronoi < MFTL_VERYSMALL) continue;
-
-    double lb0 = 0.5 * mean_sum[0] / area_voronoi;
-    double lb1 = 0.5 * mean_sum[1] / area_voronoi;
-    double lb2 = 0.5 * mean_sum[2] / area_voronoi;
-
-    v->area = area_voronoi;
-    v->meancurvature = sqrt(lb0 * lb0 + lb1 * lb1 + lb2 * lb2);
-    v->gaussiancurvature = 2.0 * (MFTL_TWO_PI - gauss_angle_sum) / area_voronoi;
+    mftlVertexCurvatureKernel(obj, i, ring, n, 0);
   }
+}
+
+int MFTLComputeVertexCurvatureAt(MFTL_Object* obj, int vi)
+{
+  int ring[MFTL_CURVATURE_MAX_RING];
+  int n = mftlGatherRing(obj, vi, ring);
+  if (n == 0) return MFTL_ERROR;
+  return mftlVertexCurvatureKernel(obj, vi, ring, n, 1);
 }
 
 double MFTLComputeRoughness(MFTL_Object* obj)

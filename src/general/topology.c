@@ -79,6 +79,7 @@ void MFTLRebuildTwins(MFTL_Object *obj)
       if (he_base[candidate].vertex_idx == u)
       {
         he->twin_idx = candidate;
+        he->twin_gid = he_base[candidate].global_id;  // (a rim half-edge keeps its retained twin_gid)
         he->boundary = MFTL_FALSE;
         break;  // Found it!
       }
@@ -386,10 +387,8 @@ int MFTLCheckMeshIntegrity(MFTL_Object *object)
     }
   }
 
-  if (ok == MFTL_SUCCESS)
-  {
-    printf("[MeshCheck] Mesh is consistent and closed.\n");
-  }
+  // Stage 15: success is silent (the check runs inside MFTL_ASSERTs of hot collective
+  // routines such as MFTLObjectVolume; failures are still reported above).
   return ok;
 }
 
@@ -535,6 +534,7 @@ void MFTLBuildTopologyFromTriples(MFTL_Object* obj, int nV, const double positio
       he->vertex_idx = b;
       he->next_idx = 3 * t + ((j + 1) % 3);
       he->twin_idx = MFTL_ERROR;
+      he->twin_gid = MFTL_ERROR;
       he->boundary = MFTL_TRUE;
       he->flags = 0;
 

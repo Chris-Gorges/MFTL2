@@ -178,15 +178,18 @@ static inline void MFTLGetTriangleProperties(const MFTL_Object *object, const MF
   cross_prod[1] = vec_a[2] * vec_b[0] - vec_a[0] * vec_b[2];
   cross_prod[2] = vec_a[0] * vec_b[1] - vec_a[1] * vec_b[0];
 
-  // Calculate the magnitude of the cross product vector
-  const double mag = MFTL_SQRT(MFTL_MAX(MFTL_VERYSMALL, cross_prod[0] * cross_prod[0] + cross_prod[1] * cross_prod[1] + cross_prod[2] * cross_prod[2]));
+  // Calculate the magnitude of the cross product vector. Stage 15: the area is NOT floored
+  // (the former floor sqrt(MFTL_VERYSMALL) = 1e-6 on |cross| silently clamped every triangle
+  // below 5e-7 in area and de-normalised its normal — i.e. typical front-tracking meshes);
+  // only the normalisation divides by max(|cross|, 1e-15), exactly as MFTL1 did.
+  const double mag = MFTL_SQRT(cross_prod[0] * cross_prod[0] + cross_prod[1] * cross_prod[1] + cross_prod[2] * cross_prod[2]);
   if (area_out)
   {
     *area_out = 0.5 * mag;
   }
   if (normal_out)
   {
-    const double inv_mag = 1.0 / mag;
+    const double inv_mag = 1.0 / MFTL_MAX(MFTL_VERYVERYSMALL, mag);
     normal_out[0] = cross_prod[0] * inv_mag;
     normal_out[1] = cross_prod[1] * inv_mag;
     normal_out[2] = cross_prod[2] * inv_mag;
@@ -245,7 +248,7 @@ static inline void MFTLGetTriangleCenter(const MFTL_Object *object, const MFTL_T
 static inline void MFTLComputeTriangleProperties(const MFTL_Object *object)
 {
   MFTL_Triangle *tri_base = object->triangles;
-  for (size_t i = 0; i < object->n_triangles; i++)
+  for (int i = 0; i < object->n_triangles; i++)
   {
     MFTL_Triangle *tri = &tri_base[i];
     if (tri->flags & MFTL_FLAG_DEAD) continue;  // remeshing leftovers until finalization
@@ -284,7 +287,7 @@ double MFTLSurfaceCenter(MFTL_Object* obj, double cm[3]);
  * periodic image as the mesh — e.g. the centroid returned by
  * MFTLSurfaceCenter.
  */
-void MFTLMomentOfInertia(MFTL_Object* obj, double I[3][3], const double center[3], double density);
+void MFTLMomentOfInertia(MFTL_Object* obj, double inertia[3][3], const double center[3], double density);
 
 /**
  * @brief Minimum-image constraint check (Stage 13): on a periodic domain the
@@ -363,6 +366,14 @@ void MFTLComputeVertexNormals(MFTL_Object* obj);
 /** @brief Cotangent Laplace-Beltrami curvatures + mixed-Voronoi area per owned vertex. */
 void MFTLComputeVertexCurvatures(MFTL_Object* obj);
 
+/* Stage 15 (L5): single-vertex variants (MFTL1 MFTL_OneRingVertexNormal /
+   MFTL_VertexLaplaceBeltrami). They work on ANY stored vertex (owned or ghost) whose stored
+   one-ring is closed, recompute the ring triangles' cached normals (normal) or areas
+   (curvature) from the current positions first, and return MFTL_ERROR (vertex untouched)
+   when the ring is not closed. */
+int MFTLComputeVertexNormalAt(MFTL_Object* obj, int vi);
+int MFTLComputeVertexCurvatureAt(MFTL_Object* obj, int vi);
+
 /**
  * @brief Surface roughness: returns the GLOBAL geometric-Laplacian average
  * (MFTL1 parity); stores per-vertex dihedral mean/variance in
@@ -391,6 +402,20 @@ double MFTLPointTriangleDistance(const MFTL_Object* obj, int tri_idx, const doub
  * 100). On periodic domains the probe is re-imaged next to the object.
  */
 int MFTLPointInsideObject(MFTL_Object* obj, const double p[3]);
+
+/* Stage 15 (L2): caller-held point query. MFTLPointQueryCreate builds the object's LBVH
+   ONCE (collective); MFTLPointQueryInside / MFTLPointQueryInsideMany then classify points
+   against it with exactly the MFTLPointInsideObject semantics (same shared ray sequence,
+   same retry rule, 1 inside / 0 outside / -1 on the surface) without rebuilding anything.
+   InsideMany classifies n points (the SAME n points on every rank) with O(retries)
+   collectives in total instead of O(n). The query is valid until the object is changed
+   structurally or its vertices move. On periodic domains the query falls back to
+   MFTLPointInsideObject per point (the unwrap-to-anchor step cannot be cached). */
+typedef struct MFTL_PointQuery MFTL_PointQuery;
+MFTL_PointQuery* MFTLPointQueryCreate(MFTL_Object* obj);
+void MFTLPointQueryDestroy(MFTL_PointQuery** q);
+int MFTLPointQueryInside(MFTL_PointQuery* q, const double p[3]);
+int MFTLPointQueryInsideMany(MFTL_PointQuery* q, int n, const double* xyz, int* result);
 
 /** @brief Orthogonal containment test with MFTL_VERYSMALL slack (MFTL1 MFTLPointInsideObjectBox parity). */
 int MFTLPointInsideAABB(const double center[3], const double dims[3], const double p[3]);

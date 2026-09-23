@@ -185,3 +185,13 @@ foreach(_t ${_mftl2_test_targets})
         mftl2_dev_target_options(${_t})
     endif()
 endforeach()
+
+# --- Stage 15: library items L1-L7 (rectilinear domains, twin gids, surface scalar, point
+#     query objects, single-vertex curvature, soup builder, native mesh I/O, transfers) ---
+add_executable(test_stage15 test_stage15.c)
+target_link_libraries(test_stage15 PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_stage15 PRIVATE ${CMAKE_SOURCE_DIR}/include)
+foreach(NP 1 2 3 4)
+    add_test(NAME Stage15-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage15>)
+    set_tests_properties(Stage15-np${NP} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+endforeach()

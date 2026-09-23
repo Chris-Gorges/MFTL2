@@ -240,7 +240,6 @@ static int mftlFanInterior(MFTL_Object *obj, int he_idx)
   return 1;
 }
 
-
 /* ══════════════════════════════════════════════════════════════════════
  * Split phase with disjoint per-rank GID blocks
  *
@@ -252,9 +251,10 @@ static int mftlFanInterior(MFTL_Object *obj, int he_idx)
  *   start = base + prefix_sum(my candidate count) * per-split consumption
  *
  * A split consumes 1 vertex, 2 triangle and 6 half-edge GIDs, so the
- * candidate count bounds consumption exactly. The predicate is read-only
- * and deterministic, so the counting pass sees the same candidates as the
- * apply pass.
+ * candidate count bounds consumption exactly. The apply pass splits only
+ * the candidates recorded by the counting pass (Stage 15: criteria that read
+ * the neighbourhood could otherwise approve more edges after neighbouring
+ * splits than were counted).
  * ══════════════════════════════════════════════════════════════════════ */
 static long mftlParallelSplitPhase(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
 {
@@ -262,22 +262,28 @@ static long mftlParallelSplitPhase(MFTL_Ensemble *ens, MFTL_RemeshParameters *pa
   int nobj = ens->num_objects;
   int nproc = dom->nproc;
   long splits = 0;
+  if (params->skip_split) return 0;  // identical on all ranks: skips the collective too
 
-  // 1. Count candidates per object (serial order: highest half-edge first).
+  // 1. Collect the candidates per object (serial order: highest half-edge first). The apply
+  //    pass splits exactly these: a criterion that reads the neighbourhood (the MFTL1 JIAO
+  //    test compares the wing edges, which neighbouring splits shorten) must not approve
+  //    more edges than were counted, or the reserved gid blocks would overlap.
   int *cand = (int *) calloc((size_t) nobj, sizeof(int));
+  int **cand_he = (int **) calloc((size_t) nobj, sizeof(int *));
   for (int o = 0; o < nobj; ++o)
   {
     MFTL_Object *obj = ens->objects[o];
+    cand_he[o] = (int *) malloc(((size_t) obj->n_half_edges + 1) * sizeof(int));
     for (int j = obj->n_half_edges - 1; j >= 0; --j)
     {
       if (!mftlEdgeInterior(obj, j)) continue;
       if (!MFTLSplitApproved(obj, j, params)) continue;
-      cand[o]++;
+      cand_he[o][cand[o]++] = j;
     }
   }
 
   // 2. Exchange candidate counts + current counters in one Allgather.
-  int *sendbuf = (int *) malloc((size_t) 4 * nobj * sizeof(int));
+  int *sendbuf = (int *) calloc((size_t) 4 * nobj + 1, sizeof(int));
   int *recvbuf = (int *) malloc((size_t) 4 * nobj * nproc * sizeof(int));
   for (int o = 0; o < nobj; ++o)
   {
@@ -314,17 +320,22 @@ static long mftlParallelSplitPhase(MFTL_Ensemble *ens, MFTL_RemeshParameters *pa
     obj->next_triangle_gid = base_t + (int) (off * 2) + 1;
     obj->next_halfedge_gid = base_h + (int) (off * 6) + 1;
 
-    for (int j = obj->n_half_edges - 1; j >= 0; --j)
+    for (int c = 0; c < cand[o]; ++c)
     {
+      const int j = cand_he[o][c];
+      // a twin approved in the same pass, or an edge touched by an earlier split, is skipped
+      if (obj->half_edges[j].flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) continue;
       if (!mftlEdgeInterior(obj, j)) continue;
-      if (!MFTLSplitApproved(obj, j, params)) continue;
       MFTLSplitEdgeWithFit(obj, j, params);
       splits++;
     }
+    free(cand_he[o]);
   }
 
   free(recvbuf);
+  free(cand_he);
   free(cand);
+  params->stat_splits += splits;
   return splits;
 }
 
@@ -382,7 +393,7 @@ static long mftlParallelRemeshPass(MFTL_Ensemble *ens, MFTL_RemeshParameters *pa
   ops += mftlParallelSplitPhase(ens, params);
 
   // 3. COLLAPSE (parallel-interior fan gate + Stage-08 approval).
-  for (int o = 0; o < nobj; ++o)
+  for (int o = 0; o < nobj && !params->skip_collapse; ++o)
   {
     MFTL_Object *obj = ens->objects[o];
     for (int j = 0; j < obj->n_half_edges; ++j)
@@ -392,11 +403,12 @@ static long mftlParallelRemeshPass(MFTL_Ensemble *ens, MFTL_RemeshParameters *pa
       MFTLCollapseEdgeWithFit(obj, j, params);
       collapses_occurred[o] = MFTL_TRUE;
       ops++;
+      params->stat_collapses++;
     }
   }
 
   // 4. FLIP (parallel-interior gate + Stage-08 gate stack).
-  for (int o = 0; o < nobj; ++o)
+  for (int o = 0; o < nobj && !params->skip_flip; ++o)
   {
     MFTL_Object *obj = ens->objects[o];
     for (int j = 0; j < obj->n_half_edges; ++j)
@@ -410,12 +422,13 @@ static long mftlParallelRemeshPass(MFTL_Ensemble *ens, MFTL_RemeshParameters *pa
       if (!FlipApprovedWithParams(obj, j, params)) continue;
       MFTLFlipEdge(obj, j);
       ops++;
+      params->stat_flips++;
     }
   }
 
   // 5. Tangential smoothing (ghost-safe since Stage 10; mirrors the serial
   //    driver, which runs it after the edge operators).
-  for (int o = 0; o < nobj; ++o)
+  for (int o = 0; o < nobj && !params->skip_tangential_smoothing; ++o)
   {
     MFTL_Object *obj = ens->objects[o];
     if (obj->n_vertices == 0) continue;
@@ -459,7 +472,7 @@ static long mftlParallelRemeshPass(MFTL_Ensemble *ens, MFTL_RemeshParameters *pa
   for (int o = 0; o < nobj; ++o)
   {
     MFTL_Object *obj = ens->objects[o];
-    MFTLVolumeRecovery(obj, start_volume[o]);
+    if (!params->skip_volume_recovery) MFTLVolumeRecovery(obj, start_volume[o]);
     MFTLComputeTriangleProperties(obj);
   }
 
@@ -772,9 +785,34 @@ int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *par
   for (int o = 0; o < nobj; ++o)
     start_volume[o] = MFTLObjectVolume(ens->objects[o]);
 
+  // Stage 15: on a non-x-only decomposition the load-balanced two-pass scheme runs on a
+  // TEMPORARY x-only slab layout (slab i = rank i, MFTL1's LoadBalance ownership model:
+  // adjacent slabs are graph neighbours there), and the native decomposition is restored
+  // before the final redistribution below.
+  MFTL_Domain native_domain;
+  int swapped_domain = 0;
+  if (!x_only && params->load_balance != 0 && dom->nproc > 1)
+  {
+    MFTL_Domain tmp;
+    const int xcuts[3] = {dom->nproc, 1, 1};
+    if (MFTLDomainCreateTemporary(dom, xcuts, &tmp) == MFTL_SUCCESS)
+    {
+      native_domain = *dom;
+      *dom = tmp;
+      swapped_domain = 1;
+      x_only = 1;
+      MFTLRedistributeListOfObjects(ens);
+      MFTLSyncEnsembleGidCounters(ens);
+    }
+    else
+    {
+      MFTLDomainFreeTemporary(&tmp);
+    }
+  }
+
   int do_two_pass = (params->load_balance != 0) && x_only && dom->nproc > 1;
 
-  if (!x_only && dom->rank == 0 && dom->nproc > 1)
+  if (!x_only && dom->rank == 0 && dom->nproc > 1 && !params->quiet)
   {
     printf("MFTLRemeshEnsembleShiftScheme: non-x-only decomposition {%d,%d,%d}; "
            "using interior-only remeshing without load balancing or boundary shift "
@@ -818,7 +856,7 @@ int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *par
     }
 
     MPI_Allreduce(&local_ops, &total_ops, 1, MPI_LONG, MPI_SUM, dom->comm_cart);
-    if (total_ops < 10) break;
+    if (total_ops < 10 && !params->fixed_iterations) break;
     if (iter >= 15 && params->iterations == MFTL_ERROR) break;
     iter++;
   }
@@ -873,13 +911,25 @@ int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *par
   // the native decomposition.
   if (params->boundary_cleanup) MFTLRemeshEnsembleDispersedCentering(ens, params);
 
-  MFTL_SPLIT_CLEANUP();
+  if (!params->skip_split_cleanup) MFTL_SPLIT_CLEANUP();
   // Restore the native decomposition and re-sync everything.
+  if (swapped_domain)
+  {
+    MFTLDomainFreeTemporary(dom);
+    *dom = native_domain;
+  }
   dom->lb_nprocs = 0;
   MFTLRedistributeListOfObjects(ens);
   MFTLSyncEnsembleGidCounters(ens);
   MFTLUpdateGhostPositions(ens, NULL);
-  MFTL_SPLIT_CLEANUP();
+  if (!params->skip_split_cleanup)
+  {
+    MFTL_SPLIT_CLEANUP();
+    // Stage 15: the cleanup splits run after the redistribution above, so the ghost copies
+    // of split triangles on neighbouring ranks are topologically stale; re-derive them.
+    MFTLRedistributeListOfObjects(ens);
+    MFTLSyncEnsembleGidCounters(ens);
+  }
 
   // MFTL1 end-of-remesh clamp into the domain box (non-periodic axes only;
   // periodic axes are wrapped by the advection instead).
@@ -909,7 +959,7 @@ int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *par
   // neighbours' shifts too). Each cycle removes the previous jump
   // geometrically, so a few cheap cycles converge the post-sync volume to
   // the target; converged cycles exit on their first check.
-  for (int cycle = 0; cycle < 5; ++cycle)
+  for (int cycle = 0; cycle < 5 && !params->skip_volume_recovery; ++cycle)
   {
     MFTLUpdateGhostPositions(ens, NULL);
     for (int o = 0; o < nobj; ++o)
@@ -925,6 +975,73 @@ int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *par
 }
 
 /* ══════════════════════════════════════════════════════════════════════
+ * Stage 15: serial bracket (gather an ensemble to rank 0 and back)
+ *
+ * MFTLEnsembleBeginSerial swaps a single-partition domain (everything owned by rank 0,
+ * no ghosts) into the ensemble and redistributes every object onto rank 0, then syncs the
+ * gid counters. MFTLEnsembleEndSerial restores the native domain and, when requested,
+ * redistributes back. All ranks call both (collective); objects on ranks != 0 are empty
+ * in between, and every collective inside a serial kernel runs on the temporary
+ * communicator.
+ * ══════════════════════════════════════════════════════════════════════ */
+int MFTLEnsembleBeginSerial(MFTL_Ensemble *ens, MFTL_SerialBracket *bracket)
+{
+  MFTL_Domain *dom = &ens->domain;
+  bracket->native = *dom;
+
+  MFTL_Domain tmp = *dom;
+  tmp.cuts[0] = 1;
+  tmp.cuts[1] = 1;
+  tmp.cuts[2] = 1;
+  for (int k = 0; k < 3; ++k) tmp.grid_factors[k] = 1.0 / tmp.domain_size[k];
+  // The single-partition ownership must not inherit an ACTIVE lb slab decomposition (e.g.
+  // when called mid-shift-scheme) nor rectilinear cuts: clear both so MFTLGetOwnerProc maps
+  // everything to rank 0.
+  tmp.lb_nprocs = 0;
+  tmp.lb_xmin = 0.0;
+  tmp.lb_xmax = 0.0;
+  tmp.lb_xcuts = NULL;
+  for (int k = 0; k < 3; ++k) tmp.axis_cuts[k] = NULL;
+
+  tmp.rank_map = (int *) malloc(sizeof(int));
+  tmp.rank_map[0] = 0;
+
+  // Single-partition communicator over ALL ranks: MPI_Comm_dup (NOT MPI_Cart_create with
+  // one cell — that would hand MPI_COMM_NULL to every rank but rank 0, and the collectives
+  // inside the serial kernel would deadlock).
+  MPI_Comm_dup(tmp.comm_world, &tmp.comm_cart);
+  tmp.num_neighbors = 0;
+  tmp.neighbors = NULL;
+  MPI_Dist_graph_create_adjacent(tmp.comm_world, 0, NULL, MPI_UNWEIGHTED, 0, NULL, MPI_UNWEIGHTED, MPI_INFO_NULL, 0, &tmp.comm_graph);
+
+  // Objects reference &ens->domain; swap in the single-partition domain.
+  *dom = tmp;
+
+  MFTLRedistributeListOfObjects(ens);  // everything -> rank 0
+  // The gather moved entities minted on ALL ranks onto rank 0, but the gid counters still
+  // hold each rank's own high-water mark; sync BEFORE any serial kernel so it cannot mint
+  // colliding gids.
+  MFTLSyncEnsembleGidCounters(ens);
+  return MFTL_SUCCESS;
+}
+
+int MFTLEnsembleEndSerial(MFTL_Ensemble *ens, MFTL_SerialBracket *bracket, int redistribute)
+{
+  MFTL_Domain *dom = &ens->domain;
+  free(dom->rank_map);
+  MPI_Comm_free(&dom->comm_cart);
+  MPI_Comm_free(&dom->comm_graph);
+  *dom = bracket->native;
+
+  if (redistribute)
+  {
+    MFTLRedistributeListOfObjects(ens);
+    MFTLSyncEnsembleGidCounters(ens);
+  }
+  return MFTL_SUCCESS;
+}
+
+/* ══════════════════════════════════════════════════════════════════════
  * MFTLRemeshEnsembleDispersedCentering
  *
  * Gather the whole ensemble to rank 0 through a temporary single-partition
@@ -936,54 +1053,10 @@ int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *par
  * ══════════════════════════════════════════════════════════════════════ */
 int MFTLRemeshEnsembleDispersedCentering(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
 {
-  MFTL_Domain *dom = &ens->domain;
-
-  MFTL_Domain saved = *dom;
-
-  MFTL_Domain tmp = *dom;
-  tmp.cuts[0] = 1;
-  tmp.cuts[1] = 1;
-  tmp.cuts[2] = 1;
-  for (int k = 0; k < 3; ++k) tmp.grid_factors[k] = 1.0 / tmp.domain_size[k];
-  // The single-partition ownership must not inherit an ACTIVE lb slab
-  // decomposition (e.g. when called mid-shift-scheme): clear it so
-  // MFTLGetOwnerProc maps everything to rank 0.
-  tmp.lb_nprocs = 0;
-  tmp.lb_xmin = 0.0;
-  tmp.lb_xmax = 0.0;
-  tmp.lb_xcuts = NULL;
-
-  tmp.rank_map = (int *) malloc(sizeof(int));
-  tmp.rank_map[0] = 0;
-
-  // Single-partition communicator over ALL ranks: MPI_Comm_dup (NOT
-  // MPI_Cart_create with one cell — that would hand MPI_COMM_NULL to every
-  // rank but rank 0, and the collectives inside the serial kernel would
-  // deadlock).
-  MPI_Comm_dup(tmp.comm_world, &tmp.comm_cart);
-  tmp.num_neighbors = 0;
-  tmp.neighbors = NULL;
-  MPI_Dist_graph_create_adjacent(tmp.comm_world, 0, NULL, MPI_UNWEIGHTED, 0, NULL, MPI_UNWEIGHTED, MPI_INFO_NULL, 0, &tmp.comm_graph);
-
-  // Objects reference &ens->domain; swap in the single-partition domain.
-  *dom = tmp;
-
-  MFTLRedistributeListOfObjects(ens);  // everything -> rank 0
-  // The gather moved entities minted on ALL ranks onto rank 0, but the
-  // gid counters still hold each rank's own high-water mark; sync BEFORE
-  // the serial kernel so it cannot mint colliding gids.
-  MFTLSyncEnsembleGidCounters(ens);
-  MFTLRemeshEnsemble(ens, params);     // serial kernel (collective-safe on empty objects)
-
-  // Restore the native domain and redistribute back.
-  *dom = saved;
-  free(tmp.rank_map);
-  MPI_Comm_free(&tmp.comm_cart);
-  MPI_Comm_free(&tmp.comm_graph);
-
-  MFTLRedistributeListOfObjects(ens);
-  MFTLSyncEnsembleGidCounters(ens);
-
+  MFTL_SerialBracket bracket;
+  MFTLEnsembleBeginSerial(ens, &bracket);
+  MFTLRemeshEnsemble(ens, params);  // serial kernel (collective-safe on empty objects)
+  MFTLEnsembleEndSerial(ens, &bracket, 1);
   return MFTL_SUCCESS;
 }
 

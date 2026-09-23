@@ -176,6 +176,7 @@ static int tessellate_sphere(MFTL_Object *object)
 
         // Twin: We leave invalid (-1), will rebuild globally later
         he->twin_idx = MFTL_ERROR;
+        he->twin_gid = MFTL_ERROR;
         he->boundary = MFTL_TRUE;
 
         // 3. Update Vertex Connectivity
@@ -296,6 +297,7 @@ static int generate_icosahedron(MFTL_Object *object)
       he[j]->triangle_idx = i;
       he[j]->vertex_idx = v_idx[(j + 1) % 3];  // END vertex
       he[j]->twin_idx = -1;  // will be rebuilt
+      he[j]->twin_gid = MFTL_ERROR;
       he[j]->next_idx = -1;  // will be set later
 
       //   int ret;
@@ -388,6 +390,33 @@ static void canonicalize_outward_winding(MFTL_Object *object)
  * @param radius The radius of the sphere.
  * @param refinements The number of refinements for the sphere.
  */
+// Id -> index maps of the generated sphere (the generator fills the arrays directly).
+static void sphere_rebuild_lookups(MFTL_Object *object)
+{
+  int ret;
+  kh_clear(vertex_map, object->vertex_lookup);
+  for (int i = 0; i < object->n_vertices; ++i)
+  {
+    khiter_t k = kh_put(vertex_map, object->vertex_lookup, object->vertices[i].global_id, &ret);
+    kh_value(object->vertex_lookup, k) = i;
+  }
+  kh_clear(triangle_map, object->triangle_lookup);
+  for (int i = 0; i < object->n_triangles; ++i)
+  {
+    khiter_t k = kh_put(triangle_map, object->triangle_lookup, object->triangles[i].global_id, &ret);
+    kh_value(object->triangle_lookup, k) = i;
+  }
+  if (object->halfedge_lookup)
+  {
+    kh_clear(halfedge_map, object->halfedge_lookup);
+    for (int i = 0; i < object->n_half_edges; ++i)
+    {
+      khiter_t k = kh_put(halfedge_map, object->halfedge_lookup, object->half_edges[i].global_id, &ret);
+      kh_value(object->halfedge_lookup, k) = i;
+    }
+  }
+}
+
 int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int refinements)
 {
   assert(object);
@@ -417,6 +446,7 @@ int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int
       object->vertices[i].pos[2] = center[2] + radius * object->vertices[i].pos[2];
       MFTLApplyPeriodicity(domain, object->vertices[i].pos);
     }
+    sphere_rebuild_lookups(object);
   }
 
   MPI_Bcast(&object->next_vertex_gid, 1, MPI_INT, 0, domain->comm_world);

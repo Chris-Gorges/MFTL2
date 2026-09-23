@@ -72,6 +72,9 @@ typedef struct
   int flags;
 
   int body_id;
+
+  // --- Conserved surface scalar (Stage 15, see MFTL_Triangle.surface_scalar) ---
+  double surface_scalar;
 } PackedTriangle;
 
 /**
@@ -176,11 +179,31 @@ void MFTLFreeMpiTypes();
  *
  * MPI works with 32 bit int, so its safer to stay with int here.
  */
+// Slab of coordinate x in a sorted cut array c[0..n] (n slabs): the largest s in [0, n-1]
+// with c[s] <= x; positions outside [c[0], c[n]] clamp to the end slabs.
+static inline int MFTLSlabIndex(const double* c, int n, double x)
+{
+  int lo = 1, hi = n - 1, s = 0;
+  while (lo <= hi)
+  {
+    int mid = lo + (hi - lo) / 2;
+    if (c[mid] <= x)
+    {
+      s = mid;
+      lo = mid + 1;
+    }
+    else
+    {
+      hi = mid - 1;
+    }
+  }
+  return s;
+}
+
 static inline int MFTLGetOwnerProc(const MFTL_Domain* domain, const double pos[3])
 {
-  // Pre-check: Ensure the point is within the global domain.
-  MFTL_ASSERT(pos[0] >= domain->global_min[0] && pos[0] <= domain->global_max[0] && pos[1] >= domain->global_min[1] && pos[1] <= domain->global_max[1] &&
-              pos[2] >= domain->global_min[2] && pos[2] <= domain->global_max[2] && "Point is outside the global simulation box");
+  // Positions outside the global box (possible transiently, e.g. a front vertex advected
+  // through a wall) clamp to the boundary slabs (Stage 15: was an assertion).
 
   // Stage 10: x-only load-balanced ownership override (MFTL1 ownership
   // ranges). Slab index == owning rank; cuts are arbitrary x positions.
@@ -213,15 +236,22 @@ static inline int MFTLGetOwnerProc(const MFTL_Domain* domain, const double pos[3
   // Use pre-calculated factors (multiplication is faster than division).
   // Use (int) cast instead of floor() (faster, safe because assertions ensure pos >= min).
 
-  int i = (int) ((pos[0] - domain->global_min[0]) * domain->grid_factors[0]);
-  int j = (int) ((pos[1] - domain->global_min[1]) * domain->grid_factors[1]);
-  int k = (int) ((pos[2] - domain->global_min[2]) * domain->grid_factors[2]);
-
-  // 2. Clamp Indices
-  // (Handling the edge case where pos is exactly on the max boundary)
-  if (i >= domain->cuts[0]) i = domain->cuts[0] - 1;
-  if (j >= domain->cuts[1]) j = domain->cuts[1] - 1;
-  if (k >= domain->cuts[2]) k = domain->cuts[2] - 1;
+  int ijk[3];
+  for (int d = 0; d < 3; ++d)
+  {
+    if (domain->axis_cuts[d])  // Stage 15 (L1): rectilinear slabs
+    {
+      ijk[d] = MFTLSlabIndex(domain->axis_cuts[d], domain->cuts[d], pos[d]);
+    }
+    else
+    {
+      double f = (pos[d] - domain->global_min[d]) * domain->grid_factors[d];
+      int c = (f > 0.0) ? (int) f : 0;
+      // 2. Clamp Indices (the max boundary, and positions beyond it)
+      ijk[d] = (c >= domain->cuts[d]) ? domain->cuts[d] - 1 : c;
+    }
+  }
+  int i = ijk[0], j = ijk[1], k = ijk[2];
 
   // 3. Lookup Optimization
   // Direct array access instead of MPI_Cart_rank
@@ -345,5 +375,14 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps);
  * @return MFTL_SUCCESS on completion.
  */
 int MFTLEnsembleCreateSpatialGhosts(MFTL_Ensemble* ens, double proximity_tolerance);
+
+/**
+ * @brief Stage 15 (L6): makes every locally OWNED triangle of obj (with its vertices and
+ * payload) available as a ghost on EVERY rank whose box lies within `distance` of the
+ * triangle's bounding box (MFTL1 MFTLSendLocalTrisToAllProcs parity; global exchange, not
+ * limited to the 26 graph neighbours, rectilinear boxes honoured). Already stored entities
+ * are not duplicated; topology is resolved afterwards. Collective; invalidates indices.
+ */
+int MFTLObjectSendLocalTrianglesToAll(MFTL_Object* obj, double distance);
 
 #endif

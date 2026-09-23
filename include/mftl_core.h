@@ -100,6 +100,15 @@ typedef struct MFTL_Triangle
   // --- Application-Specific Data ---
   void *data;  ///< Pointer to user-defined data associated with this triangle. TO-DO: put this into a hash define for better cache performance!?
   int flags;  ///< Bit flags for marking (e.g., for remeshing).
+
+  /* Conserved surface scalar (Stage 15, MFTL1 `scalarconcentration` parity): a concentration
+     per unit area whose MASS (surface_scalar * area) the library conserves. It travels with
+     the triangle through every redistribution / ghost / pack operation, is remapped
+     mass-conservingly by split / flip / collapse and rescaled (c *= A_old / A_new) by the
+     TSUR3D / volume-conserving vertex moves, starts at 0 for generated / built triangles and
+     is written/read by the native mesh I/O. Vertex moves made by the APPLICATION do not
+     rescale it. See plans/15 (item L7). */
+  double surface_scalar;
 } MFTL_Triangle;
 
 /**
@@ -121,6 +130,12 @@ typedef struct MFTL_HalfEdge
 
   // --- Parallelism & Domain Information ---
   int global_id;  ///< A unique ID across all processors.
+  /* Global id of the opposite half-edge, retained EVEN WHEN THE TWIN IS NOT STORED LOCALLY
+     (ghost-layer rim), so the undirected edge has a rank-independent identity
+     min(global_id, twin_gid) (Stage 15, item L3). MFTL_ERROR when unknown (open mesh, or an
+     entity created by a local operation whose twin lives elsewhere). Invariant: when twin_idx
+     is valid, twin_gid == half_edges[twin_idx].global_id. */
+  int twin_gid;
 
   // --- Application-Specific Data ---
   int flags;  ///< Bit flags for marking (e.g., for remeshing).
@@ -235,6 +250,13 @@ typedef struct MFTL_Domain
   // --- Lookup table for ijk to rank mapping ---
   int *rank_map;  // Linear array: rank_map[i + j*nx + k*nx*ny] = rank
   double grid_factors[3];  // Pre-calculated: cuts[i] / domain_size[i]
+
+  // --- Stage 15 (L1): rectilinear decomposition ---
+  // When axis_cuts[d] != NULL, slab i along axis d is [axis_cuts[d][i], axis_cuts[d][i+1])
+  // (cuts[d] + 1 ascending coordinates; axis_cuts[d][0] / [cuts[d]] are the global box
+  // faces) instead of the uniform split. rank_map may then be any bijection slab -> rank
+  // (e.g. the PETSc DMDA x-fastest layout). NULL axes keep the uniform split.
+  double *axis_cuts[3];
 
   // --- Parallel Remeshing (Stage 10): x-only load-balanced ownership ---
   // When lb_nprocs > 0, MFTLGetOwnerProc ignores the Cartesian rank_map and
@@ -381,6 +403,54 @@ void MFTLObjectUpdateGlobalStats(MFTL_Object *object);
  * @return A pointer to the newly created MFTL_Ensemble, or NULL if initialization fails.
  */
 MFTL_Ensemble *MFTLEnsembleCreate(MPI_Comm comm, int cuts[3], double global_min[3], double global_max[3], bool is_periodic[3], int initial_object_capacity);
+
+/**
+ * @brief Stage 15 (L1): creates an ensemble on a RECTILINEAR decomposition.
+ *
+ * Same as MFTLEnsembleCreate, but the slab boundaries along every axis are given explicitly
+ * (axis_cuts[d] holds cuts[d] + 1 ascending coordinates; NULL = uniform split of
+ * [global_min[d], global_max[d]]) and the slab -> rank map is given explicitly
+ * (rank_map[i + j*cuts[0] + k*cuts[0]*cuts[1]] = rank; NULL = MPI Cartesian order).
+ * The arrays are copied. Collective over comm.
+ */
+MFTL_Ensemble *MFTLEnsembleCreateRectilinear(MPI_Comm comm, const int cuts[3], const double *const axis_cuts[3], const int *rank_map,
+                                             const double global_min[3], const double global_max[3], const bool is_periodic[3], int initial_object_capacity);
+
+/**
+ * @brief Stage 15 (L1): replaces the decomposition of an existing ensemble (collective).
+ *
+ * Rebuilds the Cartesian/graph communicators, the neighbour list, the rank map and the
+ * axis cuts; the global box and periodicity are replaced too. Objects are NOT moved: call
+ * MFTLRedistribute afterwards. Any active load-balancing override is cleared.
+ */
+int MFTLEnsembleSetDecomposition(MFTL_Ensemble *ens, const int cuts[3], const double *const axis_cuts[3], const int *rank_map, const double global_min[3],
+                                 const double global_max[3], const bool is_periodic[3]);
+
+/**
+ * @brief Stage 15 (L4): detaches an object from its ensemble WITHOUT destroying it.
+ *
+ * The object is removed from ens->objects (the order of the remaining objects is kept) and
+ * its domain link is cleared. Returns MFTL_ERROR if the object is not in the ensemble.
+ */
+int MFTLEnsembleRemoveObject(MFTL_Ensemble *ensemble, MFTL_Object *object);
+
+/**
+ * @brief Stage 15: builds a temporary domain on base's communicator with a different
+ * (uniform) process grid — e.g. the x-only slab layout used by load-balanced remeshing on
+ * a 3-D decomposition. Slab (i,j,k) maps to rank i + j*cuts[0] + k*cuts[0]*cuts[1].
+ * Collective. Release with MFTLDomainFreeTemporary. The caller swaps it into
+ * ens->domain (objects reference &ens->domain) and restores the original afterwards.
+ */
+int MFTLDomainCreateTemporary(const MFTL_Domain *base, const int cuts[3], MFTL_Domain *tmp);
+void MFTLDomainFreeTemporary(MFTL_Domain *tmp);
+
+/**
+ * @brief Stage 15 (L4): moves an object from one ensemble to another (appended to dst).
+ *
+ * Both ensembles must describe the same decomposition (the object keeps its entities and
+ * ownership; only its domain link changes). Rank-local; call it identically on all ranks.
+ */
+int MFTLEnsembleTransferObject(MFTL_Ensemble *dst, MFTL_Ensemble *src, MFTL_Object *object);
 
 /**
  * @brief Adds an object to the ensemble and links the domain.

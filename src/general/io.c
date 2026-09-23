@@ -887,3 +887,188 @@ void MFTLWritePvtu(MFTL_Ensemble* ens, const char* stem)
   // the rank-0 collection index <stem>.pvtu referencing all pieces.
   MFTLWriteVtu(ens, stem);
 }
+/* ========================================================================== */
+/* Stage 15: native restart mesh (MFTL1 `.mesh` format, surface scalar incl.) */
+/* ========================================================================== */
+/*
+ * Format (MFTL1 MFTL_ObjectWriteMeshForeach / MFTLObjectReadNativeMesh, FRONTTRACKING build):
+ *   nv ne nt
+ *   nv x  "owner gid x y z"                (%.15e)
+ *   ne x  "owner edge_id v0_gid v1_gid"
+ *   nt x  "owner gid e0 e1 e2 scalar"      (%.15e)
+ * A triangle's vertex order follows from its first two edges exactly as in MFTL1
+ * (MFTL_FindTriangleEdgesandVertices), so files are exchangeable between the libraries.
+ * Written edges are the undirected edges, id = min(half-edge gid, twin gid).
+ */
+static int mftlNativeEdgeId(const MFTL_Object* obj, const MFTL_HalfEdge* he)
+{
+  int tg = MFTLHeTwinGid(obj, he);
+  return (tg != MFTL_ERROR && tg < he->global_id) ? tg : he->global_id;
+}
+
+int MFTLWriteNativeMesh(const MFTL_Object* obj, const char* path)
+{
+  FILE* fp = fopen(path, "w");
+  if (!fp)
+  {
+    fprintf(stderr, "MFTLWriteNativeMesh: cannot open %s\n", path);
+    return MFTL_ERROR;
+  }
+  int ne = 0;
+  for (int i = 0; i < obj->n_half_edges; ++i)
+  {
+    const MFTL_HalfEdge* he = &obj->half_edges[i];
+    if (he->flags & MFTL_FLAG_DEAD) continue;
+    if (mftlNativeEdgeId(obj, he) == he->global_id) ne++;  // canonical half-edge of its edge
+  }
+  fprintf(fp, "%d %d %d\n", obj->n_vertices, ne, obj->n_triangles);
+  for (int i = 0; i < obj->n_vertices; ++i)
+  {
+    const MFTL_Vertex* v = &obj->vertices[i];
+    fprintf(fp, "%d %d %.15e %.15e %.15e\n", v->owner_proc, v->global_id, v->pos[0], v->pos[1], v->pos[2]);
+  }
+  for (int i = 0; i < obj->n_half_edges; ++i)
+  {
+    const MFTL_HalfEdge* he = &obj->half_edges[i];
+    if (he->flags & MFTL_FLAG_DEAD) continue;
+    if (mftlNativeEdgeId(obj, he) != he->global_id) continue;
+    fprintf(fp, "%d %d %d %d\n", obj->triangles[he->triangle_idx].owner_proc, he->global_id, MFTLHeOrigin(obj, he)->global_id,
+            MFTLHeTarget(obj, he)->global_id);
+  }
+  for (int t = 0; t < obj->n_triangles; ++t)
+  {
+    const MFTL_Triangle* tri = &obj->triangles[t];
+    MFTL_HalfEdge* he[3];
+    MFTLGetTriangleHalfedges(obj, tri, he);
+    fprintf(fp, "%d %d %d %d %d %.15e\n", tri->owner_proc, tri->global_id, mftlNativeEdgeId(obj, he[0]), mftlNativeEdgeId(obj, he[1]),
+            mftlNativeEdgeId(obj, he[2]), tri->surface_scalar);
+  }
+  fclose(fp);
+  return MFTL_SUCCESS;
+}
+
+typedef struct
+{
+  int id, v0, v1;
+} mftlNativeEdge;
+
+static int mftlCmpNativeEdge(const void* a, const void* b)
+{
+  int x = ((const mftlNativeEdge*) a)->id, y = ((const mftlNativeEdge*) b)->id;
+  return (x > y) - (x < y);
+}
+
+static const mftlNativeEdge* mftlFindNativeEdge(const mftlNativeEdge* e, int n, int id)
+{
+  int lo = 0, hi = n - 1;
+  while (lo <= hi)
+  {
+    int mid = lo + (hi - lo) / 2;
+    if (e[mid].id == id) return &e[mid];
+    if (e[mid].id < id)
+      lo = mid + 1;
+    else
+      hi = mid - 1;
+  }
+  return MFTL_NULL;
+}
+
+int MFTLReadNativeMesh(MFTL_Object* obj, const char* path)
+{
+  int nv = 0, ne = 0, nt = 0, bad = 0;
+  int *vgid = MFTL_NULL, *tgid = MFTL_NULL, (*tvg)[3] = MFTL_NULL;
+  double (*pos)[3] = MFTL_NULL;
+  double* scalar = MFTL_NULL;
+  mftlNativeEdge* edges = MFTL_NULL;
+
+  if (path)
+  {
+    FILE* fp = fopen(path, "r");
+    if (!fp || fscanf(fp, "%d %d %d", &nv, &ne, &nt) != 3 || nv < 0 || ne < 0 || nt < 0)
+    {
+      fprintf(stderr, "MFTLReadNativeMesh: cannot read %s\n", path);
+      bad = 1;
+      nv = ne = nt = 0;
+    }
+    vgid = (int*) malloc((size_t) (nv > 0 ? nv : 1) * sizeof(int));
+    pos = malloc((size_t) (nv > 0 ? nv : 1) * sizeof(*pos));
+    edges = (mftlNativeEdge*) malloc((size_t) (ne > 0 ? ne : 1) * sizeof(mftlNativeEdge));
+    tgid = (int*) malloc((size_t) (nt > 0 ? nt : 1) * sizeof(int));
+    tvg = malloc((size_t) (nt > 0 ? nt : 1) * sizeof(*tvg));
+    scalar = (double*) malloc((size_t) (nt > 0 ? nt : 1) * sizeof(double));
+    int owner;
+    for (int i = 0; i < nv && !bad; ++i)
+      if (fscanf(fp, "%d %d %lf %lf %lf", &owner, &vgid[i], &pos[i][0], &pos[i][1], &pos[i][2]) != 5) bad = 1;
+    for (int i = 0; i < ne && !bad; ++i)
+      if (fscanf(fp, "%d %d %d %d", &owner, &edges[i].id, &edges[i].v0, &edges[i].v1) != 4) bad = 1;
+    if (!bad) qsort(edges, (size_t) ne, sizeof(mftlNativeEdge), mftlCmpNativeEdge);
+    for (int t = 0; t < nt && !bad; ++t)
+    {
+      int e[3];
+      if (fscanf(fp, "%d %d %d %d %d %lf", &owner, &tgid[t], &e[0], &e[1], &e[2], &scalar[t]) != 6)
+      {
+        bad = 1;
+        break;
+      }
+      const mftlNativeEdge* E0 = mftlFindNativeEdge(edges, ne, e[0]);
+      const mftlNativeEdge* E1 = mftlFindNativeEdge(edges, ne, e[1]);
+      if (!E0 || !E1)
+      {
+        bad = 1;
+        break;
+      }
+      // MFTL1 MFTL_FindTriangleEdgesandVertices: vertex order from the first two edges
+      int V0 = E0->v0, V1, V2;
+      if (V0 == E1->v0)
+      {
+        V1 = E1->v1;
+        V2 = E0->v1;
+      }
+      else if (E0->v1 == E1->v1)
+      {
+        V1 = E0->v1;
+        V2 = E1->v0;
+      }
+      else if (V0 == E1->v1)
+      {
+        V1 = E1->v0;
+        V2 = E0->v1;
+      }
+      else
+      {
+        V1 = E0->v1;
+        V2 = E1->v1;
+      }
+      tvg[t][0] = V0;
+      tvg[t][1] = V1;
+      tvg[t][2] = V2;
+    }
+    if (fp) fclose(fp);
+    if (bad)
+    {
+      fprintf(stderr, "MFTLReadNativeMesh: malformed file %s\n", path);
+      nv = nt = 0;
+    }
+  }
+
+  int rc = MFTLBuildFromSoup(obj, nv, vgid, (const double (*)[3]) pos, MFTL_NULL, nt, tgid, (const int (*)[3]) tvg, MFTL_NULL);
+  if (rc == MFTL_SUCCESS)
+  {
+    for (int t = 0; t < nt; ++t)
+    {
+      khiter_t k = kh_get(triangle_map, obj->triangle_lookup, tgid[t]);
+      if (k != kh_end(obj->triangle_lookup)) obj->triangles[kh_value(obj->triangle_lookup, k)].surface_scalar = scalar[t];
+    }
+    for (int t = 0; t < obj->n_triangles; ++t)
+      MFTLGetTriangleProperties(obj, &obj->triangles[t], &obj->triangles[t].area, obj->triangles[t].normal, obj->triangles[t].center);
+  }
+  free(vgid);
+  free(pos);
+  free(edges);
+  free(tgid);
+  free(tvg);
+  free(scalar);
+  int gbad = 0;
+  MPI_Allreduce(&bad, &gbad, 1, MPI_INT, MPI_MAX, obj->domain->comm_cart);
+  return (gbad || rc != MFTL_SUCCESS) ? MFTL_ERROR : MFTL_SUCCESS;
+}

@@ -116,6 +116,13 @@ static inline MFTL_Vertex *MFTLHeOrigin(const MFTL_Object *obj, const MFTL_HalfE
  */
 static inline MFTL_HalfEdge *MFTLHeTwin(const MFTL_Object *obj, const MFTL_HalfEdge *he) { return MFTLGetHalfedge(obj, he->twin_idx); }
 
+/* Global id of the opposite half-edge: the stored twin's id when the twin is local, otherwise
+   the retained twin_gid (ghost-layer rim; MFTL_ERROR when unknown). Stage 15, item L3. */
+static inline int MFTLHeTwinGid(const MFTL_Object *obj, const MFTL_HalfEdge *he)
+{
+  return (he->twin_idx != MFTL_ERROR) ? obj->half_edges[he->twin_idx].global_id : he->twin_gid;
+}
+
 /**
  * @brief Get the NEXT half-edge in the triangle loop (CCW).
  */
@@ -457,5 +464,31 @@ void MFTLGetNeighborhood(MFTL_Object *restrict obj, int *restrict seed_indices, 
  * desired). The object must be empty.
  */
 void MFTLBuildTopologyFromTriples(MFTL_Object* obj, int nV, const double positions[][3], int nF, const int triples[][3]);
+
+/**
+ * @brief Stage 15: builds an EMPTY object from a distributed triangle soup with global ids.
+ *
+ * Vertex i has global id vgid[i], position pos[i] and owner vowner[i] (NULL: this rank);
+ * triangle t has global id tgid[t], vertex global ids tvg[t][0..2] (the order defines the
+ * orientation) and owner towner[t] (NULL: this rank). The same vertex/triangle may be passed
+ * on several ranks (identical ids); duplicates within one rank are ignored. Half-edge ids
+ * are compact and identical on every rank holding the triangle; twins are paired locally and
+ * the retained twin gid of every rim half-edge is resolved globally. Every entity is stored
+ * as local with the given owner; call MFTLRedistribute afterwards. Collective; returns
+ * MFTL_ERROR on every rank if the object was not empty or a triangle references an unknown
+ * vertex anywhere.
+ */
+int MFTLBuildFromSoup(MFTL_Object *obj, int nV, const int *vgid, const double (*pos)[3], const int *vowner, int nT, const int *tgid, const int (*tvg)[3],
+                      const int *towner);
+
+/**
+ * @brief Stage 15: copies triangle tri_idx of src (with its half-edges and missing vertices,
+ * payload and surface scalar) into dst unless dst already stores that triangle id. Twins
+ * are linked through the retained twin gids. Returns the triangle's index in dst. Rank-local.
+ */
+int MFTLObjectAppendTriangleCopy(MFTL_Object *dst, const MFTL_Object *src, int tri_idx);
+
+/** @brief Stage 15: removes every entity (and payload) from an object; rank-local. */
+void MFTLObjectClear(MFTL_Object *obj);
 
 #endif  // MFTL_TOPOLOGY_H
