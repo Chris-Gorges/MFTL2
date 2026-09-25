@@ -665,18 +665,37 @@ typedef struct
    *
    * ── Why LOCALITY FIRST ─────────────────────────────────────────
    *
-   * A body stays on its centroid's owner unless that rank is over the cap, and
-   * a reassigned one prefers the least-loaded of the 26 cells around it before
-   * anywhere else. Object-centering is a 26-neighbour exchange exactly while
-   * every destination is within a box of the body, so the bodies that do not
-   * move keep the stencil and only the reassigned tail pushes redistribution
-   * onto its global path -- which it detects itself.
+   * A body stays on its centroid's owner unless that rank is over the cap, and a
+   * reassigned one goes to a neighbouring cell -- never further. Object-centering
+   * is a 26-neighbour exchange exactly while every destination is within a box of
+   * the body, so the bodies that do not move keep the stencil and only the
+   * reassigned tail pushes redistribution onto its global path -- which it
+   * detects itself.
    *
-   * The assignment is a pure function of replicated data (the reduced centroids
-   * and the reduced per-body weights), so every rank computes the same one
-   * without communicating about it. That is required, not merely nice:
-   * #MFTL_OwnerMap is undefined if two ranks name different destinations for the
-   * same entity.
+   * ── ONE RANK DECIDES A BODY AND TELLS THE HOLDERS ──────────────────
+   *
+   * #MFTL_OwnerMap is undefined -- not slow, undefined -- if two ranks name
+   * different destinations for one entity, so the destination has to be AGREED.
+   * It used to be agreed by REPLICATION: every rank was given every body's
+   * centroid and weight and ran the same greedy, at `4 * n_bodies_global` doubles
+   * of payload and about `84 * n_bodies_global` bytes of staging PER RANK. It is
+   * now agreed by DELIVERY: the rank owning a body's centroid decides it and
+   * publishes `(body, destination)` one hop along `comm_graph`, which every
+   * holder of that body is on. Payload and memory are `O(local bodies x graph
+   * degree)`, and the degree is at most 26 whatever `nproc` is.
+   *
+   * The balance is the same -- measured 4.00 -> 1.25 at np = 4, 8.00 -> 1.25 at
+   * np = 8 and 27.00 -> 1.25 at np = 27 on the clustered fixture of
+   * `examples/remesh_regime_sweep -only l`, with no rank left idle. What it costs
+   * instead is latency: three directed exchanges of one or two doubles per
+   * neighbour, three times over, because a purely local rule has to NEGOTIATE
+   * (every overloaded rank sees the same empty neighbour) where a replicated one
+   * could simply look.
+   *
+   * The one precondition -- a body's centroid owner is a graph neighbour of every
+   * rank holding the body -- is tested locally on every rank and reduced;
+   * MFTL_RemeshStats::n_bodies_unreachable reports a failure and the pass then
+   * falls back to pure centroid ownership rather than to replicating.
    */
   double dispersed_balance_slack;
 } MFTL_RemeshParameters;
@@ -953,6 +972,32 @@ typedef struct
    */
   int n_bodies_not_centred;
 
+  /**
+   * DISPERSED only: (holder, body) pairs whose centroid owner is not that
+   * holder's graph neighbour, so the balancer could not have delivered a verdict
+   * to them. Non-zero disables balancing for the WHOLE pass, which then reduces
+   * to pure centroid ownership -- correct, unbalanced, and reported here rather
+   * than silent.
+   *
+   * ── Why it is a gate and not a per-body exception ───────────────────────
+   *
+   * The balancer's one precondition is that a body's home rank can reach every
+   * holder of it in one hop along `comm_graph`; see the load-balancing banner in
+   * `remesh_dispersed.c`. A holder tests its own half with no communication, and
+   * the sum over the job is this. Skipping just the offending bodies would leave
+   * the rank loads describing a different assignment from the one that ran, so
+   * the whole pass steps back instead.
+   *
+   * Reaching it needs a body wider than the admission test allows -- which is
+   * `dispersed_radius_fraction * h_min`, i.e. under one cell, so under one hop.
+   * The realistic route is `parallel_coarsen` relaxing the yardstick to a
+   * COARSENED box: the body then legitimately spans several fine cells and the
+   * balancer correctly declines. Counted once per holder rather than once per
+   * body, because that is what makes the count purely local; only zero versus
+   * non-zero changes what happens.
+   */
+  int n_bodies_unreachable;
+
   // --- Profile (parallel drivers only) ---------------------------------------
   //
   // WHY THESE EXIST. Everything anyone wants to know about the cost of a
@@ -1084,6 +1129,35 @@ int MFTLRemeshMeasurementCount(void);
  * @rank_local
  */
 void MFTLRemeshResetMeasurementCount(void);
+
+/**
+ * @brief Doubles this rank has STAGED for the dispersed balancer, and a reset.
+ *
+ * A TEST HOOK FOR A SCALING PROPERTY, and it exists because that property has no
+ * other observable. The balancer decides where every body is remeshed; it used
+ * to do so by replicating `4 * n_bodies_global` doubles onto every rank, and it
+ * now decides each body on ONE rank and delivers the verdict one hop along
+ * `comm_graph`. Both give a correct, balanced, reproducible mesh -- so every
+ * digest, every soundness check and every imbalance figure in the suite is
+ * blind to the difference, exactly as `MFTLEnsembleGetBodyReduceStats()` is the
+ * only thing that can see a per-body reduction pinned to `comm_world`.
+ *
+ * What this counts is what THIS rank puts on the wire: three doubles per body it
+ * speaks for, three per body it moves, and a fixed handful per graph neighbour.
+ * The number to assert is therefore that a rank holding NO BODY sends NOTHING,
+ * however many bodies the ensemble has -- under replication it sent `4B`.
+ *
+ * @return Doubles staged since the last reset.
+ *
+ * @rank_local A plain per-process counter, neither collective nor reduced.
+ */
+long MFTLRemeshBalancerPayload(void);
+
+/**
+ * @brief Zeroes the counter MFTLRemeshBalancerPayload() reports.
+ * @rank_local
+ */
+void MFTLRemeshResetBalancerPayload(void);
 
 /**
  * @brief Recomputes the squared length band after min/max were set by hand.

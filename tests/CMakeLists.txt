@@ -257,4 +257,44 @@ if(BUILD_EXAMPLES)
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
                    $<TARGET_FILE:leveque_remeshing_parallel>
                    -steps 12 -budget 4 -quiet -verify ${MPIEXEC_POSTFLAGS})
+
+  # OPEN SURFACES. No library test runs the distributed remesher on a surface
+  # with a rim; these four examples do, and each checks what an open surface
+  # must keep that a closed one cannot lose: every twin-less half-edge of an
+  # owned triangle carries MFTL_FLAG_BOUNDARY (a short halo otherwise), the Euler
+  # characteristic of a disk or an annulus, every rim vertex on its constraint,
+  # no triangle turned over against all its neighbours, and a conserved volume.
+  #
+  # --require-rim-cut is the non-vacuity measure: each run fails unless some rim
+  # triangle was held by two ranks at once. Without it a grid or resolution change
+  # can leave the rim inside one rank's box, and the test would keep passing
+  # with nothing about parallel rims exercised.
+  #
+  # open_surface_creation   no remeshing: a patch and a cap crossing a periodic
+  #                         2x2x1 grid, area/entities/rim exact to round-off
+  # rayleigh_taylor         a rim on four walls, cut by both cut planes of the
+  #                         default 2x2x1 grid
+  # travelling_waves        a rim on two walls AND a periodic seam, i.e. an
+  #                         annulus that must stay one; at np = 2 the seam is
+  #                         itself a partition boundary
+  # liquid_jet              a surface growing through a pinned inflow rim, on
+  #                         2x2x1 so that a cut plane runs through the jet axis
+  #                         and the lip; the default (P,1,1) grid would leave the
+  #                         lip inside rank 0's box
+  add_test(NAME test_open_surface_creation_conserves
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:open_surface_creation>
+                   2 2 1 --steps 20 --no-output --require-rim-cut ${MPIEXEC_POSTFLAGS})
+  add_test(NAME test_rayleigh_taylor_open_remesh
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:rayleigh_taylor_open_surface>
+                   --res 24 --steps 60 --vtk 0 --report 20 --require-rim-cut ${MPIEXEC_POSTFLAGS})
+  add_test(NAME test_travelling_waves_open_remesh
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:travelling_waves_open_surface>
+                   --nx 64 --ny 16 --steps 100 --vtk 0 --report 25 --require-rim-cut ${MPIEXEC_POSTFLAGS})
+  add_test(NAME test_liquid_jet_open_remesh
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:liquid_jet_open_surface>
+                   2 2 1 --sectors 24 --steps 60 --vtk 0 --report 20 --require-rim-cut ${MPIEXEC_POSTFLAGS})
 endif()

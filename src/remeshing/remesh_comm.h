@@ -67,6 +67,21 @@
  *                               through MFTLEnsembleReduceBodies() instead.
  *   MFTLRemeshAgreeDoubleMax    1 Allreduce of 8 doubles. The profile and the
  *                               band measurement, once per pass.
+ *   MFTLRemeshNeighborGather    26-neighbour, variable length. What one rank
+ *                               holds, delivered one hop. The dispersed
+ *                               balancer's two publishes: `(body, home, weight)`
+ *                               for the bodies a rank speaks for, and
+ *                               `(body, destination, weight)` for the ones it
+ *                               moves. Three doubles each, and NOTHING sized by
+ *                               `n_bodies_global`.
+ *   MFTLRemeshNeighborAllgather 26-neighbour, fixed length. One double: the room
+ *                               a rank advertises before the negotiation starts.
+ *   MFTLRemeshNeighborAlltoall  26-neighbour, DIRECTED, one or two doubles. The
+ *                               ask, the grant and the shipping report of one
+ *                               balancing round, three times over. Latency, not
+ *                               volume -- and it is what a purely local balancer
+ *                               costs instead of the `4 * n_bodies_global`
+ *                               doubles the replicated one broadcast.
  *
  * ### HOW MUCH A SHIFTED MIGRATION ACTUALLY MOVES
  *
@@ -587,6 +602,99 @@ double MFTLRemeshWallTime(void);
  * @return #MFTL_SUCCESS, or #MFTL_ERROR if the exchange failed.
  */
 int MFTLRemeshSyncGhostIds(MFTL_Ensemble *ens, const int *vertex_gid_base);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4. Neighbourhood exchange -- the three shapes a bounded-degree pass needs
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * THE POINT OF THESE IS WHAT THEY CANNOT EXPRESS. Every one of them moves a
+ * payload proportional to `num_neighbors` -- at most 26, whatever `nproc` is --
+ * and to what THIS RANK holds. Nothing here can be handed an array indexed by
+ * the body id space or by the rank space, so a call site that needs one has to
+ * say so by reaching for MFTLRemeshAgreeDouble() instead, where the cost is
+ * visible.
+ *
+ * They exist for the dispersed load balancer, which used to replicate
+ * `4 * n_bodies_global` doubles onto every rank once per remesh so that every
+ * rank could compute the same greedy over the same table. It now decides each
+ * body on ONE rank and delivers the verdict one hop, which is these three
+ * collectives and no replicated table at all.
+ *
+ * ── The self-loop, which is not a corner case ─────────────────────────────
+ *
+ * `domain->neighbors` is built from the 26 non-zero cell OFFSETS, so on a grid
+ * with a single cut on a periodic axis two opposite offsets wrap onto this rank
+ * and `comm_graph` carries a SELF-LOOP -- shapes {2,1,1} and {2,2,1} have one,
+ * {2,2,2} and {3,3,3} do not. A gather then delivers this rank's own block back
+ * to it, and a caller that also folds in its own contribution locally counts it
+ * twice. Every consumer here must skip MFTLRemeshSelfLoopSlot(), and the same
+ * trap doubled every SUM in MFTLEnsembleReduceBodies() before it was found.
+ */
+
+/**
+ * @brief Index of this rank's own entry in `domain->neighbors`, if it has one.
+ *
+ * @param domain The MPI/physical world.
+ * @return The slot, or #MFTL_ERROR when the graph carries no self-loop.
+ * @rank_local Pure inspection of a list built at ensemble creation.
+ */
+static inline int MFTLRemeshSelfLoopSlot(const MFTL_Domain *domain)
+{
+  for (int i = 0; i < domain->num_neighbors; ++i)
+  {
+    if (domain->neighbors[i] == domain->rank) return i;
+  }
+  return MFTL_ERROR;
+}
+
+/**
+ * @brief Variable-length allgatherv of doubles over `comm_graph`.
+ *
+ * Two collectives and not one, for the reason every sparse exchange in this
+ * library is: only the sender knows how much it is sending, so the lengths
+ * cannot be predicted from anything replicated.
+ *
+ * @param      domain The MPI/physical world.
+ * @param      send   `[n_send]` this rank's block, delivered to every neighbour.
+ * @param      n_send Doubles in @p send. May be zero.
+ * @param[out] rcount `[num_neighbors]` doubles received from each neighbour.
+ * @param[out] rdispl `[num_neighbors]` offset of each neighbour's block.
+ * @param[out] n_recv Total doubles received.
+ * @return A newly allocated buffer of @p n_recv doubles; the caller frees it.
+ *         Never #MFTL_NULL, so that an empty result still frees cleanly.
+ * @collective Over `comm_graph`, so a rank with no neighbours does not
+ *             communicate at all.
+ */
+double *MFTLRemeshNeighborGather(const MFTL_Domain *domain, const double *send, int n_send, int *rcount, int *rdispl, int *n_recv);
+
+/**
+ * @brief Fixed-length allgather of @p n doubles over `comm_graph`.
+ *
+ * @param      domain The MPI/physical world.
+ * @param      send   `[n]` this rank's record.
+ * @param      n      Doubles per rank.
+ * @param[out] recv   `[num_neighbors * n]`; block `i` came from `neighbors[i]`.
+ * @collective
+ */
+void MFTLRemeshNeighborAllgather(const MFTL_Domain *domain, const double *send, int n, double *recv);
+
+/**
+ * @brief Directed @p n-doubles-per-neighbour exchange over `comm_graph`.
+ *
+ * The shape a NEGOTIATION needs and an allgather cannot express: block `i` of
+ * @p send goes to `neighbors[i]` only, and block `i` of @p recv is what
+ * `neighbors[i]` sent to this rank. The graph is created with identical source
+ * and destination lists (`MPI_Dist_graph_create_adjacent` in
+ * `domain_init_comm`), so in-degree and out-degree agree and slot `i` means the
+ * same rank in both directions.
+ *
+ * @param      domain The MPI/physical world.
+ * @param      send   `[num_neighbors * n]`, one block per neighbour.
+ * @param      n      Doubles per neighbour.
+ * @param[out] recv   `[num_neighbors * n]`, one block from each neighbour.
+ * @collective
+ */
+void MFTLRemeshNeighborAlltoall(const MFTL_Domain *domain, const double *send, int n, double *recv);
 
 /* MFTLRemeshMeasureBodies is declared in mftl_remeshing.h -- it is the one entry
  * point here a CALLER has a use for (the plan's section 6 rebalance is exactly

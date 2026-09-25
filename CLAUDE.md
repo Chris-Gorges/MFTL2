@@ -45,8 +45,9 @@ What exists today:
   boxes through the owner map when the frozen band no longer fits — plus a single-rank gather
   (`serial_gather_max_triangles`) that is the same mechanism at `group = cuts`, and a frozen-share
   diagnostic (`MFTL_RemeshStats.frozen_fraction`). Both extra triggers ship off; see the invariants below
-- **a deterministic, collective-free load balancer for the dispersed path** (`dispersed_balance_slack`,
-  default on), which spreads clustered bodies over ranks from replicated data alone
+- **a deterministic, neighbourhood-local load balancer for the dispersed path** (`dispersed_balance_slack`,
+  default on), which spreads clustered bodies over ranks by deciding each body on ONE rank and delivering
+  the verdict one hop along `comm_graph` — nothing sized by the body count or the rank count
 - **all the remeshing module's MPI in one file** (`src/remeshing/remesh_comm.c`): migration, the id
   collectives and the ghost id exchange. Enforced by `test_remeshing_mpi_is_confined`
 - LBVH and object–object contact detection (`src/bvh/`, `MFTL_GenerateLBVH` / `MFTL_RefitLBVH` /
@@ -144,7 +145,7 @@ ctest --output-on-failure              # from build/
 ctest --output-on-failure -R object    # one module
 ```
 
-Forty-eight CTest entries, built on `tests/test_utils.h` (`RUN_TEST`, `TEST_ASSERT*`, `TEST_REPORT`). **Run the suite in
+Fifty-two CTest entries, built on `tests/test_utils.h` (`RUN_TEST`, `TEST_ASSERT*`, `TEST_REPORT`). **Run the suite in
 the `--debug` build too** — `tests/test_object.c` deliberately writes the last addressable element of every pool
 array, so an array that was not grown with the rest is an ASan failure rather than a silent corruption.
 
@@ -183,6 +184,21 @@ structurally perfect — valid closed sphere, Euler 2, mean quality above 0.98, 
 `MFTLCheckMeshIntegrity` to say — and 93 % smaller than it should be. np = 2 and not 1: at one rank nothing
 is ever destroyed and the same code is correct. Every example that advects a distributed mesh owes an
 equivalent `--verify` mode; `parallel_advection_scaling` already had one.
+
+**OPEN SURFACES ARE COVERED BY FOUR EXAMPLES, NOT BY A LIBRARY TEST, AND EACH CARRIES ITS OWN NON-VACUITY
+MEASURE.** `open_surface_creation`, `rayleigh_taylor_open_surface` (a rim on four walls),
+`travelling_waves_open_surface` (an annulus: two rims plus a periodic seam) and `liquid_jet_open_surface` (a
+surface growing through a pinned inflow rim) are the only runs of the distributed remesher on a surface with a
+boundary; the four `test_*_open*` entries run them briefly. They check what a closed surface cannot lose: a
+twin-less half-edge of an owned triangle must carry `MFTL_FLAG_BOUNDARY`, the Euler characteristic (1 or 0 from
+owned counts with E = (3F + B)/2), every rim vertex on its constraint, and a conserved volume (below the interface,
+or through the nozzle). `--require-rim-cut` fails a run in which no rim triangle was ever held by two ranks — the
+jet's default (P,1,1) grid is exactly that, which is why its test runs on 2x2x1. Two things they found are worth
+knowing before touching them. Rim constraints are re-derived from POSITION for boundary vertices: a split of a rim
+edge hands the new vertex `MFTL_FLAG_BOUNDARY` and no other bit, and application flag bits 0x2/0x4 collide with
+`MFTL_FLAG_DEAD`/`MFTL_FLAG_VISITED`. And orientation is judged against edge neighbours, not vertex normals: a
+surface curled tighter than one edge (the rolled-up RT cap, a pinching neck) puts consistently wound triangles
+back to back, which the vertex-normal fold test reports as inverted.
 
 **Never compare two vectors that should be identical with `acos(a·b)`.** The arc cosine has infinite derivative at
 1, so a dot product one ulp below 1 reports 1.5e-8 rad — a noise floor of ~1e-6 degrees regardless of how exact the
@@ -396,7 +412,7 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   `global_id`**, not by a list slot — that covers the wire, the skip votes, and every per-body array in the
   remesher that a migration outlives.
 
-  **The converse is the part that got over-applied, and it cost the last `O(B)` array in the tree.** A
+  **The converse is the part that got over-applied, and it cost an `O(B)` array in the tree.** A
   per-body argument that never leaves the rank is indexed by LOCAL SLOT, because the two ends walk the same
   list in the same order and no identity has to survive anything. `MFTL_OwnerMap` is the case: keyed by gid
   it made every remeshing migration allocate, clear and carry two pointers for every body in the JOB on a
@@ -568,22 +584,48 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
 
 - **DISPERSED IDLENESS SPLITS IN TWO, AND ONLY ONE HALF IS FIXABLE.** With `N_bodies >= P` a pile-up is
   clustered centroids and `dispersed_balance_slack` fixes it (default 1.25, ON): measured imbalance
-  4.00/8.00/27.00 -> 1.25 at np = 4/8/27, **2.5–5.2× less wall clock**, idle ranks to zero. Below
+  2.00/4.00/8.00/27.00 -> 1.25 at np = 2/4/8/27, **1.45–5.0× less wall clock**, idle ranks to zero. Below
   `N_bodies == P` nothing can, because a body is the smallest unit of work this strategy has;
-  `n_ranks_idle` versus `load_imbalance` is how to tell which you have. The greedy is over RANK LOADS, and a
-  rank's load sums bodies held anywhere in the job, so it **needs replicated per-body data and no
-  communicator choice fixes that**: `MFTL_OwnerMap` is undefined — not slow, undefined — if two ranks name
-  different destinations, so every tie-break is total (ranks by id, bodies by index) and
-  **`domain->neighbors` must never be used** to find the 26 candidates, because it is this rank's list and
-  differs on every rank. The cells are re-derived from the body's own centroid.
+  `n_ranks_idle` versus `load_imbalance` is how to tell which you have.
 
-  **IT IS THE LIBRARY'S LAST `O(bodies in the ensemble)` TERM, AND IT IS NOW THE ONLY THING THAT PAYS FOR
-  IT.** `replicate_for_balancer` broadcasts `4 * n_bodies_global` doubles by MAX — MAX, not SUM, because
-  every holder came out of `MFTLEnsembleReduceBodies` with the same value TO THE BIT and a sum would multiply
-  a shared body by its holder count. It runs **only when `dispersed_balance_slack > 0`**; with the balancer
-  off, `assign_destinations_local` decides from each rank's own measurement rows and the whole driver is
-  `O(local + nproc)`, its imbalance report included. The replacement is a local rule decided by each body's
-  home rank — see `docs/scalability-update-status.md` §6 for what has to be proved first.
+  **ONE RANK DECIDES A BODY AND TELLS THE HOLDERS; NOBODY REPLICATES ANYTHING.** `MFTL_OwnerMap` is
+  undefined — not slow, undefined — if two ranks name different destinations for one entity, so the
+  destination has to be AGREED, and there are exactly two ways to agree. REPLICATE (give every rank every
+  centroid and weight and run the same greedy) was `4 * n_bodies_global` doubles of payload and ~`84 * B`
+  bytes of staging per rank, and it was the library's LAST `O(bodies in the ensemble)` term. DECIDE ONCE is
+  what runs now: the owner of a body's reduced centroid decides it and publishes `(gid, dest, weight)` one
+  hop along `comm_graph`. `O(local bodies * degree)`, degree <= 26 whatever `nproc` is.
+
+  **The precondition is a LOCAL TEST, which is what makes it work**: each holder checks that `home(o)` — the
+  owner of the reduced centroid, bit-identical on every holder — is itself or a graph neighbour, and one
+  `MPI_LAND` establishes "for every body, home is a neighbour of every holder". Two consequences fall out and
+  they are exactly the two messages needed: home CAN BE TOLD (the graph is symmetric, so `lowest_holder` — a
+  provable holder, already reduced — is its neighbour) and home CAN TELL EVERY HOLDER. Not required: the
+  holder set being a clique, a holder owning an entity, or home holding the body —
+  `MFTLEnsembleBodyHoldersFitTheGraph` is strictly stronger and deliberately not the test. A failure reports
+  `n_bodies_unreachable` and reverts to plain centroid ownership, never to replicating, because an `O(B)`
+  fallback IS an `O(B)` term.
+
+  **A LOCAL RULE HAS TO NEGOTIATE, AND TWO WAYS OF DOING IT WRONG ARE SILENT.** Every overloaded rank sees
+  the same idle neighbour, so a rank asks its neighbours for room and each divides the room IT HAS among the
+  askers neediest-first; `sum of grants <= room` by construction, so nobody is pushed past the cap however
+  many ship at once. A BODY IS INDIVISIBLE, so a proportional ask over 26 neighbours returns grants smaller
+  than one body and NOTHING MOVES — measured, 108 bodies over 27 ranks stalled at 2.00 with
+  `n_bodies_reassigned == 0`, which is what a balanced ensemble also reports. And A TIE-BREAK IDENTICAL ON
+  EVERY RANK STARVES THE SAME RANK — four senders, four equally empty targets, 1 of 8 idle — so ties break on
+  the neighbour's CELL OFFSET, which is relative to the rank doing the looking. Rounds are bounded (3), not
+  convergent: running out leaves an imbalance the pass reports, never a wrong mesh.
+
+  **THE ONLY OBSERVABLE IS THE PAYLOAD.** Both balancers give a correct, reproducible, equally balanced mesh,
+  so every digest is blind to the difference — exactly as `MFTLEnsembleGetBodyReduceStats` is the only thing
+  that sees a pinned reduction scope. `MFTLRemeshBalancerPayload()` counts staged doubles and
+  `test_the_balancer_payload_ignores_bodies_a_rank_does_not_hold` asserts the sharp form: double the ensemble
+  and a rank holding NONE of it stages the same number. 25/49/85 doubles at np = 2/4/8, unchanged from 16 to
+  32 bodies, against `4B` on every rank before.
+
+  What the one hop costs is stated rather than hidden: weight moves at most one cell per pass, so a pile-up
+  spanning many cells is only partly fixed. The replicated greedy was barely better there — its own policy
+  tried the 26 cells first and its global fallback is the case that leaves the stencil.
 
   The balancer decides who REMESHES, not who holds the mesh afterwards — the closing `MFTLRedistribute`
   restores the geometric partition.

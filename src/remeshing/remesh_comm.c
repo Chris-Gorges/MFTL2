@@ -582,7 +582,62 @@ void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radiu
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 4. The ghost global-id exchange
+ * 4. Neighbourhood exchange
+ *
+ * Three shapes, none of which can carry a payload indexed by the body id space
+ * or by the rank space -- see remesh_comm.h for why that is the point.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+double *MFTLRemeshNeighborGather(const MFTL_Domain *domain, const double *send, int n_send, int *rcount, int *rdispl, int *n_recv)
+{
+  const int d = domain->num_neighbors;
+
+  *n_recv = 0;
+  if (domain->nproc < 2 || d < 1)
+  {
+    return (double *) MFTLMallocOrDie(sizeof(double), "remesh neighbour gather (empty)");
+  }
+
+  MPI_Neighbor_allgather(&n_send, 1, MPI_INT, rcount, 1, MPI_INT, domain->comm_graph);
+
+  size_t total = 0;
+  for (int i = 0; i < d; ++i)
+  {
+    rdispl[i] = (int) total;
+    total += (size_t) rcount[i];
+  }
+
+  /* Reaching this needs of the order of 10^7 doubles arriving from 26 neighbours
+   * at once. The records here are three doubles per body a rank DECIDES, so it
+   * is millions of bodies on one rank -- far past where the payload is the
+   * problem. Same bound and same reasoning as holder_gather(). */
+  MFTL_ASSERT(total <= (size_t) 0x7fffffff && "MFTLRemeshNeighborGather: neighbour payload exceeds an MPI int count");
+
+  double *const recv = (double *) MFTLMallocOrDie(MFTL_MAX(total, (size_t) 1) * sizeof(double), "remesh neighbour gather");
+  MPI_Neighbor_allgatherv(send, n_send, MPI_DOUBLE, recv, rcount, rdispl, MPI_DOUBLE, domain->comm_graph);
+
+  *n_recv = (int) total;
+  return recv;
+}
+
+void MFTLRemeshNeighborAllgather(const MFTL_Domain *domain, const double *send, int n, double *recv)
+{
+  const int d = domain->num_neighbors;
+  if (domain->nproc < 2 || d < 1 || n < 1) return;
+
+  MPI_Neighbor_allgather(send, n, MPI_DOUBLE, recv, n, MPI_DOUBLE, domain->comm_graph);
+}
+
+void MFTLRemeshNeighborAlltoall(const MFTL_Domain *domain, const double *send, int n, double *recv)
+{
+  const int d = domain->num_neighbors;
+  if (domain->nproc < 2 || d < 1 || n < 1) return;
+
+  MPI_Neighbor_alltoall(send, n, MPI_DOUBLE, recv, n, MPI_DOUBLE, domain->comm_graph);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 5. The ghost global-id exchange
  *
  * Request/reply over comm_graph, the same schedule shape as
  * MFTLUpdateGhostPositions and deliberately a separate implementation of it --

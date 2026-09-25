@@ -1321,24 +1321,22 @@ flowchart TD
   B --> G["GUARDS: the edge-length band, MFTLRemeshParamsAgree"]
   G --> AD{"ADMISSION: any radius above dispersed_radius_fraction times h_box?"}
   AD -->|yes| FB["n_bodies_not_centred, message on rank 0, THE WHOLE ENSEMBLE falls back to MFTLRemeshEnsembleParallel — nothing has moved yet"]
-  AD -->|no| DS["assign_destinations — NO MPI AT ALL"]
+  AD -->|no| DS["assign_destinations — neighbourhood only, nothing sized by N_b or P"]
 
-  DS --> D1["dest[b] = MFTLGetOwnerProc(centroid[b]) — the PRODUCTION rule"]
-  D1 --> D2["load[r] = sum of the weights routed to r"]
-  D2 --> BL{"dispersed_balance_slack greater than 0, and P greater than 1, and N_b greater than 1?"}
-  BL -->|no| MG
-  BL -->|yes| B1["cap = max of mean times slack, and the heaviest single body"]
-  B1 --> B2{"some UNSETTLED rank over cap?"}
-  B2 -->|no| MG
-  B2 -->|yes| B3["take its heaviest body — qsort by weight, ties by index"]
-  B3 --> B4{"any of the 26 cells around the BODY'S OWN centroid under cap?"}
-  B4 -->|yes| B5["least loaded of them, ties by rank id — KEEPS the stencil"]
-  B4 -->|no| B6{"any rank at all under cap?"}
-  B6 -->|yes| B7["globally least loaded under cap — LEAVES the stencil, counted separately"]
-  B6 -->|no| B8["nothing could leave: mark the rank SETTLED and move on"]
-  B5 --> B2
-  B7 --> B2
-  B8 --> B2
+  DS --> D1["dest[b] = MFTLGetOwnerProc(centroid[b]) — the PRODUCTION rule, and the default"]
+  D1 --> D2["gather_homed_bodies: each body's LOWEST HOLDER publishes body, home, weight one hop"]
+  D2 --> D3["load = sum of the weights homed HERE; two scalar Allreduces give the total and the heaviest"]
+  D3 --> BL{"dispersed_balance_slack greater than 0, and P greater than 1, and n_bodies_unreachable is zero?"}
+  BL -->|no| VP
+  BL -->|yes| B1["cap = max of mean times slack, and the heaviest single body; advertise room = cap minus load"]
+  B1 --> B2["ROUND: ask the emptiest neighbours, as many as the budget can give a whole body each"]
+  B2 --> B3["each neighbour grants neediest first, never more room than it has"]
+  B3 --> B4["place bodies heaviest first into the largest grant, ties by NEAREST cell"]
+  B4 --> B5["report what was actually shipped"]
+  B5 --> B6{"three rounds done?"}
+  B6 -->|no| B2
+  B6 -->|yes| VP
+  VP["publish body, destination, weight one hop — every holder is a neighbour of home"] --> MG
 
   MG["MFTLRemeshMigrateToRanks — ONE destination for the WHOLE body"] --> MG1["Debug ASSERT: no ghosts anywhere, on any body"]
   MG1 --> SW["per object with tris.n greater than 0: MFTLRemeshObject — the untouched SERIAL entry point"]
@@ -1350,10 +1348,13 @@ flowchart TD
 
 @warning The balancer decides **who remeshes**, not who holds the mesh
          afterwards — the closing `MFTLRedistribute` restores the geometric
-         partition. And every tie-break in it is total (ranks by id, bodies by
-         index) because #MFTL_OwnerMap is undefined if two ranks name different
-         destinations. `domain->neighbors` must never be used to find the 26
-         candidates: it is *this* rank's list and differs on every rank.
+         partition. #MFTL_OwnerMap is undefined if two ranks name different
+         destinations for one entity, and the way that is guaranteed here is that
+         **exactly one rank decides a body** — its centroid's owner — and every
+         other holder reads the verdict off the wire. No rank recomputes another
+         rank's decision, which is a weaker requirement than the replicated
+         balancer's "every tie-break must be total on every rank" and is why the
+         balancer no longer needs a replicated table.
 
 ```
 MFTLRemeshEnsembleDispersed(ens, params, stats)                  COLLECTIVE
@@ -1376,19 +1377,27 @@ MFTLRemeshEnsembleDispersedMeasured(ens, params, stats, centroid, radius, weight
 │                  ─▶ MFTLRemeshEnsembleParallel(ens, params, st)
 │                     THE WHOLE ENSEMBLE falls back; nothing has moved yet
 │
-├─ 2 ── DESTINATIONS ── assign_destinations — NO MPI AT ALL ───────────────────
-│   ├─ dest[b] = MFTLGetOwnerProc(dom, &centroid[3b])   the PRODUCTION rule
-│   ├─ load[r] = sum of weights of bodies with dest == r
-│   └─◆ dispersed_balance_slack > 0 && P > 1 && N_b > 1 ?
+├─ 2 ── DESTINATIONS ── assign_destinations — 26-NEIGHBOUR ONLY ───────────────
+│   ├─ dest[o] = MFTLGetOwnerProc(dom, &centroid[3o])   the PRODUCTION rule,
+│   │                                                    per LOCAL SLOT
+│   ├─ gather_homed_bodies                             1 neighbourhood gather
+│   │    each body's LOWEST HOLDER publishes (gid, home, weight); this rank keeps
+│   │    the records addressed to it, skipping the SELF-LOOP slot
+│   ├─ load = sum over them;  total = Allreduce(SUM, 1);  heaviest = MAX(1)
+│   └─◆ dispersed_balance_slack > 0 && P > 1 && n_bodies_unreachable == 0 ?
 │        cap = max(mean * slack, heaviest single body)
-│        while some unsettled rank exceeds cap:
-│          ├─ take its heaviest bodies in turn (qsort by weight, ties by index)
-│          ├─◆ any of the 26 cells AROUND THE BODY'S OWN CENTROID under cap ?
-│          │     yes ─▶ least-loaded of them, ties by rank id  (keeps the stencil)
-│          │     no  ─▶ globally least-loaded rank under cap   (leaves the stencil,
-│          │                                                    counted separately)
-│          └─◆ nothing could leave ? ─▶ mark the rank settled and move on
+│        advertise room = max(cap - load, 0)           1 neighbourhood allgather
+│        3 x ROUND:
+│          ├─ ask the emptiest neighbours, floor(budget / w_max) of them, so that
+│          │  every ask is at least one whole body            1 alltoall
+│          ├─ grant neediest first, sum of grants <= own room  1 alltoall (2 dbl)
+│          ├─ place heaviest first into the largest grant, ties by NEAREST cell
+│          └─ report what was actually shipped                 1 alltoall
+│        publish (gid, dest, weight)                    1 neighbourhood gather
+│          every holder of a body is a neighbour of its home rank -- that is the
+│          precondition the gate above reduced, and it is what makes one hop enough
 │        ▸ stats.n_bodies_reassigned / n_ranks_idle / load_imbalance
+│          from four scalar reductions, NOT from a [nproc] load table
 │
 ├─ 3 ── MFTLRemeshMigrateToRanks(&mig, ens, dest, &report)          t_migrate
 │        one destination for the WHOLE body ─▶ MFTLRedistributeWithOwners
@@ -1511,32 +1520,107 @@ $$
 $$
 
 The second term of the cap is not defensive padding: a body is indivisible here,
-so a cap below the heaviest body asks for an assignment that does not exist and
-the loop would spin looking for it.
+so a cap below the heaviest body asks for an assignment that does not exist, and
+every rank holding that body would try and fail to shed it on every pass.
 
-**Termination**, in two guarantees that are both needed. A body is only ever moved
-to a rank where it still *fits* under the cap, so a rank under the cap stays under
-it and is never processed; and the cap is at least the heaviest single body, so a
-rank holding one body is never over it. A body therefore moves at most once, and
-the outer loop settles one rank per iteration. A rank from which nothing could
-leave is marked settled either way — the loads only rise from there, so without
-that the outer loop would pick the same rank forever.
+#### One rank decides a body, and tells the holders {#rem_balance_local}
 
-Measured on $4P$ droplets packed into one rank's box: imbalance
-$4.00 \to 1.25$, $8.00 \to 1.25$, $27.00 \to 1.25$ at $P = 4, 8, 27$, with
-**2.5–5.2× less wall clock** and the idle ranks going to zero. Full table in
-`docs/parallel-remeshing-analysis.md` §7.4.
+#MFTL_OwnerMap is *undefined* — not slow, undefined — if two ranks name different
+destinations for one entity, so a destination has to be **agreed**. There are
+exactly two ways to agree, and which one is used is the whole scalability question
+for this driver:
 
-@warning **It costs no collective, and that is a constraint rather than a bonus.**
-         The assignment is a pure function of the reduced centroids and the
-         per-body triangle counts — which ride the reduction
-         `MFTLRemeshMeasureBodies` already takes, its stride having gone 7 → 8 → 9 for
-         exactly this — so every rank derives the same answer without
-         communicating. #MFTL_OwnerMap is *undefined* if two ranks name different
-         destinations for one entity, so every tie-break is total: ranks by id,
-         bodies by index. In particular `domain->neighbors` must **not** be used
-         to find the 26 candidates — it is this rank's list and differs on every
-         rank. The cells are re-derived from the body's own centroid instead.
+| | replicate | decide once |
+|---|---|---|
+| how | every rank gets every centroid and weight and runs the same greedy | the rank owning the centroid decides and sends the verdict one hop |
+| payload | $4B$ doubles, `Allreduce` on `comm_world` | $3\times$(bodies a rank speaks for), 26-neighbour |
+| staging | $\approx 84B$ bytes **per rank** | $O(\text{local} + d)$ |
+| collectives | 1 large | ~14 tiny |
+
+The first is what this file did until the local rule landed, and it was the **last
+$O(B)$ term in the library**.
+
+The precondition of the second is that the decider can reach every holder, and the
+elegant part is that it is a **local test**: let $\mathrm{home}(o)$ be the owner of
+body $o$'s reduced centroid — agreed to the bit by every holder, because the
+centroid came out of a reduction. Each holder checks that $\mathrm{home}(o)$ is
+itself or one of its graph neighbours, and one `MPI_LAND` establishes
+
+$$
+  \forall o,\ \forall\ \text{holders } H \text{ of } o:
+  \qquad \mathrm{home}(o) \in \{H\} \cup N(H).
+$$
+
+Two consequences fall straight out. `home` **can be told about the body**, because
+the graph is symmetric and `lowest_holder` (already reduced, already agreed) is
+therefore one of its neighbours. And `home` **can tell every holder**, in one
+neighbourhood gather of $(\text{body}, \text{destination}, \text{weight})$.
+
+Note what is *not* required: the holder set need not be a clique, no holder need
+own an entity, and `home` need not hold the body.
+`MFTLEnsembleBodyHoldersFitTheGraph` is a strictly stronger statement and is
+deliberately not what is tested. When the precondition does fail the pass reports
+`n_bodies_unreachable` and reverts to pure centroid ownership — never to
+replicating, because a fallback that is $O(B)$ *is* an $O(B)$ term.
+
+#### Why it is a negotiation, and not a greedy {#rem_balance_negotiate}
+
+A replicated greedy could see every rank's load and hand a body to the least-loaded
+rank in the job knowing nobody else was doing the same. A local rule cannot: every
+overloaded rank sees the same idle neighbour. Three directed doubles per neighbour
+per round fix it —
+
+$$
+\text{ask}_{s\to r} \le \text{room}_r,
+\qquad
+\sum_s \text{grant}_{s\to r} \le \text{room}_r ,
+$$
+
+the second by construction, so **no rank can be pushed past its cap** however many
+neighbours ship at once. Two details are not obvious and both were found by
+measurement:
+
+- **A body is indivisible, so a proportional split is wrong.** Asking 26
+  neighbours for a twenty-sixth of the excess each returns grants *smaller than one
+  body*: nothing is placeable, nothing moves, and the pass reports an unchanged
+  imbalance with `n_bodies_reassigned == 0` — indistinguishable from an ensemble
+  that needed no balancing. Measured before the fix: 108 bodies over 27 ranks
+  stayed at 2.00 while a lone clustered rank balanced perfectly. The ask goes to
+  $\lfloor \text{budget}/w_{\max}\rfloor$ neighbours, emptiest first, which is the
+  largest number that can still be given a whole body each.
+- **A tie-break identical on every rank starves the same rank.** Four overloaded
+  ranks looking at four equally empty neighbours all pick the same one — measured
+  as 1 of 8 ranks left idle. Ties therefore break on the neighbour's *cell offset*,
+  which is relative to the rank doing the looking, and is a cheaper migration
+  besides.
+
+Rounds are **bounded, not convergent**: running out leaves an imbalance the pass
+reports, never a wrong mesh. One is enough for a lone pile-up and two for a spread
+one; three ship.
+
+Measured on $4P$ droplets packed into one rank's box, `remesh_regime_sweep -only l`:
+
+| $P$ | imbalance | idle ranks | bodies moved | wall |
+|---|---|---|---|---|
+| 2 | $2.00 \to 1.25$ | $1 \to 0$ | 3 / 8 | $1.45\times$ less |
+| 4 | $4.00 \to 1.25$ | $3 \to 0$ | 11 / 16 | $2.5\times$ |
+| 8 | $8.00 \to 1.25$ | $7 \to 0$ | 27 / 32 | $5.0\times$ |
+| 27 | $27.00 \to 1.25$ | $26 \to 0$ | 103 / 108 | $3.3\times$ |
+
+Identical to what the replicated greedy reached on the same fixture, and one idle
+rank better at $P = 27$.
+
+@warning **The balance quality is invisible to every digest, and so is the
+         payload.** Both balancers produce a correct, reproducible, equally
+         balanced mesh, so no soundness check, volume or triangle count can tell
+         them apart — the same blindness `MFTLEnsembleGetBodyReduceStats` exists to
+         cure for pinned reduction scopes. The gate is
+         `MFTLRemeshBalancerPayload()` and
+         `test_the_balancer_payload_ignores_bodies_a_rank_does_not_hold`: double
+         the ensemble and a rank holding **none** of it must stage the same number
+         of doubles. Measured 25 / 49 / 85 doubles at $P = 2/4/8$, unchanged from
+         16 to 32 bodies, against $4B = 64 \to 128$ on **every** rank under
+         replication.
 
 @note The balancer decides who does the **remeshing**, not who holds the mesh
       afterwards. The closing `MFTLRedistribute` restores the canonical geometric
@@ -1587,7 +1671,9 @@ Every MPI call the remesher makes is in `remesh_comm.c`:
 | `MFTLRemeshMigrateShifted` | LOR + `MFTLRedistributeWithOwners` | the band |
 | `MFTLRemeshMigrateToRanks` | `MFTLRedistributeWithOwners` | whole bodies |
 | `MFTLRemeshSumInts` | Allreduce(SUM) | 3 ints, once per phase |
-| `MFTLRemeshAgreeIntMax` / `AgreeDouble` / `AgreeDoubleMax` | Allreduce | $O(P)$ or $O(1)$, except the balancer's $4B$ |
+| `MFTLRemeshAgreeIntMax` / `AgreeDouble` / `AgreeDoubleMax` | Allreduce | $O(1)$ — a handful of scalars |
+| `MFTLRemeshNeighborGather` | `comm_graph` allgatherv | 3 doubles per body a rank **speaks for** or **moves** |
+| `MFTLRemeshNeighborAllgather` / `NeighborAlltoall` | `comm_graph` | 1–2 doubles per neighbour, the balancing rounds |
 | `MFTLRemeshMeasureBodies` | 2 × `MFTLEnsembleReduceBodies` + 1 scalar `MPI_MAX` | $9 + 1$ doubles per **local** body |
 | `MFTLRemeshSyncGhostIds` | request/reply over `comm_graph` | 4 B per ghost vertex |
 | `MFTLRemeshParamsAgree` | Allreduce | Debug only |
@@ -1615,12 +1701,16 @@ and all three were `O(\text{bodies in the ensemble})` per rank:
   caller fills it walking `ens->local_objects` and `MFTLRedistributeWithOwners`
   reads it walking the same list in the same order on the same rank.
 
-What did **not** move is the dispersed load balancer's replication
-(`replicate_for_balancer`, one `Allreduce` of $4B$ doubles). Its greedy is over
-rank *loads* and a rank's load sums bodies held anywhere in the job, so it needs
-replicated per-body data as a matter of algorithm rather than of route. It runs
-only when `dispersed_balance_slack > 0`; with the balancer off the driver is
-$O(\text{local} + P)$ end to end.
+- **the dispersed load balancer** — the last one to go, and the only one that
+  needed a different *algorithm* rather than a different route. It is its own
+  section below.
+
+The dispersed driver is now $O(\text{local} + d)$ end to end, balancer on or off,
+with $d \le 26$ the graph degree. Nothing in `src/remeshing/` allocates or
+messages a quantity proportional to $B$; the one thing still proportional to $P$
+is the `[nproc]` inverse neighbour table in `MFTLRemeshSyncGhostIds`, which the
+global fallback genuinely needs and which redistribution's own `[nproc]` arrays
+dominate anyway (CLAUDE.md, deferred issue 6).
 
 `test_remeshing_mpi_is_confined` — a **CMake source check**, not a runtime one —
 fails the build if that stops being true, because no runtime test can see it.

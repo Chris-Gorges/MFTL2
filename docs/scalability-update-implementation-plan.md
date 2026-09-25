@@ -988,16 +988,22 @@ and refilled on every migration. The lesson registered with the first is a route
 test — `test_a_droplet_remesh_takes_no_global_reduction`, which counts
 communicators rather than values.
 
-The second clause is met **except for the dispersed assignment**: "replace
-dispersed global greedy assignment with a deterministic distributed algorithm" was
-not done. Its greedy is over rank *loads*, and a rank's load sums bodies held
-anywhere in the job, so it genuinely needs replicated per-body data — a property
-of the algorithm and not of the route. What was done instead is to make it the
-only thing that pays: the replication is explicit (`replicate_for_balancer`, one
-`Allreduce` of `4B` doubles rather than the measurement's `9B`), it runs only when
-`dispersed_balance_slack > 0`, and with the balancer off the driver is
-`O(local + P)` end to end. Status document §6 states what a local rule has to
-prove before it can replace this.
+The second clause is met **including the dispersed assignment**, though not in one
+step. At the time this section was written, "replace dispersed global greedy
+assignment with a deterministic distributed algorithm" had *not* been done: the
+greedy is over rank *loads*, a rank's load sums bodies held anywhere in the job,
+and so long as every rank ran the greedy it genuinely needed replicated per-body
+data. What was done first was to make it the only thing that pays — the
+replication became explicit (`replicate_for_balancer`, one `Allreduce` of `4B`
+doubles rather than the measurement's `9B`) and skippable.
+
+**It has since been replaced outright.** The way out is that agreement does not
+require replication, it requires *delivery*: the owner of a body's reduced
+centroid decides that body alone and publishes `(gid, dest, weight)` one hop along
+`comm_graph`, which every holder of it provably is on. Payload and staging are
+`O(local bodies × degree)`, the balance is unchanged, and the cost is a
+negotiation — three directed doubles per neighbour per round — instead of a
+broadcast. Status document §Stage 6 has the argument and the measurements.
 
 ### Phase 8 -- spatial halo and BVH candidate-discovery redesign
 

@@ -263,16 +263,16 @@ same test, and is checked by `test_the_scan_tiles_every_body_exactly_once`: ever
 holder's range must abut the previous one and the last must close exactly on the
 total, gathered and walked per body on rank 0.
 
-Two things did **not** move, and both are stated rather than hidden. The
-convergence certificate used to ride the id `Allreduce` for free; now that the ids
-go over the 26-neighbour graph it pays its own 3-int `Allreduce` per phase — one
-small latency, to remove an ensemble-sized payload from every phase. And the
-**dispersed load balancer still needs replicated per-body data**, because its
+Two things did **not** move at this stage, and both are stated rather than hidden.
+The convergence certificate used to ride the id `Allreduce` for free; now that the
+ids go over the 26-neighbour graph it pays its own 3-int `Allreduce` per phase —
+one small latency, to remove an ensemble-sized payload from every phase. And the
+**dispersed load balancer still needed replicated per-body data**, because its
 greedy is over rank *loads* and a rank's load sums bodies held anywhere in the
-job. That replication is now explicit (`replicate_for_balancer`, one
+job. That replication was made explicit here (`replicate_for_balancer`, one
 `MPI_Allreduce` of `4B` doubles instead of the measurement's `9B`), attributable
-to one switch, and **skipped entirely** when `dispersed_balance_slack <= 0`, where
-the driver becomes `O(local + nproc)` end to end.
+to one switch, and **skipped entirely** when `dispersed_balance_slack <= 0`. It is
+gone in Stage 6.
 
 #### The evidence that Stage 4 changed no answer
 
@@ -357,7 +357,7 @@ sized `MFTL_RemeshMigrator.maps` at `MAX(n_bodies_global, n_local)` and keyed it
 by `global_id`. So each migration cleared and then partly filled two pointers for
 every body in the **job**, on a rank that may hold none of them: 16 B per body per
 rank, four to eight times per remesh, plus the `O(B)` clearing pass. It was the
-last `O(bodies in the ensemble)` allocation in the library that is not the
+last `O(bodies in the ensemble)` allocation in the library apart from the
 dispersed balancer, and unlike the balancer it is on the **per-phase** path.
 
 It is item 4 of the implementation plan's own remeshing checklist — *"explicit
@@ -414,6 +414,80 @@ over its local list and printed a column that halved when the rank count doubled
 correctness obligation onto callers, and the only thing that catches a caller
 getting it wrong is a *physical* measurement over enough timesteps for the drift
 to be unmistakable.
+
+### Stage 6 — the dispersed balancer, and the end of the `O(B)` terms
+
+The one term Stages 4 and 5 both named and neither removed, because it needed a
+different *algorithm* rather than a different route. `assign_destinations` is a
+greedy over rank LOADS; a rank's load sums bodies held anywhere in the job; so as
+long as every rank ran the greedy, every rank needed every body. `MFTL_OwnerMap`
+is undefined — not slow, undefined — if two ranks name different destinations for
+one entity, and that is what made "every rank runs the same greedy over the same
+replicated table" look like the only safe shape.
+
+**The way out is that agreement does not require replication; it requires
+delivery.** Let `home(o)` be the owner of body `o`'s reduced centroid — bit-identical
+on every holder, because the centroid came out of `MFTLEnsembleReduceBodies`. Then
+one rank decides `o` and the rest read the verdict.
+
+The precondition of that is reachability, and it is a **local test**, which is
+what makes the whole thing work: each holder checks that `home(o)` is itself or
+one of its 26 graph neighbours, and one `MPI_LAND` turns those local checks into
+
+> for every body `o` and every holder `H` of `o`: `home(o) ∈ {H} ∪ N(H)`.
+
+Two consequences fall straight out, and they are exactly the two messages needed.
+`home(o)` **can be told about the body**: the graph is symmetric, so
+`lowest_holder(o)` — already reduced, already agreed, and provably a holder — is
+one of its neighbours. And `home(o)` **can tell every holder**, in one
+neighbourhood gather. Note what is *not* required: the holder set need not be a
+clique, no holder need own an entity, and `home` need not hold the body.
+`MFTLEnsembleBodyHoldersFitTheGraph` is strictly stronger and deliberately not
+what is tested here. A failure reports `MFTL_RemeshStats::n_bodies_unreachable`
+and reverts the pass to plain centroid ownership — never to replicating, because
+a fallback that is `O(B)` *is* an `O(B)` term.
+
+**What a local rule costs instead is a negotiation.** A replicated greedy can hand
+a body to the least-loaded rank in the job knowing nobody else is doing the same;
+a local one cannot, because every overloaded rank sees the same idle neighbour.
+Three directed doubles per neighbour per round buy it: a rank asks its neighbours
+for room in proportion to what they advertise, and each neighbour divides the room
+it actually has among the askers, neediest first. `Σ grants ≤ room` by
+construction, so no rank can be pushed past its cap however many neighbours ship
+at once.
+
+Two failures of that rule were found by measurement, and neither is visible to any
+test of the answer — a balancer that silently does nothing produces a perfectly
+valid mesh:
+
+- **a body is indivisible, so a proportional ask is wrong.** Splitting the excess
+  over 26 neighbours returns grants smaller than one body and nothing is
+  placeable: 108 bodies over 27 ranks stayed at an imbalance of 2.00 with
+  `n_bodies_reassigned == 0`, while the clustered fixture — one uncontended asker
+  — balanced perfectly;
+- **a tie-break identical on every rank starves the same rank.** Four overloaded
+  ranks looking at four equally empty neighbours all pick the same one: 1 of 8
+  left idle. Ties now break on the neighbour's cell *offset*, which is relative to
+  the rank doing the looking.
+
+The result reproduces the replicated balancer digit for digit — 2.00 / 4.00 / 8.00
+/ 27.00 → 1.25 at np = 2 / 4 / 8 / 27 on the clustered fixture, zero ranks idle
+(one better than the replicated greedy at np = 27), 1.45× to 5.0× less wall clock.
+
+**The observable is the payload, and it needed a new instrument.** Both balancers
+give a correct, reproducible, equally balanced mesh, so every digest and every
+imbalance figure in the suite is blind to the difference — the same blindness
+`MFTLEnsembleGetBodyReduceStats` exists to cure for pinned reduction scopes. So
+`MFTLRemeshBalancerPayload()` counts the doubles a rank stages, and
+`test_the_balancer_payload_ignores_bodies_a_rank_does_not_hold` asserts the sharp
+form: **double the ensemble and a rank holding none of it must stage the same
+number**. Measured 25 / 49 / 85 doubles at np = 2 / 4 / 8, unchanged from 16 to 32
+bodies, against `4B = 64 → 128` on *every* rank under replication.
+
+Two smaller things went with it. The imbalance report no longer reduces a
+`[nproc]` load table — it is four scalars — so the dispersed driver has no
+`O(nproc)` term of its own either. And the balanced and unbalanced paths are now
+one function rather than two, so the diagnostic costs the same either way.
 
 ## 3. What it measurably bought
 
@@ -576,22 +650,19 @@ outside.
 
 ## 6. What is still missing
 
-**One `O(bodies in the ensemble)` term is left in the library**, and it is a
-property of an algorithm rather than of a communicator, so it needs a different
-idea and not a different route. Everything else below is either a measurement that
-this machine cannot take, a module that was never part of this work, or a small
-item with a stated reason for not having been done.
-
-The remesher's explicit owner maps used to be a second entry in this table. They
-are not any more — see Stage 5 — and that leaves the balancer as the only
-`O(B)` term in the library, which is what makes the sentence above true rather
-than merely intended.
+**No `O(bodies in the ensemble)` term is left on a per-timestep or per-remesh
+path.** The dispersed load balancer was the last one and Stage 6 removed it; the
+remesher's explicit owner maps were the one before that, in Stage 5. What is left
+below is either a measurement this machine cannot take, a module that was never
+part of this work, an `O(nproc)` term, or a small item with a stated reason for
+not having been done.
 
 | what | where | shape |
 |---|---|---|
-| the dispersed load balancer replicates | `replicate_for_balancer`, once per remesh, only when `dispersed_balance_slack > 0` | `4B` doubles |
 | generation builds every body on rank 0 | `MFTLGenerateSphere`, once per run | serial, and the Amdahl ceiling |
+| `[nproc]` metadata inside a redistribution | `redistribute_core`, `MFTLRemeshSyncGhostIds` | `O(P)` per call, allocated and freed |
 | the halo reaches one hop | `MFTLExtendSpatialHalo`, by construction | a contact two cells away is missed, silently |
+| the balancer's weight moves one cell per pass | `assign_destinations`, by construction | a pile-up wider than a cell is only partly fixed |
 | a route choice has no test of its own unless one counts routes | every `MFTL_BODY_REDUCE_SCOPE_*` call site | invisible to every digest; two gate tests, and no more |
 | nothing measured above four ranks | the machine | every scaling claim is a model, not a measurement |
 
@@ -607,31 +678,41 @@ Specifically unmeasured: whether the holder route's predicted crossover at
 one at `P = 10 000`, and whether the `O(B)` terms that remain below actually
 become the limit.
 
-### The dispersed load balancer still replicates, and it needs a different idea
+### The balancer's weight moves one cell per pass, and that is now the limit
 
-The one `O(bodies in the ensemble)` term left on a per-remesh path, and the only
-one that is a property of an *algorithm* rather than of a route.
-`assign_destinations` is a greedy over rank LOADS, and a rank's load sums bodies
-held anywhere in the job; every rank must reach the same assignment, because
-`MFTL_OwnerMap` is undefined — not slow, undefined — if two ranks name different
-destinations for one entity. No communicator choice fixes that.
+Stage 6 replaced the replicated greedy with a rule that decides each body on the
+owner of its centroid and delivers the verdict one hop along `comm_graph`. The
+`O(B)` term is gone; what took its place is a **reach** limit, and it is worth
+being precise about because it is not the same weakness.
 
-What Stage 4 did do is make it **the only thing that pays**. The replication is
-one `MPI_Allreduce` of `4 × n_bodies_global` doubles in
-`replicate_for_balancer()`, it happens only when `dispersed_balance_slack > 0`,
-and with the balancer off the dispersed driver is `O(local + nproc)` end to end —
-including its imbalance report, which costs `nproc` doubles rather than
-`n_bodies_global`.
+A body can only be reassigned to a graph neighbour of its home rank. A pile-up
+confined to one rank box is therefore fixed completely — measured 27.00 → 1.25 at
+np = 27 with no rank idle — and so is any imbalance whose surplus has somewhere to
+go within one cell, which is what droplet clustering looks like. A pile-up
+*spanning many cells* is only partly fixed, and successive remeshing passes do not
+compound the fix, because the closing `MFTLRedistribute` restores the geometric
+partition every time.
 
-The replacement is a **local** balancing rule: a body's home rank decides on its
-own load and its 26 neighbours' and tells the holders, which is
-`O(local bodies × degree)`. Two things have to be established first, and neither
-is free. A body's home rank must be provably one of its holders — true in the
-dispersed regime, where `r ≤ 0.4 h` puts a ray from the centroid through the
-surface inside the home cell, but it is an argument about *triangle centres* and
-has not been written down properly. And a purely local greedy is not obviously
-convergent, where the replicated one terminates by an argument this document's
-predecessor states in four lines.
+The honest comparison is that **the replicated greedy was not much better here**:
+its own policy tried the 26 cells around a body before anywhere else, and its
+global fallback is precisely the case where a body leaves the stencil and
+redistribution drops to its all-to-all path. What it could do and this cannot is
+place a body on an idle rank on the far side of the machine. Whether that is worth
+an `O(B)` broadcast is a question a cluster measurement should answer, not this
+document.
+
+Two smaller properties of the new rule, both recorded rather than fixed:
+
+- **The rounds are bounded, not convergent.** Three ask/grant/ship rounds run
+  whatever the state; running out leaves an imbalance the pass reports in
+  `load_imbalance`, never a wrong mesh. Measured, two rounds suffice on every
+  fixture up to np = 27 and one does not (np = 27 spread stalls at 1.50).
+- **The precondition is a gate, not a per-body exception.** One unreachable
+  (holder, body) pair anywhere disables balancing for the whole pass, because
+  skipping just that body would leave the rank loads describing a different
+  assignment from the one that ran. `n_bodies_unreachable` reports it. Reaching it
+  needs a body wider than the admission test allows; the realistic route is
+  `parallel_coarsen` relaxing the yardstick to a coarsened box.
 
 ### Generation is still rank-0 serial, and it is the Amdahl ceiling
 
@@ -789,6 +870,39 @@ New in Stage 5:
   exercised by every remeshing entry at every registered rank count, in Release
   and under ASan and UBSan, with all three recorded mesh digests unchanged and
   the `remesh_regime_sweep` balancer table reproduced digit for digit.
+
+New in Stage 6:
+
+- `test_the_balancer_payload_ignores_bodies_a_rank_does_not_hold` at
+  `np = 2, 4, 8`. It counts BYTES STAGED, not values, for the same reason the
+  route tests count routes: the replicated and the local balancer reach the same
+  imbalance on the same fixture, so no digest, volume or triangle count can tell
+  them apart. Two runs, 16 bodies and 32, all inside one rank's box; a rank
+  holding none of them must stage the SAME number of doubles both times, and the
+  rank holding all of them must stage at least `3 x 16` more. Measured 25 / 49 /
+  85 doubles on a non-holder at np = 2 / 4 / 8, identical at both body counts,
+  against `4B = 64 -> 128` on every rank under replication. Two non-vacuity
+  conditions guard it: some rank must genuinely hold nothing, and the balancer
+  must have moved bodies in both runs.
+- `MFTLRemeshBalancerPayload()` / `MFTLRemeshResetBalancerPayload()`, the
+  instrument that makes the above expressible at all — the sibling of
+  `MFTLRemeshMeasurementCount()` and of `MFTLEnsembleGetBodyReduceStats()`.
+- `test_the_balancer_evens_out_a_pile_up` and `test_the_balancer_is_deterministic`
+  were already there and both pass unchanged, which is the point: they are
+  sensitive to the answer and blind to how it was reached.
+- One test tolerance moved and it is recorded rather than quietly widened.
+  `test_four_split_droplets_are_centred_and_remeshed` asserted that fewer than
+  2 % of edges end outside the length band; which rank remeshes a body decides
+  the order its pool arrives in, split and collapse are order-dependent, and the
+  quantity spans **1.31 % to 2.17 %** over np = 1, 2, 4, 8 with the balancer on
+  and off — all equally correct. The threshold is 3 %, with the measured spread
+  in the comment. What it is for is catching a pass that did not converge, which
+  reports tens of per cent.
+
+Re-verified after Stage 6: 48 of 48 CTest entries in Release and in Debug with
+ASan and UBSan; `remesh_regime_sweep -only l` gives clustered imbalance 2.00 /
+4.00 / 8.00 / 27.00 -> 1.25 at np = 2 / 4 / 8 / 27 with **zero** ranks idle and
+busiest-rank ops 6 304 / 12 608 / 25 216 / 85 104 -> 3 940.
 
 Re-verified after Stage 5: 48 of 48 CTest entries in Release and in Debug with
 ASan and UBSan; `leveque_remeshing_parallel` at np = 1, 2, 4 gives

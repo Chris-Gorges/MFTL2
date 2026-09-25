@@ -812,13 +812,29 @@ over the arrivals); `MFTLRemeshMeasureBodies`, the per-phase `2B` Exscan and
 Allreduce, the dispersed id counters and the Debug watermark check all go through
 `MFTLEnsembleReduceBodies` or its new sibling `MFTLEnsembleExscanBodies`.
 
-**What remains, and it is one thing:** the dispersed balancer's `O(P x B)`
-replicated greedy. Its assignment must be identical on every rank and its greedy
-is over rank *loads*, so it genuinely needs replicated per-body data — that is a
-property of the algorithm, not of the route. It is now explicit
-(`replicate_for_balancer`, one `Allreduce` of `4B` doubles rather than the
-measurement's `9B`), attributable to one switch, and skipped entirely when
-`dispersed_balance_slack <= 0`.
+**What remained after that pass was one thing, and it is now gone too:** the
+dispersed balancer's replicated greedy. Its assignment has to be identical on
+every rank and its greedy is over rank *loads*, so as long as every rank ran the
+greedy it genuinely needed replicated per-body data — a property of the algorithm
+and not of the route, which is why it outlived every other `O(B)` term. The fix
+was to stop having every rank run it: the owner of a body's reduced centroid
+decides that body alone and publishes `(body, destination, weight)` one hop along
+`comm_graph`, which every holder of it is on. Payload and staging are
+`O(local bodies x graph degree)`.
+
+The balance is unchanged — 4.00 / 8.00 / 27.00 -> 1.25 at np = 4 / 8 / 27 on the
+clustered fixture, no rank idle — and the counted quantity that moved is the only
+observable it has: on a rank holding NONE of the ensemble, the balancer stages
+25 / 49 / 85 doubles at np = 2 / 4 / 8 **and that number does not change when the
+body count doubles**, against `4B` on every rank before. Gated by
+`test_the_balancer_payload_ignores_bodies_a_rank_does_not_hold`, because no digest
+and no imbalance figure can see the difference. Full account in
+`docs/parallel-remeshing-analysis.md` §7.4.
+
+Nothing in the library is now proportional to `n_bodies_global` on a per-timestep
+or per-remesh path. What is left is proportional to `nproc`: the `[nproc]` inverse
+neighbour table in `MFTLRemeshSyncGhostIds` and the several `[nproc]` arrays inside
+`redistribute_core` (CLAUDE.md deferred issue 6), which dominate it.
 
 Generation is still rank-0 serial, so the peak of §scaling_trap_pools stands and
 setup time still grows linearly with `nproc` in a weak sweep.

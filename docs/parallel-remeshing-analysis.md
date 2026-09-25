@@ -324,40 +324,74 @@ was 2.8× faster while doing it.
 
 Bodies go where their centroids are, and centroids cluster — an emulsion is not a uniform distribution over
 a process grid. The balancer keeps each body on its centroid's owner unless that rank exceeds
-`mean × dispersed_balance_slack`, then prefers the least-loaded of the 26 cells around it, then anywhere.
-It is a pure function of the replicated centroids and per-body triangle counts, so it costs **no collective
-of its own** — the weights ride the reduction `MFTLRemeshMeasureBodies` already takes.
+`mean × dispersed_balance_slack`, and then moves it to a neighbouring cell that has room.
 
-Since the ensemble's object list became sparse, "replicated" is no longer free: the measurement is indexed
-by local slot and reduced over each body's holders, so the balancer broadcasts what it needs itself
-(`replicate_for_balancer`, one `MPI_Allreduce` of `4 × n_bodies_global` doubles by MAX — MAX and not SUM,
-because every holder already reduced to the same value to the bit). **That is the library's last
-`O(bodies in the ensemble)` term**, it runs only when `dispersed_balance_slack > 0`, and it is a property of
-the algorithm rather than of the route: the greedy is over rank *loads*, and a rank's load sums bodies held
-anywhere in the job. Every number in the tables below was re-measured after that change and is unchanged.
+**It used to reach that decision by replication and it now reaches it by delivery**, which is the whole of
+what changed here. `replicate_for_balancer` broadcast `4 × n_bodies_global` doubles so that every rank could
+run the same greedy over the same table — the library's last `O(bodies in the ensemble)` term, and one that
+needed a different *algorithm* rather than a different route, because a greedy over rank *loads* sums bodies
+held anywhere in the job. What replaces it decides each body on ONE rank — the owner of its reduced centroid
+— and publishes `(body, destination, weight)` one hop along `comm_graph`, which every holder of that body is
+on. Payload and staging are `O(local bodies × graph degree)`; the precondition (a body's centroid owner is a
+graph neighbour of every rank holding it) is a purely local test reduced by one `MPI_LAND`, and a failure
+reverts the pass to plain centroid ownership and reports `n_bodies_unreachable`.
 
-$4P$ droplets, all packed into one rank's box:
+**Every row of both tables below was re-measured on the new balancer and reproduces the old one**, which is
+the point: the two agree on the answer and differ only in what they cost. Rows marked *before* are the
+replicated greedy, measured on the same fixture in the same session.
 
-| np | balancer | imbalance | ranks idle | busiest-rank ops | wall |
-|---:|---|---:|---:|---:|---:|
-| 4 | off | 4.00 | 3 / 4 | 12 608 | 0.0162 |
-| 4 | **on** | **1.25** | **0 / 4** | **3 940** | **0.0064 (2.5×)** |
-| 8 | off | 8.00 | 7 / 8 | 25 216 | 0.0519 |
-| 8 | **on** | **1.25** | **0 / 8** | **3 940** | **0.0100 (5.2×)** |
-| 27 | off | 27.00 | 26 / 27 | 85 104 | 0.1081 |
-| 27 | **on** | **1.25** | **1 / 27** | **3 940** | **0.0317 (3.4×)** |
+$4P$ droplets, all packed into one rank's box (`remesh_regime_sweep -only l`, the `clustered` row):
+
+| np | balancer | imbalance | ranks idle | busiest-rank ops | wall | (replicated, same session) |
+|---:|---|---:|---:|---:|---:|---|
+| 2 | off | 2.00 | 1 / 2 | 6 304 | 0.0139 | |
+| 2 | **on** | **1.25** | **0 / 2** | **3 940** | **0.0096 (1.45×)** | 1.25, 0 idle, 3 moved |
+| 4 | off | 4.00 | 3 / 4 | 12 608 | 0.0300 | |
+| 4 | **on** | **1.25** | **0 / 4** | **3 940** | **0.0121 (2.5×)** | 1.25, 0 idle, 11 moved |
+| 8 | off | 8.00 | 7 / 8 | 25 216 | 0.0997 | |
+| 8 | **on** | **1.25** | **0 / 8** | **3 940** | **0.0198 (5.0×)** | 1.25, 0 idle, 27 moved |
+| 27 | off | 27.00 | 26 / 27 | 85 104 | 0.2699 | |
+| 27 | **on** | **1.25** | **0 / 27** | **3 940** | **0.0827 (3.3×)** | 1.25, **1 idle**, 103 moved |
 
 The same droplets on a lattice across the domain, i.e. the case the balancer should leave alone:
 
 | np | balancer | imbalance | ranks idle | wall |
 |---:|---|---:|---:|---:|
-| 4 | off → on | 1.50 → 1.25 | 0 → 0 | 0.0077 → 0.0059 |
-| 8 | off → on | 2.00 → 1.25 | **4 / 8 → 0** | 0.0175 → 0.0128 |
-| 27 | off → on | 2.00 → 1.25 | 0 → 0 | 0.0263 → 0.0271 |
+| 2 | off → on | 1.00 → 1.00 | 0 → 0 | 0.0077 → 0.0071 |
+| 4 | off → on | 1.25 → 1.25 | 0 → 0 | 0.0126 → 0.0121 |
+| 8 | off → on | 2.00 → 1.25 | **4 / 8 → 0** | 0.0217 → 0.0147 |
+| 27 | off → on | 2.00 → 1.25 | 0 → 0 | 0.0489 → 0.0799 |
 
 Even the lattice benefits at np = 8, where four of eight ranks were idle because a cubic lattice of bodies
-does not align with a 2×2×2 process grid. At np = 27 it is a wash, which is the right outcome: there was
-nothing to fix and it cost nothing to check.
+does not align with a 2×2×2 process grid. The np = 27 lattice row is the one that costs: 16 of 108 bodies
+move to reach 1.25, and each is a body that leaves the geometric partition and pays for it in the closing
+redistribution. That is the trade the slack names, and lowering it is how a caller declines it.
+
+**Two failures the local rule has and the replicated one did not, both found by measurement and both fixed.**
+Neither could have been found by a test of the answer — a balancer that silently does nothing produces a
+perfectly valid mesh:
+
+- **A body is indivisible, so a proportional ask is wrong.** Splitting the excess over 26 neighbours in
+  proportion to the room each advertises returns grants *smaller than one body*, so nothing is placeable.
+  Measured: 108 bodies over 27 ranks stayed at an imbalance of 2.00 with `n_bodies_reassigned == 0`, while
+  the clustered fixture — one rank asking, uncontended — balanced perfectly. The ask now goes to
+  `floor(budget / heaviest)` neighbours, emptiest first.
+- **A tie-break identical on every rank starves the same rank.** Four overloaded ranks looking at four
+  equally empty neighbours all choose the same one; measured as 1 of 8 ranks left idle. Ties break on the
+  neighbour's cell *offset*, which is relative to the rank doing the looking.
+
+And one parameter the local rule has that the replicated one did not: the number of ask/grant/ship rounds.
+Measured imbalance against a slack of 1.25 —
+
+| rounds | np = 4 | np = 8 | np = 27 spread | np = 27 clustered |
+|---:|---:|---:|---:|---:|
+| 1 | 1.25 | 1.25 | 1.50 | 1.25 |
+| 2 | 1.25 | 1.25 | 1.25 | 1.25 |
+| 3 | 1.25 | 1.25 | 1.25 | 1.25 |
+| 4 | 1.25 | 1.25 | 1.25 | 1.25 |
+
+Two is what the measurement needs; three ship, because one too few is a silently unbalanced pass and one too
+many is three directed doubles per neighbour.
 
 **So `dispersed_balance_slack` defaults to 1.25, enabled** — the one of the three that the measurement says
 to turn on.
