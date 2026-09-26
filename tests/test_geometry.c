@@ -383,7 +383,7 @@ static int test_normals_of_a_whole_mesh_are_unit(void)
    * projection -- a short vertex normal there leaves a residual normal component
    * in the displacement, which is exactly the surface shrinkage the projection
    * exists to remove. */
-  MFTLComputeVertexNormals(obj);
+  MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
   TEST_ASSERT(inv_vertex_normals_are_unit(obj, 1e-12));
 
   return 0;
@@ -520,6 +520,277 @@ static int test_triangle_geometry_respects_the_count(void)
   return 0;
 }
 
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Point-triangle closest point
+ *
+ * The reference below shares nothing with MFTLClosestPointOnTriangle's region
+ * test: it projects onto the PLANE, accepts the projection if its barycentric
+ * coordinates are all non-negative, and otherwise takes the nearest of the three
+ * exact segment distances. Two independent derivations of one answer.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/** @brief Deterministic uniform variate in [lo, hi); the tests must reproduce. */
+static double cp_rand(unsigned *state, double lo, double hi)
+{
+  *state = *state * 1664525u + 1013904223u;
+  return lo + (hi - lo) * ((double) (*state >> 8) / (double) (1u << 24));
+}
+
+/** @brief Exact distance from p to the segment [a, b], squared. */
+static double ref_segment_dist_sq(const double p[3], const double a[3], const double b[3])
+{
+  double ab[3], ap[3];
+  for (int k = 0; k < 3; ++k)
+  {
+    ab[k] = b[k] - a[k];
+    ap[k] = p[k] - a[k];
+  }
+  const double l2 = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
+  double s = (l2 > 0.0) ? (ab[0] * ap[0] + ab[1] * ap[1] + ab[2] * ap[2]) / l2 : 0.0;
+  s = (s < 0.0) ? 0.0 : (s > 1.0 ? 1.0 : s);
+  double d2 = 0.0;
+  for (int k = 0; k < 3; ++k)
+  {
+    const double d = p[k] - (a[k] + s * ab[k]);
+    d2 += d * d;
+  }
+  return d2;
+}
+
+/** @brief Plane projection if it lands inside, the three edges otherwise. */
+static double ref_triangle_dist_sq(const double p[3], const double T[3][3])
+{
+  double e1[3], e2[3], n[3];
+  for (int k = 0; k < 3; ++k)
+  {
+    e1[k] = T[1][k] - T[0][k];
+    e2[k] = T[2][k] - T[0][k];
+  }
+  n[0] = e1[1] * e2[2] - e1[2] * e2[1];
+  n[1] = e1[2] * e2[0] - e1[0] * e2[2];
+  n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+  const double nn = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+
+  double best = ref_segment_dist_sq(p, T[0], T[1]);
+  best = fmin(best, ref_segment_dist_sq(p, T[1], T[2]));
+  best = fmin(best, ref_segment_dist_sq(p, T[2], T[0]));
+  if (nn <= 0.0) return best;
+
+  const double t = ((p[0] - T[0][0]) * n[0] + (p[1] - T[0][1]) * n[1] + (p[2] - T[0][2]) * n[2]) / nn;
+  const double q[3] = {p[0] - t * n[0], p[1] - t * n[1], p[2] - t * n[2]};
+
+  /* Barycentric signs by sub-triangle normals against n. */
+  int inside = 1;
+  for (int e = 0; e < 3; ++e)
+  {
+    const double *a = T[e], *b = T[(e + 1) % 3];
+    const double u[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+    const double w[3] = {q[0] - a[0], q[1] - a[1], q[2] - a[2]};
+    const double c[3] = {u[1] * w[2] - u[2] * w[1], u[2] * w[0] - u[0] * w[2], u[0] * w[1] - u[1] * w[0]};
+    if (c[0] * n[0] + c[1] * n[1] + c[2] * n[2] < 0.0) inside = 0;
+  }
+  if (!inside) return best;
+  const double d2 = t * t * nn;
+  return fmin(best, d2);
+}
+
+static int test_closest_point_matches_an_independent_reference(void)
+{
+  unsigned seed = 12345u;
+  for (int trial = 0; trial < 20000; ++trial)
+  {
+    double T[3][3], p[3];
+    for (int c = 0; c < 3; ++c)
+      for (int k = 0; k < 3; ++k) T[c][k] = cp_rand(&seed, -1.0, 1.0);
+    for (int k = 0; k < 3; ++k) p[k] = cp_rand(&seed, -2.0, 2.0);
+
+    double q[3];
+    MFTL_TriangleFeature f;
+    const double d2 = MFTLClosestPointOnTriangle(p, T, q, &f);
+    const double r2 = ref_triangle_dist_sq(p, T);
+
+    TEST_ASSERT(isfinite(d2));
+    TEST_ASSERT(fabs(d2 - r2) <= 1e-12 * (1.0 + r2));
+
+    /* The returned point is consistent with the returned distance. */
+    const double dq = (p[0] - q[0]) * (p[0] - q[0]) + (p[1] - q[1]) * (p[1] - q[1]) + (p[2] - q[2]) * (p[2] - q[2]);
+    TEST_ASSERT(fabs(dq - d2) <= 1e-12 * (1.0 + d2));
+  }
+  return 0;
+}
+
+static int test_closest_point_reports_every_feature(void)
+{
+  /* A right triangle in z = 0: corners (0,0,0), (1,0,0), (0,1,0). One query per
+   * Voronoi region, lifted out of the plane so the distance is never zero. */
+  const double T[3][3] = {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, {0.0, 1.0, 0.0}};
+  const struct
+  {
+    double p[3];
+    MFTL_TriangleFeature f;
+    double q[3];
+  } cases[] = {
+      {{0.2, 0.2, 0.5}, MFTL_TRI_FEATURE_FACE, {0.2, 0.2, 0.0}},     {{-1.0, -1.0, 0.3}, MFTL_TRI_FEATURE_VERTEX0, {0.0, 0.0, 0.0}},
+      {{2.0, -0.5, 0.3}, MFTL_TRI_FEATURE_VERTEX1, {1.0, 0.0, 0.0}}, {{-0.5, 2.0, -0.3}, MFTL_TRI_FEATURE_VERTEX2, {0.0, 1.0, 0.0}},
+      {{0.5, -1.0, 0.1}, MFTL_TRI_FEATURE_EDGE0, {0.5, 0.0, 0.0}},   {{1.0, 1.0, 0.1}, MFTL_TRI_FEATURE_EDGE1, {0.5, 0.5, 0.0}},
+      {{-1.0, 0.5, -0.1}, MFTL_TRI_FEATURE_EDGE2, {0.0, 0.5, 0.0}},
+  };
+
+  for (size_t i = 0; i < sizeof cases / sizeof cases[0]; ++i)
+  {
+    double q[3];
+    MFTL_TriangleFeature f;
+    MFTLClosestPointOnTriangle(cases[i].p, T, q, &f);
+    TEST_ASSERT_EQUAL_INT(cases[i].f, f);
+    for (int k = 0; k < 3; ++k) TEST_ASSERT_EQUAL_DOUBLE(cases[i].q[k], q[k], 1e-15);
+  }
+  return 0;
+}
+
+static int test_closest_point_lies_on_the_feature_it_reports(void)
+{
+  unsigned seed = 777u;
+  int seen[7] = {0, 0, 0, 0, 0, 0, 0};
+
+  for (int trial = 0; trial < 20000; ++trial)
+  {
+    double T[3][3], p[3];
+    for (int c = 0; c < 3; ++c)
+      for (int k = 0; k < 3; ++k) T[c][k] = cp_rand(&seed, -1.0, 1.0);
+    for (int k = 0; k < 3; ++k) p[k] = cp_rand(&seed, -1.5, 1.5);
+
+    double q[3];
+    MFTL_TriangleFeature f;
+    MFTLClosestPointOnTriangle(p, T, q, &f);
+    seen[f]++;
+
+    if (f >= MFTL_TRI_FEATURE_VERTEX0 && f <= MFTL_TRI_FEATURE_VERTEX2)
+    {
+      /* BIT-exact: the SDF's pseudo-normal lookup relies on it. */
+      const int c = f - MFTL_TRI_FEATURE_VERTEX0;
+      TEST_ASSERT(q[0] == T[c][0] && q[1] == T[c][1] && q[2] == T[c][2]);
+    }
+    else if (f >= MFTL_TRI_FEATURE_EDGE0)
+    {
+      const int e = f - MFTL_TRI_FEATURE_EDGE0;
+      const double *a = T[e], *b = T[(e + 1) % 3];
+      TEST_ASSERT(ref_segment_dist_sq(q, a, b) <= 1e-24);
+      /* On the edge and pointing AWAY from it: p - q is orthogonal to the edge. */
+      const double ab[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+      const double pq[3] = {p[0] - q[0], p[1] - q[1], p[2] - q[2]};
+      const double dot = ab[0] * pq[0] + ab[1] * pq[1] + ab[2] * pq[2];
+      TEST_ASSERT(fabs(dot) <= 1e-10 * (1.0 + sqrt(pq[0] * pq[0] + pq[1] * pq[1] + pq[2] * pq[2])));
+    }
+    else
+    {
+      /* Face: p - q is parallel to the normal. */
+      double e1[3], e2[3];
+      for (int k = 0; k < 3; ++k)
+      {
+        e1[k] = T[1][k] - T[0][k];
+        e2[k] = T[2][k] - T[0][k];
+      }
+      const double pq[3] = {p[0] - q[0], p[1] - q[1], p[2] - q[2]};
+      TEST_ASSERT(fabs(e1[0] * pq[0] + e1[1] * pq[1] + e1[2] * pq[2]) <= 1e-10);
+      TEST_ASSERT(fabs(e2[0] * pq[0] + e2[1] * pq[1] + e2[2] * pq[2]) <= 1e-10);
+    }
+  }
+
+  /* Non-vacuity: every region was actually exercised by the random sample. */
+  for (int i = 0; i < 7; ++i) TEST_ASSERT(seen[i] > 100);
+  return 0;
+}
+
+static int test_closest_point_on_degenerate_triangles(void)
+{
+  const double p[3] = {0.3, 0.7, -0.4};
+
+  /* Collinear corners: the answer is the distance to the segment they span. */
+  const double line[3][3] = {{0.0, 0.0, 0.0}, {2.0, 0.0, 0.0}, {1.0, 0.0, 0.0}};
+  double q[3];
+  MFTL_TriangleFeature f;
+  double d2 = MFTLClosestPointOnTriangle(p, line, q, &f);
+  TEST_ASSERT(isfinite(d2) && isfinite(q[0]) && isfinite(q[1]) && isfinite(q[2]));
+  TEST_ASSERT_EQUAL_DOUBLE(0.7 * 0.7 + 0.4 * 0.4, d2, 1e-14);
+
+  /* Two coincident corners. */
+  const double spike[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 3.0, 0.0}};
+  d2 = MFTLClosestPointOnTriangle(p, spike, q, &f);
+  TEST_ASSERT(isfinite(d2));
+  TEST_ASSERT_EQUAL_DOUBLE(0.3 * 0.3 + 0.4 * 0.4, d2, 1e-14);
+
+  /* A triangle collapsed to a point reports that point as corner 0. */
+  const double dot[3][3] = {{1.0, 1.0, 1.0}, {1.0, 1.0, 1.0}, {1.0, 1.0, 1.0}};
+  d2 = MFTLClosestPointOnTriangle(p, dot, q, &f);
+  TEST_ASSERT_EQUAL_INT(MFTL_TRI_FEATURE_VERTEX0, f);
+  TEST_ASSERT_EQUAL_DOUBLE(0.7 * 0.7 + 0.3 * 0.3 + 1.4 * 1.4, d2, 1e-14);
+
+  /* A sliver just above the degeneracy threshold is still answered as a face. */
+  const double sliver[3][3] = {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, {0.5, 1e-6, 0.0}};
+  const double above[3] = {0.5, 0.5e-6, 1.0};
+  d2 = MFTLClosestPointOnTriangle(above, sliver, q, &f);
+  TEST_ASSERT_EQUAL_INT(MFTL_TRI_FEATURE_FACE, f);
+  TEST_ASSERT_EQUAL_DOUBLE(1.0, d2, 1e-12);
+
+  /* NULL outputs are allowed. */
+  d2 = MFTLClosestPointOnTriangle(p, line, MFTL_NULL, MFTL_NULL);
+  TEST_ASSERT(isfinite(d2));
+  return 0;
+}
+
+static int test_closest_point_is_scale_and_translation_invariant(void)
+{
+  const double base[3][3] = {{0.1, -0.2, 0.05}, {0.9, 0.1, -0.1}, {0.2, 0.8, 0.3}};
+  const double bp[3] = {0.6, 0.6, -0.7};
+
+  double q0[3];
+  MFTL_TriangleFeature f0;
+  const double d0 = MFTLClosestPointOnTriangle(bp, base, q0, &f0);
+
+  const double scales[] = {1e-8, 1e-4, 1.0, 1e4, 1e8};
+  const double offset = 1.0e6;
+  for (size_t s = 0; s < sizeof scales / sizeof scales[0]; ++s)
+  {
+    const double L = scales[s];
+    double T[3][3], p[3];
+    for (int c = 0; c < 3; ++c)
+      for (int k = 0; k < 3; ++k) T[c][k] = base[c][k] * L;
+    for (int k = 0; k < 3; ++k) p[k] = bp[k] * L;
+
+    MFTL_TriangleFeature f;
+    const double d = MFTLClosestPointOnTriangle(p, T, MFTL_NULL, &f);
+    TEST_ASSERT_EQUAL_INT(f0, f);
+    TEST_ASSERT(fabs(d / (L * L) - d0) <= 1e-12 * d0);
+
+    /* The same shape far from the origin: only the rounding of the offset is
+     * lost, so compare against a tolerance relative to it. */
+    if (L >= 1.0)
+    {
+      for (int c = 0; c < 3; ++c)
+        for (int k = 0; k < 3; ++k) T[c][k] += offset;
+      for (int k = 0; k < 3; ++k) p[k] += offset;
+      const double dt = MFTLClosestPointOnTriangle(p, T, MFTL_NULL, &f);
+      TEST_ASSERT_EQUAL_INT(f0, f);
+      TEST_ASSERT(fabs(sqrt(dt) - sqrt(d0) * L) <= 1e-9 * (offset + L));
+    }
+  }
+  return 0;
+}
+
+static int test_a_point_on_the_triangle_is_at_distance_zero(void)
+{
+  const double T[3][3] = {{0.0, 0.0, 0.0}, {2.0, 0.0, 1.0}, {0.0, 3.0, -1.0}};
+  const double bary[][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {0.5, 0.5, 0}, {0, 0.5, 0.5}, {0.25, 0.25, 0.5}};
+  for (size_t i = 0; i < sizeof bary / sizeof bary[0]; ++i)
+  {
+    double p[3];
+    for (int k = 0; k < 3; ++k) p[k] = bary[i][0] * T[0][k] + bary[i][1] * T[1][k] + bary[i][2] * T[2][k];
+    const double d2 = MFTLClosestPointOnTriangle(p, T, MFTL_NULL, MFTL_NULL);
+    TEST_ASSERT(d2 <= 1e-28);
+  }
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
@@ -552,6 +823,12 @@ int main(int argc, char **argv)
   RUN_TEST(test_bulk_geometry_matches_the_scalar_path);
   RUN_TEST(test_triangle_geometry_paths_are_bit_identical);
   RUN_TEST(test_triangle_geometry_respects_the_count);
+  RUN_TEST(test_closest_point_matches_an_independent_reference);
+  RUN_TEST(test_closest_point_reports_every_feature);
+  RUN_TEST(test_closest_point_lies_on_the_feature_it_reports);
+  RUN_TEST(test_closest_point_on_degenerate_triangles);
+  RUN_TEST(test_closest_point_is_scale_and_translation_invariant);
+  RUN_TEST(test_a_point_on_the_triangle_is_at_distance_zero);
 
   TEST_REPORT();
 

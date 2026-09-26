@@ -129,8 +129,6 @@ static inline void stack_push(pair_stack *s, int a, int b)
 /** @brief Everything the narrow phase needs, hoisted out of the traversal loop. */
 typedef struct
 {
-  const MFTL_Object *objA;  ///< Object the A-side tree was built over.
-  const MFTL_Object *objB;  ///< Object the B-side tree was built over.
   MFTL_BVH *bvhA;  ///< A-side hierarchy.
   MFTL_BVH *bvhB;  ///< B-side hierarchy.
 
@@ -140,10 +138,46 @@ typedef struct
   IntersectionCallback callback;  ///< Invoked once per surviving pair.
   void *user_data;  ///< Passed to @c callback untouched.
 
+  /** Both trees are over ONE object: a self-proximity query. */
+  bool self;
+  /** The A side's optional cheap pre-test; see MFTL_BVHBuildParams::pair_filter. */
+  bool (*filter)(const MFTL_BVH *, int, const MFTL_BVH *, int, void *);
+
   int prim_a[MFTL_BVH_BATCH_SIZE];  ///< A-side primitive of each pending pair.
   int prim_b[MFTL_BVH_BATCH_SIZE];  ///< B-side primitive of each pending pair.
   int n_batched;  ///< Pairs pending in the batch.
 } narrow_ctx;
+
+/**
+ * @brief The self-proximity rules, applied BEFORE the exact test.
+ *
+ * ADJACENT PAIRS: triangles sharing a vertex touch by construction. Compared by
+ * vertex GLOBAL id, because the B side may be a halo patch, whose vertex slots
+ * mean nothing in the body's pool.
+ *
+ * REPORTED ONCE: a local pair is found twice, as (t1, t2) and (t2, t1), and a
+ * cross-rank one once on each owner. Keeping only `gid(A) < gid(B)` keeps
+ * exactly one in both cases -- the analogue of the smaller-body-id rule, one
+ * level down.
+ *
+ * Both are integer compares on records the narrow phase would have to load
+ * anyway, against an exact test that costs two orders of magnitude more.
+ */
+static bool self_pair_admissible(const MFTL_BVH *bvhA, int pa, const MFTL_BVH *bvhB, int pb)
+{
+  int ta, tb;
+  const MFTL_Object *const oa = MFTL_BVHPrimTriangle(bvhA, pa, &ta);
+  const MFTL_Object *const ob = MFTL_BVHPrimTriangle(bvhB, pb, &tb);
+  if (oa->tris.rec[ta].global_id >= ob->tris.rec[tb].global_id) return MFTL_FALSE;
+
+  for (int i = 0; i < 3; ++i)
+  {
+    const int ga = oa->verts.rec[oa->tris.verts[3 * ta + i]].global_id;
+    for (int j = 0; j < 3; ++j)
+      if (ga == ob->verts.rec[ob->tris.verts[3 * tb + j]].global_id) return MFTL_FALSE;
+  }
+  return MFTL_TRUE;
+}
 
 /**
  * @brief Runs the exact test on every batched pair and reports the hits.
@@ -166,6 +200,9 @@ static void flush_batch(narrow_ctx *ctx)
 
   for (int i = 0; i < ctx->n_batched; ++i)
   {
+    if (ctx->self && !self_pair_admissible(ctx->bvhA, ctx->prim_a[i], ctx->bvhB, ctx->prim_b[i])) continue;
+    if (ctx->filter && !ctx->filter(ctx->bvhA, ctx->prim_a[i], ctx->bvhB, ctx->prim_b[i], ctx->user_data)) continue;
+
     double TA[3][3];
     double TB[3][3];
 
@@ -179,7 +216,7 @@ static void flush_batch(narrow_ctx *ctx)
       TB[c][2] += sz;
     }
 
-    if (MFTL_TriTriProximity(TA, TB, ctx->tolerance)) ctx->callback(ctx->objA, ctx->prim_a[i], ctx->objB, ctx->prim_b[i], ctx->user_data);
+    if (MFTL_TriTriProximity(TA, TB, ctx->tolerance)) ctx->callback(ctx->bvhA, ctx->prim_a[i], ctx->bvhB, ctx->prim_b[i], ctx->user_data);
   }
 
   ctx->n_batched = 0;
@@ -302,13 +339,13 @@ void MFTL_IntersectObjects(const MFTL_Object *objA, MFTL_BVH *bvhA, const MFTL_O
   MFTL_ASSERT(bvhA != bvhB && "MFTL_IntersectObjects: a BVH against itself is not a self-intersection query");
 
   narrow_ctx ctx;
-  ctx.objA = objA;
-  ctx.objB = objB;
   ctx.bvhA = bvhA;
   ctx.bvhB = bvhB;
   ctx.callback = callback;
   ctx.user_data = user_data;
   ctx.n_batched = 0;
+  ctx.self = (objA == objB);
+  ctx.filter = bvhA->params.pair_filter;
 
   /* ── The pair's tolerance ────────────────────────────────────────────────
    *
@@ -381,12 +418,14 @@ int MFTLEnsembleIntersectObjects(MFTL_Ensemble *ens, const MFTL_BVHBuildParams *
 {
   if (ens == MFTL_NULL || callback == MFTL_NULL) return MFTL_ERROR;
 
+  const bool self = (params != MFTL_NULL) && params->self_pairs;
+
   /* THE GLOBAL count, because everything below is collective. One body in the
    * whole ensemble cannot collide with another, and that is a statement every
    * rank makes identically; the LOCAL count is not, and returning early on it
    * would leave the ranks that still held two bodies inside a collective on
-   * their own. */
-  if (ens->n_bodies_global < 2) return MFTL_SUCCESS;
+   * their own. With self-proximity one body is enough to have work. */
+  if (ens->n_bodies_global < (self ? 1 : 2)) return MFTL_SUCCESS;
 
   const int nb = ens->n_local_objects;
 
@@ -428,6 +467,7 @@ int MFTLEnsembleIntersectObjects(MFTL_Ensemble *ens, const MFTL_BVHBuildParams *
    * droplet A needs A's envelope, and the envelope scales with A; published
    * alongside the extent, it costs one double per body per rank and replaces an
    * `O(bodies^2)` array that every rank built and every rank agreed on. */
+  halo->self_pairs = self;
   MFTLExtendSpatialHaloNearBodies(ens, tol, halo);
   free(tol);
 
@@ -489,7 +529,34 @@ int MFTLEnsembleIntersectObjects(MFTL_Ensemble *ens, const MFTL_BVHBuildParams *
     if (ea == MFTL_ERROR || eb == MFTL_ERROR) continue;
     if (by_entry[ea] == MFTL_NULL || by_entry[eb] == MFTL_NULL) continue;
 
-    MFTL_IntersectObjects(obj_by_entry[ea], by_entry[ea], obj_by_entry[eb], by_entry[eb], callback, user_data);
+    if (ea != eb)
+    {
+      MFTL_IntersectObjects(obj_by_entry[ea], by_entry[ea], obj_by_entry[eb], by_entry[eb], callback, user_data);
+      continue;
+    }
+
+    /* ── A body against itself ─────────────────────────────────────────────
+     *
+     * The B side is the body's tree WITH its patch: its own owned triangles
+     * plus the neighbours' share near this one. The A side has to be a second,
+     * patch-free tree over the same owned triangles -- MFTL_IntersectObjects
+     * refuses one tree against itself, and a patch primitive may never be the
+     * reporting side. Built only for the bodies that actually have a self pair. */
+    /* TIGHT boxes on the A side: a zero envelope. The broad phase admits a
+     * pair when the two trees' inflated boxes overlap, i.e. within tol_A +
+     * tol_B, while the narrow phase tests MAX(tol_A, tol_B). Between two bodies
+     * that surplus is the price of each tree carrying its own tolerance; here
+     * both sides are one body and it is pure waste -- measured on a 17k
+     * triangle tube at an envelope of 1.5 edges, 129 candidate pairs per
+     * triangle. A tight A side halves the search radius and leaves the
+     * threshold exactly what it was, because the B side still carries it. */
+    const MFTL_Object *const obj = obj_by_entry[ea];
+    MFTL_BVHBuildParams tight = (params != MFTL_NULL) ? *params : MFTL_BVHDefaultParams();
+    tight.proximity_factor = 0.0;
+    tight.proximity_floor = 0.0;
+    MFTL_BVH *const a_side = MFTL_GenerateLBVH(obj, &tight);
+    MFTL_IntersectObjects(obj, a_side, obj, by_entry[eb], callback, user_data);
+    MFTL_DestroyBVH(a_side);
   }
 
   for (int e = 0; e < ne; ++e)

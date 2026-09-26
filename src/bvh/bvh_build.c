@@ -64,6 +64,12 @@ static inline const MFTL_Object *prim_source(const MFTL_BVH *bvh, int p, int *t_
   return bvh->obj;
 }
 
+const MFTL_Object *MFTL_BVHPrimTriangle(const MFTL_BVH *bvh, int p, int *tri)
+{
+  MFTL_ASSERT(bvh != MFTL_NULL && tri != MFTL_NULL);
+  return prim_source(bvh, p, tri);
+}
+
 void MFTL_BVHPrimVerts(const MFTL_BVH *bvh, int p, double out[3][3])
 {
   int t;

@@ -164,6 +164,30 @@
  *                       and orientation hold at every report
  *     --require-rim-cut --verify, and fail if at np > 1 no rim triangle ever met
  *                       a partition boundary (what the CTest passes)
+ *
+ *     --topology        let the surface change topology: a breaking crest whose
+ *                       lip comes within --delta-coalescence of the face it
+ *                       overturns onto reconnects with it, trapping air, and a
+ *                       sheet thinner than --delta-breakup tears
+ *     --delta-breakup X     (default 1.5 * target)
+ *     --delta-coalescence X (default 1.0 * target)
+ *     --topo-dx X       reconstruction lattice spacing (default target)
+ *     --topo-every N    detect every N steps (default --remesh-every)
+ *     --require-topology --verify, and fail unless the body count or the genus
+ *                       actually changed (the --topology CTest's non-vacuity)
+ *
+ * ── Breaking, with topology changes ────────────────────────────────────────
+ *
+ * Without --topology an overturned triangle FAILS --verify: a single-valued
+ * kinematic field cannot fold the surface through itself, but it can bring the
+ * plunging lip arbitrarily close to the face below it, which no mesh resolves.
+ * With --topology that is exactly what gets detected and reconnected, so an
+ * overturned triangle is a reported quantity rather than a failure, and the
+ * annulus check becomes a per-body one: every OPEN body has V-E+F <= 1 and
+ * every CLOSED one an even V-E+F <= 2. The volume below the surface is
+ * conserved by the reconstruction itself -- it measures the same flux of
+ * (z - z_bottom) e_z this example does -- and what is left is booked per call.
+ * A breaking sea: --components 2 --steepness 0.42 --ripple 0.03.
  */
 
 #include <math.h>
@@ -224,6 +248,13 @@ typedef struct
   char out[128];
   bool verify;
   bool require_rim_cut;
+
+  bool topology;
+  double delta_breakup;
+  double delta_coalescence;
+  double topo_dx;
+  int topo_every;
+  bool require_topology;
 } config;
 
 static int parse_args(int argc, char **argv, int rank, int nproc, config *cfg)
@@ -252,6 +283,12 @@ static int parse_args(int argc, char **argv, int rank, int nproc, config *cfg)
   cfg->report_every = 50;
   cfg->verify = MFTL_FALSE;
   cfg->require_rim_cut = MFTL_FALSE;
+  cfg->topology = MFTL_FALSE;
+  cfg->delta_breakup = 0.0;
+  cfg->delta_coalescence = 0.0;
+  cfg->topo_dx = 0.0;
+  cfg->topo_every = 0;
+  cfg->require_topology = MFTL_FALSE;
   snprintf(cfg->out, sizeof cfg->out, "waves");
 
   int i = 1;
@@ -267,6 +304,18 @@ static int parse_args(int argc, char **argv, int rank, int nproc, config *cfg)
       cfg->oblique = MFTL_TRUE;
     else if (!strcmp(argv[i], "--verify"))
       cfg->verify = MFTL_TRUE;
+    else if (!strcmp(argv[i], "--topology"))
+      cfg->topology = MFTL_TRUE;
+    else if (!strcmp(argv[i], "--require-topology"))
+      cfg->verify = cfg->require_topology = cfg->topology = MFTL_TRUE;
+    else if (!strcmp(argv[i], "--delta-breakup") && i + 1 < argc)
+      cfg->delta_breakup = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--delta-coalescence") && i + 1 < argc)
+      cfg->delta_coalescence = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--topo-dx") && i + 1 < argc)
+      cfg->topo_dx = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--topo-every") && i + 1 < argc)
+      cfg->topo_every = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--require-rim-cut"))
       cfg->verify = cfg->require_rim_cut = MFTL_TRUE;
     else if (!strcmp(argv[i], "--nx") && i + 1 < argc)
@@ -975,14 +1024,60 @@ static double slope_degrees(double min_nz) { return atan2(sqrt(MFTL_MAX(0.0, 1.0
  * surface must stay single-valued, and a remesher that folds a steep crest over
  * shows up here before it shows up anywhere else.
  */
-static bool verdict(const wave_stats *g, double v0, char *why, size_t why_len)
+/**
+ * @brief Per body: V-E+F, and whether it has a rim. What --verify's Euler check
+ *        reads once topology changes can split the surface into several.
+ *
+ * Arrays over the body id space, reduced: a handful of bodies here. A solver
+ * with thousands would use MFTLEnsembleReduceBodies() instead.
+ */
+typedef struct
+{
+  int n_bodies;  ///< bodies that exist anywhere
+  int n_open;  ///< of which with a rim
+  int bad;  ///< bodies whose V-E+F no orientable surface of their kind can have
+  int chi_sum;  ///< V-E+F summed over all bodies
+} body_census;
+
+static void census_bodies(const MFTL_Ensemble *ens, body_census *c)
+{
+  const int n = ens->n_bodies_global;
+  long long *a = (long long *) calloc(4 * (size_t) (n > 0 ? n : 1), sizeof(long long));
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    const MFTL_Object *obj = ens->local_objects[o];
+    long long *r = &a[4 * obj->global_id];
+    r[0] += obj->verts.n_local;
+    r[1] += obj->tris.n_local;
+    for (int h = 0; h < 3 * obj->tris.n_local; ++h)
+      if (MFTLHeIsMeshBoundary(obj, h)) r[2]++;
+    r[3] += obj->tris.n_local > 0 ? 1 : 0;
+  }
+  MPI_Allreduce(MPI_IN_PLACE, a, 4 * n, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+  memset(c, 0, sizeof(*c));
+  for (int b = 0; b < n; ++b)
+  {
+    if (a[4 * b + 3] == 0) continue;
+    const long long chi = a[4 * b] - (3 * a[4 * b + 1] + a[4 * b + 2]) / 2 + a[4 * b + 1];
+    const bool open = a[4 * b + 2] > 0;
+    c->n_bodies++;
+    c->chi_sum += (int) chi;
+    if (open) c->n_open++;
+    /* chi = 2 - 2g - (rim loops): at most 1 with a rim, an even at most 2 without. */
+    if (open ? chi > 1 : (chi > 2 || (chi & 1) != 0)) c->bad++;
+  }
+  free(a);
+}
+
+static bool verdict(const wave_stats *g, double v0, const body_census *bc, char *why, size_t why_len)
 {
   why[0] = '\0';
   if (g->sum[S_HOLES] != 0.0) snprintf(why, why_len, "%.0f twin-less interior half-edges (halo incomplete)", g->sum[S_HOLES]);
-  if (fabs(euler_of(g)) > 0.5) snprintf(why, why_len, "V-E+F = %.0f, the seam came apart (an annulus has 0)", euler_of(g));
+  if (bc == MFTL_NULL && fabs(euler_of(g)) > 0.5) snprintf(why, why_len, "V-E+F = %.0f, the seam came apart (an annulus has 0)", euler_of(g));
+  if (bc != MFTL_NULL && bc->bad > 0) snprintf(why, why_len, "%d body(ies) with a V-E+F no orientable surface of its kind has", bc->bad);
   if (g->sum[S_OFF_WALL] != 0.0) snprintf(why, why_len, "%.0f rim vertices left their channel wall", g->sum[S_OFF_WALL]);
   if (g->sum[S_INVERTED] != 0.0) snprintf(why, why_len, "%.0f inverted triangles", g->sum[S_INVERTED]);
-  if (g->sum[S_OVERTURNED] != 0.0) snprintf(why, why_len, "%.0f overturned triangles -- the wave broke", g->sum[S_OVERTURNED]);
+  if (bc == MFTL_NULL && g->sum[S_OVERTURNED] != 0.0) snprintf(why, why_len, "%.0f overturned triangles -- the wave broke", g->sum[S_OVERTURNED]);
   if (fabs(g->sum[S_VOLUME] / v0 - 1.0) > 0.01) snprintf(why, why_len, "volume below the surface drifted to V/V0 = %.5f", g->sum[S_VOLUME] / v0);
   return why[0] == '\0';
 }
@@ -1143,6 +1238,15 @@ int main(int argc, char **argv)
 
   const bool remeshing = cfg.remesh_every > 0;
 
+  /* Topology: a lip within one edge of the face below it reconnects, a sheet
+   * tears at one and a half, the result is remeshed with the loop's parameters. */
+  MFTL_TopologyOptions topt = MFTLTopologyDefaultOptions();
+  topt.dx = (cfg.topo_dx > 0.0) ? cfg.topo_dx : target;
+  topt.delta_breakup = (cfg.delta_breakup > 0.0) ? cfg.delta_breakup : 1.5 * target;
+  topt.delta_coalescence = (cfg.delta_coalescence > 0.0) ? cfg.delta_coalescence : 1.0 * target;
+  topt.remesh = remeshing ? &params : MFTL_NULL;
+  const int topo_every = (cfg.topo_every > 0) ? cfg.topo_every : (remeshing ? cfg.remesh_every : 2);
+
   wave_stats g0;
   measure(ens, &field, 0.0, &g0);
   const double v0 = g0.sum[S_VOLUME];
@@ -1180,6 +1284,11 @@ int main(int argc, char **argv)
   double min_edge = g0.min[X_MIN_EDGE], max_edge = -g0.min[X_NEG_MAX_EDGE];
   remesh_window win = {0, 0, 0, 0, MFTL_REMESH_PARALLEL_SPANNING, MFTL_FALSE, MFTL_FALSE};
   wave_stats g = g0;
+
+  double v_surgery = 0.0, t_topology = 0.0;
+  int n_changes = 0, n_events_total = 0, max_bodies = 1;
+  bool genus_changed = MFTL_FALSE;
+  body_census bc = {1, 1, 0, 0};
 
   for (int step = 1; step <= cfg.steps; ++step)
   {
@@ -1225,6 +1334,51 @@ int main(int argc, char **argv)
     else if (MFTLRedistribute(ens) != MFTL_SUCCESS)
       MPI_Abort(MPI_COMM_WORLD, 1);
 
+    /* Topology: detect, and only when something was found, reconstruct -- with
+     * the volume below the surface measured around it. */
+    if (cfg.topology && step % topo_every == 0)
+    {
+      const double a = MPI_Wtime();
+      MFTL_TopologyEvent *events = MFTL_NULL;
+      int n_events = 0;
+      if (MFTLTopologyDetectEvents(ens, &topt, &events, &n_events) != MFTL_SUCCESS) MPI_Abort(MPI_COMM_WORLD, 1);
+      if (n_events > 0)
+      {
+        wave_stats before, after;
+        measure(ens, &field, t, &before);
+        int *bodies = (int *) malloc(2 * (size_t) n_events * sizeof(int));
+        for (int e = 0; e < n_events; ++e)
+        {
+          bodies[2 * e] = events[e].body_a;
+          bodies[2 * e + 1] = events[e].body_b;
+        }
+        MFTL_TopologyStats tst;
+        if (MFTLEnsembleReconstructBodies(ens, bodies, 2 * n_events, events, n_events, &topt, &tst) != MFTL_SUCCESS)
+        {
+          if (rank == 0) fprintf(stderr, "topology change failed at step %d\n", step);
+          MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        free(bodies);
+        snap_rim(ens);
+        measure(ens, &field, t, &after);
+        const int chi_before = bc.chi_sum;
+        census_bodies(ens, &bc);
+        if (bc.chi_sum != chi_before) genus_changed = MFTL_TRUE;
+        max_bodies = MFTL_MAX(max_bodies, bc.n_bodies);
+        v_surgery += after.sum[S_VOLUME] - before.sum[S_VOLUME];
+        n_changes++;
+        n_events_total += n_events;
+        if (rank == 0)
+          printf(
+              "  step %5d t %6.2f: TOPOLOGY -- %d breakup / %d coalescence event(s); %d body(ies) in, %d out; now %d bodies (%d open), "
+              "V-E+F %d; volume moved %+.2e\n",
+              step, t, tst.n_breakup, tst.n_coalescence, tst.n_bodies_reconstructed, tst.n_bodies_out, bc.n_bodies, bc.n_open, bc.chi_sum,
+              after.sum[S_VOLUME] - before.sum[S_VOLUME]);
+      }
+      free(events);
+      t_topology += MPI_Wtime() - a;
+    }
+
     if (cfg.report_every > 0 && (step % cfg.report_every == 0 || step == cfg.steps))
     {
       measure(ens, &field, t, &g);
@@ -1240,7 +1394,7 @@ int main(int argc, char **argv)
       rim_cut_max = MFTL_MAX(rim_cut_max, g.sum[S_RIM_CUT]);
 
       char why[160];
-      if (!verdict(&g, v0, why, sizeof why))
+      if (!verdict(&g, v0 + v_surgery, cfg.topology ? &bc : MFTL_NULL, why, sizeof why))
       {
         broken++;
         if (rank == 0) fprintf(stderr, "  step %d: %s\n", step, why);
@@ -1280,12 +1434,25 @@ int main(int argc, char **argv)
     broken++;
     if (rank == 0) fprintf(stderr, "  VACUOUS: the rim never met a partition boundary -- choose a grid whose cut planes cross it\n");
   }
+  if (cfg.require_topology && max_bodies == 1 && !genus_changed)
+  {
+    broken++;
+    if (rank == 0) fprintf(stderr, "  VACUOUS: neither the body count nor the genus ever changed -- make the sea break harder or run longer\n");
+  }
 
-  double t_max = 0.0;
+  double t_max = 0.0, t_topo_max = 0.0;
   MPI_Allreduce(&t_remesh, &t_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+  MPI_Allreduce(&t_topology, &t_topo_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+  if (cfg.topology) census_bodies(ens, &bc);
 
   if (rank == 0)
   {
+    if (cfg.topology)
+    {
+      printf("\n  TOPOLOGY: %d reconstruction(s) from %d event(s); up to %d bodies; now %d (%d open), V-E+F summed %d%s\n", n_changes, n_events_total,
+             max_bodies, bc.n_bodies, bc.n_open, bc.chi_sum, genus_changed ? ", genus changed" : "");
+      printf("            volume moved by reconstructions %+.3e (V0 %.6f), %.3f s in topology calls (max over ranks)\n", v_surgery, v0, t_topo_max);
+    }
     const double flat_area = ens->domain.domain_size[0] * ens->domain.domain_size[1];
 
     printf("\n  crest travel     %.2f box lengths in %.1f time units, %d seam re-entries observed\n", field.c * t / ens->domain.domain_size[0], t, wraps);
@@ -1297,7 +1464,10 @@ int main(int argc, char **argv)
            -g0.min[X_NEG_MAX_EDGE]);
     printf("  worst quality    %.4f at the start, %.4f at the worst report, %.4f now\n", g0.min[X_MIN_Q], worst_q, g.min[X_MIN_Q]);
     printf("  volume below     V/V0 = %.6f\n", g.sum[S_VOLUME] / v0);
-    printf("  Euler V-E+F      %.0f   (0 for an annulus: the seam held)\n", euler_of(&g));
+    if (cfg.topology)
+      printf("  Euler V-E+F      %.0f summed over %d bodies, %s\n", euler_of(&g), bc.n_bodies, bc.bad ? "SOME INCONSISTENT" : "each consistent with its kind");
+    else
+      printf("  Euler V-E+F      %.0f   (0 for an annulus: the seam held)\n", euler_of(&g));
     printf("  orientation      %.0f inverted triangles, %.0f creases sharper than 120 deg\n", g.sum[S_INVERTED], g.sum[S_CREASES]);
     if (remeshing)
     {

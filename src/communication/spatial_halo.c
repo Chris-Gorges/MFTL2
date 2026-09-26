@@ -1260,6 +1260,21 @@ static void build_near_pairs(MFTL_Ensemble *ens, MFTL_SpatialHalo *halo, const d
     }
   }
 
+  /* ── Every body against ITSELF, when asked ───────────────────────────────
+   *
+   * A record exists only for a body this rank owns something of, which is
+   * exactly the condition for having A-side triangles to report from. Whether
+   * any B side arrived does not matter: the local share alone can be within
+   * the envelope of itself -- a neck entirely inside one rank. */
+  if (halo->self_pairs)
+  {
+    for (int i = 0; i < n_my; ++i)
+    {
+      const int gi = (int) my_rec[(size_t) i * MFTL_HALO_REC];
+      halo_pair_add(halo, gi, gi);
+    }
+  }
+
   ib_free(&cand);
   grid_free(&grid);
   halo_pairs_finish(halo);
@@ -1566,7 +1581,10 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
           const int r = cand.data[ci];
           const double *const rc = &nb_rec[(size_t) r * MFTL_HALO_REC];
           const int ga = (int) rc[0];
-          if (ga >= gb) continue;  // only the larger id travels
+          /* Only the larger id travels -- or the SAME id, when self-proximity
+           * was asked for: then a neighbour's share of body B is near this
+           * rank's share of body B, and the pair (B, B) needs it here. */
+          if (ga > gb || (ga == gb && !halo->self_pairs)) continue;
           if (domain->neighbors[rec_src[r]] == domain->rank) continue;  // a thin periodic grid can name this rank
 
           const double m = MFTL_MAX(my_tol, rc[8]);

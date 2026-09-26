@@ -313,8 +313,12 @@ typedef enum
 /**
  * @struct MFTL_RemeshParameters
  * @brief Everything MFTLRemeshObject() needs. Fill it with MFTLInitRemeshParams.
+ *
+ * The struct carries its tag so a header that only passes a pointer to it --
+ * mftl_topology_change.h -- can forward-declare it instead of including this
+ * one, which would break the one-layer-per-header rule.
  */
-typedef struct
+typedef struct MFTL_RemeshParameters
 {
   MFTL_RemeshType type;  ///< How min/max are derived from `target_length`.
   MFTL_SmoothMode smooth_mode;  ///< Which neighbourhood the smoother's target point is built from.

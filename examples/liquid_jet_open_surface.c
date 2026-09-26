@@ -20,10 +20,30 @@
  * downstream, by the Rayleigh-Plateau instability's growth rate. The necks thin,
  * the swells grow, and eventually a neck is thinner than the mesh can resolve.
  * That is where a real jet breaks up into drops, and it is a TOPOLOGY CHANGE --
- * cutting the ligament and closing both ends -- which this library does not do
- * yet. So the run stops there and reports where and when the jet broke, against
- * Rayleigh's linear estimate of the breakup length. It is the example the
- * topology-change work will be driven by.
+ * cutting the ligament and closing both ends.
+ *
+ * Without --topology the run stops there and reports where and when the jet
+ * broke, against Rayleigh's linear estimate of the breakup length. With it,
+ * MFTLEnsembleApplyTopologyChanges() detects the neck as a pair of opposing
+ * triangles closer than --delta-breakup, reconstructs the jet from its signed
+ * distance field with the neck opened, and the drop that comes off becomes a
+ * body of its own -- a closed sphere-like surface travelling downstream while
+ * the jet, still a disk attached to the lip, keeps growing and pinching.
+ *
+ * ── What a topology change does to the checks ──────────────────────────────
+ *
+ * Three statements change meaning once bodies can split, and --verify follows:
+ *
+ *   EULER   the jet stays a disk (V-E+F = 1) and every drop is a sphere (2), so
+ *           the SUM over all bodies is 1 + 2 * (bodies - 1).
+ *   VOLUME  a reconstruction moves the surface by the marching-cubes error and
+ *           by the bias that opens the neck. That volume is measured across
+ *           every call and booked separately, so the balance still checks the
+ *           advection and the remesher -- V = V0 + A_lip U t + (surgery).
+ *   THE LIP a reconstruction rebuilds the lip from the level set's crossing of
+ *           the nozzle wall, at lattice resolution; the projection onto the
+ *           nozzle circle that follows every remesh follows every
+ *           reconstruction too.
  *
  * ── What this is NOT ───────────────────────────────────────────────────────
  *
@@ -164,6 +184,17 @@
  *     --vtk N           write a .pvtu every N steps      (default 20, 0 off)
  *     --report N        print a line every N steps       (default 20)
  *     --out PREFIX      output file prefix               (default "jet")
+ *     --topology        cut the ligament when the neck is thinner than
+ *                       --delta-breakup and let the drops go on as bodies,
+ *                       instead of stopping at the first pinch-off
+ *     --delta-breakup X neck DIAMETER that breaks, in R0 (default 1.5 * target:
+ *                       fewer than five edges around -- see below)
+ *     --delta-coalescence X  film between two surfaces that ruptures, in R0
+ *                       (default 0.5 * target)
+ *     --topo-dx X       reconstruction lattice spacing, in R0 (default target)
+ *     --require-breakup --verify, and fail unless at least one drop separated
+ *                       (the non-vacuity measure of the --topology CTest)
+ *
  *     --verify          exit non-zero unless halo, lip, Euler characteristic,
  *                       orientation and volume balance hold at every report
  *     --require-rim-cut --verify, and fail if at np > 1 no lip triangle ever met
@@ -219,6 +250,12 @@ typedef struct
   char out[128];
   bool verify;
   bool require_rim_cut;
+
+  bool topology;
+  double delta_breakup;  ///< 0 = derive from the target edge length
+  double delta_coalescence;  ///< 0 = derive from the target edge length
+  double topo_dx;  ///< 0 = the target edge length
+  bool require_breakup;
 } config;
 
 static int parse_args(int argc, char **argv, int rank, int nproc, config *cfg)
@@ -246,6 +283,11 @@ static int parse_args(int argc, char **argv, int rank, int nproc, config *cfg)
   cfg->report_every = 20;
   cfg->verify = MFTL_FALSE;
   cfg->require_rim_cut = MFTL_FALSE;
+  cfg->topology = MFTL_FALSE;
+  cfg->delta_breakup = 0.0;
+  cfg->delta_coalescence = 0.0;
+  cfg->topo_dx = 0.0;
+  cfg->require_breakup = MFTL_FALSE;
   snprintf(cfg->out, sizeof cfg->out, "jet");
 
   int i = 1;
@@ -261,6 +303,16 @@ static int parse_args(int argc, char **argv, int rank, int nproc, config *cfg)
       cfg->verify = MFTL_TRUE;
     else if (!strcmp(argv[i], "--require-rim-cut"))
       cfg->verify = cfg->require_rim_cut = MFTL_TRUE;
+    else if (!strcmp(argv[i], "--topology"))
+      cfg->topology = MFTL_TRUE;
+    else if (!strcmp(argv[i], "--require-breakup"))
+      cfg->verify = cfg->require_breakup = cfg->topology = MFTL_TRUE;
+    else if (!strcmp(argv[i], "--delta-breakup") && i + 1 < argc)
+      cfg->delta_breakup = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--delta-coalescence") && i + 1 < argc)
+      cfg->delta_coalescence = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--topo-dx") && i + 1 < argc)
+      cfg->topo_dx = atof(argv[++i]);
     else if (!strcmp(argv[i], "--length") && i + 1 < argc)
       cfg->length = atof(argv[++i]);
     else if (!strcmp(argv[i], "--width") && i + 1 < argc)
@@ -693,6 +745,15 @@ static void clamp_to_domain(const MFTL_Domain *dom, double pos[3])
  * Pinning the lip is the whole inflow mechanism: every other vertex leaves at U,
  * so the band of triangles attached to the lip stretches at rate U and the
  * remesher refills it.
+ *
+ * A DROP -- any body but the jet -- translates rigidly at U. The Rayleigh-Plateau
+ * field is the jet's sausage mode and says nothing about a detached drop; kept
+ * under it, a drop sitting on a swell phase is pushed radially outwards forever
+ * and flattens into a sheet that the next topology call shreds, which is the
+ * caricature's physics and not the drop's. Measured before this rule: 45
+ * reconstructions and a drop count that rose and fell by the step. A real drop
+ * relaxes towards a sphere under surface tension; a rigid translation is the
+ * kinematic stand-in for that.
  */
 static void advect(MFTL_Ensemble *ens, const jet_field *f, double t, double dt)
 {
@@ -701,6 +762,15 @@ static void advect(MFTL_Ensemble *ens, const jet_field *f, double t, double dt)
   for (int o = 0; o < ens->n_local_objects; ++o)
   {
     MFTL_Object *obj = ens->local_objects[o];
+
+    if (obj->global_id != 0)
+    {
+      MFTL_FOREACH_OWNED_VERTEX(obj, {
+        pos[0] += U0 * dt;
+        clamp_to_domain(dom, pos);
+      });
+      continue;
+    }
 
     MFTL_FOREACH_OWNED_VERTEX(obj, {
       if (rec->flags & MFTL_FLAG_BOUNDARY) continue;
@@ -804,6 +874,10 @@ typedef struct
  * a plain minimum would always be the last one. A neck between two swells, or
  * behind a bulbous head, passes; the taper towards the pole does not.
  *
+ * Only the JET is profiled -- body 0, the one attached to the lip. Once drops
+ * have come off, a drop is a swell with nothing downstream of it on the jet, and
+ * the gap between them would read as a neck of radius zero.
+ *
  * @return The neck radius, R0 if there is no neck (an unperturbed jet).
  */
 static double find_neck(MFTL_Ensemble *ens, double slab, int n_slabs, double *profile, double *scratch, double *neck_x)
@@ -815,6 +889,7 @@ static double find_neck(MFTL_Ensemble *ens, double slab, int n_slabs, double *pr
   for (int o = 0; o < ens->n_local_objects; ++o)
   {
     const MFTL_Object *obj = ens->local_objects[o];
+    if (obj->global_id != 0) continue;
     MFTL_FOREACH_VERTEX_POS(obj, obj->verts.n_local, {
       int s = (int) ((px - x0) / slab);
       s = MFTL_MIN(MFTL_MAX(s, 0), n_slabs - 1);
@@ -987,8 +1062,28 @@ static void measure(MFTL_Ensemble *ens, jet_stats *g)
   g->sum[S_LIP_AREA] = fabs(g->sum[S_LIP_AREA]);
 }
 
-/** @brief V - E + F from owned counts, with E = (3F + B)/2: 1 for the jet (a disk). */
+/** @brief V - E + F from owned counts, with E = (3F + B)/2: 1 for the jet (a disk), 2 more per drop. */
 static double euler_of(const jet_stats *g) { return g->sum[S_VERTS] - 0.5 * (3.0 * g->sum[S_TRIS] + g->sum[S_RIM]) + g->sum[S_TRIS]; }
+
+/**
+ * @brief Bodies that exist anywhere: the jet plus every drop that came off it.
+ *
+ * A flag per body id, reduced. The id space is the handful of drops this run
+ * makes, so the array is small; a solver with thousands of bodies would count
+ * them with a per-body reduction instead.
+ */
+static int count_bodies(const MFTL_Ensemble *ens)
+{
+  const int n = ens->n_bodies_global;
+  int *flags = (int *) calloc((size_t) (n > 0 ? n : 1), sizeof(int));
+  for (int o = 0; o < ens->n_local_objects; ++o)
+    if (ens->local_objects[o]->tris.n_local > 0) flags[ens->local_objects[o]->global_id] = 1;
+  MPI_Allreduce(MPI_IN_PLACE, flags, n, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+  int live = 0;
+  for (int b = 0; b < n; ++b) live += flags[b];
+  free(flags);
+  return live;
+}
 
 /**
  * @brief The verdict --verify acts on, identical on every rank.
@@ -1002,11 +1097,12 @@ static double euler_of(const jet_stats *g) { return g->sum[S_VERTS] - 0.5 * (3.0
  * stretched band every pass; with remeshing OFF the band's long straight
  * triangles cut through the necks and swells and the balance misses by 40 %.
  */
-static bool verdict(const jet_stats *g, double v_expected, char *why, size_t why_len)
+static bool verdict(const jet_stats *g, double v_expected, int n_bodies, char *why, size_t why_len)
 {
   why[0] = '\0';
+  const double chi = 1.0 + 2.0 * (n_bodies - 1);
   if (g->sum[S_HOLES] != 0.0) snprintf(why, why_len, "%.0f twin-less interior half-edges (halo incomplete)", g->sum[S_HOLES]);
-  if (fabs(euler_of(g) - 1.0) > 0.5) snprintf(why, why_len, "V-E+F = %.0f, the jet is no longer a disk", euler_of(g));
+  if (fabs(euler_of(g) - chi) > 0.5) snprintf(why, why_len, "V-E+F = %.0f, not a disk plus %d sphere(s)", euler_of(g), n_bodies - 1);
   if (g->sum[S_OFF_LIP] != 0.0) snprintf(why, why_len, "%.0f lip vertices left the nozzle circle", g->sum[S_OFF_LIP]);
   if (g->sum[S_INVERTED] != 0.0) snprintf(why, why_len, "%.0f inverted triangles", g->sum[S_INVERTED]);
   if (fabs(g->sum[S_VOLUME] / v_expected - 1.0) > 0.05)
@@ -1120,6 +1216,19 @@ int main(int argc, char **argv)
 
   const bool remeshing = cfg.remesh_every > 0;
 
+  /* Topology changes: the lattice at the target edge length, and a neck that
+   * breaks when it is 1.5 edges across -- fewer than five edges around, which
+   * is where the mesh stops resolving it. Not 2: the swells of this field grow
+   * lobes whose rims are just under two edges thick, and at 2 every call
+   * trimmed one of them -- measured, nine reconstructions of the whole jet in
+   * fifty steps that changed nothing but the lobe. The result is remeshed at
+   * once with the same parameters the loop uses. */
+  MFTL_TopologyOptions topt = MFTLTopologyDefaultOptions();
+  topt.dx = (cfg.topo_dx > 0.0) ? cfg.topo_dx : target;
+  topt.delta_breakup = (cfg.delta_breakup > 0.0) ? cfg.delta_breakup : 1.5 * target;
+  topt.delta_coalescence = (cfg.delta_coalescence > 0.0) ? cfg.delta_coalescence : 0.5 * target;
+  topt.remesh = remeshing ? &params : MFTL_NULL;
+
   /* The neck profile's slabs: one target edge wide, so every slab of the tube
    * holds vertices of at least one ring. */
   const double slab = target;
@@ -1181,6 +1290,11 @@ int main(int argc, char **argv)
   remesh_window win = {0, 0, 0, 0, MFTL_REMESH_PARALLEL_SPANNING, MFTL_FALSE, MFTL_FALSE};
   jet_stats g = g0;
 
+  /* Topology bookkeeping: what the reconstructions did, and the volume they
+   * moved, which the balance books separately from what came through the lip. */
+  double v_surgery = 0.0, t_topology = 0.0, t_detect = 0.0;
+  int n_changes = 0, n_created = 0, n_discarded = 0, n_bodies = 1;
+
   /* Without --steps the run ends at pinch-off or at the outlet; the cap only
    * stops an unperturbed jet in a domain long enough never to fill. */
   const int max_steps = (cfg.steps > 0) ? cfg.steps : (int) ceil(4.0 * cfg.length / (U0 * cfg.dt));
@@ -1227,6 +1341,56 @@ int main(int argc, char **argv)
     else if (MFTLRedistribute(ens) != MFTL_SUCCESS)
       MPI_Abort(MPI_COMM_WORLD, 1);
 
+    /* ── Topology: cut a neck that has become thinner than the mesh ─────────
+     *
+     * Detection and reconstruction are called separately, rather than through
+     * MFTLEnsembleApplyTopologyChanges, for one reason: the volume a
+     * reconstruction moves is measured around it, and a measurement costs a
+     * reduction the far more common "nothing detected" call should not pay. */
+    if (cfg.topology && (!remeshing || step % cfg.remesh_every == 0))
+    {
+      const double a = MPI_Wtime();
+      MFTL_TopologyEvent *events = MFTL_NULL;
+      int n_events = 0;
+      if (MFTLTopologyDetectEvents(ens, &topt, &events, &n_events) != MFTL_SUCCESS) MPI_Abort(MPI_COMM_WORLD, 1);
+      t_detect += MPI_Wtime() - a;
+      if (n_events > 0)
+      {
+        jet_stats before, after;
+        measure(ens, &before);
+
+        int *bodies = (int *) malloc(2 * (size_t) n_events * sizeof(int));
+        for (int e = 0; e < n_events; ++e)
+        {
+          bodies[2 * e] = events[e].body_a;
+          bodies[2 * e + 1] = events[e].body_b;
+        }
+        MFTL_TopologyStats tst;
+        if (MFTLEnsembleReconstructBodies(ens, bodies, 2 * n_events, events, n_events, &topt, &tst) != MFTL_SUCCESS)
+        {
+          if (rank == 0) fprintf(stderr, "topology change failed at step %d\n", step);
+          MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        free(bodies);
+        project_lip(ens);
+
+        measure(ens, &after);
+        v_surgery += after.sum[S_VOLUME] - before.sum[S_VOLUME];
+        n_changes++;
+        n_created += tst.n_bodies_created;
+        n_discarded += tst.n_bodies_discarded;
+        n_bodies = count_bodies(ens);
+        if (rank == 0)
+          printf(
+              "  step %5d t %6.2f: TOPOLOGY -- %d breakup / %d coalescence event(s); %d body(ies) in, %d out (%d new, %d discarded); "
+              "volume moved %+.5f\n",
+              step, t, tst.n_breakup, tst.n_coalescence, tst.n_bodies_reconstructed, tst.n_bodies_out, tst.n_bodies_created, tst.n_bodies_discarded,
+              after.sum[S_VOLUME] - before.sum[S_VOLUME]);
+      }
+      free(events);
+      t_topology += MPI_Wtime() - a;
+    }
+
     /* The head and the neck are checked EVERY step -- one small reduction each
      * -- because stopping one report late at a pinch means stopping with a neck
      * of a fraction of an edge, i.e. with a degenerate mesh. */
@@ -1241,17 +1405,19 @@ int main(int argc, char **argv)
     double neck_x = 0.0;
     const double neck = find_neck(ens, slab, n_slabs, profile, scratch, &neck_x);
 
+    /* With topology changes on, a thin neck is what the next call cuts, so it
+     * no longer ends the run: the drops travel on until one reaches the outlet. */
     pinched = (cfg.eps > 0.0) && neck < pinch_radius;
     reached_outlet = tip > global_max[0] - 2.0 * R0;
 
-    const bool last = pinched || reached_outlet || step == max_steps;
+    const bool last = (pinched && !cfg.topology) || reached_outlet || step == max_steps;
     if ((cfg.report_every > 0 && step % cfg.report_every == 0) || last)
     {
       measure(ens, &g);
       g.neck_radius = neck;
       g.neck_x = neck_x;
 
-      const double v_expected = v0 + lip_area0 * U0 * t;
+      const double v_expected = v0 + lip_area0 * U0 * t + v_surgery;
       if (rank == 0) print_stats(step, t, &g, v_expected, &win, remeshing);
       memset(&win, 0, sizeof win);
       worst_q = MFTL_MIN(worst_q, g.min[X_MIN_Q]);
@@ -1259,7 +1425,7 @@ int main(int argc, char **argv)
       rim_cut_max = MFTL_MAX(rim_cut_max, g.sum[S_RIM_CUT]);
 
       char why[160];
-      if (!verdict(&g, v_expected, why, sizeof why))
+      if (!verdict(&g, v_expected, n_bodies, why, sizeof why))
       {
         broken++;
         if (rank == 0) fprintf(stderr, "  step %d: %s\n", step, why);
@@ -1288,15 +1454,33 @@ int main(int argc, char **argv)
     if (rank == 0) fprintf(stderr, "  VACUOUS: the rim never met a partition boundary -- choose a grid whose cut planes cross it\n");
   }
 
-  double t_max = 0.0;
+  /* And for the --topology CTest: a run in which no drop ever came off tested
+   * the detection's "nothing here" path and nothing else. */
+  if (cfg.require_breakup && n_created == 0)
+  {
+    broken++;
+    if (rank == 0) fprintf(stderr, "  VACUOUS: no drop separated -- run longer, or raise --eps\n");
+  }
+
+  double t_max = 0.0, t_topo_max = 0.0, t_detect_max = 0.0;
   MPI_Allreduce(&t_remesh, &t_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+  MPI_Allreduce(&t_topology, &t_topo_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+  MPI_Allreduce(&t_detect, &t_detect_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
 
   if (rank == 0)
   {
-    const double v_expected = v0 + lip_area0 * U0 * t;
+    const double v_expected = v0 + lip_area0 * U0 * t + v_surgery;
 
     printf("\n");
-    if (pinched)
+    if (cfg.topology)
+    {
+      printf("  TOPOLOGY: %d reconstruction(s) over the run, %d drop(s) made, %d discarded below the size floor;\n", n_changes, n_created, n_discarded);
+      printf("            %d body(ies) at the end -- the jet and %d drop(s); %.3f s in topology calls, of which %.3f s detection (max over ranks)\n", n_bodies,
+             n_bodies - 1, t_topo_max, t_detect_max);
+      printf("            volume moved by reconstructions %+.5f (%.3f %% of the final volume), booked in the balance below\n", v_surgery,
+             100.0 * v_surgery / g.sum[S_VOLUME]);
+    }
+    if (pinched && !cfg.topology)
     {
       printf("  PINCH-OFF at t = %.2f R0/U: a neck at x = %.2f R0 is %.3f R0 thin (%.1f edges around).\n", t, g.neck_x, g.neck_radius,
              MFTL_TWO_PI * g.neck_radius / target);
@@ -1305,6 +1489,8 @@ int main(int argc, char **argv)
       printf("  breakup length   %.2f R0 measured, %.2f R0 Rayleigh's linear estimate (see the file header\n", g.neck_x - global_min[0], breakup_length);
       printf("                   for why the kinematic neck pinches downstream of it)\n");
     }
+    else if (reached_outlet && cfg.topology)
+      printf("  The leading drop reached the outlet at t = %.2f.\n", t);
     else if (reached_outlet)
       printf("  The head reached the outlet at t = %.2f without a pinch-off%s.\n", t,
              (cfg.eps > 0.0) ? " -- lengthen the domain or raise --eps" : ", as an unperturbed jet does");
@@ -1314,10 +1500,10 @@ int main(int argc, char **argv)
     printf("  jet              head at x = %.2f, widest swell %.3f R0, surface area %.3f\n", -g.min[X_NEG_TIP], -g.min[X_NEG_SWELL], g.sum[S_AREA]);
     printf("  triangles        %.0f -> %.0f   (lip %.0f -> %.0f half-edges, polygon area %.5f -> %.5f)\n", g0.sum[S_TRIS], g.sum[S_TRIS], g0.sum[S_RIM],
            g.sum[S_RIM], lip_area0, g.sum[S_LIP_AREA]);
-    printf("  volume           %.5f, against %.5f = V0 + A_lip U t that came through the nozzle (%.4f)\n", g.sum[S_VOLUME], v_expected,
-           g.sum[S_VOLUME] / v_expected);
+    printf("  volume           %.5f, against %.5f = V0 + A_lip U t that came through the nozzle%s (%.4f)\n", g.sum[S_VOLUME], v_expected,
+           cfg.topology ? " + surgery" : "", g.sum[S_VOLUME] / v_expected);
     printf("  worst quality    %.4f at the start, %.4f at the worst report, %.4f at the end\n", g0.min[X_MIN_Q], worst_q, g.min[X_MIN_Q]);
-    printf("  Euler V-E+F      %.0f   (1: still one disk)\n", euler_of(&g));
+    printf("  Euler V-E+F      %.0f   (%.0f: the jet a disk, every drop a sphere)\n", euler_of(&g), 1.0 + 2.0 * (n_bodies - 1));
     printf("  orientation      %.0f inverted triangles, %.0f creases sharper than 120 deg\n", g.sum[S_INVERTED], g.sum[S_CREASES]);
     if (remeshing)
     {

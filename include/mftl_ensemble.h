@@ -40,6 +40,7 @@
 #ifndef MFTL_ENSEMBLE_H
 #define MFTL_ENSEMBLE_H
 
+#include "mftl_geometry.h"
 #include "mftl_types.h"
 
 /**
@@ -122,10 +123,12 @@ void MFTLEnsembleDestroy(MFTL_Ensemble **p_ens);
 static inline int MFTLEnsembleLocalBodyCount(const MFTL_Ensemble *ens) { return (ens != MFTL_NULL) ? ens->n_local_objects : 0; }
 
 /**
- * @brief Bodies in the whole ensemble, i.e. the size of the body-id space.
+ * @brief The size of the body-id space: every id ever handed out.
  *
- * The number every rank agrees about, and the one a collective may be sized or
- * guarded by. MFTLEnsembleLocalBodyCount() is not: returning early on it is a
+ * Equal to the number of bodies until a topology change retires one -- ids are
+ * never reused, so after MFTLEnsembleReconstructBodies() some ids below it name
+ * no body anywhere. The number every rank agrees about, and the one a collective
+ * may be sized or guarded by. MFTLEnsembleLocalBodyCount() is not: returning early on it is a
  * rank-local decision about a collective call, which is a deadlock.
  *
  * @param ens The ensemble.
@@ -604,9 +607,14 @@ void MFTLEnsembleUpdate(MFTL_Ensemble *ensemble);
  *         this rank's outcome).
  *
  * @param ensemble The ensemble.
+ * @param weighting #MFTL_NORMAL_WEIGHT_AREA (the volume gradient, what advection
+ *                  and smoothing want) or #MFTL_NORMAL_WEIGHT_ANGLE (the
+ *                  pseudo-normal a signed distance needs). Must be the same on
+ *                  every rank only in the sense that the result is then the same
+ *                  normal field everywhere; the exchange itself does not read it.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR if the ghost exchange failed.
  */
-int MFTLEnsembleUpdateVertexNormals(MFTL_Ensemble *ensemble);
+int MFTLEnsembleUpdateVertexNormals(MFTL_Ensemble *ensemble, MFTL_NormalWeighting weighting);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Decomposition metrics

@@ -1060,7 +1060,7 @@ static void run_step(MFTL_Ensemble *ens, const config *cfg, const double *vel, r
      * leaves every ghost vertex holding a partial sum -- correctly normalised
      * and quietly wrong. */
     t0 = phase_begin(cfg->sync_phases, &wt[PH_NORM]);
-    MFTLEnsembleUpdateVertexNormals(ens);
+    MFTLEnsembleUpdateVertexNormals(ens, MFTL_NORMAL_WEIGHT_AREA);
     ph[PH_NORM] += MPI_Wtime() - t0;
   }
 

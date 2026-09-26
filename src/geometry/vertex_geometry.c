@@ -4,7 +4,7 @@
  * @date 2026-08-14
  * @ingroup mftl_geometry
  *
- * @brief Per-vertex geometry: the area-weighted vertex normal pass.
+ * @brief Per-vertex geometry: the area- and angle-weighted vertex normal passes.
  *
  * ## SCATTER OVER TRIANGLES, NOT GATHER OVER VERTICES
  *
@@ -66,6 +66,7 @@
 
 #include "mftl_geometry.h"
 
+#include <math.h>
 #include <string.h>
 
 #include "mftl_constants.h"
@@ -121,6 +122,50 @@ static void scatter_face_normals(MFTL_Object *obj)
 }
 
 /**
+ * @brief The angle-weighted scatter: each face's UNIT normal times its interior
+ *        angle at each corner.
+ *
+ * The three corner angles come from one cross product and three dot products:
+ * every corner sees the same |e1 x e2| (twice the area), so
+ *
+ *     alpha_0 = atan2(|e1 x e2|,  e1.e2)
+ *     alpha_1 = atan2(|e1 x e2|,  e1.e1 - e1.e2)
+ *     alpha_2 = atan2(|e1 x e2|,  e2.e2 - e1.e2)
+ *
+ * `atan2` rather than `acos` of a normalised dot product, for the reason
+ * CLAUDE.md gives about comparing unit vectors: `acos` has an infinite
+ * derivative at +-1, so a nearly flat corner would carry an angle error of
+ * ~1e-8 rad whatever the inputs; `atan2` is well conditioned everywhere.
+ *
+ * A face with zero area has no unit normal. It is skipped rather than given the
+ * zero vector's angle sum, which is the same answer and avoids three `atan2`.
+ *
+ * @param obj The mesh. `verts.normal` is accumulated into after being zeroed.
+ */
+static void scatter_angle_weighted_normals(MFTL_Object *obj)
+{
+  const int n_tris = obj->tris.n;
+  const int n_verts = obj->verts.n;
+
+  double *restrict vn = obj->verts.normal;
+  memset(vn, 0, 3 * (size_t) n_verts * sizeof(double));
+
+  MFTL_FOREACH_TRIANGLE_GEOMETRY(obj, n_tris, const double nx = e1y * e2z - e1z * e2y; const double ny = e1z * e2x - e1x * e2z;
+                                 const double nz = e1x * e2y - e1y * e2x; const double mag = MFTL_SQRT(nx * nx + ny * ny + nz * nz); if (!(mag > 0.0)) continue;
+                                 const double inv = 1.0 / mag; const double ux = nx * inv, uy = ny * inv, uz = nz * inv;
+
+                                 const double d12 = e1x * e2x + e1y * e2y + e1z * e2z; const double d11 = e1x * e1x + e1y * e1y + e1z * e1z;
+                                 const double d22 = e2x * e2x + e2y * e2y + e2z * e2z; const double a0 = atan2(mag, d12);
+                                 const double a1 = atan2(mag, d11 - d12); const double a2 = atan2(mag, d22 - d12);
+
+                                 vn[3 * v0 + 0] += a0 * ux; vn[3 * v0 + 1] += a0 * uy; vn[3 * v0 + 2] += a0 * uz;
+
+                                 vn[3 * v1 + 0] += a1 * ux; vn[3 * v1 + 1] += a1 * uy; vn[3 * v1 + 2] += a1 * uz;
+
+                                 vn[3 * v2 + 0] += a2 * ux; vn[3 * v2 + 1] += a2 * uy; vn[3 * v2 + 2] += a2 * uz;);
+}
+
+/**
  * @brief Scales every accumulated vector to unit length, in place.
  *
  * A pure streaming pass: 24 bytes in, 24 bytes out, one sqrt per vertex, no
@@ -131,6 +176,13 @@ static void scatter_face_normals(MFTL_Object *obj)
  * zero. That is a detectable sentinel: a unit normal never has zero length, so a
  * consumer can tell "not computed" from "computed", which a normalised arbitrary
  * direction would not allow.
+ *
+ * The test is against ZERO, not against a small constant. It used to be
+ * `len_sq > MFTL_VERYSMALL`, the clamp CLAUDE.md records as removed from every
+ * other normalisation on 2026-08-15 and missed here: with area weighting the
+ * accumulated vector has the magnitude of an AREA, so every vertex of a mesh
+ * whose triangles are smaller than about 1e-6 on a side silently came out with
+ * a zero normal -- the "not computed" sentinel -- on a perfectly valid mesh.
  *
  * @param obj The mesh. Each `verts.normal` entry is scaled to unit length in place.
  */
@@ -146,7 +198,7 @@ static void normalise_vertex_normals(MFTL_Object *obj)
     const double z = vn[3 * v + 2];
 
     const double len_sq = x * x + y * y + z * z;
-    const double inv = (len_sq > MFTL_VERYSMALL) ? 1.0 / MFTL_SQRT(len_sq) : 0.0;
+    const double inv = (len_sq > 0.0) ? 1.0 / MFTL_SQRT(len_sq) : 0.0;
 
     vn[3 * v + 0] = x * inv;
     vn[3 * v + 1] = y * inv;
@@ -154,7 +206,7 @@ static void normalise_vertex_normals(MFTL_Object *obj)
   }
 }
 
-void MFTLComputeVertexNormals(MFTL_Object *obj)
+void MFTLComputeVertexNormals(MFTL_Object *obj, MFTL_NormalWeighting weighting)
 {
   MFTL_ASSERT(obj != MFTL_NULL);
 
@@ -162,6 +214,9 @@ void MFTLComputeVertexNormals(MFTL_Object *obj)
 
   if (obj->verts.n == 0) return;
 
-  scatter_face_normals(obj);
+  if (weighting == MFTL_NORMAL_WEIGHT_ANGLE)
+    scatter_angle_weighted_normals(obj);
+  else
+    scatter_face_normals(obj);
   normalise_vertex_normals(obj);
 }

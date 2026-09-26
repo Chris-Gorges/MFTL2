@@ -42,5 +42,6 @@
 #include "mftl_meshgen.h"
 #include "mftl_object.h"
 #include "mftl_remeshing.h"
+#include "mftl_topology_change.h"
 
 #endif  // MFTL_CORE_H

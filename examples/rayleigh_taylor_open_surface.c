@@ -177,6 +177,47 @@
  *                        volume below the interface all hold at every report
  *     --require-rim-cut  --verify, and fail if at np > 1 no rim triangle ever
  *                        met a partition boundary (what the CTest passes)
+ *
+ *     --topology         let the interface change topology: a film of light
+ *                        fluid thinner than --delta-coalescence between two
+ *                        turns of the rolled cap closes, a sheet of heavy fluid
+ *                        thinner than --delta-breakup tears, and whatever that
+ *                        encloses or sheds becomes a body of its own
+ *     --delta-breakup X     (default 1.5 * target)
+ *     --delta-coalescence X (default 1.0 * target)
+ *     --topo-dx X        reconstruction lattice spacing (default target)
+ *     --topo-every N     detect every N steps (default --remesh-every)
+ *     --require-topology --verify, and fail unless the body count or the
+ *                        number of handles actually changed (the --topology
+ *                        CTest's non-vacuity measure: a reconstruction that
+ *                        only trims a thin lip changes neither)
+ *
+ * ── Topology changes ───────────────────────────────────────────────────────
+ *
+ * Without --topology the vortex ring winds the mushroom cap tighter than one
+ * edge from t ~ 2.5 on and the `crs` column counts the creases that leaves.
+ * With it, MFTLEnsembleApplyTopologyChanges' two halves -- detection, then a
+ * reconstruction from the signed distance field -- run after the remesher, and
+ * the turns of the cap that come within --delta-coalescence of each other are
+ * joined. Three checks change meaning once that can happen:
+ *
+ *   EULER    the interface can gain handles and shed closed bubbles or rings,
+ *            so "a disk" becomes: every OPEN body has an odd V-E+F <= 1 (a disk
+ *            with g handles has 1 - 2g), every CLOSED one an even V-E+F <= 2.
+ *   VOLUME   the volume below the interface is conserved by the reconstruction
+ *            itself (MFTL_TopologyOptions::conserve_volume measures it the same
+ *            way, as the flux of (z - z_bottom) e_z); what is left is booked
+ *            per call and reported.
+ *   THE RIM  is rebuilt as the level set's crossing of the side walls, on them
+ *            to the bit, and re-snapped like after every remesh.
+ *
+ * Measured at --roll 1.6 with everything else default, np = 4: 49
+ * reconstructions over the run, and at t ~ 3.55 a blob of heavy fluid pinches
+ * off the cap and stays a closed body through every later remesh -- what the
+ * topology CTest runs. At --res 24 the same field pinches only blobs a couple of
+ * lattice cells across; the remesher collapses those to tetrahedra, the size
+ * floor deletes them (MFTL_TopologyOptions::min_body_triangles), and
+ * --require-topology correctly reports the run as vacuous.
  */
 
 #include <math.h>
@@ -228,6 +269,13 @@ typedef struct
   char out[128];
   bool verify;
   bool require_rim_cut;
+
+  bool topology;
+  double delta_breakup;  ///< 0 = 1.5 * target
+  double delta_coalescence;  ///< 0 = 1.0 * target
+  double topo_dx;  ///< 0 = target
+  int topo_every;  ///< 0 = remesh_every
+  bool require_topology;
 } config;
 
 /** @brief cx*cy == nproc as square as possible, cz = 1: the interface is horizontal. */
@@ -260,6 +308,12 @@ static int parse_args(int argc, char **argv, int rank, int nproc, config *cfg)
   cfg->target = 0.0;
   cfg->iterations = 3;
   cfg->smooth = 3;
+  cfg->topology = MFTL_FALSE;
+  cfg->delta_breakup = 0.0;
+  cfg->delta_coalescence = 0.0;
+  cfg->topo_dx = 0.0;
+  cfg->topo_every = 0;
+  cfg->require_topology = MFTL_FALSE;
   cfg->budget = 4;
   cfg->strategy = MFTL_REMESH_PARALLEL_AUTO;
   cfg->vtk_every = 20;
@@ -283,6 +337,18 @@ static int parse_args(int argc, char **argv, int rank, int nproc, config *cfg)
       cfg->verify = MFTL_TRUE;
     else if (!strcmp(argv[i], "--require-rim-cut"))
       cfg->verify = cfg->require_rim_cut = MFTL_TRUE;
+    else if (!strcmp(argv[i], "--topology"))
+      cfg->topology = MFTL_TRUE;
+    else if (!strcmp(argv[i], "--require-topology"))
+      cfg->verify = cfg->require_topology = cfg->topology = MFTL_TRUE;
+    else if (!strcmp(argv[i], "--delta-breakup") && i + 1 < argc)
+      cfg->delta_breakup = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--delta-coalescence") && i + 1 < argc)
+      cfg->delta_coalescence = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--topo-dx") && i + 1 < argc)
+      cfg->topo_dx = atof(argv[++i]);
+    else if (!strcmp(argv[i], "--topo-every") && i + 1 < argc)
+      cfg->topo_every = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--res") && i + 1 < argc)
       cfg->res = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--steps") && i + 1 < argc)
@@ -878,11 +944,58 @@ static double euler_of(const rt_stats *g) { return g->sum[S_VERTS] - 0.5 * (3.0 
  * Two percent is loose against what the loop actually loses -- it exists to fail
  * a remesher that eats volume at the rim, not to grade RK2.
  */
-static bool verdict(const rt_stats *g, double v0, bool pin_rim, char *why, size_t why_len)
+/**
+ * @brief Per body: V-E+F, and whether it has a rim. What --verify's Euler check
+ *        reads once topology changes can split the interface into several.
+ *
+ * Arrays over the body id space, reduced: a handful of bodies here. A solver
+ * with thousands would use MFTLEnsembleReduceBodies() instead.
+ */
+typedef struct
+{
+  int n_bodies;  ///< bodies that exist anywhere
+  int n_open;  ///< of which with a rim
+  int bad;  ///< bodies whose V-E+F no orientable surface of their kind can have
+  int handles;  ///< total genus over all bodies
+} body_census;
+
+static void census_bodies(const MFTL_Ensemble *ens, body_census *c)
+{
+  const int n = ens->n_bodies_global;
+  long long *a = (long long *) calloc(4 * (size_t) (n > 0 ? n : 1), sizeof(long long));
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    const MFTL_Object *obj = ens->local_objects[o];
+    long long *r = &a[4 * obj->global_id];
+    r[0] += obj->verts.n_local;
+    r[1] += obj->tris.n_local;
+    for (int h = 0; h < 3 * obj->tris.n_local; ++h)
+      if (MFTLHeIsMeshBoundary(obj, h)) r[2]++;
+    r[3] += obj->tris.n_local > 0 ? 1 : 0;
+  }
+  MPI_Allreduce(MPI_IN_PLACE, a, 4 * n, MPI_LONG_LONG, MPI_SUM, MPI_COMM_WORLD);
+  memset(c, 0, sizeof(*c));
+  for (int b = 0; b < n; ++b)
+  {
+    if (a[4 * b + 3] == 0) continue;
+    const long long chi = a[4 * b] - (3 * a[4 * b + 1] + a[4 * b + 2]) / 2 + a[4 * b + 1];
+    const bool open = a[4 * b + 2] > 0;
+    c->n_bodies++;
+    if (open) c->n_open++;
+    /* A closed orientable surface has chi = 2 - 2g; a disk with g handles 1 - 2g. */
+    if (open ? (chi > 1 || (chi & 1) == 0) : (chi > 2 || (chi & 1) != 0)) c->bad++;
+    c->handles += (int) ((open ? 1 - chi : 2 - chi) / 2);
+  }
+  free(a);
+}
+
+static bool verdict(const rt_stats *g, double v0, bool pin_rim, const body_census *bc, char *why, size_t why_len)
 {
   why[0] = '\0';
   if (g->sum[S_HOLES] != 0.0) snprintf(why, why_len, "%.0f twin-less interior half-edges (halo incomplete)", g->sum[S_HOLES]);
-  if (fabs(euler_of(g) - 1.0) > 0.5) snprintf(why, why_len, "V-E+F = %.0f, the surface is no longer a disk", euler_of(g));
+  if (bc == MFTL_NULL && fabs(euler_of(g) - 1.0) > 0.5) snprintf(why, why_len, "V-E+F = %.0f, the surface is no longer a disk", euler_of(g));
+  if (bc != MFTL_NULL && bc->bad > 0) snprintf(why, why_len, "%d body(ies) with a V-E+F no orientable surface of its kind has", bc->bad);
+  if (bc != MFTL_NULL && bc->n_open != 1) snprintf(why, why_len, "%d open bodies, the interface must stay one", bc->n_open);
   if (g->sum[S_OFF_WALL] != 0.0) snprintf(why, why_len, "%.0f rim vertices left their wall", g->sum[S_OFF_WALL]);
   if (g->sum[S_INVERTED] != 0.0) snprintf(why, why_len, "%.0f inverted triangles", g->sum[S_INVERTED]);
   if (!pin_rim && fabs(g->sum[S_VOLUME] / v0 - 1.0) > 0.02) snprintf(why, why_len, "volume below the interface drifted to V/V0 = %.5f", g->sum[S_VOLUME] / v0);
@@ -1067,6 +1180,16 @@ int main(int argc, char **argv)
   const bool remeshing = cfg.remesh_every > 0;
   const double h_min = MFTLDomainGetHMin(&ens->domain);
 
+  /* Topology: a film between two turns of the cap closes at one edge, a sheet
+   * tears at one and a half, and the result is remeshed at once with the loop's
+   * own parameters. */
+  MFTL_TopologyOptions topt = MFTLTopologyDefaultOptions();
+  topt.dx = (cfg.topo_dx > 0.0) ? cfg.topo_dx : target;
+  topt.delta_breakup = (cfg.delta_breakup > 0.0) ? cfg.delta_breakup : 1.5 * target;
+  topt.delta_coalescence = (cfg.delta_coalescence > 0.0) ? cfg.delta_coalescence : 1.0 * target;
+  topt.remesh = remeshing ? &params : MFTL_NULL;
+  const int topo_every = (cfg.topo_every > 0) ? cfg.topo_every : (remeshing ? cfg.remesh_every : 5);
+
   rt_stats g0;
   measure(ens, &g0);
   const double v0 = g0.sum[S_VOLUME];
@@ -1117,6 +1240,10 @@ int main(int argc, char **argv)
   double t_remesh = 0.0;
   rt_stats g = g0;
 
+  double v_surgery = 0.0, t_topology = 0.0;
+  int n_changes = 0, n_created = 0, n_retired = 0, n_events_total = 0, max_bodies = 1, max_handles = 0;
+  body_census bc = {1, 1, 0, 0};
+
   for (int step = 1; step <= cfg.steps; ++step)
   {
     /* 1. move only what this rank owns */
@@ -1165,6 +1292,52 @@ int main(int argc, char **argv)
     else if (MFTLRedistribute(ens) != MFTL_SUCCESS)
       MPI_Abort(MPI_COMM_WORLD, 1);
 
+    /* 5. topology: detect, and only when something was found, reconstruct --
+     *    with the volume below the interface measured around it */
+    if (cfg.topology && step % topo_every == 0)
+    {
+      const double a = MPI_Wtime();
+      MFTL_TopologyEvent *events = MFTL_NULL;
+      int n_events = 0;
+      if (MFTLTopologyDetectEvents(ens, &topt, &events, &n_events) != MFTL_SUCCESS) MPI_Abort(MPI_COMM_WORLD, 1);
+      if (n_events > 0)
+      {
+        rt_stats before, after;
+        measure(ens, &before);
+        int *bodies = (int *) malloc(2 * (size_t) n_events * sizeof(int));
+        for (int e = 0; e < n_events; ++e)
+        {
+          bodies[2 * e] = events[e].body_a;
+          bodies[2 * e + 1] = events[e].body_b;
+        }
+        MFTL_TopologyStats tst;
+        if (MFTLEnsembleReconstructBodies(ens, bodies, 2 * n_events, events, n_events, &topt, &tst) != MFTL_SUCCESS)
+        {
+          if (rank == 0) fprintf(stderr, "topology change failed at step %d\n", step);
+          MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+        free(bodies);
+        snap_rim(ens);
+        measure(ens, &after);
+        census_bodies(ens, &bc);
+        max_bodies = MFTL_MAX(max_bodies, bc.n_bodies);
+        max_handles = MFTL_MAX(max_handles, bc.handles);
+        v_surgery += after.sum[S_VOLUME] - before.sum[S_VOLUME];
+        n_changes++;
+        n_events_total += n_events;
+        n_created += tst.n_bodies_created;
+        n_retired += tst.n_bodies_retired;
+        if (rank == 0)
+          printf(
+              "  step %4d t %5.2f: TOPOLOGY -- %d breakup / %d coalescence event(s); %d body(ies) in, %d out; now %d bodies (%d open), "
+              "%d handle(s); volume moved %+.2e\n",
+              step, t, tst.n_breakup, tst.n_coalescence, tst.n_bodies_reconstructed, tst.n_bodies_out, bc.n_bodies, bc.n_open, bc.handles,
+              after.sum[S_VOLUME] - before.sum[S_VOLUME]);
+      }
+      free(events);
+      t_topology += MPI_Wtime() - a;
+    }
+
     const bool report_now = cfg.report_every > 0 && (step % cfg.report_every == 0 || step == cfg.steps);
     if (report_now)
     {
@@ -1175,7 +1348,7 @@ int main(int argc, char **argv)
       rim_cut_max = MFTL_MAX(rim_cut_max, g.sum[S_RIM_CUT]);
 
       char why[160];
-      if (!verdict(&g, v0, cfg.pin_rim, why, sizeof why))
+      if (!verdict(&g, v0 + v_surgery, cfg.pin_rim, cfg.topology ? &bc : MFTL_NULL, why, sizeof why))
       {
         broken++;
         if (rank == 0) fprintf(stderr, "  step %d: %s\n", step, why);
@@ -1200,14 +1373,29 @@ int main(int argc, char **argv)
     broken++;
     if (rank == 0) fprintf(stderr, "  VACUOUS: the rim never met a partition boundary -- choose a grid whose cut planes cross it\n");
   }
+  if (cfg.require_topology && max_bodies == 1 && max_handles == 0)
+  {
+    broken++;
+    if (rank == 0) fprintf(stderr, "  VACUOUS: neither the body count nor the genus ever changed -- run longer, or strengthen --roll\n");
+  }
 
   /* ── Closing summary ────────────────────────────────────────────────────── */
   measure(ens, &g);
-  double t_max = 0.0;
+  double t_max = 0.0, t_topo_max = 0.0;
   MPI_Allreduce(&t_remesh, &t_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+  MPI_Allreduce(&t_topology, &t_topo_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
+  if (cfg.topology) census_bodies(ens, &bc);
 
   if (rank == 0)
   {
+    if (cfg.topology)
+    {
+      printf(
+          "\n  TOPOLOGY: %d reconstruction(s) from %d event(s); %d new body(ies), %d id(s) retired; up to %d bodies and %d handle(s); now %d bodies "
+          "(%d open), %d handle(s)\n",
+          n_changes, n_events_total, n_created, n_retired, max_bodies, max_handles, bc.n_bodies, bc.n_open, bc.handles);
+      printf("            volume moved by reconstructions %+.3e (V0 %.6f), %.3f s in topology calls (max over ranks)\n", v_surgery, v0, t_topo_max);
+    }
     printf("\n  interface area   %.6f -> %.6f  (%.2fx)\n", area0, g.sum[S_AREA], g.sum[S_AREA] / area0);
     printf("  triangles        %.0f -> %.0f\n", g0.sum[S_TRIS], g.sum[S_TRIS]);
     printf("  longest edge     %.6f -> %.6f  (%.2fx)\n", max_edge0, -g.min[X_NEG_MAX_EDGE], -g.min[X_NEG_MAX_EDGE] / max_edge0);
@@ -1215,7 +1403,10 @@ int main(int argc, char **argv)
     printf("  rim              %.0f -> %.0f half-edges, perimeter %.6f -> %.6f, max distance from its wall %.2e\n", g0.sum[S_RIM], g.sum[S_RIM],
            g0.sum[S_PERIMETER], g.sum[S_PERIMETER], -g.min[X_NEG_RIM_DIST]);
     printf("  volume below     V/V0 = %.6f%s\n", g.sum[S_VOLUME] / v0, cfg.pin_rim ? "  (not an invariant with a pinned rim)" : "");
-    printf("  Euler V-E+F      %.0f   (1 for a disk)\n", euler_of(&g));
+    if (cfg.topology)
+      printf("  Euler V-E+F      %.0f summed over %d bodies, %s\n", euler_of(&g), bc.n_bodies, bc.bad ? "SOME INCONSISTENT" : "each consistent with its kind");
+    else
+      printf("  Euler V-E+F      %.0f   (1 for a disk)\n", euler_of(&g));
     printf("  orientation      %.0f inverted triangles, %.0f creases sharper than 120 deg (curvature below the mesh resolution)\n", g.sum[S_INVERTED],
            g.sum[S_CREASES]);
     if (remeshing)

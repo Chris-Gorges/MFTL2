@@ -59,10 +59,10 @@ typedef struct
   const MFTL_BVH *bvh_b;
 } contact_set;
 
-static void record_contact(const MFTL_Object *objA, int primA, const MFTL_Object *objB, int primB, void *user_data)
+static void record_contact(const MFTL_BVH *bvhA, int primA, const MFTL_BVH *bvhB, int primB, void *user_data)
 {
-  (void) objA;
-  (void) objB;
+  (void) bvhA;
+  (void) bvhB;
   contact_set *const s = (contact_set *) user_data;
 
   if (s->n == s->cap)
@@ -77,11 +77,11 @@ static void record_contact(const MFTL_Object *objA, int primA, const MFTL_Object
 }
 
 /** @brief Counts hits and nothing else, for the pipeline comparison. */
-static void count_only(const MFTL_Object *objA, int primA, const MFTL_Object *objB, int primB, void *user_data)
+static void count_only(const MFTL_BVH *bvhA, int primA, const MFTL_BVH *bvhB, int primB, void *user_data)
 {
-  (void) objA;
+  (void) bvhA;
   (void) primA;
-  (void) objB;
+  (void) bvhB;
   (void) primB;
   (*(int *) user_data)++;
 }
@@ -384,7 +384,7 @@ static int test_halo_patch_is_a_valid_object(void)
 
     /* And the ordinary passes must run on it. */
     MFTLComputeTriangleGeometry(mut, mut->tris.n);
-    MFTLComputeVertexNormals(mut);
+    MFTLComputeVertexNormals(mut, MFTL_NORMAL_WEIGHT_AREA);
     ok = ok && inv_triangle_normals_are_unit(mut, 1e-9);
   }
 

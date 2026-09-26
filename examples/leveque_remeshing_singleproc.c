@@ -117,7 +117,7 @@ static mesh_report measure(MFTL_Object *obj)
   mesh_report r = {1.0, 0.0, 0, 0.0, 0.0};
   if (obj->tris.n == 0) return r;
 
-  MFTLComputeVertexNormals(obj);
+  MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
 
   for (int t = 0; t < obj->tris.n; ++t)
   {

@@ -68,6 +68,18 @@ mftl_add_mpi_test(test_derived 1)
 mftl_add_mpi_test(test_meshgen 1)
 mftl_add_mpi_test(test_vertex_normals 1)
 
+# Marching cubes: the generated 256-case table, exhaustively (crack freedom over
+# every pair of cells that can share a face), and the extraction against
+# analytic shapes and adversarial random / checkerboard fields. Serial by
+# construction -- the lattice identity it tests is what the distributed
+# topology change relies on, and that is tested there.
+mftl_add_mpi_test(test_marching_cubes 1)
+
+# The signed distance rasteriser, whose SIGN is checked against the generalised
+# winding number -- a reference that shares nothing with the closest-point and
+# pseudo-normal machinery -- on shapes built to break it.
+mftl_add_mpi_test(test_signed_distance 1)
+
 # The BVH's serial half: predicates, build, refit, traversal, and both halves of
 # the periodic problem. Everything here is local by construction -- the module's
 # only collective is the spatial ghost exchange, which test_bvh_parallel covers.
@@ -105,6 +117,27 @@ mftl_add_mpi_test_at(test_bvh_ghosting_np2 test_bvh_ghosting 2)
 mftl_add_mpi_test_at(test_bvh_ghosting_np4 test_bvh_ghosting 4)
 mftl_add_mpi_test_at(test_bvh_ghosting_np8 test_bvh_ghosting 8)
 mftl_add_mpi_test_oversub(test_bvh_ghosting_np27 test_bvh_ghosting 27)
+
+# SELF-proximity (params.self_pairs), the query a topology change is detected
+# by, tested as a multiset against an exhaustive sweep taken before
+# partitioning. Same rank counts and the same reasons as test_bvh_ghosting; the
+# fixtures sit where the cut planes meet and the cross-rank pairs are counted.
+mftl_add_mpi_test(test_bvh_self 1)
+mftl_add_mpi_test_at(test_bvh_self_np2 test_bvh_self 2)
+mftl_add_mpi_test_at(test_bvh_self_np4 test_bvh_self 4)
+mftl_add_mpi_test_at(test_bvh_self_np8 test_bvh_self 8)
+mftl_add_mpi_test_oversub(test_bvh_self_np27 test_bvh_self 27)
+
+# Topology changes. Every scenario is checked for what the result must BE and,
+# at np > 1, against a genuine np = 1 run of the same scenario on MPI_COMM_SELF
+# inside the same test: same bodies, same ids, same vertex positions. The rank
+# counts are the usual ones -- a face (2), an edge (4), a corner (8), an
+# interior rank (27) -- and every fixture sits where the cut planes meet.
+mftl_add_mpi_test(test_topology_change 1)
+mftl_add_mpi_test_at(test_topology_change_np2 test_topology_change 2)
+mftl_add_mpi_test_at(test_topology_change_np4 test_topology_change 4)
+mftl_add_mpi_test_at(test_topology_change_np8 test_topology_change 8)
+mftl_add_mpi_test_oversub(test_topology_change_np27 test_topology_change 27)
 
 # The remeshing OPERATORS are serial by construction -- MFTLRemeshObject asserts
 # the object holds no ghosts -- so one rank is not a reduced case here, it is the
@@ -164,6 +197,16 @@ mftl_add_mpi_test_at(test_remeshing_dispersed_np8 test_remeshing_dispersed 8)
 add_test(NAME test_remeshing_mpi_is_confined
          COMMAND ${CMAKE_COMMAND}
                  -DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../src/remeshing
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/check_mpi_confinement.cmake)
+
+# The same rule for topology changes: rasterisation, marching cubes, labelling
+# and the id decision are local computation, and every exchange they need goes
+# through topo_comm.c -- which is what lets the reconstruction be argued
+# partition-independent one file at a time.
+add_test(NAME test_topology_change_mpi_is_confined
+         COMMAND ${CMAKE_COMMAND}
+                 -DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../src/topology_change
+                 -DALLOWED=topo_comm.c
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/check_mpi_confinement.cmake)
 
 # --- Genuine multi-rank coverage ------------------------------------------
@@ -297,4 +340,38 @@ if(BUILD_EXAMPLES)
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
                    $<TARGET_FILE:liquid_jet_open_surface>
                    2 2 1 --sectors 24 --steps 60 --vtk 0 --report 20 --require-rim-cut ${MPIEXEC_POSTFLAGS})
+
+  # TOPOLOGY CHANGES on the same three open surfaces. Each run must make a
+  # change actually happen -- the non-vacuity flag fails it otherwise -- and
+  # keep every structural and physical check of its plain run through it, with
+  # the Euler rule generalised per body and the volume the reconstructions moved
+  # booked separately:
+  #
+  #   liquid_jet   a neck pinches and a drop travels on as a closed body to the
+  #                outlet; 2x2x1 so the lip, the jet and the neck are all cut
+  #   rayleigh_    a stronger vortex ring rolls the cap until turns touch and
+  #   taylor       a blob of heavy fluid pinches off it (t ~ 3.5), surviving the
+  #                remesh as a closed body. A coarser patch pinches only blobs
+  #                too small to resolve, which the size floor deletes: an
+  #                honest run in which nothing visible changes
+  #   travelling_  a steep carrier with a ripple plunges and its lip reconnects
+  #   waves        with the face, trapping air as an open body between the
+  #                channel walls. 104 steps: past that the prescribed field's
+  #                e^{kz} feedback runs away, which the example's own guard
+  #                reports and which is not the reconstruction's to fix
+  add_test(NAME test_liquid_jet_topology
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:liquid_jet_open_surface>
+                   2 2 1 --sectors 24 --length 24 --eps 0.1 --weber 2 --vtk 0 --report 20
+                   --require-breakup --require-rim-cut ${MPIEXEC_POSTFLAGS})
+  add_test(NAME test_rayleigh_taylor_topology
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:rayleigh_taylor_open_surface>
+                   --roll 1.6 --vtk 0 --report 50
+                   --require-topology --require-rim-cut ${MPIEXEC_POSTFLAGS})
+  add_test(NAME test_travelling_waves_topology
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:travelling_waves_open_surface>
+                   --nx 64 --ny 16 --components 2 --steepness 0.55 --ripple 0.05 --delta-breakup 0.02
+                   --steps 104 --vtk 0 --report 8 --require-topology --require-rim-cut ${MPIEXEC_POSTFLAGS})
 endif()

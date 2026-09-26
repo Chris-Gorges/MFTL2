@@ -44,10 +44,10 @@ typedef struct
   int last_b;
 } hit_counter;
 
-static void count_hits(const MFTL_Object *objA, int primA, const MFTL_Object *objB, int primB, void *user_data)
+static void count_hits(const MFTL_BVH *bvhA, int primA, const MFTL_BVH *bvhB, int primB, void *user_data)
 {
-  (void) objA;
-  (void) objB;
+  (void) bvhA;
+  (void) bvhB;
   hit_counter *const h = (hit_counter *) user_data;
   h->hits++;
   h->last_a = primA;
@@ -62,10 +62,10 @@ typedef struct
   int cap;
 } pair_log;
 
-static void log_pair(const MFTL_Object *objA, int primA, const MFTL_Object *objB, int primB, void *user_data)
+static void log_pair(const MFTL_BVH *bvhA, int primA, const MFTL_BVH *bvhB, int primB, void *user_data)
 {
-  (void) objA;
-  (void) objB;
+  (void) bvhA;
+  (void) bvhB;
   pair_log *const l = (pair_log *) user_data;
   if (l->n == l->cap)
   {

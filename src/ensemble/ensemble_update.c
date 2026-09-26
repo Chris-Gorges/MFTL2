@@ -351,7 +351,7 @@ void MFTLEnsembleUpdate(MFTL_Ensemble *ensemble)
  *               collective is an EXCHANGE.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-int MFTLEnsembleUpdateVertexNormals(MFTL_Ensemble *ensemble)
+int MFTLEnsembleUpdateVertexNormals(MFTL_Ensemble *ensemble, MFTL_NormalWeighting weighting)
 {
   MFTL_ASSERT(ensemble != MFTL_NULL);
   if (ensemble == MFTL_NULL) return MFTL_ERROR;
@@ -362,7 +362,7 @@ int MFTLEnsembleUpdateVertexNormals(MFTL_Ensemble *ensemble)
   /* Local, communication-free, exact for every OWNED vertex. Ghost vertices come
    * out of this holding a partial sum -- correctly normalised and quietly wrong,
    * which is precisely why the exchange below is not optional. */
-  for (int o = 0; o < ensemble->n_local_objects; ++o) MFTLComputeVertexNormals(ensemble->local_objects[o]);
+  for (int o = 0; o < ensemble->n_local_objects; ++o) MFTLComputeVertexNormals(ensemble->local_objects[o], weighting);
 
   /* One request/reply over the graph communicator, 32 B per ghost vertex. It is
    * blocking inside, and there is nothing here to overlap it with: every object

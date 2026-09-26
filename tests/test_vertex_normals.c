@@ -122,7 +122,7 @@ static MFTL_Object *make_sphere(MFTL_Ensemble *ens, const double centre[3], doub
   double c[3] = {centre[0], centre[1], centre[2]};
   MFTLGenerateSphere(obj, c, radius, refinement);
   MFTLObjectReorderMorton(obj);
-  MFTLComputeVertexNormals(obj);
+  MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
   return obj;
 }
 
@@ -188,8 +188,8 @@ static int test_recomputing_gives_the_same_answer(void)
      * have the same direction. Running it three times and comparing bit for bit
      * is what actually catches it: with a missing clear the third run differs
      * from the first in the rounding of the un-normalised sum. */
-    MFTLComputeVertexNormals(obj);
-    MFTLComputeVertexNormals(obj);
+    MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
+    MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
 
     if (memcmp(first, obj->verts.normal, bytes) != 0) ok = 0;
     free(first);
@@ -357,7 +357,7 @@ static int test_isolated_vertex_gets_a_zero_normal(void)
   obj->verts.rec[2].out_he_idx = 2;
 
   MFTLObjectBuildDerived(obj);
-  MFTLComputeVertexNormals(obj);
+  MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
 
   int ok = 1;
   for (int k = 0; k < 3; ++k)
@@ -384,7 +384,7 @@ static int test_empty_object_is_handled(void)
   MFTLEnsembleAddObject(g_open, obj);
   MFTLObjectBuildDerived(obj);  // vacuously current on an empty mesh
 
-  MFTLComputeVertexNormals(obj);  // must not touch a NULL pool pointer
+  MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);  // must not touch a NULL pool pointer
 
   TEST_ASSERT(agreed(obj->verts.n == 0, g_open->domain.comm_world));
   return 0;
@@ -401,7 +401,7 @@ static int test_normals_follow_vertex_motion(void)
 
   /* Squash the sphere into an ellipsoid and recompute from current positions. */
   MFTL_FOREACH_OWNED_VERTEX(obj, pos[2] *= 0.5;);
-  MFTLComputeVertexNormals(obj);
+  MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
 
   int ok = 1;
   if (obj->verts.n > 0)
@@ -447,6 +447,196 @@ static int test_mesh_stays_sound_around_the_pass(void)
 
 /* ─────────────────────────────────────────────────────────────────────────── */
 
+/* ─────────────────────────────────────────────────────────────────────────────
+ * 6. Angle weighting
+ *
+ * The property that matters is the one the signed distance field depends on:
+ * the angle-weighted normal is a function of the SURFACE, not of how the fan
+ * happens to be triangulated. Area weighting is not -- which is correct for what
+ * it is for (the volume gradient) and wrong for a pseudo-normal.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * @brief The corner of the positive octant solid, faces of UNEQUAL size.
+ *
+ * Corner O at the origin, legs 3 along x and 1 along y and z. The three faces
+ * lie in the coordinate planes with outward normals -x, -y, -z, so the
+ * angle-weighted normal at O is -(1,1,1)/sqrt(3) whatever the leg lengths, and
+ * the area-weighted one is pulled towards the two large faces.
+ *
+ * @param split_with_interior_point Re-triangulate the z = 0 face through an
+ *        interior point, so that part of that face no longer touches O.
+ */
+static MFTL_Object *make_corner(MFTL_Ensemble *ens, bool split_with_interior_point)
+{
+  MFTL_Object *obj = MFTLObjectCreate(21);
+  MFTLEnsembleAddObject(ens, obj);
+
+  int rank = 0;
+  MPI_Comm_rank(ens->domain.comm_world, &rank);
+  if (rank != 0)
+  {
+    MFTLObjectBuildDerived(obj);
+    return obj;
+  }
+
+  const double pos[5][3] = {{0, 0, 0}, {3, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1.0, 0.25, 0}};
+  if (!split_with_interior_point)
+  {
+    const int tv[3 * 3] = {0, 2, 1, 0, 3, 2, 0, 1, 3};
+    MFTLBuildIndexedMesh(obj, &pos[0][0], 4, tv, 3);
+  }
+  else
+  {
+    /* (O,B,A) becomes (O,B,Q), (O,Q,A) and (B,A,Q): same face, same outward
+     * normal, but the fan at O now covers less of it. */
+    const int tv[3 * 5] = {0, 2, 4, 0, 4, 1, 2, 1, 4, 0, 3, 2, 0, 1, 3};
+    MFTLBuildIndexedMesh(obj, &pos[0][0], 5, tv, 5);
+  }
+  return obj;
+}
+
+static int test_angle_weighted_normal_ignores_how_the_fan_is_split(void)
+{
+  MFTL_Object *coarse = make_corner(g_open, MFTL_FALSE);
+  MFTL_Object *split = make_corner(g_open, MFTL_TRUE);
+
+  int ok = 1;
+  if (coarse->verts.n > 0)
+  {
+    const double s = -1.0 / sqrt(3.0);
+
+    MFTLComputeVertexNormals(coarse, MFTL_NORMAL_WEIGHT_ANGLE);
+    MFTLComputeVertexNormals(split, MFTL_NORMAL_WEIGHT_ANGLE);
+    for (int k = 0; k < 3; ++k)
+    {
+      if (fabs(coarse->verts.normal[k] - s) > 1e-15) ok = 0;
+      if (fabs(split->verts.normal[k] - s) > 1e-15) ok = 0;
+    }
+
+    /* And the control: area weighting DOES move, both away from the diagonal
+     * and between the two tessellations of one surface. Without it this test
+     * could pass with the weighting argument ignored. */
+    MFTLComputeVertexNormals(coarse, MFTL_NORMAL_WEIGHT_AREA);
+    MFTLComputeVertexNormals(split, MFTL_NORMAL_WEIGHT_AREA);
+    double off_diag = 0.0, between = 0.0;
+    for (int k = 0; k < 3; ++k)
+    {
+      off_diag = fmax(off_diag, fabs(coarse->verts.normal[k] - s));
+      between = fmax(between, fabs(coarse->verts.normal[k] - split->verts.normal[k]));
+    }
+    if (off_diag < 0.1 || between < 0.01) ok = 0;
+  }
+
+  TEST_ASSERT(agreed(ok, g_open->domain.comm_world));
+  return 0;
+}
+
+static int test_both_weightings_agree_on_a_regular_sphere(void)
+{
+  const double c[3] = {0.1, 0.2, -0.3};
+  MFTL_Object *obj = make_sphere(g_open, c, 1.0, 4);
+
+  int ok = 1;
+  if (obj->verts.n > 0)
+  {
+    const size_t bytes = 3 * (size_t) obj->verts.n * sizeof(double);
+    double *area = (double *) malloc(bytes);
+    memcpy(area, obj->verts.normal, bytes);
+
+    MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_ANGLE);
+
+    /* Near-equilateral fans: the two agree closely but not exactly. */
+    const double dev = max_deviation(area, obj->verts.normal, obj->verts.n);
+    if (!(dev > 0.0 && dev < 5e-3)) ok = 0;
+
+    for (int v = 0; v < obj->verts.n; ++v)
+    {
+      const double *n = &obj->verts.normal[3 * v];
+      const double *p = &obj->verts.pos[3 * v];
+      const double r[3] = {p[0] - c[0], p[1] - c[1], p[2] - c[2]};
+      const double rl = sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+      const double len = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+      if (fabs(len - 1.0) > 1e-14) ok = 0;
+      if ((n[0] * r[0] + n[1] * r[1] + n[2] * r[2]) / rl < 0.999) ok = 0;
+    }
+    free(area);
+  }
+
+  TEST_ASSERT(agreed(ok, g_open->domain.comm_world));
+  return 0;
+}
+
+static int test_angle_weighting_skips_a_degenerate_face(void)
+{
+  /* The corner patch plus a zero-area triangle whose three corners are
+   * collinear on the x axis. It has no unit normal and must contribute nothing,
+   * rather than a NaN or an arbitrary direction. */
+  MFTL_Object *obj = MFTLObjectCreate(22);
+  MFTLEnsembleAddObject(g_open, obj);
+
+  int rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  int ok = 1;
+  if (rank == 0)
+  {
+    const double pos[6][3] = {{0, 0, 0}, {3, 0, 0}, {0, 1, 0}, {0, 0, 1}, {4, 0, 0}, {5, 0, 0}};
+    const int tv[3 * 4] = {0, 2, 1, 0, 3, 2, 0, 1, 3, 1, 4, 5};
+    MFTLBuildIndexedMesh(obj, &pos[0][0], 6, tv, 4);
+    MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_ANGLE);
+
+    for (int i = 0; i < 3 * obj->verts.n; ++i)
+      if (!isfinite(obj->verts.normal[i])) ok = 0;
+    for (int k = 0; k < 3; ++k)
+      if (fabs(obj->verts.normal[k] + 1.0 / sqrt(3.0)) > 1e-15) ok = 0;
+    /* The two vertices only the degenerate face touches get the "no normal"
+     * sentinel, exactly as an isolated vertex does. */
+    for (int v = 4; v < 6; ++v)
+      for (int k = 0; k < 3; ++k)
+        if (obj->verts.normal[3 * v + k] != 0.0) ok = 0;
+  }
+  else
+    MFTLObjectBuildDerived(obj);
+
+  TEST_ASSERT(agreed(ok, g_open->domain.comm_world));
+  return 0;
+}
+
+static int test_normals_are_unit_on_a_tiny_and_a_huge_sphere(void)
+{
+  /* Radius 1e-7: triangle edges of ~2e-8, so an area-weighted accumulator of
+   * ~1e-16. The normalisation used to clamp |n|^2 at 1e-12 and returned the
+   * zero "not computed" sentinel for every vertex of such a mesh. */
+  const double radii[2] = {1e-7, 1e+7};
+  int ok = 1;
+
+  for (int r = 0; r < 2; ++r)
+  {
+    int cuts[3] = {1, 1, 1};
+    MPI_Comm_size(MPI_COMM_WORLD, &cuts[0]);
+    const double L = 4.0 * radii[r];
+    double lo[3] = {-L, -L, -L}, hi[3] = {L, L, L};
+    MFTL_Ensemble *ens = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, lo, hi, MFTL_NULL, 4);
+
+    const double c[3] = {0.0, 0.0, 0.0};
+    MFTL_Object *obj = make_sphere(ens, c, radii[r], 3);
+
+    for (int w = 0; w < 2; ++w)
+    {
+      MFTLComputeVertexNormals(obj, (w == 0) ? MFTL_NORMAL_WEIGHT_AREA : MFTL_NORMAL_WEIGHT_ANGLE);
+      for (int v = 0; v < obj->verts.n; ++v)
+      {
+        const double *n = &obj->verts.normal[3 * v];
+        if (fabs(sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]) - 1.0) > 1e-13) ok = 0;
+      }
+    }
+    MFTLEnsembleDestroy(&ens);
+  }
+
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
@@ -479,6 +669,10 @@ int main(int argc, char **argv)
   RUN_TEST(test_empty_object_is_handled);
   RUN_TEST(test_normals_follow_vertex_motion);
   RUN_TEST(test_mesh_stays_sound_around_the_pass);
+  RUN_TEST(test_angle_weighted_normal_ignores_how_the_fan_is_split);
+  RUN_TEST(test_both_weightings_agree_on_a_regular_sphere);
+  RUN_TEST(test_angle_weighting_skips_a_degenerate_face);
+  RUN_TEST(test_normals_are_unit_on_a_tiny_and_a_huge_sphere);
 
   if (rank == 0) TEST_REPORT();
 

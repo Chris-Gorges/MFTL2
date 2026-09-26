@@ -186,7 +186,7 @@ static void measure(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, rep
     MFTL_Object *const obj = ens->local_objects[o];
     if (obj->tris.n == 0) continue;
 
-    MFTLComputeVertexNormals(obj);
+    MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
 
     s[0] += (double) obj->tris.n_local;
     s[1] += (double) obj->verts.n_local;

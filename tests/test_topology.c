@@ -353,6 +353,113 @@ static int test_integrity_check_rejects_a_stale_out_he(void)
   return 0;
 }
 
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Connected components
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+static int test_one_closed_surface_is_one_component(void)
+{
+  MFTL_Object *obj = make_tetrahedron();
+  int labels[4];
+  TEST_ASSERT_EQUAL_INT(1, MFTLLabelConnectedComponents(obj, labels));
+  for (int t = 0; t < 4; ++t) TEST_ASSERT_EQUAL_INT(0, labels[t]);
+  TEST_ASSERT_EQUAL_INT(1, MFTLLabelConnectedComponents(obj, MFTL_NULL));
+  return 0;
+}
+
+static int test_two_shells_in_one_pool_are_two_components(void)
+{
+  /* A quad (triangles 0,1), then a tetrahedron (2..5), then a second quad
+   * (6,7) glued to the first along edge 2-3. The numbering follows each
+   * component's SMALLEST triangle index, so the second quad inherits label 0
+   * even though it comes after the tetrahedron in the pool. */
+  static const double pos[] = {0, 0, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0,  // quad A: 0..3
+                               5, 0, 0, 6, 0, 0, 5, 1, 0, 5, 0, 1,  // tet: 4..7
+                               2, 2, 0, 1, 2, 0};  // quad B: 8, 9 (+ vertex 2 of A)
+  static const int tris[] = {0, 1, 2, 0, 2, 3, 4, 6, 5, 4, 5, 7, 4, 7, 6, 5, 6, 7, 2, 8, 9, 2, 9, 3};
+  MFTL_Object *obj = MFTLObjectCreate(3);
+  MFTLEnsembleAddObject(g_ens, obj);
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLBuildIndexedMesh(obj, pos, 10, tris, 8));
+
+  int labels[8];
+  const int n = MFTLLabelConnectedComponents(obj, labels);
+  /* Triangle (2,9,3) carries half-edge 3 -> 2, the twin of quad A's 2 -> 3. */
+  TEST_ASSERT_EQUAL_INT(2, n);
+  TEST_ASSERT_EQUAL_INT(0, labels[0]);
+  TEST_ASSERT_EQUAL_INT(0, labels[1]);
+  for (int t = 2; t < 6; ++t) TEST_ASSERT_EQUAL_INT(1, labels[t]);
+  TEST_ASSERT_EQUAL_INT(0, labels[6]);
+  TEST_ASSERT_EQUAL_INT(0, labels[7]);
+  return 0;
+}
+
+static int test_a_shared_vertex_does_not_join_components(void)
+{
+  /* Two triangles touching at vertex 0 only: a bowtie. */
+  static const double pos[] = {0, 0, 0, 1, 0, 0, 1, 1, 0, -1, 0, 0, -1, -1, 0};
+  static const int tris[] = {0, 1, 2, 0, 3, 4};
+  MFTL_Object *obj = MFTLObjectCreate(4);
+  MFTLEnsembleAddObject(g_ens, obj);
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLBuildIndexedMesh(obj, pos, 5, tris, 2));
+
+  int labels[2];
+  TEST_ASSERT_EQUAL_INT(2, MFTLLabelConnectedComponents(obj, labels));
+  TEST_ASSERT_EQUAL_INT(0, labels[0]);
+  TEST_ASSERT_EQUAL_INT(1, labels[1]);
+  return 0;
+}
+
+static int test_cutting_the_twins_along_a_loop_splits_a_sphere(void)
+{
+  MFTL_Object *obj = MFTLObjectCreate(5);
+  MFTLEnsembleAddObject(g_ens, obj);
+  double c[3] = {0.0, 0.0, 0.0};
+  MFTLGenerateSphere(obj, c, 1.0, 3);
+  TEST_ASSERT_EQUAL_INT(1, MFTLLabelConnectedComponents(obj, MFTL_NULL));
+
+  /* Unlink every half-edge whose two triangles lie on opposite sides of z = 0.
+   * That is a closed loop of cuts, so the sphere falls into two caps. */
+  int cut = 0;
+  for (int h = 0; h < 3 * obj->tris.n; ++h)
+  {
+    const int tw = obj->tris.he[h].twin_idx;
+    if (tw == MFTL_ERROR) continue;
+    double ca[3], cb[3];
+    MFTLGetTriangleCenter(obj, MFTLHeTriIdx(h), ca);
+    MFTLGetTriangleCenter(obj, MFTLHeTriIdx(tw), cb);
+    if ((ca[2] > 0.0) != (cb[2] > 0.0))
+    {
+      obj->tris.he[h].twin_idx = MFTL_ERROR;
+      cut++;
+    }
+  }
+  TEST_ASSERT(cut > 0);
+
+  int *labels = (int *) malloc((size_t) obj->tris.n * sizeof(int));
+  TEST_ASSERT_EQUAL_INT(2, MFTLLabelConnectedComponents(obj, labels));
+  /* Same side of the cut as triangle 0 <=> same label as triangle 0. */
+  double c0[3];
+  MFTLGetTriangleCenter(obj, 0, c0);
+  int ok = 1;
+  for (int t = 0; t < obj->tris.n; ++t)
+  {
+    double ct[3];
+    MFTLGetTriangleCenter(obj, t, ct);
+    if ((labels[t] == labels[0]) != ((ct[2] > 0.0) == (c0[2] > 0.0))) ok = 0;
+  }
+  free(labels);
+  TEST_ASSERT(ok);
+  return 0;
+}
+
+static int test_an_empty_pool_has_no_components(void)
+{
+  MFTL_Object *obj = MFTLObjectCreate(6);
+  MFTLEnsembleAddObject(g_ens, obj);
+  TEST_ASSERT_EQUAL_INT(0, MFTLLabelConnectedComponents(obj, MFTL_NULL));
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
@@ -376,6 +483,11 @@ int main(int argc, char **argv)
   RUN_TEST(test_rebuild_twins_invalidates_derived);
   RUN_TEST(test_integrity_check_rejects_a_broken_twin);
   RUN_TEST(test_integrity_check_rejects_a_stale_out_he);
+  RUN_TEST(test_one_closed_surface_is_one_component);
+  RUN_TEST(test_two_shells_in_one_pool_are_two_components);
+  RUN_TEST(test_a_shared_vertex_does_not_join_components);
+  RUN_TEST(test_cutting_the_twins_along_a_loop_splits_a_sphere);
+  RUN_TEST(test_an_empty_pool_has_no_components);
 
   TEST_REPORT();
 

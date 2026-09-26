@@ -532,7 +532,7 @@ void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params,
   for (int sweep = 0; sweep < iterations; ++sweep)
   {
     /* Normals are refreshed from current positions every sweep. */
-    MFTLComputeVertexNormals(obj);
+    MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
 
     memcpy(new_pos, obj->verts.pos, (size_t) n_v * 3 * sizeof(double));
 

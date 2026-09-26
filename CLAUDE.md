@@ -27,8 +27,24 @@ What exists today:
   body radii, the remesher's body measurement and its id counters
 - the fused per-timestep geometry + quality pass (`MFTLEnsembleUpdate`), whose statistics are PER BODY
   because that is what a solver reads to decide whether a given droplet needs remeshing
-- area-weighted vertex normals (`MFTLComputeVertexNormals`, `src/geometry/`) and their ensemble-wide form
-  (`MFTLEnsembleUpdateVertexNormals`), which adds the ghost exchange that makes them exact on ghosts too
+- area- or angle-weighted vertex normals (`MFTLComputeVertexNormals(obj, weighting)`, `src/geometry/`) and
+  their ensemble-wide form (`MFTLEnsembleUpdateVertexNormals(ens, weighting)`), which adds the ghost exchange
+  that makes them exact on ghosts too. Area is what a solver wants; ANGLE is what makes a pseudo-normal sign
+  exact at a spiky vertex (Bærentzen–Aanæs), and the signed distance uses it
+- the closest point on a triangle AND which feature it is (`MFTLClosestPointOnTriangle`), and signed-distance
+  rasterisation onto a lattice window (`MFTL_SdfGrid`, `MFTLRasterizeSignedDistance`, merge rule `MFTLSdfMerge`),
+  `src/geometry/signed_distance.c` — local, no MPI
+- marching cubes (`src/mesh_creation/marching_cubes.c`): a 256-case table GENERATED from one face rule
+  (`MFTLMarchingCubesCase`), an extractor that names every vertex by its lattice edge (`MFTLExtractLevelSet`),
+  and a one-call serial field-to-mesh (`MFTLBuildMeshFromLevelSet`)
+- connected components over twins (`MFTLLabelConnectedComponents`, `src/topology/`)
+- **TOPOLOGY CHANGES** (`src/topology_change/`, `include/mftl_topology_change.h`): breakup and coalescence by
+  opposing-triangle detection (`MFTLTopologyDetectEvents`), union-field signed distance with an explicit
+  bias at each event, marching cubes, component labelling and dense ids (`MFTLEnsembleReconstructBodies`),
+  one call for both (`MFTLEnsembleApplyTopologyChanges`). DISTRIBUTED ON THE PARTITION AS IT STANDS —
+  nothing migrates — and the reconstructed surface equals the single-rank one to 1e-12 at np = 1 … 27. All
+  of its MPI in `topo_comm.c`, enforced by `test_topology_change_mpi_is_confined`. Theory in
+  `src/topology_change/README.md`
 - array functions (stable radix sort for keys and key/value pairs)
 - redistribution and ghost synchronisation (`src/communication/`, `MFTLRedistribute`,
   `MFTLUpdateGhostPositions`)
@@ -53,7 +69,10 @@ What exists today:
 - LBVH and object–object contact detection (`src/bvh/`, `MFTL_GenerateLBVH` / `MFTL_RefitLBVH` /
   `MFTL_IntersectObjects`): Morton radix-split tree, explicit-stack dual traversal,
   Shewchuk-adaptive orientation and an exact Guigue–Devillers narrow phase, over a body-extent
-  BROAD PHASE rather than an all-pairs enumeration (`MFTLEnsembleIntersectObjects`)
+  BROAD PHASE rather than an all-pairs enumeration (`MFTLEnsembleIntersectObjects`). SELF-proximity within
+  one body is `MFTL_BVHBuildParams.self_pairs`, and `pair_filter` is a predicate run before the narrow
+  phase; the callback receives the two BVHs, and `MFTL_BVHPrimTriangle` resolves a primitive to
+  (object, triangle)
 - the spatial halo (`src/communication/spatial_halo.c`, `MFTLExtendSpatialHalo` and
   `MFTLExtendSpatialHaloNearBodies`): the triangles of one body that neighbouring ranks hold near this
   rank's share of another, delivered as a standalone shadow `MFTL_Object` per body, out of a sparse
@@ -62,8 +81,9 @@ What exists today:
   `src/ensemble/ensemble_reduce.c`) — the sibling of the reduction, and what lets the distributed
   remesher hand out global ids without a `comm_world` scan over the id space
 
-**Absent**: open-surface generators, GTS I/O, topological ghost-layer growth, and a mesh READER of any
-format. Do not add references to these from the current modules — build the module first.
+**Absent**: open-surface generators (other than a level set through `MFTLBuildMeshFromLevelSet`), GTS I/O,
+topological ghost-layer growth, continuous-time (swept) contact or topology detection, and a mesh READER of
+any format. Do not add references to these from the current modules — build the module first.
 
 ## The one idea
 
@@ -145,7 +165,7 @@ ctest --output-on-failure              # from build/
 ctest --output-on-failure -R object    # one module
 ```
 
-Fifty-two CTest entries, built on `tests/test_utils.h` (`RUN_TEST`, `TEST_ASSERT*`, `TEST_REPORT`). **Run the suite in
+Sixty-eight CTest entries, built on `tests/test_utils.h` (`RUN_TEST`, `TEST_ASSERT*`, `TEST_REPORT`). **Run the suite in
 the `--debug` build too** — `tests/test_object.c` deliberately writes the last addressable element of every pool
 array, so an array that was not grown with the rest is an ASan failure rather than a silent corruption.
 
@@ -200,6 +220,16 @@ edge hands the new vertex `MFTL_FLAG_BOUNDARY` and no other bit, and application
 surface curled tighter than one edge (the rolled-up RT cap, a pinching neck) puts consistently wound triangles
 back to back, which the vertex-normal fold test reports as inverted.
 
+**A TOPOLOGY CHANGE IS TESTED AGAINST THE SAME CALL ON ONE RANK, AS A CENSUS.** `tests/test_topology_change.c`
+runs each scene distributed and again on rank 0 with `MPI_COMM_SELF`, and compares per body the vertex,
+triangle and boundary counts, the Euler characteristic, the volume, and the sorted owned vertex positions —
+QUANTISED (`llround(x * 1e8)`), because the volume correction's reduced sums differ in the last bit between
+rank counts and an exact sort key then reorders ties. Every scene is centred where the cut planes of every
+tested grid meet, so the change itself crosses ranks; np = 1, 2, 4, 8 and 27. The three `test_*_topology`
+examples each carry a non-vacuity flag (`--require-breakup` / `--require-topology`) that fails a run in which
+the body count or genus never changed — and a coarse Rayleigh–Taylor patch is exactly such a run: every
+blob it pinches is below the size floor.
+
 **Never compare two vectors that should be identical with `acos(a·b)`.** The arc cosine has infinite derivative at
 1, so a dot product one ulp below 1 reports 1.5e-8 rad — a noise floor of ~1e-6 degrees regardless of how exact the
 inputs are. Use the chord `|a − b|`. `tests/test_vertex_normals.c` records the false failure this produced.
@@ -220,7 +250,7 @@ hang instead of a clean failure.
 
 **The documentation build is NOT in this repository.** It lives in
 `MFTL_Documentation`, normally checked out beside this one, and reads this tree from wherever it is. What
-stays here is only what is read in place: the Doxygen comments in `include/` and `src/**`, the ten
+stays here is only what is read in place: the Doxygen comments in `include/` and `src/**`, the eleven
 `src/<module>/README.md` theory chapters (they render on GitHub next to the code they explain) and the four
 `docs/*-analysis.md` measurement documents (some thirty comments in `src/`, `include/`, `tests/` and
 `examples/` cite them by path).
@@ -266,7 +296,7 @@ lower layer:
 | 0 | `mftl_constants.h`, `mftl_memory.h`, `mftl_vectoroperations.h`, `mftl_arrayfunctions.h` | macros and plain-C helpers, no MFTL types |
 | 1 | `mftl_types.h` | all structs — the single place they are defined |
 | 2 | `mftl_topology.h`, `mftl_geometry.h` | inline accessors over layer 1 |
-| 3 | `mftl_object.h`, `mftl_ensemble.h`, `mftl_meshgen.h`, `mftl_communication.h`, `mftl_io.h`, `mftl_remeshing.h`, `mftl_bvh.h` | module APIs |
+| 3 | `mftl_object.h`, `mftl_ensemble.h`, `mftl_meshgen.h`, `mftl_communication.h`, `mftl_io.h`, `mftl_remeshing.h`, `mftl_bvh.h`, `mftl_topology_change.h` | module APIs |
 | 4 | `mftl_core.h` | umbrella for application code; library sources must not use it |
 
 Two checks worth running after touching headers:
@@ -331,7 +361,10 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   `MFTLEnsembleReduceBodies` and `MFTLRemeshEnsembleParallel` are collective too.
   `MFTLObjectReorderMorton`, `MFTLObjectBuildDerived`, `MFTLComputeVertexNormals`, `MFTLRemeshMarkFrozen`,
   `MFTLDilateFrozenBand`, `MFTLEnsembleBodyHoldersFitTheGraph` and `MFTLGenerateSphereLocal` are
-  deliberately **local** — each rank works on its own partition. `test_vertex_normals_np3` exists to make an accidentally-introduced collective deadlock in CI.
+  deliberately **local** — each rank works on its own partition. So are `MFTLRasterizeSignedDistance`,
+  `MFTLExtractLevelSet`, `MFTLBuildMeshFromLevelSet`, `MFTLLabelConnectedComponents` and
+  `MFTLTopologyLattice`; `MFTLTopologyDetectEvents`, `MFTLEnsembleReconstructBodies` and
+  `MFTLEnsembleApplyTopologyChanges` are collective. `test_vertex_normals_np3` exists to make an accidentally-introduced collective deadlock in CI.
 - **A SWITCH THAT CHANGES A MESSAGE LENGTH OR A MESSAGE COUNT IS COLLECTIVE STATE, EVEN THOUGH IT LOOKS
   LOCAL.** `MFTLRedistributeSetSkipUnchangedBodies` changes how many collectives a redistribution makes, so
   two ranks disagreeing about it is a deadlock with no diagnostic — which is why it rides in the Debug
@@ -501,7 +534,12 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   same order, and a Debug-only checksum inside the redistribution reduces `(num_objects, n_bodies_global,
   skip switch)` to report a violation rather than silently merging entities into the wrong body. Whatever
   was passed to `MFTLObjectCreate` is provisional. `slot_of_body` (`redistribute.c`) is the one place a
-  wire gid becomes a local index.
+  wire gid becomes a local index. **A topology change is the one other place ids are handed out, and it
+  RETIRES ids too**: `MFTLEnsembleReconstructBodies` raises `n_bodies_global` identically on every rank for
+  each new body and never reuses the id of one that vanished, so after a change `n_bodies_global` is the
+  size of the id SPACE and may exceed the number of live bodies. Everything indexed by gid over
+  `[0, n_bodies_global)` (the global reduction and scan fallbacks, the dense view) sees a hole as a body
+  nobody holds, which is already a state it handles.
 - **`MFTLComputeVertexNormals` needs a VERTEX-COMPLETE halo and no communication.** It accumulates over all
   triangles including ghosts, so an owned vertex gets the exact answer iff every triangle incident to it is present
   locally. That is a stronger requirement on redistribution than "one layer of edge-adjacent ghost triangles", and
@@ -893,6 +931,56 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   `next_vertex_gid` does not, because old vertices are carried over and keep their IDs. Density is what lets a
   receiver size a lookup table by ID range instead of hashing. Guarded by `inv_global_ids_are_dense`.
 
+- **A TOPOLOGY EVENT IS CLASSIFIED BY THE SIDE ITS GAP IS ON, NOT BY HOW MANY BODIES IT TOUCHES.** Two
+  opposing triangles within a threshold, each BEHIND the other, have liquid between them: BREAKUP at
+  `delta_breakup`. Each in FRONT: a film of the other phase, COALESCENCE at `delta_coalescence`. Mixed: a
+  fold seen edge-on, no event. "Within one body = breakup, between two = coalescence" — the draft's rule —
+  is wrong in both directions: a rolled-up Rayleigh–Taylor cap coalesces with its own stem, and the liquid
+  film between a drop and a bubble inside it breaks between two bodies. Clusters therefore join on a
+  two-body event of EITHER kind, and a cluster is rasterised as the distance to the UNION of its surfaces
+  signed by the nearest one — `min` over per-body fields is negative inside a nested bubble.
+
+- **THE RECONSTRUCTED SURFACE IS INDEPENDENT OF THE PROCESS COUNT, AND FOUR THINGS KEEP IT SO — each silent
+  when broken, because every rank still produces a valid mesh.** (1) Each rank rasterises only the
+  triangles it OWNS, and `MFTLSdfMerge` (smaller |phi|, tie towards negative) is commutative and
+  associative, so the merged field is bit-identical to a serial rasterisation. (2) The event list is
+  canonical: points snapped to a quarter of `max(min delta, dx)` and merged on (bodies, kind, cell) —
+  without the `dx` one jet neck came out as 779 events. (3) Component labels are the smallest lattice
+  triangle key, which every holder computes alike. (4) **A marching-cubes vertex is positioned from WRAPPED
+  node indices.** Across a periodic seam one rank reaches a lattice edge as node `n`, the other as `n - N`;
+  unwrapped, the two positions are a period apart, the owner rule sends them to two owners, and the
+  travelling-wave example at np = 2 came back with holes and chi = 15. Guarded by
+  `test_seam_vertices_get_one_owner_on_every_rank`, which fails with the wrap removed.
+  `tests/test_topology_change.c` compares every scene against a rank-0 `MPI_COMM_SELF` rerun; the surfaces
+  agree to 1e-12 at np = 1, 2, 4, 8, 27.
+
+- **THE RASTERISATION CUTOFF REPLACES A FLOOD FILL, AND IT IS A PROOF, NOT A TUNING KNOB.** A node farther
+  than `r_cut = |cell diagonal| + max bias + dx/2` from every triangle stays `MFTL_SDF_UNKNOWN`, and a cell
+  with an unknown corner provably cannot be crossed by the BIASED zero level set, so marching cubes skips it
+  without knowing its side. Raise the bias without raising the cutoff and a crossed cell is skipped: a hole.
+  A flood fill is the alternative, and it is a global, sequential sign propagation across ranks.
+
+- **THE SIZE FLOOR IS TAKEN TWICE: on the marching-cubes surface and again after the optional remesh.** A
+  satellite two lattice cells across clears `min_body_triangles` as MC slivers, is remeshed at a target edge
+  length near its diameter into a TETRAHEDRON, and survives — the collapse approval refuses to dissolve a
+  tetrahedron, and every one of its four faces opposes all three neighbours. The Rayleigh–Taylor example
+  reported exactly that at np = 4 as "4 inverted triangles". Guarded by
+  `test_a_satellite_the_remesher_collapses_is_discarded`, which fails without the second count. A body
+  deleted at either point gives its volume to the survivors of its cluster through the correction.
+
+- **THE VOLUME CORRECTION RUNS LAST, IS NEWTON'S METHOD, AND TAKES A FIXED NUMBER OF STEPS.** Last, because the
+  remesh that cleans up MC slivers moves volume on its own (as a correction BEFORE it, a steady -0.5 per
+  reconstruction on the jet). Newton, because the step divides by the exact first variation
+  `sum_t S_t . mean(u)` of the displacement field actually applied — dividing by the area converges only
+  linearly (0.03 per step; from a 15 % deficit 1.3e-4 after two steps against 1e-9 after three Newton
+  steps). Fixed at three, because a stopping test on a reduced double is two ranks disagreeing in the last
+  ulp about whether to enter another collective.
+
+- **A LEVEL SET HAS A BOUNDARY ONLY WHERE IT MEETS A WALL, so a rim off the walls is REFUSED.** The lattice
+  puts a node plane on every wall, so a rim on a wall is reproduced on it and flagged `MFTL_FLAG_BOUNDARY` from
+  the lattice key of its edge. A cluster with a rim anywhere else is left untouched
+  (`n_clusters_refused`), never reconstructed into a closed surface.
+
 ## Performance
 
 `docs/performance-analysis.md` holds the measured picture, `docs/remeshing-quality-analysis.md` the
@@ -1205,6 +1293,30 @@ comments:**
    step earlier and would save the 24 B/tri stream, was rejected: it covers only the triangle half (nothing
    in the library writes `verts.pos` — the solver does) and it puts routing into the geometry API, which is
    the boundary deferred issue 7 declines to cross.
+
+22. **A TOPOLOGY CHANGE RE-TRIANGULATES EVERY BODY IN ITS CLUSTER, EVERYWHERE, not only at the event.**
+   Vertices, ids and pool order are all new, the surface moves by the marching-cubes error
+   O(dx^2 * curvature) away from the event, and the optional remesh then runs over the whole ensemble.
+   Measured at np = 4 (laptop, Release): the Rayleigh–Taylor run at `--roll 1.6` spends 3.46 s in 80
+   topology calls — 49 reconstructions on up to 18.7k triangles, each including its remesh — against 2.11 s
+   in its 80 ordinary remeshing passes; the liquid jet 0.43 s over its run. A LOCAL reconstruction that
+   re-extracts a neighbourhood of each event and stitches it into the old mesh would remove the far-field
+   perturbation and most of the cost; it needs a seam between a lattice surface and a remeshed one, which
+   is its own correctness problem, and was not attempted.
+
+23. **Detection is an ensemble-wide self- and pair-proximity query on EVERY call, including the calls that
+   find nothing, which is most of them.** On the jet it is 0.16 of 0.43 s. The opposing-normal `pair_filter`
+   and the zero-envelope A-side tree already took the candidates from 129 to 45 per triangle; what is left
+   is the traversal itself. A per-primitive normal cache, or a trigger that only queries bodies whose
+   curvature or thickness estimate moved, are the next levers — neither measured. Nothing sweeps time
+   either: a surface that closes a gap of more than `delta` in one step is missed, exactly as issue 16.
+
+24. **`n_bodies_global` counts retired ids, and one heuristic reads it as a body count.** Correctness is
+   unaffected (every gid-indexed fallback treats a hole as a body nobody holds), but
+   `dispersed_box_min`'s `N_bodies >= nproc` relaxation guard in `remesh_dispersed.c` over-counts after
+   topology changes have retired ids, and can relax with fewer live bodies than ranks. A live count is
+   known exactly and identically on every rank inside `MFTLEnsembleReconstructBodies` (bodies in minus
+   out); keeping it on `MFTL_Ensemble` is the fix when a run with many retirements makes it matter.
 
 ### Settled, so nobody re-opens them
 

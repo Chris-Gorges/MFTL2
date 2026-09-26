@@ -79,6 +79,29 @@ static inline void *MFTLCallocOrDie(size_t count, size_t size, const char *what)
   return p;
 }
 
+/**
+ * @brief `realloc` that aborts instead of returning NULL.
+ *
+ * For the growable scratch arrays of a single algorithm, where the element
+ * counts of several arrays move together and one of the growth macros below
+ * would need a separate capacity counter per array.
+ *
+ * @param ptr   Existing block, or NULL.
+ * @param bytes New size in bytes.
+ * @param what  Human-readable name of the caller, printed in the fatal message.
+ * @return The (possibly moved) block. Never NULL for a non-zero size.
+ */
+static inline void *MFTLReallocOrDie(void *ptr, size_t bytes, const char *what)
+{
+  void *p = realloc(ptr, bytes);
+  if (!p && bytes > 0)
+  {
+    fprintf(stderr, "FATAL ERROR: %s reallocation failed for %lu bytes.\n", what, (unsigned long) bytes);
+    exit(EXIT_FAILURE);
+  }
+  return p;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Cache-line-aligned block allocation and sub-array layout
  * ═══════════════════════════════════════════════════════════════════════════ */

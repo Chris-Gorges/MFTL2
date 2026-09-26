@@ -105,7 +105,7 @@ int main(int argc, char *argv[])
    * Area-weighted vertex normals: one triangle scatter, one
    * normalising pass. LOCAL -- it accumulates over ghost triangles too, so an
    * owned vertex needs no communication to get the exact answer. */
-  MFTLComputeVertexNormals(object);
+  MFTLComputeVertexNormals(object, MFTL_NORMAL_WEIGHT_AREA);
 
   if (rank == 0)
   {

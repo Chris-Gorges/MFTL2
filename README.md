@@ -58,7 +58,7 @@ double centre[3] = {0, 0, 0};
 MFTLGenerateSphere(obj, centre, 1.0, 5);      // collective
 MFTLObjectReorderMorton(obj);                 // local: spatial renumbering
 MFTLEnsembleUpdate(ens);                      // collective: geometry + quality, one pass
-MFTLEnsembleUpdateVertexNormals(ens);         // collective: normals + one ghost exchange
+MFTLEnsembleUpdateVertexNormals(ens, MFTL_NORMAL_WEIGHT_AREA);  // collective: normals + one ghost exchange
 
 printf("mean-ratio quality: %f\n", obj->quality.avg_aspect_ratio);
 
@@ -121,7 +121,7 @@ results as prominently as the positive ones.
 ## Documentation
 
 **The documentation build lives in a separate repository, `MFTL_Documentation`**, normally checked out beside
-this one. This tree carries the sources it reads — the Doxygen comments in `include/` and `src/**`, the ten
+this one. This tree carries the sources it reads — the Doxygen comments in `include/` and `src/**`, the eleven
 `src/<module>/README.md` theory chapters and the four measurement documents in `docs/` — and none of the
 machinery that renders them.
 
@@ -135,7 +135,7 @@ python3 build_docs.py --open            # -> build/docs/html         (Doxygen al
 It finds this checkout on its own when the two sit side by side; otherwise pass `--source-dir`, set
 `MFTL_SOURCE_DIR`, or write the path into its `mftl-source.txt`.
 
-`build_mkdocs.py` builds a MkDocs Material site — guides, the ten module theory chapters, the four
+`build_mkdocs.py` builds a MkDocs Material site — guides, the eleven module theory chapters, the four
 measurement documents and a browsable API reference — and mounts the complete Doxygen manual inside it at
 `/doxygen/`, so the call graphs, the include graphs and the annotated source browser come with it. No prose is
 duplicated to make this work: its `mkdocs/gen_pages.py` reads the same files Doxygen reads and rewrites the

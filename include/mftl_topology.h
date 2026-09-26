@@ -723,4 +723,36 @@ int MFTLMarkMeshBoundary(MFTL_Object *obj);
  */
 int MFTLCheckMeshIntegrity(const MFTL_Object *obj);
 
+/**
+ * @brief Labels the edge-connected components of the triangles in the pool.
+ *
+ * Two triangles are in one component when a chain of twin links joins them. A
+ * breadth-first sweep over `twin_idx`, O(T), one scratch queue, no recursion.
+ *
+ * ── What it is for ─────────────────────────────────────────────────────────
+ *
+ * The library assumes an #MFTL_Object is ONE connected surface (the per-body
+ * reduction's holder route rests on it, see MFTLEnsembleReduceBodies). A
+ * topology change is exactly the operation that can break that assumption --
+ * a pinched-off drop is a second component of the body it left -- so the
+ * topology-change module labels components to split a body into one object per
+ * component. It is also the cheap way for a caller to COUNT drops.
+ *
+ * ── On a partitioned mesh ───────────────────────────────────────────────────
+ *
+ * It is purely local: every triangle in the pool, owned and ghost, and nothing
+ * else. Two parts of a body joined only through triangles another rank holds
+ * come out as two local components. That is the correct local answer and the
+ * input the distributed labelling in src/topology_change/ starts from; it is not
+ * the global component count.
+ *
+ * @param obj The mesh.
+ * @param[out] labels `[obj->tris.n]` component of each triangle, numbered from 0
+ *                    in order of each component's smallest triangle index. May
+ *                    be #MFTL_NULL to only count.
+ * @return The number of components; 0 for an empty pool.
+ * @rank_local No MPI.
+ */
+int MFTLLabelConnectedComponents(const MFTL_Object *obj, int *labels);
+
 #endif  // MFTL_TOPOLOGY_H

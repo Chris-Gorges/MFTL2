@@ -790,11 +790,14 @@ int MFTLUpdateGhostVertexNormals(MFTL_Ensemble *ens);
  * @struct MFTL_SpatialHaloPair
  * @brief One candidate body pair the broad phase kept, ordered by body id.
  *
- * `body_a < body_b`, always: the smaller id is the A side, the side whose OWNED
+ * `body_a < body_b`: the smaller id is the A side, the side whose OWNED
  * triangles are the ones reported, and the larger is the side whose triangles
  * travel. That asymmetry is the whole of the "reported once" rule -- see
  * MFTL_SpatialHaloRequest -- so the ordering is a contract and not a
- * convenience.
+ * convenience. The one exception is a SELF pair, `body_a == body_b`, present
+ * only when #MFTL_SpatialHalo::self_pairs asked for it; there the traversal
+ * restores "reported once" by triangle id instead (see
+ * MFTLEnsembleIntersectObjects()).
  *
  * A pair is present on THIS rank iff this rank holds body A and can see body B,
  * either because it holds part of it or because a patch for it arrived.
@@ -802,7 +805,7 @@ int MFTLUpdateGhostVertexNormals(MFTL_Ensemble *ens);
 typedef struct MFTL_SpatialHaloPair
 {
   int body_a;  ///< Smaller body id. Held by this rank; its owned triangles report.
-  int body_b;  ///< Larger body id. Held here, patched here, or both.
+  int body_b;  ///< Larger body id -- or the SAME id for a self pair. Held here, patched here, or both.
 } MFTL_SpatialHaloPair;
 
 /**
@@ -854,6 +857,19 @@ typedef struct MFTL_SpatialHalo
   MFTL_SpatialHaloPair *pair;
   int n_pairs;  ///< Entries in `pair`.
   int cap_pairs;  ///< Entries allocated in `pair`.
+
+  /**
+   * @brief INPUT to MFTLExtendSpatialHaloNearBodies(): also derive SELF pairs.
+   *
+   * False by default. When set, a body travels towards a neighbour's share of
+   * the SAME body as well as towards smaller ids, and `pair` gains `(B, B)` for
+   * every body this rank owns something of. That is the exchange a
+   * self-proximity query needs -- two sheets of one body across a rank boundary,
+   * a thin neck on a cut plane -- and it rides the same two collectives as the
+   * pairwise one rather than costing a second exchange. The explicit request
+   * form ignores it: a request `(B, B)` already asks for exactly this.
+   */
+  bool self_pairs;
 
   MFTL_Domain *domain;  ///< Borrowed from the ensemble.
 } MFTL_SpatialHalo;

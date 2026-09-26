@@ -192,6 +192,8 @@ static inline int MFTL_BVHLeftChild(const MFTL_BVHNode *n) { return (int) (n->pa
 /** @brief Default maximum primitives in a leaf. */
 #define MFTL_BVH_DEFAULT_LEAF_SIZE 4
 
+struct MFTL_BVH;  // defined in section 3; the pair filter below takes pointers to it
+
 /**
  * @struct MFTL_BVHBuildParams
  * @brief Everything the build needs that is not the geometry.
@@ -248,6 +250,46 @@ typedef struct MFTL_BVHBuildParams
    * distinction is empty anyway.
    */
   bool include_ghosts;
+
+  /**
+   * @brief Also test every body against ITSELF. Read by
+   *        MFTLEnsembleIntersectObjects() only; a single build ignores it.
+   *
+   * MFTL_FALSE by default. Self-proximity is a different question from contact
+   * between two bodies: every triangle touches its neighbours, so the pairs that
+   * share a VERTEX are dropped, and what is left is two parts of one surface
+   * that are close without being adjacent -- two sheets of a fold, the opposite
+   * sides of a thin neck. That is the query a topology change is detected by.
+   *
+   * Each unordered pair is still reported exactly once across all ranks: by the
+   * rank owning the triangle with the SMALLER global id, which is the analogue
+   * for one body of the smaller-body-id rule between two.
+   *
+   * Must be the same on every rank: it decides whether a one-body ensemble
+   * enters the collectives at all.
+   */
+  bool self_pairs;
+
+  /**
+   * @brief Optional CHEAP pre-test, run on every candidate pair before the
+   *        exact narrow phase. Return false to skip the pair.
+   *
+   * #MFTL_NULL by default. The narrow phase is exact -- adaptive orientation
+   * predicates and fifteen distance sub-tests -- and a query whose answer
+   * depends on more than proximity can often reject most candidates with a
+   * dot product. The topology-change detector is that caller: only triangles
+   * whose normals OPPOSE can be an event, and on a smooth surface nearly every
+   * neighbour within the envelope has a parallel normal. Measured on its test
+   * fixtures, skipping those first is the difference between minutes and
+   * seconds.
+   *
+   * Read from the A-side hierarchy's parameters and called with the same
+   * `user_data` as the callback. It must be a pure function of the two
+   * primitives: it runs on every rank for the pairs that rank reports, and a
+   * filter that depended on anything local would make the reported set depend
+   * on the partition.
+   */
+  bool (*pair_filter)(const struct MFTL_BVH *bvhA, int primA, const struct MFTL_BVH *bvhB, int primB, void *user_data);
 } MFTL_BVHBuildParams;
 
 /**
@@ -262,6 +304,8 @@ static inline MFTL_BVHBuildParams MFTL_BVHDefaultParams(void)
   p.proximity_floor = 0.0;
   p.leaf_size = MFTL_BVH_DEFAULT_LEAF_SIZE;
   p.include_ghosts = MFTL_FALSE;
+  p.self_pairs = MFTL_FALSE;
+  p.pair_filter = MFTL_NULL;
   return p;
 }
 
@@ -382,6 +426,23 @@ typedef struct MFTL_BVH
  * @param[out] out Row \f$k\f$ is corner \f$k\f$.
  */
 void MFTL_BVHPrimVerts(const MFTL_BVH *bvh, int p, double out[3][3]);
+
+/**
+ * @brief The object and triangle a primitive IS: `bvh->obj` for a local
+ *        primitive, the halo patch for a remote one.
+ *
+ * The whole local/remote distinction in one call. Both kinds are "triangle t of
+ * some MFTL_Object", so a callback that needs more than the corners -- the
+ * triangle's vertex ids to recognise a shared vertex, its body id, its twins --
+ * reads them from the returned object like from any other mesh. A patch carries
+ * the body's real ids and its `global_id` is the body's.
+ *
+ * @param      bvh The hierarchy.
+ * @param      p   Primitive index in `[0, n_prims)`.
+ * @param[out] tri Triangle index within the returned object.
+ * @return The object the triangle lives in. Never #MFTL_NULL for a valid @p p.
+ */
+const MFTL_Object *MFTL_BVHPrimTriangle(const MFTL_BVH *bvh, int p, int *tri);
 
 /**
  * @brief True if primitive @p p is a triangle of `bvh->obj` rather than a remote copy.
@@ -552,14 +613,26 @@ int MFTL_BVHSetGlobalRadius(MFTL_BVH *bvh, double radius);
 /**
  * @brief Called once per primitive pair that passed the narrow phase.
  *
- * @param objA     Object A, as handed to MFTL_IntersectObjects.
- * @param primA    Primitive index in bvhA. Use MFTL_BVHPrimGlobalId() for an
- *                 identity that means something on another rank.
- * @param objB     Object B.
- * @param primB    Primitive index in bvhB.
+ * ── It is handed the HIERARCHIES, not the objects ──────────────────────────
+ *
+ * A primitive index means nothing without the tree it indexes: past
+ * `n_local_prims` it names a triangle of the spatial halo PATCH, not of the
+ * object. The callback used to receive the two objects, so a primitive that
+ * arrived through the halo could not be resolved at all -- which is exactly
+ * the cross-rank contact a distributed caller is interested in, and was why
+ * MFTLEnsembleIntersectObjects could only COUNT contacts. With the trees in
+ * hand every primitive resolves the same way: MFTL_BVHPrimTriangle() for the
+ * (object, triangle) it is, MFTL_BVHPrimVerts() for its corners,
+ * MFTL_BVHPrimGlobalId() for an identity that means something on another rank.
+ * The objects are still there, as `bvh->obj`.
+ *
+ * @param bvhA      The A-side hierarchy. primA is always LOCAL to it.
+ * @param primA     Primitive index in @p bvhA.
+ * @param bvhB      The B-side hierarchy.
+ * @param primB     Primitive index in @p bvhB; local or remote.
  * @param user_data Whatever the caller passed through.
  */
-typedef void (*IntersectionCallback)(const MFTL_Object *objA, int primA, const MFTL_Object *objB, int primB, void *user_data);
+typedef void (*IntersectionCallback)(const MFTL_BVH *bvhA, int primA, const MFTL_BVH *bvhB, int primB, void *user_data);
 
 /**
  * @brief Reports every contacting primitive pair between two hierarchies.
@@ -594,9 +667,12 @@ typedef void (*IntersectionCallback)(const MFTL_Object *objA, int primA, const M
  *
  * @param objA      The object @p bvhA was built from.
  * @param bvhA       Hierarchy over object A. Refitted if its geometry moved.
- * @param objB      The object @p bvhB was built from. May be the same object as
- *                  @p objA only if the two BVHs are distinct; a BVH against
- *                  itself is not a self-intersection query and is not supported.
+ * @param objB      The object @p bvhB was built from. May be the SAME object as
+ *                  @p objA, with two distinct hierarchies: that is the
+ *                  self-proximity query, in which pairs sharing a vertex are
+ *                  dropped and each unordered pair is reported once (see
+ *                  MFTL_BVHBuildParams::self_pairs) -- filtered before the exact
+ *                  narrow phase, which is where the cost of a self query is.
  * @param bvhB       Hierarchy over object B.
  * @param callback  Invoked per contacting pair. Must not modify either object.
  * @param user_data Passed through to @p callback untouched.
@@ -643,10 +719,11 @@ void MFTL_IntersectObjects(const MFTL_Object *objA, MFTL_BVH *bvhA, const MFTL_O
  * @return MFTL_SUCCESS, or MFTL_ERROR on invalid arguments.
  *
  * @note Tests every unordered pair of distinct bodies whose extents are within
- *       `MAX(tol_A, tol_B)` of each other, with the smaller body id as A. A
- *       single body is therefore a no-op: self-intersection of one surface is a
- *       different algorithm (adjacent triangles share vertices and always
- *       "touch"), and it is deliberately not what this does.
+ *       `MAX(tol_A, tol_B)` of each other, with the smaller body id as A --
+ *       and, with `params->self_pairs`, every body against ITSELF, minus the
+ *       triangle pairs that share a vertex (adjacent triangles always "touch",
+ *       which is why self-proximity is opt-in and filtered). Without it a
+ *       single body is a no-op.
  * @note The guard is on `n_bodies_global`, never on the local count: everything
  *       below it is collective, so the test has to be one every rank makes
  *       identically.

@@ -728,7 +728,7 @@ static int test_vertex_normals_match_serial_reference(void)
   /* Rank 0 still holds the complete mesh, so its answer is the ground truth. */
   if (g_rank == 0)
   {
-    MFTLComputeVertexNormals(obj);
+    MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
     for (int v = 0; v < obj->verts.n; ++v)
     {
       const int g = obj->verts.rec[v].global_id;
@@ -739,7 +739,7 @@ static int test_vertex_normals_match_serial_reference(void)
 
   MFTLRedistribute(ens);
   refresh_geometry(ens);
-  MFTLComputeVertexNormals(obj);
+  MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
 
   int ok = 1;
   for (int v = 0; v < obj->verts.n_local; ++v)
@@ -818,7 +818,7 @@ static int test_ghost_vertex_normals_are_exact(void)
   /* Rank 0 still holds the complete mesh, so its answer is the ground truth. */
   if (g_rank == 0)
   {
-    MFTLComputeVertexNormals(obj);
+    MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
     for (int v = 0; v < obj->verts.n; ++v)
     {
       const int g = obj->verts.rec[v].global_id;
@@ -835,7 +835,7 @@ static int test_ghost_vertex_normals_are_exact(void)
   /* 1. Without the exchange, the ghosts hold partial sums. If this rank has any
    *    ghost at all, at least one of them must DISAGREE -- if they all agreed,
    *    the test below would be proving nothing. */
-  MFTLComputeVertexNormals(obj);
+  MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
   int local_ghost_wrong = 0;
   for (int v = obj->verts.n_local; v < obj->verts.n; ++v)
   {
@@ -854,7 +854,7 @@ static int test_ghost_vertex_normals_are_exact(void)
   }
 
   /* 2. With the exchange, every vertex in the pool is exact. */
-  TEST_ASSERT(agreed(MFTLEnsembleUpdateVertexNormals(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLEnsembleUpdateVertexNormals(ens, MFTL_NORMAL_WEIGHT_AREA) == MFTL_SUCCESS, MPI_COMM_WORLD));
 
   int ok = 1;
   for (int v = 0; v < obj->verts.n; ++v)
@@ -885,7 +885,7 @@ static int test_ghost_syncs_leave_topology_current(void)
 
   TEST_ASSERT(agreed(MFTLObjectHasTopology(obj), MPI_COMM_WORLD));
 
-  TEST_ASSERT(agreed(MFTLEnsembleUpdateVertexNormals(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLEnsembleUpdateVertexNormals(ens, MFTL_NORMAL_WEIGHT_AREA) == MFTL_SUCCESS, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(MFTLObjectHasTopology(obj), MPI_COMM_WORLD));
 
   TEST_ASSERT(agreed(MFTLUpdateGhostPositions(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));

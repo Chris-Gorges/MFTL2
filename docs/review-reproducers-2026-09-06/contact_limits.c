@@ -3,7 +3,7 @@
 #include <string.h>
 #include "mftl_core.h"
 
-static void hit(const MFTL_Object *a, int ia, const MFTL_Object *b, int ib, void *data)
+static void hit(const MFTL_BVH *a, int ia, const MFTL_BVH *b, int ib, void *data)
 {
   (void)a; (void)ia; (void)b; (void)ib;
   ++*(int *)data;

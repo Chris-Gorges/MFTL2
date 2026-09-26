@@ -29,6 +29,7 @@
 #ifndef MFTL_MESHGEN_H
 #define MFTL_MESHGEN_H
 
+#include "mftl_geometry.h"
 #include "mftl_types.h"
 
 /**
@@ -167,5 +168,131 @@ int MFTLGenerateSphereLocal(MFTL_Object *object, double center[3], double radius
  * @return #MFTL_SUCCESS, or #MFTL_ERROR on a NULL ensemble.
  */
 int MFTLPublishGeneratedBodies(MFTL_Ensemble *ens);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Marching cubes  (see src/mesh_creation/marching_cubes.c)
+ *
+ * ## CUBE CONVENTIONS
+ *
+ * Corner c of a cell is at offset (c & 1, (c >> 1) & 1, (c >> 2) & 1) from the
+ * cell's lower node. Edge e runs along axis a = e / 4 from its lower corner,
+ * whose offsets on the other two axes b = (a+1)%3 and c = (a+2)%3 are
+ * (e & 1) and ((e >> 1) & 1). A case MASK has bit c set when corner c is
+ * INSIDE (negative).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/** @brief Most triangles one cell can produce, centroid fallback included. */
+#define MFTL_MC_MAX_CASE_TRIANGLES 12
+/** @brief Most separate surface pieces one cell can hold. */
+#define MFTL_MC_MAX_CASE_POLYGONS 4
+/** @brief Vertex index 12 + p in a case triangle is the centroid of polygon p. */
+#define MFTL_MC_CENTROID 12
+
+/**
+ * @struct MFTL_MarchingCubesCase
+ * @brief The triangulation of one of the 256 sign patterns of a cell.
+ *
+ * Generated once, from ONE face rule, rather than typed in: see
+ * src/mesh_creation/marching_cubes.c for the rule and for why it makes the
+ * surface crack-free and manifold across every pair of neighbouring cells.
+ */
+typedef struct MFTL_MarchingCubesCase
+{
+  int n_tris;  ///< Triangles in this case.
+  /** Corner vertices: a cube edge in [0, 12), or #MFTL_MC_CENTROID + p. Wound so
+   *  the normal points from inside (negative) to outside (positive). */
+  signed char tri[MFTL_MC_MAX_CASE_TRIANGLES][3];
+  int n_polys;  ///< Separate surface pieces (closed edge loops) in the cell.
+  int poly_len[MFTL_MC_MAX_CASE_POLYGONS];  ///< Vertices of each loop.
+  signed char poly[MFTL_MC_MAX_CASE_POLYGONS][12];  ///< Cube edges of each loop, in winding order.
+  int n_centroids;  ///< Loops that needed a centroid vertex. Zero for every case in practice; see the tests.
+} MFTL_MarchingCubesCase;
+
+/**
+ * @brief The triangulation of case @p mask.
+ * @param mask Bit c set when corner c is inside. 0..255.
+ * @return The case; generated on first use and then read-only.
+ */
+const MFTL_MarchingCubesCase *MFTLMarchingCubesCase(int mask);
+
+/**
+ * @struct MFTL_LevelSetSurface
+ * @brief An extracted iso-surface as a triangle soup with LATTICE identities.
+ *
+ * Every vertex carries the key of the lattice edge it lies on and every
+ * triangle the key of the cell that produced it, both computed from WRAPPED
+ * global lattice indices. Two extractions of overlapping cell ranges -- on two
+ * ranks, say -- therefore name a shared vertex identically without comparing a
+ * single coordinate, and produce it at bit-identical positions from
+ * bit-identical node values.
+ *
+ * Keys: node `(i, j, k)` has linear index `(k * N_y + j) * N_x + i` over
+ * `n_global`; a lattice-edge vertex is `3 * node + axis`; a cell is its lower
+ * node's index; a centroid vertex is `-(16 * cell + polygon) - 2`, negative so
+ * it can never collide with an edge key.
+ */
+typedef struct MFTL_LevelSetSurface
+{
+  double *pos;  ///< [3*n_verts] positions from WRAPPED lattice nodes: bit-identical on every rank; a seam-crossing triangle has corners a period apart.
+  long long *vkey;  ///< [n_verts] lattice identity of each vertex.
+  int n_verts;  ///< Vertices.
+  int cap_verts;  ///< Allocated vertex slots.
+  int *tri;  ///< [3*n_tris] vertex indices, normals pointing to phi > 0.
+  long long *tcell;  ///< [n_tris] key of the cell each triangle came from.
+  signed char *tslot;  ///< [n_tris] triangle's index within its cell's case, < 16.
+  int n_tris;  ///< Triangles.
+  int cap_tris;  ///< Allocated triangle slots.
+} MFTL_LevelSetSurface;
+
+/**
+ * @brief Marching cubes over the cells `[cell_lo, cell_hi]` of a grid window.
+ *
+ * A cell is extracted iff all eight corners are inside the window and none is
+ * #MFTL_SDF_UNKNOWN. Values within `snap * min(spacing)` of zero are pushed out
+ * to that distance, sign preserved and zero counted as positive, so no vertex
+ * lands on a lattice node and no triangle comes out with a zero-length edge.
+ *
+ * Vertices on a lattice edge are shared between the cells of one call (one
+ * vertex per edge, whichever cell reaches it first). A range on a periodic axis
+ * must not exceed one period, or a cell would be extracted twice.
+ *
+ * @param      grid    The window.
+ * @param      cell_lo First cell per axis, as a GLOBAL (unwrapped) lower-node index.
+ * @param      cell_hi Last cell per axis, inclusive.
+ * @param      snap    Relative snap distance, e.g. 1e-2. 0 disables it (then a
+ *                     node exactly at zero is still counted as positive).
+ * @param[out] out     Appended to; zero-initialise before the first call.
+ * @return The number of triangles appended.
+ * @rank_local
+ */
+int MFTLExtractLevelSet(const MFTL_SdfGrid *grid, const int cell_lo[3], const int cell_hi[3], double snap, MFTL_LevelSetSurface *out);
+
+/**
+ * @brief Releases a surface's arrays and zeroes it.
+ * @param s The surface.
+ */
+void MFTLLevelSetSurfaceFree(MFTL_LevelSetSurface *s);
+
+/**
+ * @brief Triangulates the zero level set of a whole grid into an EMPTY object.
+ *
+ * MFTLExtractLevelSet() over every cell of the window, positions wrapped into
+ * the object's domain, then MFTLBuildIndexedMesh() -- so the result obeys every
+ * convention that function establishes, including the mesh boundary: where the
+ * level set leaves the window the surface is open, and those half-edges carry
+ * MFTL_FLAG_BOUNDARY. Outward normals point to phi > 0.
+ *
+ * A level set that does not cross the window leaves the object empty (with its
+ * derived arrays marked current) and returns success.
+ *
+ * @param obj  An EMPTY object linked to a domain.
+ * @param grid The values. On a periodic axis a window of exactly one period
+ *             closes the surface across the seam.
+ * @param snap Relative snap distance; see MFTLExtractLevelSet().
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on invalid input.
+ * @rank_local No MPI: the caller owns the global bookkeeping, exactly as for
+ *             MFTLBuildIndexedMesh().
+ */
+int MFTLBuildMeshFromLevelSet(MFTL_Object *obj, const MFTL_SdfGrid *grid, double snap);
 
 #endif  // MFTL_MESHGEN_H

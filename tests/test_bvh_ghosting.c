@@ -258,10 +258,10 @@ typedef struct
   int self_pairs;  ///< Events where objA == objB. Must always be zero.
 } collector;
 
-static void collect(const MFTL_Object *objA, int primA, const MFTL_Object *objB, int primB, void *user_data)
+static void collect(const MFTL_BVH *bvhA, int primA, const MFTL_BVH *bvhB, int primB, void *user_data)
 {
   collector *const c = (collector *) user_data;
-  if (objA == objB) c->self_pairs++;
+  if (bvhA->obj == bvhB->obj) c->self_pairs++;
 
   const long long ga = MFTL_BVHPrimGlobalId(c->ba, primA);
   const long long gb = MFTL_BVHPrimGlobalId(c->bb, primB);
@@ -271,10 +271,9 @@ static void collect(const MFTL_Object *objA, int primA, const MFTL_Object *objB,
 /**
  * @brief Counts events without naming them.
  *
- * For the ensemble entry point, which owns its BVHs internally and hands the
- * callback only the objects -- so there is no hierarchy to resolve a primitive
- * index against, and the pair identity is not available. That is fine for the
- * statements that are about HOW MANY and about WHICH OBJECTS.
+ * For the statements that are about HOW MANY and about WHICH OBJECTS. The
+ * ensemble entry point now hands the callback its hierarchies, so the pair
+ * identity IS available there too -- see collect_resolved() below.
  */
 typedef struct
 {
@@ -282,13 +281,33 @@ typedef struct
   int self;
 } tally;
 
-static void count_pairs(const MFTL_Object *objA, int primA, const MFTL_Object *objB, int primB, void *user_data)
+static void count_pairs(const MFTL_BVH *bvhA, int primA, const MFTL_BVH *bvhB, int primB, void *user_data)
 {
   (void) primA;
   (void) primB;
   tally *const t = (tally *) user_data;
   t->hits++;
-  if (objA == objB) t->self++;
+  if (bvhA->obj == bvhB->obj) t->self++;
+}
+
+/**
+ * @brief Records every event as (body A, body B, triangle A, triangle B), each
+ *        primitive resolved through its OWN hierarchy.
+ *
+ * Possible only since the callback receives the hierarchies: a B primitive that
+ * arrived through the spatial halo resolves to the patch, whose ids are the
+ * body's real ones. That is what turns the ensemble pipeline's test from a COUNT
+ * into a multiset comparison -- and a count cannot see a duplicate that cancels
+ * a miss.
+ */
+static void collect_resolved(const MFTL_BVH *bvhA, int primA, const MFTL_BVH *bvhB, int primB, void *user_data)
+{
+  keyset *const ks = (keyset *) user_data;
+  int ta, tb;
+  const MFTL_Object *const oa = MFTL_BVHPrimTriangle(bvhA, primA, &ta);
+  const MFTL_Object *const ob = MFTL_BVHPrimTriangle(bvhB, primB, &tb);
+  const long long body_pair = (long long) oa->global_id * 256 + ob->global_id;
+  ks_push(ks, (body_pair << (2 * KEY_SHIFT)) + ((long long) oa->tris.rec[ta].global_id << KEY_SHIFT) + ob->tris.rec[tb].global_id);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -1848,6 +1867,7 @@ static int test_the_broad_phase_finds_the_pairs_without_enumerating_them(void)
 
   /* ── The oracle, while rank 0 holds everything ─────────────────────────── */
   int ref_hits = 0;
+  keyset ref_set = {MFTL_NULL, 0, 0};
   if (g_rank == 0)
   {
     /* The envelope each body would be judged at. Every body is the same size
@@ -1865,6 +1885,8 @@ static int test_the_broad_phase_finds_the_pairs_without_enumerating_them(void)
         keyset one = {MFTL_NULL, 0, 0};
         brute_contacts(bodyv(i), bodyv(j), tol, &one);
         ref_hits += one.n;
+        const long long body_pair = (long long) bodyv(i)->global_id * 256 + bodyv(j)->global_id;
+        for (int q = 0; q < one.n; ++q) ks_push(&ref_set, (body_pair << (2 * KEY_SHIFT)) + one.k[q]);
         ks_free(&one);
       }
     }
@@ -1887,6 +1909,24 @@ static int test_the_broad_phase_finds_the_pairs_without_enumerating_them(void)
     if (g_rank == 0 && got != ref_hits) printf("\n  [broad-phase] exhaustive sweep %d contacts, pipeline %d\n  ", ref_hits, got);
     TEST_ASSERT(agreed(got == ref_hits, MPI_COMM_WORLD));
     TEST_ASSERT(agreed(self == 0, MPI_COMM_WORLD));
+  }
+
+  /* ── And the same as a MULTISET of named pairs, not just a count ──────── */
+  {
+    keyset mine = {MFTL_NULL, 0, 0}, all = {MFTL_NULL, 0, 0};
+    TEST_ASSERT(agreed(MFTLEnsembleIntersectObjects(g_ens, &p, collect_resolved, &mine) == MFTL_SUCCESS, MPI_COMM_WORLD));
+    ks_gather(&mine, &all);
+    int same = 1;
+    if (g_rank == 0)
+    {
+      ks_sort(&ref_set);
+      same = ks_equal(&ref_set, &all, "broad-phase set");
+    }
+    MPI_Bcast(&same, 1, MPI_INT, 0, MPI_COMM_WORLD);
+    ks_free(&mine);
+    ks_free(&all);
+    ks_free(&ref_set);
+    TEST_ASSERT(agreed(same, MPI_COMM_WORLD));
   }
 
   /* ── TIGHT: what the broad phase actually proposed ─────────────────────── */

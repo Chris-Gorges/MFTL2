@@ -1,4 +1,8 @@
-# Fails if any source in src/remeshing/ outside remesh_comm.{c,h} calls MPI.
+# Fails if any source in SRC_DIR outside the ALLOWED files calls MPI.
+#
+# Used for two modules: src/remeshing/ (ALLOWED defaults to remesh_comm.{c,h})
+# and src/topology_change/ (ALLOWED=topo_comm.c). What follows was written for
+# the first and holds for the second for the same reason.
 #
 # The remeshing module reaches the network through exactly one file. Everything
 # else -- the operators, the smoother, the compaction, and both distributed
@@ -22,7 +26,12 @@ endif()
 
 file(GLOB _sources "${SRC_DIR}/*.c" "${SRC_DIR}/*.h")
 
-set(_allowed "remesh_comm.c" "remesh_comm.h")
+if(DEFINED ALLOWED)
+  string(REPLACE "," ";" _allowed "${ALLOWED}")
+else()
+  set(_allowed "remesh_comm.c" "remesh_comm.h")
+endif()
+list(GET _allowed 0 _home)
 set(_offenders "")
 
 foreach(_f IN LISTS _sources)
@@ -47,8 +56,8 @@ if(_offenders)
     message("  ${_o}")
   endforeach()
   message(FATAL_ERROR
-          "MPI calls found outside src/remeshing/remesh_comm.c. Every collective and every "
-          "point-to-point the remesher makes belongs in that file; see its header for why.")
+          "MPI calls found outside ${SRC_DIR}/${_home}. Every collective and every "
+          "point-to-point the module makes belongs in that file; see its header for why.")
 endif()
 
-message(STATUS "remeshing MPI confinement: OK")
+message(STATUS "MPI confinement of ${SRC_DIR}: OK")

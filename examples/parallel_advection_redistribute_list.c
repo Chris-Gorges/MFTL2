@@ -775,7 +775,7 @@ int main(int argc, char **argv)
        * leaves every GHOST vertex holding a partial sum -- correctly normalised
        * and quietly wrong. This adds one ghost exchange and makes the field
        * exact for the whole pool. */
-      if (cfg.normals) MFTLEnsembleUpdateVertexNormals(ens);
+      if (cfg.normals) MFTLEnsembleUpdateVertexNormals(ens, MFTL_NORMAL_WEIGHT_AREA);
       t_extra += MPI_Wtime() - t0;
     }
 

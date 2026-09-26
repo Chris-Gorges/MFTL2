@@ -244,3 +244,51 @@ int MFTLCheckMeshIntegrity(const MFTL_Object *obj)
 
   return ok;
 }
+
+int MFTLLabelConnectedComponents(const MFTL_Object *obj, int *labels)
+{
+  MFTL_ASSERT(obj != MFTL_NULL);
+
+  const int nt = obj->tris.n;
+  if (nt <= 0) return 0;
+
+  /* One allocation: the labels when the caller wants none, then the queue. */
+  int *const scratch = (int *) MFTLMallocOrDie((size_t) (labels ? nt : 2 * nt) * sizeof(int), "MFTLLabelConnectedComponents");
+  int *const lab = labels ? labels : scratch + nt;
+  int *const queue = scratch;
+
+  for (int t = 0; t < nt; ++t) lab[t] = MFTL_ERROR;
+
+  const MFTL_HalfEdge *const he = obj->tris.he;
+  int n_comp = 0;
+
+  /* Seeds in ascending triangle index, so a component's label is the order of
+   * its smallest triangle -- a function of the pool alone, not of the sweep. */
+  for (int seed = 0; seed < nt; ++seed)
+  {
+    if (lab[seed] != MFTL_ERROR) continue;
+
+    int head = 0, tail = 0;
+    queue[tail++] = seed;
+    lab[seed] = n_comp;
+
+    while (head < tail)
+    {
+      const int t = queue[head++];
+      for (int k = 0; k < 3; ++k)
+      {
+        const int tw = he[3 * t + k].twin_idx;
+        if (tw == MFTL_ERROR) continue;
+        const int u = MFTLHeTriIdx(tw);
+        MFTL_ASSERT(u >= 0 && u < nt && "MFTLLabelConnectedComponents: twin outside the pool");
+        if (lab[u] != MFTL_ERROR) continue;
+        lab[u] = n_comp;
+        queue[tail++] = u;
+      }
+    }
+    n_comp++;
+  }
+
+  free(scratch);
+  return n_comp;
+}
