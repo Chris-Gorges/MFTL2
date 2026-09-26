@@ -126,6 +126,8 @@ void MFTLObjectDestroy(MFTL_Object** p_object)
 
   // Free Data Pools
   free(object->vertices);
+  free(object->wind_gen);  // Stage 16B
+  free(object->bcurve);  // Stage 16C
   free(object->triangles);
   free(object->half_edges);
 

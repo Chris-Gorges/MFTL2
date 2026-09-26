@@ -78,4 +78,43 @@ typedef enum
 #define MFTL_FLAG_VISITED (1 << 3)  // 0000 1000 - Element evaluated in current remeshing pass
 #define MFTL_FLAG_FEATURE (1 << 4)  // 0001 0000 - Element is a sharp feature (do not smooth across)
 
+// Stage 16C (plans/16 §4.2/§4.3): vertex flag bits (packed with the vertex flags)
+#define MFTL_VFLAG_CURV_UNDEFINED (1 << 8)  // curvature not computed: open (boundary) or incomplete fan
+#define MFTL_VFLAG_CURV_EXTRAPOLATED (1 << 9)  // curv_extrap holds an open-stencil paraboloid estimate
+#define MFTL_VFLAG_CORNER (1 << 10)  // boundary corner (input/application tag): never moved/merged/collapsed
+
+// Stage 16C (plans/16 §4.4.4): per-body remesh mode
+#define MFTL_REMESH_MODE_DEFAULT 0  // closed: Stage-15 path (parity when mftl1_criteria); open: generalized
+#define MFTL_REMESH_MODE_GENERALIZED 1  // explicit opt-in of a closed body into the generalized remesher
+
+// Stage 16C (plans/16 §4.3): boundary-curve modes per boundary tag
+#define MFTL_BCURVE_REPRESENTED 0  // interpolating Catmull-Rom spline through the loop's vertices (default)
+#define MFTL_BCURVE_CONSTRAINED 1  // application projector: new/moved boundary vertices are projected
+#define MFTL_BOUNDARY_CORNER_ANGLE_DEFAULT 30.0  // degrees (plans/16 §4.3)
+
+// =============================================================================
+// Stage 16A: half-edge twin states (plans/16 §2.1)
+// =============================================================================
+// Every live half-edge of a QUIESCENT mesh is exactly one of
+//   LOCAL    : twin_idx >= 0, twin_gid == half_edges[twin_idx].global_id
+//   REMOTE   : twin_idx == -1, twin_gid >= 0 (live twin on another rank, names h back)
+//   BOUNDARY : twin_idx == -1, twin_gid == MFTL_TWIN_NONE - tag (tag >= 0)
+// MFTL_TWIN_UNKNOWN (== MFTL_ERROR) is legal only inside an operation (remesh pass,
+// staged copy before MFTLObjectCommitCopy) and is rejected by MFTLValidateTwinStates.
+#define MFTL_TWIN_UNKNOWN (-1)
+#define MFTL_TWIN_NONE (-2)
+
+// MFTLVertexRing classification
+#define MFTL_RING_CLOSED 0  // interior vertex, closed fan
+#define MFTL_RING_OPEN_COMPLETE 1  // fan runs BOUNDARY -> BOUNDARY (boundary vertex)
+#define MFTL_RING_INCOMPLETE 2  // the fan walk reaches a REMOTE half-edge (or is malformed)
+
+// MFTLObjectCommitCopy modes (plans/16 §2.2)
+#define MFTL_COMMIT_ASSEMBLE 0  // every non-LOCAL half-edge must resolve to a live partner
+#define MFTL_COMMIT_CUT 1  // unresolved copies of existing source twins become BOUNDARY (new tag)
+
+// MFTLValidateTwinStatesEx flags
+#define MFTL_VALIDATE_GHOSTS (1 << 0)  // also check G1/G2 (after a redistribution)
+#define MFTL_VALIDATE_CHEAP (1 << 1)  // local: states, LOCAL symmetry and G1 only (Release quiescent points)
+
 #endif

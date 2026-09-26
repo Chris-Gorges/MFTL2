@@ -1,6 +1,6 @@
 # 00 — Overview: reimplementing MFTL1 functionality in MFTL2
 
-Status: IN PROGRESS — Stages 01–13 accepted; 14 IMPLEMENTED (awaiting independent acceptance); 15 ACCEPTED (independent review 2026-09-23); 16 planned
+Status: IN PROGRESS — Stages 01–13 accepted; 14 IMPLEMENTED (awaiting independent acceptance); 15 ACCEPTED (independent review 2026-09-23); 16 (generalized surfaces) **ACCEPTED / COMPLETE (2026-09-25)** — 16A–16E ACCEPTED (independent reviews 2026-09-24/25), 16F final validation ACCEPTED (2026-09-25, `plans/16` §28); 17 (cleanup + manual) planned; 18 (performance) to be planned
 Depends on: —
 Implemented by:
 Reviewed by:
@@ -336,22 +336,108 @@ comments (math helpers are local, `ftvectorops.h`).
   exact collapse-survivor parity NOT needed; should-fix items (SERIAL mode ignores
   boundary_cleanup, guaranteed ghost completion for assembled bodies, redundant redistribution,
   test_stage15 instrumentation) and coverage gaps (marching cubes / MoveIBM end to end) listed in
-  `plans/15` §R6–R7 for Stage 16.
-- *Deferred to Stage 16:* remaining scale-dependent absolute thresholds, the pre-existing zero-mass result of
+  `plans/15` §R6–R7 — now Stage 17 (renumbered), except R6.2 (guaranteed ghost completion),
+  which is folded into Stage 16A.
+- *Deferred to Stage 17:* remaining scale-dependent absolute thresholds, the pre-existing zero-mass result of
   multiflow's surface-scalar solver in the FT test configuration, repository-wide formatting.
 
-**Stage 16 (code-quality/documentation cleanup + MFTL2 manual) — PLANNED, NOT STARTED.** Runs
-**only after Stage 15 is complete and fully accepted**, when the code, public API, and multiflow
-coupling are stable. Purpose: a repository-wide, **behaviour-preserving** cleanup —
-(16A) comments/file-header standardization and terminology, (16B) internal naming/style
-(public API, types, macros, struct fields and MPI packed layouts frozen), (16C) directory/file
-reorganization, large-file splits and de-duplication (bit-identical), public/private header
-separation, and (16D) a new LaTeX MFTL2 manual under `doc/` conceptually modelled on MFTL1's
-`mftl-doc/MFTL.tex` but describing the actual half-edge/array/`khash`/periodic MFTL2, closed by
-(16E) a full consistency + regression gate. No intended numerical change; no public-API change
-without explicit approval; behaviour/perf fixes surfaced during cleanup (linear-search→hash,
+**Stage 16 (generalized surfaces: periodic and open triangulated objects) — ACCEPTED / COMPLETE
+(2026-09-25; final validation 16F, `plans/16` §28):
+16A ACCEPTED (independent review 2026-09-24); §3.6 revision 3.2 INDEPENDENTLY REVIEWED AND FROZEN
+(2026-09-24, errata E1–E8); 16B ACCEPTED (independent review 2026-09-24, with fixes to
+winding validity, periodic transforms and the generated-test build; `plans/16` §20, §21); 16C
+ACCEPTED (independent review 2026-09-24, after one fix; `plans/16` §22, §23); 16D ACCEPTED
+(independent review 2026-09-25, after fixes R16D-1 to R16D-5; `plans/16` §24, §25); 16E
+ACCEPTED (independent review 2026-09-25, after corrections C16E-1 to C16E-6; `plans/16` §26,
+§27; gap C16E-7 closed in 16F); 16F ACCEPTED (2026-09-25, `plans/16` §28)**
+(`plans/16-generalized-surfaces.md`).
+One surface model for both
+capabilities and their combination. Substages, each gated (closed non-periodic behaviour
+bit-identical to Stage 15 at every gate):
+- *16A topology/invariants:* three strict half-edge states — LOCAL, REMOTE (MPI rim,
+  `twin_gid ≥ 0` naming a live twin), BOUNDARY (`twin_gid = −2 − tag`); no unknown state;
+  maintained explicitly by every operator (incl. `glue_wings`, copy/commit ASSEMBLE/CUT) and
+  validated collectively at quiescent points; remote-twin discovery (global mode with any
+  authoritative holder before ownership exists; after redistribution geometric candidates
+  with the global maximum edge length + margin, then an always-executed global fallback) giving guaranteed ghost completion (every edge of an owned
+  triangle LOCAL or BOUNDARY; complete owned fans); manifold/orientable builder validation;
+  distributed boundary loops with persistent tags.
+- *16B periodic image representation:* persistent per-vertex per-axis image counters
+  (`img[3]`, continuous coordinate `pos + img·L` evaluated relative to reference points; the
+  only structural change — `PackedVertex` and native I/O v2), every vertex update a
+  minimum-image displacement from an anchor, homological winding (cycle sums of edge lattice
+  shifts) with canonicalisation after every assembly event, no object-extent restriction (only
+  per-edge < half period); phase-boundary sets with DEFINED / UNDEFINED / UNSUPPORTED status:
+  separating iff closed (or wall-closed), net flux/homology Φ(S) = 0 and consistent
+  orientation; evaluation along an admissible axis in a canonical relative gauge, otherwise
+  UNSUPPORTED; class-guarded remesh drivers.
+- *16C kernels + remeshing:* local-frame kernels, boundary conormal/tangent geometry, curvature
+  validity flags, boundary curve (represented spline or application projector), corners,
+  augmented (virtual-vertex) link condition for collapses in serial and parallel.
+- *16D multiflow integration:* explicit `PeriodicFronts` / `OpenSurface` / phase sets,
+  enforced capability matrix, adapter class checks (no bypass), per-body remesh criteria
+  (closed bodies → Stage-15 parity periodic or not; open → generalized; closed generalized
+  only by opt-in), periodic `FTDomain`, conversion of the
+  131 raw-position sites, marching cubes in continuous coordinates, IBM open bodies only for
+  force coupling or with explicit mass properties. Review fixes (§25): corner-threshold
+  initialisation in `MFTLInitRemeshParams`; generalized bodies always remeshed with the two-pass
+  shift scheme; capability re-check of the bodies created by marching cubes; periodic marching
+  cubes at factor 1 only (factor > 1 rejected); iterated volume recovery after a periodic
+  reconstruction. D5 and D6 run and passed.
+- *16E boundary models:* surface-scalar NEUMANN/DIRICHLET loop BCs; surface tension REJECT
+  (default) / PINNED (reaction on a declared support), CSF only when pinned on a wall closure;
+  contact lines reserved for a later stage. Implemented 2026-09-25 (§26): per-tag
+  `SurfaceScalarBC`, `SurfaceTensionBoundary … PINNED STATIC` (static supports; IBM/DEM supports
+  UNSUPPORTED in Stage 16), `PhaseSetMember` + `WallClosure` (Poisson indicator with Neumann
+  closure faces, wall-closed volume recovery, CSF/IRL non-periodic only), extended capability
+  matrix. Review corrections (§27): Frenet surface tension on a pinned open surface no longer needs
+  the indicator (single-phase fluid; the indicator/CSF/volume rows keep the wall closure); the
+  Dirichlet distance is the normal distance h_T/3 (the midpoint distance was first order on skewed
+  boundary triangles) with the sliver floor max(δ_e, 0.1 L_e) (the frozen 0.1 h_T could never
+  act); multiflow CMake composes `CMAKE_C_FLAGS` instead of replacing it (sanitizers now really
+  instrument multiflow) and `FT_SCALAR_TRANSPORT` is the option `MF3_FT_SCALAR_TRANSPORT`; the
+  MFTL2 parallel remesh clamp keeps declared-open bodies in the closed box (pinned rims stay exactly
+  on their wall); the validation is versioned in `multiflow/testcases/FT_Stage16E`.
+- *16F validation:* invariant fuzzing with exactly-once ownership, link-condition pinch/ear/loop
+  cases, dyadic seam/corner translation invariance, ribbon/film/slab phase sets, Gauss–Bonnet,
+  pinned-cap force balance, Dirichlet diffusion, scalar conservation, mixed ensembles, restart on
+  a different rank count, geometry scales 1e-4/1e4, np 1/2/4/8 incl. 1- and 2-slab periodic
+  decompositions. **Executed and accepted 2026-09-25 (§28):** the phase set is re-classified after every
+  geometry change a phase-dependent module relies on (C16E-7: advection, remeshing, volume
+  recovery; a wall-closed cap pushed through its wall stops before the indicator uses the invalid
+  set); minimal fixes: unchecked volume / inertia also reject open bodies (F16F-1), the abort
+  message is collective (F16F-2), suite scripts (F16F-3); all D5/D6/marching-cubes/restart/A-B inputs
+  versioned (`multiflow/testcases/FT_Stage16D`, reproducing the accepted 16D outputs bit for bit),
+  new wrapping-topology test `test_stage16f`; closed legacy A/B bit-identical; periodic
+  seam/edge/corner translation exact to 1e-15; 1 000-step invariant fuzz on 1/2/4/8 ranks;
+  genuinely instrumented multiflow ASan/UBSan clean; capability matrix audited, every requirement
+  classified (§28.13, §28.14). **Stage-16 summary: §28.15.**
+
+**Stage 17 (code-quality/documentation cleanup + MFTL2 manual; formerly Stage 16, renumbered
+2026-09-23) — PLANNED, NOT STARTED.** Runs **only after Stage 16 is complete and accepted**,
+when the code, public API (incl. the generalized surface model) and multiflow coupling are
+stable. Purpose: a repository-wide, **behaviour-preserving** cleanup —
+(17A) comments/file-header standardization and terminology, (17B) internal naming on
+lowerCamelCase (public API, types, macros, struct fields, packed layouts frozen; conventional
+short math/index names kept), (17C) structural cleanup in four individually gated sub-steps —
+17C1 directory/file moves, 17C2 large-file splits, 17C3 de-duplication/shared helpers
+(bit-identical; never combined with the `communication.c` move/split), 17C4 public/private
+header separation (only declarations verified unconsumed by multiflow, examples, tests and
+external `find_package(MFTL2)` consumers may move) — and (17D) a new LaTeX manual at
+`doc/MFTL2.tex` conceptually modelled on MFTL1's `mftl-doc/MFTL.tex` (prose, equations,
+figures, compilable examples) but describing the actual post-Stage-16
+half-edge/array/`khash`/periodic/open-surface MFTL2, with a documented `MFTL2.pdf` build
+target, closed by (17E) a full consistency + regression gate (any repo-wide formatting is one
+isolated final commit). No intended numerical change; no public-API
+change without explicit approval; behaviour/perf fixes surfaced during cleanup (linear-search→hash,
 boundary-cleanup distributed variant, point-query BVH cache, paraboloid tolerance) are
-**documented and deferred**, not performed. Details in `plans/16`. The **winding convention is RESOLVED and APPLIED** (invariant #2): MFTL2
+**documented and deferred** to Stage 18, not performed. Also carries the Stage-15 review
+should-fix items R6.1, R6.3, R6.4 and the R7 coverage gaps. Details in
+`plans/17-code-quality-documentation.md`.
+
+**Stage 18 (performance) — to be planned** after Stage 17: the deferred performance items
+(point-query BVH cache, distributed boundary cleanup, serial TSUR/VCS gathers, per-pass edge
+sort, construction all-gathers, full redistribution in ghost-position updates). The **winding convention is RESOLVED and APPLIED** (invariant #2): MFTL2
 standardizes on **outward winding / `V > 0`** for all closed meshes; the sphere generator
 and the affected sign-pinned tests have been updated and independently reviewed.
 
@@ -452,11 +538,12 @@ counters between gather and serial kernel (rank 0 could otherwise mint colliding
 `12` opaque Data transport (front-tracking prereq).
 `{02,06,07,10,11}` → `13` periodicity completion.
 `14` CFD adapter (early, vs MFTL1) → `15` MFTL1→MFTL2 swap (depends on 02–14; both implemented 2026-09-23; 15 accepted 2026-09-23, 14 awaiting independent acceptance).
-`15` (complete + accepted) → `16` code-quality/documentation cleanup + MFTL2 manual.
+`{13,15}` (accepted) → `16` generalized surfaces (periodic + open) → `17` code-quality/documentation cleanup + MFTL2 manual → `18` performance.
 
 **Critical path to a usable, faster, periodic library**: 01→02→05→06→08→09→10→13.
 **Migration path**: 14 (early, low-risk) then 15 (last).
-**Polish path**: 16 (after migration is done and stable — behaviour-preserving cleanup + manual).
+**Capability path**: 16 (periodic and open triangulated surfaces, after the migration).
+**Polish path**: 17 (after 16 — behaviour-preserving cleanup + manual), then 18 (performance).
 
 ## Top technical risks
 

@@ -61,11 +61,29 @@ int AddHalfEdge(MFTL_Object* obj)
   MFTL_HalfEdge* he = &obj->half_edges[idx];
   he->next_idx = MFTL_ERROR;
   he->twin_idx = MFTL_ERROR;
+  he->twin_gid = MFTL_TWIN_NONE;  // Stage 16A: unpaired = BOUNDARY (tag 0); see FinishOpenMesh
+  he->boundary = true;
   he->vertex_idx = MFTL_ERROR;
   he->triangle_idx = MFTL_ERROR;
   he->flags = MFTL_FLAG_NONE;
   he->global_id = idx;
   return idx;
+}
+
+// Stage 16A: hand-built fans are open bodies; LOCAL pairs get their twin gids and every
+// unpaired half-edge is BOUNDARY (tag 0), with the boundary-vertex out-half-edge convention.
+static void FinishOpenMesh(MFTL_Object* obj)
+{
+  MFTLObjectDeclareOpen(obj, 1);
+  for (int i = 0; i < obj->n_half_edges; ++i)
+  {
+    MFTL_HalfEdge* he = &obj->half_edges[i];
+    if (he->twin_idx >= 0)
+      he->twin_gid = obj->half_edges[he->twin_idx].global_id;
+    else
+      MFTLHeSetBoundary(he, 0);
+  }
+  MFTLRefreshBoundaryCache(obj);
 }
 
 // -----------------------------------------------------------------------------
@@ -285,6 +303,7 @@ void CreateFullOneRing(MFTL_Object* obj, int n_spokes, bool is_closed)
   // Allow boundary vertices to point to boundary edges if free
 
   free(ring_v);
+  FinishOpenMesh(obj);
 }
 
 // -----------------------------------------------------------------------------
@@ -324,6 +343,7 @@ void CreateSingleTriangle(MFTL_Object* obj, int v[3], int he[3], int* tri)
   obj->vertices[v[0]].out_he_idx = he[0];
   obj->vertices[v[1]].out_he_idx = he[1];
   obj->vertices[v[2]].out_he_idx = he[2];
+  FinishOpenMesh(obj);
 }
 
 // -----------------------------------------------------------------------------
@@ -447,7 +467,11 @@ int TestCollapseBoundary()
   // T0: 0-1-2, T1: 0-2-3, T2: 0-3-4.
   // Center 0 is physically shared by all.
   // Boundary edges are: 0->1 and 0->4 (and the ring chain 1-2-3-4).
-  CreateFullOneRing(obj, 4, false);  // 4 spokes -> 3 triangles
+  // Stage 16A: 5 spokes -> 4 triangles. Collapsing spoke 0-2 of the 4-spoke fan would remove
+  // T0, whose two wings are both BOUNDARY (a dangling edge; forbidden by the link condition,
+  // plans/16 §2.2 — the collapse gates reject it). Spoke 0-3 of the 5-spoke fan is admissible:
+  // T1(0-2-3) and T2(0-3-4) each have one BOUNDARY and one LOCAL wing.
+  CreateFullOneRing(obj, 5, false);
 
   TEST_VALIDATE(obj);
 
@@ -477,7 +501,7 @@ int TestCollapseBoundary()
       // Origin is ?
       // Actually, let's just use the twin.
       int twin = obj->half_edges[i].twin_idx;
-      if (twin != MFTL_ERROR && obj->half_edges[twin].vertex_idx == 2)
+      if (twin != MFTL_ERROR && obj->half_edges[twin].vertex_idx == 3)
       {
         he_tocal = twin;
         break;

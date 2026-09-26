@@ -14,6 +14,9 @@
 #include "mftl_core.h"
 #include "mftl_communication.h"
 #include "mftl_remeshing.h"
+#include "mftl_images.h"
+#include "mftl_boundary_internal.h"
+#include "mftl_phase_set.h"
 #include "mftl_topology.h"
 #include "mftl_geometry.h"
 #include "mftl_memory.h"
@@ -26,6 +29,7 @@ static int new_vertex(MFTL_Object *obj)
 
   obj->vertices[idx].out_he_idx = MFTL_ERROR;
   obj->vertices[idx].flags = MFTL_FLAG_NONE;
+  obj->vertices[idx].img[0] = obj->vertices[idx].img[1] = obj->vertices[idx].img[2] = 0;  // set by the operator
   return idx;
 }
 
@@ -55,7 +59,8 @@ static int new_halfedge(MFTL_Object *obj)
   int idx = obj->n_half_edges++;
 
   obj->half_edges[idx].twin_idx = MFTL_ERROR;
-  obj->half_edges[idx].twin_gid = MFTL_ERROR;
+  obj->half_edges[idx].twin_gid = MFTL_TWIN_UNKNOWN;  // set by the operator (Stage 16A)
+  obj->half_edges[idx].boundary = MFTL_FALSE;
   obj->half_edges[idx].next_idx = MFTL_ERROR;
   obj->half_edges[idx].vertex_idx = MFTL_ERROR;
   obj->half_edges[idx].triangle_idx = MFTL_ERROR;
@@ -86,6 +91,10 @@ int MFTLSplitEdge(MFTL_Object *obj, int he_ab_idx)
   // --- 1. Gather Initial Context ---
   MFTL_HalfEdge *he_ab = &obj->half_edges[he_ab_idx];
   int he_ba_idx = he_ab->twin_idx;
+  // Stage 16A: only LOCAL (interior) or BOUNDARY edges are split; a BOUNDARY edge's two halves
+  // inherit its state code (tag).
+  MFTL_ASSERT(!MFTLHeIsRemote(he_ab) && "MFTLSplitEdge: REMOTE edge");
+  const int parent_code = he_ab->twin_gid;
 
   // Vertices of the edge
   int he_next = obj->half_edges[he_ab_idx].next_idx;
@@ -110,7 +119,9 @@ int MFTLSplitEdge(MFTL_Object *obj, int he_ab_idx)
     {
       v_m->pos[i] = v_a->pos[i] + 0.5 * e_ab[i];
     }
-    MFTLApplyPeriodicity(obj->domain, v_m->pos);
+    // Stage 16B displacement rule: anchor a (edge a->M has zero lattice shift)
+    memcpy(v_m->img, v_a->img, 3 * sizeof(int));
+    MFTLWrapPosImg(obj->domain, v_m->pos, v_m->img);
   }
   else
   {
@@ -146,7 +157,7 @@ int MFTLSplitEdge(MFTL_Object *obj, int he_ab_idx)
   obj->half_edges[he_ab_idx].next_idx = he_mc_idx;
   // twin_idx for he_am will be set in the bottom half logic
   obj->half_edges[he_ab_idx].twin_idx = MFTL_ERROR;
-  obj->half_edges[he_ab_idx].twin_gid = MFTL_ERROR;  // A->M is a new edge (re-derived in MFTLFinalizeRemeshing)
+  obj->half_edges[he_ab_idx].twin_gid = MFTL_TWIN_UNKNOWN;  // A->M: set below (LOCAL pair or BOUNDARY)
 
   // HE M->C
   MFTL_HalfEdge *he_mc = &obj->half_edges[he_mc_idx];
@@ -185,6 +196,8 @@ int MFTLSplitEdge(MFTL_Object *obj, int he_ab_idx)
   he_cm->next_idx = he_mb_idx;
   he_cm->twin_idx = he_mc_idx;
   he_cm->global_id = obj->next_halfedge_gid++;  // change this later because in parallel this might not be true
+  he_mc->twin_gid = he_cm->global_id;  // new inner pair: LOCAL
+  he_cm->twin_gid = he_mc->global_id;
 
   // Mark the split segments as visited so the remeshing loop doesn't split them again
   obj->half_edges[he_ab_idx].flags |= MFTL_FLAG_VISITED;
@@ -255,6 +268,13 @@ int MFTLSplitEdge(MFTL_Object *obj, int he_ab_idx)
     he_dm->next_idx = he_ma_idx;
     he_dm->twin_idx = he_md_idx;
     he_dm->global_id = obj->next_halfedge_gid++;  // change this later because in parallel this might not be true
+    obj->half_edges[he_md_idx].twin_gid = he_dm->global_id;  // new inner pair: LOCAL
+    he_dm->twin_gid = obj->half_edges[he_md_idx].global_id;
+    // the split halves of the interior edge: A->M <-> M->A, M->B <-> B->M
+    obj->half_edges[he_ab_idx].twin_gid = obj->half_edges[he_ma_idx].global_id;
+    obj->half_edges[he_ma_idx].twin_gid = obj->half_edges[he_ab_idx].global_id;
+    obj->half_edges[he_mb_idx].twin_gid = obj->half_edges[he_ba_idx].global_id;
+    obj->half_edges[he_ba_idx].twin_gid = obj->half_edges[he_mb_idx].global_id;
 
     // Mark the split segments as visited so the remeshing loop doesn't split them again
     obj->half_edges[he_ba_idx].flags |= MFTL_FLAG_VISITED;
@@ -266,11 +286,19 @@ int MFTLSplitEdge(MFTL_Object *obj, int he_ab_idx)
     }
   }
 
+  else
+  {
+    // BOUNDARY edge: both halves keep the parent's tag (plans/16 §2.2)
+    MFTLHeSetBoundary(&obj->half_edges[he_ab_idx], MFTL_TWIN_NONE - parent_code);
+    MFTLHeSetBoundary(&obj->half_edges[he_mb_idx], MFTL_TWIN_NONE - parent_code);
+  }
+
   // --- 5. Set Vertex Outgoing Edges ---
   // These must be valid, non-deleted outgoing edges
   obj->vertices[v_m_idx].out_he_idx = he_mb_idx;
   obj->vertices[v_a_idx].out_he_idx = he_ab_idx;
-  obj->vertices[v_b_idx].out_he_idx = he_bc_idx;
+  // a boundary vertex keeps its outgoing BOUNDARY half-edge (plans/16 §2.6)
+  if (!MFTLHeIsBoundary(&obj->half_edges[obj->vertices[v_b_idx].out_he_idx])) obj->vertices[v_b_idx].out_he_idx = he_bc_idx;
 
   obj->vertices[v_m_idx].flags |= MFTL_FLAG_VISITED;
 
@@ -278,28 +306,69 @@ int MFTLSplitEdge(MFTL_Object *obj, int he_ab_idx)
 }
 
 // Helper to link twins and bypass a dead edge
-// Connects OuterTwin1 <-> OuterTwin2
+// Connects OuterTwin1 <-> OuterTwin2. Stage 16A (plans/16 §2.2): the merged edge's state
+// follows from the outer half-edges — both LOCAL: a LOCAL pair; one BOUNDARY: the LOCAL one
+// becomes BOUNDARY with that tag. A REMOTE outer half-edge or two BOUNDARY ones are rejected by
+// the collapse gates before any change.
 void glue_wings(MFTL_Object *o, int edge1, int edge2)
 {
   int t1 = o->half_edges[edge1].twin_idx;
   int t2 = o->half_edges[edge2].twin_idx;
+  MFTL_ASSERT(!MFTLHeIsRemote(&o->half_edges[edge1]) && !MFTLHeIsRemote(&o->half_edges[edge2]) && "glue_wings: REMOTE wing");
+  MFTL_ASSERT((t1 != MFTL_ERROR || t2 != MFTL_ERROR) && "glue_wings: two BOUNDARY wings");
 
   if (t1 != MFTL_ERROR)
   {
     o->half_edges[t1].twin_idx = t2;
-    // Safety: Update vertex out pointer
-    int v = o->half_edges[t1].vertex_idx;  // Origin of t2
-    // Actually origin of t1 is target of edge1.
-    // Target of edge1 is the vertex 'C'.
+    if (t2 != MFTL_ERROR)
+    {
+      o->half_edges[t1].twin_gid = o->half_edges[t2].global_id;
+      o->half_edges[t1].boundary = MFTL_FALSE;
+    }
+    else
+    {
+      o->half_edges[t1].twin_gid = o->half_edges[edge2].twin_gid;  // inherits edge2's BOUNDARY code
+      o->half_edges[t1].boundary = MFTLHeIsBoundary(&o->half_edges[t1]);
+    }
+    // Safety: Update vertex out pointer (origin of t1 = target of edge1 = the vertex 'C')
     o->vertices[o->half_edges[edge1].vertex_idx].out_he_idx = t1;
   }
   if (t2 != MFTL_ERROR)
   {
     o->half_edges[t2].twin_idx = t1;
+    if (t1 != MFTL_ERROR)
+    {
+      o->half_edges[t2].twin_gid = o->half_edges[t1].global_id;
+      o->half_edges[t2].boundary = MFTL_FALSE;
+    }
+    else
+    {
+      o->half_edges[t2].twin_gid = o->half_edges[edge1].twin_gid;  // inherits edge1's BOUNDARY code
+      o->half_edges[t2].boundary = MFTLHeIsBoundary(&o->half_edges[t2]);
+    }
     // Safety: Update vertex out pointer
     o->vertices[o->half_edges[edge2].vertex_idx].out_he_idx = t2;
   }
 };
+
+/* Stage 16A collapse admissibility of the twin states (plans/16 §2.2): the edge is LOCAL or
+   BOUNDARY, no wing of a removed triangle is REMOTE, and the two wings of a removed triangle
+   are not both BOUNDARY. */
+static int mftlCollapseStatesOk(const MFTL_Object *obj, int he_ab_idx)
+{
+  const MFTL_HalfEdge *he = &obj->half_edges[he_ab_idx];
+  if (MFTLHeIsRemote(he) || MFTLHeIsUnresolved(he)) return 0;
+  int tri_he[2] = {he_ab_idx, he->twin_idx};
+  for (int s = 0; s < 2; ++s)
+  {
+    if (tri_he[s] == MFTL_ERROR) continue;
+    const int w1 = obj->half_edges[tri_he[s]].next_idx, w2 = obj->half_edges[w1].next_idx;
+    const MFTL_HalfEdge *a = &obj->half_edges[w1], *b = &obj->half_edges[w2];
+    if (MFTLHeIsRemote(a) || MFTLHeIsRemote(b) || MFTLHeIsUnresolved(a) || MFTLHeIsUnresolved(b)) return 0;
+    if (MFTLHeIsBoundary(a) && MFTLHeIsBoundary(b)) return 0;
+  }
+  return 1;
+}
 
 void MFTLCollapseEdge(MFTL_Object *obj, int he_ab_idx)
 {
@@ -438,7 +507,7 @@ void MFTLCollapseEdge(MFTL_Object *obj, int he_ab_idx)
     {
       obj->vertices[v_b_idx].pos[k] = obj->vertices[v_b_idx].pos[k] + 0.5 * e_ba[k];
     }
-    MFTLApplyPeriodicity(obj->domain, obj->vertices[v_b_idx].pos);
+    MFTLWrapPosImg(obj->domain, obj->vertices[v_b_idx].pos, obj->vertices[v_b_idx].img);  // Stage 16B: anchor b
   }
   else
   {
@@ -470,18 +539,38 @@ void MFTLCollapseEdge(MFTL_Object *obj, int he_ab_idx)
   obj->vertices[v_b_idx].flags |= MFTL_FLAG_VISITED;
 }
 
+/* Stage 16A: the one-ring VERTICES of v including, for a boundary vertex (OPEN_COMPLETE fan),
+   the neighbour across the incoming BOUNDARY edge, which MFTLGetVertexOneRingVertices (targets of
+   the outgoing half-edges) misses. Identical to MFTLGetVertexOneRingVertices for closed fans.
+   16C review: returns -1 (buffer untouched) when the ring does not fit into `max` entries; the
+   callers reject the operation. MFTLGetVertexOneRingVertices only asserts its bound, i.e. it
+   overflowed the caller's buffer in Release builds once refinement raised a valence past `max`. */
+static int mftlRingVerticesFull(const MFTL_Object *obj, MFTL_Vertex *v, MFTL_Vertex **out, int max)
+{
+  int nfan = 0;
+  MFTLVertexRing(obj, (int) (v - obj->vertices), MFTL_NULL, 0, &nfan);  // count only (no buffer)
+  if (nfan + 1 > max) return -1;
+  int n = MFTLGetVertexOneRingVertices(obj, v, out, max, MFTL_FALSE);
+  int ring[64], nr = 0;
+  if (MFTLVertexRing(obj, (int) (v - obj->vertices), ring, 64, &nr) == MFTL_RING_OPEN_COMPLETE && nr > 0 && n < max)
+  {
+    const int in_h = obj->half_edges[obj->half_edges[ring[0]].next_idx].next_idx;  // incoming BOUNDARY
+    const int in_prev = obj->half_edges[obj->half_edges[in_h].next_idx].next_idx;
+    MFTL_Vertex *w = &obj->vertices[obj->half_edges[in_prev].vertex_idx];  // its origin
+    int present = 0;
+    for (int i = 0; i < n; ++i)
+      if (out[i] == w) present = 1;
+    if (!present) out[n++] = w;
+  }
+  return n;
+}
+
 // Helper to check if vertex is on boundary (uses the 1-ring logic implicitly)
 static bool IsBoundaryVertex(const MFTL_Object *obj, int v_idx)
 {
-  // Fast check: just see if the circulation hits a null twin
-  MFTL_HalfEdge *start = &obj->half_edges[obj->vertices[v_idx].out_he_idx];
-  MFTL_HalfEdge *curr = start;
-  do
-  {
-    if (curr->twin_idx == MFTL_ERROR) return MFTL_TRUE;
-    curr = &obj->half_edges[obj->half_edges[curr->twin_idx].next_idx];
-  } while (curr != start);
-  return MFTL_FALSE;
+  // Stage 16A: MFTLVertexRing. An incomplete fan (REMOTE rim) is treated like a boundary, as
+  // before; a boundary vertex has an OPEN_COMPLETE fan.
+  return MFTLVertexRing(obj, v_idx, MFTL_NULL, 0, MFTL_NULL) != MFTL_RING_CLOSED;
 }
 
 /**
@@ -593,9 +682,142 @@ static int mftlEdgeIsGeometricallySharp(MFTL_Object* obj, int he_idx, double ang
   return dot < MFTL_COS(angle_degrees * MFTL_PI / 180.0);
 }
 
+/* number of NON-boundary feature (sharp-dihedral) half-edges leaving v (generalized mode: a
+   boundary edge is not a feature; corners are handled by the turning angle) */
+static int mftlInteriorFeatureCount(MFTL_Object *obj, int v)
+{
+  int ring[128], nr = 0, n = 0;
+  if (MFTLVertexRing(obj, v, ring, 128, &nr) == MFTL_RING_INCOMPLETE) return 0;
+  for (int i = 0; i < nr; ++i)
+  {
+    const MFTL_HalfEdge *h = &obj->half_edges[ring[i]];
+    if (MFTLHeIsLocal(h) && (h->flags & MFTL_FLAG_FEATURE)) n++;
+  }
+  return n;
+}
+
+/* Stage 16C (plans/16 §4.4.1): collapse approval of the GENERALIZED remesher (open bodies and
+   closed bodies opted in). The topological test is the augmented link condition only; on top:
+   corners are never collapsed, a boundary vertex never collapses into an interior one, the
+   survivor of a boundary edge lies on the boundary curve and an interior edge with one boundary
+   endpoint keeps the boundary vertex in place (16A S-A5); boundary edges are not features, so
+   boundary loops coarsen as well as refine (16A S-A4). */
+#define MFTL_GENERALIZED_MAX_VALENCE 16
+/* 16C review: splits add a neighbour to each opposite vertex, and flips to the two new edge
+   endpoints; refinement around a vertex left coarse by repeated coarsening raised its valence past
+   the fixed one-ring buffers (flip gate 32, smoothers 32, fits 64; np-8 cycles). A generalized
+   split or flip therefore never raises a valence above this cap (a topological, translation- and
+   decomposition-independent rule; flips still reduce higher valences). */
+#define MFTL_GENERALIZED_MAX_GROW_VALENCE 24
+#define MFTL_FLIP_RING_MAX 128
+
+/* number of neighbour vertices of v (a boundary vertex's full fan plus one), -1 if its fan is not
+   completely stored */
+static int mftlVertexValence(const MFTL_Object *obj, int v)
+{
+  int nfan = 0;
+  const int cls = MFTLVertexRing(obj, v, MFTL_NULL, 0, &nfan);
+  if (cls == MFTL_RING_INCOMPLETE) return -1;
+  return cls == MFTL_RING_OPEN_COMPLETE ? nfan + 1 : nfan;
+}
+
+/* 1 if splitting he keeps both opposite vertices within the growth cap (complete fans only: an
+   opposite vertex whose fan is not stored is not split around) */
+int MFTLGeneralizedSplitValenceOk(const MFTL_Object *obj, int he_idx)
+{
+  const MFTL_HalfEdge *he = &obj->half_edges[he_idx];
+  const int val_c = mftlVertexValence(obj, obj->half_edges[he->next_idx].vertex_idx);
+  if (val_c < 0 || val_c + 1 > MFTL_GENERALIZED_MAX_GROW_VALENCE) return 0;
+  if (MFTLHeIsLocal(he))
+  {
+    const int val_d = mftlVertexValence(obj, obj->half_edges[obj->half_edges[he->twin_idx].next_idx].vertex_idx);
+    if (val_d < 0 || val_d + 1 > MFTL_GENERALIZED_MAX_GROW_VALENCE) return 0;
+  }
+  return 1;
+}
+static int mftlCollapseApprovedGeneralized(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params)
+{
+  MFTL_HalfEdge *he = &obj->half_edges[he_idx];
+  if (he->flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) return MFTL_FALSE;
+  const int v_a = obj->half_edges[obj->half_edges[he->next_idx].next_idx].vertex_idx;
+  const int v_b = he->vertex_idx;
+  if (obj->vertices[v_a].flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) return MFTL_FALSE;
+  if (obj->vertices[v_b].flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) return MFTL_FALSE;
+  const int is_bnd = MFTLHeIsBoundary(he);
+  if (!is_bnd && mftlEdgeIsGeometricallySharp(obj, he_idx, params->feature_angle_threshold)) return MFTL_FALSE;
+
+  // criterion (boundary edges: one triangle; curvature-based criteria fall back to the length
+  // criterion where the curvature is undefined, i.e. at boundary vertices)
+  const int curv_undef = (obj->vertices[v_a].flags | obj->vertices[v_b].flags) & MFTL_VFLAG_CURV_UNDEFINED;
+  if (params->criterion == MFTL_CRITERION_TRIANGLE_AREA)
+  {
+    double a1 = obj->triangles[he->triangle_idx].area, amin = a1;
+    if (MFTLHeIsLocal(he)) amin = fmin(a1, obj->triangles[obj->half_edges[he->twin_idx].triangle_idx].area);
+    if (amin > params->min_area_threshold) return MFTL_FALSE;
+  }
+  else if (params->criterion == MFTL_CRITERION_BOTSCH_KOBBELT_CURVATURE && !is_bnd && !curv_undef)
+  {
+    if (!MFTLBotschKobbeltCurvatureThreshold(obj, he_idx, params, 2)) return MFTL_FALSE;
+  }
+  else if (MFTLGetEdgeLengthSquared(obj, he) > params->min_edge_length_sq)
+    return MFTL_FALSE;
+
+  // complete fans, corners, boundary-into-interior
+  const int cls_a = MFTLVertexRing(obj, v_a, MFTL_NULL, 0, MFTL_NULL);
+  const int cls_b = MFTLVertexRing(obj, v_b, MFTL_NULL, 0, MFTL_NULL);
+  if (cls_a == MFTL_RING_INCOMPLETE || cls_b == MFTL_RING_INCOMPLETE) return MFTL_FALSE;
+  const double corner = MFTLBoundaryCornerAngle(params);
+  const int ka = MFTLBoundaryVertexKind(obj, v_a, corner), kb = MFTLBoundaryVertexKind(obj, v_b, corner);
+  if (ka == 1 || kb == 1) return MFTL_FALSE;  // corners are never collapsed or merged
+  if (ka == 0 && kb != 0) return MFTL_FALSE;  // a boundary vertex never moves into the interior
+  if (!MFTLAugmentedLinkConditionOk(obj, he_idx)) return MFTL_FALSE;
+  // survivor valence cap: repeated coarsening would otherwise pile fans onto one survivor (valence
+  // > 30 observed on a coarsened patch) and overflow the fixed one-ring buffers of the smoothers;
+  // the survivor keeps at most val(a) + val(b) - 2 neighbours
+  {
+    int nra = 0, nrb = 0;
+    MFTLVertexRing(obj, v_a, MFTL_NULL, 0, &nra);
+    MFTLVertexRing(obj, v_b, MFTL_NULL, 0, &nrb);
+    if (nra + nrb - 2 > MFTL_GENERALIZED_MAX_VALENCE) return MFTL_FALSE;
+  }
+
+  // survivor placement and geometric gates
+  double target[3];
+  int kind;
+  if (MFTLGeneralizedCollapseTarget(obj, he_idx, corner, target, &kind) != MFTL_SUCCESS) return MFTL_FALSE;
+  MFTL_Vertex *ring[64];
+  const int ends[2] = {v_a, v_b};
+  for (int e = 0; e < 2; ++e)
+  {
+    MFTL_Vertex *ve = &obj->vertices[ends[e]];
+    const int cnt = mftlRingVerticesFull(obj, ve, ring, 64);
+    if (cnt < 0) return MFTL_FALSE;  // ring larger than the buffer (16C review)
+    for (int i = 0; i < cnt; ++i)
+    {
+      if (ring[i] == &obj->vertices[v_a] || ring[i] == &obj->vertices[v_b]) continue;
+      double d[3];
+      MFTLGetMinimumImageVector(obj->domain, d, target, ring[i]->pos);
+      if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > params->max_edge_length_sq) return MFTL_FALSE;  // stretch
+    }
+  }
+  if (!MFTLCollapseKeepsOrientation(obj, he_idx, target)) return MFTL_FALSE;
+  // interior feature lines (Stage 08 protection, boundary edges excluded)
+  const int fa = mftlInteriorFeatureCount(obj, v_a), fb = mftlInteriorFeatureCount(obj, v_b);
+  if ((fa > 0) != (fb > 0)) return MFTL_FALSE;
+  if (fa > 2 || fb > 2) return MFTL_FALSE;
+  return MFTL_TRUE;
+}
+
 int CollapseApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params)
 {
   MFTL_HalfEdge *he = &obj->half_edges[he_idx];
+
+  // Stage 16A: twin-state admissibility (no REMOTE wing, no two BOUNDARY wings)
+  if (!mftlCollapseStatesOk(obj, he_idx)) return MFTL_FALSE;
+
+  // Stage 16C: open bodies and closed bodies opted in use the generalized remesher (never the
+  // parity path); closed bodies in the default mode are unchanged
+  if (params && MFTLObjectRemeshGeneralized(obj)) return mftlCollapseApprovedGeneralized(obj, he_idx, params);
 
   // Stage 15: MFTL1 criteria (with the parallel drivers' locks)
   if (params && params->mftl1_criteria) return MFTL1CollapseApproved(obj, he_idx, params, 1);
@@ -620,7 +842,7 @@ int CollapseApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params
   // 1.1 Check if the edge is a boundary edge
   // if (he->twin_idx == MFTL_ERROR) return MFTL_FALSE;  // Generally avoid collapsing boundary edges unless robust
   // Boundary Edge Detection
-  bool is_boundary_edge = (he->twin_idx == MFTL_ERROR);
+  bool is_boundary_edge = MFTLHeIsBoundary(he);
 
   // 2. Criterion Check (Stage 08): reject unless the criterion says the edge
   // is short enough to collapse.
@@ -651,8 +873,10 @@ int CollapseApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params
   // Get Rings
   MFTL_Vertex *ring_a[64];
   MFTL_Vertex *ring_b[64];
-  int count_a = MFTLGetVertexOneRingVertices(obj, v_a_ptr, ring_a, 64, MFTL_FALSE);  // Check if MFTL_FALSE OR TRUE IS BETTER HERE
-  int count_b = MFTLGetVertexOneRingVertices(obj, v_b_ptr, ring_b, 64, MFTL_FALSE);  // Check if MFTL_FALSE OR TRUE IS BETTER HERE
+  // Stage 16A: full neighbour sets (boundary vertices included), so the link test is exact
+  int count_a = mftlRingVerticesFull(obj, v_a_ptr, ring_a, 64);
+  int count_b = mftlRingVerticesFull(obj, v_b_ptr, ring_b, 64);
+  if (count_a < 0 || count_b < 0) return MFTL_FALSE;  // ring larger than the buffer (16C review)
 
   // Count Common Neighbors
   int common = 0;
@@ -682,6 +906,9 @@ int CollapseApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *params
   bool a_bound = IsBoundaryVertex(obj, v_a_idx);
   bool b_bound = IsBoundaryVertex(obj, v_b_idx);
   if (a_bound && !b_bound) return MFTL_FALSE;
+  // Stage 16A: an interior edge joining two boundary vertices would pinch the surface into a
+  // non-manifold vertex (link condition with the virtual boundary vertex, plans/16 §4.4.1)
+  if (a_bound && b_bound && !is_boundary_edge) return MFTL_FALSE;
 
   // --- 5. Ping-Pong Prevention (The Stretch Check) ---
   // Calculate proposed midpoint M (seam-safe; raw average when non-periodic)
@@ -759,8 +986,24 @@ int MFTLSplitApproved(MFTL_Object *obj, int he_idx, MFTL_RemeshParameters *param
   if (obj->vertices[v_a].flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) return MFTL_FALSE;
   if (obj->vertices[v_b].flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) return MFTL_FALSE;
 
-  // Stage 15: MFTL1 criteria
-  if (params->mftl1_criteria) return MFTL1SplitCriterion(obj, he_idx, params);
+  // Stage 16A: a REMOTE edge is never split (its second triangle is not stored)
+  if (MFTLHeIsRemote(he) || MFTLHeIsUnresolved(he)) return MFTL_FALSE;
+
+  // Stage 15: MFTL1 criteria (Stage 16C: never for generalized bodies)
+  const int generalized = MFTLObjectRemeshGeneralized(obj);
+  if (params->mftl1_criteria && !generalized) return MFTL1SplitCriterion(obj, he_idx, params);
+  // 16C review: the opposite vertices gain a neighbour; never above the growth cap
+  if (generalized && !MFTLGeneralizedSplitValenceOk(obj, he_idx)) return MFTL_FALSE;
+  // Stage 16C: a boundary split needs its boundary-curve point (a CONSTRAINED projector may refuse)
+  if (generalized && MFTLHeIsBoundary(he))
+  {
+    double tmp[3];
+    if (MFTLGeneralizedSplitTarget(obj, he_idx, MFTLBoundaryCornerAngle(params), tmp) != MFTL_SUCCESS) return MFTL_FALSE;
+  }
+  // Stage 16C: curvature criteria are undefined at boundary vertices -> length criterion
+  if (generalized && params->criterion == MFTL_CRITERION_BOTSCH_KOBBELT_CURVATURE &&
+      (MFTLHeIsBoundary(he) || ((obj->vertices[v_a].flags | obj->vertices[v_b].flags) & MFTL_VFLAG_CURV_UNDEFINED)))
+    return MFTLGetEdgeLengthSquared(obj, he) > params->max_edge_length_sq;
 
   // 2. Criterion check (Stage 08: MFTL1 RemeshCriteria parity)
   switch (params->criterion)
@@ -828,8 +1071,9 @@ void MFTLFlipEdge(MFTL_Object *obj, int he_idx)
   int v_d = obj->half_edges[he_ad_idx].vertex_idx;
 
   // update the outgoing halfedges of the vertices a and b (simply do it instead of also checking)
-  obj->vertices[v_a].out_he_idx = he_ad_idx;
-  obj->vertices[v_b].out_he_idx = he_bc_idx;
+  // (a boundary vertex keeps its outgoing BOUNDARY half-edge, which the flip does not touch)
+  if (!MFTLHeIsBoundary(&obj->half_edges[obj->vertices[v_a].out_he_idx])) obj->vertices[v_a].out_he_idx = he_ad_idx;
+  if (!MFTLHeIsBoundary(&obj->half_edges[obj->vertices[v_b].out_he_idx])) obj->vertices[v_b].out_he_idx = he_bc_idx;
 
   // update the halfedge for t1 and t2 (simply do it instead of also checking)
   obj->triangles[tri1_idx].he_idx = he_ab_idx;
@@ -872,6 +1116,7 @@ int FlipApproved(MFTL_Object *obj, int he_idx)
 {
   MFTL_HalfEdge *he_ab = &obj->half_edges[he_idx];
   int he_ba_idx = he_ab->twin_idx;
+  if (!MFTLHeIsLocal(he_ab)) return MFTL_FALSE;  // Stage 16A: only interior LOCAL edges flip
 
   MFTL_HalfEdge *he_ba = &obj->half_edges[he_ba_idx];
 
@@ -888,15 +1133,21 @@ int FlipApproved(MFTL_Object *obj, int he_idx)
 
   // --- 3. Gather Current Valences ---
   // We use your existing 1-ring function just to get the degree/count
-  MFTL_Vertex *ring_buffer[32];  // 32 is plenty for a safe maximum valence
-  int val_a = MFTLGetVertexOneRingVertices(obj, &obj->vertices[v_a], ring_buffer, 32, MFTL_FALSE);
-  int val_b = MFTLGetVertexOneRingVertices(obj, &obj->vertices[v_b], ring_buffer, 32, MFTL_FALSE);
+  // 16C review: 32 entries overflowed on generalized bodies (refinement around a coarse vertex
+  // raised its valence past 32); the gather is bounded and a ring that does not fit rejects the
+  // flip. Identical to the previous buffer for every valence below 32.
+  MFTL_Vertex *ring_buffer[MFTL_FLIP_RING_MAX];
+  int val_a = mftlRingVerticesFull(obj, &obj->vertices[v_a], ring_buffer, MFTL_FLIP_RING_MAX);
+  int val_b = mftlRingVerticesFull(obj, &obj->vertices[v_b], ring_buffer, MFTL_FLIP_RING_MAX);
 
   // Topological Safety Check 1: Prevent Degenerate Triangles
   // Flipping reduces the valence of A and B by 1. A vertex must have at least valence 3.
   if (val_a <= 3 || val_b <= 3) return MFTL_FALSE;
 
-  int val_c = MFTLGetVertexOneRingVertices(obj, &obj->vertices[v_c], ring_buffer, 32, MFTL_FALSE);
+  // Stage 16A: full neighbour set of C (a boundary vertex's neighbour across its incoming
+  // boundary edge included) for the duplicate-edge test below
+  int val_c = mftlRingVerticesFull(obj, &obj->vertices[v_c], ring_buffer, MFTL_FLIP_RING_MAX);
+  if (val_c < 0) return MFTL_FALSE;
 
   // Topological Safety Check 2: Prevent Non-Manifold Edges
   // If C and D are ALREADY connected by an edge, flipping AB to CD would create
@@ -908,7 +1159,11 @@ int FlipApproved(MFTL_Object *obj, int he_idx)
     if (ring_buffer[i] == &obj->vertices[v_d]) return MFTL_FALSE;
   }
 
-  int val_d = MFTLGetVertexOneRingVertices(obj, &obj->vertices[v_d], ring_buffer, 32, MFTL_FALSE);
+  int val_d = mftlRingVerticesFull(obj, &obj->vertices[v_d], ring_buffer, MFTL_FLIP_RING_MAX);
+  if (val_d < 0) return MFTL_FALSE;
+  // 16C review: a generalized flip never raises a valence above the split/flip cap (see
+  // MFTL_GENERALIZED_MAX_GROW_VALENCE)
+  if (MFTLObjectRemeshGeneralized(obj) && (val_c + 1 > MFTL_GENERALIZED_MAX_GROW_VALENCE || val_d + 1 > MFTL_GENERALIZED_MAX_GROW_VALENCE)) return MFTL_FALSE;
 
   // --- 4. Determine Target Valences ---
   // Ideal valence is 6 for interior vertices, 4 for boundary vertices
@@ -916,6 +1171,15 @@ int FlipApproved(MFTL_Object *obj, int he_idx)
   int opt_b = IsBoundaryVertex(obj, v_b) ? 4 : 6;
   int opt_c = IsBoundaryVertex(obj, v_c) ? 4 : 6;
   int opt_d = IsBoundaryVertex(obj, v_d) ? 4 : 6;
+  if (MFTLObjectRemeshGeneralized(obj))
+  {
+    // Stage 16C (plans/16 §4.4.2): boundary valence target round(theta / 60 deg) + 1 (min 2),
+    // theta the interior angle; 6 in the interior
+    opt_a = MFTLBoundaryValenceTarget(obj, v_a);
+    opt_b = MFTLBoundaryValenceTarget(obj, v_b);
+    opt_c = MFTLBoundaryValenceTarget(obj, v_c);
+    opt_d = MFTLBoundaryValenceTarget(obj, v_d);
+  }
 
   // --- 5. Calculate Current Error (Energy) ---
   int err_current =
@@ -952,7 +1216,8 @@ int FlipApproved(MFTL_Object *obj, int he_idx)
  * @param collapses_occurred Set to true if ANY collapse operation was performed.
  */
 // Stage 15 (L3): re-derive the retained twin gid of every half-edge whose twin is stored.
-// The edge operators relink twins by index only; rim half-edges (no local twin) keep theirs.
+// Stage 16A: the operators set twin_gid explicitly (split / glue_wings); this only refreshes
+// LOCAL pairs after compaction and never touches REMOTE / BOUNDARY codes.
 static void mftlRefreshTwinGids(MFTL_Object *obj)
 {
   for (int i = 0; i < obj->n_half_edges; ++i)
@@ -1010,6 +1275,7 @@ void MFTLFinalizeRemeshing(MFTL_Object *obj, int start_num_v, int start_num_t, i
     }
 
     mftlRefreshTwinGids(obj);
+    MFTLRefreshBoundaryCache(obj);
     return;  // DONE! (Fast exit)
   }
 
@@ -1172,6 +1438,7 @@ void MFTLFinalizeRemeshing(MFTL_Object *obj, int start_num_v, int start_num_t, i
     }
   }
   mftlRefreshTwinGids(obj);
+  MFTLRefreshBoundaryCache(obj);
 }
 
 /**
@@ -1359,8 +1626,8 @@ void MFTLSmoothTangential(MFTL_Object *obj, MFTL_SmoothMode mode, double relaxat
       obj->vertices[i].pos[0] = new_pos[i][0];
       obj->vertices[i].pos[1] = new_pos[i][1];
       obj->vertices[i].pos[2] = new_pos[i][2];
-      // keep the wrapped-storage invariant (no-op when non-periodic)
-      MFTLApplyPeriodicity(obj->domain, obj->vertices[i].pos);
+      // keep the wrapped-storage invariant (no-op when non-periodic); new_pos = pos + short move
+      MFTLWrapPosImg(obj->domain, obj->vertices[i].pos, obj->vertices[i].img);
     }
   }
   free(new_pos);
@@ -1411,6 +1678,49 @@ void MFTLDetectFeatures(MFTL_Object *obj, double angle_degrees)
   }
 }
 
+/* ------------------------------------------------------------------------------------------
+ * Stage 16C (plans/16 §4.4.4): class-guarded volume recovery of the remesh drivers
+ * ------------------------------------------------------------------------------------------ */
+void MFTLRemeshRecoveryTarget(MFTL_Object *obj, MFTL_RemeshParameters *params, MFTL_RecoveryTarget *t)
+{
+  t->kind = 0;
+  t->target = 0.0;
+  MFTLObjectEnsureWinding(obj);  // collective; unknown winding never counts as compact
+  if (MFTLObjectHasVolume(obj))
+  {
+    // closed and compact: the body's own volume (Stage-15 behaviour, bit-identical)
+    t->kind = 1;
+    t->target = MFTLObjectVolume(obj);
+    return;
+  }
+  if (params->skip_volume_recovery) return;
+  // open or wrapping: the singleton phase set decides (never MFTLObjectVolume)
+  MFTL_PhaseSet *S = MFTLPhaseSetCreate(obj->domain);
+  MFTLPhaseSetAddMember(S, obj, 1);
+  double V = 0.0;
+  if (MFTLPhaseSetVolume(S, &V) == MFTL_DEFINED)
+  {
+    t->kind = 2;
+    t->target = V;
+  }
+  else
+    params->stat_recovery_skipped++;
+  MFTLPhaseSetDestroy(&S);
+}
+
+void MFTLRemeshRecover(MFTL_Ensemble *ens, MFTL_Object *obj, const MFTL_RecoveryTarget *t)
+{
+  if (t->kind == 1)
+    MFTLVolumeRecovery(obj, t->target);
+  else if (t->kind == 2)
+  {
+    MFTL_PhaseSet *S = MFTLPhaseSetCreate(obj->domain);
+    MFTLPhaseSetAddMember(S, obj, 1);
+    MFTLPhaseSetVolumeRecovery(S, ens, t->target, MFTL_NULL);
+    MFTLPhaseSetDestroy(&S);
+  }
+}
+
 void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
 {
   int iter = 0;
@@ -1420,7 +1730,7 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
   int start_n_vertices[ens->num_objects];
   int start_n_triangles[ens->num_objects];
   int start_n_halfedges[ens->num_objects];
-  double start_volume[ens->num_objects];
+  MFTL_RecoveryTarget start_volume[ens->num_objects];
 
   for (int i = 0; i < ens->num_objects; i++)
   {
@@ -1430,7 +1740,9 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
     start_n_vertices[i] = obj->n_vertices;
     start_n_triangles[i] = obj->n_triangles;
     start_n_halfedges[i] = obj->n_half_edges;
-    start_volume[i] = MFTLObjectVolume(obj);  // Stage 09 recovery target (collective)
+    // Stage 09 recovery target (collective); Stage 16B/16C class guard: the body's own volume only
+    // for closed compact bodies, a set-level target for DEFINED singleton phase sets, else none
+    MFTLRemeshRecoveryTarget(obj, params, &start_volume[i]);
   }
 
   // Loop continues IF:
@@ -1467,7 +1779,9 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
           MFTLComputeVertexCurvatures(obj);
       }
 
-      if (params->mftl1_criteria)
+      // Stage 16C (plans/16 §4.4.4): the parity path only for closed bodies in the default mode
+      const int parity = params->mftl1_criteria && !MFTLObjectRemeshGeneralized(obj);
+      if (parity)
       {
         // Stage 15: MFTL1's sweeps (MFTL_Refining / MFTL_Coarsening / MFTL_Flipping)
         MFTL1Sweeps(obj, params, &obj_split, &obj_collapse, &obj_swap);
@@ -1475,7 +1789,7 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
       }
 
       // 1. SPLIT
-      for (int j = obj->n_half_edges - 1; j >= 0 && !params->skip_split && !params->mftl1_criteria; j--)
+      for (int j = obj->n_half_edges - 1; j >= 0 && !params->skip_split && !parity; j--)
       {
         if (MFTLSplitApproved(obj, j, params))
         {
@@ -1485,7 +1799,7 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
       }
 
       // 2. COLLAPSE
-      for (int j = 0; j < obj->n_half_edges && !params->skip_collapse && !params->mftl1_criteria; ++j)
+      for (int j = 0; j < obj->n_half_edges && !params->skip_collapse && !parity; ++j)
       {
         if (CollapseApproved(obj, j, params))
         {
@@ -1496,7 +1810,7 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
       }
 
       // 3. SWAP / FLIP (Valence Optimization + quality/dihedral gates)
-      for (int j = 0; j < obj->n_half_edges && !params->skip_flip && !params->mftl1_criteria; ++j)
+      for (int j = 0; j < obj->n_half_edges && !params->skip_flip && !parity; ++j)
       {
         MFTL_HalfEdge *he = &obj->half_edges[j];
 
@@ -1609,7 +1923,7 @@ void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
   for (int i = 0; i < ens->num_objects; i++)
   {
     MFTL_Object *obj = ens->objects[i];
-    if (!params->skip_volume_recovery) MFTLVolumeRecovery(obj, start_volume[i]);
+    if (!params->skip_volume_recovery) MFTLRemeshRecover(ens, obj, &start_volume[i]);
     MFTLComputeTriangleProperties(obj);
   }
   MFTLUpdateGhostPositions(ens, NULL);
@@ -1704,7 +2018,8 @@ static inline double mftlTriQualityFromPos(const MFTL_Domain* dom, const double 
 // the legacy valence-only behaviour.
 int FlipApprovedWithParams(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
 {
-  if (params && params->mftl1_criteria) return MFTL1FlipApproved(obj, he_idx, params);  // Stage 15
+  if (!MFTLHeIsLocal(&obj->half_edges[he_idx])) return MFTL_FALSE;  // Stage 16A: interior LOCAL edges only
+  if (params && params->mftl1_criteria && !MFTLObjectRemeshGeneralized(obj)) return MFTL1FlipApproved(obj, he_idx, params);  // Stage 15
   if (!FlipApproved(obj, he_idx)) return MFTL_FALSE;
   if (!params) return MFTL_TRUE;
 
@@ -1725,6 +2040,42 @@ int FlipApprovedWithParams(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* 
   double q1 = mftlTriQualityFromPos(obj->domain, pc, pd, pa);
   double q2 = mftlTriQualityFromPos(obj->domain, pc, pd, pb);
   if (q1 > params->max_quality_threshold || q2 > params->max_quality_threshold) return MFTL_FALSE;
+
+  // Stage 16C (generalized bodies): the created triangles are (c, a, d) and (d, b, c) with the
+  // orientation of the original pair; the dihedral gate compares their consistently oriented
+  // normals, so a flip of a non-convex quad (one created triangle inverted) is always rejected.
+  // NOTE: the legacy gate below builds both normals from (c, d, x), which inverts the sign of the
+  // dot product (it rejects convex flips and accepts folding ones). It is kept unchanged for closed
+  // bodies in the default mode (bit-identity contract, plans/16 §0); see plans/16 §22.
+  if (MFTLObjectRemeshGeneralized(obj))
+  {
+    double ca[3], cd[3], db[3], dc[3];
+    MFTLGetMinimumImageVector(obj->domain, ca, pc, pa);
+    MFTLGetMinimumImageVector(obj->domain, cd, pc, pd);
+    MFTLGetMinimumImageVector(obj->domain, db, pd, pb);
+    MFTLGetMinimumImageVector(obj->domain, dc, pd, pc);
+    const double n1[3] = {ca[1] * cd[2] - ca[2] * cd[1], ca[2] * cd[0] - ca[0] * cd[2], ca[0] * cd[1] - ca[1] * cd[0]};
+    const double n2[3] = {db[1] * dc[2] - db[2] * dc[1], db[2] * dc[0] - db[0] * dc[2], db[0] * dc[1] - db[1] * dc[0]};
+    const double l1 = sqrt(n1[0] * n1[0] + n1[1] * n1[1] + n1[2] * n1[2]), l2 = sqrt(n2[0] * n2[0] + n2[1] * n2[1] + n2[2] * n2[2]);
+    if (!(l1 > 0.0) || !(l2 > 0.0)) return MFTL_FALSE;  // degenerate created triangle
+    double dot = (n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2]) / (l1 * l2);
+    dot = dot > 1.0 ? 1.0 : (dot < -1.0 ? -1.0 : dot);
+    const double max_angle = params->max_angle_between_tris < 179.0 ? params->max_angle_between_tris : 179.0;
+    if (acos(dot) * 180.0 / MFTL_PI > max_angle) return MFTL_FALSE;
+    // neither created triangle may invert with respect to the original pair (normals from the
+    // current positions: cached triangle normals are stale within a pass)
+    double ab[3], ac[3], ba[3], bd[3];
+    MFTLGetMinimumImageVector(obj->domain, ab, pa, pb);
+    MFTLGetMinimumImageVector(obj->domain, ac, pa, pc);
+    MFTLGetMinimumImageVector(obj->domain, ba, pb, pa);
+    MFTLGetMinimumImageVector(obj->domain, bd, pb, pd);
+    const double no1[3] = {ab[1] * ac[2] - ab[2] * ac[1], ab[2] * ac[0] - ab[0] * ac[2], ab[0] * ac[1] - ab[1] * ac[0]};
+    const double no2[3] = {ba[1] * bd[2] - ba[2] * bd[1], ba[2] * bd[0] - ba[0] * bd[2], ba[0] * bd[1] - ba[1] * bd[0]};
+    const double nold[3] = {no1[0] + no2[0], no1[1] + no2[1], no1[2] + no2[2]};
+    if (n1[0] * nold[0] + n1[1] * nold[1] + n1[2] * nold[2] <= 0.0) return MFTL_FALSE;
+    if (n2[0] * nold[0] + n2[1] * nold[1] + n2[2] * nold[2] <= 0.0) return MFTL_FALSE;
+    return MFTL_TRUE;
+  }
 
   // Dihedral gate: reject when the angle between the new triangle normals
   // exceeds max_angle_between_tris (degrees).
@@ -1773,6 +2124,7 @@ void MFTLSmoothTangentialWithParams(MFTL_Object* obj, MFTL_RemeshParameters* par
   assert(new_pos != MFTL_NULL);
   MFTL_Vertex* ring_verts[64];
   MFTL_Triangle* ring_tris[32];
+  const int generalized = MFTLObjectRemeshGeneralized(obj);  // Stage 16C
 
   for (int s = 0; s < iters; ++s)
   {
@@ -1802,6 +2154,14 @@ void MFTLSmoothTangentialWithParams(MFTL_Object* obj, MFTL_RemeshParameters* par
       } while (he != start && he != MFTL_ERROR);
 
       int locked = (bnd_count > 0 || feat_count > 0);
+      // Stage 16C: a generalized fan larger than the one-ring buffers below (refinement around a
+      // high-valence vertex) is left in place instead of overflowing them
+      if (generalized)
+      {
+        int nfan = 0;
+        MFTLVertexRing(obj, i, MFTL_NULL, 0, &nfan);
+        if (nfan >= 32) continue;
+      }
       if (mode == MFTL_SMOOTH_QUALITY_DRIVEN || mode == MFTL_SMOOTH_CURVATURE_BASED)
       {
         // Stage-08 modes: feature vertices are fixed
@@ -1914,6 +2274,10 @@ void MFTLSmoothTangentialWithParams(MFTL_Object* obj, MFTL_RemeshParameters* par
         }
         if (q_after >= q_before) continue;  // no improvement: keep position
       }
+      // Stage 16C: generalized bodies never accept a move that inverts a fan triangle
+      if (MFTLObjectRemeshGeneralized(obj) && !MFTLMoveKeepsOrientation(obj, i, v->pos, cand)) continue;
+      // ... nor a move racing with another rank's move of a fan corner (checked only after the ghost update)
+      if (MFTLObjectRemeshGeneralized(obj) && !MFTLVertexFanOwned(obj, i)) continue;
 
       memcpy(new_pos[i], cand, sizeof(cand));
     }
@@ -1922,10 +2286,20 @@ void MFTLSmoothTangentialWithParams(MFTL_Object* obj, MFTL_RemeshParameters* par
     {
       if (obj->vertices[i].is_ghost) continue;  // Stage 10: ghosts are synced from their owner, never written here
       if ((obj->vertices[i].flags & MFTL_FLAG_DEAD) || obj->vertices[i].out_he_idx == MFTL_ERROR) continue;
+      // Stage 16C: the Jacobi candidates were checked against the OLD neighbour positions; for
+      // generalized bodies each move is re-checked against the current ones when it is applied, so
+      // simultaneous neighbour moves can never fold the surface
+      if (generalized && !MFTLMoveKeepsOrientation(obj, i, obj->vertices[i].pos, new_pos[i])) continue;
+      double old_pos[3];
+      memcpy(old_pos, obj->vertices[i].pos, 3 * sizeof(double));
       memcpy(obj->vertices[i].pos, new_pos[i], 3 * sizeof(double));
       // keep the wrapped-storage invariant (no-op when non-periodic)
       MFTLApplyPeriodicity(obj->domain, obj->vertices[i].pos);
+      MFTLImgFollow(obj->domain, obj->vertices[i].img, old_pos, obj->vertices[i].pos);  // Stage 16B
     }
+    // Stage 16C (plans/16 §4.4.2): boundary vertices of a generalized body move only along their
+    // boundary curve (arc-length redistribution); corners and frozen tags stay fixed
+    if (MFTLObjectRemeshGeneralized(obj)) MFTLSmoothBoundaryVertices(obj, relaxation, MFTLBoundaryCornerAngle(params));
   }
   free(new_pos);
 }

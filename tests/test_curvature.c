@@ -153,6 +153,7 @@ int test_flat_patch()
       triples[t][2] = d;
       t++;
     }
+  MFTLObjectDeclareOpen(obj, 1);  // Stage 16A: an open surface
   if (g_rank == 0) MFTLBuildTopologyFromTriples(obj, N * N, (const double (*)[3]) pos, t, (const int (*)[3]) triples);
   free(pos);
   free(triples);

@@ -59,6 +59,7 @@ int test_point_triangle_distance()
   // Single unit right triangle in the z=0 plane.
   double pos[3][3] = {{0, 0, 0}, {1, 0, 0}, {0, 1, 0}};
   int triples[1][3] = {{0, 1, 2}};
+  MFTLObjectDeclareOpen(obj, 1);  // Stage 16A: an open surface
   if (g_rank == 0) MFTLBuildTopologyFromTriples(obj, 3, (const double (*)[3]) pos, 1, (const int (*)[3]) triples);
   MFTLComputeTriangleProperties(obj);
 

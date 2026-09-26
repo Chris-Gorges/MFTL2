@@ -47,6 +47,8 @@ typedef struct
 
   int body_id;
 
+  int img[3];  // Stage 16B: periodic image counters (travel with pos)
+
 } PackedVertex;
 
 /**
@@ -133,6 +135,7 @@ typedef struct
   double area;
   double roughness_mean;  // Stage 10: ghost payload carries roughness data
   double roughness_variance;
+  int img[3];  // Stage 16B: ghost copies carry the owner's image counters
 } GhostUpdatePayload;
 
 // A map from a neighbor rank (int) to a list of GIDs (int64_t*).

@@ -15,6 +15,7 @@
 #include "mftl_core.h"
 #include "mftl_constants.h"
 #include "mftl_communication.h"
+#include "mftl_twin_internal.h"
 #include "mftl_arrayfunctions.h"
 #include "mftl_topology.h"
 #include "mftl_memory.h"
@@ -42,8 +43,8 @@ void MFTLRegisterMpiTypes()
 {
   // --- 1. Create MPI Datatype for PackedVertex ---
   {
-#define NITEMS_VERTEX 13
-    int blocklengths[] = {1, 1, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1};
+#define NITEMS_VERTEX 14
+    int blocklengths[] = {1, 1, 3, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 3};
 
     MPI_Datatype types[] = {
         MPI_INT,  // global_id (was MPI_UINT64_T)
@@ -58,7 +59,8 @@ void MFTLRegisterMpiTypes()
         MPI_C_BOOL,  // is_ghost
         MPI_INT,  // flags (was MPI_INT)
         MPI_INT,  // id_he_out (was MPI_UINT64_T)
-        MPI_INT  // body_id (was MPI_UINT64_T)
+        MPI_INT,  // body_id (was MPI_UINT64_T)
+        MPI_INT  // img[3] (Stage 16B)
     };
 
     MPI_Aint offsets[NITEMS_VERTEX];
@@ -75,6 +77,7 @@ void MFTLRegisterMpiTypes()
     offsets[10] = offsetof(PackedVertex, flags);
     offsets[11] = offsetof(PackedVertex, id_he_out);
     offsets[12] = offsetof(PackedVertex, body_id);
+    offsets[13] = offsetof(PackedVertex, img);
 
     MPI_Type_create_struct(NITEMS_VERTEX, blocklengths, offsets, types, &MPI_PackedVertex);
     mftlResizeToSizeof(&MPI_PackedVertex, sizeof(PackedVertex));
@@ -167,8 +170,8 @@ void MFTLRegisterMpiTypes()
 
   // --- 5. Create MPI Datatype for MFTL_GhostUpdatePayload ---
   {
-#define NITEMS_GHOST 9
-    int blocklengths[] = {1, 1, 3, 3, 1, 1, 1, 1, 1};
+#define NITEMS_GHOST 10
+    int blocklengths[] = {1, 1, 3, 3, 1, 1, 1, 1, 1, 3};
 
     MPI_Datatype types[] = {
         MPI_INT,  // global_id
@@ -180,6 +183,7 @@ void MFTLRegisterMpiTypes()
         MPI_DOUBLE,  // area
         MPI_DOUBLE,  // roughness_mean (Stage 10)
         MPI_DOUBLE,  // roughness_variance (Stage 10)
+        MPI_INT,  // img[3] (Stage 16B)
     };
 
     MPI_Aint offsets[NITEMS_GHOST];
@@ -192,6 +196,7 @@ void MFTLRegisterMpiTypes()
     offsets[6] = offsetof(GhostUpdatePayload, area);
     offsets[7] = offsetof(GhostUpdatePayload, roughness_mean);
     offsets[8] = offsetof(GhostUpdatePayload, roughness_variance);
+    offsets[9] = offsetof(GhostUpdatePayload, img);
 
     MPI_Type_create_struct(NITEMS_GHOST, blocklengths, offsets, types, &MPI_GhostUpdatePayload);
     mftlResizeToSizeof(&MPI_GhostUpdatePayload, sizeof(GhostUpdatePayload));
@@ -277,10 +282,10 @@ void MFTLPackSingleTriangle(MFTL_Object* obj, int tri_idx, PackedTriangleComplex
     dst->half_edges[j].global_id = t_he[j]->global_id;
     dst->half_edges[j].vertex_gid = MFTLHeTarget(obj, t_he[j])->global_id;
     // If twin exists (not boundary), save twin's GID. Else -1.
-    dst->half_edges[j].twin_gid = MFTLHeTwinGid(obj, t_he[j]);  // retained on the rim (Stage 15, L3)
+    dst->half_edges[j].twin_gid = MFTLHeTwinCode(obj, t_he[j]);  // state code: gid / boundary code (Stage 16A)
     dst->half_edges[j].next_gid = MFTLHeNext(obj, t_he[j])->global_id;
     dst->half_edges[j].triangle_gid = MFTLHeTriangle(obj, t_he[j])->global_id;
-    dst->half_edges[j].boundary = MFTL_TRUE;  // Will be re-evaluated at destination
+    dst->half_edges[j].boundary = MFTLHeIsBoundary(t_he[j]);  // re-derived at destination
     dst->half_edges[j].flags = t_he[j]->flags;
   }
 }
@@ -305,6 +310,7 @@ void MFTLPackSingleVertex(MFTL_Object* obj, int vert_idx, PackedVertex* dst, boo
   dst->body_id = obj->global_id;
 
   memcpy(dst->pos, src->pos, 3 * sizeof(double));
+  memcpy(dst->img, src->img, 3 * sizeof(int));  // Stage 16B
   memcpy(dst->normal, src->normal, 3 * sizeof(double));
 }
 
@@ -893,10 +899,10 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
           PackedHalfEdge* he = &packed_tri->half_edges[j];
           he->global_id = t_he[j]->global_id;
           he->vertex_gid = MFTLHeTarget(object, t_he[j])->global_id;
-          he->twin_gid = MFTLHeTwinGid(object, t_he[j]);  // retained on the rim (Stage 15, L3)
+          he->twin_gid = MFTLHeTwinCode(object, t_he[j]);  // state code: gid / boundary code (Stage 16A)
           he->next_gid = MFTLHeNext(object, t_he[j])->global_id;
           he->triangle_gid = MFTLHeTriangle(object, t_he[j])->global_id;
-          he->boundary = MFTL_TRUE;
+          he->boundary = MFTLHeIsBoundary(t_he[j]);
           he->flags = t_he[j]->flags;
         }
 
@@ -928,6 +934,7 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
         packed_vert->global_id = vert_base[vert_idx].global_id;
         packed_vert->owner_proc = vert_base[vert_idx].owner_proc;
         memcpy(packed_vert->pos, vert_base[vert_idx].pos, 3 * sizeof(double));
+        memcpy(packed_vert->img, vert_base[vert_idx].img, 3 * sizeof(int));  // Stage 16B
         memcpy(packed_vert->normal, vert_base[vert_idx].normal, 3 * sizeof(double));
         packed_vert->meancurvature = vert_base[vert_idx].meancurvature;
         packed_vert->gaussiancurvature = vert_base[vert_idx].gaussiancurvature;
@@ -1270,9 +1277,9 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
             he->triangle_idx = write_count;
             he->next_idx = write_count * 3 + (i + 1) % 3;
             he->twin_gid = src->half_edges[i].twin_gid;
-            he->twin_idx = src->half_edges[i].twin_gid;  // needs to be converted to local index
+            he->twin_idx = (src->half_edges[i].twin_gid >= 0) ? src->half_edges[i].twin_gid : MFTL_ERROR;  // GID (re-derived by MFTLRebuildTwins)
             he->vertex_idx = src->half_edges[i].vertex_gid;  // needs to be converted to local index
-            he->boundary = MFTL_TRUE;  // set later
+            he->boundary = MFTL_FALSE;  // cache set by MFTLRebuildTwins (Stage 16A)
             int ret;
             khiter_t k_he = kh_put(halfedge_map, target_obj->halfedge_lookup, he->global_id, &ret);
             kh_value(target_obj->halfedge_lookup, k_he) = write_count * 3 + i;  // local index
@@ -1332,9 +1339,9 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
             he->triangle_idx = write_count;
             he->next_idx = write_count * 3 + (i + 1) % 3;
             he->twin_gid = src->half_edges[i].twin_gid;
-            he->twin_idx = src->half_edges[i].twin_gid;
+            he->twin_idx = (src->half_edges[i].twin_gid >= 0) ? src->half_edges[i].twin_gid : MFTL_ERROR;  // GID (re-derived by MFTLRebuildTwins)
             he->vertex_idx = src->half_edges[i].vertex_gid;
-            he->boundary = MFTL_TRUE;
+            he->boundary = MFTL_FALSE;  // cache set by MFTLRebuildTwins (Stage 16A)
             khiter_t k_he = kh_put(halfedge_map, target_obj->halfedge_lookup, he->global_id, &ret);
             kh_value(target_obj->halfedge_lookup, k_he) = write_count * 3 + i;
           }
@@ -1503,6 +1510,7 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
           dst->roughness_variance = src->roughness_variance;
 
           memcpy(dst->pos, src->pos, 3 * sizeof(double));
+          memcpy(dst->img, src->img, 3 * sizeof(int));  // Stage 16B
           memcpy(dst->normal, src->normal, 3 * sizeof(double));
 
           dst->out_he_idx = src->id_he_out;  // needs to be converted to local index
@@ -1542,6 +1550,7 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
             dst->roughness_mean = src->roughness_mean;
             dst->roughness_variance = src->roughness_variance;
             memcpy(dst->pos, src->pos, 3 * sizeof(double));
+            memcpy(dst->img, src->img, 3 * sizeof(int));  // Stage 16B
             memcpy(dst->normal, src->normal, 3 * sizeof(double));
             dst->out_he_idx = src->id_he_out;
 
@@ -1577,7 +1586,21 @@ int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble)
     MFTLFlattenConnectivity(object);
   }
 
-  return MFTL_SUCCESS;
+  // Stage 16A (plans/16 §2.5, §2.3): guaranteed ghost completion G1/G2, then the quiescent check.
+  // One collective decides for all objects which ones need completion rounds.
+  int rc = MFTL_SUCCESS;
+  int* need = (int*) calloc((size_t) (num_objects > 0 ? num_objects : 1), sizeof(int));
+  int* gneed = (int*) calloc((size_t) (num_objects > 0 ? num_objects : 1), sizeof(int));
+  for (int o = 0; o < num_objects; ++o) need[o] = MFTLInternalCountGhostRequests(objects[o]);
+  MPI_Allreduce(need, gneed, num_objects, MPI_INT, MPI_SUM, domain->comm_cart);
+  for (int o = 0; o < num_objects; ++o)
+  {
+    if (gneed[o] > 0 && MFTLCompleteGhosts(objects[o], 0.0, MFTL_NULL) != MFTL_SUCCESS) rc = MFTL_ERROR;
+    if (MFTLInternalQuiescentCheck(objects[o], MFTL_VALIDATE_GHOSTS) != MFTL_SUCCESS) rc = MFTL_ERROR;
+  }
+  free(need);
+  free(gneed);
+  return rc;
 }
 
 /**
@@ -1965,9 +1988,9 @@ int MFTLRedistributeObject(MFTL_Object* object)
         he->triangle_idx = write_idx;
         he->next_idx = write_idx * 3 + (j + 1) % 3;
         he->twin_gid = src->half_edges[j].twin_gid;
-        he->twin_idx = src->half_edges[j].twin_gid;  // Fix later
+        he->twin_idx = (src->half_edges[j].twin_gid >= 0) ? src->half_edges[j].twin_gid : MFTL_ERROR;  // GID (re-derived by MFTLRebuildTwins)
         he->vertex_idx = src->half_edges[j].vertex_gid;  // Fix later
-        he->boundary = MFTL_TRUE;
+        he->boundary = MFTL_FALSE;  // cache set by MFTLRebuildTwins (Stage 16A)
 
         iter = kh_put(halfedge_map, object->halfedge_lookup, he->global_id, &ret);
         kh_value(object->halfedge_lookup, iter) = write_idx * 3 + j;
@@ -2022,9 +2045,9 @@ int MFTLRedistributeObject(MFTL_Object* object)
         he->triangle_idx = write_idx;
         he->next_idx = write_idx * 3 + (j + 1) % 3;
         he->twin_gid = src->half_edges[j].twin_gid;
-        he->twin_idx = src->half_edges[j].twin_gid;
+        he->twin_idx = (src->half_edges[j].twin_gid >= 0) ? src->half_edges[j].twin_gid : MFTL_ERROR;  // GID (re-derived by MFTLRebuildTwins)
         he->vertex_idx = src->half_edges[j].vertex_gid;
-        he->boundary = MFTL_TRUE;
+        he->boundary = MFTL_FALSE;  // cache set by MFTLRebuildTwins (Stage 16A)
 
         iter = kh_put(halfedge_map, object->halfedge_lookup, he->global_id, &ret);
         kh_value(object->halfedge_lookup, iter) = write_idx * 3 + j;
@@ -2092,6 +2115,7 @@ int MFTLRedistributeObject(MFTL_Object* object)
       dst->roughness_mean = src->roughness_mean;
       dst->roughness_variance = src->roughness_variance;
       memcpy(dst->pos, src->pos, sizeof(double) * 3);
+      memcpy(dst->img, src->img, 3 * sizeof(int));  // Stage 16B
       memcpy(dst->normal, src->normal, sizeof(double) * 3);
       dst->out_he_idx = src->id_he_out;  // Fix later
 
@@ -2130,6 +2154,7 @@ int MFTLRedistributeObject(MFTL_Object* object)
         dst->roughness_mean = src->roughness_mean;
         dst->roughness_variance = src->roughness_variance;
         memcpy(dst->pos, src->pos, sizeof(double) * 3);
+        memcpy(dst->img, src->img, 3 * sizeof(int));  // Stage 16B
         memcpy(dst->normal, src->normal, sizeof(double) * 3);
         dst->out_he_idx = src->id_he_out;
 
@@ -2152,7 +2177,10 @@ int MFTLRedistributeObject(MFTL_Object* object)
   MFTLRebuildTwins(object);
   MFTLFlattenConnectivity(object);
 
-  return MFTL_SUCCESS;
+  // Stage 16A: guaranteed ghost completion G1/G2, then the quiescent check.
+  int rc = MFTLCompleteGhosts(object, 0.0, MFTL_NULL);
+  if (MFTLInternalQuiescentCheck(object, MFTL_VALIDATE_GHOSTS) != MFTL_SUCCESS) rc = MFTL_ERROR;
+  return rc;
 }
 
 /**
@@ -2353,6 +2381,7 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lo
     else
     {
       memcpy(p->pos, found_v->pos, 3 * sizeof(double));
+      memcpy(p->img, found_v->img, 3 * sizeof(int));  // Stage 16B
       memcpy(p->normal, found_v->normal, 3 * sizeof(double));
       p->meancurvature = found_v->meancurvature;
       p->gaussiancurvature = found_v->gaussiancurvature;
@@ -2445,6 +2474,7 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lo
 
         // Apply Update
         memcpy(v->pos, p->pos, 3 * sizeof(double));
+        memcpy(v->img, p->img, 3 * sizeof(int));  // Stage 16B
         memcpy(v->normal, p->normal, 3 * sizeof(double));
         v->meancurvature = p->meancurvature;
         v->gaussiancurvature = p->gaussiancurvature;
@@ -2901,6 +2931,7 @@ void MFTLAppendGhostVertex(MFTL_Object* obj, PackedVertex* pv)
   v->out_he_idx = pv->id_he_out;  // GID, resolved later
 
   memcpy(v->pos, pv->pos, 3 * sizeof(double));
+  memcpy(v->img, pv->img, 3 * sizeof(int));  // Stage 16B
   memcpy(v->normal, pv->normal, 3 * sizeof(double));
 
   int ret;
@@ -2957,9 +2988,9 @@ void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc, const
     he->triangle_idx = t_idx;
     he->vertex_idx = phe->vertex_gid;  // GID, resolved later
     he->twin_gid = phe->twin_gid;
-    he->twin_idx = phe->twin_gid;  // GID, resolved later
+    he->twin_idx = (phe->twin_gid >= 0) ? phe->twin_gid : MFTL_ERROR;  // GID, resolved later
     he->next_idx = t->he_idx + ((i + 1) % 3);
-    he->boundary = MFTL_TRUE;
+    he->boundary = MFTL_FALSE;  // cache set by MFTLRebuildTwins (Stage 16A)
     he->flags = phe->flags;
 
     k = kh_put(halfedge_map, obj->halfedge_lookup, he->global_id, &ret);
@@ -2979,7 +3010,7 @@ void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc, const
  * entities carry GIDs, so only they are remapped; twins are recomputed
  * topologically by MFTLRebuildTwins afterwards anyway.
  */
-static void MFTLRemapAppendedGhostIndices(MFTL_Object* obj, int v_mark, int he_mark)
+void MFTLInternalRemapAppendedGhostIndices(MFTL_Object* obj, int v_mark, int he_mark)
 {
   // --- 1. Remap appended vertices' outgoing half-edge: GID -> local index ---
   for (int i = v_mark; i < obj->n_vertices; ++i)
@@ -3007,7 +3038,7 @@ static void MFTLRemapAppendedGhostIndices(MFTL_Object* obj, int v_mark, int he_m
 
     // Twin was packed as a GID (or MFTL_ERROR). Resolve it if the twin half-edge
     // lives on this rank; otherwise leave MFTL_ERROR for MFTLRebuildTwins.
-    if (he->twin_idx != MFTL_ERROR)
+    if (he->twin_idx >= 0)
     {
       khiter_t kt = kh_get(halfedge_map, obj->halfedge_lookup, he->twin_idx);
       he->twin_idx = (kt != kh_end(obj->halfedge_lookup)) ? kh_value(obj->halfedge_lookup, kt) : MFTL_ERROR;
@@ -3478,7 +3509,7 @@ int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps)
   for (int o = 0; o < ens->num_objects; ++o)
   {
     MFTL_Object* obj = ens->objects[o];
-    MFTLRemapAppendedGhostIndices(obj, v_marks[o], he_marks[o]);
+    MFTLInternalRemapAppendedGhostIndices(obj, v_marks[o], he_marks[o]);
     MFTLRebuildTwins(obj);
     MFTLFlattenConnectivity(obj);
   }
@@ -3842,6 +3873,8 @@ int MFTLEnsembleCreateSpatialGhosts(MFTL_Ensemble* ens, double proximity_toleran
 /* ========================================================================== */
 
 // Box of `rank` in the domain (rectilinear or uniform slabs).
+void MFTLInternalRankBox(const MFTL_Domain* dom, int rank, double bmin[3], double bmax[3]) { mftlRankBox(dom, rank, bmin, bmax); }
+
 static void mftlRankBox(const MFTL_Domain* dom, int rank, double bmin[3], double bmax[3])
 {
   int idx = 0;
@@ -3976,7 +4009,7 @@ int MFTLObjectSendLocalTrianglesToAll(MFTL_Object* obj, double distance)
   free(recv_verts);
   free(recv_data);
 
-  MFTLRemapAppendedGhostIndices(obj, v_mark, he_mark);
+  MFTLInternalRemapAppendedGhostIndices(obj, v_mark, he_mark);
   MFTLRebuildTwins(obj);
   MFTLFlattenConnectivity(obj);
   return MFTL_SUCCESS;

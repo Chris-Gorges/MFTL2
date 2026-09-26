@@ -9,6 +9,7 @@
 #include "mftl_core.h"
 #include "mftl_constants.h"
 #include "mftl_memory.h"
+#include "mftl_twin_internal.h"
 #include <stdlib.h>  // for malloc/free
 #include <stdio.h>  // for fprintf
 #include <string.h>  // for memcpy
@@ -55,8 +56,7 @@ void MFTLRebuildTwins(MFTL_Object *obj)
     v_heads[u] = i;
 
     MFTL_HalfEdge *he = &he_base[i];
-    he->twin_idx = MFTL_ERROR;
-    he->boundary = MFTL_TRUE;
+    he->twin_idx = MFTL_ERROR;  // unpaired half-edges keep their state code (REMOTE / BOUNDARY)
   }
 
   // --- 3. Find Twins (Pass 2) ---
@@ -80,7 +80,6 @@ void MFTLRebuildTwins(MFTL_Object *obj)
       {
         he->twin_idx = candidate;
         he->twin_gid = he_base[candidate].global_id;  // (a rim half-edge keeps its retained twin_gid)
-        he->boundary = MFTL_FALSE;
         break;  // Found it!
       }
       // Move to next edge starting at v
@@ -91,6 +90,9 @@ void MFTLRebuildTwins(MFTL_Object *obj)
   // --- Cleanup ---
   free(v_heads);
   free(he_next);
+
+  // Stage 16A: boundary cache and boundary-vertex out-half-edge convention (plans/16 §2.6)
+  MFTLRefreshBoundaryCache(obj);
 }
 
 void MFTLConvertGlobalToLocalIndices(MFTL_Object *obj)
@@ -296,9 +298,14 @@ int MFTLCheckMeshIntegrity(MFTL_Object *object)
     }
 
     // 2. Twin Consistency
-    if (he->twin_idx == MFTL_ID_INVALID && !he->boundary)
+    if (MFTLHeIsUnresolved(he))
     {
-      fprintf(stderr, "[MeshCheck] Half-edge %d has no twin (mesh is not closed)\n", he->global_id);
+      fprintf(stderr, "[MeshCheck] Half-edge %d has no twin and no REMOTE/BOUNDARY state\n", he->global_id);
+      ok = MFTL_ERROR;
+    }
+    else if (MFTLHeIsBoundary(he) && !object->declared_open)
+    {
+      fprintf(stderr, "[MeshCheck] Half-edge %d is BOUNDARY on a body not declared open\n", he->global_id);
       ok = MFTL_ERROR;
     }
     else if (he->twin_idx != MFTL_ID_INVALID)
@@ -444,7 +451,7 @@ void MFTLFlattenConnectivity(MFTL_Object *obj)
 
       // Flatten Neighbors
       int neighbor_idx = -1;
-      if (!he[j]->boundary)
+      if (MFTLHeIsLocal(he[j]))
       {
         MFTL_Triangle *adj_tri = MFTLHeAdjacentTriangle(obj, he[j]);
         // PTRDIFF: Ensure adj_tri is within the tri_base array range
@@ -490,12 +497,15 @@ void MFTLFlattenConnectivity(MFTL_Object *obj)
   v_offsets[0] = 0;
 }
 
-void MFTLBuildTopologyFromTriples(MFTL_Object* obj, int nV, const double positions[][3], int nF, const int triples[][3])
+int MFTLBuildTopologyFromTriples(MFTL_Object* obj, int nV, const double positions[][3], int nF, const int triples[][3])
 {
   MFTL_ASSERT(obj != MFTL_NULL);
   MFTL_ASSERT(positions != MFTL_NULL && triples != MFTL_NULL);
   MFTL_ASSERT(obj->n_vertices == 0 && "MFTLBuildTopologyFromTriples: object must be empty");
   MFTL_Domain* domain = obj->domain;
+  // Stage 16B: rank-local builder, cannot canonicalise (collective): the winding state is
+  // unknown until the next wrap-sensitive collective operation (MFTLObjectEnsureWinding)
+  obj->wrap_valid = 0;
 
   MFTL_RESERVE_ADDITIONAL(obj->vertices, &obj->n_vertices, &obj->capacity_vertices, nV, MFTL_Vertex);
   MFTL_RESERVE_ADDITIONAL(obj->triangles, &obj->n_triangles, &obj->capacity_triangles, nF, MFTL_Triangle);
@@ -513,11 +523,14 @@ void MFTLBuildTopologyFromTriples(MFTL_Object* obj, int nV, const double positio
     v->is_ghost = MFTL_FALSE;
     memcpy(v->pos, positions[i], 3 * sizeof(double));
     v->out_he_idx = MFTL_ERROR;
+    v->flags = MFTL_FLAG_NONE;
+    v->img[0] = v->img[1] = v->img[2] = 0;  // Stage 16B: callers lift continuous input
   }
 
   for (int t = 0; t < nF; ++t)
   {
     MFTL_Triangle* tri = &obj->triangles[t];
+    tri->flags = MFTL_FLAG_NONE;
     tri->global_id = t;
     tri->owner_proc = domain->rank;
     tri->is_ghost = MFTL_FALSE;
@@ -534,8 +547,8 @@ void MFTLBuildTopologyFromTriples(MFTL_Object* obj, int nV, const double positio
       he->vertex_idx = b;
       he->next_idx = 3 * t + ((j + 1) % 3);
       he->twin_idx = MFTL_ERROR;
-      he->twin_gid = MFTL_ERROR;
-      he->boundary = MFTL_TRUE;
+      he->twin_gid = MFTL_TWIN_UNKNOWN;
+      he->boundary = MFTL_FALSE;
       he->flags = 0;
 
       obj->vertices[a].out_he_idx = 3 * t + j;
@@ -546,8 +559,77 @@ void MFTLBuildTopologyFromTriples(MFTL_Object* obj, int nV, const double positio
   obj->next_triangle_gid = nF;
   obj->next_halfedge_gid = 3 * nF;
 
+  // lookups (gid -> local index), needed by the Stage-16A discovery / validation
+  for (int i = 0; i < nV; ++i)
+  {
+    int ret;
+    khiter_t k = kh_put(vertex_map, obj->vertex_lookup, obj->vertices[i].global_id, &ret);
+    kh_value(obj->vertex_lookup, k) = i;
+  }
+  for (int t = 0; t < nF; ++t)
+  {
+    int ret;
+    khiter_t k = kh_put(triangle_map, obj->triangle_lookup, obj->triangles[t].global_id, &ret);
+    kh_value(obj->triangle_lookup, k) = t;
+  }
+  for (int h = 0; h < 3 * nF; ++h)
+  {
+    int ret;
+    khiter_t k = kh_put(halfedge_map, obj->halfedge_lookup, obj->half_edges[h].global_id, &ret);
+    kh_value(obj->halfedge_lookup, k) = h;
+  }
+  obj->n_local_vertices = nV;
+  obj->n_local_triangles = nF;
+  obj->n_local_half_edges = 3 * nF;
+
+  // Stage 16A: manifold / orientation check, then pairing and the declared-class policy
+  if (MFTLInternalCountDirectedDuplicates(obj, 1) > 0)
+  {
+    fprintf(stderr, "MFTLBuildTopologyFromTriples: non-manifold edge or inconsistent orientation\n");
+    return MFTL_ERROR;
+  }
   MFTLRebuildTwins(obj);
+  int n_open = 0;
+  for (int i = 0; i < obj->n_half_edges; ++i)
+    if (!MFTLHeIsLocal(&obj->half_edges[i])) n_open++;
+  if (n_open > 0)
+  {
+    if (!obj->declared_open)
+    {
+      fprintf(stderr, "MFTLBuildTopologyFromTriples: %d unmatched half-edge(s) on a body not declared open\n", n_open);
+      return MFTL_ERROR;
+    }
+    int(*ab)[2] = malloc((size_t) n_open * sizeof(*ab));
+    int* idx = malloc((size_t) n_open * sizeof(int));
+    int* tag = malloc((size_t) n_open * sizeof(int));
+    int k = 0;
+    for (int i = 0; i < obj->n_half_edges; ++i)
+    {
+      if (MFTLHeIsLocal(&obj->half_edges[i])) continue;
+      ab[k][0] = MFTLHeOrigin(obj, &obj->half_edges[i])->global_id;
+      ab[k][1] = MFTLHeTarget(obj, &obj->half_edges[i])->global_id;
+      idx[k++] = i;
+    }
+    int rc = MFTLInternalTagBoundaryLoops(n_open, (const int(*)[2]) ab, tag);
+    if (rc == MFTL_SUCCESS)
+      for (k = 0; k < n_open; ++k) MFTLHeSetBoundary(&obj->half_edges[idx[k]], tag[k]);
+    free(ab);
+    free(idx);
+    free(tag);
+    if (rc != MFTL_SUCCESS)
+    {
+      fprintf(stderr, "MFTLBuildTopologyFromTriples: boundary does not form simple loops (bow-tie vertex)\n");
+      return MFTL_ERROR;
+    }
+    MFTLRefreshBoundaryCache(obj);
+  }
   MFTLFlattenConnectivity(obj);
+  if (MFTLCheckTwinStatesLocal(obj, 0, 1) != 0)
+  {
+    fprintf(stderr, "MFTLBuildTopologyFromTriples: twin-state validation failed\n");
+    return MFTL_ERROR;
+  }
+  return MFTL_SUCCESS;
 }
 
 /**

@@ -25,6 +25,8 @@
 #include "mftl_memory.h"
 #include "mftl_topology.h"
 #include "mftl_geometry.h"
+#include "mftl_twin_internal.h"
+#include "mftl_images.h"
 
 static int mftlCmpInt(const void* a, const void* b)
 {
@@ -87,6 +89,35 @@ static void mftlAllgathervInts(MPI_Comm comm, const int* send, int nsend, int** 
 int MFTLBuildFromSoup(MFTL_Object* obj, int nV, const int* vgid, const double (*pos)[3], const int* vowner, int nT, const int* tgid, const int (*tvg)[3],
                       const int* towner)
 {
+  return MFTLBuildFromSoupEx(obj, nV, vgid, pos, vowner, nT, tgid, tvg, towner, MFTL_NULL);
+}
+
+static int mftlCmpDecl(const void* a, const void* b)
+{
+  const int* x = (const int*) a;
+  const int* y = (const int*) b;
+  if (x[0] != y[0]) return (x[0] > y[0]) - (x[0] < y[0]);
+  return (x[1] > y[1]) - (x[1] < y[1]);
+}
+
+static int mftlSoupCore(MFTL_Object* obj, int nV, const int* vgid, const double (*pos)[3], const int (*vimg)[3], const int* vowner, int nT,
+                        const int* tgid, const int (*tvg)[3], const int* towner, const MFTL_BoundaryDecl* decl);
+
+int MFTLBuildFromSoupEx(MFTL_Object* obj, int nV, const int* vgid, const double (*pos)[3], const int* vowner, int nT, const int* tgid,
+                        const int (*tvg)[3], const int* towner, const MFTL_BoundaryDecl* decl)
+{
+  return mftlSoupCore(obj, nV, vgid, pos, MFTL_NULL, vowner, nT, tgid, tvg, towner, decl);
+}
+
+int MFTLBuildFromSoupImg(MFTL_Object* obj, int nV, const int* vgid, const double (*pos)[3], const int (*vimg)[3], const int* vowner, int nT,
+                         const int* tgid, const int (*tvg)[3], const int* towner, const MFTL_BoundaryDecl* decl)
+{
+  return mftlSoupCore(obj, nV, vgid, pos, vimg, vowner, nT, tgid, tvg, towner, decl);
+}
+
+static int mftlSoupCore(MFTL_Object* obj, int nV, const int* vgid, const double (*pos)[3], const int (*vimg)[3], const int* vowner, int nT,
+                        const int* tgid, const int (*tvg)[3], const int* towner, const MFTL_BoundaryDecl* decl)
+{
   MFTL_ASSERT(obj != MFTL_NULL && obj->domain != MFTL_NULL);
   MFTL_Domain* domain = obj->domain;
   MPI_Comm comm = domain->comm_cart;
@@ -109,7 +140,13 @@ int MFTLBuildFromSoup(MFTL_Object* obj, int nV, const int* vgid, const double (*
     v->global_id = vgid[i];
     v->owner_proc = vowner ? vowner[i] : domain->rank;
     v->is_ghost = MFTL_FALSE;
-    memcpy(v->pos, pos[i], 3 * sizeof(double));
+    if (vimg)
+    {
+      memcpy(v->pos, pos[i], 3 * sizeof(double));  // wrapped position with explicit counters (restart)
+      memcpy(v->img, vimg[i], 3 * sizeof(int));
+    }
+    else
+      MFTLWrapContinuous(domain, pos[i], v->pos, v->img);  // Stage 16B: continuous input
     v->out_he_idx = MFTL_ERROR;
     int ret;
     k = kh_put(vertex_map, obj->vertex_lookup, v->global_id, &ret);
@@ -175,8 +212,8 @@ int MFTLBuildFromSoup(MFTL_Object* obj, int nV, const int* vgid, const double (*
       he->vertex_idx = vi[(j + 1) % 3];  // half-edge j: v_j -> v_(j+1)
       he->next_idx = 3 * nt_loc + (j + 1) % 3;
       he->twin_idx = MFTL_ERROR;
-      he->twin_gid = MFTL_ERROR;
-      he->boundary = MFTL_TRUE;
+      he->twin_gid = MFTL_TWIN_UNKNOWN;
+      he->boundary = MFTL_FALSE;
       if (obj->vertices[vi[j]].out_he_idx == MFTL_ERROR) obj->vertices[vi[j]].out_he_idx = 3 * nt_loc + j;
       int ret;
       khiter_t kh = kh_put(halfedge_map, obj->halfedge_lookup, he->global_id, &ret);
@@ -229,16 +266,18 @@ int MFTLBuildFromSoup(MFTL_Object* obj, int nV, const int* vgid, const double (*
   }
 
   // --- 4. local twins, then the rim twins through one gather of the unpaired half-edges --
+  // (GLOBAL discovery mode, plans/16 §2.4: before ownership, every rank's copy counts.)
+  int bad4 = (MFTLInternalCountDirectedDuplicates(obj, 1) > 0);  // non-manifold / orientation
   MFTLRebuildTwins(obj);
   int n_rim = 0;
   for (int i = 0; i < obj->n_half_edges; ++i)
-    if (obj->half_edges[i].twin_idx == MFTL_ERROR) n_rim++;
+    if (!MFTLHeIsLocal(&obj->half_edges[i])) n_rim++;
   int* rim_send = (int*) malloc((size_t) (4 * (n_rim > 0 ? n_rim : 1)) * sizeof(int));
   int r = 0;
   for (int i = 0; i < obj->n_half_edges; ++i)
   {
     MFTL_HalfEdge* he = &obj->half_edges[i];
-    if (he->twin_idx != MFTL_ERROR) continue;
+    if (MFTLHeIsLocal(he)) continue;
     int a = MFTLHeOrigin(obj, he)->global_id, b = MFTLHeTarget(obj, he)->global_id;
     rim_send[4 * r + 0] = a < b ? a : b;
     rim_send[4 * r + 1] = a < b ? b : a;
@@ -250,16 +289,76 @@ int MFTLBuildFromSoup(MFTL_Object* obj, int nV, const int* vgid, const double (*
   int n_rim_all = 0;
   mftlAllgathervInts(comm, rim_send, 4 * n_rim, &rim_all, &n_rim_all);
   n_rim_all /= 4;
-  qsort(rim_all, (size_t) n_rim_all, sizeof(mftlRimRec), mftlCmpRim);
-  for (int i = 0; i < obj->n_half_edges; ++i)
+  // phase 2: locally paired half-edges on an edge that is on some rank's rim (the same edge may
+  // be interior on one rank and rim on another when triangles are duplicated across ranks)
   {
-    MFTL_HalfEdge* he = &obj->half_edges[i];
-    if (he->twin_idx != MFTL_ERROR) continue;
-    int a = MFTLHeOrigin(obj, he)->global_id, b = MFTLHeTarget(obj, he)->global_id;
-    // the twin runs b -> a: same undirected pair, opposite direction
-    mftlRimRec key = {a < b ? a : b, a < b ? b : a, !(a < b), -2147483647 - 1};
-    const mftlRimRec* base = (const mftlRimRec*) rim_all;
-    int lo = 0, hi = n_rim_all;  // first record >= key
+    int(*keys)[2] = malloc((size_t) (n_rim_all > 0 ? n_rim_all : 1) * sizeof(*keys));
+    for (int i = 0; i < n_rim_all; ++i)
+    {
+      keys[i][0] = rim_all[4 * i];
+      keys[i][1] = rim_all[4 * i + 1];
+    }
+    qsort(keys, (size_t) n_rim_all, sizeof(*keys), mftlCmpDecl);
+    int n2 = 0, cap2 = 64;
+    int* send2 = (int*) malloc((size_t) (4 * cap2) * sizeof(int));
+    for (int i = 0; i < obj->n_half_edges && n_rim_all > 0; ++i)
+    {
+      MFTL_HalfEdge* he = &obj->half_edges[i];
+      if (!MFTLHeIsLocal(he)) continue;
+      int a = MFTLHeOrigin(obj, he)->global_id, b = MFTLHeTarget(obj, he)->global_id;
+      int key[2] = {MFTL_MIN(a, b), MFTL_MAX(a, b)};
+      if (!bsearch(key, keys, (size_t) n_rim_all, sizeof(*keys), mftlCmpDecl)) continue;
+      if (n2 == cap2)
+      {
+        cap2 *= 2;
+        send2 = (int*) realloc(send2, (size_t) (4 * cap2) * sizeof(int));
+      }
+      send2[4 * n2 + 0] = key[0];
+      send2[4 * n2 + 1] = key[1];
+      send2[4 * n2 + 2] = a < b;
+      send2[4 * n2 + 3] = he->global_id;
+      n2++;
+    }
+    free(keys);
+    int* all2 = MFTL_NULL;
+    int n_all2 = 0;
+    mftlAllgathervInts(comm, send2, 4 * n2, &all2, &n_all2);
+    free(send2);
+    if (n_all2 > 0)
+    {
+      rim_all = (int*) realloc(rim_all, (size_t) (4 * n_rim_all + n_all2) * sizeof(int));
+      memcpy(rim_all + 4 * n_rim_all, all2, (size_t) n_all2 * sizeof(int));
+      n_rim_all += n_all2 / 4;
+    }
+    free(all2);
+  }
+  qsort(rim_all, (size_t) n_rim_all, sizeof(mftlRimRec), mftlCmpRim);
+  mftlRimRec* base = (mftlRimRec*) rim_all;
+  // drop identical duplicates (the same half-edge held on several ranks); a second half-edge
+  // with the same direction on the same vertex pair is a non-manifold edge / orientation error
+  int n_u = 0;
+  for (int i = 0; i < n_rim_all; ++i)
+  {
+    if (n_u > 0 && base[i].lo == base[n_u - 1].lo && base[i].hi == base[n_u - 1].hi && base[i].forward == base[n_u - 1].forward)
+    {
+      if (base[i].he_gid != base[n_u - 1].he_gid)
+      {
+        if (domain->rank == 0)
+          fprintf(stderr, "MFTLBuildFromSoup: duplicate directed edge %d-%d (half-edges %d, %d): non-manifold edge or inconsistent orientation\n",
+                  base[i].lo, base[i].hi, base[n_u - 1].he_gid, base[i].he_gid);
+        bad4 = 1;
+      }
+      continue;
+    }
+    base[n_u++] = base[i];
+  }
+  // partner of each unique rim record; unmatched ones form the global boundary candidate set U
+  int* partner = (int*) malloc((size_t) (n_u > 0 ? n_u : 1) * sizeof(int));
+  int n_unm = 0;
+  for (int i = 0; i < n_u; ++i)
+  {
+    mftlRimRec key = {base[i].lo, base[i].hi, !base[i].forward, -2147483647 - 1};
+    int lo = 0, hi = n_u;
     while (lo < hi)
     {
       int mid = lo + (hi - lo) / 2;
@@ -268,21 +367,151 @@ int MFTLBuildFromSoup(MFTL_Object* obj, int nV, const int* vgid, const double (*
       else
         hi = mid;
     }
-    if (lo < n_rim_all && base[lo].lo == key.lo && base[lo].hi == key.hi && base[lo].forward == key.forward) he->twin_gid = base[lo].he_gid;
+    partner[i] = (lo < n_u && base[lo].lo == key.lo && base[lo].hi == key.hi && base[lo].forward == key.forward) ? base[lo].he_gid : MFTL_ERROR;
+    if (partner[i] == MFTL_ERROR) n_unm++;
   }
+  // U: unmatched records {origin gid, target gid, he gid, tag}
+  int(*U)[4] = malloc((size_t) (n_unm > 0 ? n_unm : 1) * sizeof(*U));
+  n_unm = 0;
+  for (int i = 0; i < n_u; ++i)
+  {
+    if (partner[i] != MFTL_ERROR) continue;
+    U[n_unm][0] = base[i].forward ? base[i].lo : base[i].hi;
+    U[n_unm][1] = base[i].forward ? base[i].hi : base[i].lo;
+    U[n_unm][2] = base[i].he_gid;
+    U[n_unm][3] = -1;
+    n_unm++;
+  }
+  if (n_unm > 0)
+  {
+    // the declaration is the union over ranks (collective decision)
+    int dloc[2] = {decl ? decl->from_mesh : 0, decl ? decl->n_edges : 0}, dglob[2];
+    MPI_Allreduce(dloc, dglob, 2, MPI_INT, MPI_MAX, comm);
+    if (!obj->declared_open || (!dglob[0] && dglob[1] == 0))
+    {
+      if (domain->rank == 0)
+        fprintf(stderr, "MFTLBuildFromSoup: %d edge(s) unmatched on every rank (first %d-%d) on a body %s\n", n_unm, U[0][0], U[0][1],
+                obj->declared_open ? "declared open without a boundary declaration" : "not declared open");
+      bad4 = 1;
+    }
+    else if (dglob[0])
+    {
+      int(*ab)[2] = malloc((size_t) n_unm * sizeof(*ab));
+      int* tag = malloc((size_t) n_unm * sizeof(int));
+      for (int i = 0; i < n_unm; ++i)
+      {
+        ab[i][0] = U[i][0];
+        ab[i][1] = U[i][1];
+      }
+      if (MFTLInternalTagBoundaryLoops(n_unm, (const int(*)[2]) ab, tag) != MFTL_SUCCESS)
+      {
+        if (domain->rank == 0) fprintf(stderr, "MFTLBuildFromSoup: the unmatched edges do not form simple loops\n");
+        bad4 = 1;
+      }
+      else
+        for (int i = 0; i < n_unm; ++i) U[i][3] = tag[i];
+      free(ab);
+      free(tag);
+    }
+    else
+    {
+      const int nde = decl ? decl->n_edges : 0;
+      int* dl = (int*) malloc((size_t) (3 * (nde > 0 ? nde : 1)) * sizeof(int));
+      for (int i = 0; i < nde; ++i)
+      {
+        dl[3 * i + 0] = MFTL_MIN(decl->edges[i].vgid_a, decl->edges[i].vgid_b);
+        dl[3 * i + 1] = MFTL_MAX(decl->edges[i].vgid_a, decl->edges[i].vgid_b);
+        dl[3 * i + 2] = decl->edges[i].tag;
+      }
+      int *dall = MFTL_NULL, nd = 0;
+      mftlAllgathervInts(comm, dl, 3 * nde, &dall, &nd);
+      nd /= 3;
+      free(dl);
+      qsort(dall, (size_t) nd, 3 * sizeof(int), mftlCmpDecl);
+      char* used = (char*) calloc((size_t) (nd > 0 ? nd : 1), 1);
+      for (int i = 0; i < n_unm; ++i)
+      {
+        int key[3] = {MFTL_MIN(U[i][0], U[i][1]), MFTL_MAX(U[i][0], U[i][1]), 0};
+        int* f = (int*) bsearch(key, dall, (size_t) nd, 3 * sizeof(int), mftlCmpDecl);
+        if (!f || f[2] < 0)
+        {
+          if (domain->rank == 0) fprintf(stderr, "MFTLBuildFromSoup: unmatched edge %d-%d is not declared a boundary\n", key[0], key[1]);
+          bad4 = 1;
+          continue;
+        }
+        U[i][3] = f[2];
+        // mark every (duplicate) declaration of this edge as used
+        for (int* g = f; g >= dall && g[0] == key[0] && g[1] == key[1]; g -= 3) used[(g - dall) / 3] = 1;
+        for (int* g = f; g < dall + 3 * nd && g[0] == key[0] && g[1] == key[1]; g += 3) used[(g - dall) / 3] = 1;
+      }
+      for (int k = 0; k < nd; ++k)
+        if (!used[k])
+        {
+          if (domain->rank == 0) fprintf(stderr, "MFTLBuildFromSoup: declared boundary edge %d-%d is not an unmatched edge\n", dall[3 * k], dall[3 * k + 1]);
+          bad4 = 1;
+        }
+      free(used);
+      free(dall);
+    }
+  }
+  // apply: unmatched -> BOUNDARY with its tag; partner found -> REMOTE (below)
+  {
+    int(*Ug)[2] = malloc((size_t) (n_unm > 0 ? n_unm : 1) * sizeof(*Ug));
+    for (int i = 0; i < n_unm; ++i)
+    {
+      Ug[i][0] = U[i][2];
+      Ug[i][1] = U[i][3];
+    }
+    qsort(Ug, (size_t) n_unm, sizeof(*Ug), mftlCmpDecl);
+    for (int i = 0; i < obj->n_half_edges; ++i)
+    {
+      MFTL_HalfEdge* he = &obj->half_edges[i];
+      if (MFTLHeIsLocal(he)) continue;
+      int gk[2] = {he->global_id, 0};
+      int(*f)[2] = bsearch(gk, Ug, (size_t) n_unm, sizeof(*Ug), mftlCmpInt);
+      if (f && (*f)[1] >= 0) MFTLHeSetBoundary(he, (*f)[1]);
+    }
+    free(Ug);
+  }
+  for (int i = 0; i < obj->n_half_edges; ++i)
+  {
+    MFTL_HalfEdge* he = &obj->half_edges[i];
+    if (MFTLHeIsLocal(he) || MFTLHeIsBoundary(he)) continue;
+    int a = MFTLHeOrigin(obj, he)->global_id, b = MFTLHeTarget(obj, he)->global_id;
+    mftlRimRec key = {a < b ? a : b, a < b ? b : a, !(a < b), -2147483647 - 1};
+    int lo = 0, hi = n_u;  // first record >= key
+    while (lo < hi)
+    {
+      int mid = lo + (hi - lo) / 2;
+      if (mftlCmpRim(&base[mid], &key) < 0)
+        lo = mid + 1;
+      else
+        hi = mid;
+    }
+    if (lo < n_u && base[lo].lo == key.lo && base[lo].hi == key.hi && base[lo].forward == key.forward) MFTLHeSetRemote(he, base[lo].he_gid);
+  }
+  free(partner);
+  free(U);
   free(rim_send);
   free(rim_all);
+  MFTLRefreshBoundaryCache(obj);
+  bad4 += MFTLCheckTwinStatesLocal(obj, 0, 1);
+  int gbad4 = 0;
+  MPI_Allreduce(&bad4, &gbad4, 1, MPI_INT, MPI_MAX, comm);
+  if (gbad4) return MFTL_ERROR;
 
   // --- 5. counters and acceleration arrays ---------------------------------------------
   obj->next_vertex_gid = MFTL_MAX(obj->next_vertex_gid, global_max[0] + 1);
   obj->next_triangle_gid = MFTL_MAX(obj->next_triangle_gid, global_max[1] + 1);
   obj->next_halfedge_gid = he_base + 3 * n_unique_t;
   MFTLFlattenConnectivity(obj);
-  return MFTL_SUCCESS;
+  // Stage 16B (§3.2/§3.3): assembled pieces may be gauged independently -> canonicalise
+  return MFTLCanonicaliseImages(obj);
 }
 
 int MFTLObjectAppendTriangleCopy(MFTL_Object* dst, const MFTL_Object* src, int tri_idx)
 {
+  dst->wrap_valid = 0;  // Stage 16B: staged; MFTLObjectCommitCopy canonicalises
   const MFTL_Triangle* st = &src->triangles[tri_idx];
   khiter_t kt = kh_get(triangle_map, dst->triangle_lookup, st->global_id);
   if (kt != kh_end(dst->triangle_lookup)) return kh_value(dst->triangle_lookup, kt);
@@ -305,7 +534,7 @@ int MFTLObjectAppendTriangleCopy(MFTL_Object* dst, const MFTL_Object* src, int t
     dst->vertices[idx] = *sv;
     dst->vertices[idx].is_ghost = MFTL_FALSE;
     dst->vertices[idx].out_he_idx = MFTL_ERROR;
-    dst->vertices[idx].flags = MFTL_FLAG_NONE;
+    dst->vertices[idx].flags = sv->flags & MFTL_VFLAG_CORNER;  // Stage 16C: the corner tag travels with copies
     int ret;
     kv = kh_put(vertex_map, dst->vertex_lookup, sv->global_id, &ret);
     kh_value(dst->vertex_lookup, kv) = idx;
@@ -342,18 +571,18 @@ int MFTLObjectAppendTriangleCopy(MFTL_Object* dst, const MFTL_Object* src, int t
     MFTL_HalfEdge* he = &dst->half_edges[h0 + j];
     memset(he, 0, sizeof(*he));
     he->global_id = sh[j]->global_id;
-    he->twin_gid = MFTLHeTwinGid(src, sh[j]);
+    he->twin_gid = MFTLHeTwinCode(src, sh[j]);  // staged: source state code until the commit
     he->vertex_idx = dv[j];
     he->next_idx = h0 + (j + 1) % 3;
     he->triangle_idx = ti;
     he->twin_idx = MFTL_ERROR;
-    he->boundary = MFTL_TRUE;
+    he->boundary = MFTLHeIsBoundary(he);
     he->flags = sh[j]->flags & MFTL_FLAG_FEATURE;
     int origin = dv[(j + 2) % 3];
     if (dst->vertices[origin].out_he_idx == MFTL_ERROR) dst->vertices[origin].out_he_idx = h0 + j;
     khiter_t kh = kh_put(halfedge_map, dst->halfedge_lookup, he->global_id, &ret);
     kh_value(dst->halfedge_lookup, kh) = h0 + j;
-    if (he->twin_gid != MFTL_ERROR)
+    if (MFTLHeIsRemote(he))  // staged: the source twin gid (a BOUNDARY code is kept)
     {
       khiter_t ktw = kh_get(halfedge_map, dst->halfedge_lookup, he->twin_gid);
       if (ktw != kh_end(dst->halfedge_lookup))
@@ -378,6 +607,7 @@ int MFTLObjectAppendTriangleCopy(MFTL_Object* dst, const MFTL_Object* src, int t
 
 void MFTLObjectClear(MFTL_Object* obj)
 {
+  obj->wrap_valid = 0;  // Stage 16B: no stale winding flags for the next contents
   if (obj->data_size > 0)
     for (int i = 0; i < obj->n_triangles; ++i) free(obj->triangles[i].data);
   obj->n_vertices = obj->n_triangles = obj->n_half_edges = 0;

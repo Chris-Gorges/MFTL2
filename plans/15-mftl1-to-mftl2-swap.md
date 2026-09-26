@@ -7,6 +7,11 @@ Reviewed by: Claude Code, independent review 2026-09-23 (see "Independent review
 Acceptance: PASSED (2026-09-23) — with the should-fix items and the corrected golden-baseline
 diagnosis recorded in "Independent review"
 
+> **Renumbering note (2026-09-23).** Stages were renumbered after this review: the cleanup
+> stage referred to below as "Stage 16" is now **Stage 17** (`plans/17-code-quality-documentation.md`);
+> the new **Stage 16** is generalized surfaces (`plans/16-generalized-surfaces.md`), which absorbs
+> R6.2 (guaranteed ghost completion). The text below is left as written.
+
 > **Implementation note.** The "compatibility shim" of the original plan was NOT built: the
 > brief for this stage asked for local math helpers and no MFTL1 compat library, and the Stage-14
 > adapter made a shim unnecessary. multiflow now contains no MFTL1 include, type or call; see

@@ -24,6 +24,7 @@
 #include "mftl_geometry.h"
 #include "mftl_topology.h"
 #include "mftl_memory.h"
+#include "mftl_images.h"
 
 // ---------------------------------------------------------------------------
 // Core builder: shared with mesh I/O (MFTLBuildTopologyFromTriples in
@@ -34,15 +35,16 @@ static void mftlBuildMeshFromTriples(MFTL_Object* obj, int nV, const double posi
   MFTL_Domain* domain = obj->domain;
 
   double (*wrapped)[3] = malloc(nV * sizeof(*wrapped));
-  MFTL_ASSERT(wrapped != MFTL_NULL);
-  for (int i = 0; i < nV; ++i)
-  {
-    memcpy(wrapped[i], positions[i], 3 * sizeof(double));
-    MFTLApplyPeriodicity(domain, wrapped[i]);
-  }
+  int (*img)[3] = malloc(nV * sizeof(*img));
+  MFTL_ASSERT(wrapped != MFTL_NULL && img != MFTL_NULL);
+  for (int i = 0; i < nV; ++i) MFTLWrapContinuous(domain, positions[i], wrapped[i], img[i]);  // Stage 16B lift
 
-  MFTLBuildTopologyFromTriples(obj, nV, (const double (*)[3]) wrapped, nF, triples);
+  int rc = MFTLBuildTopologyFromTriples(obj, nV, (const double (*)[3]) wrapped, nF, triples);
+  MFTL_ASSERT(rc == MFTL_SUCCESS && "generator produced an invalid mesh");
+  (void) rc;
+  for (int i = 0; i < nV; ++i) memcpy(obj->vertices[i].img, img[i], 3 * sizeof(int));
   free(wrapped);
+  free(img);
 }
 
 // Collective tail identical to MFTLGenerateSphere: broadcast gid counters so
@@ -57,6 +59,7 @@ static void mftlGeneratorFinish(MFTL_Object* obj)
 
   MFTLObjectUpdateGlobalStats(obj);
   MFTLFlattenConnectivity(obj);
+  MFTLCanonicaliseImages(obj);  // Stage 16B: wrap flags (continuous input -> consistent counters)
 }
 
 // Orient one triangle so its normal faces `outward_ref` (a point strictly on
@@ -218,9 +221,21 @@ static int mftlTessellateFlat(MFTL_Object* object)
     const MFTL_Vertex* v0 = &old_vertices[old_half_edges[twin_idx].vertex_idx];
 
     MFTL_Vertex* mid = &new_vertices[next_mid_idx];
-    mid->pos[0] = 0.5 * (v0->pos[0] + v1->pos[0]);
-    mid->pos[1] = 0.5 * (v0->pos[1] + v1->pos[1]);
-    mid->pos[2] = 0.5 * (v0->pos[2] + v1->pos[2]);
+    if (MFTLDomainAnyPeriodic(object->domain))
+    {
+      // Stage 16B: seam-safe midpoint anchored at v0 (displacement rule)
+      double e[3];
+      MFTLGetMinimumImageVector(object->domain, e, v0->pos, v1->pos);
+      for (int k = 0; k < 3; ++k) mid->pos[k] = v0->pos[k] + 0.5 * e[k];
+      memcpy(mid->img, v0->img, 3 * sizeof(int));
+      MFTLWrapPosImg(object->domain, mid->pos, mid->img);
+    }
+    else
+    {
+      mid->pos[0] = 0.5 * (v0->pos[0] + v1->pos[0]);
+      mid->pos[1] = 0.5 * (v0->pos[1] + v1->pos[1]);
+      mid->pos[2] = 0.5 * (v0->pos[2] + v1->pos[2]);
+    }
     mid->global_id = object->next_vertex_gid++;
     mid->owner_proc = object->domain->rank;
     mid->is_ghost = MFTL_FALSE;
@@ -265,8 +280,8 @@ static int mftlTessellateFlat(MFTL_Object* object)
         he->vertex_idx = sub[j][(k + 1) % 3];
         he->next_idx = new_he_idx + ((k + 1) % 3);
         he->twin_idx = MFTL_ERROR;
-        he->twin_gid = MFTL_ERROR;
-        he->boundary = MFTL_TRUE;
+        he->twin_gid = MFTL_TWIN_UNKNOWN;  // closed input: every half-edge is paired below
+        he->boundary = MFTL_FALSE;
         he->flags = 0;
 
         new_vertices[sub[j][k]].out_he_idx = new_he_idx + k;
@@ -458,6 +473,7 @@ void MFTLGenerateFace(MFTL_Object* obj, const double v[4][3])
   MFTL_ASSERT(v != MFTL_NULL);
   MFTL_ASSERT(obj->n_vertices == 0 && "MFTLGenerateFace: object must be empty");
   MFTL_Domain* domain = obj->domain;
+  MFTLObjectDeclareOpen(obj, 1);  // Stage 16A: an open surface (one boundary loop, tag 0)
   if (domain->rank != 0)
   {
     mftlGeneratorFinish(obj);

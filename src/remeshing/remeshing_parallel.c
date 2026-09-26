@@ -45,12 +45,14 @@
 #include <stdio.h>
 #include <math.h>
 #include <mpi.h>
+#include "mftl_images.h"
 #include "mftl_arrayfunctions.h"
 #include "mftl_constants.h"
 #include "mftl_core.h"
 #include "mftl_communication.h"
 #include "mftl_remeshing.h"
 #include "mftl_topology.h"
+#include "mftl_boundary_internal.h"
 #include "mftl_geometry.h"
 #include "mftl_memory.h"
 
@@ -240,6 +242,48 @@ static int mftlFanInterior(MFTL_Object *obj, int he_idx)
   return 1;
 }
 
+/* Stage 16C (plans/16 §4.4.3): gates of the GENERALIZED remesher (open bodies, closed bodies opted
+   in). The same test functions as in serial are applied to edges whose complete (augmented)
+   neighbourhood is local: a LOCAL or BOUNDARY edge (never REMOTE) whose triangle(s) are owned with
+   owned corners (split), resp. whose endpoint fans are completely owned (collapse). Closed bodies
+   in the default mode keep the Stage-15 gates above bit-identically. */
+static int mftlEdgeInteriorGen(MFTL_Object *obj, int he_idx)
+{
+  MFTL_HalfEdge *he = &obj->half_edges[he_idx];
+  if (he->flags & MFTL_FLAG_DEAD) return 0;
+  if (!MFTLHeIsLocal(he) && !MFTLHeIsBoundary(he)) return 0;
+  if (!mftlTriFullyLocal(obj, he->triangle_idx)) return 0;
+  if (MFTLHeIsLocal(he))
+  {
+    MFTL_HalfEdge *tw = &obj->half_edges[he->twin_idx];
+    if (tw->flags & MFTL_FLAG_DEAD) return 0;
+    if (!mftlTriFullyLocal(obj, tw->triangle_idx)) return 0;
+  }
+  return 1;
+}
+
+static int mftlFanInteriorGen(MFTL_Object *obj, int he_idx)
+{
+  MFTL_HalfEdge *he = &obj->half_edges[he_idx];
+  if (he->flags & MFTL_FLAG_DEAD) return 0;
+  if (!MFTLHeIsLocal(he) && !MFTLHeIsBoundary(he)) return 0;
+  const int v_a = obj->half_edges[obj->half_edges[he->next_idx].next_idx].vertex_idx, v_b = he->vertex_idx;
+  if (obj->vertices[v_a].is_ghost || obj->vertices[v_b].is_ghost) return 0;
+  if ((obj->vertices[v_a].flags | obj->vertices[v_b].flags) & MFTL_FLAG_DEAD) return 0;
+  const int ends[2] = {v_a, v_b};
+  for (int e = 0; e < 2; ++e)
+  {
+    int ring[128], nr = 0;
+    if (MFTLVertexRing(obj, ends[e], ring, 128, &nr) == MFTL_RING_INCOMPLETE || nr > 128) return 0;
+    for (int i = 0; i < nr; ++i)
+      if (!mftlTriFullyLocal(obj, obj->half_edges[ring[i]].triangle_idx)) return 0;
+  }
+  return 1;
+}
+
+static inline int mftlSplitGate(MFTL_Object *obj, int j) { return MFTLObjectRemeshGeneralized(obj) ? mftlEdgeInteriorGen(obj, j) : mftlEdgeInterior(obj, j); }
+static inline int mftlCollapseGate(MFTL_Object *obj, int j) { return MFTLObjectRemeshGeneralized(obj) ? mftlFanInteriorGen(obj, j) : mftlFanInterior(obj, j); }
+
 /* ══════════════════════════════════════════════════════════════════════
  * Split phase with disjoint per-rank GID blocks
  *
@@ -276,7 +320,7 @@ static long mftlParallelSplitPhase(MFTL_Ensemble *ens, MFTL_RemeshParameters *pa
     cand_he[o] = (int *) malloc(((size_t) obj->n_half_edges + 1) * sizeof(int));
     for (int j = obj->n_half_edges - 1; j >= 0; --j)
     {
-      if (!mftlEdgeInterior(obj, j)) continue;
+      if (!mftlSplitGate(obj, j)) continue;
       if (!MFTLSplitApproved(obj, j, params)) continue;
       cand_he[o][cand[o]++] = j;
     }
@@ -325,7 +369,10 @@ static long mftlParallelSplitPhase(MFTL_Ensemble *ens, MFTL_RemeshParameters *pa
       const int j = cand_he[o][c];
       // a twin approved in the same pass, or an edge touched by an earlier split, is skipped
       if (obj->half_edges[j].flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) continue;
-      if (!mftlEdgeInterior(obj, j)) continue;
+      if (!mftlSplitGate(obj, j)) continue;
+      // 16C review: earlier splits of this pass may have raised an opposite vertex's valence;
+      // skipping only lowers the consumption below the reserved block
+      if (MFTLObjectRemeshGeneralized(obj) && !MFTLGeneralizedSplitValenceOk(obj, j)) continue;
       MFTLSplitEdgeWithFit(obj, j, params);
       splits++;
     }
@@ -354,7 +401,7 @@ static long mftlParallelSplitPhase(MFTL_Ensemble *ens, MFTL_RemeshParameters *pa
  *
  * Returns the LOCAL operation count (caller reduces globally).
  * ══════════════════════════════════════════════════════════════════════ */
-static long mftlParallelRemeshPass(MFTL_Ensemble *ens, MFTL_RemeshParameters *params, const double *start_volume)
+static long mftlParallelRemeshPass(MFTL_Ensemble *ens, MFTL_RemeshParameters *params, const MFTL_RecoveryTarget *start_volume)
 {
   long ops = 0;
   int nobj = ens->num_objects;
@@ -398,7 +445,7 @@ static long mftlParallelRemeshPass(MFTL_Ensemble *ens, MFTL_RemeshParameters *pa
     MFTL_Object *obj = ens->objects[o];
     for (int j = 0; j < obj->n_half_edges; ++j)
     {
-      if (!mftlFanInterior(obj, j)) continue;
+      if (!mftlCollapseGate(obj, j)) continue;
       if (!CollapseApproved(obj, j, params)) continue;
       MFTLCollapseEdgeWithFit(obj, j, params);
       collapses_occurred[o] = MFTL_TRUE;
@@ -472,7 +519,7 @@ static long mftlParallelRemeshPass(MFTL_Ensemble *ens, MFTL_RemeshParameters *pa
   for (int o = 0; o < nobj; ++o)
   {
     MFTL_Object *obj = ens->objects[o];
-    if (!params->skip_volume_recovery) MFTLVolumeRecovery(obj, start_volume[o]);
+    if (!params->skip_volume_recovery) MFTLRemeshRecover(ens, obj, &start_volume[o]);
     MFTLComputeTriangleProperties(obj);
   }
 
@@ -781,9 +828,8 @@ int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *par
   int x_only = (dom->cuts[1] == 1 && dom->cuts[2] == 1);
 
   // Snapshot pre-remesh volumes (collective per object).
-  double *start_volume = (double *) malloc((size_t) nobj * sizeof(double));
-  for (int o = 0; o < nobj; ++o)
-    start_volume[o] = MFTLObjectVolume(ens->objects[o]);
+  MFTL_RecoveryTarget *start_volume = (MFTL_RecoveryTarget *) malloc((size_t) nobj * sizeof(MFTL_RecoveryTarget));
+  for (int o = 0; o < nobj; ++o) MFTLRemeshRecoveryTarget(ens->objects[o], params, &start_volume[o]);  // Stage 16B/16C class guard
 
   // Stage 15: on a non-x-only decomposition the load-balanced two-pass scheme runs on a
   // TEMPORARY x-only slab layout (slab i = rank i, MFTL1's LoadBalance ownership model:
@@ -932,10 +978,15 @@ int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *par
   }
 
   // MFTL1 end-of-remesh clamp into the domain box (non-periodic axes only;
-  // periodic axes are wrapped by the advection instead).
+  // periodic axes are wrapped by the advection instead). A declared-open body
+  // is clamped into the CLOSED box (16E review): a boundary loop held on a
+  // wall (a pinned loop on a wall closure, plans/16 §3.6.2, §7.2) must stay
+  // exactly on it, and the absolute 1e-12 inset would move it off the wall by
+  // more than the closure tolerance on small domains. Closed bodies unchanged.
   for (int o = 0; o < nobj; ++o)
   {
     MFTL_Object *obj = ens->objects[o];
+    const double inset = obj->declared_open ? 0.0 : MFTL_VERYSMALL;
     for (int i = 0; i < obj->n_vertices; ++i)
     {
       MFTL_Vertex *v = &obj->vertices[i];
@@ -943,7 +994,7 @@ int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *par
       for (int k = 0; k < 3; ++k)
       {
         if (dom->is_periodic[k]) continue;
-        v->pos[k] = MFTL_MAX(dom->global_min[k] + MFTL_VERYSMALL, MFTL_MIN(v->pos[k], dom->global_max[k] - MFTL_VERYSMALL));
+        v->pos[k] = MFTL_MAX(dom->global_min[k] + inset, MFTL_MIN(v->pos[k], dom->global_max[k] - inset));
       }
     }
   }
@@ -965,7 +1016,7 @@ int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *par
     for (int o = 0; o < nobj; ++o)
     {
       MFTL_Object *obj = ens->objects[o];
-      MFTLVolumeRecovery(obj, start_volume[o]);
+      MFTLRemeshRecover(ens, obj, &start_volume[o]);  // Stage 16C class guard
       MFTLComputeTriangleProperties(obj);
     }
   }

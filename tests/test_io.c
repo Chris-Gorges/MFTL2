@@ -10,6 +10,7 @@
  *   - parallel read: every rank owns triangles after redistribution; global
  *     volume rank-independent (np2/np4 via registration)
  *   - PVTU smoke: .pvtu exists, is well-formed XML, references N .vtu pieces
+ *   - Stage 16D: open GTS patch across the periodic seams (declared open only)
  *
  * MPI safety: per-mesh checks are rank-0-only (the mesh lives on rank 0 until
  * redistribution) and accumulate into flags; every collective completes
@@ -370,6 +371,111 @@ int test_write_rejects_distributed_surface()
   return 0;
 }
 
+
+/* Stage 16D: an open GTS patch (8 x 8 quads split in two) crossing the x and y seams of the
+   periodic box [0,2]^3, in continuous coordinates. Rejected on a body not declared open;
+   read on a declared-open body with its file orientation (+z normals) and one boundary loop. */
+static void write_open_patch(const char* path, int flip)
+{
+  const int n = 9;
+  FILE* f = fopen(path, "w");
+  int nE = 0, (*E)[2] = malloc(sizeof(int[2]) * 3 * n * n), (*F)[3] = malloc(sizeof(int[3]) * 2 * n * n), nF = 0;
+  for (int j = 0; j < n - 1; ++j)
+    for (int i = 0; i < n - 1; ++i)
+    {
+      const int v0 = i + j * n, v1 = v0 + 1, v2 = v1 + n, v3 = v0 + n;
+      const int tri[2][3] = {{v0, v1, v2}, {v0, v2, v3}};
+      for (int q = 0; q < 2; ++q)
+      {
+        int tv[3] = {tri[q][0], flip ? tri[q][2] : tri[q][1], flip ? tri[q][1] : tri[q][2]};
+        for (int k = 0; k < 3; ++k)
+        {
+          const int a = tv[k], b = tv[(k + 1) % 3];
+          int e = -1;
+          for (int m = 0; m < nE; ++m)
+            if ((E[m][0] == a && E[m][1] == b) || (E[m][0] == b && E[m][1] == a)) e = m;
+          if (e < 0)
+          {
+            E[nE][0] = a;
+            E[nE][1] = b;
+            e = nE++;
+          }
+          F[nF][k] = e;
+        }
+        nF++;
+      }
+    }
+  fprintf(f, "%d %d %d GtsSurface GtsFace GtsEdge GtsVertex\n", n * n, nE, nF);
+  for (int j = 0; j < n; ++j)
+    for (int i = 0; i < n; ++i) fprintf(f, "%.17g %.17g %.17g\n", 1.6 + 0.1 * i, 1.6 + 0.1 * j, 1.0 + 0.02 * sin(0.7 * i + 0.3 * j));
+  for (int m = 0; m < nE; ++m) fprintf(f, "%d %d\n", E[m][0] + 1, E[m][1] + 1);
+  for (int m = 0; m < nF; ++m) fprintf(f, "%d %d %d\n", F[m][0] + 1, F[m][1] + 1, F[m][2] + 1);
+  fclose(f);
+  free(E);
+  free(F);
+}
+
+int test_read_open_gts()
+{
+  double bmin[3] = {0, 0, 0}, bmax[3] = {2, 2, 2};
+  bool per[3] = {true, true, true};
+  char path[256];
+  snprintf(path, sizeof(path), "test_io_open_patch_np%d.gts", g_nproc);
+  int fail = 0;
+  for (int flip = 0; flip < 2; ++flip)
+  {
+    if (g_rank == 0) write_open_patch(path, flip);
+    MPI_Barrier(MPI_COMM_WORLD);
+
+    MFTL_Object* obj = NULL;
+    MFTL_Ensemble* ens = make_ensemble(bmin, bmax, per, &obj);
+    TEST_ASSERT(ens != NULL);
+    CHECK(MFTLReadGTS(obj, path) == MFTL_ERROR);  // undeclared: boundary edges rejected
+    MFTLEnsembleDestroy(&ens);
+
+    ens = make_ensemble(bmin, bmax, per, &obj);
+    MFTLObjectDeclareOpen(obj, 1);
+    const int rc = MFTLReadGTS(obj, path);
+    CHECK(rc == MFTL_SUCCESS);
+    if (rc == MFTL_SUCCESS)
+    {
+      MFTLRedistributeListOfObjects(ens);
+      MFTLEnsembleUpdateGlobalCounts(ens);
+      CHECK(MFTLCheckMeshIntegrity(obj) == MFTL_SUCCESS);
+      int wrong = 0, owned = 0, outside = 0;
+      for (int t = 0; t < obj->n_triangles; ++t)
+      {
+        const MFTL_Triangle* tri = &obj->triangles[t];
+        if (tri->is_ghost || tri->owner_proc != g_rank) continue;
+        owned++;
+        MFTL_Vertex* vv[3];
+        MFTLGetTriangleVertices(obj, tri, vv);
+        double a[3], b[3];
+        MFTLGetMinimumImageVector(obj->domain, a, vv[0]->pos, vv[1]->pos);
+        MFTLGetMinimumImageVector(obj->domain, b, vv[0]->pos, vv[2]->pos);
+        const double nz = a[0] * b[1] - a[1] * b[0];
+        if ((nz > 0.0) != (flip == 0)) wrong++;  // the file orientation is kept
+      }
+      for (int v = 0; v < obj->n_vertices; ++v)
+        for (int k = 0; k < 3; ++k) outside += obj->vertices[v].pos[k] < 0.0 || obj->vertices[v].pos[k] >= 2.0;
+      int sums[3] = {wrong, owned, outside}, tot[3];
+      MPI_Allreduce(sums, tot, 3, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+      MFTL_BoundaryLoopSet L;
+      CHECK(MFTLBoundaryLoops(obj, &L) == MFTL_SUCCESS);
+      if (g_rank == 0)
+        printf("  flip=%d: %d triangles, wrong orientation %d, positions outside %d, %d loop(s) of %d edges, length %.15g\n", flip, tot[1], tot[0],
+               tot[2], L.n_loops, L.n_loops ? L.loops[0].n : 0, L.n_loops ? L.loops[0].length : 0.0);
+      CHECK(tot[1] == 128 && tot[0] == 0 && tot[2] == 0);
+      CHECK(L.n_loops == 1 && L.loops[0].n == 32 && L.loops[0].winding[0] == 0 && L.loops[0].winding[1] == 0);
+      MFTLFreeBoundaryLoops(&L);
+    }
+    MFTLEnsembleDestroy(&ens);
+  }
+  if (g_rank == 0) remove(path);
+  TEST_ASSERT(fail == 0);
+  return 0;
+}
+
 int main(int argc, char** argv)
 {
   MPI_Init(&argc, &argv);
@@ -382,6 +488,7 @@ int main(int argc, char** argv)
   RUN_TEST(test_parallel_read);
   RUN_TEST(test_write_rejects_distributed_surface);
   RUN_TEST(test_pvtu);
+  RUN_TEST(test_read_open_gts);
 
   TEST_REPORT();
   MPI_Finalize();

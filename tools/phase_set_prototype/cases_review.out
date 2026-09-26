@@ -1,0 +1,29 @@
+     (I1 canonical line crossing order (A=Y1, B=Y2): candidate 1 at x=0.2600: ABBAAB )
+PASS I1   interlocking: thin folded slab, ceiling in the floor pocket expect DEFINED     got DEFINED      V=0.035629022250  Cz=0.312800650601  centre DEFINED  |dV|=5.6e-17  |dCz|=4.4e-16
+PASS I2   interlocking: complement of the folded slab                expect DEFINED     got DEFINED      V=0.964370977750  Cz=-0.182000250048  centre DEFINED  |dV|=6.7e-16  |dCz|=2.2e-16
+     (I3 canonical line crossing order: candidate 1 at x=0.2600: ABCCBAABCD )
+PASS I3   interlocking 4-layer stack (-,+,-,+) in mixed images       expect DEFINED     got DEFINED      V=0.042754826701  centre UNSUPPORTED  |dV|=3.9e-16
+PASS I4   interlocking 3-layer stack                                 expect UNDEFINED   got UNDEFINED    Phi(S) != 0 for every admissible wall patch
+PASS I5   interlocking 4 layers (-,-,+,+)                            expect UNDEFINED   got UNDEFINED    crossings of the canonical line do not alternate (inconsistent orientation)
+PASS I6   interlocking 4-layer stack (+,-,+,-) complement            expect DEFINED     got DEFINED      V=0.957245173299  centre UNSUPPORTED  |dV|=0.0e+00
+PASS I7   bubble in the overhang pocket of an interlocking slab (stored +1) expect DEFINED     got DEFINED      V=0.071255114360  Cz=-0.674395599593  centre DEFINED  |dV|=0.0e+00  |dCz|=1.1e-16
+PASS I8   interlocking slab whose fold straddles the z seam          expect DEFINED     got DEFINED      V=0.035629022250  Cz=-0.087199349399  centre DEFINED  |dV|=0.0e+00  |dCz|=1.6e-15
+PASS I1q  I1 point queries between consecutive crossings of the fold line expect DEFINED     got DEFINED      V=0.035629022250  Cz=0.312800650601  centre DEFINED
+PASS S1   wavy floor crossing the z seam, ceiling stored +5 periods  expect DEFINED     got DEFINED      V=0.480000000000  Cz=0.256093770127  centre DEFINED  |dV|=4.4e-16  |dCz|=2.2e-16  inside(0.75, 0.3, 0.95)=True  inside(0.75, 0.3, 0.85)=False  inside(0.75, 0.3, 0.0)=True  inside(0.25, 0.3, 0.1)=False  inside(0.25, 0.3, 0.2)=True
+PASS S2   4-layer stack of wavy layers, one across the seam          expect DEFINED     got DEFINED      V=0.630000000000  centre UNSUPPORTED  |dV|=6.7e-16
+PASS S3   overhanging floor in a 4-layer stack                       expect DEFINED     got DEFINED      V=0.520000000000  centre UNSUPPORTED  |dV|=0.0e+00
+PASS S4   bubble crossing the z seam inside a slab crossing the seam expect DEFINED     got DEFINED      V=0.395841028564  Cz=0.101050667095  centre DEFINED  |dV|=0.0e+00  |dCz|=7.8e-16  inside(0.5, 0.5, 0.0)=False  inside(0.5, 0.5, 0.15)=True  inside(0.1, 0.1, 0.99)=True
+PASS S5   same, bubble stored three periods up                       expect DEFINED     got DEFINED      V=0.395841028564  Cz=0.101050667095  centre DEFINED  |dV|=0.0e+00  |dCz|=7.8e-16
+PASS W16  two separate caps on the z-min wall (two drops)            expect DEFINED     got DEFINED      V=0.009097750017  Cz=0.051889873801  centre DEFINED  |dV|=0.0e+00  |dCz|=0.0e+00  inside(0.3, 0.3, 0.05)=True  inside(0.7, 0.7, 0.05)=True  inside(0.5, 0.5, 0.05)=False
+PASS W16+  phase components 2 (expect 2: two wall pieces)
+PASS W17  nested caps on the wall: drop cap with a cavity cap        expect DEFINED     got DEFINED      V=0.054066628672  Cz=0.115219386711  centre DEFINED  |dV|=0.0e+00  |dCz|=0.0e+00  inside(0.5, 0.5, 0.05)=False  inside(0.5, 0.5, 0.2)=True  inside(0.1, 0.1, 0.05)=False
+PASS W17+  phase components 1 (expect 1: one annulus piece)
+PASS W18  two caps, a cavity inside the second                       expect DEFINED     got DEFINED      V=0.039001409600  Cz=0.086533114279  centre DEFINED  |dV|=0.0e+00  |dCz|=0.0e+00  inside(0.7, 0.7, 0.12)=False  inside(0.7, 0.7, 0.2)=True
+PASS W18+  phase components 2
+PASS W19  two caps with opposite sigma on one wall                   expect UNDEFINED   got UNDEFINED    wall zmin: loop winding numbers outside a single {0,1} pair (inconsistent loop orientation)
+PASS D1   single tiny drop (V < tau_V)                               expect UNSUPPORTED got UNSUPPORTED  sphere: degenerate compact component (zero enclosed volume)
+PASS D2   tiny drop next to a normal drop                            expect UNSUPPORTED got UNSUPPORTED  sphere: degenerate compact component (zero enclosed volume)
+PASS D3   matrix phase with a tiny bubble (V > V_cell - tau_V)       expect UNSUPPORTED got UNSUPPORTED  sphere: degenerate compact component (zero enclosed volume)
+PASS D4   slab of the full cell minus 1e-11 (complement of L9)       expect UNDEFINED   got UNDEFINED    degenerate volume (V_raw representative 1: empty or full region)
+
+25 passed, 0 failed

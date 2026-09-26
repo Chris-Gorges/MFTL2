@@ -12,6 +12,7 @@
 #include "mftl_constants.h"
 #include "mftl_communication.h"
 #include "mftl_geometry.h"
+#include "mftl_images.h"
 #include "mftl_topology.h"
 
 // MFTL1 overlap.c: near-degenerate in-plane gradient normal system.
@@ -1034,6 +1035,25 @@ int MFTLEnsembleCalculateOverlap(MFTL_Ensemble* ensA, MFTL_Ensemble* ensB, MFTL_
   int nobjA = ensA->num_objects;
   int nobjB = ensB ? ensB->num_objects : nobjA;  // self-intersection pairs within ensA
 
+  // Stage 16B: the overlap query unwraps each body about its surface centre, which exists only
+  // for bodies compact along every periodic axis. A wrapping body is an explicit error here
+  // (collective: the flags are identical on all ranks), not an abort inside MFTLSurfaceCenter.
+  for (int e = 0; e < (ensB ? 2 : 1); ++e)
+  {
+    MFTL_Ensemble* en = e ? ensB : ensA;
+    for (int o = 0; o < en->num_objects; ++o)
+    {
+      MFTLObjectEnsureWinding(en->objects[o]);
+      if (!MFTLObjectIsCompact(en->objects[o]))
+      {
+        if (dom->rank == 0)
+          fprintf(stderr, "MFTLEnsembleCalculateOverlap: body %d wraps a periodic direction; the overlap query requires bodies compact along every periodic axis\n",
+                  en->objects[o]->global_id);
+        return MFTL_ERROR;
+      }
+    }
+  }
+
   MFTL_Overlap* mine = NULL;
   int mine_n = 0, mine_cap = 0;
 
@@ -1068,6 +1088,7 @@ int MFTLEnsembleCalculateOverlap(MFTL_Ensemble* ensA, MFTL_Ensemble* ensB, MFTL_
       int any_periodic = dom->is_periodic[0] || dom->is_periodic[1] || dom->is_periodic[2];
 
       double* saveA = NULL;
+      int *imgA = NULL, *imgB = NULL;  // Stage 16B
       double* saveB = NULL;
       int nA_save = 0, nB_save = 0;
       if (any_periodic)
@@ -1080,17 +1101,20 @@ int MFTLEnsembleCalculateOverlap(MFTL_Ensemble* ensA, MFTL_Ensemble* ensB, MFTL_
           img[k] = -L * floor((cmB[k] - cmA[k]) / L + 0.5);
         }
         for (int vi = 0; vi < objA->n_vertices; ++vi)
-          if (!objA->vertices[vi].is_ghost && objA->vertices[vi].owner_proc == dom->rank) nA_save++;
+          nA_save++;  // Stage 16B: ghosts too (the counters of every copy are held at 0 below)
         for (int vi = 0; vi < objB->n_vertices; ++vi)
-          if (!objB->vertices[vi].is_ghost && objB->vertices[vi].owner_proc == dom->rank) nB_save++;
+          nB_save++;
         saveA = (double*) malloc((size_t) (nA_save > 0 ? nA_save : 1) * 3 * sizeof(double));
         saveB = (double*) malloc((size_t) (nB_save > 0 ? nB_save : 1) * 3 * sizeof(double));
+        imgA = (int*) malloc((size_t) (nA_save > 0 ? nA_save : 1) * 3 * sizeof(int));
+        imgB = (int*) malloc((size_t) (nB_save > 0 ? nB_save : 1) * 3 * sizeof(int));
         int s = 0;
         for (int vi = 0; vi < objA->n_vertices; ++vi)
         {
           MFTL_Vertex* vtx = &objA->vertices[vi];
-          if (vtx->is_ghost || vtx->owner_proc != dom->rank) continue;
           memcpy(saveA + 3 * s, vtx->pos, 3 * sizeof(double));
+          memcpy(imgA + 3 * s, vtx->img, 3 * sizeof(int));  // Stage 16B: the temporary positions are
+          vtx->img[0] = vtx->img[1] = vtx->img[2] = 0;      // continuous; counters restored below
           s++;
           for (int k = 0; k < 3; ++k)
           {
@@ -1103,8 +1127,9 @@ int MFTLEnsembleCalculateOverlap(MFTL_Ensemble* ensA, MFTL_Ensemble* ensB, MFTL_
         for (int vi = 0; vi < objB->n_vertices; ++vi)
         {
           MFTL_Vertex* vtx = &objB->vertices[vi];
-          if (vtx->is_ghost || vtx->owner_proc != dom->rank) continue;
           memcpy(saveB + 3 * s, vtx->pos, 3 * sizeof(double));
+          memcpy(imgB + 3 * s, vtx->img, 3 * sizeof(int));
+          vtx->img[0] = vtx->img[1] = vtx->img[2] = 0;
           s++;
           for (int k = 0; k < 3; ++k)
           {
@@ -1125,20 +1150,22 @@ int MFTLEnsembleCalculateOverlap(MFTL_Ensemble* ensA, MFTL_Ensemble* ensB, MFTL_
         for (int vi = 0; vi < objA->n_vertices; ++vi)
         {
           MFTL_Vertex* vtx = &objA->vertices[vi];
-          if (vtx->is_ghost || vtx->owner_proc != dom->rank) continue;
           memcpy(vtx->pos, saveA + 3 * s, 3 * sizeof(double));
+          memcpy(vtx->img, imgA + 3 * s, 3 * sizeof(int));
           s++;
         }
         s = 0;
         for (int vi = 0; vi < objB->n_vertices; ++vi)
         {
           MFTL_Vertex* vtx = &objB->vertices[vi];
-          if (vtx->is_ghost || vtx->owner_proc != dom->rank) continue;
           memcpy(vtx->pos, saveB + 3 * s, 3 * sizeof(double));
+          memcpy(vtx->img, imgB + 3 * s, 3 * sizeof(int));
           s++;
         }
         free(saveA);
         free(saveB);
+        free(imgA);
+        free(imgB);
         MFTL_Ensemble* sync_ens = (ensB && ensB != ensA) ? ensB : ensA;
         MFTLUpdateGhostPositions(sync_ens, NULL);
       }

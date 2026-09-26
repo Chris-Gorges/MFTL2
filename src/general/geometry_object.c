@@ -30,6 +30,7 @@
 #include "mftl_constants.h"
 #include "mftl_geometry.h"
 #include "mftl_topology.h"
+#include "mftl_images.h"
 
 /**
  * @brief Determines the global unwrap anchor for an object: the (wrapped)
@@ -37,12 +38,13 @@
  * every rank re-images into the SAME image.
  * @return 0 if the object has no owned triangles anywhere (all sums are 0).
  */
-static int MFTLObjectUnwrapAnchor(const MFTL_Object* obj, double anchor[3])
+static int MFTLObjectUnwrapAnchor(const MFTL_Object* obj, double anchor[3], int anchor_img[3])
 {
   const MFTL_Domain* dom = obj->domain;
   int rank = dom->rank;
 
   double local_anchor[3] = {0.0, 0.0, 0.0};
+  int local_img[3] = {0, 0, 0};
   int have_local = 0;
   for (int t = 0; t < obj->n_triangles && !have_local; ++t)
   {
@@ -51,6 +53,7 @@ static int MFTLObjectUnwrapAnchor(const MFTL_Object* obj, double anchor[3])
     MFTL_Vertex* vv[3];
     MFTLGetTriangleVertices(obj, tri, vv);
     memcpy(local_anchor, vv[0]->pos, 3 * sizeof(double));
+    memcpy(local_img, vv[0]->img, 3 * sizeof(int));
     have_local = 1;
   }
 
@@ -62,22 +65,57 @@ static int MFTLObjectUnwrapAnchor(const MFTL_Object* obj, double anchor[3])
   // On the root, seed the broadcast buffer from the local scan; on the other
   // ranks MPI_Bcast fills it. (Without the seed, the root would integrate
   // towards an uninitialized anchor.)
-  if (rank == root) memcpy(anchor, local_anchor, 3 * sizeof(double));
+  if (rank == root)
+  {
+    memcpy(anchor, local_anchor, 3 * sizeof(double));
+    memcpy(anchor_img, local_img, 3 * sizeof(int));
+  }
   MPI_Bcast(anchor, 3, MPI_DOUBLE, root, dom->comm_cart);
+  MPI_Bcast(anchor_img, 3, MPI_INT, root, dom->comm_cart);
   return 1;
 }
 
+/* Stage 16B (plans/16 §3.5): integrals over a periodic domain need a body that is compact
+   along every periodic axis (volume, centroid and inertia of a wrapping body are not defined;
+   use the phase-set API). Collective-safe: the flags are identical on all ranks. */
+static void mftlRequireCompact(MFTL_Object* obj, const char* what)
+{
+  MFTLObjectEnsureWinding(obj);  // collective; an unknown winding state is never taken as compact
+  if (MFTLObjectIsCompact(obj)) return;
+  if (obj->domain->rank == 0)
+    fprintf(stderr, "MFTL: %s of body %d is not defined: the body wraps a periodic direction (use MFTLPhaseSetVolume/Centre)\n", what,
+            obj->global_id);
+  MPI_Barrier(obj->domain->comm_world);  // collective check: the message is out before any rank aborts
+  MPI_Abort(obj->domain->comm_world, 1);
+}
+
+/* Volume-based quantities (volume, moment of inertia) also need a CLOSED surface: a declared-open
+   body encloses no volume (plans/16 §3.6, §12 "mass properties derived from open surfaces"); the
+   integrity assertion alone only acts in debug builds (16F audit). The area-based surface centre
+   stays defined for open bodies. */
+static void mftlRequireEnclosed(MFTL_Object* obj, const char* what)
+{
+  mftlRequireCompact(obj, what);
+  if (!obj->declared_open) return;
+  if (obj->domain->rank == 0)
+    fprintf(stderr, "MFTL: %s of body %d is not defined: the body is an open surface (use MFTLPhaseSetVolume with wall closures)\n", what,
+            obj->global_id);
+  MPI_Barrier(obj->domain->comm_world);
+  MPI_Abort(obj->domain->comm_world, 1);
+}
+
 /**
- * @brief Re-images v into the periodic image containing anchor.
- * Identity for non-periodic axes. Requires |anchor - v| < L/2 (guaranteed
- * when the body extent is strictly smaller than half the domain).
+ * @brief Continuous coordinate of v in the image of the anchor (Stage 16B, §3.5):
+ * anchor + (img - img_anchor) L + (pos - anchor), formed from the exact integer image
+ * difference. Identity (a plain copy) on non-periodic axes, so the non-periodic arithmetic
+ * is bit-identical. No extent restriction (the counters carry the image).
  */
-static inline void mftlUnwrapToAnchor(const MFTL_Domain* dom, double out[3], const double v[3], const double anchor[3])
+static inline void mftlUnwrapToAnchor(const MFTL_Domain* dom, double out[3], const MFTL_Vertex* v, const double anchor[3], const int anchor_img[3])
 {
   for (int k = 0; k < 3; ++k)
   {
-    out[k] = v[k];
-    if (dom->is_periodic[k]) out[k] += round((anchor[k] - v[k]) / dom->domain_size[k]) * dom->domain_size[k];
+    out[k] = v->pos[k];
+    if (dom->is_periodic[k]) out[k] = anchor[k] + ((double) (v->img[k] - anchor_img[k]) * dom->domain_size[k] + (v->pos[k] - anchor[k]));
   }
 }
 
@@ -89,9 +127,11 @@ double MFTLObjectVolume(MFTL_Object* obj)
 
   // Volume is only defined for a closed, consistently-oriented surface.
   MFTL_ASSERT(MFTLCheckMeshIntegrity(obj) == MFTL_SUCCESS);
+  mftlRequireEnclosed(obj, "the volume");
 
   double anchor[3];
-  if (!MFTLObjectUnwrapAnchor(obj, anchor)) return 0.0;
+  int anchor_img[3] = {0, 0, 0};
+  if (!MFTLObjectUnwrapAnchor(obj, anchor, anchor_img)) return 0.0;
 
   double local = 0.0;
   for (int t = 0; t < obj->n_triangles; ++t)
@@ -102,9 +142,9 @@ double MFTLObjectVolume(MFTL_Object* obj)
     MFTL_Vertex* vv[3];
     MFTLGetTriangleVertices(obj, tri, vv);
     double p1[3], p2[3], p3[3];
-    mftlUnwrapToAnchor(dom, p1, vv[0]->pos, anchor);
-    mftlUnwrapToAnchor(dom, p2, vv[1]->pos, anchor);
-    mftlUnwrapToAnchor(dom, p3, vv[2]->pos, anchor);
+    mftlUnwrapToAnchor(dom, p1, vv[0], anchor, anchor_img);
+    mftlUnwrapToAnchor(dom, p2, vv[1], anchor, anchor_img);
+    mftlUnwrapToAnchor(dom, p3, vv[2], anchor, anchor_img);
 
     // MFTL1 VolumeFace: v1.(v2 x v3), expanded cyclically.
     local += p1[0] * (p2[1] * p3[2] - p2[2] * p3[1]) + p2[0] * (p3[1] * p1[2] - p3[2] * p1[1]) +
@@ -123,9 +163,11 @@ double MFTLSurfaceCenter(MFTL_Object* obj, double cm[3])
   MFTL_ASSERT(dom != MFTL_NULL);
 
   cm[0] = cm[1] = cm[2] = 0.0;
+  mftlRequireCompact(obj, "the surface centre");
 
   double anchor[3];
-  if (!MFTLObjectUnwrapAnchor(obj, anchor)) return 0.0;
+  int anchor_img[3] = {0, 0, 0};
+  if (!MFTLObjectUnwrapAnchor(obj, anchor, anchor_img)) return 0.0;
 
   double local[4] = {0.0, 0.0, 0.0, 0.0};
   for (int t = 0; t < obj->n_triangles; ++t)
@@ -136,9 +178,9 @@ double MFTLSurfaceCenter(MFTL_Object* obj, double cm[3])
     MFTL_Vertex* vv[3];
     MFTLGetTriangleVertices(obj, tri, vv);
     double p1[3], p2[3], p3[3];
-    mftlUnwrapToAnchor(dom, p1, vv[0]->pos, anchor);
-    mftlUnwrapToAnchor(dom, p2, vv[1]->pos, anchor);
-    mftlUnwrapToAnchor(dom, p3, vv[2]->pos, anchor);
+    mftlUnwrapToAnchor(dom, p1, vv[0], anchor, anchor_img);
+    mftlUnwrapToAnchor(dom, p2, vv[1], anchor, anchor_img);
+    mftlUnwrapToAnchor(dom, p3, vv[2], anchor, anchor_img);
 
     // Area from the re-imaged (true) edges: 0.5 * |(p2-p1) x (p3-p1)|.
     double x[3] = {p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]};
@@ -177,9 +219,11 @@ void MFTLMomentOfInertia(MFTL_Object* obj, double inertia[3][3], const double ce
 
   for (int i = 0; i < 3; ++i)
     for (int j = 0; j < 3; ++j) inertia[i][j] = 0.0;
+  mftlRequireEnclosed(obj, "the moment of inertia");
 
   double anchor[3];
-  if (!MFTLObjectUnwrapAnchor(obj, anchor)) return;
+  int anchor_img[3] = {0, 0, 0};
+  if (!MFTLObjectUnwrapAnchor(obj, anchor, anchor_img)) return;
 
   double Ilocal[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
   for (int t = 0; t < obj->n_triangles; ++t)
@@ -190,9 +234,9 @@ void MFTLMomentOfInertia(MFTL_Object* obj, double inertia[3][3], const double ce
     MFTL_Vertex* vv[3];
     MFTLGetTriangleVertices(obj, tri, vv);
     double p1[3], p2[3], p3[3];
-    mftlUnwrapToAnchor(dom, p1, vv[0]->pos, anchor);
-    mftlUnwrapToAnchor(dom, p2, vv[1]->pos, anchor);
-    mftlUnwrapToAnchor(dom, p3, vv[2]->pos, anchor);
+    mftlUnwrapToAnchor(dom, p1, vv[0], anchor, anchor_img);
+    mftlUnwrapToAnchor(dom, p2, vv[1], anchor, anchor_img);
+    mftlUnwrapToAnchor(dom, p3, vv[2], anchor, anchor_img);
 
     // MFTL1 lumped-tetrahedron form (momentofinertia.c).
     double a[3] = {p2[0] - p1[0], p2[1] - p1[1], p2[2] - p1[2]};
@@ -265,44 +309,7 @@ int MFTLCheckMinimumImageConstraint(const MFTL_Object* obj)
     return MFTL_ERROR;
   }
 
-  // --- 2. Unwrapped body extent per periodic axis ---
-  double anchor[3];
-  if (!MFTLObjectUnwrapAnchor(obj, anchor)) return MFTL_SUCCESS;  // no owned triangles anywhere: nothing to check
-
-  double lmin[3] = {MFTL_DBL_MAX, MFTL_DBL_MAX, MFTL_DBL_MAX};
-  double lmax[3] = {-MFTL_DBL_MAX, -MFTL_DBL_MAX, -MFTL_DBL_MAX};
-  for (int i = 0; i < obj->n_vertices; ++i)
-  {
-    const MFTL_Vertex* v = &obj->vertices[i];
-    if (v->is_ghost || v->owner_proc != dom->rank) continue;
-    if (v->flags & MFTL_FLAG_DEAD) continue;
-    double u[3];
-    mftlUnwrapToAnchor(dom, u, v->pos, anchor);
-    for (int k = 0; k < 3; ++k)
-    {
-      if (u[k] < lmin[k]) lmin[k] = u[k];
-      if (u[k] > lmax[k]) lmax[k] = u[k];
-    }
-  }
-  double gmin[3], gmax[3];
-  MPI_Allreduce(lmin, gmin, 3, MPI_DOUBLE, MPI_MIN, dom->comm_cart);
-  MPI_Allreduce(lmax, gmax, 3, MPI_DOUBLE, MPI_MAX, dom->comm_cart);
-
-  for (int k = 0; k < 3; ++k)
-  {
-    if (!dom->is_periodic[k]) continue;
-    double extent = gmax[k] - gmin[k];
-    if (extent >= dom->domain_half_size[k])
-    {
-      if (dom->rank == 0)
-        fprintf(stderr,
-                "ERROR: MFTLCheckMinimumImageConstraint: object %d violates the minimum-image constraint: "
-                "axis %d extent %.6g >= half-period %.6g. Single-anchor unwraps (integrals, point queries) are "
-                "ambiguous for bodies this large — increase the domain or shrink the body.\n",
-                obj->global_id, k, extent, dom->domain_half_size[k]);
-      return MFTL_ERROR;
-    }
-  }
-
+  // --- 2. (Stage 16B) the object-extent restriction is removed: the image counters carry
+  //        every vertex's image, so bodies of any extent are evaluated exactly (§3.5). ---
   return MFTL_SUCCESS;
 }

@@ -747,30 +747,31 @@ static int test_minimum_image_constraint(void)
     MFTLEnsembleDestroy(&ens);
   }
 
-  // Over-large sphere (extent 3.0 >= half period 2.0): the generator refuses
-  // on a periodic domain.
+  // Stage 16B (plans/16 §3.5, test B2): the object-extent restriction is removed. An
+  // over-large compact sphere (extent 3.0 >= half period 2.0, every edge far shorter than half a
+  // period) is accepted and evaluated exactly through its image counters: same volume as the
+  // same sphere generated on the non-periodic domain.
   {
     int cuts[3] = {g_nproc, 1, 1};
-    MFTL_Ensemble* ens = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, bmin, bmax, per, 2);
-    TEST_ASSERT(ens != NULL);
-    MFTL_Object* obj = MFTLObjectCreate(1);
-    MFTLEnsembleAddObject(ens, obj);
-    TEST_ASSERT(MFTLGenerateSphere(obj, origin, 1.5, 2) == MFTL_ERROR);
-    MFTLEnsembleDestroy(&ens);
-  }
+    bool noper[3] = {false, false, false};
+    MFTL_Ensemble* ens0 = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, bmin, bmax, noper, 2);
+    MFTL_Object* ref = MFTLObjectCreate(1);
+    MFTLEnsembleAddObject(ens0, ref);
+    TEST_ASSERT(MFTLGenerateSphere(ref, origin, 1.5, 2) == MFTL_SUCCESS);
+    MFTLRedistributeListOfObjects(ens0);
+    const double V_ref = MFTLObjectVolume(ref);
+    MFTLEnsembleDestroy(&ens0);
 
-  // The check itself: generate the over-large sphere with periodicity
-  // temporarily disabled (legal), then flip it back on and probe.
-  {
-    int cuts[3] = {g_nproc, 1, 1};
     MFTL_Ensemble* ens = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, bmin, bmax, per, 2);
     TEST_ASSERT(ens != NULL);
     MFTL_Object* obj = MFTLObjectCreate(1);
     MFTLEnsembleAddObject(ens, obj);
-    ens->domain.is_periodic[0] = false;
     TEST_ASSERT(MFTLGenerateSphere(obj, origin, 1.5, 2) == MFTL_SUCCESS);
-    ens->domain.is_periodic[0] = true;
-    TEST_ASSERT(MFTLCheckMinimumImageConstraint(obj) == MFTL_ERROR);
+    TEST_ASSERT(MFTLCheckMinimumImageConstraint(obj) == MFTL_SUCCESS);  // edges only
+    MFTLRedistributeListOfObjects(ens);
+    const double V = MFTLObjectVolume(obj);
+    if (g_rank == 0) printf("  large compact sphere: V(periodic)=%.12g V(non-periodic)=%.12g\n", V, V_ref);
+    TEST_ASSERT(fabs(V - V_ref) <= 1e-12 * fabs(V_ref));
     MFTLEnsembleDestroy(&ens);
   }
 

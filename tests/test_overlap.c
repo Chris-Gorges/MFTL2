@@ -163,6 +163,7 @@ static int test_detection_regressions(void)
   {
     double pos[4][3] = {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, {1.0, 1.0, 0.0}, {0.0, 1.0, 0.0}};
     int tri[2][3] = {{0, 1, 2}, {0, 2, 3}};
+    MFTLObjectDeclareOpen(face, 1);  // Stage 16A: an open surface
     MFTLBuildTopologyFromTriples(face, 4, pos, 2, tri);
     MFTLComputeTriangleProperties(face);
   }

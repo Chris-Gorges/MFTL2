@@ -15,6 +15,7 @@
 #include "mftl_constants.h"
 #include "mftl_vectoroperations.h"
 #include "mftl_geometry.h"
+#include "mftl_images.h"
 #include "mftl_topology.h"
 
 /**
@@ -176,8 +177,8 @@ static int tessellate_sphere(MFTL_Object *object)
 
         // Twin: We leave invalid (-1), will rebuild globally later
         he->twin_idx = MFTL_ERROR;
-        he->twin_gid = MFTL_ERROR;
-        he->boundary = MFTL_TRUE;
+        he->twin_gid = MFTL_TWIN_UNKNOWN;  // closed: every half-edge is paired by MFTLRebuildTwins
+        he->boundary = MFTL_FALSE;
 
         // 3. Update Vertex Connectivity
         // Ensure the vertex points to this outgoing half-edge
@@ -269,6 +270,7 @@ static int generate_icosahedron(MFTL_Object *object)
     v->owner_proc = domain->rank;
     v->is_ghost = MFTL_FALSE;
     memcpy(v->pos, vertices_data[i], 3 * sizeof(double));
+    v->img[0] = v->img[1] = v->img[2] = 0;  // Stage 16B (lifted after scaling)
     v->out_he_idx = -1;  // will be set later
     // int ret;
     // khiter_t k = kh_put(vertex_map, object->vertex_lookup, v->global_id, &ret);
@@ -444,7 +446,9 @@ int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int
       object->vertices[i].pos[0] = center[0] + radius * object->vertices[i].pos[0];
       object->vertices[i].pos[1] = center[1] + radius * object->vertices[i].pos[1];
       object->vertices[i].pos[2] = center[2] + radius * object->vertices[i].pos[2];
-      MFTLApplyPeriodicity(domain, object->vertices[i].pos);
+      // Stage 16B: continuous input -> (pos, img), img = floor((X - min) / L)
+      double X[3] = {object->vertices[i].pos[0], object->vertices[i].pos[1], object->vertices[i].pos[2]};
+      MFTLWrapContinuous(domain, X, object->vertices[i].pos, object->vertices[i].img);
     }
     sphere_rebuild_lookups(object);
   }
@@ -456,6 +460,7 @@ int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int
   MFTLObjectUpdateGlobalStats(object);
 
   MFTLFlattenConnectivity(object);
+  MFTLCanonicaliseImages(object);  // Stage 16B: wrap flags
 
   // Stage 13: refuse periodic meshes that violate the minimum-image
   // constraint (collective; empty on non-root ranks, so all ranks agree).

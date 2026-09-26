@@ -147,6 +147,13 @@ typedef struct
   //    length for the JIAO / BOTSCH_KOBBELT criteria), and no vertex locking or feature-flag
   //    protection is applied in that sweep (MFTL1 has neither).
   int mftl1_criteria;
+  // Stage 16C (plans/16 §4.3): boundary corner threshold in degrees (<= 0: default 30). Used by
+  // the generalized remesher (open bodies, closed bodies opted in with
+  // MFTLObjectSetRemeshMode(obj, MFTL_REMESH_MODE_GENERALIZED)).
+  double boundary_corner_angle;
+  // Stage 16C (plans/16 §4.4.4), outputs accumulated by the drivers: bodies whose volume recovery
+  // was skipped because their phase set is not DEFINED (open without closure, wrapping, ...)
+  long stat_recovery_skipped;
   // Outputs: LOCAL operation counts of this rank, ACCUMULATED by every remesh driver call
   // (the caller resets them).
   long stat_splits, stat_collapses, stat_flips;
@@ -243,6 +250,11 @@ static inline void MFTLInitRemeshParams(MFTL_RemeshParameters *params, MFTL_Reme
   params->quiet = 0;
   params->mftl1_criteria = 0;
   params->stat_splits = params->stat_collapses = params->stat_flips = 0;
+
+  // --- Stage 16C fields (16D review: previously left uninitialised, so the generalized
+  //     remesher's corner protection read an indeterminate threshold) ---
+  params->boundary_corner_angle = 0.0;  // <= 0: MFTL_BOUNDARY_CORNER_ANGLE_DEFAULT (30 deg)
+  params->stat_recovery_skipped = 0;
 }
 
 // --- Core Topological Operators ---
@@ -344,6 +356,22 @@ void MFTLTSUR3D(MFTL_Object* obj, MFTL_RemeshParameters* params);
 void MFTLRoughnessSmoothing(MFTL_Object* obj, MFTL_RemeshParameters* params);
 
 // --- High Level Routine ---
+/* ---- Stage 16C: remesh-mode selection and boundary curves (plans/16 §4.3, §4.4.4) ---- */
+/** @brief Per-body remesh mode (identical on all ranks): MFTL_REMESH_MODE_DEFAULT (closed bodies:
+ *  the Stage-15 path, i.e. MFTL1 parity when params->mftl1_criteria, periodic or not) or
+ *  MFTL_REMESH_MODE_GENERALIZED (explicit opt-in of a closed body). Open bodies always use the
+ *  generalized, boundary-aware remesher (never the parity path). */
+void MFTLObjectSetRemeshMode(MFTL_Object *obj, int mode);
+/** @brief 1 if the body is remeshed by the generalized remesher (open, or opted in). */
+int MFTLObjectRemeshGeneralized(const MFTL_Object *obj);
+/** @brief Boundary-curve mode of boundary tag `tag` (identical on all ranks): REPRESENTED
+ *  (default; interpolating Catmull-Rom spline through the loop's vertices, corners are
+ *  breakpoints) or CONSTRAINED (new and moved boundary vertices are projected by `project`).
+ *  freeze = 1: boundary vertices of the tag are never moved by smoothing (e.g. PINNED). */
+int MFTLObjectSetBoundaryCurve(MFTL_Object *obj, int tag, int mode, MFTL_BoundaryProjector project, void *user, int freeze);
+/** @brief 1 (and clears the flag) if the last canonicalisation changed the body's wrap flags. */
+int MFTLObjectTakeClassTransition(MFTL_Object *obj);
+
 void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params);
 
 // --- Stage 10: parallel remeshing + load balancing (MFTL1 parity) ---

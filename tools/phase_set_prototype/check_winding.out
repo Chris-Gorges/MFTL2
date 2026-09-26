@@ -1,0 +1,11 @@
+PASS sphere                                   declared (0, 0, 0) derived (0, 0, 0) lattice []
+PASS seam sphere                              declared (0, 0, 0) derived (0, 0, 0) lattice []
+PASS flat sheet                               declared (1, 1, 0) derived (1, 1, 0) lattice [(-1, -1, 0), (-1, 0, 0), (0, -1, 0), (0, 1, 0)]...
+PASS wavy sheet                               declared (1, 1, 0) derived (1, 1, 0) lattice [(-1, -1, 0), (-1, 0, 0), (0, -1, 0), (0, 1, 0)]...
+PASS x-tube                                   declared (1, 0, 0) derived (1, 0, 0) lattice [(-1, 0, 0), (1, 0, 0)]
+PASS tilted plane                             declared (1, 1, 1) derived (1, 1, 1) lattice [(-1, -1, 1), (-1, 0, 1), (0, -1, 0), (0, 1, 0)]...
+PASS fold                                     declared (1, 1, 0) derived (1, 1, 0) lattice [(-1, 0, 0), (0, -1, 0), (0, 1, 0), (1, 1, 0)]
+PASS diagonal tube (lattice (1,1,0))          declared (1, 1, 0) derived (1, 1, 0) lattice [(-1, -1, 0), (1, 1, 0)]
+     diagonal tube classified with derived flags: DEFINED V=0.04329568801169577
+     two opposite tilted planes, derived flags (1, 1, 1): UNSUPPORTED (no admissible axis (every periodic axis wrapped by some member))
+winding checks: OK

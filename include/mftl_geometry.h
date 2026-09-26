@@ -69,6 +69,100 @@ static inline void MFTLApplyPeriodicity(const MFTL_Domain *domain, double pos[3]
   }
 }
 
+/* ---- Stage 16B: image counters (plans/16 §3.1–§3.3) ------------------------------------ */
+
+/* Wrap a vertex position that was displaced by less than one period from a wrapped state and
+   count the wrap into its image counters (the continuous coordinate pos + img*L is unchanged).
+   The position arithmetic is exactly that of MFTLApplyPeriodicity (bit-identical positions). */
+static inline void MFTLWrapPosImg(const MFTL_Domain *domain, double pos[3], int img[3])
+{
+  for (int i = 0; i < 3; ++i)
+  {
+    if (domain->is_periodic[i])
+    {
+      if (pos[i] >= domain->global_max[i])
+      {
+        pos[i] -= domain->domain_size[i];
+        img[i] += 1;
+      }
+      else if (pos[i] < domain->global_min[i])
+      {
+        pos[i] += domain->domain_size[i];
+        img[i] -= 1;
+      }
+    }
+  }
+}
+
+/* Displacement rule for a position that was REPLACED by an independently wrapped value new_pos
+   (fits, smoothing results): the move old -> new is the minimum-image displacement, so the
+   counters follow by the number of periods the wrapped difference jumps. */
+static inline void MFTLImgFollow(const MFTL_Domain *domain, int img[3], const double old_pos[3], const double new_pos[3])
+{
+  for (int i = 0; i < 3; ++i)
+  {
+    if (!domain->is_periodic[i]) continue;
+    const double diff = new_pos[i] - old_pos[i];
+    if (diff > domain->domain_half_size[i])
+      img[i] -= 1;
+    else if (diff < -domain->domain_half_size[i])
+      img[i] += 1;
+  }
+}
+
+/* Continuous coordinate of v relative to a reference (pos_ref, img_ref), formed from the exact
+   integer image difference (§3.5): Y = (img - img_ref) L + (pos - pos_ref). */
+static inline void MFTLVertexRelative(const MFTL_Domain *domain, const MFTL_Vertex *v, const double pos_ref[3], const int img_ref[3], double Y[3])
+{
+  for (int i = 0; i < 3; ++i)
+  {
+    Y[i] = v->pos[i] - pos_ref[i];
+    if (domain->is_periodic[i]) Y[i] += (double) (v->img[i] - img_ref[i]) * domain->domain_size[i];
+  }
+}
+
+/* Edge lattice shift s(u,v) = round((X_v - X_u - d(u,v)) / L) (§3.3), exact in integers:
+   img_v - img_u + j, where j is the wrap of the minimum-image displacement d. */
+static inline void MFTLEdgeShift(const MFTL_Domain *domain, const MFTL_Vertex *u, const MFTL_Vertex *v, int s[3])
+{
+  for (int i = 0; i < 3; ++i)
+  {
+    s[i] = 0;
+    if (!domain->is_periodic[i]) continue;
+    const double diff = v->pos[i] - u->pos[i];
+    const int j = (diff > domain->domain_half_size[i]) ? 1 : ((diff < -domain->domain_half_size[i]) ? -1 : 0);
+    s[i] = v->img[i] - u->img[i] + j;
+  }
+}
+
+/* Wrap a continuous input coordinate X into (pos, img) with img = floor((X - min) / L) on the
+   periodic axes (continuous input, §3.2). */
+static inline void MFTLWrapContinuous(const MFTL_Domain *domain, const double X[3], double pos[3], int img[3])
+{
+  for (int i = 0; i < 3; ++i)
+  {
+    pos[i] = X[i];
+    img[i] = 0;
+    if (!domain->is_periodic[i]) continue;
+    const double k = floor((X[i] - domain->global_min[i]) / domain->domain_size[i]);
+    if (k != 0.0)
+    {
+      pos[i] = X[i] - k * domain->domain_size[i];
+      img[i] = (int) k;
+    }
+    if (pos[i] >= domain->global_max[i])  // round-off at the upper face
+    {
+      pos[i] -= domain->domain_size[i];
+      img[i] += 1;
+    }
+    else if (pos[i] < domain->global_min[i])
+    {
+      pos[i] += domain->domain_size[i];
+      img[i] -= 1;
+    }
+  }
+}
+
 /**
  * @brief True when the domain has at least one periodic axis.
  *
@@ -268,7 +362,9 @@ static inline void MFTLComputeTriangleProperties(const MFTL_Object *object)
 /**
  * @brief Enclosed volume of a closed object: 1/6 * sum_owned v1.(v2 x v3).
  * Requires a closed, consistently-oriented surface (MFTLCheckMeshIntegrity is
- * asserted in debug builds). Returns 0 for an empty object.
+ * asserted in debug builds). Returns 0 for an empty object. A body that wraps a
+ * periodic direction or is declared open aborts with a message (collective;
+ * use the phase-set API, plans/16 §3.6). MFTLMomentOfInertia likewise.
  */
 double MFTLObjectVolume(MFTL_Object* obj);
 
@@ -305,21 +401,63 @@ void MFTLMomentOfInertia(MFTL_Object* obj, double inertia[3][3], const double ce
 int MFTLCheckMinimumImageConstraint(const MFTL_Object* obj);
 
 // =============================================================================
+// Stage 16C: GENERALIZED GEOMETRY KERNELS (plans/16 §4.1-§4.2; src/general/kernels.c)
+// Local frames: minimum-image differences from an anchor vertex (edges < half a period).
+// =============================================================================
+/** @brief Minimum-image displacement b - a. */
+void MFTLVertexDelta(const MFTL_Object *obj, const MFTL_Vertex *a, const MFTL_Vertex *b, double d[3]);
+/** @brief Minimum-image vector origin -> target of a half-edge. */
+void MFTLEdgeVector(const MFTL_Object *obj, const MFTL_HalfEdge *he, double d[3]);
+/** @brief Continuous coordinate X = pos + img L (for large counters prefer MFTLVertexRelative). */
+void MFTLVertexContinuous(const MFTL_Object *obj, const MFTL_Vertex *v, double X[3]);
+/** @brief Triangle corners in the periodic image of its first corner (half-edge order). */
+void MFTLTriangleUnwrapped(const MFTL_Object *obj, const MFTL_Triangle *tri, double P[3][3]);
+/** @brief BOUNDARY half-edge geometry: length, unit tangent t (along the half-edge), in-surface
+ *  outward conormal nu = t x n (n: unit triangle normal) and the continuous midpoint (may be
+ *  NULL). MFTL_ERROR for a non-boundary or degenerate half-edge. */
+int MFTLBoundaryEdgeGeometry(const MFTL_Object *obj, int he_idx, double *len, double t[3], double nu[3], double mid_X[3]);
+/** @brief Stage 16E (plans/16 §6): for a BOUNDARY half-edge, the in-surface distance delta from
+ *  its triangle's centroid to the edge midpoint and the triangle height h_T = 2 A_T / L_e over the
+ *  edge (local frame). Note delta >= h_T / 3 for every non-degenerate triangle. MFTL_ERROR for a
+ *  non-boundary or degenerate half-edge. */
+int MFTLBoundaryEdgeCentroidDistance(const MFTL_Object *obj, int he_idx, double *delta, double *h_T);
+/** @brief Sum of the corner angles at v over its stored fan; returns the MFTL_RING_* class (the sum
+ *  is valid for CLOSED and OPEN_COMPLETE). Angle defect of an interior vertex: 2 pi - sum. */
+int MFTLVertexAngleSum(const MFTL_Object *obj, int v, double *sum);
+/** @brief Geodesic turning angle pi - sum of corner angles of a boundary (OPEN_COMPLETE) vertex. */
+int MFTLVertexTurningAngle(const MFTL_Object *obj, int v, double *theta);
+/** @brief Loop neighbours of a boundary vertex (prev = -1 if not stored); MFTL_ERROR when v has no
+ *  stored outgoing BOUNDARY half-edge. */
+int MFTLBoundaryNeighbours(const MFTL_Object *obj, int v, int *prev, int *next);
+/** @brief Thin-region pairs: stored triangles with opposing normals, minimum-image centre distance
+ *  below threshold, no shared vertex; *pairs (malloc'ed) holds (gid, gid) pairs. Rank-local. */
+int MFTLFindThinRegionPairs(MFTL_Object *obj, double threshold, int **pairs, int *npairs);
+/** @brief Proximity pairs between stored triangles of o0 and o1 whose local-frame boxes are within
+ *  `distance` in the minimum image; *pairs holds (gid in o0, gid in o1). Rank-local. */
+int MFTLFindProximityPairs(MFTL_Object *o0, MFTL_Object *o1, double distance, int **pairs, int *npairs);
+
+// =============================================================================
 // RIGID-BODY TRANSFORMS (see src/general/transform.c)
 // Operate on LOCAL (owned, non-ghost) vertices only; refresh ghosts afterwards
 // via MFTLUpdateGhostPositions. Each transform recomputes triangle properties.
 // Storage stays unwrapped — use MFTLWrapObjectIntoDomain explicitly if needed.
 // =============================================================================
 
-/** @brief In-place per-axis scale about the origin: pos[d] *= s[d] (MFTL1 MFTLScaleSurface). */
-void MFTLScaleObject(MFTL_Object* obj, const double s[3]);
+/** @brief In-place per-axis scale about the origin: pos[d] *= s[d] (MFTL1 MFTLScaleSurface).
+ * Stage 16B, periodic domains (collective): continuous coordinates relative to the body
+ * reference point, about the image of the origin nearest to it (lattice-gauge invariant, §3.2);
+ * MFTL_ERROR (body unchanged) if the scaling maps a winding vector off the periodic lattice. */
+int MFTLScaleObject(MFTL_Object* obj, const double s[3]);
 
 /** @brief In-place rigid translation: pos += d (MFTL1 MFTLMoveBody). */
 void MFTLTranslateObject(MFTL_Object* obj, const double d[3]);
 
 /** @brief In-place rotation about `centre`: pos = centre + R.(pos - centre).
- * R must be orthonormal (asserted in debug builds, det R = 1). */
-void MFTLRotateObject(MFTL_Object* obj, const double R[3][3], const double centre[3]);
+ * R must be orthonormal (asserted in debug builds, det R = 1).
+ * Stage 16B, periodic domains (collective): about the image of `centre` nearest to the body
+ * reference point, in continuous coordinates relative to it (lattice-gauge invariant, §3.2);
+ * MFTL_ERROR (body unchanged) if R maps a winding vector off the periodic lattice. */
+int MFTLRotateObject(MFTL_Object* obj, const double R[3][3], const double centre[3]);
 
 /** @brief Explicitly wrap local vertex positions back into the periodic domain. */
 void MFTLWrapObjectIntoDomain(MFTL_Object* obj);
@@ -365,6 +503,13 @@ void MFTLComputeVertexNormals(MFTL_Object* obj);
 
 /** @brief Cotangent Laplace-Beltrami curvatures + mixed-Voronoi area per owned vertex. */
 void MFTLComputeVertexCurvatures(MFTL_Object* obj);
+
+/** @brief Stage 16C (plans/16 §4.2): extrapolated curvature |2H| of every owned boundary vertex
+ *  (OPEN_COMPLETE fan) from a least-squares paraboloid over its open two-ring stencil (>= 6
+ *  points), stored in curv_extrap with MFTL_VFLAG_CURV_EXTRAPOLATED (cleared when the fit is not
+ *  possible). MFTLComputeVertexCurvatures flags every owned vertex without a closed fan with
+ *  MFTL_VFLAG_CURV_UNDEFINED (no silent skip). */
+void MFTLComputeExtrapolatedCurvatures(MFTL_Object* obj);
 
 /* Stage 15 (L5): single-vertex variants (MFTL1 MFTL_OneRingVertexNormal /
    MFTL_VertexLaplaceBeltrami). They work on ANY stored vertex (owned or ghost) whose stored

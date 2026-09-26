@@ -38,6 +38,21 @@ struct MFTL_Object;
 struct MFTL_Domain;
 struct MFTL_Ensemble;
 
+/* Stage 16C (plans/16 §4.3): boundary-curve projector of a CONSTRAINED boundary tag. X_in is a
+   point in the local frame of the operation (coordinates in the periodic image of the wrapped
+   position of the operation's first vertex); X_out receives its projection onto the curve.
+   Returns MFTL_SUCCESS, or MFTL_ERROR to refuse (the operation is then skipped). */
+typedef int (*MFTL_BoundaryProjector)(int tag, const double X_in[3], double X_out[3], void *user);
+
+typedef struct MFTL_BoundaryCurve
+{
+  int tag;
+  int mode;  ///< MFTL_BCURVE_REPRESENTED / MFTL_BCURVE_CONSTRAINED
+  MFTL_BoundaryProjector project;  ///< CONSTRAINED only
+  void *user;
+  int freeze;  ///< 1: boundary vertices of this tag are never moved by smoothing (PINNED supports)
+} MFTL_BoundaryCurve;
+
 //------------------------------------------------------------------------------
 // Core Data Structures
 //------------------------------------------------------------------------------
@@ -52,7 +67,11 @@ struct MFTL_Ensemble;
  */
 typedef struct MFTL_Vertex
 {
-  double pos[3];  ///< x, y, z coordinates of the vertex.
+  double pos[3];  ///< x, y, z coordinates of the vertex (WRAPPED into [min, max) on periodic axes).
+  /* Stage 16B (plans/16 §3.1): periodic image counters. The continuous coordinate of the vertex
+     is X = pos + img ⊙ L (img = 0 on non-periodic axes). Maintained by the displacement rule
+     (§3.2) and re-gauged by MFTLCanonicaliseImages (§3.3). */
+  int img[3];
 
   // --- Geometric Properties ---
   double normal[3];  ///< Computed normal vector at the vertex.
@@ -72,6 +91,11 @@ typedef struct MFTL_Vertex
 
   // --- Application-Specific Data ---
   int flags;  ///< Bit flags for marking (e.g., for remeshing).
+
+  /* Stage 16C (plans/16 §4.2, §13): extrapolated curvature (2H, as meancurvature) of a boundary
+     vertex from an open-stencil paraboloid fit; valid iff MFTL_VFLAG_CURV_EXTRAPOLATED. Local,
+     not packed (recomputed on demand). */
+  double curv_extrap;
 
 } MFTL_Vertex;
 
@@ -124,22 +148,25 @@ typedef struct MFTL_HalfEdge
 {
   // --- Topology ---
   int vertex_idx;  ///< Index of the vertex at the END of this directed edge.
-  int twin_idx;  ///< Index of the oppositely oriented half-edge. NULL if on a boundary.
+  int twin_idx;  ///< Local index of the opposite half-edge; MFTL_ERROR when it is not stored here.
   int next_idx;  ///< Index of the next half-edge in the counter-clockwise direction.
   int triangle_idx;  ///< Index of the triangle this half-edge belongs to.
 
   // --- Parallelism & Domain Information ---
   int global_id;  ///< A unique ID across all processors.
-  /* Global id of the opposite half-edge, retained EVEN WHEN THE TWIN IS NOT STORED LOCALLY
-     (ghost-layer rim), so the undirected edge has a rank-independent identity
-     min(global_id, twin_gid) (Stage 15, item L3). MFTL_ERROR when unknown (open mesh, or an
-     entity created by a local operation whose twin lives elsewhere). Invariant: when twin_idx
-     is valid, twin_gid == half_edges[twin_idx].global_id. */
+  /* Twin state code (Stage 16A, plans/16 §2.1; see MFTL_TWIN_* in mftl_constants.h):
+     LOCAL     twin_idx >= 0 and twin_gid == half_edges[twin_idx].global_id;
+     REMOTE    twin_idx == -1 and twin_gid >= 0: the gid of the live twin on another rank
+               (retained on the ghost-layer rim, Stage 15 item L3);
+     BOUNDARY  twin_idx == -1 and twin_gid == MFTL_TWIN_NONE - tag: a genuine physical boundary.
+     Read it only through the predicates of mftl_topology.h (MFTLHeIsLocal / IsRemote /
+     IsBoundary / BoundaryTag / TwinGid / EdgeId). The undirected edge id is
+     min(global_id, twin gid) for LOCAL/REMOTE and global_id for BOUNDARY. */
   int twin_gid;
 
   // --- Application-Specific Data ---
   int flags;  ///< Bit flags for marking (e.g., for remeshing).
-  bool boundary;  ///<  True if this halfedge is a boundary edge.
+  bool boundary;  ///< Cache of MFTLHeIsBoundary (BOUNDARY state); never a rim marker (Stage 16A).
 } MFTL_HalfEdge;
 
 //------------------------------------------------------------------------------
@@ -209,6 +236,30 @@ typedef struct MFTL_Object
 
   // Pointer to the domain this object lives in.
   struct MFTL_Domain *domain;
+
+  /* Stage 16A: the body is declared OPEN (MFTLObjectDeclareOpen, identical on every rank).
+     Only a declared-open body may carry BOUNDARY half-edges; a closed body with an
+     unmatched edge is an error, never silently opened (plans/16 §0, §2.2). */
+  int declared_open;
+
+  /* Stage 16B (plans/16 §3.3/§3.4): cached per-axis wrap flags, set by MFTLCanonicaliseImages:
+     wrap[k] = 1 iff some component of the body winds along k (a cycle with non-zero lattice
+     residual). wrap_valid = 0 until the first canonicalisation. */
+  int wrap[3];
+  int wrap_valid;
+  /* winding lattice generators of the body (all components), from the last canonicalisation */
+  int n_wind;
+  int (*wind_gen)[3];
+  /* Stage 16C (plans/16 §4.4.4): set when a canonicalisation finds different wrap flags than the
+     previous valid state (a class transition); read and cleared by MFTLObjectTakeClassTransition. */
+  int class_transition;
+
+  /* Stage 16C (plans/16 §4.4.4): MFTL_REMESH_MODE_DEFAULT / _GENERALIZED (identical on all ranks) */
+  int remesh_mode;
+  /* Stage 16C (plans/16 §4.3): boundary-curve mode per boundary tag (identical on all ranks;
+     tags without an entry are REPRESENTED) */
+  int n_bcurve;
+  struct MFTL_BoundaryCurve *bcurve;
 
 } MFTL_Object;
 

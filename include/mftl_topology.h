@@ -116,11 +116,55 @@ static inline MFTL_Vertex *MFTLHeOrigin(const MFTL_Object *obj, const MFTL_HalfE
  */
 static inline MFTL_HalfEdge *MFTLHeTwin(const MFTL_Object *obj, const MFTL_HalfEdge *he) { return MFTLGetHalfedge(obj, he->twin_idx); }
 
-/* Global id of the opposite half-edge: the stored twin's id when the twin is local, otherwise
-   the retained twin_gid (ghost-layer rim; MFTL_ERROR when unknown). Stage 15, item L3. */
+/* ---- Stage 16A twin-state predicates (plans/16 §2.1). The ONLY sanctioned readers of
+   twin_idx-as-state and twin_gid; see MFTL_TWIN_* in mftl_constants.h. ---- */
+static inline bool MFTLHeIsLocal(const MFTL_HalfEdge *he) { return he->twin_idx >= 0; }
+static inline bool MFTLHeIsRemote(const MFTL_HalfEdge *he) { return he->twin_idx < 0 && he->twin_gid >= 0; }
+static inline bool MFTLHeIsBoundary(const MFTL_HalfEdge *he) { return he->twin_idx < 0 && he->twin_gid <= MFTL_TWIN_NONE; }
+/* Illegal at quiescent points: no stored twin and no REMOTE/BOUNDARY code. */
+static inline bool MFTLHeIsUnresolved(const MFTL_HalfEdge *he) { return he->twin_idx < 0 && he->twin_gid == MFTL_TWIN_UNKNOWN; }
+static inline int MFTLBoundaryCode(int tag) { return MFTL_TWIN_NONE - tag; }
+/* Boundary tag of a BOUNDARY half-edge (asserts the state). */
+static inline int MFTLHeBoundaryTag(const MFTL_HalfEdge *he)
+{
+  assert(MFTLHeIsBoundary(he));
+  return MFTL_TWIN_NONE - he->twin_gid;
+}
+/* Mark a half-edge BOUNDARY with a tag / REMOTE with a partner gid (keeps the cache). */
+static inline void MFTLHeSetBoundary(MFTL_HalfEdge *he, int tag)
+{
+  he->twin_idx = MFTL_ERROR;
+  he->twin_gid = MFTLBoundaryCode(tag);
+  he->boundary = MFTL_TRUE;
+}
+static inline void MFTLHeSetRemote(MFTL_HalfEdge *he, int partner_gid)
+{
+  he->twin_idx = MFTL_ERROR;
+  he->twin_gid = partner_gid;
+  he->boundary = MFTL_FALSE;
+}
+
+/* Global id of the opposite half-edge for LOCAL (the stored twin's id) and REMOTE (the
+   retained rim id); MFTL_ERROR for BOUNDARY (and for the transient UNKNOWN state), so a
+   boundary code is never mistaken for a gid. Stage 15 (L3) / Stage 16A. */
 static inline int MFTLHeTwinGid(const MFTL_Object *obj, const MFTL_HalfEdge *he)
 {
-  return (he->twin_idx != MFTL_ERROR) ? obj->half_edges[he->twin_idx].global_id : he->twin_gid;
+  if (he->twin_idx >= 0) return obj->half_edges[he->twin_idx].global_id;
+  return (he->twin_gid >= 0) ? he->twin_gid : MFTL_ERROR;
+}
+
+/* Raw state code for transport / copies: the twin gid (LOCAL, REMOTE), the boundary code
+   (BOUNDARY) or MFTL_TWIN_UNKNOWN. Unpacking this value reproduces the state. */
+static inline int MFTLHeTwinCode(const MFTL_Object *obj, const MFTL_HalfEdge *he)
+{
+  return (he->twin_idx >= 0) ? obj->half_edges[he->twin_idx].global_id : he->twin_gid;
+}
+
+/* Rank-independent undirected edge id: min(gid, twin gid) for LOCAL/REMOTE, gid for BOUNDARY. */
+static inline int MFTLHeEdgeId(const MFTL_Object *obj, const MFTL_HalfEdge *he)
+{
+  const int tg = MFTLHeTwinGid(obj, he);
+  return (tg != MFTL_ERROR && tg < he->global_id) ? tg : he->global_id;
 }
 
 /**
@@ -462,8 +506,14 @@ void MFTLGetNeighborhood(MFTL_Object *restrict obj, int *restrict seed_indices, 
  * MFTLRebuildTwins + MFTLFlattenConnectivity. Positions are stored verbatim
  * (NO periodic wrapping — callers apply MFTLApplyPeriodicity beforehand if
  * desired). The object must be empty.
+ *
+ * Stage 16A: rank-local. A half-edge without a partner becomes BOUNDARY only when the object
+ * is declared open (MFTLObjectDeclareOpen; tags = boundary-loop index ordered by the
+ * smallest vertex gid of the loop); on a closed object it is an error. Duplicate directed
+ * half-edges (non-manifold edge / inconsistent orientation / Mobius) and bow-tie vertices
+ * are rejected. Returns MFTL_SUCCESS or MFTL_ERROR (the mesh is then not usable).
  */
-void MFTLBuildTopologyFromTriples(MFTL_Object* obj, int nV, const double positions[][3], int nF, const int triples[][3]);
+int MFTLBuildTopologyFromTriples(MFTL_Object* obj, int nV, const double positions[][3], int nF, const int triples[][3]);
 
 /**
  * @brief Stage 15: builds an EMPTY object from a distributed triangle soup with global ids.
@@ -481,12 +531,157 @@ void MFTLBuildTopologyFromTriples(MFTL_Object* obj, int nV, const double positio
 int MFTLBuildFromSoup(MFTL_Object *obj, int nV, const int *vgid, const double (*pos)[3], const int *vowner, int nT, const int *tgid, const int (*tvg)[3],
                       const int *towner);
 
+/* Stage 16A boundary declaration of a soup (plans/16 §2.2). Honoured only for a body declared
+   open (MFTLObjectDeclareOpen, before the build). */
+typedef struct MFTL_BoundaryEdgeDecl
+{
+  int vgid_a, vgid_b;  ///< undirected edge (vertex global ids)
+  int tag;  ///< boundary tag >= 0
+} MFTL_BoundaryEdgeDecl;
+
+typedef struct MFTL_BoundaryDecl
+{
+  /* "BoundaryFromMesh": every edge unmatched on every rank is a boundary, auto-tagged by
+     loop index ordered by the smallest vertex gid of the loop. */
+  int from_mesh;
+  int n_edges;  ///< explicit list (the union over all ranks is used)
+  const MFTL_BoundaryEdgeDecl *edges;
+} MFTL_BoundaryDecl;
+
+/**
+ * @brief Stage 16A: MFTLBuildFromSoup with an explicit boundary declaration.
+ *
+ * Twins are paired locally, then every unpaired half-edge is resolved in GLOBAL discovery
+ * mode (all ranks, before ownership): a partner anywhere -> REMOTE. An edge unmatched
+ * everywhere becomes BOUNDARY only if the body is declared open AND decl declares it (explicit
+ * edge list or from_mesh); any other unmatched edge, a declared edge that is not unmatched, a
+ * duplicate directed half-edge (non-manifold / inconsistent orientation) or a rim edge that is
+ * also interior elsewhere is a collective error. decl == NULL: closed body required.
+ */
+int MFTLBuildFromSoupEx(MFTL_Object *obj, int nV, const int *vgid, const double (*pos)[3], const int *vowner, int nT, const int *tgid,
+                        const int (*tvg)[3], const int *towner, const MFTL_BoundaryDecl *decl);
+
+/** @brief Stage 16B: as MFTLBuildFromSoupEx, with the WRAPPED positions and explicit image
+ *  counters of every vertex (native restart, §3.2); canonicalised afterwards like every build. */
+int MFTLBuildFromSoupImg(MFTL_Object *obj, int nV, const int *vgid, const double (*pos)[3], const int (*vimg)[3], const int *vowner, int nT,
+                         const int *tgid, const int (*tvg)[3], const int *towner, const MFTL_BoundaryDecl *decl);
+
 /**
  * @brief Stage 15: copies triangle tri_idx of src (with its half-edges and missing vertices,
  * payload and surface scalar) into dst unless dst already stores that triangle id. Twins
  * are linked through the retained twin gids. Returns the triangle's index in dst. Rank-local.
+ *
+ * Stage 16A: the copy is STAGED — a half-edge whose twin is not in dst keeps the source's
+ * state code (REMOTE gid / BOUNDARY code) and dst is not quiescent until the batch is closed
+ * by MFTLObjectCommitCopy (collective).
  */
 int MFTLObjectAppendTriangleCopy(MFTL_Object *dst, const MFTL_Object *src, int tri_idx);
+
+/**
+ * @brief Stage 16A: closes a batch of staged copies (collective, GLOBAL discovery mode).
+ *
+ * Every non-LOCAL, non-BOUNDARY half-edge of dst is resolved against the live authoritative
+ * (non-ghost) half-edges of dst on all ranks. mode MFTL_COMMIT_ASSEMBLE: an unresolved one is a
+ * collective error. mode MFTL_COMMIT_CUT: an unresolved copy of an existing source twin (the
+ * explicit cut set) becomes BOUNDARY with ONE new tag (max existing tag + 1); dst must be
+ * declared open. Duplicate authoritative copies of one half-edge must be identical (topology
+ * and position). Returns MFTL_SUCCESS / MFTL_ERROR on every rank.
+ */
+int MFTLObjectCommitCopy(MFTL_Object *dst, int mode);
+
+/* ---------------------------------------------------------------------------------------
+ * Stage 16A: twin states, declared class, validation, ghost completion, rings and loops
+ * (plans/16 §2). All "collective" functions use obj->domain->comm_cart.
+ * --------------------------------------------------------------------------------------- */
+
+/** @brief Declare the body open (1) or closed (0, default). Must be identical on all ranks. */
+void MFTLObjectDeclareOpen(MFTL_Object *obj, int open);
+
+/**
+ * @brief Classifies the fan of vertex v_idx: MFTL_RING_CLOSED, MFTL_RING_OPEN_COMPLETE (the fan
+ * runs from an incoming BOUNDARY to an outgoing BOUNDARY half-edge) or MFTL_RING_INCOMPLETE (the
+ * walk reaches a REMOTE / unresolved half-edge, or the fan is malformed). When out_he != NULL the
+ * outgoing half-edges are stored in CCW order (for an open fan: starting after the incoming
+ * boundary, ending with the outgoing BOUNDARY half-edge), at most max_he; *n_out receives the
+ * count (may be NULL). Rank-local.
+ */
+int MFTLVertexRing(const MFTL_Object *obj, int v_idx, int *out_he, int max_he, int *n_out);
+
+/**
+ * @brief Rank-local twin-state checks (the cheap part of MFTLValidateTwinStates): every live
+ * half-edge LOCAL/REMOTE/BOUNDARY, LOCAL symmetry and vertex consistency, boundary cache,
+ * BOUNDARY only on declared-open bodies, no duplicate directed half-edge, boundary-vertex
+ * out-half-edge convention and bow-ties on complete owned fans; with MFTL_VALIDATE_GHOSTS also
+ * G1 (every edge of an owned triangle LOCAL or BOUNDARY) and G2 (complete fan of every owned
+ * vertex). Returns the number of violations (printed with gids when verbose).
+ */
+int MFTLCheckTwinStatesLocal(const MFTL_Object *obj, int flags, int verbose);
+
+/**
+ * @brief Collective validation (plans/16 §2.3): the local checks plus remote liveness — every
+ * REMOTE twin gid is held as a live authoritative (non-ghost) half-edge on some rank that names
+ * the requester back, and every BOUNDARY half-edge carries the same tag on every rank storing
+ * it. Returns MFTL_SUCCESS or MFTL_ERROR on every rank (offending gids printed).
+ */
+int MFTLValidateTwinStatesEx(MFTL_Object *obj, int flags);
+static inline int MFTLValidateTwinStates(MFTL_Object *obj) { return MFTLValidateTwinStatesEx(obj, 0); }
+
+/* Ghost-completion / discovery statistics of the last MFTLCompleteGhosts call (for tests). */
+typedef struct MFTL_DiscoveryStats
+{
+  int rounds;  ///< completion rounds executed (the last one found nothing)
+  long n_requested;  ///< global number of requested twin gids (all rounds)
+  long n_round1;  ///< resolved by the owned-mode geometric round
+  long n_fallback;  ///< resolved by the global fallback
+  long n_unresolved;  ///< unresolved (collective error)
+} MFTL_DiscoveryStats;
+
+/**
+ * @brief Guaranteed ghost completion (G1/G2, plans/16 §2.5; collective). Imports, as ghosts,
+ * the twin triangle of every REMOTE edge of an owned triangle and of every REMOTE edge incident
+ * to an owned vertex, until no rank has one. Each round: owned-mode discovery (candidate ranks
+ * whose box meets the periodic ball B(edge midpoint, l_max/3 + 2 eps)) followed by the mandatory
+ * global fallback. eps is the ghost-position staleness margin (0 right after an update).
+ * Called by every MFTLRedistribute*; stats may be NULL.
+ */
+int MFTLCompleteGhosts(MFTL_Object *obj, double eps, MFTL_DiscoveryStats *stats);
+
+/** @brief Test hook: 1 disables owned-mode round 1 (everything goes through the fallback). */
+void MFTLDiscoverySetForceFallback(int force);
+
+/** @brief Statistics of the last ghost completion run on this rank's process. */
+void MFTLGetLastDiscoveryStats(MFTL_DiscoveryStats *stats);
+
+/* Boundary loops (plans/16 §2.6), identical on every rank. */
+typedef struct MFTL_BoundaryLoop
+{
+  int n;  ///< number of boundary edges (= vertices) in the loop
+  int *edge_ids;  ///< edge ids in loop order (edge i runs vertex_gids[i] -> vertex_gids[i+1])
+  int *vertex_gids;
+  int tag;  ///< tag of the loop (the smallest tag when mixed)
+  int mixed_tags;  ///< 1 when the loop carries more than one tag
+  double length;  ///< sum of the (minimum-image) edge lengths
+  int winding[3];  ///< Stage 16B: sum of the edge lattice shifts around the loop (§2.6/§3.3)
+} MFTL_BoundaryLoop;
+
+typedef struct MFTL_BoundaryLoopSet
+{
+  int n_loops;
+  MFTL_BoundaryLoop *loops;  ///< ordered by the smallest vertex gid of each loop
+} MFTL_BoundaryLoopSet;
+
+/**
+ * @brief Collective: builds all boundary loops from the owned boundary vertices (requires G2,
+ * i.e. call after a redistribution, or on a single rank). Every owned boundary vertex emits
+ * (in edge id, out edge id, vertex gid, tag, out-edge length); the records are gathered and
+ * chained on every rank. Returns MFTL_ERROR (all ranks) on a broken chain.
+ */
+int MFTLBoundaryLoops(MFTL_Object *obj, MFTL_BoundaryLoopSet *out);
+void MFTLFreeBoundaryLoops(MFTL_BoundaryLoopSet *set);
+
+/* Internal (library): after local pairing, sets the boundary cache from the state and points
+   every vertex with an outgoing BOUNDARY half-edge at it (plans/16 §2.6). */
+void MFTLRefreshBoundaryCache(MFTL_Object *obj);
 
 /** @brief Stage 15: removes every entity (and payload) from an object; rank-local. */
 void MFTLObjectClear(MFTL_Object *obj);

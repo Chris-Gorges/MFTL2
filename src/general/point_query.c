@@ -39,6 +39,7 @@
 #include "mftl_core.h"
 #include "mftl_constants.h"
 #include "mftl_geometry.h"
+#include "mftl_images.h"
 #include "mftl_topology.h"
 #include "mftl_bvh.h"
 
@@ -388,7 +389,7 @@ int MFTLDebugPointQueryLastIterations(void)
 // geometry_object.c): the wrapped position of the first owned triangle vertex
 // on the lowest-rank owner, broadcast so every rank re-images into the SAME
 // image. Returns 0 when the object has no owned triangles anywhere.
-static int mftlPQUnwrapAnchor(MFTL_Object* obj, double anchor[3])
+static int mftlPQUnwrapAnchor(MFTL_Object* obj, double anchor[3], int anchor_img[3])
 {
   MFTL_Domain* dom = obj->domain;
   int rank = dom->rank;
@@ -402,6 +403,7 @@ static int mftlPQUnwrapAnchor(MFTL_Object* obj, double anchor[3])
     MFTL_Vertex* vv[3];
     MFTLGetTriangleVertices(obj, tri, vv);
     memcpy(local_anchor, vv[0]->pos, 3 * sizeof(double));
+    memcpy(anchor_img, vv[0]->img, 3 * sizeof(int));
     have_local = 1;
   }
 
@@ -412,6 +414,7 @@ static int mftlPQUnwrapAnchor(MFTL_Object* obj, double anchor[3])
 
   if (rank == root) memcpy(anchor, local_anchor, 3 * sizeof(double));
   MPI_Bcast(anchor, 3, MPI_DOUBLE, root, dom->comm_cart);
+  MPI_Bcast(anchor_img, 3, MPI_INT, root, dom->comm_cart);
   return 1;
 }
 
@@ -428,34 +431,71 @@ int MFTLPointInsideObject(MFTL_Object* obj, const double p_in[3])
 
   double p[3] = {p_in[0], p_in[1], p_in[2]};
 
-  // Stage 13: on a periodic domain the wrapped storage of a seam-straddling
-  // body is torn across the domain faces, so neither its AABB nor the raw ray
-  // tests see the true geometry. Temporarily re-image ALL local vertex
-  // positions (owned and ghost) into one contiguous image about a collective
-  // anchor, re-image the probe next to it, ray-cast against the unwrapped
-  // mesh, then restore the wrapped storage. Exact under the minimum-image
-  // constraint (MFTLCheckMinimumImageConstraint). Non-periodic domains keep
-  // the legacy path untouched.
+  // Stage 13 / 16B: on a periodic domain the wrapped storage of a seam-straddling body is torn
+  // across the domain faces. Temporarily replace ALL local vertex positions (owned and ghost) by
+  // their continuous coordinates in the anchor's image (exact from the image counters, any body
+  // extent, plans/16 §3.5), ray-cast every lattice image of the probe that lies in the body's
+  // continuous bounding box (the lifts of a compact body are disjoint, so at most one image is
+  // inside), then restore the wrapped storage. Non-periodic domains keep the legacy path.
   double* saved = NULL;
+  int n_img = 1;
+  double probes[27][3];
+  memcpy(probes[0], p, sizeof(p));
   if (MFTLDomainAnyPeriodic(domain))
   {
+    MFTLObjectEnsureWinding(obj);  // collective (Stage 16B)
+    if (!MFTLObjectIsCompact(obj))
+    {
+      if (rank == 0)
+        fprintf(stderr, "MFTLPointInsideObject: body %d wraps a periodic direction; use MFTLPhaseSetInside\n", obj->global_id);
+      MPI_Abort(domain->comm_world, 1);
+    }
     double anchor[3];
-    if (mftlPQUnwrapAnchor(obj, anchor))  // collective
+    int anchor_img[3] = {0, 0, 0};
+    if (mftlPQUnwrapAnchor(obj, anchor, anchor_img))  // collective
     {
       saved = malloc((size_t) obj->n_vertices * 3 * sizeof(double));
       MFTL_ASSERT(saved != MFTL_NULL || obj->n_vertices == 0);
+      double lo[3] = {MFTL_DBL_MAX, MFTL_DBL_MAX, MFTL_DBL_MAX}, hi[3] = {-MFTL_DBL_MAX, -MFTL_DBL_MAX, -MFTL_DBL_MAX};
       for (int i = 0; i < obj->n_vertices; ++i)
       {
         MFTL_Vertex* v = &obj->vertices[i];
         memcpy(saved + 3 * i, v->pos, 3 * sizeof(double));
-        MFTLUnwrapToAnchor(domain, v->pos, v->pos, anchor);
+        for (int k = 0; k < 3; ++k)
+        {
+          if (!domain->is_periodic[k]) continue;
+          v->pos[k] = anchor[k] + ((double) (v->img[k] - anchor_img[k]) * domain->domain_size[k] + (saved[3 * i + k] - anchor[k]));
+        }
+        if (!v->is_ghost)
+          for (int k = 0; k < 3; ++k)
+          {
+            lo[k] = fmin(lo[k], v->pos[k]);
+            hi[k] = fmax(hi[k], v->pos[k]);
+          }
       }
-      // re-image the probe next to the anchor
+      double glo[3], ghi[3];
+      MPI_Allreduce(lo, glo, 3, MPI_DOUBLE, MPI_MIN, domain->comm_cart);
+      MPI_Allreduce(hi, ghi, 3, MPI_DOUBLE, MPI_MAX, domain->comm_cart);
+      // probe images: p + n L inside [glo, ghi] (with a small margin) on every periodic axis
+      int nlo[3] = {0, 0, 0}, nhi[3] = {0, 0, 0};
       for (int k = 0; k < 3; ++k)
       {
         if (!domain->is_periodic[k]) continue;
-        p[k] += round((anchor[k] - p[k]) / domain->domain_size[k]) * domain->domain_size[k];
+        const double Lk = domain->domain_size[k], eps = 1e-12 * Lk;
+        nlo[k] = (int) ceil((glo[k] - eps - p[k]) / Lk);
+        nhi[k] = (int) floor((ghi[k] + eps - p[k]) / Lk);
+        if (nhi[k] < nlo[k]) nhi[k] = nlo[k] - 1;  // no image of p in the box on this axis
       }
+      n_img = 0;
+      for (int a = nlo[0]; a <= nhi[0]; ++a)
+        for (int b = nlo[1]; b <= nhi[1]; ++b)
+          for (int c = nlo[2]; c <= nhi[2]; ++c)
+            if (n_img < 27)
+            {
+              const int n[3] = {a, b, c};
+              for (int k = 0; k < 3; ++k) probes[n_img][k] = p[k] + (domain->is_periodic[k] ? n[k] * domain->domain_size[k] : 0.0);
+              n_img++;
+            }
     }
   }
   else
@@ -471,6 +511,7 @@ int MFTLPointInsideObject(MFTL_Object* obj, const double p_in[3])
       while (p[k] - c[k] > half) p[k] -= domain->domain_size[k];
       while (p[k] - c[k] < -half) p[k] += domain->domain_size[k];
     }
+    memcpy(probes[0], p, sizeof(p));
   }
 
   // Ray length: 50x the domain diagonal (MFTL1) guarantees exit.
@@ -482,27 +523,45 @@ int MFTLPointInsideObject(MFTL_Object* obj, const double p_in[3])
   MFTL_BVH* bvh = MFTL_GenerateLBVH(obj);
   g_mftl_pq_bvh_builds++;
 
-  int maxiter = 100;
+  int result = 0;
   int i = 0;
-  int flag = 0;
-  int stabbed_glob = 0;
-  while (i++ < maxiter)
+  const int maxiter = 100;
+  for (int pi = 0; pi < n_img; ++pi)
   {
-    int degenerate = 0;
-    double dir[3];
+    const double* pp = probes[pi];
+    int flag = 0;
+    int stabbed_glob = 0;
+    i = 0;
+    while (i++ < maxiter)
+    {
+      int degenerate = 0;
+      double dir[3];
 
-    // One shared random direction: rank 0 draws, everyone receives.
-    if (rank == 0) mftlRandomRayLocal(i - 1, dir);
-    MPI_Bcast(dir, 3, MPI_DOUBLE, 0, domain->comm_cart);
+      // One shared random direction: rank 0 draws, everyone receives.
+      if (rank == 0) mftlRandomRayLocal(i - 1, dir);
+      MPI_Bcast(dir, 3, MPI_DOUBLE, 0, domain->comm_cart);
 
-    double ray_end[3] = {p[0] + dir[0] * ray_length, p[1] + dir[1] * ray_length, p[2] + dir[2] * ray_length};
+      double ray_end[3] = {pp[0] + dir[0] * ray_length, pp[1] + dir[1] * ray_length, pp[2] + dir[2] * ray_length};
 
-    int stabbed_loc = mftlStabbedTrianglesBVH(obj, bvh, p, &degenerate, ray_end);
+      int stabbed_loc = mftlStabbedTrianglesBVH(obj, bvh, pp, &degenerate, ray_end);
 
-    MPI_Allreduce(&stabbed_loc, &stabbed_glob, 1, MPI_INT, MPI_SUM, domain->comm_cart);
-    flag = 0;
-    MPI_Allreduce(&degenerate, &flag, 1, MPI_INT, MPI_SUM, domain->comm_cart);
-    if (flag == 0 || flag < 0) break;  // clean verdict, or on-surface everywhere
+      MPI_Allreduce(&stabbed_loc, &stabbed_glob, 1, MPI_INT, MPI_SUM, domain->comm_cart);
+      flag = 0;
+      MPI_Allreduce(&degenerate, &flag, 1, MPI_INT, MPI_SUM, domain->comm_cart);
+      if (flag == 0 || flag < 0) break;  // clean verdict, or on-surface everywhere
+    }
+    int r;
+    if (i > maxiter)
+      r = 1;  // MFTL1: after 100 retries assume inside
+    else if (flag < 0)
+      r = -1;  // on the surface
+    else
+      r = stabbed_glob % 2;  // odd => inside
+    if (r != 0)
+    {
+      result = r;
+      break;
+    }
   }
   g_mftl_pq_last_iterations = i;
 
@@ -514,10 +573,7 @@ int MFTLPointInsideObject(MFTL_Object* obj, const double p_in[3])
     for (int i2 = 0; i2 < obj->n_vertices; ++i2) memcpy(obj->vertices[i2].pos, saved + 3 * i2, 3 * sizeof(double));
     free(saved);
   }
-
-  if (i > maxiter) return 1;  // MFTL1: after 100 retries assume inside
-  if (flag < 0) return -1;    // on the surface
-  return stabbed_glob % 2;    // odd => inside
+  return result;
 }
 
 /* ------------------------------------------------------------------------- */

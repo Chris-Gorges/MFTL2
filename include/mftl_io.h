@@ -77,6 +77,9 @@ void MFTLWritePvtu(MFTL_Ensemble* ens, const char* stem);
  * call MFTLRedistribute afterwards).
  */
 int MFTLWriteNativeMesh(const MFTL_Object* obj, const char* path);
+/** @brief Stage 16B: native mesh v2 (class, period box, exact positions + image counters,
+ *  boundary tags); read back by MFTLReadNativeMesh on any rank count (then MFTLRedistribute). */
+int MFTLWriteNativeMeshV2(const MFTL_Object* obj, const char* path);
 int MFTLReadNativeMesh(MFTL_Object* obj, const char* path);
 
 #endif  // MFTL_IO_H

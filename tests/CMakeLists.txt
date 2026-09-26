@@ -195,3 +195,137 @@ foreach(NP 1 2 3 4)
     add_test(NAME Stage15-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage15>)
     set_tests_properties(Stage15-np${NP} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
 endforeach()
+
+# --- Stage 16A: twin states (LOCAL/REMOTE/BOUNDARY), builders and declared class, copy/commit,
+#     remote-twin discovery, ghost completion G1/G2, boundary loops, boundary-adjacent operators,
+#     invariant fuzz (plans/16-generalized-surfaces.md §2, §10 T-A) ---
+add_executable(test_stage16a test_stage16a.c)
+target_link_libraries(test_stage16a PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_stage16a PRIVATE ${CMAKE_SOURCE_DIR}/include)
+foreach(NP 1 2 4 8)
+    add_test(NAME Stage16A-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage16a>)
+    set_tests_properties(Stage16A-np${NP} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+endforeach()
+
+# --- Stage 16A: no raw twin_gid comparisons outside the state predicates (plans/16 §2.1) ---
+add_test(NAME TwinGidReaderAudit COMMAND ${CMAKE_SOURCE_DIR}/tools/check_twin_gid_readers.sh ${CMAKE_SOURCE_DIR})
+
+# --- Stage 16B: periodic image counters, winding/canonicalisation, phase-boundary sets
+#     (plans/16 §3, tests T-B). The phase-set cases (every case of §3.6.10 and of the review
+#     §19.3, with the executable model's statuses/values) are REGENERATED from
+#     tools/phase_set_prototype (python3 + numpy) by a ctest fixture on every test run, so the
+#     tests never run on stale data. The library build never needs Python: the generator is a
+#     test-time dependency only, and without python3+numpy the model cases are skipped (the other
+#     16B tests still run) unless MFTL_PHASE_SET_MODEL_TESTS=ON demands them. ---
+set(MFTL_PHASE_SET_MODEL_TESTS "AUTO" CACHE STRING "Run the phase-set model cases (needs python3 + numpy at test time): AUTO, ON or OFF")
+set_property(CACHE MFTL_PHASE_SET_MODEL_TESTS PROPERTY STRINGS AUTO ON OFF)
+set(_mftl_ps_model OFF)
+if(NOT MFTL_PHASE_SET_MODEL_TESTS STREQUAL "OFF")
+    find_package(Python3 COMPONENTS Interpreter)
+    if(Python3_Interpreter_FOUND)
+        execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
+                        RESULT_VARIABLE _mftl_numpy_rc OUTPUT_QUIET ERROR_QUIET)
+        if(_mftl_numpy_rc EQUAL 0)
+            set(_mftl_ps_model ON)
+        endif()
+    endif()
+    if(NOT _mftl_ps_model)
+        if(MFTL_PHASE_SET_MODEL_TESTS STREQUAL "ON")
+            message(FATAL_ERROR "MFTL_PHASE_SET_MODEL_TESTS=ON needs python3 with numpy")
+        endif()
+        message(STATUS "MFTL2: python3+numpy not found - the Stage-16B phase-set model cases are skipped")
+    endif()
+endif()
+set(MFTL_PS_CASES ${CMAKE_BINARY_DIR}/phase_set_cases.txt)
+set(MFTL_PS_PROTO ${CMAKE_SOURCE_DIR}/tools/phase_set_prototype)
+set(_mftl_ps_arg "")
+if(_mftl_ps_model)
+    add_test(NAME Stage16B-export-model-cases
+             COMMAND ${CMAKE_COMMAND} -E env PYTHONDONTWRITEBYTECODE=1 ${Python3_EXECUTABLE} export_cases.py ${MFTL_PS_CASES}
+             WORKING_DIRECTORY ${MFTL_PS_PROTO})
+    set_tests_properties(Stage16B-export-model-cases PROPERTIES FIXTURES_SETUP s16b_model_cases TIMEOUT 1200)
+    set(_mftl_ps_arg ${MFTL_PS_CASES})
+endif()
+add_executable(test_stage16b test_stage16b.c)
+target_link_libraries(test_stage16b PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_stage16b PRIVATE ${CMAKE_SOURCE_DIR}/include)
+foreach(NP 1 2 4 8)
+    add_test(NAME Stage16B-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage16b> ${_mftl_ps_arg})
+    set_tests_properties(Stage16B-np${NP} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+    if(_mftl_ps_model)
+        set_tests_properties(Stage16B-np${NP} PROPERTIES FIXTURES_REQUIRED s16b_model_cases)
+    endif()
+endforeach()
+foreach(SL 1 2)
+    add_test(NAME Stage16B-slab${SL}-np4 COMMAND mpirun -np 4 $<TARGET_FILE:test_stage16b> ${_mftl_ps_arg})
+    set_tests_properties(Stage16B-slab${SL}-np4 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV};S16B_SLABS=${SL};S16B_AXES=z")
+    if(_mftl_ps_model)
+        set_tests_properties(Stage16B-slab${SL}-np4 PROPERTIES FIXTURES_REQUIRED s16b_model_cases)
+    endif()
+endforeach()
+# --- Stage 16B independent review (plans/16 §21): gauge invariance of transforms, winding
+#     validity through every construction path, legacy v1 restart, analytic phase sets ---
+add_executable(test_stage16b_gauge test_stage16b_gauge.c)
+target_link_libraries(test_stage16b_gauge PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_stage16b_gauge PRIVATE ${CMAKE_SOURCE_DIR}/include)
+foreach(NP 1 2 4 8)
+    add_test(NAME Stage16B-gauge-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage16b_gauge>)
+    set_tests_properties(Stage16B-gauge-np${NP} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+endforeach()
+# --- Stage 16C: generalized geometry kernels and boundary-aware remeshing (plans/16 §4, T-C) ---
+add_executable(test_stage16c test_stage16c.c)
+target_link_libraries(test_stage16c PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_stage16c PRIVATE ${CMAKE_SOURCE_DIR}/include)
+foreach(NP 1 2 4 8)
+    add_test(NAME Stage16C-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage16c>)
+    set_tests_properties(Stage16C-np${NP} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}" TIMEOUT 1800)
+endforeach()
+# --- Stage 16E: geometry of the open-surface boundary models (plans/16 §6, §7; E2/E3 library part) ---
+add_executable(test_stage16e test_stage16e.c)
+target_link_libraries(test_stage16e PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_stage16e PRIVATE ${CMAKE_SOURCE_DIR}/include)
+foreach(NP 1 2 4 8)
+    add_test(NAME Stage16E-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage16e>)
+    set_tests_properties(Stage16E-np${NP} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+endforeach()
+
+# --- Stage 16F: final validation of the wrapping topology (winding invariance under
+#     redistribution, lattice re-gauge, remeshing, rank count and restart; the abort contract of
+#     the unchecked single-body volume / inertia calls) ---
+add_executable(test_stage16f test_stage16f.c)
+target_link_libraries(test_stage16f PRIVATE MFTL MPI::MPI_C m)
+target_include_directories(test_stage16f PRIVATE ${CMAKE_SOURCE_DIR}/include)
+foreach(NP 1 2 4 8)
+    add_test(NAME Stage16F-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage16f>)
+    set_tests_properties(Stage16F-np${NP} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+endforeach()
+add_test(NAME Stage16F-restart-write-np4 COMMAND mpirun -np 4 $<TARGET_FILE:test_stage16f> write ${CMAKE_BINARY_DIR}/stage16f_restart)
+set_tests_properties(Stage16F-restart-write-np4 PROPERTIES FIXTURES_SETUP s16f_restart ENVIRONMENT "${MFTL_LSAN_ENV}")
+foreach(NP 1 2 8)
+    add_test(NAME Stage16F-restart-read-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage16f> read ${CMAKE_BINARY_DIR}/stage16f_restart)
+    set_tests_properties(Stage16F-restart-read-np${NP} PROPERTIES FIXTURES_REQUIRED s16f_restart ENVIRONMENT "${MFTL_LSAN_ENV}")
+endforeach()
+# the unchecked calls abort with their documented message (the exit status of an MPI_Abort is not
+# portable, so the message decides). The test runs as an MPI singleton (no launcher) with its output
+# in a file: under load MPICH's launcher ends an aborting job before forwarding its output (observed
+# 2 of 160 runs, even on one rank); without the launcher the message is always there (240 of 240).
+foreach(CASE volume_tube:wraps inertia_ribbon:wraps volume_patch:open inertia_patch:open)
+    string(REPLACE ":" ";" _c ${CASE})
+    list(GET _c 0 WHAT)
+    list(GET _c 1 KIND)
+    if(KIND STREQUAL "wraps")
+        set(_msg "the body wraps a periodic direction")
+    else()
+        set(_msg "the body is an open surface")
+    endif()
+    set(_out ${CMAKE_CURRENT_BINARY_DIR}/stage16f_unchecked_${WHAT}.out)
+    add_test(NAME Stage16F-unchecked-${WHAT}
+             COMMAND sh -c "'$<TARGET_FILE:test_stage16f>' unchecked ${WHAT} > '${_out}' 2>&1; grep -q '${_msg}' '${_out}' && ! grep -q 'NOT ABORTED' '${_out}'")
+    set_tests_properties(Stage16F-unchecked-${WHAT} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+endforeach()
+add_test(NAME Stage16B-restart-write-np4 COMMAND mpirun -np 4 $<TARGET_FILE:test_stage16b> write ${CMAKE_BINARY_DIR}/stage16b_restart)
+set_tests_properties(Stage16B-restart-write-np4 PROPERTIES FIXTURES_SETUP s16b_restart ENVIRONMENT "${MFTL_LSAN_ENV}")
+foreach(NP 1 2 8)
+    add_test(NAME Stage16B-restart-read-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage16b> read ${CMAKE_BINARY_DIR}/stage16b_restart)
+    set_tests_properties(Stage16B-restart-read-np${NP} PROPERTIES FIXTURES_REQUIRED s16b_restart ENVIRONMENT "${MFTL_LSAN_ENV}")
+endforeach()

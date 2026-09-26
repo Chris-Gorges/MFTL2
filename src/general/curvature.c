@@ -153,6 +153,19 @@ static void mftlVertexNormalAccumulate(MFTL_Object* obj, int i, const int* ring,
   }
 }
 
+/* Stage 16C: triangles of an OPEN_COMPLETE fan (boundary vertex); 0 otherwise */
+static int mftlGatherOpenFan(const MFTL_Object* obj, int vi, int* ring_tris)
+{
+  int hes[MFTL_CURVATURE_MAX_RING], n = 0;
+  if (MFTLVertexRing(obj, vi, hes, MFTL_CURVATURE_MAX_RING, &n) != MFTL_RING_OPEN_COMPLETE || n >= MFTL_CURVATURE_MAX_RING) return 0;
+  for (int k = 0; k < n; ++k)
+  {
+    if (obj->half_edges[hes[k]].flags & MFTL_FLAG_DEAD) return 0;
+    ring_tris[k] = obj->half_edges[hes[k]].triangle_idx;
+  }
+  return n;
+}
+
 void MFTLComputeVertexNormals(MFTL_Object* obj)
 {
   MFTL_ASSERT(obj != MFTL_NULL);
@@ -165,7 +178,14 @@ void MFTLComputeVertexNormals(MFTL_Object* obj)
     if (!mftlCurvIsLocal(v, rank)) continue;
 
     int n = mftlGatherRing(obj, i, ring);
-    if (n == 0) continue;  // incomplete stored ring: skip (ghosts cover owned)
+    if (n == 0)
+    {
+      // Stage 16C (plans/16 §4.2): a boundary vertex (OPEN_COMPLETE fan) gets the angle-weighted
+      // normal of its available fan; an incomplete fan is skipped (ghost-covered owned vertices
+      // never have one after G2)
+      n = mftlGatherOpenFan(obj, i, ring);
+      if (n == 0) continue;
+    }
 
     double acc[3];
     mftlVertexNormalAccumulate(obj, i, ring, n, 0, acc);
@@ -286,7 +306,14 @@ void MFTLComputeVertexCurvatures(MFTL_Object* obj)
     if (!mftlCurvIsLocal(v, rank)) continue;
 
     int n = mftlGatherRing(obj, i, ring);
-    if (n == 0) continue;  // incomplete stored ring: skip (see header)
+    if (n == 0)
+    {
+      // Stage 16C (plans/16 §4.2): no silent skip — curvature is defined only on closed fans;
+      // boundary (and, before G2, incomplete) vertices are flagged
+      v->flags |= MFTL_VFLAG_CURV_UNDEFINED;
+      continue;
+    }
+    v->flags &= ~MFTL_VFLAG_CURV_UNDEFINED;
 
     mftlVertexCurvatureKernel(obj, i, ring, n, 0);
   }
@@ -296,7 +323,12 @@ int MFTLComputeVertexCurvatureAt(MFTL_Object* obj, int vi)
 {
   int ring[MFTL_CURVATURE_MAX_RING];
   int n = mftlGatherRing(obj, vi, ring);
-  if (n == 0) return MFTL_ERROR;
+  if (n == 0)
+  {
+    obj->vertices[vi].flags |= MFTL_VFLAG_CURV_UNDEFINED;  // Stage 16C
+    return MFTL_ERROR;
+  }
+  obj->vertices[vi].flags &= ~MFTL_VFLAG_CURV_UNDEFINED;
   return mftlVertexCurvatureKernel(obj, vi, ring, n, 1);
 }
 
@@ -414,4 +446,117 @@ double MFTLComputeRoughness(MFTL_Object* obj)
   MPI_Allreduce(&gl_sum, &gl_global, 1, MPI_DOUBLE, MPI_SUM, obj->domain->comm_cart);
   MPI_Allreduce(&gl_count, &gl_count_global, 1, MPI_INT, MPI_SUM, obj->domain->comm_cart);
   return gl_count_global > 0 ? gl_global / (double) gl_count_global : 0.0;
+}
+
+/* ------------------------------------------------------------------------------------------
+ * Stage 16C (plans/16 §4.2): extrapolated curvature of boundary vertices
+ * ------------------------------------------------------------------------------------------ */
+static int mftlSolve5(double A[5][5], double b[5], double x[5])
+{
+  for (int c = 0; c < 5; ++c)
+  {
+    int p = c;
+    for (int r = c + 1; r < 5; ++r)
+      if (fabs(A[r][c]) > fabs(A[p][c])) p = r;
+    if (!(fabs(A[p][c]) > 0.0)) return MFTL_ERROR;
+    if (p != c)
+    {
+      for (int k = 0; k < 5; ++k)
+      {
+        double t = A[c][k];
+        A[c][k] = A[p][k];
+        A[p][k] = t;
+      }
+      double t = b[c];
+      b[c] = b[p];
+      b[p] = t;
+    }
+    for (int r = c + 1; r < 5; ++r)
+    {
+      const double f = A[r][c] / A[c][c];
+      for (int k = c; k < 5; ++k) A[r][k] -= f * A[c][k];
+      b[r] -= f * b[c];
+    }
+  }
+  for (int r = 4; r >= 0; --r)
+  {
+    double s = b[r];
+    for (int k = r + 1; k < 5; ++k) s -= A[r][k] * x[k];
+    x[r] = s / A[r][r];
+  }
+  return MFTL_SUCCESS;
+}
+
+void MFTLComputeExtrapolatedCurvatures(MFTL_Object* obj)
+{
+  MFTL_ASSERT(obj != MFTL_NULL);
+  const int rank = obj->domain->rank;
+  int ring[MFTL_CURVATURE_MAX_RING];
+  for (int i = 0; i < obj->n_vertices; ++i)
+  {
+    MFTL_Vertex* v = &obj->vertices[i];
+    if (!mftlCurvIsLocal(v, rank)) continue;
+    v->flags &= ~MFTL_VFLAG_CURV_EXTRAPOLATED;
+    const int n = mftlGatherOpenFan(obj, i, ring);
+    if (n == 0) continue;
+    // frame: the open-fan normal
+    double w[3];
+    mftlVertexNormalAccumulate(obj, i, ring, n, 0, w);
+    double wl = sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+    if (!(wl > 0.0)) continue;
+    for (int k = 0; k < 3; ++k) w[k] /= wl;
+    double u[3] = {1, 0, 0};
+    if (fabs(w[0]) > 0.9) u[0] = 0, u[1] = 1;
+    double dd = u[0] * w[0] + u[1] * w[1] + u[2] * w[2];
+    for (int k = 0; k < 3; ++k) u[k] -= dd * w[k];
+    double ul = sqrt(u[0] * u[0] + u[1] * u[1] + u[2] * u[2]);
+    for (int k = 0; k < 3; ++k) u[k] /= ul;
+    double s[3] = {w[1] * u[2] - w[2] * u[1], w[2] * u[0] - w[0] * u[2], w[0] * u[1] - w[1] * u[0]};
+    // stencil: the vertices of the fan triangles and of the stored fans of the fan vertices
+    int st[4 * MFTL_CURVATURE_MAX_RING], ns = 0;
+    for (int r = 0; r < n; ++r)
+    {
+      MFTL_Vertex* tv[3];
+      MFTLGetTriangleVertices(obj, &obj->triangles[ring[r]], tv);
+      for (int c = 0; c < 3; ++c)
+      {
+        const int x = (int) (tv[c] - obj->vertices);
+        if (x == i) continue;
+        MFTL_Vertex* nb[64];
+        const int nn = MFTLGetVertexOneRingVertices(obj, tv[c], nb, 64, MFTL_FALSE);
+        for (int q = -1; q < nn; ++q)
+        {
+          const int y = (q < 0) ? x : (int) (nb[q] - obj->vertices);
+          if (y == i) continue;
+          int dup = 0;
+          for (int z = 0; z < ns; ++z)
+            if (st[z] == y) dup = 1;
+          if (!dup && ns < 4 * MFTL_CURVATURE_MAX_RING) st[ns++] = y;
+        }
+      }
+    }
+    if (ns < 6) continue;
+    // least squares h = a x^2 + b x y + c y^2 + d x + e y
+    double A[5][5] = {{0}}, B[5] = {0}, X[5];
+    for (int q = 0; q < ns; ++q)
+    {
+      double dv[3];
+      MFTLGetMinimumImageVector(obj->domain, dv, v->pos, obj->vertices[st[q]].pos);
+      const double x = dv[0] * u[0] + dv[1] * u[1] + dv[2] * u[2];
+      const double y = dv[0] * s[0] + dv[1] * s[1] + dv[2] * s[2];
+      const double h = dv[0] * w[0] + dv[1] * w[1] + dv[2] * w[2];
+      const double f[5] = {x * x, x * y, y * y, x, y};
+      for (int r = 0; r < 5; ++r)
+      {
+        for (int c = 0; c < 5; ++c) A[r][c] += f[r] * f[c];
+        B[r] += f[r] * h;
+      }
+    }
+    if (mftlSolve5(A, B, X) != MFTL_SUCCESS) continue;
+    const double a = X[0], b = X[1], c = X[2], d = X[3], e = X[4];
+    const double g = 1.0 + d * d + e * e;
+    const double twoH = ((1.0 + e * e) * 2.0 * a - 2.0 * b * d * e + (1.0 + d * d) * 2.0 * c) / pow(g, 1.5);
+    v->curv_extrap = fabs(twoH);  // same convention as meancurvature (|2H|)
+    v->flags |= MFTL_VFLAG_CURV_EXTRAPOLATED;
+  }
 }

@@ -38,6 +38,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "mftl_images.h"
 #include "mftl_core.h"
 #include "mftl_constants.h"
 #include "mftl_geometry.h"
@@ -311,6 +312,9 @@ static double mftlVcDet3(const double m[3][3])
 
 double MFTLVolumeRecovery(MFTL_Object* obj, double target_volume)
 {
+  // Stage 16B class guard: open or wrapping bodies enclose no volume by themselves
+  MFTLObjectEnsureWinding(obj);  // collective
+  if (!MFTLObjectHasVolume(obj)) return 0.0;
   MFTL_ASSERT(obj != MFTL_NULL);
 
   // Effective first-order surface area for the normal shift. Each OWNED
@@ -404,8 +408,8 @@ double MFTLVolumeRecovery(MFTL_Object* obj, double target_volume)
       v->pos[1] -= n[1] * h;
       v->pos[2] -= n[2] * h;
       // storage invariant: positions stay wrapped inside the domain (no-op
-      // when no axis is periodic)
-      MFTLApplyPeriodicity(obj->domain, v->pos);
+      // when no axis is periodic); Stage 16B: the wrap is counted into img
+      MFTLWrapPosImg(obj->domain, v->pos, v->img);
     }
   }
 
@@ -587,7 +591,7 @@ void MFTLEdgeVolumeConservingSmoothing(MFTL_Object* obj, int he_idx, MFTL_Remesh
       obj->vertices[vi].pos[k] += dx[i][k] + h * AA[k] / AA_MAG;
     }
     // keep the storage invariant: wrapped positions (no-op when non-periodic)
-    MFTLApplyPeriodicity(obj->domain, obj->vertices[i == 0 ? v0 : v1].pos);
+    MFTLWrapPosImg(obj->domain, obj->vertices[i == 0 ? v0 : v1].pos, obj->vertices[i == 0 ? v0 : v1].img);
   }
 
   // Stage 15 (L7): conserve the surface-scalar mass of the moved rings.
@@ -819,6 +823,9 @@ int MFTLEdgeTSUR(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
   double nh[3] = {normal[0] * h, normal[1] * h, normal[2] * h};
   double* pos0 = obj->vertices[v0].pos;
   double* pos1 = obj->vertices[v1].pos;
+  double old0[3], old1[3];  // Stage 16B: displacement rule for the image counters
+  memcpy(old0, pos0, sizeof(old0));
+  memcpy(old1, pos1, sizeof(old1));
   for (int k = 0; k < 3; ++k)
   {
     pos0[k] = p0[k] + nh[k];
@@ -826,6 +833,8 @@ int MFTLEdgeTSUR(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
   }
   MFTLApplyPeriodicity(dom, pos0);
   MFTLApplyPeriodicity(dom, pos1);
+  MFTLImgFollow(dom, obj->vertices[v0].img, old0, pos0);
+  MFTLImgFollow(dom, obj->vertices[v1].img, old1, pos1);
   for (int k = 0; k < 3; ++k)
   {
     if (dom->is_periodic[k]) continue;  // wrapped above

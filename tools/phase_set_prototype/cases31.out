@@ -1,0 +1,107 @@
+-- 1 seam-crossing sphere (x,z seams)   [expected: DEFINED]
+  literal                                                        UNSUPPORTED sph appears on no generic ray
+  F12                                                            DEFINED     V=0.033271771491 Cz=0.970000000000
+      |dV|=0.0e+00 |dCz|=0.0e+00   ok
+  fixed                                                          DEFINED     V=0.033271771491 Cz=0.970000000000
+      |dV|=0.0e+00 |dCz|=0.0e+00   ok
+-- 2 one wrapping xy sheet   [expected: UNDEFINED]
+  literal                                                        UNDEFINED   Phi != 0
+  F12                                                            UNDEFINED   Phi != 0
+  fixed                                                          UNDEFINED   Phi != 0
+-- 3 two opposite sheets (slab, ceiling in image +1)   [expected: DEFINED V=0.5 Cz=0.45]
+  literal                                                        DEFINED     V=0.500000000000 Cz=0.450000000000
+      |dV|=3.3e-16 |dCz|=3.3e-16   ok
+  F12                                                            DEFINED     V=0.500000000000 Cz=0.450000000000
+      |dV|=3.3e-16 |dCz|=3.3e-16   ok
+  fixed                                                          DEFINED     V=0.500000000000 Cz=0.450000000000
+      |dV|=3.3e-16 |dCz|=3.3e-16   ok
+-- 3b complement of the slab   [expected: DEFINED V=0.5 Cz=0.95]
+  literal                                                        DEFINED     V=0.500000000000 Cz=0.950000000000
+      |dV|=3.3e-16 |dCz|=6.7e-16   ok
+  F12                                                            DEFINED     V=0.500000000000 Cz=0.950000000000
+      |dV|=3.3e-16 |dCz|=6.7e-16   ok
+  fixed                                                          DEFINED     V=0.500000000000 Cz=0.950000000000
+      |dV|=3.3e-16 |dCz|=6.7e-16   ok
+-- 4 wavy floor + ceiling + bubble in dip (bubble gauge +1)   [expected: DEFINED, bubble at z=0.1]
+  literal                                                        UNSUPPORTED bubble appears on no generic ray
+  F12                                                            DEFINED     V=0.499733825828 Cz=0.438948495945
+      |dV|=0.0e+00 |dCz|=0.0e+00   ok
+  fixed                                                          DEFINED     V=0.499733825828 Cz=0.438948495945
+      |dV|=0.0e+00 |dCz|=0.0e+00   ok
+   (fold curve self-intersections: 0)
+-- 5 overhanging floor z0=0.3 (3 crossings on some lines)   [expected: DEFINED]
+  literal                                                        DEFINED     V=0.544243903871 Cz=0.479423503592
+      |dV|=0.0e+00 |dCz|=0.0e+00   ok
+  F12                                                            DEFINED     V=0.544243903871 Cz=0.479423503592
+      |dV|=0.0e+00 |dCz|=0.0e+00   ok
+  fixed                                                          DEFINED     V=0.544243903871 Cz=0.479423503592
+      |dV|=0.0e+00 |dCz|=0.0e+00   ok
+   (max crossings of the fold floor on a vertical line: 6)
+   (fold curve self-intersections: 0)
+-- 5 overhanging floor z0=0.9 (3 crossings on some lines)   [expected: DEFINED]
+  literal                                                        DEFINED     V=0.544243903871 Cz=1.079423503592
+      |dV|=3.3e-16 |dCz|=6.7e-16   ok
+  F12                                                            DEFINED     V=0.544243903871 Cz=1.079423503592
+      |dV|=3.3e-16 |dCz|=6.7e-16   ok
+  fixed                                                          DEFINED     V=0.544243903871 Cz=1.079423503592
+      |dV|=3.3e-16 |dCz|=6.7e-16   ok
+   (max crossings of the fold floor on a vertical line: 6)
+-- 6a four sheets (-,+,-,+): two slabs   [expected: DEFINED V=0.5 (set centre UNSUPPORTED per plan)]
+  literal                                                        DEFINED     V=0.500000000000 Cz=0.470000000000
+  F12                                                            DEFINED     V=0.500000000000 Cz=0.470000000000
+  fixed                                                          DEFINED     V=0.500000000000 Cz=0.470000000000
+-- 6b three sheets   [expected: UNDEFINED]
+  literal                                                        UNDEFINED   Phi != 0
+  F12                                                            UNDEFINED   Phi != 0
+  fixed                                                          UNDEFINED   Phi != 0
+-- 6c six sheets, alternating, mixed images   [expected: DEFINED V=0.1+0.1+0.25=0.45]
+  literal                                                        DEFINED     V=0.450000000000 Cz=0.580555555556
+  F12                                                            DEFINED     V=0.450000000000 Cz=0.580555555556
+  fixed                                                          DEFINED     V=0.450000000000 Cz=0.580555555556
+-- 7 closed tube wrapping x (Phi=0, compact along z)   [expected: DEFINED V~pi r^2]
+  literal                                                        UNSUPPORTED tube appears on no generic ray
+  F12                                                            DEFINED     V=0.070484143799 Cz=0.500000000000
+      |dV|=0.0e+00 |dCz|=0.0e+00   ok
+  fixed                                                          DEFINED     V=0.070484143799 Cz=0.500000000000
+      |dV|=0.0e+00 |dCz|=0.0e+00   ok
+-- 7b slab + tube inside it (tube = other phase)   [expected: DEFINED]
+  literal                                                        DEFINED     V=0.529515856201 Cz=0.500000000000
+      |dV|=0.0e+00 |dCz|=0.0e+00   ok
+  F12                                                            DEFINED     V=0.529515856201 Cz=0.500000000000
+      |dV|=0.0e+00 |dCz|=0.0e+00   ok
+  fixed                                                          DEFINED     V=0.529515856201 Cz=0.500000000000
+      |dV|=0.0e+00 |dCz|=0.0e+00   ok
+-- 8a four sheets (-,-,+,+)   [expected: UNDEFINED]
+  literal                                                        UNDEFINED   alternation fails on canonical ray
+  F12                                                            UNDEFINED   alternation fails on canonical ray
+  fixed                                                          UNDEFINED   alternation fails on canonical ray
+-- 8b nested drops, same orientation (inner drop sigma=+1)   [expected: UNDEFINED]
+  literal                                                        UNSUPPORTED sph appears on no generic ray
+  F12                                                            UNDEFINED   alternation fails on local ray of sph
+  fixed                                                          UNDEFINED   alternation fails on local ray of sph
+-- 8c laterally disjoint drops, sigma=+1 and sigma=-1   [expected: UNDEFINED (levels -1,0,+1)]
+  literal                                                        UNSUPPORTED sph appears on no generic ray
+  F12                                                            DEFINED     V=0.029112800054 Cz=0.500000000000
+  fixed                                                          UNDEFINED   outermost compact members disagree on the exterior (inconsistent orientation)
+-- 8d slab + drop in the non-phase region with sigma=-1   [expected: UNDEFINED]
+  literal                                                        UNSUPPORTED sph appears on no generic ray
+  F12                                                            UNDEFINED   alternation fails on local ray of sph
+  fixed                                                          UNDEFINED   alternation fails on local ray of sph
+-- 8e two disjoint drops, both sigma=+1 (consistent)   [expected: DEFINED V=V1+V2 (centre UNSUPPORTED per plan)]
+  literal                                                        UNSUPPORTED sph appears on no generic ray
+  F12                                                            DEFINED     V=0.037430742927 Cz=0.500000000000
+      |dV|=0.0e+00 |dCz|=0.0e+00   ok
+  fixed                                                          DEFINED     V=0.037430742927 Cz=0.500000000000
+      |dV|=0.0e+00 |dCz|=0.0e+00   ok
+-- 8f matrix: one bubble sigma=-1 in the triply periodic box   [expected: DEFINED V=1-Vb (valid region)]
+  literal                                                        UNSUPPORTED sph appears on no generic ray
+  F12                                                            UNDEFINED   V_raw=-0.0332718 outside (0,V_cell)
+  fixed                                                          DEFINED     V=0.966728228509 Cz=-0.017208441064
+-- 4b wavy floor + ceiling + wide x-tube near the floor (tube gauge +1)   [expected: DEFINED, tube at z=0.54]
+  literal                                                        DEFINED     V=0.336712846268 Cz=-1.094729983390
+      |dV|=1.1e-16 |dCz|=1.6e+00   WRONG VALUE
+  F12                                                            DEFINED     V=0.336712846268 Cz=0.548471812636
+      |dV|=1.1e-16 |dCz|=1.1e-16   ok
+  fixed                                                          DEFINED     V=0.336712846268 Cz=0.548471812636
+      |dV|=1.1e-16 |dCz|=1.1e-16   ok
+exit=0

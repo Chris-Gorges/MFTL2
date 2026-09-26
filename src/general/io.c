@@ -8,8 +8,10 @@
 #include "mftl_core.h"
 #include "mftl_constants.h"
 #include "mftl_geometry.h"
+#include "mftl_images.h"
 #include "mftl_topology.h"
 #include "khash.h"
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -617,10 +619,13 @@ int MFTLReadGTS(MFTL_Object* obj, const char* path)
                 edge_corner[2 * e + edge_count[e]] = j;
                 edge_count[e]++;
               }
+            // Stage 16D: a declared-open body may have boundary edges (one triangle, BoundaryFromMesh);
+            // an edge used by no triangle is malformed input for every class.
             for (int e = 0; e < nE && ok; ++e)
-              if (edge_count[e] != 2)
+              if (edge_count[e] != 2 && !(obj->declared_open && edge_count[e] == 1))
               {
-                fprintf(stderr, "MFTLReadGTS: edge %d shared by %d triangles (not a closed manifold) in '%s'\n", e, edge_count[e], path);
+                fprintf(stderr, "MFTLReadGTS: edge %d shared by %d triangles (not a %s manifold) in '%s'\n", e, edge_count[e],
+                        obj->declared_open ? "valid open" : "closed", path);
                 ok = 0;
                 break;
               }
@@ -641,6 +646,7 @@ int MFTLReadGTS(MFTL_Object* obj, const char* path)
                 for (int j = 0; j < 3; ++j)
                 {
                   int e = tri_edge[t][j];
+                  if (edge_count[e] == 1) continue;  // boundary edge of a declared-open body
                   int eff_dir = tri_dir[t][j] ^ tflip;
                   int slot = edge_tri[2 * e] == t ? 1 : 0;  // the OTHER triangle
                   int u = edge_tri[2 * e + slot];
@@ -689,7 +695,9 @@ int MFTLReadGTS(MFTL_Object* obj, const char* path)
 
     // Canonicalize the global winding: flip every triangle so the enclosed
     // signed volume (same formula as MFTLObjectVolume) is POSITIVE.
-    if (ok)
+    // Stage 16D: closed bodies only. An open surface encloses no volume; this sum depends on the
+    // origin there, so a declared-open body keeps the orientation of its input file.
+    if (ok && !obj->declared_open)
     {
       double S = 0.0;
       for (int t = 0; t < nF; ++t)
@@ -722,17 +730,20 @@ int MFTLReadGTS(MFTL_Object* obj, const char* path)
 
   if (rank == 0)
   {
-    MFTLBuildTopologyFromTriples(obj, nV, (const double (*)[3]) positions, nF, (const int (*)[3]) triples);
-
-    // Reject open or non-manifold input: a closed GTS surface leaves no
-    // boundary half-edge after the twin rebuild.
-    for (int i = 0; i < obj->n_half_edges; ++i)
+    // Reject open or non-manifold input (Stage 16A: the builder refuses an unmatched edge on a
+    // body not declared open, duplicate directed half-edges and bow-tie vertices).
+    if (MFTLBuildTopologyFromTriples(obj, nV, (const double (*)[3]) positions, nF, (const int (*)[3]) triples) != MFTL_SUCCESS)
     {
-      if (obj->half_edges[i].twin_idx == MFTL_ERROR)
+      fprintf(stderr, "MFTLReadGTS: '%s' is not a valid %s manifold surface\n", path, obj->declared_open ? "open" : "closed");
+      ok = 0;
+    }
+    else
+    {
+      // Stage 16B: the file holds continuous coordinates -> (pos, img) (no-op when non-periodic)
+      for (int i = 0; i < obj->n_vertices; ++i)
       {
-        fprintf(stderr, "MFTLReadGTS: '%s' is not a closed manifold surface (boundary edge found)\n", path);
-        ok = 0;
-        break;
+        double X[3] = {obj->vertices[i].pos[0], obj->vertices[i].pos[1], obj->vertices[i].pos[2]};
+        MFTLWrapContinuous(domain, X, obj->vertices[i].pos, obj->vertices[i].img);
       }
     }
   }
@@ -750,6 +761,7 @@ int MFTLReadGTS(MFTL_Object* obj, const char* path)
   MPI_Bcast(&obj->next_halfedge_gid, 1, MPI_INT, 0, domain->comm_world);
   MFTLObjectUpdateGlobalStats(obj);
   MFTLFlattenConnectivity(obj);
+  if (MFTLCanonicaliseImages(obj) != MFTL_SUCCESS) return MFTL_ERROR;  // Stage 16B: wrap flags
 
   if (rank == 0)
   {
@@ -900,11 +912,7 @@ void MFTLWritePvtu(MFTL_Ensemble* ens, const char* stem)
  * (MFTL_FindTriangleEdgesandVertices), so files are exchangeable between the libraries.
  * Written edges are the undirected edges, id = min(half-edge gid, twin gid).
  */
-static int mftlNativeEdgeId(const MFTL_Object* obj, const MFTL_HalfEdge* he)
-{
-  int tg = MFTLHeTwinGid(obj, he);
-  return (tg != MFTL_ERROR && tg < he->global_id) ? tg : he->global_id;
-}
+static int mftlNativeEdgeId(const MFTL_Object* obj, const MFTL_HalfEdge* he) { return MFTLHeEdgeId(obj, he); }
 
 int MFTLWriteNativeMesh(const MFTL_Object* obj, const char* path)
 {
@@ -947,6 +955,65 @@ int MFTLWriteNativeMesh(const MFTL_Object* obj, const char* path)
   return MFTL_SUCCESS;
 }
 
+/* Stage 16B (plans/16 §3.2, §13 item 4): native restart mesh v2. Adds the declared class, the
+   period box, exact positions (%.17g) with the image counters, the boundary tag of every edge
+   and the explicit vertex triple of every triangle:
+     MFTL2NATIVE 2
+     open <declared_open>
+     box <per_x per_y per_z> <min_x min_y min_z> <max_x max_y max_z>
+     nv ne nt
+     nv x  "owner gid x y z ix iy iz"
+     ne x  "owner edge_id v0_gid v1_gid tag"         (tag -1: interior edge)
+     nt x  "owner gid e0 e1 e2 v0_gid v1_gid v2_gid scalar"
+   MFTLReadNativeMesh reads v1 and v2 (v1: closed-or-declared class, img = 0, then
+   canonicalisation). Locally stored entities are written (gather first, as for v1). */
+int MFTLWriteNativeMeshV2(const MFTL_Object* obj, const char* path)
+{
+  FILE* fp = fopen(path, "w");
+  if (!fp)
+  {
+    fprintf(stderr, "MFTLWriteNativeMeshV2: cannot open %s\n", path);
+    return MFTL_ERROR;
+  }
+  const MFTL_Domain* dom = obj->domain;
+  int ne = 0;
+  for (int i = 0; i < obj->n_half_edges; ++i)
+  {
+    const MFTL_HalfEdge* he = &obj->half_edges[i];
+    if (he->flags & MFTL_FLAG_DEAD) continue;
+    if (mftlNativeEdgeId(obj, he) == he->global_id) ne++;
+  }
+  fprintf(fp, "MFTL2NATIVE 2\nopen %d\nbox %d %d %d %.17g %.17g %.17g %.17g %.17g %.17g\n", obj->declared_open ? 1 : 0, dom->is_periodic[0] ? 1 : 0,
+          dom->is_periodic[1] ? 1 : 0, dom->is_periodic[2] ? 1 : 0, dom->global_min[0], dom->global_min[1], dom->global_min[2], dom->global_max[0],
+          dom->global_max[1], dom->global_max[2]);
+  fprintf(fp, "%d %d %d\n", obj->n_vertices, ne, obj->n_triangles);
+  for (int i = 0; i < obj->n_vertices; ++i)
+  {
+    const MFTL_Vertex* v = &obj->vertices[i];
+    fprintf(fp, "%d %d %.17g %.17g %.17g %d %d %d\n", v->owner_proc, v->global_id, v->pos[0], v->pos[1], v->pos[2], v->img[0], v->img[1], v->img[2]);
+  }
+  for (int i = 0; i < obj->n_half_edges; ++i)
+  {
+    const MFTL_HalfEdge* he = &obj->half_edges[i];
+    if (he->flags & MFTL_FLAG_DEAD) continue;
+    if (mftlNativeEdgeId(obj, he) != he->global_id) continue;
+    fprintf(fp, "%d %d %d %d %d\n", obj->triangles[he->triangle_idx].owner_proc, he->global_id, MFTLHeOrigin(obj, he)->global_id,
+            MFTLHeTarget(obj, he)->global_id, MFTLHeIsBoundary(he) ? MFTLHeBoundaryTag(he) : -1);
+  }
+  for (int t = 0; t < obj->n_triangles; ++t)
+  {
+    const MFTL_Triangle* tri = &obj->triangles[t];
+    MFTL_HalfEdge* he[3];
+    MFTLGetTriangleHalfedges(obj, tri, he);
+    MFTL_Vertex* vv[3];
+    MFTLGetTriangleVertices(obj, tri, vv);
+    fprintf(fp, "%d %d %d %d %d %d %d %d %.17g\n", tri->owner_proc, tri->global_id, mftlNativeEdgeId(obj, he[0]), mftlNativeEdgeId(obj, he[1]),
+            mftlNativeEdgeId(obj, he[2]), vv[0]->global_id, vv[1]->global_id, vv[2]->global_id, tri->surface_scalar);
+  }
+  fclose(fp);
+  return MFTL_SUCCESS;
+}
+
 typedef struct
 {
   int id, v0, v1;
@@ -980,11 +1047,42 @@ int MFTLReadNativeMesh(MFTL_Object* obj, const char* path)
   double (*pos)[3] = MFTL_NULL;
   double* scalar = MFTL_NULL;
   mftlNativeEdge* edges = MFTL_NULL;
+  int v2 = 0, file_open = 0, (*vimg)[3] = MFTL_NULL, nb = 0;
+  MFTL_BoundaryEdgeDecl* bdecl = MFTL_NULL;
 
   if (path)
   {
     FILE* fp = fopen(path, "r");
-    if (!fp || fscanf(fp, "%d %d %d", &nv, &ne, &nt) != 3 || nv < 0 || ne < 0 || nt < 0)
+    char magic[32] = {0};
+    if (fp)
+    {
+      long at = ftell(fp);
+      if (fscanf(fp, "%31s", magic) == 1 && strcmp(magic, "MFTL2NATIVE") == 0)
+      {
+        int ver = 0, per[3];
+        double mn[3], mx[3];
+        char w1[16], w2[16];
+        if (fscanf(fp, "%d %15s %d %15s %d %d %d %lf %lf %lf %lf %lf %lf", &ver, w1, &file_open, w2, &per[0], &per[1], &per[2], &mn[0], &mn[1],
+                   &mn[2], &mx[0], &mx[1], &mx[2]) != 13 ||
+            ver != 2)
+          bad = 1;
+        else
+        {
+          v2 = 1;
+          const MFTL_Domain* dom = obj->domain;
+          for (int k = 0; k < 3; ++k)
+            if (per[k] != (dom->is_periodic[k] ? 1 : 0) || (per[k] && (fabs(mn[k] - dom->global_min[k]) > 1e-12 * dom->domain_size[k] ||
+                                                                         fabs(mx[k] - dom->global_max[k]) > 1e-12 * dom->domain_size[k])))
+            {
+              fprintf(stderr, "MFTLReadNativeMesh: %s was written for a different periodic box\n", path);
+              bad = 1;
+            }
+        }
+      }
+      else
+        fseek(fp, at, SEEK_SET);
+    }
+    if (!fp || bad || fscanf(fp, "%d %d %d", &nv, &ne, &nt) != 3 || nv < 0 || ne < 0 || nt < 0)
     {
       fprintf(stderr, "MFTLReadNativeMesh: cannot read %s\n", path);
       bad = 1;
@@ -996,15 +1094,37 @@ int MFTLReadNativeMesh(MFTL_Object* obj, const char* path)
     tgid = (int*) malloc((size_t) (nt > 0 ? nt : 1) * sizeof(int));
     tvg = malloc((size_t) (nt > 0 ? nt : 1) * sizeof(*tvg));
     scalar = (double*) malloc((size_t) (nt > 0 ? nt : 1) * sizeof(double));
+    vimg = malloc((size_t) (nv > 0 ? nv : 1) * sizeof(*vimg));
+    bdecl = (MFTL_BoundaryEdgeDecl*) malloc((size_t) (ne > 0 ? ne : 1) * sizeof(MFTL_BoundaryEdgeDecl));
     int owner;
     for (int i = 0; i < nv && !bad; ++i)
+    {
       if (fscanf(fp, "%d %d %lf %lf %lf", &owner, &vgid[i], &pos[i][0], &pos[i][1], &pos[i][2]) != 5) bad = 1;
+      vimg[i][0] = vimg[i][1] = vimg[i][2] = 0;
+      if (v2 && !bad && fscanf(fp, "%d %d %d", &vimg[i][0], &vimg[i][1], &vimg[i][2]) != 3) bad = 1;
+    }
     for (int i = 0; i < ne && !bad; ++i)
+    {
       if (fscanf(fp, "%d %d %d %d", &owner, &edges[i].id, &edges[i].v0, &edges[i].v1) != 4) bad = 1;
+      int tag = -1;
+      if (v2 && !bad && fscanf(fp, "%d", &tag) != 1) bad = 1;
+      if (tag >= 0)
+      {
+        bdecl[nb].vgid_a = edges[i].v0;
+        bdecl[nb].vgid_b = edges[i].v1;
+        bdecl[nb].tag = tag;
+        nb++;
+      }
+    }
     if (!bad) qsort(edges, (size_t) ne, sizeof(mftlNativeEdge), mftlCmpNativeEdge);
     for (int t = 0; t < nt && !bad; ++t)
     {
       int e[3];
+      if (v2)
+      {
+        if (fscanf(fp, "%d %d %d %d %d %d %d %d %lf", &owner, &tgid[t], &e[0], &e[1], &e[2], &tvg[t][0], &tvg[t][1], &tvg[t][2], &scalar[t]) != 9) bad = 1;
+        continue;  // v2 stores the vertex triple explicitly
+      }
       if (fscanf(fp, "%d %d %d %d %d %lf", &owner, &tgid[t], &e[0], &e[1], &e[2], &scalar[t]) != 6)
       {
         bad = 1;
@@ -1051,7 +1171,26 @@ int MFTLReadNativeMesh(MFTL_Object* obj, const char* path)
     }
   }
 
-  int rc = MFTLBuildFromSoup(obj, nv, vgid, (const double (*)[3]) pos, MFTL_NULL, nt, tgid, (const int (*)[3]) tvg, MFTL_NULL);
+  // v2 (Stage 16B): the declared class, exact counters and the boundary tags come from the file
+  int flg[2] = {v2, v2 ? file_open : 0}, gflg[2];
+  MPI_Allreduce(flg, gflg, 2, MPI_INT, MPI_MAX, obj->domain->comm_cart);
+  int rc;
+  if (gflg[0])
+  {
+    MFTLObjectDeclareOpen(obj, gflg[1]);
+    const MFTL_BoundaryDecl decl = {0, nb, bdecl};
+    rc = MFTLBuildFromSoupImg(obj, nv, vgid, (const double (*)[3]) pos, (const int (*)[3]) vimg, MFTL_NULL, nt, tgid, (const int (*)[3]) tvg,
+                              MFTL_NULL, gflg[1] ? &decl : MFTL_NULL);
+  }
+  else
+  {
+    // Stage 16A: a body declared open reads its boundary from the mesh (v1 files carry no tags;
+    // tags are re-derived as loop indices). Stage 16B: v1 positions are wrapped input with
+    // img = 0; the build canonicalises.
+    const MFTL_BoundaryDecl from_mesh = {1, 0, MFTL_NULL};
+    rc = MFTLBuildFromSoupEx(obj, nv, vgid, (const double (*)[3]) pos, MFTL_NULL, nt, tgid, (const int (*)[3]) tvg, MFTL_NULL,
+                             obj->declared_open ? &from_mesh : MFTL_NULL);
+  }
   if (rc == MFTL_SUCCESS)
   {
     for (int t = 0; t < nt; ++t)
@@ -1068,6 +1207,8 @@ int MFTLReadNativeMesh(MFTL_Object* obj, const char* path)
   free(tgid);
   free(tvg);
   free(scalar);
+  free(vimg);
+  free(bdecl);
   int gbad = 0;
   MPI_Allreduce(&bad, &gbad, 1, MPI_INT, MPI_MAX, obj->domain->comm_cart);
   return (gbad || rc != MFTL_SUCCESS) ? MFTL_ERROR : MFTL_SUCCESS;
