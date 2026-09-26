@@ -4,23 +4,14 @@
  * @date 2026-08-14
  * @ingroup mftl_ensemble
  *
- * @brief The fused per-timestep geometry and quality update.
+ * @brief The fused per-timestep geometry + quality pass, and the collective
+ *        vertex-normal pass.
  *
- * One gathered pass over compact triangle connectivity produces area, normal
- * and centroid AND nine quality accumulators from the same position loads.
- *
- *   1. ONE PASS, NOT TWO. Area/normal/centroid and the edge-length statistics
- *      read the same edges. The three edges of a triangle are e1, e2 and e2-e1,
- *      so the statistics cost three subtractions and three dot products on
- *      vectors already in registers -- against a second pass that re-gathered
- *      eighteen doubles per triangle to recompute them.
- *
- *   2. PERIODICITY IS UNSWITCHED. The periodic-domain decision is outside the
- *      triangle loop. Non-periodic meshes pay no correction instructions;
- *      periodic meshes use branchless minimum-image arithmetic.
- *
- *   3. THE OWNED PREFIX, NOT AN OWNERSHIP TEST. Owned triangles are an array
- *      prefix, so the loop bound IS the ownership filter.
+ * One gathered pass over the owned prefix of `tris.verts` writes area, normal
+ * and centroid and accumulates nine statistics from the same registers (the
+ * three edges are e1, e2 and e2-e1); periodicity is decided outside the loop.
+ * The kernel is file-static here, not in src/geometry/, so its accumulators stay
+ * in registers.
  */
 
 #include "mftl_ensemble.h"
@@ -37,13 +28,11 @@
 #include "mftl_types.h"
 
 /**
- * @name Reduction slot counts
+ * @name Reduction record layout
  *
- * The eleven values one body contributes, kept in one contiguous record so that
- * the whole ensemble's statistics are ONE call to MFTLEnsembleReduceBodies()
- * rather than one per body. Mixing the three operators inside one record is what
- * lets the holder route send a single message; see the banner above
- * unpack_slot().
+ * One body contributes eleven values -- MIN, MAX, SUM groups -- so the whole
+ * ensemble's statistics are ONE MFTLEnsembleReduceBodies() call; mixed operators
+ * cost nothing on the holder route.
  * @{
  */
 /** @brief MIN slots per object: area, quality, squared edge length. */
@@ -57,13 +46,7 @@
 /** @} */
 
 /**
- * @brief The nine local accumulators, so the kernel has one out-parameter.
- *
- * Passed by pointer and written back ONCE, at the end of the kernel. The nine
- * values stay in registers across the loop, which is the whole reason the kernel
- * is a file-static function here rather than in `src/geometry/`: crossing a
- * translation-unit boundary would force them into an address-taken struct, and
- * that was measured at 15 %.
+ * @brief The nine local accumulators, written back once at the end of the kernel.
  */
 typedef struct
 {
@@ -81,16 +64,10 @@ typedef struct
 /**
  * @brief The hot loop: geometry into the triangle pool, statistics into @p acc.
  *
- * The accumulators use fmin/fmax rather than the obvious `if (a < lo) lo = a;`,
- * and that is a measured choice. Checked with -Rpass-analysis=loop-vectorize on
- * the identical kernel: with the if-form (and with a ternary) clang reports
- * "value that could not be identified as reduction", i.e.
- * the loop is disqualified before anything else is considered. With fmin/fmax
- * that objection disappears.
- *
- * Caveat for the cluster: on AArch64 fmin/fmax lower to single fminnm/fmaxnm
- * instructions; on x86-64 they need extra NaN fixup around minsd/maxsd, so the
- * 4-5 % measured is not portable and is worth re-measuring there.
+ * Min/max use `fmin`/`fmax`: with an if-form clang rejects the loop as a
+ * reduction before anything else ("value that could not be identified as
+ * reduction"). They lower to single instructions on AArch64 but need NaN fix-up
+ * on x86-64, so the measured 4-5 % is platform dependent.
  *
  * @param      obj    The mesh. `tris.area`, `tris.normal` and `tris.center` are
  *                    written for the first @p n_tris triangles.
@@ -102,20 +79,13 @@ static void update_kernel(MFTL_Object *obj, int n_tris, update_accumulators *acc
   MFTL_ASSERT(MFTLObjectHasTopology(obj) && "MFTLEnsembleUpdate: stale tris.verts -- call MFTLObjectBuildDerived first");
   MFTL_ASSERT(n_tris <= obj->tris.n && "MFTLEnsembleUpdate: count exceeds the triangle pool");
 
-  /* Three contiguous output streams. As fields of MFTL_Triangle they would make
-   * this loop a 96-byte-stride scatter, which clang refuses to vectorise with
-   * "cannot identify array bounds". */
+  /* Three contiguous output streams (SoA). */
   double *const restrict out_area = obj->tris.area;
   double *const restrict out_normal = obj->tris.normal;
   double *const restrict out_center = obj->tris.center;
 
-  /* The wrap stays the BRANCHY library call, and that is measured, not assumed.
-   * A hoisted branchless form (multiply by a per-axis length that is zero off a
-   * periodic axis) is the standard advice and it was 1.34-1.37x SLOWER here: the
-   * three branches are perfectly predicted, while the branchless form does
-   * unconditional work on all three axes including non-periodic ones. It would
-   * be the right choice if this loop vectorised -- it does not, see the note at
-   * the bottom of this file. */
+  /* The centroid wrap stays the branchy MFTLApplyPeriodicity(): a branchless
+   * form measured 1.34-1.37x slower in this (non-vectorised) loop. */
   const MFTL_Domain *const dom = obj->domain;
 
   double min_area = acc->min_area, max_area = acc->max_area, sum_area = 0.0;
@@ -130,12 +100,8 @@ static void update_kernel(MFTL_Object *obj, int n_tris, update_accumulators *acc
       const double ny = e1z * e2x - e1x * e2z;
       const double nz = e1x * e2y - e1y * e2x;
 
-      /* No clamp on the magnitude -- see MFTLGetTriangleProperties. Flooring it
-       * would floor `area` at 5e-7, which is precisely the quantity this kernel
-       * exists to reduce: min_triangle_area could then never report a degenerate
-       * triangle, and the quality below would exceed its own maximum of 1. The
-       * unit-normal guarantee costs this loop +1.1 %, measured; that is the whole
-       * of what the exactness is priced at. */
+      /* Unclamped, as in MFTLGetTriangleProperties(): a clamp would floor the
+       * area and let q exceed 1. */
       const double mag = MFTL_SQRT(nx * nx + ny * ny + nz * nz);
       const double area = 0.5 * mag;
 
@@ -148,11 +114,8 @@ static void update_kernel(MFTL_Object *obj, int n_tris, update_accumulators *acc
       const double b_sq = e2x * e2x + e2y * e2y + e2z * e2z;
       const double c_sq = e3x * e3x + e3y * e3y + e3z * e3z;
 
-      /* Mean-ratio quality: 1 for an equilateral triangle, 0 for a degenerate one.
-       * It is DIMENSIONLESS, so the only degeneracy test that means the same thing
-       * at every length scale is against zero: an absolute floor on the squared
-       * edge sum (which scales as L^2) reported q = 0 for a perfect equilateral
-       * triangle with 1e-7 edges. */
+      /* Mean-ratio quality, dimensionless: the only scale-free degeneracy test
+       * is against zero. */
       const double denom = a_sq + b_sq + c_sq;
       const double q = (denom > 0.0) ? MFTL_FOUR_SQRT3 * area / denom : 0.0;
 
@@ -166,10 +129,7 @@ static void update_kernel(MFTL_Object *obj, int n_tris, update_accumulators *acc
       out_normal[3 * t + 1] = ny * inv_mag;
       out_normal[3 * t + 2] = nz * inv_mag;
 
-      /* Centroid = corner0 + (e1 + e2)/3. The offset is seam-consistent, so this
-       * is the true centroid even for a triangle straddling a periodic face --
-       * but the result must be wrapped back into the box, because redistribution
-       * feeds it to MFTLGetOwnerProc. */
+      /* Centroid from seam-consistent offsets, then wrapped (MFTLGetOwnerProc()). */
       double c[3] = {p0x + (e1x + e2x) * MFTL_ONE_THIRD, p0y + (e1y + e2y) * MFTL_ONE_THIRD, p0z + (e1z + e2z) * MFTL_ONE_THIRD};
       MFTLApplyPeriodicity(dom, c);
       out_center[3 * t + 0] = c[0];
@@ -187,42 +147,11 @@ static void update_kernel(MFTL_Object *obj, int n_tris, update_accumulators *acc
   acc->sum_esq = sum_esq;
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * The statistics are PER BODY, and the reduction is over that body's HOLDERS
- *
- * Eleven doubles per body, every timestep. An ensemble-wide aggregate would be
- * eleven doubles full stop, and it is the wrong answer: per-body quality is what
- * a solver reads to decide whether THIS droplet needs remeshing. A single number
- * over every triangle of every body cannot answer that -- one degenerating
- * interface among a thousand healthy ones moves the ensemble minimum and nothing
- * else, so the caller learns that something is wrong and not which body it is.
- *
- * So the payload stays per body. What does NOT have to stay is the set of ranks
- * each body's eleven doubles are reduced over, and that is where this used to
- * cost: three MPI_Allreduce calls over comm_world on a buffer indexed by BODY ID,
- * on every rank, whether or not it held any of that body. The message COUNT was 3
- * regardless of the body count, which is the property that made it look fine --
- * but the VOLUME and the staging memory were both O(bodies in the ensemble) per
- * rank, and in a weak-scaling sweep the body count grows with the rank count.
- *
- * Only the holders of a body have anything to contribute to it, so the reduction
- * goes through MFTLEnsembleReduceBodies(), whose buffer is indexed by LOCAL SLOT
- * and whose collective is a neighbourhood one whenever every body's holders fit
- * inside one 26-neighbourhood. Three consequences worth stating:
- *
- *   - the eleven slots carry THREE DIFFERENT OPERATORS and that is now free. A
- *     neighbourhood exchange combines in local memory, so mixing min, max and sum
- *     costs one message rather than three; the comm_world fallback still needs
- *     one Allreduce per operator, which is exactly what this used to be.
- *   - the identity fill moved inside the reduction. It used to be O(bodies) of
- *     DBL_MAX on every rank so that a body it did not hold contributed nothing to
- *     a minimum; on the holder route no such slot exists to fill.
- *   - a rank holding no bodies still enters every collective, and the guard below
- *     therefore reads n_bodies_global rather than the local count.
- * ════════════════════════════════════════════════════════════════════════════ */
-
 /**
- * @brief Turns one reduced slot into the nine public statistics.
+ * @brief Turns one reduced record into the nine public statistics.
+ *
+ * Averages divide by GLOBAL counts (never an average of per-rank averages). A
+ * body with no triangles anywhere reports zeros instead of the identities.
  *
  * @param[out] qs  Destination.
  * @param      mn  MFTL_UPD_N_MIN reduced minima for this body.
@@ -234,14 +163,12 @@ static void unpack_slot(MFTL_ObjectQualityStatistics *qs, const double *mn, cons
   const double n_tris_g = sm[3];
   const double n_edges_g = sm[4];
 
-  /* Averages against the GLOBAL counts, never an average of per-rank averages:
-   * ranks hold wildly different triangle counts and the two differ. */
+  /* Averages against the GLOBAL counts. */
   qs->avg_triangle_area = (n_tris_g > 0.0) ? sm[0] / n_tris_g : 0.0;
   qs->avg_aspect_ratio = (n_tris_g > 0.0) ? sm[1] / n_tris_g : 0.0;
   qs->avg_edge_length_sq = (n_edges_g > 0.0) ? sm[2] / n_edges_g : 0.0;
 
-  /* A body with no triangles anywhere leaves the identities in place; zero them
-   * so a caller does not read DBL_MAX as a measurement. */
+  /* No triangles anywhere: report zeros, not the DBL_MAX identities. */
   const bool empty = (n_tris_g <= 0.0);
   qs->min_triangle_area = empty ? 0.0 : mn[0];
   qs->max_triangle_area = empty ? 0.0 : mx[0];
@@ -256,21 +183,16 @@ void MFTLEnsembleUpdate(MFTL_Ensemble *ensemble)
   MFTL_ASSERT(ensemble != MFTL_NULL);
   if (ensemble == MFTL_NULL) return;
 
-  /* GLOBAL, not local. A collective follows, so the guard has to be a number
-   * every rank agrees about: returning on the local body count would have a rank
-   * holding nothing skip a reduction the others are inside. */
+  /* Guard on the GLOBAL count: a collective follows. */
   if (ensemble->n_bodies_global == 0) return;
 
   const int n_local = ensemble->n_local_objects;
 
-  /* One record per LOCAL body, eleven slots wide:
+  /* One record per LOCAL body, indexed by slot:
    *
    *   [0..2]  MIN  area, quality, squared edge length
    *   [3..5]  MAX  the same three
-   *   [6..10] SUM  area, quality, squared edge length, triangle count, edge count
-   *
-   * Indexed by this rank's slot, not by body id, which is the entire scaling
-   * argument -- see the banner above unpack_slot(). */
+   *   [6..10] SUM  area, quality, squared edge length, triangle count, half-edge count */
   static const MFTL_BodyReduceOp ops[MFTL_UPD_N_SLOTS] = {
       MFTL_BODY_REDUCE_MIN, MFTL_BODY_REDUCE_MIN, MFTL_BODY_REDUCE_MIN, MFTL_BODY_REDUCE_MAX, MFTL_BODY_REDUCE_MAX, MFTL_BODY_REDUCE_MAX,
       MFTL_BODY_REDUCE_SUM, MFTL_BODY_REDUCE_SUM, MFTL_BODY_REDUCE_SUM, MFTL_BODY_REDUCE_SUM, MFTL_BODY_REDUCE_SUM};
@@ -288,10 +210,7 @@ void MFTLEnsembleUpdate(MFTL_Ensemble *ensemble)
 
     update_accumulators acc = {MFTL_DBL_MAX, -MFTL_DBL_MAX, 0.0, MFTL_DBL_MAX, -MFTL_DBL_MAX, 0.0, MFTL_DBL_MAX, -MFTL_DBL_MAX, 0.0};
 
-    /* A body with no owned triangles here keeps the kernel's identities, so it
-     * contributes nothing to its own reduction rather than a zero that would win
-     * every minimum. There is no longer a slot for a body this rank does not
-     * hold at all -- that is the point -- so this is the only such case left. */
+    /* No owned triangles here: contribute the identities, not zeros. */
     if (n_tris > 0) update_kernel(obj, n_tris, &acc);
 
     double *const r = &rows[(size_t) o * MFTL_UPD_N_SLOTS];
@@ -308,22 +227,8 @@ void MFTLEnsembleUpdate(MFTL_Ensemble *ensemble)
     r[10] = (double) (3 * n_tris); /* edges visited */
   }
 
-  /* ── One reduction, over each body's holders ─────────────────────────────
-   *
-   * BLOCKING, and there is nothing left to overlap it with: the loop above is
-   * what produces the values, and the unpack below consumes them. The three
-   * MPI_Iallreduce calls this replaces were non-blocking for a reason that no
-   * longer applies -- they were three independent comm_world reductions whose
-   * latencies would otherwise have been in series. Mixing the operators is free
-   * on the holder route because it combines in local memory, so there is one
-   * message rather than three; the comm_world fallback inside still issues one
-   * Iallreduce per operator and waits on them together, which is the old
-   * behaviour exactly.
-   *
-   * There is deliberately no attempt to overlap it with the geometry loop
-   * itself: the only available overlap would be per body (start body o's
-   * reduction while computing body o+1), and that trades the message count --
-   * the thing that actually scales -- for a little latency hiding. Wrong trade. */
+  /* One blocking reduction over each body's holders for the whole ensemble
+   * (per-body overlap would multiply the message count). */
   MFTLEnsembleReduceBodies(ensemble, rows, MFTL_UPD_N_SLOTS, ops, MFTL_BODY_REDUCE_SCOPE_AUTO);
 
   for (int o = 0; o < n_local; ++o)
@@ -347,111 +252,32 @@ void MFTLEnsembleComputeTriangleGeometry(MFTL_Ensemble *ensemble)
   }
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * The per-vertex counterpart
- *
- * MFTLEnsembleUpdate is to triangles what this is to vertices, and the two are
- * deliberately the same shape: iterate the object list, run the local kernel
- * from src/geometry/, then own whatever collective the result needs. What
- * differs is WHICH collective, and that difference is the interesting part.
- *
- *   triangles   the statistics are global by definition -- a minimum over one
- *               rank's partition is not the mesh's minimum -- so the collective
- *               is a REDUCTION, and it is the reason the kernel and the
- *               orchestration live in the same file (see the note at the very
- *               bottom of this file).
- *
- *   vertices    the normals need no reduction at all: an owned vertex's normal
- *               is a function of its one-ring, which a vertex-complete halo makes
- *               entirely local. What IS missing is the ghost half, so the
- *               collective is an EXCHANGE.
- * ═══════════════════════════════════════════════════════════════════════════ */
+/* The per-vertex counterpart needs an EXCHANGE, not a reduction: owned normals
+ * are exact locally (vertex-complete halo); only the ghost half is missing. */
 
 int MFTLEnsembleUpdateVertexNormals(MFTL_Ensemble *ensemble, MFTL_NormalWeighting weighting)
 {
   MFTL_ASSERT(ensemble != MFTL_NULL);
   if (ensemble == MFTL_NULL) return MFTL_ERROR;
-  /* GLOBAL, not local: MFTLUpdateGhostVertexNormals() below is collective, so a
-   * rank holding no bodies must still reach it. */
+  /* Guard on the GLOBAL count: the exchange below is collective. */
   if (ensemble->n_bodies_global == 0) return MFTL_SUCCESS;
 
-  /* Local, communication-free, exact for every OWNED vertex. Ghost vertices come
-   * out of this holding a partial sum -- correctly normalised and quietly wrong,
-   * which is precisely why the exchange below is not optional. */
+  /* Exact on owned vertices; partial sums on ghosts until the exchange. */
   for (int o = 0; o < ensemble->n_local_objects; ++o) MFTLComputeVertexNormals(ensemble->local_objects[o], weighting);
 
-  /* One request/reply over the graph communicator, 32 B per ghost vertex. It is
-   * blocking inside, and there is nothing here to overlap it with: every object
-   * has to be accumulated before any reply can be served, because a ghost on
-   * this rank may be owned by a rank whose own accumulation is not finished
-   * either. Issuing it per object would multiply the message COUNT by the number
-   * of bodies while moving the same bytes -- the exchange takes the whole
-   * ensemble at once for exactly that reason. */
+  /* One request/reply exchange for the whole ensemble (per object would
+   * multiply the message count for the same bytes). */
   return MFTLUpdateGhostVertexNormals(ensemble);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Historical vectorisation evidence: asked, forced, and priced
+ * Why this loop does not vectorise (docs/analysis.md §1.6)
  *
- * Everything below predates frame removal and comes from the retired
- * update-kernel benchmark, which rebuilt the frame-backed kernel eleven ways on
- * one mesh in one binary and checked identical results. It explains retained
- * arithmetic choices, but is not a current frame-vs-gather measurement. Current
- * end-to-end measurements live in docs/analysis.md §1.2.
- *
- * ── 1. Does the loop vectorise?  No, and not for the reason believed ───────
- *
- *   mpicc -std=c11 -O3 -DNDEBUG -Iinclude \
- *         -c src/ensemble/ensemble_update.c -o /dev/null \
- *         -Rpass=loop-vectorize -Rpass-missed=loop-vectorize \
- *         -Rpass-analysis=loop-vectorize
- *
- * says of the loop below: "the cost-model indicates that vectorization is not
- * beneficial". Note -Rpass-MISSED: without it clang reports nothing at all for
- * this loop and only remarks on the unpack loop at the bottom of
- * MFTLEnsembleUpdate, which is easy to misread as "no diagnostic, so it
- * vectorised".
- *
- * The obvious diagnosis is the nine-way statistics reduction. THAT ATTRIBUTION IS
- * WRONG, and two independent measurements say so:
- *
- *   - splitting the reduction into 2 independent accumulator sets -- the
- *     standard fix, written out with eighteen plain scalars so nothing is hidden
- *     in a struct -- gives 3.52 against this kernel's 3.45. A wash, very
- *     slightly worse. Four sets is no better.
- *   - overruling the cost model with `#pragma clang loop vectorize(enable)`
- *     produces "loop not vectorized: the optimizer was unable to perform the
- *     requested transformation", and times identically to this kernel. So the
- *     loop is not merely judged unprofitable, it is not vectorisable in this
- *     shape at all -- and the profitable-looking transformation is not.
- *
- * ── 2. Where the time actually goes ────────────────────────────────────────
- *
- *   this kernel, fused                        3.45
- *   geometry only, no statistics              2.26   <- statistics cost 1.19
- *   geometry only, sqrt and divide DELETED    1.36   <- they cost 0.90, i.e. 26 %
- *
- * One sqrt and one reciprocal per triangle are a quarter of the whole pass, and
- * neither is algebraically removable: the kernel needs both |n| (for the area)
- * and n/|n| (for the unit normal). That is the floor this loop sits on, and it
- * is a throughput limit on one functional unit -- which is precisely why
- * unrolling the reductions changes nothing.
- *
- * ── 3. Three traps for anyone editing this loop, all measured ──────────────
- *
- *   - DO NOT SPLIT THE STATISTICS OUT INTO THEIR OWN PASS. Geometry then
- *     statistics as two loops costs 4.33 against 3.45 fused -- 25 % slower, even
- *     though the second pass re-reads data the first left in cache. The
- *     statistics ride along on vectors already in registers; separating them
- *     means recomputing the cross product and the three edge lengths.
- *   - KEEP THE WRAP BRANCHY, AND DO NOT UNSWITCH IT EITHER. The branchless form
- *     is the textbook advice and was 1.34-1.37x SLOWER. Hoisting a separate
- *     separate non-periodic loop is also not worth it here: that variant measures 3.64 against 3.45, i.e. nominally
- *     SLOWER while doing strictly less work, which puts the wrap below this
- *     machine's code-alignment noise floor.
- *   - THE OUTPUT LAYOUT BARELY MATTERS. One array per component measures 3.41
- *     against 3.45 -- 1.3 %, and not worth breaking `tris.normal` into three
- *     arrays for. The layout is chosen for the CONSUMERS, not for this loop:
- *     redistribution wants centres and nothing else, and gets 24 B per triangle
- *     instead of 56.
+ * clang's cost model rejects it (-Rpass-missed=loop-vectorize), and forcing it
+ * with `#pragma clang loop vectorize(enable)` fails outright. The nine-way
+ * reduction is NOT the cause: splitting it into independent accumulator sets
+ * changed nothing. One sqrt and one reciprocal per triangle are about a quarter
+ * of the pass and neither is removable (the kernel needs both |n| and n/|n|).
+ * Measured traps: splitting the statistics into a second pass is 25 % slower;
+ * a per-component output layout gains 1.3 %, not worth breaking `tris.normal`.
  * ═══════════════════════════════════════════════════════════════════════════ */

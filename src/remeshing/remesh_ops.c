@@ -51,18 +51,15 @@
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Is @p h the canonical representative of its undirected edge?
- *
- * Every operator acts on an EDGE, not on a direction, so the sweeps must offer
- * each edge exactly once or an edge gets split twice and a flip gets undone by
- * its own twin. The smaller index wins; a boundary half-edge has no twin and is
- * always canonical.
- *
  * @brief Is @p h the half of its undirected edge the operators are offered?
+ *
+ * Operators act on EDGES, so each must be offered once per sweep, or an edge is
+ * split twice or a flip undone by its own twin. The smaller index wins; a
+ * boundary half-edge has no twin and is always canonical.
+ *
  * @param obj The mesh.
  * @param h   Half-edge index.
- * @return `true` for the half-edge of smaller index, so an undirected edge is
- *         considered exactly once per sweep.
+ * @return `true` for the canonical half-edge.
  */
 static inline bool he_is_canonical(const MFTL_Object *obj, int h)
 {
@@ -93,13 +90,12 @@ static bool edge_is_operable(const MFTL_Object *obj, int h)
 
 /**
  * @brief One-ring vertices of @p v, refusing rather than truncating.
- * @return The neighbour count, or MFTL_ERROR if the fan did not fit.
  *
  * @param      obj The mesh.
  * @param      v   Vertex index.
  * @param[out] out `[MFTL_REMESH_RING_MAX]` the one-ring neighbours.
- * @return Number of neighbours, or 0 if the walk was truncated -- every operator
- *         REFUSES rather than proceeds on a truncated ring.
+ * @return Number of neighbours, or #MFTL_ERROR if the walk may have been
+ *         truncated -- every operator then REFUSES rather than proceeds.
  */
 static int ring_vertices(const MFTL_Object *obj, int v, int *out)
 {
@@ -113,7 +109,8 @@ static int ring_vertices(const MFTL_Object *obj, int v, int *out)
  * @param      obj The mesh.
  * @param      v   Vertex index.
  * @param[out] out `[MFTL_REMESH_RING_MAX]` the incident triangles.
- * @return Number of triangles, or 0 if the walk was truncated.
+ * @return Number of triangles, or #MFTL_ERROR if the walk may have been
+ *         truncated.
  */
 static int ring_triangles(const MFTL_Object *obj, int v, int *out)
 {
@@ -327,28 +324,19 @@ int MFTLSplitEdge(MFTL_Object *obj, int h)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Where the surviving vertex ends up.
+ * @brief Where the surviving vertex of a collapse ends up.
  *
- * The midpoint, EXCEPT when the survivor lies on preserved geometry and the
- * retired vertex does not. Then it keeps its own position.
- *
- * The exception covers more than corners, and getting its extent wrong is subtle:
- * collapsing an ordinary face vertex INTO a ridge vertex is perfectly legal --
- * the ridge is not being retired -- but placing the survivor at the midpoint
- * drags it OFF the ridge and into the face. Repeated along a sharp edge, that
- * erodes the edge one collapse at a time while every approval clause reports
- * success, because none of them look at where the survivor lands.
- *
- * When BOTH endpoints lie on the same curve the midpoint is used, which is exact
- * on a straight feature and cuts the corner by O(h^2) on a curved one. That is
- * acceptable precisely because the edge being collapsed is short by construction.
+ * Its own position if it is a corner, or if it alone lies on a feature curve or
+ * boundary: collapsing a face vertex INTO a ridge vertex is legal, but the
+ * midpoint would drag the ridge into the face and erode it one collapse at a
+ * time while every approval clause passes. Otherwise the minimum-image
+ * midpoint -- exact on a straight feature and \f$O(h^2)\f$ off a curved one,
+ * acceptable because the edge is short by construction.
  *
  * @param      obj The mesh.
  * @param      a   The vertex that would be retired.
  * @param      b   The vertex that would survive.
- * @param[out] out Where the surviving vertex goes: the midpoint, unless exactly
- *                 one endpoint is a feature or boundary vertex, in which case that
- *                 endpoint's position is kept so the curve is not pulled off itself.
+ * @param[out] out The survivor's new position.
  */
 static void collapse_target_position(const MFTL_Object *obj, int a, int b, double out[3])
 {

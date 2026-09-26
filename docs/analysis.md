@@ -559,7 +559,10 @@ Correctness, most severe first:
    `MFTLCheckMeshIntegrity`.
 3. **Collective control parameters are not agreed.** `MFTLRemeshParamsAgree`
    checks only the length band and only in Debug; `parallel_strategy`, the phase
-   budget and the coarsening controls change the collective sequence.
+   budget and the coarsening controls change the collective sequence. The
+   drivers' refusal of a non-positive band is also a per-rank decision: a band
+   that is bad on some ranks only (the §5.5 trap) returns `MFTL_ERROR` there and
+   leaves the other ranks in the next collective — a hang in Release.
 4. **A failed ghost-id sync during a spanning remesh** still renumbers owned ids
    and proceeds into the closing redistribution; it should be an agreed
    fail-stop.

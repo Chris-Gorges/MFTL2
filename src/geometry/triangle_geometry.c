@@ -4,22 +4,13 @@
  * @date 2026-08-15
  * @ingroup mftl_geometry
  *
- * @brief Per-triangle geometry: area, unit normal and centroid for a whole mesh.
+ * @brief Per-triangle geometry for a whole mesh, and the closest point on a
+ *        triangle.
  *
- * ## TWO CONNECTIVITY PATHS, ONE ENTRY POINT
- *
- * The same three outputs can be produced two ways, and which one is available
- * depends on the state of the object rather than on what the caller wants:
- *
- *   HALF EDGE  valid even before derived connectivity has been built. This is
- *              the construction-time fallback.
- *
- *   VERTICES   streams `tris.verts`, gathers the authoritative positions and
- *              creates seam-corrected edges in registers. Periodicity is
- *              unswitched outside the triangle loop.
- *
- * Both paths have identical geometry arithmetic. The normal steady-state path
- * is VERTICES; the half-edge fallback preserves the construction-time API.
+ * MFTLComputeTriangleGeometry() has two bit-identical paths chosen by the
+ * object's state: the steady-state path streams `tris.verts` with periodicity
+ * unswitched outside the loop; the fallback walks the half-edge records and is
+ * valid before derived connectivity has been built.
  */
 
 #include "mftl_geometry.h"
@@ -29,16 +20,10 @@
 #include "mftl_types.h"
 
 /**
- * @brief The general path: half-edge walk, gathered positions, minimum image.
+ * @brief The fallback path: one MFTLGetTriangleProperties() per triangle.
  *
- * Written as a loop over MFTLGetTriangleProperties rather than open-coded,
- * because that function is the definition of what a triangle's geometry IS and
- * two spellings of it would be one too many. It is `static inline` in the header
- * and this is a tight loop around it, so nothing is called per triangle.
- *
- * The outputs go straight into the arrays: `&tris.normal[3*t]` is a three-double
- * slot of exactly the shape the output parameter wants, so this stays a direct
- * store with no stack round-trip.
+ * That inline function is the definition of a triangle's geometry, so it is
+ * reused rather than re-spelled; outputs are stored straight into the arrays.
  *
  * @param obj   The mesh. `tris.area`, `tris.normal` and `tris.center` are written.
  * @param count Triangles to process, from index 0.
@@ -52,15 +37,12 @@ static void geometry_by_walk(MFTL_Object *obj, int count)
 }
 
 /**
- * @brief The hot path: compact indices plus gathered authoritative positions.
+ * @brief The steady-state path: compact indices, gathered positions,
+ *        periodicity unswitched (#MFTL_FOREACH_TRIANGLE_GEOMETRY).
  *
- * The centroid still needs MFTLApplyPeriodicity, and that stays the branchy
- * library call deliberately: `p0 + (e1+e2)/3` is a true centroid but not
- * necessarily a WRAPPED position, and redistribution feeds it to
- * MFTLGetOwnerProc. The branchless alternative was measured 1.34-1.37x slower in
- * this exact shape of loop (see src/ensemble/ensemble_update.c), because it does
- * unconditional work on non-periodic axes too while these three branches are
- * perfectly predicted.
+ * The centroid \f$\vect{p}_0 + (\vect{e}_1+\vect{e}_2)/3\f$ is a true centroid
+ * but not necessarily inside the box, so it is wrapped (redistribution feeds it
+ * to MFTLGetOwnerProc()).
  *
  * @param obj   The mesh. Requires #MFTL_DERIVED_TOPOLOGY.
  * @param count Triangles to process, from index 0.
@@ -75,19 +57,14 @@ static void geometry_by_vertices(MFTL_Object *obj, int count)
 
   MFTL_FOREACH_TRIANGLE_GEOMETRY(
       obj, count,
-    /* Unnormalised normal; its magnitude is twice the area, so one sqrt serves
-     * both outputs and there is no second square root anywhere in the loop. */
+    /* Unnormalised normal; |n| = 2A, so one sqrt serves area and normal. */
     const double nx = e1y * e2z - e1z * e2y;
     const double ny = e1z * e2x - e1x * e2z;
     const double nz = e1x * e2y - e1y * e2x;
 
-    /* The degeneracy guard is a test against zero on the DIVISOR, never a clamp
-     * on the magnitude: clamping floors the reported AREA and leaves a small
-     * triangle's normal short of unit. Argued in full, with the +1.1 % it costs,
-     * in MFTLGetTriangleProperties (mftl_geometry.h). This must stay the exact
-     * same expression -- test_triangle_geometry_paths_are_bit_identical compares
-     * the two paths with memcmp, so a difference of one operation here is a
-     * difference in the last bit there. */
+    /* Unclamped magnitude, reciprocal guarded against zero -- the same
+     * expression as MFTLGetTriangleProperties(), which
+     * test_triangle_geometry_paths_are_bit_identical compares with memcmp. */
     const double mag = MFTL_SQRT(nx * nx + ny * ny + nz * nz);
     const double inv = (mag > 0.0) ? 1.0 / mag : 0.0;
 
@@ -166,11 +143,8 @@ static double closest_on_segment(const double p[3], const double a[3], const dou
 }
 
 /**
- * @brief The degenerate-triangle answer: the nearest of the three edges.
- *
- * A triangle with no area is a segment (or a point), and its closest point is on
- * one of its edges. Ties go to the lower edge index, so the answer does not
- * depend on anything but the input.
+ * @brief The degenerate-triangle answer: the nearest of the three edges (ties to
+ *        the lower edge index).
  *
  * @param      p       Query point.
  * @param      tri     The three corners.
@@ -217,13 +191,9 @@ double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], dou
   const double ab[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
   const double ac[3] = {c[0] - a[0], c[1] - a[1], c[2] - a[2]};
 
-  /* ── Degeneracy first, and dimensionlessly ──────────────────────────────
-   *
-   * |ab x ac|^2 = |ab|^2 |ac|^2 sin^2(angle at a). Comparing it against the
-   * product of the squared lengths is a test on sin^2 alone, so it means the
-   * same thing for a triangle of size 1e-8 and one of size 1e+8. Below the
-   * threshold the face formula's denominator is noise, and the triangle is a
-   * segment for every practical purpose. */
+  /* Degeneracy, scale-free: |ab x ac|^2 = |ab|^2 |ac|^2 sin^2(angle at a), so
+   * the test is on sin^2 alone. Below it the face formula's denominator is
+   * noise and the triangle is treated as its three edges. */
   const double cx = ab[1] * ac[2] - ab[2] * ac[1];
   const double cy = ab[2] * ac[0] - ab[0] * ac[2];
   const double cz = ab[0] * ac[1] - ab[1] * ac[0];
@@ -298,9 +268,7 @@ double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], dou
     }
   }
 
-  /* Corners are returned bit-exact rather than as a + 1.0*ab, which would round:
-   * a caller comparing a vertex feature's point against the vertex itself (the
-   * SDF's pseudo-normal lookup does) must see equality. */
+  /* Corners are returned bit-exactly, not as a + 1.0*ab (which would round). */
   switch (*f)
   {
     case MFTL_TRI_FEATURE_VERTEX0: q[0] = a[0], q[1] = a[1], q[2] = a[2]; break;

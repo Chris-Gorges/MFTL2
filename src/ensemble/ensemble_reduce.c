@@ -4,33 +4,14 @@
  * @date 2026-09-04
  * @ingroup mftl_ensemble
  *
- * @brief Per-body reductions taken over the ranks that HOLD each body.
+ * @brief Per-body reductions and exclusive scans over the ranks that HOLD each
+ *        body, with a certified neighbourhood route and an exact global fallback.
  *
- * Three per-timestep collectives in this library reduce one small record per
- * body -- the quality statistics, the global entity counts and the
- * redistribution skip vote. All three used to do it with an `MPI_Allreduce`
- * over `comm_world` on a buffer indexed by body id, which is the obvious shape
- * and the one that stops scaling first: at a million bodies every rank
- * allocates, fills with identities and reduces a million slots in order to
- * learn about the hundred it holds.
- *
- * This file is the one place that choice is made. The contract and the
- * exactness argument are on MFTLEnsembleReduceBodies() in mftl_ensemble.h; what
- * is here is the implementation and the three things about it that are easy to
- * get wrong:
- *
- *   1. THE CALLER'S BUFFER IS INDEXED BY LOCAL SLOT. Moving the id indexing
- *      inside is most of the saving -- otherwise the collective shrinks and the
- *      per-rank memory does not.
- *   2. CONTRIBUTIONS ARE COMBINED IN ASCENDING SOURCE-RANK ORDER. Floating-point
- *      addition is not associative and the neighbour list is in an MPI-chosen
- *      order that differs from rank to rank, so receive order would leave two
- *      holders of one body disagreeing in the last ulp.
- *   3. THE ROUTE IS DECIDED AFTER THE EXCHANGE, NOT BEFORE IT. What a rank can
- *      read in its own pools before the exchange is necessary and NOT
- *      sufficient; what makes the holder route exact is only visible once every
- *      holder has heard from its neighbours. Both verdicts ride on one int, so
- *      the route costs the same single MPI_Allreduce it always did.
+ * Contract and exactness proof: MFTLEnsembleReduceBodies() in mftl_ensemble.h.
+ * Implementation points: the caller's buffer is indexed by LOCAL slot;
+ * contributions are folded in ascending SOURCE-RANK order so every holder gets
+ * bit-identical results; and the route is certified AFTER the record exchange
+ * (the pre-exchange test is necessary, not sufficient), agreed with one int.
  */
 
 #include "mftl_ensemble.h"
@@ -93,33 +74,11 @@ static inline void op_combine(double *acc, const double *in, int n, const MFTL_B
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Before the exchange: what a rank's own pools can rule out
- *
- * Statements 1 and 2 of the derivation on MFTLEnsembleReduceBodies(), read off
- * the GHOST SUFFIX of each pool. Every entity in [0, n_local) is owned here by
- * the ownership-prefix invariant, so it contributes the offset (0,0,0) and
- * nothing else; the halo is what names the other holders. On a body this rank
- * holds whole -- the common case in the regime this route exists for -- there is
- * no ghost suffix and the scan does nothing at all.
- *
- * What it establishes is that a body's holders are CONNECTED on the graph, and
- * that is all. A bent tube whose holders form a chain around a corner passes it
- * on every rank while its two ends are two cells apart and never hear from each
- * other; the certificate after the exchange is what closes that.
- *
- * ── A HOLDER THAT OWNS NOTHING IS DISCONNECTED, SO IT VETOES ───────────────
- *
- * The derivation starts from "a rank holds an entity of a body only if it OWNS
- * one", which is what links every holder to another through an entity they
- * share. A rank holding an EMPTY object shares nothing with anyone, so nothing
- * connects it to the others and the certificate cannot vouch for it.
- *
- * It cannot be detected from outside, so it reports itself: a rank finding one of
- * its own bodies empty votes the whole ensemble onto the global route. That is
- * not a corner case, it is the state a generated ensemble is in before its first
- * redistribution -- MFTLGenerateSphere() builds every body on rank 0 and every
- * other rank holds the shell. After a redistribution no empty object exists at
- * all (inv_local_directory_is_sound), so in the steady state this costs nothing.
+ * Before the exchange: statements 1 and 2, read off each pool's GHOST SUFFIX
+ * (owned entities contribute offset (0,0,0) only). A body held whole costs
+ * nothing. A rank holding an EMPTY object owns nothing that connects it to the
+ * other holders, so it vetoes -- the state of a generated ensemble before its
+ * first redistribution, after which no empty object exists.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /** @brief Running state of the holder-set test for ONE body. */
@@ -170,19 +129,14 @@ static bool probe_owner(holder_probe *p, int owner)
 
   const MFTL_Domain *const dom = p->dom;
 
-  /* Statement 2: a holder this rank can SEE and cannot TALK TO on the graph.
-   * Nothing further to learn -- the neighbourhood route would silently drop that
-   * rank's contribution. */
+  /* Statement 2: a visible holder that is not a graph neighbour. */
   const int nb = MFTLDomainNeighborIndex(dom, owner);
   if (nb == MFTL_ERROR) return MFTL_FALSE;
 
   MFTL_ASSERT(p->n_seen < 27 && "a rank has at most 26 distinct neighbours");
   p->seen[p->n_seen++] = owner;
 
-  /* Two visible holders one cell either side of this one are two cells apart
-   * from each other. The certificate after the exchange would refuse the same
-   * pair, since both are neighbours that hold the body; refusing it here costs
-   * nothing and keeps this predicate's answer meaningful on its own. */
+  /* Two visible holders two cells apart: the certificate would refuse them too. */
   for (int k = 0; k < 3; ++k)
   {
     const int off = dom->neighbor_offset[nb][k];
@@ -205,8 +159,7 @@ bool MFTLEnsembleBodyHoldersFitTheGraph(const MFTL_Ensemble *ens)
   {
     const MFTL_Object *const obj = ens->local_objects[o];
 
-    /* Statement 1: owns nothing here, so nothing connects this rank to the other
-     * holders. See the banner. */
+    /* Statement 1: owns nothing here. */
     if (obj->verts.n_local < 1 && obj->tris.n_local < 1) return MFTL_FALSE;
 
     holder_probe p;
@@ -223,12 +176,9 @@ bool MFTLEnsembleBodyHoldersFitTheGraph(const MFTL_Ensemble *ens)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * The holder route's records, over the 26-neighbour graph
- *
- * The reduction and the exclusive scan below gather the SAME records -- one
- * `(body id, payload)` record per body this rank holds, published one hop along
- * `comm_graph` -- and walk them in the SAME order. Only what they do with each
- * record differs, so the gathering, the ordering and the merge are shared.
+ * The holder route's records: one (body id, payload) record per held body,
+ * published one hop along comm_graph. Reduction and scan share the gathering,
+ * the fold order and the merge.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /** @brief Everything the holder route gathers before it combines anything. */
@@ -243,26 +193,15 @@ typedef struct
 } holder_records;
 
 /**
- * @brief The neighbour block indices in ASCENDING SOURCE-RANK order, self spliced in.
+ * @brief The neighbour block indices in ASCENDING SOURCE-RANK order, with this
+ *        rank spliced in at its own position.
  *
- * ── WHY THE ORDER IS PART OF THE CONTRACT ────────────────────────────────
- *
- * `MFTL_Domain::neighbors` is in whatever order MPI reported it, which differs
- * between ranks, so folding the blocks in receive order would make two holders
- * of one body sum the same values in different orders -- and two holders
- * disagreeing in the last ulp about `quality` is two ranks entering different
- * collectives when a solver branches on it. At most 27 entries, so an insertion
- * sort is the whole algorithm.
- *
- * THIS RANK IS DROPPED FROM THE NEIGHBOUR BLOCKS, and that is not defensive
- * tidiness. domain_init_comm() skips the (0,0,0) OFFSET, not the own RANK: on an
- * axis with a single cut and periodicity every offset along it wraps back onto
- * this cell, so the 26-stencil legitimately resolves to this rank and comm_graph
- * carries a self-loop. An exchange does not care -- MPI delivers the block and
- * the data is right either way -- but a REDUCTION does: the self block would be
- * folded in a second time, and MIN and MAX would hide it while SUM silently
- * doubled. Grids of the shape {2,1,1} and {2,2,1} have the self-loop and {2,2,2}
- * and {3,3,3} do not, which is exactly the set of rank counts that failed.
+ * `MFTL_Domain::neighbors` is in an MPI-chosen order that differs between ranks;
+ * folding in receive order would make two holders sum the same values in
+ * different orders and disagree in the last ulp. This rank's own neighbour block
+ * is DROPPED: on a periodic axis with a single cut the stencil wraps onto this
+ * rank, `comm_graph` has a self-loop, and folding that block would double every
+ * SUM (shapes {2,1,1} and {2,2,1} have it, {2,2,2} and {3,3,3} do not).
  *
  * @param      dom   The MPI/physical world.
  * @param[out] order `[27]` block indices; the value `num_neighbors` stands for
@@ -298,12 +237,12 @@ static int holder_source_order(const MFTL_Domain *dom, int order[27])
 }
 
 /**
- * @brief One `(body id, payload)` allgatherv over `comm_graph`, plus the order to
- *        fold the blocks in.
+ * @brief One `(body id, payload)` neighbourhood allgatherv over `comm_graph`
+ *        (preceded by one count exchange), plus the fold order.
  *
- * Two collectives and not one for the reason the ghost sync takes two: only the
- * holder of a body knows it holds it, so the lengths cannot be predicted from
- * the id space. Release with holder_records_free().
+ * The contribution is copied aside, because it is folded in at this rank's
+ * position in the rank order rather than used as the accumulator's start.
+ * Release with holder_records_free().
  *
  * @param      ens    The ensemble.
  * @param      values `[n_local_objects * n]` this rank's contribution.
@@ -317,10 +256,7 @@ static void holder_records_gather(MFTL_Ensemble *ens, const double *values, int 
   const int b = ens->n_local_objects;
   const int rec = n + 1; /* the body id rides in front of the payload */
 
-  /* The contribution has to survive the caller overwriting `values`, because it
-   * is folded back in at this rank's own position in the rank order rather than
-   * being the accumulator's starting value. That ordering is what makes the
-   * answer bitwise identical on every holder -- see the file banner. */
+  /* Kept aside: folded in at this rank's position in the rank order. */
   h->mine = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(b * n, 1) * sizeof(double), "MFTLEnsembleReduceBodies own contribution");
   if (b > 0) memcpy(h->mine, values, (size_t) b * n * sizeof(double));
 
@@ -357,18 +293,15 @@ static void holder_records_free(holder_records *h)
 }
 
 /**
- * @brief Folds one neighbour's records into @p acc, for the bodies held here.
+ * @brief Folds one neighbour's records into @p acc for the bodies held here, by
+ *        a two-cursor merge (both lists are sorted by body id).
  *
- * A MERGE, not a search per record: the sender's local list is sorted by body id
- * and so is this rank's, so one cursor over each is enough. That is the third
- * thing the directory's sort order buys (mftl_ensemble.h).
- *
- * @param         ens The ensemble.
- * @param         blk The neighbour's block: `(body id, n values)` records.
+ * @param         ens   The ensemble.
+ * @param         blk   The neighbour's block: `(body id, n values)` records.
  * @param         n_rec Records in @p blk.
- * @param         n   Values per body.
- * @param[in,out] acc `[n_local_objects * n]` accumulator, by local slot.
- * @param         ops `[n]` operators, or #MFTL_NULL for a plain sum.
+ * @param         n     Values per body.
+ * @param[in,out] acc   `[n_local_objects * n]` accumulator, by local slot.
+ * @param         ops   `[n]` operators, or #MFTL_NULL for a plain sum.
  */
 static void fold_neighbour_block(const MFTL_Ensemble *ens, const double *blk, int n_rec, int n, double *acc, const MFTL_BodyReduceOp *ops)
 {
@@ -387,28 +320,20 @@ static void fold_neighbour_block(const MFTL_Ensemble *ens, const double *blk, in
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * After the exchange: the certificate
- *
- * Statement 3 of the derivation on MFTLEnsembleReduceBodies(). Every holder of
- * a body publishes a record for it, so once the records are in, a rank knows
- * EVERY holder of every body it holds that is a graph neighbour -- not only the
- * ones its halo happens to name. If those, with this rank, span at most one cell
- * per axis on every holder, a connected holder set is a clique and the fold is
- * exact; the proof is on MFTLEnsembleReduceBodies().
- *
- * The test is on the records alone: no pool is read, so it is equally valid for
- * redistribution's vote, taken after `owner_proc` has been rewritten.
+ * After the exchange: statement 3. Every holder publishes a record, so a rank
+ * now knows every NEIGHBOURING holder of each body it holds, not only those its
+ * halo names. Reads only the records, so it stays valid after redistribution has
+ * rewritten `owner_proc`.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
  * @brief Whether, for every body held here, this rank and the neighbours that
  *        published a record for it span at most one cell per axis.
  *
- * The offsets are `MFTL_Domain::neighbor_offset`, i.e. the first of possibly
- * several aliases on a thin periodic axis. That choice cannot make the test
- * unsound -- any alias of a rank locates its cell -- and it cannot make it
- * spuriously strict either: on an axis with at most two cuts every first alias
- * is -1 or 0, and on one with three or more cuts every alias is unique.
+ * Uses `MFTL_Domain::neighbor_offset` (the first alias on a thin periodic
+ * axis): on an axis with at most two cuts every first alias is -1 or 0, and with
+ * three or more cuts aliases are unique, so the choice is neither unsound nor
+ * spuriously strict.
  *
  * @param ens The ensemble.
  * @param h   The gathered records.
@@ -461,21 +386,15 @@ static bool holders_span_one_cell(const MFTL_Ensemble *ens, const holder_records
 }
 
 /**
- * @brief Agrees, collectively, whether the gathered records may be folded.
- *
- * THE ROUTE IS A COLLECTIVE DECISION even though both tests are local: the
- * fallback runs on `comm_world`, so a rank concluding on its own evidence would
- * be alone in it. The property is a conjunction over ranks, so MPI_LAND of the
- * local answers IS the answer. One int, which is latency and not volume -- the
- * same single collective the route cost when it was decided before the exchange,
- * now taken where it is sound.
+ * @brief Agrees, with one `MPI_LAND` of an int, whether the gathered records may
+ *        be folded. The fallback is a `comm_world` collective, so the route must
+ *        be a collective decision.
  *
  * @param ens    The ensemble.
  * @param h      The gathered records.
  * @param n      Values per body.
  * @param pre_ok This rank's MFTLEnsembleBodyHoldersFitTheGraph() verdict.
- * @return `true` on every rank if the holder route is exact, `false` on every
- *         rank otherwise.
+ * @return The same value on every rank: whether the holder route is exact.
  */
 static bool holder_route_certified(MFTL_Ensemble *ens, const holder_records *h, int n, bool pre_ok)
 {
@@ -490,12 +409,11 @@ static bool holder_route_certified(MFTL_Ensemble *ens, const holder_records *h, 
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief The `MPI_Allreduce` this function exists to stop taking, kept exact.
+ * @brief The exact global route: `MPI_Iallreduce` over body-id-indexed staging,
+ *        `O(bodies in the ensemble)` per rank.
  *
- * Correct for any ensemble, and `O(bodies in the ensemble)` per rank in both
- * payload and staging memory. The slots are grouped by OPERATOR so that each
- * group is one contiguous range and the call count is the number of DISTINCT
- * operators -- at most three, whatever `n` is.
+ * Slots are grouped by operator so each group is one contiguous range: at most
+ * three reductions (one per distinct operator), posted together.
  *
  * @param ens        The ensemble.
  * @param[in,out] values [n_local_objects * n] contribution in, reduction out.
@@ -581,7 +499,8 @@ static int reduce_over_comm_world(MFTL_Ensemble *ens, double *values, int n, con
 }
 
 /**
- * @brief The `MPI_Exscan` + `MPI_Allreduce` this function exists to stop taking.
+ * @brief The exact global route of the scan: `MPI_Iexscan` + `MPI_Iallreduce`
+ *        over body-id-indexed staging, posted together.
  *
  * @param      ens    The ensemble.
  * @param[in,out] values `[n_local_objects * n]` contribution in, prefix out.
@@ -607,18 +526,13 @@ static int exscan_over_comm_world(MFTL_Ensemble *ens, double *values, double *to
     for (int j = 0; j < n; ++j) loc[(size_t) g * n + j] = values[(size_t) o * n + j];
   }
 
-  /* Two collectives rather than one because they are different reductions of the
-   * same input, and they are independent: both are posted before either is
-   * waited on, so the two O(log P) latencies overlap instead of adding. */
+  /* Independent, so both are posted before either is waited on. */
   MPI_Request req[2];
   MPI_Iexscan(loc, pre, (int) block, MPI_DOUBLE, MPI_SUM, ens->domain.comm_world, &req[0]);
   MPI_Iallreduce(loc, tot, (int) block, MPI_DOUBLE, MPI_SUM, ens->domain.comm_world, &req[1]);
   MPI_Waitall(2, req, MPI_STATUSES_IGNORE);
 
-  /* MPI leaves the exclusive-scan receive buffer UNDEFINED on rank 0; the calloc
-   * above is no guarantee after the call. These prefixes become global-id
-   * offsets, so an implementation that writes rank 0's buffer would hand out
-   * overlapping ids. Rank 0's prefix is zero by definition. */
+  /* MPI leaves rank 0's exscan result UNDEFINED; its prefix is zero by definition. */
   if (ens->domain.rank == 0) memset(pre, 0, block * sizeof(double));
 
   g_stats.n_bytes += 2 * (long) block * (long) sizeof(double);
@@ -689,16 +603,8 @@ static int reduce_bodies(MFTL_Ensemble *ens, double *values, int n, const MFTL_B
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * The exclusive prefix sum, on the same records
- *
- * A REDUCTION IS NOT ENOUGH FOR HANDING OUT IDS, and that is the whole reason
- * this exists next to MFTLEnsembleReduceBodies() rather than inside it. Two
- * ranks that both split an edge of the same body each produce a new vertex, and
- * the two need DIFFERENT global ids -- so each holder needs to know how many
- * entities the holders BEFORE it created, which is an exclusive scan and not a
- * combination. `MPI_Exscan` gives it over `comm_world`; over a body's holders it
- * has to be arranged, and arranging it is exactly one more pass over the records
- * the reduction already gathers.
+ * The exclusive prefix sum on the same records: ids need a SCAN (disjoint
+ * ranges per holder), not a combination.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -730,9 +636,8 @@ static int exscan_bodies(MFTL_Ensemble *ens, double *values, double *total, int 
 
   for (int o = 0; o < b * n; ++o) values[o] = 0.0;
 
-  /* One sweep in ascending source rank. Everything folded in BEFORE this rank's
-   * own position is the prefix; everything, including this rank, is the total.
-   * Splitting them costs one extra array and no extra pass. */
+  /* One sweep in ascending source rank: what precedes this rank is the prefix,
+   * everything is the total. */
   bool past_self = MFTL_FALSE;
 
   for (int s = 0; s < h.n_src; ++s)
@@ -741,9 +646,7 @@ static int exscan_bodies(MFTL_Ensemble *ens, double *values, double *total, int 
 
     if (src == d)
     {
-      /* The prefix is frozen here: this rank contributes to the total but not to
-       * its own offset, which is what makes the ranges disjoint rather than
-       * overlapping by this rank's own count. */
+      /* Freeze the prefix before adding this rank's own contribution. */
       if (b > 0) memcpy(values, sum, (size_t) b * n * sizeof(double));
       for (int o = 0; o < b * n; ++o) sum[o] += h.mine[o];
       past_self = MFTL_TRUE;
@@ -770,11 +673,10 @@ static int exscan_bodies(MFTL_Ensemble *ens, double *values, double *total, int 
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief The argument checks both reduction entry points share.
- *
- * Everything that ends the call early is decided identically on every rank --
- * an argument that must be the same everywhere, or the process count -- so an
- * early return leaves no rank alone in a collective.
+ * @brief Argument checks shared by the reduction entry points. Every early exit
+ *        depends only on values identical on every rank, so none leaves a rank
+ *        alone in a collective. With one process the values already are the
+ *        answer and no MPI call is made.
  *
  * @param      ens    The ensemble.
  * @param      values The caller's buffer.
@@ -795,9 +697,7 @@ static bool reduce_is_trivial(const MFTL_Ensemble *ens, const double *values, in
   MFTL_ASSERT((values != MFTL_NULL) || ens->n_local_objects == 0);
   (void) values;
 
-  /* One rank IS the holder set of every body, so both routes are the identity
-   * and the values are already the answer. Taken before anything collective so
-   * that a serial run makes no MPI call at all. */
+  /* One rank is every body's holder set: nothing to do, no MPI call. */
   return ens->domain.nproc < 2;
 }
 
@@ -825,9 +725,7 @@ int MFTLEnsembleExscanBodies(MFTL_Ensemble *ens, double *values, double *total, 
 
   const int b = ens->n_local_objects;
 
-  /* One rank IS the holder set of every body, so the prefix is zero and the
-   * total is this rank's own contribution. Taken before anything collective, so
-   * a serial run makes no MPI call at all. */
+  /* One rank: prefix zero, total = own contribution, no MPI call. */
   if (ens->domain.nproc < 2)
   {
     if (total != MFTL_NULL && b > 0) memcpy(total, values, (size_t) b * n_per_body * sizeof(double));

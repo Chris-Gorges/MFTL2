@@ -4,26 +4,14 @@
  * @date 2026-08-14
  * @ingroup mftl_geometry
  *
- * @brief Periodic-aware geometric queries over the SoA geometry arrays.
+ * @brief Periodic-aware geometry: minimum image, ownership lookup, triangle
+ *        and vertex geometry, closest points, and signed distance on a lattice.
  *
- * Two properties of this module follow from the layout in mftl_types.h rather
- * than from anything geometric:
- *
- *   1. POSITIONS ARE REACHED BY INDEX, NOT THROUGH A RECORD. `MFTLVertexPos(obj,
- *      v)` returns a pointer into `verts.pos`, three contiguous doubles. There is
- *      no `MFTL_Vertex.pos` any more, and therefore no second copy of any
- *      coordinate anywhere in the library.
- *
- *   2. THERE ARE NO Load/Store HELPERS. MFTLLoadTriNormal / MFTLStoreTriNormal
- *      are what a geometry array needs when it is a bolted-on side channel that
- *      call sites are not supposed to know about. It is the primary storage here,
- *      so `obj->tris.normal[3*t+k]` is the normal way to write it and a helper
- *      that copies three doubles onto the stack only gets in the way -- routing
- *      the geometry kernel through a store helper measures 25 % slower.
- *
- * Everything here is inline and, apart from the two Compute* passes, side-effect
- * free. All distance and vector computations honour the domain's periodicity via
- * the minimum image convention.
+ * Everything here is LOCAL (no MPI); the collective wrappers are in
+ * mftl_ensemble.h. Positions are reached by index (MFTLVertexPos()), the
+ * geometry arrays are written directly (`obj->tris.normal[3*t+k]`), and every
+ * difference of two positions is taken under the minimum-image convention of
+ * the object's domain. Theory: src/geometry/README.md.
  */
 
 #ifndef MFTL_GEOMETRY_H
@@ -70,19 +58,18 @@ static inline double *MFTLVertexPosMut(MFTL_Object *obj, int v)
 // -----------------------------------------------------------------------------
 
 /**
- * @brief The shortest vector from @p p1 to @p p2 under the minimum image convention.
+ * @brief The shortest vector from @p p1 to @p p2 under the minimum-image convention.
  *
- * The core of all periodic geometry here.
- *
- * The correction is a multiply, a round (one instruction on both AArch64 and
- * SSE4.1+) and an FMA per axis. That is measurably cheaper in a hot loop than
- * the two compare-multiply-add pairs of the branchless comparison form, and it
- * is correct for ANY displacement rather than only for |d| < 1.5 L, which the
- * comparison form silently required. Ties at exactly \f$\pm L/2\f$ round to even.
+ * On each periodic axis
  *
  * \f[
- *   \Delta_k = (p_2 - p_1)_k - L_k\,\mathrm{round}\!\left(\frac{(p_2-p_1)_k}{L_k}\right)
+ *   \Delta_k = (p_2 - p_1)_k - L_k\,\mathrm{nearbyint}\!\left(\frac{(p_2-p_1)_k}{L_k}\right),
  * \f]
+ *
+ * so \f$|\Delta_k| \le L_k/2\f$ for ANY displacement (the comparison form
+ * `if (d > L/2) d -= L` is only correct for \f$|d| < 3L/2\f$). Ties at
+ * \f$\pm L/2\f$ round to even. One multiply, one round and one fused
+ * multiply-subtract per axis.
  *
  * @param      domain  Supplies the per-axis periodicity, sizes and reciprocals.
  * @param[out] vec_out The shortest displacement from @p p1 to @p p2.
@@ -102,16 +89,16 @@ static inline void MFTLGetMinimumImageVector(const MFTL_Domain *domain, double v
 }
 
 /**
- * @brief Wraps a position back into the periodic domain.
+ * @brief Wraps a position into the periodic domain box by at most one period.
  *
- * Assumes the displacement since the last wrap is smaller than the domain, which
- * holds for any stable simulation. Comparisons rather than fmod(): the branches
- * are perfectly predicted, and the "branchless" alternative measures 1.34-1.37x
- * SLOWER in the per-timestep kernel because it does unconditional work on
- * non-periodic axes too.
+ * Correct when the position is less than one period outside the box, which a
+ * position wrapped at every step always is. The compare-and-shift form beats a
+ * branchless one (measured 1.34-1.37x) because the branches are perfectly
+ * predicted and non-periodic axes do no work.
  *
  * @param domain Supplies the per-axis periodicity and bounds.
- * @param pos    Position, wrapped in place. Non-periodic axes are untouched.
+ * @param pos    Position, wrapped in place into \f$[\min, \max)\f$ on periodic
+ *               axes. Non-periodic axes are untouched.
  */
 static inline void MFTLApplyPeriodicity(const MFTL_Domain *domain, double pos[3])
 {
@@ -130,34 +117,20 @@ static inline void MFTLApplyPeriodicity(const MFTL_Domain *domain, double pos[3]
 /**
  * @brief The rank whose Cartesian cell contains @p pos.
  *
- * A multiply and a table lookup: `grid_factors` and `rank_map` are precomputed
- * at ensemble creation precisely so that this is not a division and not an
- * MPI_Cart_rank call. @p pos must be WRAPPED into the domain; coordinates
- * outside it are clamped to the boundary cell rather than wrapped, so a caller
- * that passes an unwrapped position gets a plausible wrong answer.
+ * Cell \f$i_k = \lfloor (x_k - \min_k)\,\mathrm{cuts}_k / L_k \rfloor\f$, clamped to
+ * \f$[0, \mathrm{cuts}_k)\f$, then a `rank_map` lookup. @p pos must be WRAPPED:
+ * coordinates outside the box are clamped to the boundary cell, a plausible
+ * wrong answer on a periodic axis.
  *
- * This is the inner statement of `compute_owners` (src/communication/
- * redistribute.c), i.e. it runs once per vertex and once per triangle on every
- * timestep the mesh is redistributed. Nothing conditional belongs in it.
- *
- * ── Why there is no cut-plane offset here ─────────────────────────────────
- *
- * The distributed remesher moves the cut planes (src/remeshing/remesh_comm.c),
- * and the tempting way to express that is to subtract a per-axis shift from `pos`
- * right here. That puts a subtract and a periodicity branch per axis into the
- * production ownership loop to serve a routine that runs a few times per hundred
- * timesteps -- measured at 1.70x on this function alone. The shifted rule lives
- * with the remesher as MFTLRemeshOwnerProc() instead, and reaches redistribution
- * through the owner-map override (MFTL_OwnerMap, mftl_communication.h) rather
- * than through this function -- which is also what the DISPERSED strategy needs,
- * and it needs a rule that is not a plane test at all.
+ * This is the inner statement of redistribution's owner classification (once
+ * per vertex and per triangle per redistributed step), so it carries nothing
+ * conditional. The remesher's shifted cut planes deliberately do NOT live here --
+ * adding the shift and its periodicity branch measured 1.70x slower (1.79 ->
+ * 3.05 ns/entity); they reach redistribution through #MFTL_OwnerMap instead.
  *
  * @param domain The MPI/physical world.
- * @param pos    A position, ALREADY WRAPPED into the domain box.
- * @return The rank owning the Cartesian cell containing @p pos.
- *
- * @measured{Adding the shift and its periodicity branch here cost **1.70x** --
- *           1.79 to 3.05 ns/entity, 42 to 89 instructions for the same loop.}
+ * @param pos    A position, already wrapped into the domain box.
+ * @return The rank owning the cell containing @p pos.
  */
 static inline int MFTLGetOwnerProc(const MFTL_Domain *domain, const double pos[3])
 {
@@ -215,26 +188,24 @@ static inline double MFTLGetEdgeLength(const MFTL_Object *obj, int h) { return M
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Area, unit normal and centroid of triangle @p t, in one pass.
+ * @brief Area, unit normal and centroid of triangle @p t.
  *
- * Uses compact `tris.verts` when current and falls back to the half-edge records
- * during construction, before derived connectivity has been built. Any output
- * may be MFTL_NULL. A loop over many triangles should use
- * MFTL_FOREACH_TRIANGLE_GEOMETRY (mftl_object.h), which unswitches periodicity
- * outside the loop.
+ * With minimum-image edges \f$\vect{e}_1 = \vect{p}_1 - \vect{p}_0\f$,
+ * \f$\vect{e}_2 = \vect{p}_2 - \vect{p}_0\f$ and
+ * \f$\vect{n} = \vect{e}_1 \times \vect{e}_2\f$:
+ * \f$A = \tfrac12\norm{\vect{n}}\f$, \f$\hat{\vect{n}} = \vect{n}/\norm{\vect{n}}\f$
+ * (zero for a degenerate triangle), \f$\vect{c} = \vect{p}_0 +
+ * \tfrac13(\vect{e}_1+\vect{e}_2)\f$ wrapped into the box. Reads `tris.verts`
+ * when current, the half-edge records otherwise. Loops over many triangles
+ * should use #MFTL_FOREACH_TRIANGLE_GEOMETRY or MFTLComputeTriangleGeometry().
  *
  * @param      obj        The mesh.
  * @param      t          Triangle index.
- * @param[out] area_out   Receives \f$\tfrac12\norm{\vect{e}_1\times\vect{e}_2}\f$.
- *                        May be #MFTL_NULL.
- * @param[out] normal_out Receives the UNIT normal, or the zero vector for a
- *                        degenerate triangle. May be #MFTL_NULL.
- * @param[out] center_out Receives the centroid WRAPPED back into the domain,
- *                        because that is what a position is expected to be. The
- *                        offset it is built from is seam-consistent, so this is
- *                        the true centroid even for a triangle straddling a
- *                        periodic face. May be #MFTL_NULL.
- *
+ * @param[out] area_out   Area, or #MFTL_NULL.
+ * @param[out] normal_out Unit normal (zero if degenerate), or #MFTL_NULL.
+ * @param[out] center_out Centroid, WRAPPED into the domain; the true centroid
+ *                        even for a triangle straddling a periodic face. Or
+ *                        #MFTL_NULL.
  */
 static inline void MFTLGetTriangleProperties(const MFTL_Object *obj, int t, double *area_out, double normal_out[3], double center_out[3])
 {
@@ -257,49 +228,12 @@ static inline void MFTLGetTriangleProperties(const MFTL_Object *obj, int t, doub
   MFTLGetMinimumImageVector(obj->domain, e1, p0, MFTLVertexPos(obj, v[1]));
   MFTLGetMinimumImageVector(obj->domain, e2, p0, MFTLVertexPos(obj, v[2]));
 
-  /* The cross product is perpendicular to the triangle; its magnitude is twice
-   * the area.
-   *
-   * ── Where the degeneracy guard belongs ──────────────────────────────────
-   *
-   * The guard exists to keep a degenerate triangle from producing a NaN that
-   * poisons a reduction, and the only operation that can produce one is the
-   * RECIPROCAL used to normalise. So the floor goes on the DIVISOR, not on the
-   * magnitude.
-   *
-   * Clamping the squared magnitude before the square root -- which is what this
-   * did -- floors the reported AREA at 0.5*sqrt(1e-12) = 5e-7 instead of letting
-   * it reach zero, and that is not a rounding detail:
-   *
-   *   - `quality.min_triangle_area` can then never report a degenerate triangle;
-   *   - the mean-ratio quality q = 4*sqrt(3)*A / (a^2+b^2+c^2) becomes UNBOUNDED
-   *     ABOVE for small triangles, for a measure whose maximum is 1 at the
-   *     equilateral triangle. An average q of 1.023 was measured on a degenerate
-   *     mesh (docs/analysis.md §4);
-   *   - and the NORMAL of any triangle smaller than that floor came out
-   *     under-normalised rather than unit, because it was divided by the clamp
-   *     instead of by its own length.
-   *
-   * ── Why the guard is a test against zero and not a clamp ────────────────
-   *
-   * `1.0 / MFTL_MAX(mag, tiny)` keeps the instruction count identical to the
-   * broken version (one max, one sqrt, one divide) but only MOVES the floor: any
-   * triangle whose |e1 x e2| falls below `tiny` still gets a short normal. With
-   * `tiny = MFTL_VERYVERYSMALL` that is an area below 5e-16 -- reachable in a
-   * simulation carrying SI units on small-scale geometry, and the failure is the
-   * silent kind again.
-   *
-   * The test against zero has no such cliff: every triangle with a representable
-   * non-zero cross product gets an exactly unit normal, and one whose cross
-   * product is exactly zero gets the zero normal, which is the same detectable
-   * sentinel normalise_vertex_normals() uses -- a unit normal never has zero
-   * length, so a consumer can tell "not computable" from "computed".
-   *
-   * It costs one instruction per triangle: `fcmp`+`fcsel` against `fmax`.
-   * The retired frame-backed ensemble benchmark measured this guard at +1.1%
-   * on the fused geometry+quality pass. That historical result is recorded in
-   * docs/analysis.md §1.7; the exactness argument remains independent of
-   * the triangle input layout. */
+  /* |e1 x e2| is twice the area. The magnitude is UNCLAMPED and the reciprocal
+   * guarded by a test against zero, so every triangle with a representable
+   * non-zero cross product gets an exactly unit normal and the true area (a
+   * clamp would floor the area and shorten small normals; see
+   * MFTLNormalizeVector()). The expression must be identical in every geometry
+   * kernel: test_triangle_geometry_paths_are_bit_identical compares them. */
   double cr[3];
   cr[0] = e1[1] * e2[2] - e1[2] * e2[1];
   cr[1] = e1[2] * e2[0] - e1[0] * e2[2];
@@ -329,23 +263,15 @@ static inline void MFTLGetTriangleProperties(const MFTL_Object *obj, int t, doub
 /**
  * @brief The three corners of triangle @p t, mutually UNWRAPPED.
  *
- * The representation anything geometric about a whole triangle wants: three
- * absolute positions that are consistent with each other even when the triangle
- * straddles a periodic face. Corner 0 is a wrapped position; corners 1 and 2 are
- * corner 0 plus the seam-corrected edge vectors, so they may lie just outside
- * the domain box. That is the point -- a triangle at x = L-eps and x = +eps comes
- * out as a small triangle rather than a domain-spanning sliver.
- *
- * Used by the BVH (primitive geometry and leaf boxes) and by the spatial halo
- * (per-triangle bounds before packing). It is here rather than in either of them
- * because two modules needing the same nine doubles is the definition of a
- * geometry query.
+ * Corner 0 is the stored (wrapped) position; corners 1 and 2 are corner 0 plus
+ * the minimum-image edges, so they may lie just outside the domain box. A
+ * triangle at \f$x = L-\epsilon\f$ and \f$x = +\epsilon\f$ thus comes out small
+ * rather than domain-spanning. The input of the BVH, the spatial halo and the
+ * signed-distance rasteriser.
  *
  * @param      obj The mesh.
  * @param      t   Triangle index. Bounds-asserted in Debug.
- * @param[out] out Row \f$k\f$ is corner \f$k\f$. Corner 0 is wrapped; corners
- *                 1 and 2 may lie just outside the domain box, which is the
- *                 point.
+ * @param[out] out Row k is corner k.
  */
 static inline void MFTLGetTriangleCorners(const MFTL_Object *obj, int t, double out[3][3])
 {
@@ -378,22 +304,15 @@ static inline void MFTLGetTriangleCorners(const MFTL_Object *obj, int t, double 
 }
 
 /**
- * @brief Axis-aligned bounds of triangle @p t, from its unwrapped corners.
+ * @brief Tight axis-aligned bounds of triangle @p t, from its unwrapped corners.
+ *
+ * No tolerance is added; callers inflate by their own. The box of a
+ * seam-straddling triangle correctly extends outside the domain.
  *
  * @param      obj The mesh.
  * @param      t   Triangle index.
  * @param[out] lo  Lower corner of the box.
  * @param[out] hi  Upper corner of the box.
- *
- * @note Tight: no tolerance is added here, because every caller inflates by its
- *       own and adding a second margin invisibly would make the two impossible
- *       to reason about together.
- *
- * @warning Because the corners are mutually unwrapped, the box of a
- *          seam-straddling triangle correctly extends OUTSIDE the domain. That
- *          is what makes it a valid box; it is also why a min/max box is the
- *          wrong primitive for the spatial halo, which must use centre plus
- *          half-width instead.
  */
 static inline void MFTLGetTriangleBounds(const MFTL_Object *obj, int t, double lo[3], double hi[3])
 {
@@ -447,20 +366,17 @@ static inline void MFTLGetTriangleNormal(const MFTL_Object *obj, int t, double o
 static inline void MFTLGetTriangleCenter(const MFTL_Object *obj, int t, double out[3]) { MFTLGetTriangleProperties(obj, t, MFTL_NULL, MFTL_NULL, out); }
 
 /**
- * @brief Does every triangle's cached `tris.center` still match its vertices?
+ * @brief Whether every triangle's cached `tris.center`, ghosts included, still
+ *        matches its vertices.
  *
- * The precondition check behind every migration that routes by centre --
- * MFTLRedistribute() and the remesher's shifted placements. It covers GHOSTS as
- * well as owned triangles, and that is the point: a rank routes its ghosts to
- * work out which of its OWN triangles the ghost's owner is about to need, so a
- * caller that refreshed only the owned centres leaves two ranks disagreeing about
- * a destination, and someone's owned triangle silently loses an edge neighbour.
- *
- * A full geometry pass, so it belongs inside `MFTL_ASSERT` and nowhere else.
+ * The precondition of every migration that routes by centre (MFTLRedistribute(),
+ * the remesher's shifted placements): a rank routes its ghosts too, and a stale
+ * ghost centre makes two ranks disagree about a destination. A full geometry
+ * pass -- use it inside `MFTL_ASSERT` only.
  *
  * @param obj The mesh.
- * @return `true` if every centre is within 1e-9 per axis of the one its three
- *         vertices imply, compared through the periodic seam.
+ * @return `true` if every centre is within an ABSOLUTE 1e-9 per axis (through
+ *         the seam) of the one its vertices imply.
  */
 static inline bool MFTLTriangleCentresAreCurrent(const MFTL_Object *obj)
 {
@@ -482,18 +398,12 @@ static inline bool MFTLTriangleCentresAreCurrent(const MFTL_Object *obj)
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Which part of a triangle a closest point lies on.
+ * @brief Which feature of a triangle a closest point lies on (its Voronoi region).
  *
- * The seven Voronoi regions of a triangle, named in the half-edge convention:
- * corner \f$k\f$ is `tri[k]`, and EDGE \f$k\f$ runs from corner \f$k\f$ to
- * corner \f$(k+1) \bmod 3\f$ -- exactly half-edge `3t+k` of an MFTL triangle.
- * So an edge feature names its half-edge directly and needs no lookup table.
- *
- * The distinction matters to anything that decides a SIGN from the closest
- * point. A face interior has one normal; an edge or a vertex is shared, and the
- * only normal there that gets the inside/outside test right is the
- * angle-weighted pseudo-normal of the whole neighbourhood (Baerentzen &
- * Aanaes, 2005). A caller has to know which case it is in to pick it.
+ * Corner k is `tri[k]`; edge k runs from corner k to corner (k+1) mod 3, i.e. it
+ * is half-edge 3t+k of an MFTL triangle. A sign decided from a closest point on
+ * an edge or a vertex needs the pseudo-normal of that feature (Bærentzen &
+ * Aanæs 2005), not the face normal.
  */
 typedef enum MFTL_TriangleFeature
 {
@@ -507,30 +417,23 @@ typedef enum MFTL_TriangleFeature
 } MFTL_TriangleFeature;
 
 /**
- * @brief Closest point of a closed triangle to a point, and which feature it is on.
+ * @brief Closest point of a (closed, solid) triangle to a point, and its feature.
  *
- * Ericson's region test (Real-Time Collision Detection, section 5.1.5): six dot
- * products decide which of the seven Voronoi regions the query point projects
- * into, and only the region's own formula is evaluated. It is exact in the
- * sense that matters here -- the returned point IS on the triangle and the
- * feature it reports is the one the returned point lies on -- and it has no
- * square root and no division outside the region that needs one.
- *
- * ── Degenerate triangles ───────────────────────────────────────────────────
- *
- * A collinear or collapsed triangle has no face region: the barycentric
- * denominator of the face case is zero. Such a triangle is answered as the
- * closest of its three edges, which is what it geometrically is, rather than
- * with a NaN. A triangle collapsed to a point reports VERTEX0.
+ * Ericson's region test (*Real-Time Collision Detection*, §5.1.5): six dot
+ * products select one of the seven Voronoi regions and only that region's
+ * formula is evaluated; corners are returned bit-exactly. A triangle with
+ * \f$|\vect{ab}\times\vect{ac}|^2 \le 10^{-15}|\vect{ab}|^2|\vect{ac}|^2\f$
+ * (a scale-free \f$\sin^2\f$ test) has no face region and is answered as the
+ * nearest of its three edges.
  *
  * @param      p       Query point.
- * @param      tri     The three corners, unwrapped into one periodic image.
- *                     The caller applies any minimum-image shift.
- * @param[out] closest The closest point on the triangle. May be #MFTL_NULL.
- * @param[out] feature Where @p closest lies. May be #MFTL_NULL.
+ * @param      tri     The three corners, in one periodic image (the caller
+ *                     applies any minimum-image shift).
+ * @param[out] closest The closest point, or #MFTL_NULL.
+ * @param[out] feature Its feature, or #MFTL_NULL.
  * @return The SQUARED distance from @p p to the triangle.
  *
- * @rank_local Pure function; no MFTL state is read.
+ * @rank_local Pure function.
  */
 double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], double closest[3], MFTL_TriangleFeature *feature);
 
@@ -539,127 +442,72 @@ double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], dou
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Writes area, normal and centroid for the first @p count triangles.
+ * @brief Writes `tris.area`, `tris.normal` and `tris.center` for the first
+ *        @p count triangles.
  *
- * Correct on any object, whatever state its derived connectivity is in. With
- * current `tris.verts`, the steady-state kernel streams compact indices, gathers
- * authoritative positions and unswitches periodicity outside the triangle loop.
- * Before that array exists it falls back to implicit half-edge indexing. The two
- * paths are bit-identical and covered by
- * `test_triangle_geometry_paths_are_bit_identical`.
+ * With current `tris.verts` it streams compact indices with periodicity
+ * unswitched outside the loop; before derived connectivity exists it walks the
+ * half-edge records. The two paths are bit-identical
+ * (`test_triangle_geometry_paths_are_bit_identical`).
  *
- * @param obj   The mesh. `tris.area`, `tris.normal` and `tris.center` are
- *              overwritten for the first @p count triangles.
- * @param count Pass `obj->tris.n_local` for owned only, `obj->tris.n` to include
+ * @param obj   The mesh.
+ * @param count `obj->tris.n_local` for owned triangles, `obj->tris.n` to include
  *              ghosts.
  *
- * @warning Redistribution routes ghost triangles by their CACHED CENTRE, so
- *          anything preceding a redistribution must use the full count. If only
- *          the owned centres are refreshed, two ranks disagree about where a
- *          ghost sits and one of them silently ends up with a triangle that is
- *          missing an edge neighbour.
+ * @warning Before a redistribution the count must be `obj->tris.n`: ghosts are
+ *          routed by their cached centre, and a stale ghost centre makes two
+ *          ranks disagree about a destination (an owned triangle then silently
+ *          loses an edge neighbour).
  *
- * @rank_local
- * @note MFTLEnsembleUpdate() is the ensemble-wide counterpart, which
- *       additionally produces and reduces the quality statistics.
+ * @rank_local MFTLEnsembleUpdate() is the collective counterpart that also
+ *             reduces quality statistics.
  */
 void MFTLComputeTriangleGeometry(MFTL_Object *obj, int count);
 
 /**
  * @brief How MFTLComputeVertexNormals() weights the faces around a vertex.
- *
- * Two weightings, because there are two genuinely different questions a vertex
- * normal answers, and each weighting is the right answer to exactly one of them.
  */
 typedef enum MFTL_NormalWeighting
 {
   /**
-   * Weight each incident face by its AREA. The un-normalised cross product IS
-   * twice the area times the unit normal, so this costs nothing beyond the cross
-   * product. It is the gradient of the enclosed volume with respect to the
-   * vertex, which is the normal a volume-conserving front-tracking scheme wants.
-   * The default for everything that moves vertices.
+   * Weight each face by its AREA: \f$\vect{N}_v \propto \sum_{f \ni v}
+   * (\vect{e}_1\times\vect{e}_2)_f = 2\sum_f A_f\hat{\vect{n}}_f\f$, free given
+   * the cross product. Parallel to the gradient of the enclosed volume with
+   * respect to the vertex position, \f$\partial V/\partial\vect{x}_v =
+   * \tfrac13\sum_f A_f\hat{\vect{n}}_f\f$ -- the normal a volume-conserving
+   * front-tracking scheme wants. The default for moving vertices.
    */
   MFTL_NORMAL_WEIGHT_AREA = 0,
 
   /**
-   * Weight each incident face by its INTERIOR ANGLE at the vertex
-   * (Thurmer-Wuthrich). Invariant under re-triangulation of the fan -- split a
-   * face into two and neither the angle sum nor the normal moves -- and it is the
-   * one weighting for which the inside/outside test
-   * `sign((x - v) . n(v))` is PROVABLY correct for a point x whose closest
-   * surface point is the vertex v (Baerentzen & Aanaes, "Signed distance
-   * computation using the angle weighted pseudonormal", 2005). Area weighting
-   * has no such guarantee and does fail it, on exactly the thin, sharply folded
-   * configurations a topology change is detected on. One `atan2` per corner.
+   * Weight each face by its INTERIOR ANGLE at the vertex (Thürmer & Wüthrich
+   * 1998): \f$\vect{N}_v \propto \sum_f \alpha_f(v)\,\hat{\vect{n}}_f\f$.
+   * Invariant under re-triangulation of the fan, and the pseudo-normal for which
+   * \f$\sign((\vect{x}-\vect{v})\cdot\vect{N}_v)\f$ is provably the correct
+   * inside/outside test when \f$\vect{v}\f$ is the closest surface point to
+   * \f$\vect{x}\f$ (Bærentzen & Aanæs 2005). Used for signed distances. One
+   * `atan2` per corner; degenerate faces contribute nothing.
    */
   MFTL_NORMAL_WEIGHT_ANGLE = 1
 } MFTL_NormalWeighting;
 
 /**
- * @brief Vertex normals for the whole mesh, into `verts.normal`.
+ * @brief Unit vertex normals for every vertex of the pool, into `verts.normal`.
  *
- * The per-vertex counterpart of MFTLEnsembleUpdate: one flat pass gathers each
- * triangle's current positions and scatters its weighted face normal into its
- * three vertices, then one streaming pass normalises. Implemented in
- * src/geometry/vertex_geometry.c,
- * where the choice of loop shape is argued and measured.
+ * One flat pass over ALL triangles (ghosts included) scatters each weighted face
+ * normal into its three corners, then one pass normalises; a vertex without
+ * incident triangles gets the zero vector. Requires current `tris.verts`.
  *
- * ── The weighting ──────────────────────────────────────────────────────────
+ * On a distributed mesh an OWNED vertex is exact without communication,
+ * because the redistribution halo is vertex-complete (every triangle incident
+ * to an owned vertex is present locally). A GHOST vertex misses its far-side
+ * faces and holds a normalised PARTIAL sum -- plausible-looking and wrong.
+ * MFTLEnsembleUpdateVertexNormals() adds the exchange that makes ghosts exact.
  *
- * #MFTL_NORMAL_WEIGHT_AREA:
- *
- * n(v) = normalise( SUM over incident faces of e1 x e2 )
- *
- * The un-normalised cross product IS twice the face area times the unit face
- * normal, so summing raw cross products is area weighting with no extra work --
- * no square root, no trigonometry, nothing per face beyond the cross product the
- * loop already needs. It is also the direction of the enclosed-volume gradient
- * at that vertex, which is the normal a volume-conserving front-tracking scheme
- * wants: moving a vertex along it changes the enclosed volume at the maximum
- * rate, and the discrete divergence theorem stays consistent with it.
- *
- * #MFTL_NORMAL_WEIGHT_ANGLE:
- *
- * n(v) = normalise( SUM over incident faces of alpha_f(v) * n_f )
- *
- * with alpha_f(v) the interior angle of face f at v and n_f its unit normal.
- * Less sensitive to a fan of very unequal triangles, independent of how the fan
- * is triangulated, and the pseudo-normal a signed distance needs: the
- * topology-change module rasterises its signed distance field with it. A
- * degenerate face has no unit normal and contributes nothing.
- *
- * Area weighting is the right default for a remeshed surface, where the fan is
- * kept near-equilateral by construction and the two agree closely.
- *
- * ── Preconditions ──────────────────────────────────────────────────────────
- *
- * Needs current `tris.verts`: call MFTLObjectBuildDerived() after a topology
- * change. Vertex motion needs no derived refresh. The triangle loop is
- * unswitched by domain periodicity and computes minimum-image edges in registers.
- *
- * ── What it computes on a distributed mesh ─────────────────────────────────
- *
- * The accumulation runs over ALL triangles, ghosts included, and this is what
- * makes the function need NO COMMUNICATION AT ALL. A vertex's normal is a
- * function of its one-ring, so an owned vertex gets the exact answer as long as
- * every triangle touching it is present locally -- which is exactly what a
- * vertex-complete ghost halo guarantees.
- *
- * GHOST vertices are a different matter: their far-side triangles are not here,
- * so `verts.normal` at index >= n_local holds a PARTIAL sum, correctly
- * normalised but taken over too few faces. It must be overwritten by the ghost
- * exchange, not consumed. Nothing in the library reads it yet.
- *
- * @param obj The mesh. `verts.normal` is overwritten for EVERY vertex, owned
- *            and ghost.
+ * @param obj       The mesh; `verts.normal` is overwritten for every vertex.
  * @param weighting #MFTL_NORMAL_WEIGHT_AREA or #MFTL_NORMAL_WEIGHT_ANGLE.
  *
- * @rank_local Every rank does its own partition.
- *
- * @warning Exact on an owned vertex only when the halo is VERTEX-COMPLETE.
- *          MFTLEnsembleUpdateVertexNormals() adds the one exchange that also
- *          makes the ghosts exact.
+ * @rank_local
  */
 void MFTLComputeVertexNormals(MFTL_Object *obj, MFTL_NormalWeighting weighting);
 
@@ -668,13 +516,13 @@ void MFTLComputeVertexNormals(MFTL_Object *obj, MFTL_NormalWeighting weighting);
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Value of a lattice node that no triangle came within the cutoff of.
+ * @brief Value of a lattice node no triangle came within the cutoff of: sign and
+ *        distance unknown.
  *
- * Neither sign is known there, so it is not a distance at all -- which is why it
- * is the largest double rather than an infinity: MFTLSdfMerge() needs it to lose
- * every comparison, and marching cubes skips any cell that has one as a corner.
- * A cell the surface crosses can never have such a corner, as long as the
- * cutoff exceeds the cell diagonal (see MFTLRasterizeSignedDistance()).
+ * The largest double, so it loses every MFTLSdfMerge() comparison; marching
+ * cubes skips any cell with such a corner. No cell crossed by the surface can
+ * have one when the cutoff exceeds the cell diagonal
+ * (MFTLRasterizeSignedDistance()).
  */
 #define MFTL_SDF_UNKNOWN MFTL_DBL_MAX
 
@@ -683,29 +531,19 @@ void MFTLComputeVertexNormals(MFTL_Object *obj, MFTL_NormalWeighting weighting);
  * @brief A dense WINDOW onto a (possibly periodic) Cartesian lattice of signed
  *        distances.
  *
- * ## THE LATTICE AND THE WINDOW ARE DIFFERENT THINGS
+ * The LATTICE is global: node g on axis k sits at `origin[k] + g*spacing[k]`,
+ * and on a periodic axis g and g + `n_global[k]` are the same node. Integer node
+ * coordinates are therefore an identity every rank computes identically, which
+ * lets a distributed marching cubes name a surface vertex by its lattice EDGE
+ * with no negotiation.
  *
- * The LATTICE is global: node `g` on axis `k` sits at `origin[k] + g *
- * spacing[k]`, and on a periodic axis `g` and `g + n_global[k]` are the same
- * node. A node's integer coordinates are therefore an identity that every rank
- * computes the same way from the same numbers -- which is what lets a
- * distributed marching cubes name a surface vertex by the lattice EDGE it lies
- * on, with no negotiation and no stitching.
+ * The WINDOW is what one caller stores: `dims[k]` consecutive nodes from global
+ * index `lo[k]` (which may be negative or past the end on a periodic axis;
+ * indices are taken modulo `n_global`, and `dims <= n_global`).
+ * MFTLSdfGridInit() makes the window the whole lattice, non-periodic.
  *
- * The WINDOW is what one caller stores: `dims[k]` consecutive nodes starting at
- * global index `lo[k]`. On a periodic axis the window may start anywhere
- * (`lo` may be negative, or past the end) and indices are taken modulo
- * `n_global`, so a window can straddle the seam; it may not exceed one period
- * (`dims <= n_global`). On a non-periodic axis there is nothing to wrap.
- *
- * A serial caller that just wants a box of nodes uses MFTLSdfGridInit(), which
- * makes the window the whole lattice and switches periodicity off.
- *
- * ## THE VALUES
- *
- * `phi` is negative INSIDE -- on the side opposite to the triangles' outward
- * normals -- positive outside, and #MFTL_SDF_UNKNOWN where nothing has been
- * rasterised. x varies fastest.
+ * `phi` is negative INSIDE (opposite the outward normals), positive outside,
+ * #MFTL_SDF_UNKNOWN where nothing was rasterised; x varies fastest.
  */
 typedef struct MFTL_SdfGrid
 {
@@ -786,17 +624,13 @@ static inline int MFTLSdfGridLocal(const MFTL_SdfGrid *grid, int k, int g)
 static inline double MFTLSdfGridCoord(const MFTL_SdfGrid *grid, int k, int g) { return grid->origin[k] + (double) g * grid->spacing[k]; }
 
 /**
- * @brief The rule two contributions to one node are combined by: the smaller
- *        magnitude wins, and a tie goes to the NEGATIVE one.
+ * @brief Combines two contributions to one node: the smaller magnitude wins, a
+ *        tie goes to the NEGATIVE value.
  *
- * Commutative and associative, so the result does not depend on the order in
- * which triangles -- or, in a distributed rasterisation, ranks -- contribute.
- * That is what makes the merged field bit-identical at every process count. The
- * tie rule is arbitrary but must be SOME total order: "keep the first" would
- * make a node exactly equidistant from a sheet's two faces take whichever sign
- * arrived first.
- *
- * #MFTL_SDF_UNKNOWN loses every comparison, so it is also the identity.
+ * A total order, hence commutative and associative: the merged field does not
+ * depend on the order in which triangles -- or ranks -- contribute, which makes
+ * a distributed rasterisation bit-identical to a serial one. #MFTL_SDF_UNKNOWN
+ * is the identity.
  *
  * @param current   The node's value so far.
  * @param candidate A new contribution.
@@ -811,58 +645,41 @@ static inline double MFTLSdfMerge(double current, double candidate)
 }
 
 /**
- * @brief Rasterises the signed distance to the first @p n_tris triangles onto
- *        every window node within @p cutoff of one of them.
+ * @brief Rasterises the signed distance to triangles `[0, n_tris)` onto every
+ *        window node within @p cutoff of one of them.
  *
- * ## THE SIGN: ANGLE-WEIGHTED PSEUDO-NORMALS
+ * For each triangle T and each node \f$\vect{x}\f$ in T's box dilated by the
+ * cutoff, the closest point \f$\vect{q}\f$ and its feature are found with
+ * MFTLClosestPointOnTriangle(); the value is
+ * \f$\pm\norm{\vect{x}-\vect{q}}\f$ with the sign of
+ * \f$(\vect{x}-\vect{q})\cdot\vect{n}\f$, \f$\vect{n}\f$ the pseudo-normal of
+ * the feature: the face normal; for an edge the sum of the two incident unit
+ * face normals (T's alone at a mesh rim); for a vertex `verts.normal`, which
+ * must hold ANGLE-weighted normals. Values are merged with MFTLSdfMerge(). For a
+ * closed, consistently oriented, non-self-intersecting surface this yields the
+ * exact signed distance (Bærentzen & Aanæs 2005); area-weighted vertex normals
+ * can give the wrong sign near thin, sharply folded sheets.
  *
- * For each node x near a triangle T the closest point q on T is found with
- * MFTLClosestPointOnTriangle(), and the sign is that of `(x - q) . n` where n is
- * the pseudo-normal of the FEATURE q lies on:
+ * **Cutoff.** Nodes farther than @p cutoff from every triangle stay
+ * #MFTL_SDF_UNKNOWN. Every corner of a lattice cell crossed by the surface lies
+ * within one cell diagonal of it, so a cutoff above the diagonal
+ * (\f$\sqrt3\,\Delta x\f$ on a cubic lattice) provides every value marching
+ * cubes needs, with no flood fill and no global pass.
  *
- *   face interior   the unit face normal
- *   edge interior   the sum of the two incident unit face normals (the twin's
- *                   triangle across half-edge 3t+k; just T's at a mesh rim)
- *   vertex          `verts.normal` -- which the caller must have filled with
- *                   #MFTL_NORMAL_WEIGHT_ANGLE
+ * **Periodicity.** Triangles are unwrapped around corner 0 and reach nodes by
+ * UNWRAPPED global index, so each distance is measured in the triangle's own
+ * image and the window's modular indexing stores it where it belongs.
  *
- * With angle weighting at the vertices this is provably the correct
- * inside/outside test for a closed, consistently oriented, non-self-intersecting
- * surface (Baerentzen & Aanaes, 2005). Area weighting is not, and fails on
- * exactly the configurations a topology change is detected on: two sheets a
- * fraction of an edge apart, one of them sharply curved.
- *
- * Each node keeps the contribution of smallest magnitude, combined with
- * MFTLSdfMerge(); ties between triangles sharing the closest feature carry the
- * same pseudo-normal and therefore the same sign.
- *
- * ## THE CUTOFF, AND WHY ONLY ONE BOUND ON IT MATTERS
- *
- * A node with no triangle within @p cutoff keeps #MFTL_SDF_UNKNOWN. Marching
- * cubes needs the sign only at the corners of cells the surface crosses, and
- * every corner of such a cell lies within one cell DIAGONAL of the surface. So a
- * cutoff above the cell diagonal (sqrt(3) * spacing on a cubic lattice) is
- * enough, and nodes left unknown are exactly nodes no surface cell needs -- no
- * sign propagation, no flood fill, no global pass.
- *
- * ## PERIODICITY
- *
- * Triangles are taken with MFTLGetTriangleCorners(), i.e. unwrapped around
- * corner 0, and the nodes they reach are addressed by UNWRAPPED global index,
- * so the distance is always measured in the triangle's own periodic image and
- * the window's modular indexing puts the result where it belongs.
- *
- * @param grid    The grid; values are merged into, not overwritten, so several
- *                objects (or several ranks' shares) may be rasterised into one.
- * @param obj     The mesh. Needs current `tris.verts`, and `verts.normal` holding
- *                ANGLE-weighted normals for every corner of the triangles used --
- *                ghosts included (MFTLEnsembleUpdateVertexNormals() with
+ * @param grid    The grid; values are MERGED, so several objects or ranks may
+ *                rasterise into one.
+ * @param obj     The mesh: current `tris.verts`, and angle-weighted
+ *                `verts.normal` for every corner of the triangles used, ghosts
+ *                included (MFTLEnsembleUpdateVertexNormals() with
  *                #MFTL_NORMAL_WEIGHT_ANGLE on a distributed mesh).
- * @param n_tris  Rasterise triangles `[0, n_tris)`: `tris.n_local` for owned
- *                only, which is what a distributed rasterisation must pass so
- *                that no triangle is counted by two ranks.
- * @param cutoff  Distance within which nodes are written. > 0.
- * @return The number of node updates that changed a value, for diagnostics.
+ * @param n_tris  Rasterise `[0, n_tris)`; `tris.n_local` in a distributed
+ *                rasterisation, so no triangle is counted by two ranks.
+ * @param cutoff  Distance within which nodes are written; > 0.
+ * @return The number of node updates that changed a value.
  * @rank_local No MPI.
  */
 long MFTLRasterizeSignedDistance(MFTL_SdfGrid *grid, const MFTL_Object *obj, int n_tris, double cutoff);

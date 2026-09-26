@@ -4,93 +4,63 @@
 **Public header:** `include/mftl_arrayfunctions.h` · **Layer:** 0 ·
 **Module group:** @ref mftl_arrayfunctions
 
-The only algorithm in MFTL with no mesh in it. One translation unit,
-`radixsort.c`, providing a **stable LSD radix sort** for keys and for key/value
-pairs, plus two duplicate-removal helpers that live inline in the header.
+A stable least-significant-digit (LSD) radix sort for 32-bit signed and 64-bit
+unsigned keys, with key-only and key/value (structure-of-arrays) variants, plus
+inline helpers for duplicate removal and binary search. `radixsort.c` derives
+from Cameron Hart's zlib-licensed radix sort (notice preserved in the file).
 
-Derived from Cameron Hart's public-domain-style radix sort, specialised for MFTL:
-unified 32/64-bit key width, SoA key/value variants, signed 32-bit ordering,
-constant-digit pass skipping, and a small-array cutoff.
-
----
-
-## Who uses it, and why it has to be stable
-
-| Caller | Key | Why sorted |
+| Caller | Key | Purpose |
 |---|---|---|
-| `MFTLObjectReorderMorton` | 63-bit Morton code | walk the Z-curve |
-| `MFTL_GenerateLBVH` | 63-bit Morton code | the radix split *is* the sorted order |
+| `MFTLObjectReorderMorton` | 63-bit Morton code; min vertex index | space-filling-curve renumbering of the pools |
+| `MFTL_GenerateLBVH` | 63-bit Morton code | the sorted order *is* the LBVH leaf order |
 | `src/communication/redistribute.c` | vertex index | de-duplicate a destination's vertex list |
-| `src/remeshing/` | global id | resolve arriving ids to slots |
+| `src/topology_change/` | body id | canonical body sets of a cluster |
 
-**Stability is a correctness requirement, not a nicety.** Two primitives with
-equal Morton codes must come out in a deterministic order, or two ranks that
-compute the same partition produce different trees — and the distributed contact
-test compares gathered *sets* across process counts. It is also what makes
-`MFTLUniquePairs` keep the *first* value of each run, which is the value whose
-entry came first in the caller's array: a rank-independent choice.
+**Stability is a correctness requirement.** Primitives with equal Morton codes
+must come out in a deterministic order, or two runs build different trees; and
+`MFTLUniquePairs` keeps the *first* value of each run of equal keys, which after
+a stable sort is a rank-independent choice.
 
 ---
 
-## The algorithm
+## Algorithm {#arr_algorithm}
 
-An LSD radix sort makes $\lceil b/r \rceil$ stable counting-sort passes over $n$
-keys of $b$ bits, $r$ bits at a time:
-
-$$
-  T(n) = O\!\left(\frac{b}{r}\,(n + 2^{r})\right)
-$$
-
-With $r = 8$ one pass needs a $2^8$-entry histogram, i.e. 1 KiB. All passes
-together are 4 KiB (32-bit keys) or 8 KiB (64-bit) — both comfortably inside L1D,
-which is what makes the implementation's central trick worth doing.
-
-### One counting pass for every digit
-
-`init_histograms32` / `init_histograms64` stream the keys **once** and update all
-$b/r$ histograms per key. The alternative — one counting pass per digit — reads
-the key array $b/r$ times for counting alone. Since every histogram update hits
-L1, the fused form costs the same instructions and $b/r$ times less traffic.
-
-```
-   for each key k:                 for pass p:            <-- NOT this
-       hist[0][byte0(k)]++             for each key k:
-       hist[1][byte1(k)]++                 hist[p][byte_p(k)]++
-       ...
-```
-
-### Constant digits are skipped
-
-`prefix_sum_histograms` converts each histogram from counts to exclusive prefix
-sums, and while doing so checks whether the bucket belonging to `first_key`'s
-digit already holds all $n$ elements. If it does, every key has the same digit
-there and the pass is the identity — so it is skipped.
-
-This is not a corner case in this library. **Global IDs are dense in $[0, n)$**
-(see @ref mftl_page_invariants), so for a mesh of under 65 536 entities the top
-two bytes of a 32-bit id are always zero and half the passes vanish.
-
-### Signed 32-bit ordering is free
-
-The most significant pass processes the sign byte. Running its prefix sum
-starting at bucket 128 and wrapping to bucket 0 places the negative keys first:
+An LSD radix sort performs $\lceil b/r \rceil$ stable counting-sort passes over
+$n$ keys of $b$ bits, $r$ bits (one *digit*) at a time:
 
 $$
-  \text{offset}[128] = 0,\quad \text{offset}[129] = c_{128},\ \ldots,\ 
-  \text{offset}[0] = \sum_{j=128}^{255} c_j,\ \ldots
+  T(n) = O\!\left(\frac{b}{r}\,(n + 2^{r})\right), \qquad r = 8 .
 $$
 
-No key is ever modified, so no un-flipping pass is needed at the end and the
-sort works on the caller's array in its own representation.
+Each pass computes, per digit value $j$, the exclusive prefix sum
+$o_j = \sum_{i<j} c_i$ of the digit histogram $c$ and scatters every key to
+position $o_{d(k)}$, incrementing that offset. Scanning the input in order makes
+each pass stable, so after the pass on digit $p$ the keys are sorted by digits
+$0\ldots p$.
 
-### Below 32 elements, insertion sort wins
+Three refinements, none of which changes the result:
 
-The fixed costs of a radix sort — clearing the histograms, the 256-entry prefix
-sums per pass, and (in the wrapper functions) a `malloc`/`free` pair — are all
-independent of $n$. Below some size they outweigh the $O(n^2/4)$ moves of an
-array that never leaves L1.
+1. **One counting pass for all digits.** `init_histograms32/64` read every key
+   once and update all $b/r$ histograms (4 KiB / 8 KiB, resident in L1). The
+   same pass tests whether the input is already sorted, in which case no
+   scatter runs.
+2. **Constant digits are skipped.** If the bucket of the first key's digit holds
+   all $n$ keys, the digit is constant and the pass is the identity. Global ids
+   are dense in $[0, n)$, so for fewer than 65 536 entities the two top bytes of
+   a 32-bit id are constant and half the passes vanish. An odd number of
+   executed passes ends in the scratch buffer and is copied back.
+3. **Signed order for free.** For the most significant digit of an `int` key the
+   prefix sum starts at bucket 128 and wraps:
+   $o_{128} = 0,\ o_{129} = c_{128},\ \ldots,\ o_0 = \sum_{j=128}^{255} c_j$.
+   Negative keys (top byte $\ge$ 0x80 in two's complement) therefore precede
+   non-negative ones without any key being modified.
 
-Measured (ns/call, Apple M-series, `-O3`, `MFTLSortIds` / `MFTLSortPairs64`):
+### Small inputs {#arr_cutoff}
+
+At $n \le 32$ a stable insertion sort replaces the radix passes: the
+$n$-independent costs (histogram clearing, 256-entry prefix sums per pass,
+scratch allocation) exceed the $O(n^2/4)$ moves of an L1-resident insertion
+sort. Measured (ns/call, Apple M-series, `-O3`):
 
 | n | radix, random | insertion, random | radix, descending | insertion, descending |
 |---|---|---|---|---|
@@ -99,54 +69,22 @@ Measured (ns/call, Apple M-series, `-O3`, `MFTLSortIds` / `MFTLSortPairs64`):
 | 48 | **859** | 866 | **369** | 639 |
 | 64 | **973** | 1310 | **415** | 1299 |
 
-`#define INSERTION_CUTOFF 32` is where insertion sort still wins on **both**
-input patterns. A larger cutoff looks better on random data (64-bit keys, 8
-passes, still 1.6× at $n = 64$) and turns into a 1.4–3× loss on descending input,
-where insertion sort hits its $O(n^2)$ worst case *and* the radix path gets
-faster because a narrow key range skips passes. One conservative cutoff for both
-key widths keeps that trap closed.
-
-The redistribution sorts one small buffer per neighbour rank, so this is not a
-corner case there either — it is the common case.
+32 is the largest size at which insertion sort wins on both random and
+descending (its worst case) input. Redistribution sorts one small buffer per
+neighbour rank, so the small path is the common one there.
 
 ---
 
-## Files
+## Interface notes {#arr_interface}
 
-| File | Contents |
-|---|---|
-| `radixsort.c` | insertion-sort fallbacks, histogram construction, prefix sums, the four scatter passes, and the five public entry points |
-
-The two duplicate-removal helpers (`MFTLUniqueIntArray`, `MFTLUniquePairs`) and
-the small-set collector `MFTLGetUniqueIntegers` are `static inline` in the header
-— they are three-line loops that callers want inlined into their own.
-
----
-
-## Type dispatch
-
-C11 `_Generic` picks the 32- or 64-bit variant at compile time:
-
-```c
-MFTLRadixSort(keys, temp, n);   /* int* -> ...32,  uint64_t* -> ...64 */
-MFTLSortPairs(keys, vals, n);
-```
-
-Under C99 the macros expand to the 32-bit variants unconditionally, so passing
-64-bit keys is a **compile error** rather than a silent mis-sort. Code that needs
-64-bit sorting under C99 calls `MFTLRadixSort64` / `MFTLSortPairs64` directly.
-
----
-
-## Two assumptions, checked at compile time
-
-```c
-_Static_assert(sizeof(int) == sizeof(uint32_t), "...");
-_Static_assert((-1 & 3) == 3,                   "...");  /* two's complement */
-```
-
-The 32-bit paths reinterpret `int` as `uint32_t` for digit extraction, and the
-pair sorts move `int` values through a `uint32_t` shuffle. Accessing an `int`
-object through an `unsigned int` lvalue is explicitly allowed by C11 6.5p7, so
-this is not a strict-aliasing violation — but the *width* and the *representation*
-are worth checking here rather than discovering on an exotic target.
+- `MFTLRadixSort(keys, temp, n)` and `MFTLSortPairs(keys, vals, n)` dispatch on
+  the key type with C11 `_Generic`; under C99 they fall back to the 32-bit
+  variants so that 64-bit keys fail to compile instead of mis-sorting.
+- The key type is the ordering contract: `int` sorts signed, `uint64_t` sorts
+  unsigned.
+- `MFTLUniqueIntArray` / `MFTLUniquePairs` compact sorted input in one scan;
+  `MFTLSortedIndexOf` is the binary search behind every sparse id-keyed
+  directory in the library (no hash maps); `MFTLGetUniqueIntegers` is an
+  $O(n\,u)$ first-seen-order collector for tiny sets such as destination ranks.
+- Two compile-time checks guard the 32-bit path, which reinterprets `int` as
+  `uint32_t` (permitted by C11 §6.5p7): `int` is 32 bits and two's complement.

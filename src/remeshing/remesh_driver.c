@@ -4,43 +4,29 @@
  * @date 2026-08-15
  * @ingroup mftl_remeshing
  *
- * @brief The remeshing pass: sweep order, convergence, and what is refreshed when.
+ * @brief The remeshing pass: sweep order, convergence, and what is refreshed
+ *        when.
  *
- * ## THE ORDER OF THE SWEEPS IS NOT ARBITRARY
+ * ## The order of the sweeps
  *
- *   DETECT   -> SPLIT -> COLLAPSE -> COMPACT -> FLIP -> SMOOTH
+ *   DETECT -> SPLIT -> COLLAPSE -> COMPACT -> FLIP -> DETECT -> SMOOTH
  *
- * SPLIT before COLLAPSE, because splitting is the operation that cannot fail:
- * it needs no link condition and no fold test, so doing it first gives the
- * collapse sweep a mesh where the short edges are genuinely short rather than
- * merely short relative to their over-long neighbours.
+ * - SPLIT before COLLAPSE: splitting cannot fail (no link condition, no fold
+ *   test), so the collapse sweep then sees edges that are genuinely short rather
+ *   than short relative to over-long neighbours.
+ * - COMPACT right after COLLAPSE: flip and smoothing never see a dead entity, so
+ *   the smoother can use MFTLComputeVertexNormals() over the whole pool without
+ *   accumulating dead triangles into live normals.
+ * - FLIP before SMOOTH: the valence criterion reads the connectivity the
+ *   previous sweeps produced; smoothing does not change it.
+ * - DETECT twice per iteration: splits and collapses change which edges exist,
+ *   and a vertex the smoother wrongly believes free (e.g. the midpoint of a
+ *   split rim edge) slides off its curve.
  *
- * COMPACT between COLLAPSE and FLIP, which is the change from the previous
- * version. It compacted once at the very end of the whole call, so the flip and
- * smoothing sweeps ran over a pool containing dead entities and had to defend
- * against them individually. Here they never see one, and the payoff is not
- * tidiness: the smoother can call MFTLComputeVertexNormals() over the whole
- * compact pool and would otherwise
- * accumulate dead triangles into live vertices' normals.
- *
- * FLIP before SMOOTH, because the valence criterion is combinatorial: it reads
- * the connectivity the previous two sweeps produced, and smoothing does not
- * change connectivity. Running it after would just delay its effect by an
- * iteration.
- *
- * DETECT at the top of every iteration rather than once per call, because splits
- * and collapses change which edges exist. Detecting once per call means that from
- * the first split onwards the smoother classifies vertices against a feature set
- * describing a mesh that no longer exists.
- *
- * ## WHY EVERY SWEEP TAKES A FRESH SNAPSHOT OF THE HALF-EDGE COUNT
- *
- * MFTLSplitEdge appends triangles, so 3 * tris.n grows DURING the split sweep.
- * The bound is captured once, before the loop, on purpose: the half-edges the
- * sweep creates are the two halves of an edge it has just decided was too long,
- * and re-examining them in the same sweep is how a remesher turns one long edge
- * into a burst of tiny ones. They are examined on the next iteration, where they
- * are measured against a mesh that has been smoothed in between.
+ * Each sweep bounds its loop by the half-edge count taken BEFORE it: the halves
+ * of a split edge are not re-examined in the same sweep (a long edge would
+ * otherwise burst into many tiny ones), but in the next iteration, after
+ * smoothing.
  */
 
 #include "mftl_remeshing.h"
@@ -63,26 +49,15 @@
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * THE PARALLEL GATE IS CHEAP AND IS TESTED FIRST; THE CONVERGENCE CERTIFICATE IS
- * MEASURED SOMEWHERE ELSE ENTIRELY, AND THAT SEPARATION IS DELIBERATE.
- *
- * The obvious design is to count here: run the approval, and if the gate then
- * refuses, record "the band hid a real operation". It does not work, and the way
- * it fails is instructive. A rank examines every half-edge in its pool, GHOSTS
- * INCLUDED, and an approval predicate walks fans -- but a fan is only guaranteed
- * complete around an OWNED vertex (inv_halo_is_vertex_complete). Deep inside a
- * neighbour's territory this rank sees a partial one-ring, approves a collapse
- * the owner correctly rejects on the link condition, and reports blocked work
- * that does not exist. Measured: 3 phantom blocked operations that never clear,
- * on a np = 4 sphere whose mesh was in fact fully converged.
- *
- * So the gate here is only a gate, and it goes FIRST because it is two flag
- * tests against an approval's fan walk. What the driver actually measures is
- * `count_hidden_edges` in remesh_parallel.c: out-of-band edges that no rank
- * could act on under this placement of the cut planes. That question needs no
- * fan and no approval, so a partial view cannot invent an answer to it.
- *
  * @brief Splits every approved edge, once per undirected edge.
+ *
+ * The parallel freeze gate is tested first (two flag tests, against an
+ * approval's fan walk). Refusals are NOT counted as blocked work: a rank sees
+ * ghosts with incomplete one-rings, approves a collapse the owner would reject,
+ * and would report phantom blocked operations (3 on a converged np = 4 sphere).
+ * Convergence is instead certified by `count_hidden_edges` in remesh_parallel.c,
+ * which needs no fan walk.
+ *
  * @param obj    The mesh.
  * @param params Supplies `max_edge_length_sq`.
  * @return Splits performed.

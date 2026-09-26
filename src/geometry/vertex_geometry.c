@@ -4,64 +4,17 @@
  * @date 2026-08-14
  * @ingroup mftl_geometry
  *
- * @brief Per-vertex geometry: the area- and angle-weighted vertex normal passes.
+ * @brief Area- and angle-weighted vertex normals.
  *
- * ## SCATTER OVER TRIANGLES, NOT GATHER OVER VERTICES
- *
- * A vertex normal is a sum over the vertex's incident faces, so there are two
- * ways to compute it and they are not close:
- *
- *   GATHER   for each vertex, walk its one-ring and accumulate in registers.
- *            One sequential write stream, no zeroing pass, no read-modify-write
- *            -- but the inner loop has a data-dependent trip count and every
- *            step of the fan is a dependent load (he -> twin -> next).
- *
- *   SCATTER  for each triangle, gather three current positions through the
- *            contiguous `tris.verts` stream and add its face normal into its
- *            three vertices. The loop is flat and has no pointer chasing, but
- *            pays a read-modify-write into three indexed vertex slots, plus a
- *            zeroing pass before and a normalisation pass after.
- *
- * The historical frame-backed comparison was measured on the same mesh in the
- * same binary and checked to agree to rounding (the retired benchmark and its
- * results are documented in docs/analysis.md §1.5):
- *
- *     scatter over triangles       5.2 - 5.5 ns per vertex, flat in mesh size
- *     gather by fan walk          17.8 - 21.6 ns per vertex, i.e. 3.4x slower
- *
- * and the fan walk is measured WITH its fast path, skipping the rewind on every
- * vertex not flagged MFTL_FLAG_BOUNDARY -- without that it is 8x slower, because
- * MFTLVertexFanStart walks a whole extra lap to discover that a closed fan is
- * closed. What is left after that is the dependent loads: each hop is
- * he -> twin -> next and cannot issue its address until the previous hop has
- * returned, so a valence-6 fan serialises six round trips that the scatter never
- * makes.
- *
- * ### The CSR question, settled
- *
- * src/object/derived.c records the vertex->triangle CSR (`vert_offsets` /
- * `vert_tris`) as deleted for want of a consumer, and asks for it to be
- * reconsidered when one appears. This is that consumer, so it was
- * measured rather than assumed: a CSR gather removes the fan walk's dependent
- * loads entirely and lands at 5.2 - 5.7 ns per vertex -- a dead heat with the
- * scatter, not a win.
- *
- * It loses on everything else. It needs 16 bytes per triangle of permanent
- * state, and a rebuild costing another 5.5 - 5.8 ns per vertex -- as much as the
- * whole normal pass -- on every topology change. On a remeshed surface that is
- * paid every step. THE CSR STAYS DELETED, and now for a measured reason rather
- * than an absent consumer.
- *
- * ## WHY THE SCATTER TARGET STAYS INTERLEAVED
- *
- * `verts.normal` is xyz-interleaved, and for THIS loop that is measurably the
- * right layout rather than an inherited one. The read-modify-write of three
- * contiguous doubles compiles to a 128-bit load, a 2-wide vector add and a
- * 128-bit store for x,y plus one scalar triple for z -- four memory operations
- * per vertex. Against three separate component arrays it would be six, because
- * three separate load-add-stores cannot pair. examples/layout_benchmark.c
- * measures that at 1.20-1.25x in favour of interleaved, consistently and at
- * every size.
+ * A SCATTER over triangles: each triangle gathers its three current positions
+ * through `tris.verts` and adds its weighted face normal into its three
+ * vertices; one streaming pass then normalises. The alternative GATHER (walk
+ * each vertex's fan) serialises dependent loads (he -> twin -> next) and
+ * measured 3.4x slower; a vertex-to-triangle CSR gather measured a dead heat
+ * with the scatter while costing 16 B/triangle and a rebuild per topology
+ * change (docs/analysis.md §1.5). `verts.normal` stays xyz-interleaved: the
+ * read-modify-write of three contiguous doubles is four memory operations per
+ * vertex against six for split arrays (1.20-1.25x in examples/layout_benchmark.c).
  */
 
 #include "mftl_geometry.h"
@@ -74,18 +27,10 @@
 #include "mftl_types.h"
 
 /**
- * @brief Scatters every face's area-weighted normal into its three vertices.
+ * @brief Scatters every face's unnormalised normal \f$\vect{e}_1\times\vect{e}_2
+ *        = 2A\hat{\vect{n}}\f$ into its three vertices (area weighting).
  *
- * The inner k-loop is written out rather than left as a loop so that the three
- * read-modify-write chains are visibly independent: they touch three different
- * vertices, and the compiler may not assume that in a loop it has to prove
- * something about.
- *
- * The position and normal arrays share the vertex allocation but occupy
- * disjoint aligned sub-arrays; the topology indices live in the triangle pool.
- *
- * @param obj The mesh. `verts.normal` is accumulated into, having been zeroed
- *            by the caller.
+ * @param obj The mesh. `verts.normal` is accumulated into; the caller zeroes it.
  */
 static void scatter_face_normals(MFTL_Object *obj)
 {
@@ -94,9 +39,7 @@ static void scatter_face_normals(MFTL_Object *obj)
 
   MFTL_FOREACH_TRIANGLE_GEOMETRY(
       obj, n_tris,
-    /* e1 x e2 is twice the area times the unit normal, so accumulating it raw
-     * IS the area weighting. No sqrt here; the only one in the whole pass is the
-     * single normalisation per vertex below. */
+    /* e1 x e2 = 2 A n_hat: accumulating it raw IS area weighting. */
     const double nx = e1y * e2z - e1z * e2y;
     const double ny = e1z * e2x - e1x * e2z;
     const double nz = e1x * e2y - e1y * e2x;
@@ -115,26 +58,19 @@ static void scatter_face_normals(MFTL_Object *obj)
 }
 
 /**
- * @brief The angle-weighted scatter: each face's UNIT normal times its interior
- *        angle at each corner.
+ * @brief Scatters each face's UNIT normal times its interior angle at each corner.
  *
- * The three corner angles come from one cross product and three dot products:
- * every corner sees the same |e1 x e2| (twice the area), so
+ * All three corners share \f$s = \norm{\vect{e}_1\times\vect{e}_2}\f$, so with
+ * \f$d_{ij} = \vect{e}_i\cdot\vect{e}_j\f$:
  *
- *     alpha_0 = atan2(|e1 x e2|,  e1.e2)
- *     alpha_1 = atan2(|e1 x e2|,  e1.e1 - e1.e2)
- *     alpha_2 = atan2(|e1 x e2|,  e2.e2 - e1.e2)
+ *     alpha_0 = atan2(s, d12),  alpha_1 = atan2(s, d11 - d12),  alpha_2 = atan2(s, d22 - d12)
  *
- * `atan2` rather than `acos` of a normalised dot product, for the reason
- * CLAUDE.md gives about comparing unit vectors: `acos` has an infinite
- * derivative at +-1, so a nearly flat corner would carry an angle error of
- * ~1e-8 rad whatever the inputs; `atan2` is well conditioned everywhere.
+ * (\f$\vect{e}_1\cdot(\vect{e}_1-\vect{e}_2)\f$ is the dot product of the two
+ * edges at corner 1, and similarly at corner 2). `atan2` is well conditioned
+ * for every angle, unlike `acos` near 0 and \f$\pi\f$. Zero-area faces have no
+ * unit normal and are skipped.
  *
- * A face with zero area has no unit normal. It is skipped rather than given the
- * zero vector's angle sum, which is the same answer and avoids three `atan2`.
- *
- * @param obj The mesh. `verts.normal` is accumulated into, having been zeroed
- *            by the caller.
+ * @param obj The mesh. `verts.normal` is accumulated into; the caller zeroes it.
  */
 static void scatter_angle_weighted_normals(MFTL_Object *obj)
 {
@@ -177,23 +113,12 @@ static void scatter_angle_weighted_normals(MFTL_Object *obj)
 /**
  * @brief Scales every accumulated vector to unit length, in place.
  *
- * A pure streaming pass: 24 bytes in, 24 bytes out, one sqrt per vertex, no
- * indirection and no branch that depends on anything but the vector itself.
+ * A vertex with no incident triangle stays exactly zero -- a detectable "not
+ * computed" sentinel. The guard is a test against ZERO, not a small constant:
+ * area-weighted sums scale as a length squared, so any absolute threshold
+ * would zero the normals of a valid mesh with small enough triangles.
  *
- * A vertex with no incident triangles -- an isolated vertex, or a ghost whose
- * faces all live on another rank -- accumulates exactly zero and is left at
- * zero. That is a detectable sentinel: a unit normal never has zero length, so a
- * consumer can tell "not computed" from "computed", which a normalised arbitrary
- * direction would not allow.
- *
- * The test is against ZERO, not against a small constant. It used to be
- * `len_sq > MFTL_VERYSMALL`, the clamp CLAUDE.md records as removed from every
- * other normalisation on 2026-08-15 and missed here: with area weighting the
- * accumulated vector has the magnitude of an AREA, so every vertex of a mesh
- * whose triangles are smaller than about 1e-6 on a side silently came out with
- * a zero normal -- the "not computed" sentinel -- on a perfectly valid mesh.
- *
- * @param obj The mesh. Each `verts.normal` entry is scaled to unit length in place.
+ * @param obj The mesh. Each `verts.normal` entry is normalised in place.
  */
 static void normalise_vertex_normals(MFTL_Object *obj)
 {
@@ -223,9 +148,8 @@ void MFTLComputeVertexNormals(MFTL_Object *obj, MFTL_NormalWeighting weighting)
 
   if (obj->verts.n == 0) return;
 
-  /* Every vertex is written by this pass, so the whole live prefix is cleared
-   * rather than only the owned part -- a ghost that kept last step's value would
-   * be a stale number that looks like a fresh one. */
+  /* Clear every vertex, ghosts included: a ghost keeping last step's value
+   * would look fresh. */
   memset(obj->verts.normal, 0, 3 * (size_t) obj->verts.n * sizeof(double));
 
   if (weighting == MFTL_NORMAL_WEIGHT_ANGLE)

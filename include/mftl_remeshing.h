@@ -4,166 +4,62 @@
  * @date 2026-08-15
  * @ingroup mftl_remeshing
  *
- * @brief Isotropic surface remeshing: split, collapse, flip, smooth.
+ * @brief Isotropic surface remeshing -- split, collapse, flip, tangential
+ *        smoothing -- serial and distributed.
  *
- * Layer 3. The OPERATORS and the per-object driver are serial and contain no MPI
- * -- they work on one rank's complete mesh, and that is deliberate rather than
- * provisional. The distributed driver (MFTLRemeshEnsembleParallel) is a
- * SCHEDULE around them: it decides who may touch what, and calls exactly the
- * same kernel. See "Parallel remeshing" at the bottom of this comment.
+ * Layer 3. The operators, the smoother and the per-object driver are serial and
+ * contain no MPI; the two distributed drivers are schedules around the same
+ * kernel. Every MPI call of the module is in src/remeshing/remesh_comm.c
+ * (enforced by `test_remeshing_mpi_is_confined`).
  *
- * ## THE ALGORITHM
+ * **Algorithm** (Botsch & Kobbelt, SGP 2004). One iteration against a target
+ * edge length \f$L\f$:
  *
- * Botsch & Kobbelt's incremental isotropic remesher. One iteration is four
- * sweeps against a target edge length L:
+ * 1. detect features (MFTLDetectFeatures());
+ * 2. SPLIT every edge longer than \f$\tfrac43 L\f$ at its midpoint;
+ * 3. COLLAPSE every edge shorter than \f$\tfrac45 L\f$, unless a resulting edge
+ *    would be longer than \f$\tfrac43 L\f$;
+ * 4. compact (MFTLRemeshCompactObject());
+ * 5. FLIP every edge whose flip strictly lowers the squared valence deviation;
+ * 6. detect features again and smooth tangentially (MFTLSmoothTangential()).
  *
- *   1. SPLIT    every edge longer than 4/3 L
- *   2. COLLAPSE every edge shorter than 4/5 L
- *   3. FLIP     every edge whose flip lowers the total squared valence deviation
- *   4. SMOOTH   tangential Laplacian relaxation
+ * A split of an edge longer than \f$\tfrac43 L\f$ gives halves longer than
+ * \f$\tfrac23 L\f$, i.e. no further from \f$L\f$ than the original edge; the
+ * collapse's stretch clause keeps split and collapse from undoing each other.
  *
- * The 4/5 and 4/3 bounds are not tuning: they are the widest pair for which a
- * split cannot immediately produce a collapsible edge and vice versa, which is
- * what stops the two sweeps oscillating.
+ * **Operators under implicit indexing.** Half-edge 3t+k is corner k of triangle
+ * t, so an operator rewrites whole triangles and re-links the twins on the rim of
+ * its patch: a flip allocates nothing, a split appends one triangle (with its
+ * three half-edges) per side, and a collapse flags two triangles and one vertex
+ * #MFTL_FLAG_DEAD for the compaction to remove. Edge flags (FEATURE, BOUNDARY)
+ * are carried to the logical edge's new slot explicitly. A half-edge's global
+ * id, \f$3\,t_\mathrm{gid}+k\f$, depends on the slot only and stays valid.
  *
- * ## WHAT IMPLICIT INDEXING DOES TO A TOPOLOGICAL OPERATOR
+ * **Global ids** stay unique but become sparse (splits create, collapses retire).
+ * Redistribution and the ghost sync size lookup tables from `next_*_gid`, so
+ * every pass ends dense again: MFTLRemeshRenumberGlobalIds() on a whole object,
+ * per-body prefix sums over each body's holders in the spanning driver.
  *
- * Half-edge 3t+k IS corner k of triangle t (mftl_topology.h). An operator
- * therefore cannot allocate a half-edge, or move one between triangles, or patch
- * a `next` pointer -- none of those are representable. What it does instead:
+ * **Distributed remeshing.** An edge whose endpoints two ranks own can be
+ * collapsed by neither, and a lock/ask protocol inside the sweeps would make the
+ * result depend on message timing. Two exact strategies need no negotiation;
+ * AUTO chooses collectively from one ratio, the largest body radius R against
+ * the narrowest rank box h:
  *
- *   REWRITE WHOLE TRIANGLES, THEN RE-LINK THE PATCH'S OUTER TWINS.
+ * - **SPANNING** (MFTLRemeshEnsembleParallel()): the kernel runs only on
+ *   entities no other rank holds a copy of (the others are #MFTL_FLAG_FROZEN,
+ *   derived locally by MFTLRemeshMarkFrozen()), and the cut planes are shifted
+ *   by half a box over the placements \f$\{0,h/2\}^3\f$ so that every entity
+ *   is interior in some placement. Requires \f$h > 4\delta\f$, \f$\delta\f$
+ *   the half-width of the frozen band.
+ * - **DISPERSED** (MFTLRemeshEnsembleDispersed(), \f$R \le 0.4\,h\f$ by
+ *   default): each body is migrated whole onto one rank (its centroid's owner,
+ *   load-balanced) and remeshed serially; two migrations per pass, nothing
+ *   frozen.
  *
- * A triangle is written by storing three TARGET vertices (`he[3t+k].vertex_idx`
- * is the target of corner k, so the triple (v0,v1,v2) is stored as v1,v2,v0),
- * and the patch is closed by re-pointing the twins of the half-edges on its rim.
- * Three consequences worth stating, because implicit indexing makes these
- * operators SHORTER than their explicitly-indexed equivalents rather than longer:
- *
- *   - FLIP allocates nothing at all. Both triangles are rewritten in place and
- *     four rim twins are re-pointed. There is no `next` cycle to repair, and
- *     repairing it is most of what an explicitly-indexed flip does.
- *   - SPLIT appends one triangle per side (two for an interior edge, one at a
- *     mesh boundary) and its three half-edges come with it, at the right indices,
- *     by construction.
- *   - COLLAPSE cannot free anything, because a triangle's half-edges are its
- *     storage. It marks the two collapsed triangles and the retired vertex
- *     MFTL_FLAG_DEAD, and a compaction pass removes them later.
- *
- * A half-edge's global id is 3 * (triangle global id) + k, so it is a function of
- * the SLOT, never of the logical edge. Rewriting a triangle leaves the ids alone
- * and the invariant holds for free (inv_halfedge_gids_are_implicit).
- *
- * What does NOT come for free is the flag word: when triangle t is rewritten, the
- * logical edge that used to sit in slot 1 may end up in slot 2, and MFTL_FLAG_
- * FEATURE / BOUNDARY have to travel with the EDGE, not with the slot. Every
- * operator below therefore captures the rim flags before it writes anything and
- * places them explicitly. A feature curve that develops a gap after a split is
- * the symptom of getting this wrong.
- *
- * ## DELETION IS COMPACTION, AND IT HAPPENS INSIDE THE ITERATION
- *
- * Marking entities dead and compacting once, at the very end of the whole
- * remeshing call, is cheaper by one pass and wrong by one class of bug: between
- * the first collapse and the final compaction, every consumer that walks the
- * POOLS rather than the topology sees the dead entities. The smoother then needs
- * a per-vertex flag test to skip them, and a feature detector reading
- * `tris.normal` reads dead triangles' normals without noticing.
- *
- * Here MFTLRemeshCompactObject() runs at the end of each iteration's collapse
- * sweep, before anything geometric. What that buys is not tidiness, it is reuse:
- * after it the object is an ordinary valid mesh, so the smoother calls
- * MFTLComputeVertexNormals() -- the library's own
- * measured kernels, with exact area-weighted normals -- instead of an open-coded
- * per-vertex cross-product loop that has to know about the dead.
- *
- * ## GLOBAL IDS AND WHY THEY ARE RENUMBERED
- *
- * Splits hand out fresh ids and collapses retire them, so a remeshed mesh's ids
- * are unique but no longer dense. Density is not merely cosmetic: redistribution
- * and the ghost sync size their arrival lookup tables from `next_*_gid`
- * (src/communication/redistribute.c, src/communication/ghost_sync.c), so holes
- * accumulated over a few hundred timesteps become an unboundedly growing table
- * for a mesh of constant size.
- *
- * MFTLRemeshRenumberGlobalIds() therefore re-densifies at the end of a pass, and
- * MFTL_RemeshParameters.renumber_global_ids (default on) controls it. It is
- * correct EXACTLY BECAUSE THIS IS SERIAL: the renumbering is a local decision,
- * and it is only sound when this rank holds the entire object. Both the
- * renumbering and MFTLRemeshObject() assert that -- no ghosts, and the object's
- * owned counts equal its global counts. The distributed driver re-densifies with
- * an MPI_Exscan instead, and pays one ghost exchange for it.
- *
- * ## PARALLEL REMESHING: MOVE THE PLANES, OR MOVE THE BODIES
- *
- * An edge whose two endpoints are owned by different ranks cannot be collapsed
- * by either of them. The answer is NOT a protocol -- a lock/ask/agree round trip
- * inside a remesher's innermost loop makes the RESULT depend on message arrival
- * order, so the same mesh remeshes differently twice in a row.
- *
- * There are two answers instead, they are opposites, and which one applies is
- * decided by ONE ratio -- the body radius against the rank box width:
- *
- *   SPANNING (R >> h)   the body cannot be made local to anybody, so MOVE THE
- *                       CUT PLANES: run the serial kernel on the INTERIOR of
- *                       each rank's share, refuse anything whose footprint
- *                       reaches the partition boundary, then move the planes by
- *                       half a box and run it again.
- *
- *   DISPERSED (R << h)  the body FITS in a rank box, so MOVE THE BODY: migrate
- *                       all of it to the rank owning its centroid and the
- *                       untouched serial kernel runs on 100 % of it. No frozen
- *                       entities, no phases, exactly two migrations.
- *
- * MFTLRemeshEnsemble picks between them (MFTLRemeshChooseStrategy) and the
- * choice is COLLECTIVE -- it comes out of a reduction, because two ranks
- * entering different drivers is an immediate deadlock.
- *
- * Nothing is negotiated in either, because nothing overlaps. Four consequences
- * worth knowing before reading any of the code:
- *
- *   THE OPERATORS ARE UNCHANGED. MFTLSplitEdge, MFTLCollapseEdge, MFTLFlipEdge
- *   and their approval predicates contain no MPI and no ownership test. The
- *   parallel driver gates them from OUTSIDE, on MFTL_FLAG_FROZEN, and on a
- *   serial object no such flag is ever set -- so nproc == 1 goes down exactly
- *   the code path it did before, to the bit.
- *
- *   "FROZEN" IS DERIVED, NOT COMMUNICATED. An owned entity is frozen exactly
- *   when some other rank holds a copy of it, and this rank can evaluate that
- *   alone: it is the same rule the redistribution used to decide what to send.
- *   MFTLRemeshMarkFrozen() is two streaming reads and six integer compares per
- *   triangle -- no distance test, no tolerance, no message.
- *
- *   THE PRECONDITION IS GEOMETRIC AND IT IS CHECKED. With delta the half-width
- *   of the frozen band and h the rank box, an entity frozen under one placement
- *   is interior under the half-shifted one iff h > 4 delta. Violate it and some
- *   entities are never offered to anyone; MFTL_RemeshStats.converged says so,
- *   and the driver warns rather than aborting -- the failure is a mesh-quality
- *   shortfall, not a corruption.
- *
- *   ALL THE MPI IS IN ONE FILE. src/remeshing/remesh_comm.c holds every
- *   collective and every point-to-point the remesher makes; the operators, the
- *   smoother, the compaction and both drivers contain none, and a CMake source
- *   check (test_remeshing_mpi_is_confined) fails the build if that changes. The
- *   rule is there because the alternative was tried: the shift reached
- *   redistribution by growing MFTLGetOwnerProc, which cost 1.70x on the
- *   production ownership loop to serve a routine that runs a few times per
- *   hundred timesteps.
- *
- * The full argument -- why no ghost position sync is needed inside a phase, why
- * the dilation ring is optional, and why the ids are renumbered the way they are
- * -- is in src/remeshing/remesh_parallel.c, and the dispersed counterpart is in
- * src/remeshing/remesh_dispersed.c.
- *
- * WHAT IS STILL NOT HERE: nothing for the LOAD-BALANCE half of the N_bodies << P
- * case. The dispersed strategy sends each body to one rank, so ranks holding no
- * body do nothing, and there is no work for them to do -- that is a property of
- * the problem, not a gap in the code. What WAS missing, the PRECONDITION half
- * (rank boxes too small for the frozen band, which made the shift schedule
- * degrade silently), is now `MFTL_RemeshParameters.parallel_coarsen`. It merges
- * rank boxes per axis through the owner map that already exists, so it needed no
- * second communicator -- see MFTLRemeshCoarseOwnerProc in
- * src/remeshing/remesh_comm.h.
+ * On a ghost-free object nothing is frozen, so the serial path is unchanged to
+ * the bit. Theory, call graphs and measurements: src/remeshing/README.md and
+ * docs/analysis.md §4-5.
  */
 
 #ifndef MFTL_REMESHING_H
@@ -177,100 +73,64 @@
 // 0. THE PHASE SCHEDULE  (src/remeshing/remesh_parallel.c)
 // -----------------------------------------------------------------------------
 
-/** @brief Distinct placements of the cut planes: {0, h/2}^3. */
+/** @brief Number of cut-plane placements, \f$\{0, h/2\}^3\f$. */
 #define MFTL_REMESH_NUM_PHASES 8
 
 /**
- * @brief Edge lengths spanned by the frozen band, either side of a cut plane.
+ * @brief Conservative reach of the frozen band either side of a cut plane, in
+ *        units of `max_edge_length`.
  *
- * The band is "one triangle to reach the plane, one more to reach a triangle
- * that reaches it, and one more because a vertex is frozen when ANY incident
- * triangle is". Three is what that adds up to, and it is measured against
- * `max_edge_length` rather than the target, because the target is what the mesh
- * converges TO and the maximum is what it may legally contain on the way.
- *
- * It appears here rather than as a literal because it is the constant in the
- * h > 4*delta precondition -- the one number that decides how many ranks a mesh
- * of a given resolution may be remeshed on.
+ * A triangle is replicated when a corner or an edge neighbour is a ghost (one
+ * triangle to the plane, one more through the neighbour), and a vertex is frozen
+ * when any incident triangle is (one more): three edges. The band actually
+ * measured is about \f$0.84\f$ `max_edge_length`
+ * (MFTL_RemeshStats::band_measured), so this bound is used only where a worst
+ * case is required.
  */
 #define MFTL_REMESH_BAND_EDGES 3.0
 
 /**
- * @brief The eight placements, in units of h_k/2 per axis.
+ * @brief The eight placements, in units of \f$h_k/2\f$ per axis.
  *
- * Ordered by how much they are worth: the first two cover every entity that is
- * near the planes of ONE axis, which is all but O((delta/h)^2) of the mesh. The
- * next two complete the even-parity orthogonal array and cover every TUBE (near
- * two axes with mixed parity); the last four cover every CORNER. The driver
- * normally exits during the first few.
+ * Ordered so that every prefix is as useful as possible: rows 0-1 ((0,0,0),
+ * (1,1,1)) make every entity near the planes of ONE axis interior at least once
+ * (all but \f$O((\delta/h)^2)\f$ of the mesh); rows 0 and 2-4 form the
+ * even-parity set {000, 011, 101, 110}, which covers every entity near the
+ * planes of TWO axes; an entity near planes of all three axes needs its unique
+ * complementary placement, so all eight rows are required. Placements differing
+ * only on an axis with fewer than two (coarse) cells coincide, and the driver
+ * de-duplicates them.
  */
 extern const double MFTL_REMESH_PHASES[MFTL_REMESH_NUM_PHASES][3];
 
-/**
- * @brief The two distributed strategies, and how to pick between them.
- *
- * They are not variations on a theme -- they solve the same problem from
- * opposite ends, and which one is possible is decided by ONE ratio, the body
- * radius against the rank box width:
- *
- *   SPANNING   R >> h. The body cannot be made local to anybody, so MOVE THE
- *              CUT PLANES: run the gated serial kernel on each rank's interior,
- *              then shift the planes by half a box so that what was on the band
- *              is in somebody's middle. Cost is a migration per phase, and the
- *              phase count is what CLAUDE.md deferred issue 11 is about.
- *
- *   DISPERSED  R << h. The body FITS in a rank box, so MOVE THE BODY: migrate
- *              every entity of it to the rank owning its centroid, and the
- *              untouched serial kernel then runs on 100 % of it with no frozen
- *              entities, no phases, and no per-phase id collective -- one rank
- *              owning a whole body makes that body's ids unique for free. Two
- *              migrations for the entire pass, whatever the mesh looks like.
- *
- * The dispersed path is strictly better where it applies, and it applies to the
- * regime a real emulsion or spray is in (thousands of droplets, each far smaller
- * than a rank box). Its weakness is LOAD BALANCE: bodies go where their centroids
- * are, so ranks holding no droplet do nothing. Coarsening does not help that --
- * there is no work to give those ranks -- and it is not what
- * `parallel_coarsen` is for; that addresses the SPANNING path's precondition,
- * which is a different failure with a different symptom.
- */
+/** @brief The distributed remeshing strategy (see the file header). */
 typedef enum
 {
-  /** Measure the bodies and choose. The default; see MFTLRemeshChooseStrategy. */
+  /** Measure the bodies and choose (default); see MFTLRemeshChooseStrategy(). */
   MFTL_REMESH_PARALLEL_AUTO = 0,
-  /** Force the shift/freeze schedule: move the CUT PLANES over \f$\{0, h/2\}^3\f$. */
+  /** Shift the cut planes over \f$\{0, h/2\}^3\f$, freezing replicated entities. */
   MFTL_REMESH_PARALLEL_SPANNING,
-  /** Force body centering: move the BODIES onto the rank owning their centroid. */
+  /** Move every body whole onto one rank. */
   MFTL_REMESH_PARALLEL_DISPERSED
 } MFTL_RemeshParallelStrategy;
 
 /**
- * @brief Why the spanning fallback merged rank boxes, as a bitmask.
+ * @brief Why the spanning driver merged rank boxes; a bitmask, since triggers
+ *        can fire together.
  *
- * A BITMASK rather than an enum because the triggers are not exclusive: a
- * partition fine enough to break `h > 4*delta` is also, necessarily, one where
- * most of the mesh is frozen, so both fire together and a single-valued field
- * would have to pick one and discard the other.
- *
- * It exists because `n_coarse_groups` says how much parallelism was given up and
- * says nothing about WHY, and the two triggers call for opposite responses. BAND
- * means the pass would otherwise have left a lattice of un-remeshed mesh: the
- * coarsening is not optional and the cost is the price of a correct answer.
- * FROZEN means the pass would have converged perfectly well and merely spent
- * most of every migration on entities it was not allowed to touch: the cheaper
- * answers -- a longer target length, or the dispersed strategy -- are still
- * available and should be preferred. Reading one as the other wastes either a
- * mesh or a machine.
+ * BAND is required for correctness (otherwise bands along the cut planes are
+ * never remeshed). FROZEN and GATHER are efficiency trades, for which a longer
+ * target length or the dispersed strategy may be the cheaper remedy.
  */
 typedef enum
 {
-  /** No trigger fired. `group` was {1,1,1} and the pass took the uncoarsened path. */
+  /** No trigger fired; the pass was not coarsened. */
   MFTL_REMESH_COARSEN_NONE = 0,
-  /** Correctness: the measured band failed \f$h > 4\delta\f$ on some cut axis. */
+  /** Correctness: the measured band violates \f$h > 4\delta\f$ on some cut axis. */
   MFTL_REMESH_COARSEN_BAND = 1,
-  /** Efficiency: the frozen share exceeded #MFTL_RemeshParameters.coarsen_frozen_fraction. */
+  /** Efficiency: the frozen share exceeded MFTL_RemeshParameters::coarsen_frozen_fraction. */
   MFTL_REMESH_COARSEN_FROZEN = 2,
-  /** Size: the ensemble fitted under #MFTL_RemeshParameters.serial_gather_max_triangles. */
+  /** Size: the ensemble has fewer triangles than MFTL_RemeshParameters::serial_gather_max_triangles. */
   MFTL_REMESH_COARSEN_GATHER = 4
 } MFTL_RemeshCoarsenTrigger;
 
@@ -281,743 +141,378 @@ typedef enum
 /** @brief How the min/max edge-length band is derived from the target length. */
 typedef enum
 {
-  MFTL_REMESH_ISOTROPIC,  ///< Botsch & Kobbelt: [4/5 L, 4/3 L].
-  MFTL_REMESH_CUSTOM  ///< The caller sets min_edge_length / max_edge_length itself.
+  MFTL_REMESH_ISOTROPIC,  ///< Band \f$[\tfrac45 L, \tfrac43 L]\f$ (Botsch & Kobbelt).
+  MFTL_REMESH_CUSTOM  ///< The caller sets `min_edge_length` / `max_edge_length`, then calls MFTLRemeshParamsFinalise().
 } MFTL_RemeshType;
 
 /** @brief Which neighbourhood the smoother's target point is built from. */
 typedef enum
 {
-  /**
-   * Umbrella operator: the unweighted mean of the one-ring VERTICES. Cheaper and
-   * the classical choice, but it equalises edge lengths rather than areas.
-   */
+  /** Umbrella operator: unweighted mean of the one-ring vertices; equalises edge lengths. */
   MFTL_SMOOTH_VERTEX_BASED,
 
   /**
-   * AREA-WEIGHTED mean of the incident TRIANGLE centroids,
-   *
-   *     q = SUM(A_i * c_i) / SUM(A_i)
-   *
-   * which is the form Botsch & Kobbelt specify. The area weight is not a detail:
-   * it is the entire mechanism by which the smoother equalises triangle SIZE, by
-   * pulling vertices out of densely triangulated regions towards sparse ones. An
-   * unweighted mean of centroids is very nearly another umbrella operator, and a
-   * remesher using it loses most of its isotropy -- measured in
-   * docs/analysis.md §4, where it costs volume conservation (6.0 %
-   * against 3.5 %) rather than triangle quality.
+   * Area-weighted mean of the incident triangle centroids,
+   * \f$\mathbf q = \sum_i A_i \mathbf c_i / \sum_i A_i\f$ (Botsch & Kobbelt). The
+   * weight is what equalises triangle AREAS; without it the operator is nearly
+   * the umbrella one (docs/analysis.md §4: 6.0 % volume loss unweighted against
+   * 3.5 % weighted).
    */
   MFTL_SMOOTH_TRIANGLE_BASED
 } MFTL_SmoothMode;
 
 /**
  * @struct MFTL_RemeshParameters
- * @brief Everything MFTLRemeshObject() needs. Fill it with MFTLInitRemeshParams.
+ * @brief Parameters of a remeshing pass; initialise with MFTLInitRemeshParams().
  *
- * The struct carries its tag so a header that only passes a pointer to it --
- * mftl_topology_change.h -- can forward-declare it instead of including this
- * one, which would break the one-layer-per-header rule.
+ * Tagged, so that mftl_topology_change.h can forward-declare it.
  */
 typedef struct MFTL_RemeshParameters
 {
   MFTL_RemeshType type;  ///< How min/max are derived from `target_length`.
   MFTL_SmoothMode smooth_mode;  ///< Which neighbourhood the smoother's target point is built from.
 
-  /** Outer iterations. Each is one split/collapse/flip/smooth round. */
+  /** Outer iterations (detect/split/collapse/flip/smooth rounds). */
   int iterations;
 
-  /** Stop early once an iteration performs fewer than this many operations. */
+  /** Stop after an iteration that performs at most this many operations (default 0). */
   int min_convergence_ops;
 
   // --- Length targets -------------------------------------------------------
   /**
-   * The edge length \f$L\f$ the mesh converges to. Everything else scales off it.
-   *
-   * MFTLMeanEdgeLength() (or its collective form) is the usual source: remeshing
-   * to the mesh's own current mean maintains the resolution rather than changing
-   * it.
+   * Target edge length \f$L\f$. To keep the current resolution use
+   * MFTLEnsembleMeanEdgeLength() (collective), not the rank-local
+   * MFTLMeanEdgeLength().
    */
   double target_length;
   double min_edge_length;  ///< Collapse below this. \f$\tfrac45 L\f$ under #MFTL_REMESH_ISOTROPIC.
   double max_edge_length;  ///< Split above this. \f$\tfrac43 L\f$ under #MFTL_REMESH_ISOTROPIC.
-  double min_edge_length_sq;  ///< Precomputed; every length test is on squares.
-  double max_edge_length_sq;  ///< Precomputed. See MFTLRemeshParamsFinalise().
+  double min_edge_length_sq;  ///< Squared bound; every length test compares squares.
+  double max_edge_length_sq;  ///< Squared bound; see MFTLRemeshParamsFinalise().
 
   // --- Features -------------------------------------------------------------
   /**
-   * Dihedral angle in DEGREES above which an edge is a feature.
-   *
-   * >= 180 DISABLES feature detection entirely, and that is a legitimate
-   * production setting rather than a debug switch: on a closed smooth interface
-   * -- a droplet, a bubble, the Leveque test sphere -- there are no features to
-   * preserve, and every edge the detector flags is a false positive that locks a
-   * vertex the smoother needed to move. See docs/analysis.md §4.
-   *
-   * A mesh boundary is ALWAYS treated as a feature, threshold or not, because it
-   * is a feature of the surface rather than of its curvature.
+   * Angle between the two face normals of an edge, in degrees, above which the
+   * edge is a feature. \f$\ge 180\f$ disables detection -- the right setting for
+   * a smooth closed interface, where every detected feature is a false positive
+   * that locks a vertex the smoother must move (docs/analysis.md §4). Mesh
+   * boundary edges are always features.
    */
   double feature_angle_threshold;
 
   /**
-   * Turn angle in DEGREES above which a vertex WITH two feature edges is a
-   * corner rather than a slidable ridge point.
-   *
-   * A separate question from feature_angle_threshold, and separately settable
-   * because it applies where that one does not: a mesh boundary is a feature
-   * curve at any dihedral threshold, so the corners of an open patch need this
-   * test even with angle detection disabled entirely. Without it a square patch's
-   * four corners have exactly two rim edges each, classify as ridge points, and
-   * slide along the diagonal between their neighbours -- off the patch.
-   *
-   * The default is 45 degrees regardless of feature_angle_threshold.
+   * Turn angle in degrees above which a vertex with exactly two feature edges is
+   * a CORNER (locked) rather than a ridge point (slides along the curve). Also
+   * applies to boundary curves with angle detection off, so the corners of an
+   * open patch stay put. Default 45.
    */
   double feature_corner_angle;
 
   // --- Smoothing ------------------------------------------------------------
   int smooth_iterations;  ///< Relaxation sweeps per outer iteration.
-  double smooth_relaxation;  ///< Step scale in [0, 1]. 1.0 is the full Jacobi step.
+  double smooth_relaxation;  ///< Step scale in [0, 1]; 1 is the full Jacobi step.
 
   /**
-   * Cap on one smoothing step, as a fraction of the vertex's shortest incident
-   * edge. The tangential projection makes a fold-over unlikely rather than
-   * impossible -- the projection is against the vertex normal, which is itself
-   * meaningless where the one-ring is already degenerate. This clamp costs one
-   * comparison against a length the smoother has already computed.
+   * Cap on one smoothing step as a fraction of the vertex's shortest incident
+   * edge (default 0.4). Guards against fold-overs where the vertex normal is
+   * ill-defined.
    */
   double smooth_max_step_fraction;
 
   // --- Safety ---------------------------------------------------------------
   /**
-   * Minimum cos(angle) between a triangle's normal before and after an operation
-   * for that operation to be allowed. Guards collapse and flip against creating
-   * inverted or near-degenerate triangles.
-   *
-   * Omitting it is not a missing nicety, it is the head of a feedback loop: an
-   * inverted triangle presents a ~180 degree dihedral angle, the feature detector
-   * reads
-   * that as a sharp edge, the smoother locks every vertex of it, and the
-   * inversion becomes permanent. Measured in
-   * docs/analysis.md §4.
+   * A collapse or flip is refused if a surviving triangle's normal would turn by
+   * more than \f$\arccos\f$ of this (default 0.2, about 78 degrees), or if a
+   * triangle would become degenerate. Without it an inverted triangle reads as a
+   * sharp edge to the feature detector, which then locks its vertices for good
+   * (docs/analysis.md §4).
    */
   double max_normal_deviation_cos;
 
-  /** Re-densify global ids after the pass. Serial only -- see the file header. */
+  /** Re-densify global ids at the end of MFTLRemeshObject() (default true). The distributed drivers always do. */
   bool renumber_global_ids;
 
   // --- Parallel (ignored when nproc == 1) -----------------------------------
   /**
-   * Placements of the cut planes to try before giving up, counted over the
-   * 8-entry MFTL_REMESH_PHASES table and wrapping when larger.
+   * SPANNING only: maximum cut-plane placements per pass, cycling through
+   * #MFTL_REMESH_PHASES. **A per-timestep solver loop must set it.**
    *
-   * ══ THIS IS THE ONE PARAMETER A SOLVER MUST SET, AND THE DEFAULT IS NOT IT ══
+   * The default, 32, runs to a fixed point: right for a one-shot remesh far
+   * from its target (check `converged`), wrong for maintaining a mesh every
+   * step, where re-converging an already good mesh is split/collapse churn that
+   * erodes it, at one migration per placement. LeVeque deformation, 150
+   * remeshed steps at np = 4 (examples/leveque_remeshing_parallel.c,
+   * docs/analysis.md §5.1):
    *
-   * The default (32) means RUN TO A FIXED POINT: keep placing planes until no
-   * rank anywhere wants to perform an operation. That is right for a ONE-SHOT
-   * remesh -- bringing a mesh to a target length it is far from, which is what
-   * the test suite does -- and it is measurably WRONG inside a per-timestep
-   * loop, in both directions at once.
+   * | budget | V/V0 | min q | ms/step |
+   * |---:|---:|---:|---:|
+   * | 2 | 0.745 | 0.897 | 12.9 |
+   * | 4 | 0.771 | 0.879 | 16.7 |
+   * | 8 | 0.670 | 0.796 | 35.4 |
+   * | 32 | 0.639 | 0.621 | 84.7 |
    *
-   * Measured on the LeVeque deformation, 150 remeshed timesteps, sphere in a
-   * time-reversed vortex (examples/leveque_remeshing_parallel.c). The budget is
-   * the only thing varied:
-   *
-   *          np = 1 (phase driver forced)        np = 4
-   *   budget  phases  V/V0    min q   ms/step    V/V0    min q   ms/step
-   *        1    1.0   0.751   0.876     7.1        --      --       --
-   *        2    2.0   0.769   0.856    20.4      0.745   0.897    12.9
-   *        4    3.7   0.733   0.836    37.8      0.771   0.879    16.7
-   *        8    5.7   0.683   0.459    52.7      0.670   0.796    35.4
-   *       32   13.3   0.682   0.278    99.0      0.639   0.621    84.7
-   *
-   *   serial reference (MFTLRemeshObject): V/V0 0.751, min q 0.876, 7.1 ms/step
-   *
-   * Two things to read off it. Volume conservation and triangle quality are
-   * NON-MONOTONE and get WORSE as the budget grows -- re-converging an
-   * already-good mesh to a fixed point every timestep is not free polish, it is
-   * repeated split/collapse churn that erodes an under-resolved surface. And the
-   * cost is linear in the phase count, because every phase is a migration.
-   *
-   * At budget 4 the distributed answer at np = 4 matches or beats the serial one
-   * on every correctness measure (V/V0 0.771 vs 0.751, min q 0.879 vs 0.876,
-   * 0.05 % of edges out of band vs 0.09 %). At the default it is worse on all of
-   * them and five times slower.
-   *
-   * ── So: ────────────────────────────────────────────────────────────────────
-   *
-   *   PER-TIMESTEP LOOP   set 2..8. Four covers slab and tube conflicts (the
-   *                       even-parity orthogonal array) and was the best measured
-   *                       compromise; eight is a full covering set of the table
-   *                       and is what to use if the process grid is large enough
-   *                       for corner conflicts to matter. `converged` will often
-   *                       be false and that is expected -- the mesh is being
-   *                       maintained, not converged.
-   *
-   *   ONE-SHOT REMESH     leave it at 32 or raise it, and check `converged`.
-   *                       A phase converges the INTERIOR of each rank's share;
-   *                       the band becomes interior in a later phase and is
-   *                       converged there -- but converging it creates new work
-   *                       on ITS OWN band, so a mesh far from its target needs
-   *                       several sweeps of the table. Measured on a sphere going
-   *                       1280 -> 3830 triangles: 4 phases at np = 1, 6 at np = 2,
-   *                       19 at np = 4, 17 at np = 8.
-   *
-   * The default stays at 32 because the one-shot case FAILS LOUDLY when the
-   * budget is too small (`converged` comes back false) and the per-timestep case
-   * fails quietly when it is too large. A default that is wrong in the loud
-   * direction is the safer of the two.
+   * (serial MFTLRemeshObject(): 0.751, 0.876, 7.1 ms/step). Use 2-8 in a loop
+   * (4 was the best measured compromise; 5 distinct placements cover every
+   * entity near one or two axes' planes, 8 every entity; `converged == false`
+   * is then normal).
+   * The default stays at 32 because a too-small budget fails loudly in the
+   * one-shot case, while a too-large one fails quietly in the loop case.
    */
   int parallel_phase_budget;
 
   /**
-   * Extra triangle rings added to the frozen band beyond the exact set.
-   *
-   * ZERO IS CORRECT and is the default. The classification is not an
-   * approximation of a distance -- it is the exact statement "some other rank
-   * holds a copy of this", and MFTLRemeshMarkFrozen() derives it from the same
-   * rule the redistribution sent by. Every operation the gate then admits has
-   * its whole modified set owned exclusively by this rank AND its whole read
-   * neighbourhood present locally, so there is nothing for a margin to protect.
-   *
-   * It is settable anyway, for two honest reasons: it widens delta, which is a
-   * lever on the h > 4*delta precondition worth being able to test against; and
-   * if the exactness argument in remesh_parallel.c ever turns out to have a
-   * hole, this is the knob that isolates it. Each ring costs coverage -- more
-   * entities frozen per phase, so more phases -- and buys nothing otherwise.
+   * Extra triangle rings added to the frozen band. 0 (default) is correct: the
+   * frozen set is exactly the replicated set, so every admitted operation's
+   * modified set belongs to this rank alone and its neighbourhood is complete.
+   * A positive value widens \f$\delta\f$ for testing that claim; each ring
+   * costs coverage.
    */
   int freeze_dilation_rings;
 
-  /**
-   * Which distributed strategy to use. MFTL_REMESH_PARALLEL_AUTO (the default)
-   * measures the bodies and decides; see MFTLRemeshChooseStrategy.
-   */
+  /** Distributed strategy (default #MFTL_REMESH_PARALLEL_AUTO). */
   MFTL_RemeshParallelStrategy parallel_strategy;
 
   /**
-   * AUTO's threshold: a body larger than this fraction of the narrowest rank box
-   * makes the whole ensemble SPANNING.
-   *
-   * 0.4 rather than 0.5, and the margin is not arbitrary. Object-centering is a
-   * 26-neighbour exchange exactly while every triangle of a body lies within one
-   * rank box of the body's centroid; at R = 0.5*h a body centred on a corner
-   * reaches two boxes away on the diagonal and the redistribution falls back to
-   * the GLOBAL communicator -- correct, but an all-to-all where the design
-   * promised a stencil. The gap between 0.4 and 0.5 is what absorbs one
-   * remeshing pass's worth of growth before the next measurement.
+   * AUTO chooses DISPERSED iff the largest body radius is at most this fraction
+   * of the narrowest rank box (default 0.4). At 0.5 a body centred on a box
+   * corner reaches two boxes away diagonally, and the centering migration
+   * leaves the 26-neighbourhood; the margin also absorbs one pass of growth.
    */
   double dispersed_radius_fraction;
 
   /**
-   * SPANNING only: ARM the fallback that merges rank boxes into groups.
+   * SPANNING only: fallback that merges rank boxes into groups when a trigger
+   * fires (#MFTL_RemeshCoarsenTrigger). 0 disarmed; 1 armed (default); > 1 armed
+   * with at most this many ranks per group.
    *
-   *   0  never -- the fallback is disarmed and a too-fine partition degrades
-   *   1  armed (the default) -- coarsen exactly as far as a trigger requires
-   *  >1  armed, but capped at this many ranks per group
-   *
-   * ══ ARMED IS NOT THE SAME AS ACTIVE, AND THAT DISTINCTION IS THE POINT ═══
-   *
-   * A non-zero value does NOT mean "always coarsen". It means "coarsen if a
-   * trigger fires". MFTLRemeshCoarseningFactors returns {1,1,1} on every axis
-   * whose box is already wide enough, and MFTLRemeshCoarseOwnerProc at {1,1,1}
-   * is bit-for-bit MFTLRemeshOwnerProc -- so on a healthy partition the armed
-   * driver takes the identical code path and produces the identical mesh. That
-   * equivalence is asserted, not asserted about: see
-   * `test_the_fallback_stays_off_on_a_healthy_partition`.
-   *
-   * The cost of arming it is one pre-pass before the phase loop -- a geometry
-   * refresh, one freeze classification and two small Allreduces, no migration
-   * and no sweeps -- which is what makes the decision come from a MEASUREMENT
-   * rather than from the 3*max_edge_length estimate that overstates the band by
-   * about three.
-   *
-   * ── The two triggers ─────────────────────────────────────────────
-   *
-   * CORRECTNESS (#MFTL_REMESH_COARSEN_BAND). Raise the rank count on a fixed
-   * domain and the rank box shrinks until it is no longer wider than four frozen
-   * bands. Past that point the shift schedule DEGRADES SILENTLY: a lattice of
-   * bands along the cut planes that no placement ever offers to anyone, each of
-   * them a perfectly valid piece of mesh that no structural check can see.
-   * `converged` and `n_edges_hidden_long` are the only symptoms.
-   *
-   * EFFICIENCY (#MFTL_REMESH_COARSEN_FROZEN). The correctness trigger is
-   * extraordinarily permissive, and the arithmetic says by how much: the band is
-   * delta either side of every plane, so the frozen share is
-   * `1 - (1 - 2*delta/h)^3`, and at the correctness limit `h = 4*delta` that is
-   * 87.5 % OF THE MESH. A pass may therefore migrate everything, every phase, to
-   * remesh a seventh of it, and report a clean certificate for doing so.
-   * `coarsen_frozen_fraction` is the second trigger, and MFTL_RemeshStats
-   * ::frozen_fraction is what it fires on.
-   *
-   * ══ WHAT COARSENING COSTS, STATED BEFORE YOU RELY ON IT ═══════════════
-   *
-   * `1/(g0*g1*g2)` of the ranks do ALL the sweep work, and the remesh is 96-99 %
-   * of a timestep in the measured case. For the BAND trigger that is the price
-   * of a correct answer and there is nothing to weigh it against. For the FROZEN
-   * trigger there is: the remedy divides the sweeping ranks by `g0*g1*g2` while
-   * raising useful-work-per-migration only from `(1-f_old)` to `(1-f_new)`, and
-   * the two cheaper answers are still available -- remesh to a LONGER TARGET
-   * LENGTH, or use the DISPERSED strategy if the bodies fit in a rank box (it
-   * has no band and so no precondition). Check
-   * MFTL_RemeshStats::coarsen_trigger before concluding which situation you are
-   * in.
-   *
-   * The factors are per axis (MFTLRemeshCoarseningFactors), because the
-   * precondition is per axis: a domain thin in x only costs 2x parallelism
-   * rather than 8x.
+   * Armed is not active: on a healthy partition the factors are {1,1,1} and the
+   * pass is bit-identical to a disarmed one
+   * (`test_the_fallback_stays_off_on_a_healthy_partition`). Arming costs one
+   * pre-pass (geometry refresh, freeze classification, two small reductions;
+   * about 0.5 % of a timestep). The BAND trigger fires when the measured band
+   * violates \f$h_k > 4\delta\f$ on a cut axis -- past that point bands along
+   * the cut planes are never offered to any rank, silently. Factors are per axis
+   * (MFTLRemeshCoarseningFactors()). Coarsening leaves \f$1/(g_0g_1g_2)\f$ of
+   * the ranks doing all the sweeping: an escape hatch for correctness, not a
+   * speed-up.
    */
   int parallel_coarsen;
 
   /**
-   * SPANNING only: the share of owned triangles that may be FROZEN at the start
-   * of a pass before `parallel_coarsen` merges boxes to reduce it.
+   * SPANNING only: coarsen when more than this share of owned triangles is
+   * frozen at the start of a pass. \f$\ge 1\f$ disables (default).
    *
-   * >= 1.0 DISABLES this trigger, leaving `parallel_coarsen` armed on the
-   * correctness condition alone. That is the default, and the reasoning is
-   * below.
-   *
-   * ══ IT DEFAULTS TO DISABLED, AND THAT IS A MEASURED DECISION ═══════════
-   *
-   * This shipped disabled because the measurement said so, and the measurement
-   * is worth repeating here so nobody re-enables it by reasoning from the model
-   * alone. Frozen share of a refine-3 / refine-2 sphere on `[-1,1]^3`, trigger
-   * off so that the number is only observed:
-   *
-   *     np (grid)     target 0.06     target 0.20     target 0.40
-   *      2 (2x1x1)        8.6 %          16.9 %          16.9 %
-   *      4 (2x2x1)       16.7 %          31.9 %          31.9 %
-   *      8 (2x2x2)       24.4 %          45.0 %          45.0 %
-   *     27 (3x3x3)       36.6 %          66.2 %          66.2 %
-   *
-   * At a threshold of a third the np = 27 / target 0.06 cell fires. That
-   * configuration's actual complaint is `converged == false` with 55 hidden long
-   * edges, and its actual cause is `parallel_phase_budget` -- the mesh is far
-   * from its target and four placements are not enough. Coarsening would have
-   * answered it by merging 3x3x3 boxes into ONE, spending the whole machine's
-   * parallelism on the wrong disease. That is the shape of the objection in
-   * general, and the arithmetic behind it is not close: the remedy costs
-   * `g0*g1*g2` in ranks and buys `(1-f_new)/(1-f_old)` in useful work per
-   * migration, so g = 2 per axis is eight times fewer ranks sweeping for about
-   * 1.3x the useful work.
-   *
-   * Note also what the table does to the obvious model. `1 - (1 - 2*delta/h)^3`
-   * predicts 71 % where 36.6 % was measured -- it OVER-PREDICTS BY ABOUT TWO,
-   * because a sphere of radius 0.7 in a box of side 2 does not sample the cut
-   * planes uniformly. Anyone setting this field from the geometry rather than
-   * from MFTL_RemeshStats::frozen_fraction will coarsen roughly twice as far as
-   * they meant to.
-   *
-   * ── So what it is FOR ──────────────────────────────────────────────
-   *
-   * The correctness trigger already covers everything above about 87 %, which is
-   * where the schedule genuinely stops working. This one covers the band below
-   * that, where the pass works and merely works wastefully -- and whether
-   * trading ranks for it pays is a property of the run, not of the library. Set
-   * it when you have measured `frozen_fraction` on YOUR configuration and want
-   * to act on it. Leave it alone otherwise; the diagnostic is free either way,
-   * because `frozen_fraction` is reported whenever `parallel_coarsen` is armed.
+   * Disabled because of measurements (docs/analysis.md §5.6): the frozen share of
+   * an r = 0.7 sphere on \f$[-1,1]^3\f$ ranges from 9 % (np = 2) to 37 %
+   * (np = 27, refine 3). Firing merges boxes, costing a factor \f$g_0g_1g_2\f$
+   * in sweeping ranks for about \f$(1-f_\text{new})/(1-f_\text{old})\f$ more
+   * useful work per migration; at 36.6 % it made an unconverged pass converge
+   * for twice the wall clock. Useful window roughly 30-60 %. The model
+   * \f$1-(1-2\delta/h)^3\f$ over-predicts the share by about two, so set this
+   * from the measured MFTL_RemeshStats::frozen_fraction, never from geometry.
    */
   double coarsen_frozen_fraction;
 
   /**
-   * SPANNING only: below this many triangles in the whole ensemble, remesh on
-   * ONE rank. 0 (the default) disables it.
+   * SPANNING only: remesh on ONE rank when the whole ensemble has fewer
+   * triangles than this. 0 disables (default).
    *
-   * ── It is not a special case; it is the top rung of the coarsening ladder ──
-   *
-   * The mechanism is `group[k] = cuts[k]`, which MFTLRemeshCoarseningFactors
-   * already clamps to and MFTLRemeshCoarseOwnerProc already maps to a single
-   * representative cell. Every entity lands on one rank, so nothing is
-   * replicated, so nothing is frozen; no axis retains an interior plane, so
-   * `n_distinct_placements` collapses to 1. The pass becomes ONE PLACEMENT, ONE
-   * SWEEP AND TWO MIGRATIONS -- the coarse one out and the closing
-   * MFTLRedistribute back to the canonical fine partition.
-   *
-   * ── Why a triangle count and not a ratio ────────────────────────────
-   *
-   * Because the count IS the memory guard. One rank holds the entire ensemble
-   * for the duration of the sweep, and the only thing that bounds what that
-   * costs is how many triangles there are.
-   *
-   * ── This is a trade, not a free win ───────────────────────────────
-   *
-   * The phase driver does roughly 3.9x the remeshing work of one serial pass,
-   * and on a mesh that can resolve its surface that extra work is worth what it
-   * looks like: at 18 300 triangles the distributed answer measures min q 0.85
-   * against the serial 0.72. Gathering buys time and gives that back. The
-   * default is 0 because the crossover has not been measured -- the np = 1 rows
-   * in docs/analysis.md §5.4 take a different code path and never
-   * pay for the gather, so they do not answer the question.
+   * The top rung of coarsening (group = cuts): nothing is replicated or frozen,
+   * one placement, exactly two migrations. A count rather than a ratio, because
+   * that rank then holds the whole ensemble. Measured crossover about 50-100
+   * triangles per rank (docs/analysis.md §5.6), i.e. about 50 x nproc, capped by
+   * one rank's memory. It gives up the extra quality of the
+   * distributed pass (min q 0.85 against 0.72 serially at 18 300 triangles).
    */
   int serial_gather_max_triangles;
 
   /**
-   * DISPERSED only: how far above the mean a rank's share of the bodies may go
-   * before the driver reassigns bodies away from it. <= 0 disables balancing and
-   * restores pure centroid ownership.
+   * DISPERSED only: a rank may carry up to this multiple of the mean body weight
+   * (global triangle count) before bodies are reassigned to neighbouring ranks
+   * (default 1.25; \f$\le 0\f$ disables). The cap is
+   * \f$\max(\text{mean}\cdot\text{slack}, \text{heaviest body})\f$ -- a body
+   * is indivisible.
    *
-   * 1.25 means "a quarter above the mean is close enough". The cap is
-   * `MAX(mean * slack, heaviest single body)`, and the second term is not a
-   * detail: a cap below the heaviest body is unachievable and the assignment
-   * loop would not terminate.
-   *
-   * ── What it fixes, and what it cannot ────────────────────────────
-   *
-   * Bodies go where their centroids are, and centroids cluster -- an emulsion is
-   * not a uniform distribution over the process grid. With N_bodies >> P that is
-   * a real and fixable imbalance, and this fixes it. With N_bodies < P it is not
-   * fixable by anything, because there is no remeshing work to give a rank that
-   * holds no body; MFTL_RemeshStats::n_ranks_idle reports which case you are in.
-   *
-   * ── Why LOCALITY FIRST ─────────────────────────────────────────
-   *
-   * A body stays on its centroid's owner unless that rank is over the cap, and a
-   * reassigned one goes to a neighbouring cell -- never further. Object-centering
-   * is a 26-neighbour exchange exactly while every destination is within a box of
-   * the body, so the bodies that do not move keep the stencil and only the
-   * reassigned tail pushes redistribution onto its global path -- which it
-   * detects itself.
-   *
-   * ── ONE RANK DECIDES A BODY AND TELLS THE HOLDERS ──────────────────
-   *
-   * #MFTL_OwnerMap is undefined -- not slow, undefined -- if two ranks name
-   * different destinations for one entity, so the destination has to be AGREED.
-   * It used to be agreed by REPLICATION: every rank was given every body's
-   * centroid and weight and ran the same greedy, at `4 * n_bodies_global` doubles
-   * of payload and about `84 * n_bodies_global` bytes of staging PER RANK. It is
-   * now agreed by DELIVERY: the rank owning a body's centroid decides it and
-   * publishes `(body, destination)` one hop along `comm_graph`, which every
-   * holder of that body is on. Payload and memory are `O(local bodies x graph
-   * degree)`, and the degree is at most 26 whatever `nproc` is.
-   *
-   * The balance is the same -- measured 4.00 -> 1.25 at np = 4, 8.00 -> 1.25 at
-   * np = 8 and 27.00 -> 1.25 at np = 27 on the clustered fixture of
-   * `examples/remesh_regime_sweep -only l`, with no rank left idle. What it costs
-   * instead is latency: three directed exchanges of one or two doubles per
-   * neighbour, three times over, because a purely local rule has to NEGOTIATE
-   * (every overloaded rank sees the same empty neighbour) where a replicated one
-   * could simply look.
-   *
-   * The one precondition -- a body's centroid owner is a graph neighbour of every
-   * rank holding the body -- is tested locally on every rank and reduced;
-   * MFTL_RemeshStats::n_bodies_unreachable reports a failure and the pass then
-   * falls back to pure centroid ownership rather than to replicating.
+   * Each body is decided by ONE rank, the owner of its reduced centroid
+   * ("home"), and the verdict is delivered one hop along `comm_graph`.
+   * Reassignments go to neighbouring cells only and are negotiated in a bounded
+   * number of ask/grant rounds that cannot push any rank past its cap; every
+   * payload is O(local bodies x graph degree). Clustered bodies: imbalance
+   * 2.00 / 4.00 / 8.00 / 27.00 -> 1.25 at np = 2 / 4 / 8 / 27 (docs/analysis.md
+   * §5.7). Nothing helps with fewer bodies than ranks
+   * (MFTL_RemeshStats::n_ranks_idle). Precondition, tested locally: home is a
+   * graph neighbour of every holder; otherwise the pass uses plain centroid
+   * ownership and reports MFTL_RemeshStats::n_bodies_unreachable.
    */
   double dispersed_balance_slack;
 } MFTL_RemeshParameters;
 
 /**
  * @struct MFTL_RemeshStats
- * @brief What one MFTLRemeshObject() call actually did. Purely diagnostic.
+ * @brief Diagnostics of one pass.
  *
- * It exists because the interesting failure mode of a remesher is not a crash,
- * it is a pass that reports success having refused most of its own operations.
- * The rejection counters are what distinguish "converged" from "wedged".
+ * A remesher typically fails not by crashing but by reporting success after
+ * refusing most of its work; the rejection counters and `converged` tell the
+ * two apart. After a distributed pass the operation and rejection counts, the
+ * vertex classes, `iterations` and `n_entities_migrated` are RANK-LOCAL; every
+ * other field is GLOBAL (the timings are maxima over ranks). Reduce the local
+ * counts yourself if needed.
  */
 typedef struct
 {
-  /**
-   * ── WHAT IS RANK-LOCAL AND WHAT IS GLOBAL ────────────────────────────────
-   *
-   * After a DISTRIBUTED pass the counters below split into two kinds and the
-   * difference is not visible from their names, so it is stated here:
-   *
-   *   RANK-LOCAL   every operation count and every rejection count, plus the
-   *                vertex classifications and the timings. They describe what
-   *                THIS rank did. Printing `n_split` from rank 0 at np = 8 shows
-   *                roughly an eighth of the mesh's splits.
-   *   GLOBAL       converged, n_edges_hidden*, n_phases, n_migrations*,
-   *                n_coarse_groups, coarsen_trigger, frozen_fraction,
-   *                n_bodies_not_centred, n_bodies_reassigned, n_ranks_idle,
-   *                load_imbalance, band_*, and n_ops_busiest_rank.
-   *
-   * The last four of those are global for a reason worth stating, because it is
-   * not the usual one: they are computed from REPLICATED data rather than
-   * reduced. The balancer's inputs come out of an Allreduce already, so every
-   * rank derives the same assignment and the same imbalance without a second
-   * collective.
-   *
-   * They are not all reduced because they are not all reducible: summing
-   * `n_feature_edges` would double-count every edge in a halo, and `iterations`
-   * is a maximum rather than a sum. A caller wanting a global operation count
-   * should reduce the ones it cares about itself -- or read
-   * `n_ops_busiest_rank`, which is the number that bounds the phase.
-   */
-  int iterations;  ///< Outer iterations actually run.
+  int iterations;  ///< Outer iterations run (maximum over objects).
 
-  int n_split;  ///< Edges split. RANK-LOCAL after a distributed pass.
-  int n_collapse;  ///< Edges collapsed. RANK-LOCAL.
-  int n_flip;  ///< Edges flipped. RANK-LOCAL.
+  int n_split;  ///< Edges split.
+  int n_collapse;  ///< Edges collapsed.
+  int n_flip;  ///< Edges flipped.
 
-  int n_collapse_rejected_link;  ///< Link condition failed (would pinch the surface).
-  int n_collapse_rejected_fold;  ///< Would have inverted a triangle.
-  int n_collapse_rejected_feature;  ///< Blocked by a feature or boundary rule.
-  int n_flip_rejected_fold;  ///< Would have inverted a triangle or made a non-convex flip.
+  int n_collapse_rejected_link;  ///< Wanted collapses refused by the link condition or a valence bound.
+  int n_collapse_rejected_fold;  ///< Wanted collapses refused by the fold-over test.
+  int n_collapse_rejected_feature;  ///< Wanted collapses refused by a feature, corner or boundary rule.
+  int n_flip_rejected_fold;  ///< Flips the valence criterion wanted but the fold-over test refused.
 
   int n_feature_edges;  ///< Undirected feature edges after the last detection.
-  int n_corner_vertices;  ///< Locked outright by the smoother.
-  int n_ridge_vertices;  ///< Smoothed along a feature curve only.
-  int n_free_vertices;  ///< Fully tangentially smoothed.
+  int n_corner_vertices;  ///< Corner vertices (locked by the smoother).
+  int n_ridge_vertices;  ///< Ridge vertices (smoothed along their feature curve).
+  int n_free_vertices;  ///< Free vertices (smoothed in the tangent plane).
 
-  int n_vertices_removed;  ///< By collapse.
-  int n_orphans_removed;  ///< Live vertices left with no incident triangle.
+  int n_vertices_removed;  ///< Vertices removed by collapses.
+  int n_orphans_removed;  ///< Live vertices left without an incident triangle, removed by compaction.
 
   // --- Parallel (zero / false after a serial pass) ---------------------------
-  int n_phases;  ///< Cut-plane placements actually used.
+  int n_phases;  ///< Cut-plane placements used (SPANNING).
 
   /**
-   * Redistributions actually PERFORMED. Not `n_phases + 1` any more: a placement
-   * that every entity already satisfies is detected (one int through an LOR) and
-   * skipped, and phase 0 of the schedule is exactly that case -- it asks for the
-   * canonical placement, which is what the caller handed in. So the usual figure
-   * is `n_phases`, and `n_phases + 1 - n_migrations` is `n_migrations_skipped`.
+   * Redistributions performed. A placement identical to the current partition
+   * (always the case for phase 0) is detected by one logical-OR reduction and
+   * skipped.
    */
   int n_migrations;
 
-  /** Placements that turned out to be the identity. See `n_migrations`. */
+  /** Placements skipped because they were the identity. */
   int n_migrations_skipped;
 
   /**
-   * How many of MFTL_REMESH_PHASES are DIFFERENT on this process grid: 2, 4 or 8.
-   *
-   * An axis with fewer than two (coarse) cells has no interior plane to move, so
-   * two table entries differing only on such an axis are the same placement. On
-   * a 2x1x1 grid the eight entries are two placements, on 2x2x1 four.
-   *
-   * It is reported because it is the size of the covering set, and therefore how
-   * many consecutive silent placements the driver needs before it may certify.
-   * It is also a blunt statement about the grid: a slab decomposition gives the
-   * shift schedule two chances at every entity, a cubic one gives eight.
+   * Distinct placements of #MFTL_REMESH_PHASES on this grid: 2, 4 or 8. An axis
+   * with fewer than two (coarse) cells has no interior plane, so entries
+   * differing only there coincide (2 on a 2x1x1 grid, 4 on 2x2x1). It is the
+   * length of the silent streak that certifies convergence.
    */
   int n_distinct_placements;
 
   /**
-   * GLOBAL: operations performed by the rank that performed the most.
-   *
-   * The phase loop is barrier-synchronised, so this -- not the sum -- is what
-   * bounds a phase's sweep time, and comparing it against the mean is how load
-   * imbalance becomes visible. Dispersed driver only so far, where it is exact
-   * for a different reason: one rank owns a whole body, so no two ranks work on
-   * the same body and a maximum is the busiest rank's true total.
+   * Operations performed by the busiest rank (DISPERSED). A phase is bounded by
+   * this, not by the sum; compare with the mean to see load imbalance.
    */
   int n_ops_busiest_rank;
 
   /**
-   * Ranks per coarse group, i.e. `g0*g1*g2`. 1 means no coarsening happened,
-   * which is the normal case and the default.
-   *
-   * Greater than 1 means a trigger fired and boxes were merged -- so this many
-   * ranks shared one box and only one of them did any sweeping. It is the field
-   * that says "this run is not scaling and here is by how much"; `coarsen_trigger`
-   * is the field that says why, and the two are only useful together.
-   *
-   * Equal to `nproc` means the whole ensemble was gathered onto one rank, which
-   * is `serial_gather_max_triangles` firing rather than anything going wrong.
+   * Ranks per coarse group, \f$g_0g_1g_2\f$: 1 without coarsening, `nproc` for
+   * the single-rank gather. Only one rank per group sweeps.
    */
   int n_coarse_groups;
 
   /**
-   * WHICH trigger merged the boxes, as a bitmask of #MFTL_RemeshCoarsenTrigger.
-   * #MFTL_REMESH_COARSEN_NONE (0) whenever `n_coarse_groups == 1`.
-   *
-   * Read it before acting on `n_coarse_groups`. BAND is not negotiable -- the
-   * alternative was an un-remeshed lattice. FROZEN and GATHER are trades, and
-   * both have cheaper alternatives that the library cannot take on its own: a
-   * longer target length, or the dispersed strategy.
+   * Bitmask of #MFTL_RemeshCoarsenTrigger explaining `n_coarse_groups`;
+   * #MFTL_REMESH_COARSEN_NONE when that is 1.
    */
   int coarsen_trigger;
 
   /**
-   * GLOBAL share of owned triangles that were FROZEN when the pass started, in
-   * [0, 1]. Zero after a dispersed or serial pass, which have no band, and zero
-   * when the pre-pass did not run (`parallel_coarsen == 0` and no gather
-   * threshold), because it is a measurement and not an estimate.
-   *
-   * ── THE MOST USEFUL SINGLE NUMBER ABOUT A SPANNING PASS ────────────────
-   *
-   * A frozen entity is migrated with everything else and then not touched, so
-   * this is the share of every migration that buys nothing. It is what
-   * `coarsen_frozen_fraction` fires on, and it is worth logging even with that
-   * trigger disabled: `converged` says the pass got there, `n_phases` says how
-   * many migrations it took, and this says how much of each one was wasted.
-   *
-   * Measured at the START of the pass, before any sweep, and on the CANONICAL
-   * partition -- so it describes the decomposition the caller handed in rather
-   * than any placement the driver chose.
+   * Share of owned triangles frozen at the start of the pass, on the canonical
+   * partition, in [0, 1]. Measured whenever the coarsening pre-pass runs,
+   * otherwise 0 (always 0 for dispersed and serial passes). A frozen entity is
+   * migrated and then not touched, so this is the share of every migration that
+   * buys nothing -- the most useful single number about a spanning pass.
    */
   double frozen_fraction;
 
   /**
-   * THE ONE FIELD TO CHECK after a parallel pass. True means the driver reached
-   * a state in which no rank anywhere wanted to perform an operation, so the
-   * mesh is as converged as the serial remesher would have made it.
+   * The verdict of a distributed pass. True when a phase saw no operation
+   * performed anywhere and no out-of-band edge hidden by the freeze, or a full
+   * streak of `n_distinct_placements` silent placements with no hidden LONG
+   * edge. False means the budget ran out first and bands along the cut planes
+   * may be un-remeshed -- invisible to any structural check. Causes: too small a
+   * `parallel_phase_budget`, or \f$h \le 4\delta\f$ (warned on rank 0).
    *
-   * False means the phase budget ran out first, and the mesh may carry a lattice
-   * of un-remeshed bands along the cut planes -- which no structural check can
-   * see, because every one of those bands is a perfectly valid piece of mesh.
-   * There are exactly two causes: `parallel_phase_budget` too small for how far
-   * the mesh was from its target, or h <= 4*delta, which the driver also warns
-   * about on rank 0.
-   *
-   * SCOPE, because it is narrower than it reads. The certificate is measured
-   * BEFORE the sweeps of the phase that certifies, and MFTLRemeshIterate smooths
-   * after them -- so true means "no rank had topological work pending at the
-   * last measurement", not "the mesh handed back has every edge inside the
-   * band". Smoothing moves vertices and can carry an edge out of the band after
-   * the fact. That is why the tests bound the out-of-band fraction rather than
-   * asserting it is zero.
+   * Measured before the sweeps of the certifying phase; the smoothing after
+   * them may still move a few edges out of the band. True for serial passes.
    */
   bool converged;
 
   /**
-   * GLOBAL number of out-of-band edges that the LAST placement of the cut planes
-   * hid from every rank at once -- a residual, not a running total.
-   *
-   * Diagnostic rather than a verdict, and the difference matters: a converged
-   * pass can legitimately report a non-zero value. An edge that no operator
-   * would fix anyway (a short edge the link condition may not collapse) still
-   * counts as hidden whenever it happens to sit on a band, and asking whether it
-   * WOULD have been fixed needs a one-ring this rank may not have. Use
-   * `converged` for the verdict and this for the size of the affected region.
+   * Out-of-band edges the LAST placement hid from every rank (a residual, not a
+   * total). A diagnostic of the affected region; `converged` is the verdict.
    */
   int n_edges_hidden;
 
-  /**
-   * `n_edges_hidden` split by the OPERATOR that would fix the edge, and the two
-   * halves are worth very different amounts.
-   *
-   * `n_edges_hidden_long` is EXACT. A long edge offered to a rank is split --
-   * MFTLSplitApproved has no merit refusal, only DEAD/VISITED/canonicity -- so a
-   * non-zero value means some placement genuinely failed to reach work, never
-   * that an operator looked and declined. It is the half `converged` is allowed
-   * to depend on, and the streak exit will not fire while it is non-zero.
-   *
-   * `n_edges_hidden_short` carries every false alarm. A collapse is refused on
-   * its merits by the link condition, the wing-valence floor, the stretch bound,
-   * and by the DIRECTIONAL feature/boundary/corner rules -- the collapse sweep
-   * only ever offers the canonical half-edge, so a short edge collapsible in the
-   * other direction only is collapsed by nobody and stays out of band forever.
-   * Expect it to be small and non-zero on a converged mesh.
+  /*
+   * `n_edges_hidden` by the operator that would fix the edge. LONG is exact: an
+   * offered long edge is always split (MFTLSplitApproved() has no merit test),
+   * so non-zero means work no placement reached. SHORT includes false alarms: a
+   * collapse can be refused on merit in both directions (link condition,
+   * valence, stretch, feature rules), so a small non-zero value is normal on a
+   * converged mesh.
    */
-  int n_edges_hidden_long;  ///< Out-of-band LONG edges with a frozen endpoint. GLOBAL.
-  int n_edges_hidden_short;  ///< Out-of-band SHORT edges with a frozen endpoint. GLOBAL.
+  int n_edges_hidden_long;  ///< Hidden edges longer than `max_edge_length`; exact (an offered long edge is always split).
+  int n_edges_hidden_short;  ///< Hidden edges shorter than `min_edge_length`; includes collapses refused on merit.
 
-  /**
-   * The frozen band as it actually occurred, and a measured upper bound on it.
-   * SPANNING only; zero after a dispersed or serial pass, which have no band.
-   *
-   * `band_measured` is the largest distance from a cut plane at which any owned
-   * entity was frozen, in the FIRST phase -- where the mesh is coarsest and the
-   * band therefore widest. Compare it with `MFTLDomainGetHMin(domain) / 4`: the
-   * shift schedule can offer every entity to somebody exactly when the band is
-   * the smaller of the two.
-   *
-   * `band_bound` is MFTL_REMESH_BAND_EDGES times the longest owned edge, i.e.
-   * the same conservative rule the library used to apply to `max_edge_length`,
-   * but measured. Expect it to be roughly THREE TIMES `band_measured`: the reach
-   * argument counts three edges and the observed reach is about one. That gap is
-   * the reason both are reported rather than one -- the bound is what a
-   * worst-case decision (the coarsening factor) has to use, and the measurement
-   * is what a diagnostic should quote.
+  /*
+   * SPANNING only. `band_measured`: largest distance from a cut plane (of the
+   * current placement) at which an owned entity was frozen, maximised over the
+   * phases; the schedule can cover every entity only if it is below h_min / 4.
+   * `band_bound`: #MFTL_REMESH_BAND_EDGES times the longest owned edge, about
+   * three times `band_measured`, for decisions that need a worst case.
    */
-  double band_measured;  ///< Largest observed distance from a cut plane at which an owned entity was frozen.
-  double band_bound;  ///< #MFTL_REMESH_BAND_EDGES times the longest owned edge. Roughly 3x `band_measured`.
+  double band_measured;  ///< SPANNING: largest distance from a cut plane at which an owned entity was frozen.
+  double band_bound;  ///< SPANNING: #MFTL_REMESH_BAND_EDGES times the longest owned edge (about 3x `band_measured`).
 
-  /** Which distributed path actually ran. AUTO is never reported -- it resolves. */
+  /** The distributed strategy that ran (never AUTO). */
   MFTL_RemeshParallelStrategy strategy;
 
   /**
-   * DISPERSED only: bodies the balancer moved off the rank owning their
-   * centroid. Zero when `dispersed_balance_slack <= 0`, and zero when the
-   * geometric assignment was already inside the cap.
-   *
-   * The non-vacuity measure for the balancer: `load_imbalance` improving while
-   * this is zero means the fixture was never imbalanced, not that the balancer
-   * worked. A reassigned body is also the one that leaves the 26-neighbourhood,
-   * so this is simultaneously what the balance cost in message locality.
+   * DISPERSED: bodies the balancer moved off their centroid's owner. An
+   * improving `load_imbalance` with this at zero means nothing needed
+   * balancing.
    */
   int n_bodies_reassigned;
 
   /**
-   * DISPERSED only: ranks assigned no body weight at all, AFTER balancing.
-   *
-   * The number that separates the two halves of the `N_bodies` versus `P`
-   * problem, which call for opposite responses. Non-zero with
-   * `N_bodies >= nproc` is a balancer failure worth investigating. Non-zero with
-   * `N_bodies < nproc` is arithmetic: there are fewer bodies than ranks and no
-   * assignment can give every rank one, because a body is the smallest unit of
-   * work this strategy has.
+   * DISPERSED: ranks left without any body after balancing. Non-zero with at
+   * least as many bodies as ranks is a balancer shortfall; with fewer bodies
+   * than ranks it is unavoidable -- a body is the smallest unit of work.
    */
   int n_ranks_idle;
 
   /**
-   * DISPERSED only: heaviest rank's body weight divided by the mean, AFTER
-   * balancing. 1.0 is perfect; it is never below 1.
-   *
-   * Compare it against `dispersed_balance_slack`. Above the slack means the
-   * balancer could not reach the cap, which happens for exactly two reasons and
-   * they are distinguishable: one body is heavier than the cap (unfixable -- a
-   * body is indivisible here), or there are fewer bodies than ranks (see
-   * `n_ranks_idle`).
-   *
-   * Weights are per-body GLOBAL triangle counts, so this predicts sweep time
-   * rather than body count -- one large body outweighs three small ones, which
-   * is what a barrier-synchronised phase actually cares about. It pairs with
-   * `n_ops_busiest_rank`, which measures the same imbalance after the fact.
+   * DISPERSED: heaviest rank's body weight over the mean, after balancing
+   * (\f$\ge 1\f$). Weights are global triangle counts, a proxy for sweep time.
+   * It stays above `dispersed_balance_slack` only when one body exceeds the cap
+   * or there are fewer bodies than ranks.
    */
   double load_imbalance;
 
   /**
-   * DISPERSED only: bodies that did not become wholly local after centering, so
-   * the pass fell back to the spanning driver for the whole ensemble.
-   *
-   * Non-zero means the strategy choice was wrong for this configuration -- a
-   * body grew past `dispersed_radius_fraction * h_min` since it was measured, or
-   * the caller forced DISPERSED on a mesh that spans ranks. The result is
-   * correct either way; the cost is one wasted migration.
+   * DISPERSED: bodies too large for the admission test (radius against the
+   * possibly coarsened rank box). Non-zero sends the whole ensemble to the
+   * spanning driver before anything is modified -- the result is correct, the
+   * body measurement was wasted. Arises when the strategy was forced or a body
+   * grew since it was measured.
    */
   int n_bodies_not_centred;
 
   /**
-   * DISPERSED only: (holder, body) pairs whose centroid owner is not that
-   * holder's graph neighbour, so the balancer could not have delivered a verdict
-   * to them. Non-zero disables balancing for the WHOLE pass, which then reduces
-   * to pure centroid ownership -- correct, unbalanced, and reported here rather
-   * than silent.
-   *
-   * ── Why it is a gate and not a per-body exception ───────────────────────
-   *
-   * The balancer's one precondition is that a body's home rank can reach every
-   * holder of it in one hop along `comm_graph`; see the load-balancing banner in
-   * `remesh_dispersed.c`. A holder tests its own half with no communication, and
-   * the sum over the job is this. Skipping just the offending bodies would leave
-   * the rank loads describing a different assignment from the one that ran, so
-   * the whole pass steps back instead.
-   *
-   * Reaching it needs a body wider than the admission test allows -- which is
-   * `dispersed_radius_fraction * h_min`, i.e. under one cell, so under one hop.
-   * The realistic route is `parallel_coarsen` relaxing the yardstick to a
-   * COARSENED box: the body then legitimately spans several fine cells and the
-   * balancer correctly declines. Counted once per holder rather than once per
-   * body, because that is what makes the count purely local; only zero versus
-   * non-zero changes what happens.
+   * DISPERSED: (holder, body) pairs whose home rank is not a graph neighbour of
+   * the holder, counted once per holder. Non-zero disables balancing for the
+   * whole pass (plain centroid ownership, correct but unbalanced). Typically
+   * reached only when `parallel_coarsen` relaxed the admission test to a
+   * coarsened box, so that a body legitimately spans several cells.
    */
   int n_bodies_unreachable;
 
-  // --- Profile (parallel drivers only) ---------------------------------------
-  //
-  // WHY THESE EXIST. Everything anyone wants to know about the cost of a
-  // distributed pass is a RATIO of these -- is the pass bound by moving the mesh
-  // or by remeshing it? -- and until they existed the question could only be
-  // answered by timing the whole call, which is what
-  // docs/analysis.md §5.4 records as the reason the
-  // work-list decision could not be made. They are also the only way to see the
-  // O(n) floor: `t_geometry` is a full triangle-geometry pass per phase over
-  // owned AND ghost triangles, and it does not get cheaper when less is moved.
-  //
-  // Seconds, and REDUCED AS A MAXIMUM OVER RANKS rather than summed. The phase
-  // loop is barrier-synchronised by the id collective, so the critical path is
-  // the slowest rank; a mean would hide exactly the load imbalance that the
-  // dispersed strategy and the coarsening path are judged on. One Allreduce of
-  // six doubles per PASS, against several migrations -- below the noise floor.
+  // --- Profile (distributed drivers only): seconds, maximum over ranks --------
+  // The critical path of a synchronised phase loop is the slowest rank; a mean
+  // would hide exactly the imbalance these are read for.
 
   double t_total;  ///< The whole call.
   double t_migrate;  ///< Migrations, including the closing MFTLRedistribute.
@@ -1027,38 +522,35 @@ typedef struct
   double t_reduce;  ///< The id and convergence collectives.
 
   /**
-   * Entities that LEFT this rank, summed over every migration of the pass.
-   *
-   * Rank-local on purpose: it answers "how much did I ship", which is what pairs
-   * with `t_migrate` on the same rank. A shifted placement moves every entity
-   * whose coordinate falls between the old plane and the new one, so this is a
-   * large fraction of the mesh and not a band -- measuring it is how that claim
-   * stops being an assumption.
+   * RANK-LOCAL: owned entities this rank sent away, summed over the pass's
+   * migrations. A shifted placement moves a large share of the mesh (87.5 % for
+   * (0,0,0) -> (1,1,1)), not only the band.
    */
   int n_entities_migrated;
 } MFTL_RemeshStats;
 
 /**
- * @brief Fills @p params with standard values for the given target edge length.
+ * @brief Fills @p params with defaults for target edge length @p target_length.
  *
- * The remaining fields are given defaults that are safe rather than aggressive;
- * a caller wanting Botsch & Kobbelt exactly sets smooth_iterations to 1 and
- * relaxation to 1.0.
+ * Defaults: one smoothing sweep at relaxation 1 (Botsch & Kobbelt), step cap
+ * 0.4, `max_normal_deviation_cos` 0.2, corner angle 45 degrees, ids renumbered,
+ * phase budget 32 (set 2-8 in a timestep loop), AUTO strategy with radius
+ * fraction 0.4, coarsening armed with the FROZEN and GATHER triggers off,
+ * balancer slack 1.25.
  *
  * @param[out] params                  Fully initialised parameter block.
- * @param      type                    #MFTL_REMESH_ISOTROPIC derives the band as
+ * @param      type                    #MFTL_REMESH_ISOTROPIC sets the band
  *                                     \f$[\tfrac45 L, \tfrac43 L]\f$;
- *                                     #MFTL_REMESH_CUSTOM leaves min/max to the
- *                                     caller, who must then call
+ *                                     #MFTL_REMESH_CUSTOM sets both bounds to
+ *                                     \f$L\f$ as placeholders for the caller to
+ *                                     overwrite before calling
  *                                     MFTLRemeshParamsFinalise().
- * @param      target_length           The edge length \f$L\f$ the mesh should
- *                                     converge to.
- * @param      iterations              Outer split/collapse/flip/smooth rounds.
- * @param      smooth_mode             Which neighbourhood the smoother's target
- *                                     point is built from.
- * @param      feature_angle_threshold Degrees. \f$\ge 180\f$ DISABLES feature
- *                                     detection, which is the correct production
- *                                     setting for any smooth closed interface.
+ * @param      target_length           Target edge length \f$L\f$.
+ * @param      iterations              Outer iterations.
+ * @param      smooth_mode             Smoother target point.
+ * @param      feature_angle_threshold Degrees; \f$\ge 180\f$ disables feature
+ *                                     detection (right for smooth closed
+ *                                     interfaces).
  */
 static inline void MFTLInitRemeshParams(MFTL_RemeshParameters *params, MFTL_RemeshType type, double target_length, int iterations, MFTL_SmoothMode smooth_mode,
                                         double feature_angle_threshold)
@@ -1078,8 +570,7 @@ static inline void MFTLInitRemeshParams(MFTL_RemeshParameters *params, MFTL_Reme
 
     case MFTL_REMESH_CUSTOM:
     default:
-      /* The caller overwrites these; equal bounds mean "do nothing" rather than
-       * an unbounded split/collapse loop if they forget. */
+      /* Placeholders for the caller to overwrite (then MFTLRemeshParamsFinalise). */
       params->min_edge_length = target_length;
       params->max_edge_length = target_length;
       break;
@@ -1111,20 +602,15 @@ static inline void MFTLInitRemeshParams(MFTL_RemeshParameters *params, MFTL_Reme
 }
 
 /**
- * @brief Body measurements taken in this process so far, and a reset.
+ * @brief Number of MFTLRemeshMeasureBodies() calls in this process since the
+ *        last reset.
  *
- * A DIAGNOSTIC AND A TEST HOOK, not a statistic. MFTLRemeshMeasureBodies is the
- * only O(num_objects) collective in the module -- two Allreduces, the first
- * carrying 7 doubles per body -- so how many times a pass takes it is the number
- * that decides the module's cost at ten thousand droplets. It is one per pass,
- * and it is one only because MFTLRemeshEnsemble threads the measurement from the
- * strategy choice into the dispersed driver rather than letting each take its
- * own. That arrangement is easy to undo by accident and impossible to see in a
- * profile, so a test asserts the count.
+ * A test hook: a pass must measure the bodies once, which MFTLRemeshEnsemble()
+ * achieves by handing the strategy choice's measurement to the dispersed
+ * driver.
  *
- * @return Body measurements taken by this process since the last reset.
- *
- * @rank_local A plain per-process counter, neither collective nor reduced.
+ * @return Body measurements since the last reset.
+ * @rank_local A plain per-process counter.
  */
 int MFTLRemeshMeasurementCount(void);
 
@@ -1135,25 +621,15 @@ int MFTLRemeshMeasurementCount(void);
 void MFTLRemeshResetMeasurementCount(void);
 
 /**
- * @brief Doubles this rank has STAGED for the dispersed balancer, and a reset.
+ * @brief Doubles this rank has staged for the dispersed balancer's exchanges
+ *        since the last reset.
  *
- * A TEST HOOK FOR A SCALING PROPERTY, and it exists because that property has no
- * other observable. The balancer decides where every body is remeshed; it used
- * to do so by replicating `4 * n_bodies_global` doubles onto every rank, and it
- * now decides each body on ONE rank and delivers the verdict one hop along
- * `comm_graph`. Both give a correct, balanced, reproducible mesh -- so every
- * digest, every soundness check and every imbalance figure in the suite is
- * blind to the difference, exactly as `MFTLEnsembleGetBodyReduceStats()` is the
- * only thing that can see a per-body reduction pinned to `comm_world`.
- *
- * What this counts is what THIS rank puts on the wire: three doubles per body it
- * speaks for, three per body it moves, and a fixed handful per graph neighbour.
- * The number to assert is therefore that a rank holding NO BODY sends NOTHING,
- * however many bodies the ensemble has -- under replication it sent `4B`.
+ * A test hook for a scaling property no mesh digest can see: a rank holding no
+ * body must stage the same amount however large the ensemble is
+ * (`test_the_balancer_payload_ignores_bodies_a_rank_does_not_hold`).
  *
  * @return Doubles staged since the last reset.
- *
- * @rank_local A plain per-process counter, neither collective nor reduced.
+ * @rank_local A plain per-process counter.
  */
 long MFTLRemeshBalancerPayload(void);
 
@@ -1164,11 +640,8 @@ long MFTLRemeshBalancerPayload(void);
 void MFTLRemeshResetBalancerPayload(void);
 
 /**
- * @brief Recomputes the squared length band after min/max were set by hand.
- *
- * Every length test in the module works on squares, so the two squared bounds
- * are the ones the sweeps actually read. Call this after setting
- * `min_edge_length` / `max_edge_length` directly under #MFTL_REMESH_CUSTOM.
+ * @brief Recomputes the squared bounds after `min_edge_length` /
+ *        `max_edge_length` were set by hand (#MFTL_REMESH_CUSTOM).
  *
  * @param params Parameter block; `min_edge_length_sq` and `max_edge_length_sq`
  *               are overwritten.
@@ -1183,28 +656,22 @@ static inline void MFTLRemeshParamsFinalise(MFTL_RemeshParameters *params)
 // 2. TOPOLOGICAL OPERATORS  (src/remeshing/remesh_ops.c)
 // -----------------------------------------------------------------------------
 //
-// Each operator has an APPROVAL predicate and an EXECUTION function, and they
-// are separate on purpose: the predicate is the entire correctness argument, the
-// execution assumes it has already been made. A distributed driver will need to
-// evaluate the predicates on one rank and replay the executions on another, and
-// that is only possible if they do not share state.
-//
-// EVERY EXECUTION FUNCTION MAY REALLOCATE THE POOLS. Any raw pointer into
-// obj->verts.* or obj->tris.* held across one of these calls is dangling.
-// Hold indices.
+// Each operator is an approval predicate plus an execution function. The
+// predicates carry the whole correctness argument; the executions assume it.
+// MFTLSplitEdge() appends and may reallocate the pools: hold indices, not
+// pointers, across it.
 
 /**
  * @brief Is half-edge @p h a legal and wanted split candidate?
  *
- * Wanted: longer than `params->max_edge_length`. Legal: alive, not already
- * touched this sweep, and CANONICAL -- an undirected edge is offered to the
- * operators once, through the half-edge of smaller index, because splitting one
- * direction splits both.
+ * Wanted: longer than `max_edge_length`. Legal: alive, not touched earlier in
+ * this sweep, and the canonical half of its edge (the smaller half-edge index,
+ * or the only one at a boundary), so every undirected edge is offered once.
  *
  * @param obj    The mesh.
  * @param h      Half-edge index.
  * @param params Supplies `max_edge_length_sq`.
- * @return `true` if the split sweep should perform this split.
+ * @return `true` if the split sweep should split this edge.
  */
 bool MFTLSplitApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParameters *params);
 
@@ -1219,113 +686,107 @@ bool MFTLSplitApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParameter
  *       \ /                  \|/
  *        D                    D
  *
- * Rewrites the incident triangle(s) and appends one new triangle per side. The
- * midpoint is computed through the minimum-image convention and wrapped, so it
- * is the true midpoint even for an edge crossing a periodic face.
+ * Rewrites the incident triangle(s) and appends one triangle per side. M is the
+ * minimum-image midpoint, wrapped into the domain, and inherits the edge's
+ * FEATURE/BOUNDARY classification, as do both halves. M and the halves are
+ * marked visited, so the same sweep neither re-splits nor collapses them.
  *
  * @param obj The mesh. **May reallocate the pools.**
  * @param h   Half-edge index, normally one MFTLSplitApproved() accepted.
- * @return The pool index of the new vertex M, or #MFTL_ERROR if @p h is not a
- *         live half-edge.
+ * @return Pool index of M, or #MFTL_ERROR if @p h is not a live half-edge.
  */
 int MFTLSplitEdge(MFTL_Object *obj, int h);
 
 /**
- * @brief Is collapsing half-edge @p h (origin into target) legal and wanted?
+ * @brief Is collapsing half-edge @p h (its origin into its target) legal and
+ *        wanted?
  *
- * Wanted: shorter than params->min_edge_length. Legal is the long half, and each
- * clause below removes a failure that is silent rather than loud:
+ * Wanted: shorter than `min_edge_length`. Each clause prevents a result that is
+ * a valid data structure but not a valid surface, and none of them fails loudly:
  *
- *   LINK CONDITION      the endpoints must share exactly two neighbours (one at
- *                       a mesh boundary edge). Violating it welds two sheets of
- *                       the surface together into a non-manifold vertex, and
- *                       every subsequent one-ring walk from it is wrong.
- *   VALENCE             both wing vertices must keep valence >= 3, and the
- *                       merged vertex must stay inside MFTL_MAX_VALENCE.
- *   STRETCH             no edge of the merged vertex may exceed
- *                       max_edge_length, or the next sweep splits it straight
- *                       back and the two sweeps oscillate forever.
- *   FOLD-OVER           no surviving triangle's normal may turn by more than
- *                       params->max_normal_deviation_cos.
- *   FEATURES            a feature vertex may not collapse into a non-feature
- *                       one (it drags the ridge off its curve), a corner may not
- *                       collapse at all, and a boundary vertex may not collapse
- *                       into an interior one.
+ * - **Features:** a corner is never retired; a feature (boundary) vertex may
+ *   only collapse into a feature (boundary) vertex; two feature (boundary)
+ *   vertices joined by a non-feature (interior) edge may not collapse -- that
+ *   edge is a chord, and collapsing it pinches the curve.
+ * - **Link condition:** the endpoints share exactly two neighbours (one at a
+ *   boundary edge); otherwise two sheets are welded into a non-manifold vertex.
+ * - **Valence:** the merged vertex has valence in [3, #MFTL_MAX_VALENCE], and
+ *   each wing vertex has at least 4 neighbours (a tetrahedron passes the link
+ *   condition and would dissolve).
+ * - **Stretch:** no edge of the merged vertex exceeds `max_edge_length`, or
+ *   split and collapse oscillate.
+ * - **Fold-over:** no surviving triangle's normal turns by more than
+ *   `max_normal_deviation_cos` or becomes degenerate (the test is relative to
+ *   the triangle's own edges, so it is independent of the length unit).
+ *
+ * Truncated one-ring walks (valence beyond the scratch size) are refused.
  *
  * @param      obj           The mesh.
- * @param      h             Half-edge index. Its ORIGIN is the vertex that would
- *                           be retired.
+ * @param      h             Half-edge index; its ORIGIN would be retired.
  * @param      params        Supplies the length band, the fold-over threshold
  *                           and the feature settings.
- * @param[out] reject_reason May be #MFTL_NULL. Receives one of the
- *                           `MFTL_REMESH_REJECT_*` codes, for the statistics.
- * @return `true` if the collapse is both legal and wanted.
+ * @param[out] reject_reason May be #MFTL_NULL. Receives a
+ *                           `MFTL_REMESH_REJECT_*` code.
+ * @return `true` if the collapse is legal and wanted.
  */
 bool MFTLCollapseApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParameters *params, int *reject_reason);
 
 /**
  * @name Rejection codes
  *
- * Reported through the `reject_reason` out-parameter of MFTLCollapseApproved()
- * and MFTLFlipApproved(). They are tallied into #MFTL_RemeshStats because the
- * interesting failure mode of a remesher is not a crash -- it is a pass that
- * reports success having refused most of its own operations.
+ * Reported through `reject_reason` of MFTLCollapseApproved() and
+ * MFTLFlipApproved() and tallied into #MFTL_RemeshStats.
  * @{
  */
 /** @brief Not rejected. */
 #define MFTL_REMESH_REJECT_NONE 0
-/** @brief Link condition failed: the collapse would weld two sheets into a non-manifold vertex. */
+/** @brief Link condition or valence bound failed. */
 #define MFTL_REMESH_REJECT_LINK 1
-/** @brief The operation would invert a triangle, i.e. flip its normal past `max_normal_deviation_cos`. */
+/** @brief A triangle would turn past `max_normal_deviation_cos` or degenerate. */
 #define MFTL_REMESH_REJECT_FOLD 2
 /** @brief Blocked by a feature, boundary or corner rule. */
 #define MFTL_REMESH_REJECT_FEATURE 3
-/** @brief Refused for any other reason -- dead entity, wrong length band, already visited. */
+/** @brief Any other reason: not wanted, dead or visited entity, stretch bound, truncated one-ring. */
 #define MFTL_REMESH_REJECT_OTHER 4
 /** @} */
 
 /**
  * @brief Collapses the edge of half-edge @p h, retiring its ORIGIN vertex.
  *
- * The surviving vertex is the target, moved to the position
- * MFTLCollapseApproved() evaluated: the midpoint, unless exactly one endpoint is
- * a feature or boundary vertex, in which case that endpoint's position is kept
- * so the curve is not pulled off itself.
+ * The target survives and moves to the position MFTLCollapseApproved()
+ * evaluated: its own position if it is a corner or if it alone lies on a
+ * feature curve or boundary, otherwise the minimum-image midpoint. The one or
+ * two incident triangles and the origin are flagged #MFTL_FLAG_DEAD; pool
+ * indices do not change until MFTLRemeshCompactObject().
  *
- * The two incident triangles and the origin vertex are flagged #MFTL_FLAG_DEAD.
- * Pool indices do NOT change here -- MFTLRemeshCompactObject() removes them.
- * A collapse cannot free anything, because a triangle's half-edges ARE its
- * storage.
- *
- * @param obj The mesh.
+ * @param obj The mesh. Allocates nothing.
  * @param h   Half-edge index, normally one MFTLCollapseApproved() accepted.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR if @p h was not collapsible.
  */
 int MFTLCollapseEdge(MFTL_Object *obj, int h);
 
 /**
- * @brief Would flipping half-edge @p h lower the total squared valence deviation?
- *
- * The target valence is 6 in the interior and 4 on a mesh boundary, and the flip
- * is approved only on a STRICT decrease -- an equality would let two flips
- * alternate forever. Additionally rejected when the two opposite vertices are
- * already adjacent (the flip would create a duplicate edge), and when it would
- * turn a triangle normal by more than params->max_normal_deviation_cos, which is
- * what a flip across a non-convex quad does.
+ * @brief Would flipping half-edge @p h strictly lower the squared valence
+ *        deviation of the four quad vertices?
  *
  * \f[
  *   E = \sum_{v \in \{a,b,c,d\}} \big(\deg(v) - \deg^{*}(v)\big)^{2},
  *   \qquad \deg^{*} = \begin{cases} 6 & \text{interior} \\ 4 & \text{boundary} \end{cases}
  * \f]
  *
+ * (\f$\deg\f$ counts neighbours). Only a STRICT decrease is accepted, or two
+ * flips could alternate forever. Refused for boundary and feature edges, when
+ * an endpoint has three neighbours or fewer, when the opposite vertices are
+ * already adjacent (a duplicate edge), when a valence would exceed
+ * #MFTL_MAX_VALENCE, and when either new triangle would turn past
+ * `max_normal_deviation_cos` against the quad's normal (a non-convex quad).
+ *
  * @param      obj           The mesh.
  * @param      h             Half-edge index.
  * @param      params        Supplies `max_normal_deviation_cos`.
- * @param[out] reject_reason May be #MFTL_NULL. #MFTL_REMESH_REJECT_FOLD when the
- *                           valence criterion WANTED the flip and the geometry
- *                           refused it, which is the only rejection worth
- *                           counting -- an edge the valence criterion declines is
- *                           the criterion working, not a failure.
+ * @param[out] reject_reason May be #MFTL_NULL. #MFTL_REMESH_REJECT_FOLD only when
+ *                           the valence criterion wanted the flip and the
+ *                           geometry refused it.
  * @return `true` if the flip strictly lowers \f$E\f$ and is geometrically legal.
  */
 bool MFTLFlipApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParameters *params, int *reject_reason);
@@ -1333,13 +794,13 @@ bool MFTLFlipApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParameters
 /**
  * @brief Flips the edge of half-edge @p h to the other diagonal of its quad.
  *
- * Allocation-free: both triangles are rewritten in place and four rim twins are
- * re-pointed. Triangle and half-edge global ids are untouched, because a
- * half-edge's id is a function of its SLOT, never of the logical edge.
+ * Both triangles are rewritten in place and four rim twins re-pointed; nothing
+ * is allocated and no global id changes. The new diagonal is marked visited for
+ * the rest of the sweep.
  *
  * @param obj The mesh.
  * @param h   Half-edge index, normally one MFTLFlipApproved() accepted.
- * @return #MFTL_SUCCESS, or #MFTL_ERROR at a boundary edge (which has no quad).
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR at a boundary edge.
  */
 int MFTLFlipEdge(MFTL_Object *obj, int h);
 
@@ -1348,26 +809,20 @@ int MFTLFlipEdge(MFTL_Object *obj, int h);
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Removes every MFTL_FLAG_DEAD entity and every orphaned vertex.
+ * @brief Removes every #MFTL_FLAG_DEAD entity and every orphaned vertex, and
+ *        restores the ownership prefix.
  *
- * Both pools are compacted in place with a forward scan, so the new index of an
- * entity is never greater than its old one and the moves are memmove-safe.
- * `he.vertex_idx`, `he.twin_idx` and `rec.out_he_idx` are remapped; half-edges
- * move as TRIPLES with their triangle, which is what preserves both the implicit
- * indexing invariant and the implicit half-edge global ids.
- *
- * `out_he_idx` is not remapped but RE-DERIVED, in one pass over the surviving
- * half-edges -- the same rule MFTLBuildTopologyFromIndexList uses. A local
- * repair after each collapse would be O(1) instead of O(H), and would be a
- * separate correctness argument for every operator; this is one argument for all
- * of them.
- *
- * Rebuilds the derived arrays, so the object is fully valid on return. The
- * cached geometry (`tris.area/normal/center`, `verts.normal/...`) is permuted
- * along rather than discarded, so it stays valid if it was valid.
+ * A forward compaction of both pools (half-edges move as triples with their
+ * triangle, which preserves implicit indexing and the implicit half-edge ids)
+ * followed, on a partitioned object, by a swap of the two trailing blocks: the
+ * sweeps append past the ghosts, so the survivors come out as
+ * [owned | ghosts | created] and the swap makes the owned entities a prefix
+ * again. `he.vertex_idx` and `he.twin_idx` are remapped, `out_he_idx` is
+ * re-derived from the surviving half-edges, the derived arrays are rebuilt, and
+ * the cached geometry is permuted along with its entities.
  *
  * @param      obj   The mesh, compacted in place.
- * @param[out] stats May be #MFTL_NULL. `n_vertices_removed` /
+ * @param[out] stats May be #MFTL_NULL. `n_vertices_removed` and
  *                   `n_orphans_removed` are accumulated into it.
  * @return The number of entities removed (vertices plus triangles).
  * @rank_local
@@ -1375,15 +830,15 @@ int MFTLFlipEdge(MFTL_Object *obj, int h);
 int MFTLRemeshCompactObject(MFTL_Object *obj, MFTL_RemeshStats *stats);
 
 /**
- * @brief Makes the global ids of both classes dense in [0, n) again.
+ * @brief Renumbers vertex and triangle global ids densely as \f$[0, n)\f$ in
+ *        slot order and stamps the partition dirty.
  *
- * SERIAL ONLY, and asserted: correct exactly when this rank holds the entire
- * object, because it is a local decision about a mesh-wide namespace. See the
- * file header for why it has to happen at all.
+ * Asserts that the object holds no ghosts: the renumbering is a local decision
+ * about a mesh-wide namespace, correct only when this rank holds the whole
+ * object.
  *
  * @param obj The mesh. Every `global_id` and all three `next_*_gid` counters are
- *            rewritten; half-edge ids follow from \f$3\,t_\mathrm{gid} + k\f$.
- *
+ *            rewritten; half-edge ids follow as \f$3\,t_\mathrm{gid} + k\f$.
  * @rank_local
  */
 void MFTLRemeshRenumberGlobalIds(MFTL_Object *obj);
@@ -1393,96 +848,64 @@ void MFTLRemeshRenumberGlobalIds(MFTL_Object *obj);
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Marks sharp edges MFTL_FLAG_FEATURE and classifies every vertex.
+ * @brief Flags feature edges and classifies every vertex as free, ridge or
+ *        corner.
  *
- * Two outputs, from two linear passes and no fan walks at all:
+ * Recomputes `tris.normal` first (after a split, new triangles have none). Then,
+ * in linear passes over undirected edges (no fan walks, which would miss the
+ * closing edge of an open fan):
  *
- *   HALF-EDGES  FEATURE set on both directions of every edge whose dihedral
- *               angle exceeds @p angle_degrees, and on every mesh-boundary
- *               half-edge unconditionally. Cleared elsewhere, so a fold that
- *               has since been smoothed out stops being a feature.
- *   VERTICES    FEATURE for exactly two incident feature edges that continue
- *               roughly straight through the vertex (a ridge point), CORNER for
- *               one, for three or more, or for two that turn by more than
- *               @p corner_angle_degrees, neither for zero.
+ * - **edges:** #MFTL_FLAG_FEATURE on both halves of every edge whose face
+ *   normals differ by more than @p angle_degrees, and on every mesh-boundary
+ *   edge; cleared elsewhere, so a smoothed-out fold stops being a feature. A
+ *   missing twin counts as a boundary only on an owned triangle -- on a ghost it
+ *   is the rim of the halo, and #MFTL_FLAG_BOUNDARY decides;
+ * - **vertices:** #MFTL_FLAG_FEATURE (ridge point) for exactly two feature edges
+ *   continuing within @p corner_angle_degrees of straight; #MFTL_FLAG_CORNER for
+ *   one, three or more, or two that turn more sharply; neither for none.
  *
- * The turn test is what makes an open patch's four corners corners: each has
- * exactly two rim edges, so a count alone classifies them as ridge points free to
- * slide along the diagonal between their neighbours -- which takes them straight
- * off the patch. It is a separate threshold because it applies even when dihedral
- * detection is off; see MFTL_RemeshParameters.feature_corner_angle.
- *
- * Doing the vertex classification HERE rather than in the smoother is what keeps
- * the smoothing sweeps free of fan walks: the smoother runs several times per
- * remeshing iteration and would otherwise re-derive the same counts each time.
- *
- * The count is over UNDIRECTED edges -- each is visited once, through the
- * half-edge of smaller index -- which is also what makes the boundary case come
- * out right. A fan walk over outgoing half-edges misses the closing edge of an
- * open fan entirely (mftl_topology.h says so about
- * MFTLGetVertexOneRingHalfedges), so a boundary vertex counted that way is short
- * by one and lands in the wrong class.
- *
- * Recomputes `tris.normal` itself via MFTLComputeTriangleGeometry rather than
- * trusting whatever is in the pool. A feature detector reading stale normals
- * silently classifies the mesh as it was one topological edit ago, and after a
- * split the new triangles' normals have never been written at all.
- *
- * @param      obj                    The mesh. Entity flags are rewritten and
- *                                    `tris.normal` is refreshed.
- * @param      angle_degrees          Dihedral angle in DEGREES. \f$\ge 180\f$
- *                                    disables detection: everything is cleared
- *                                    and only mesh boundaries stay features.
- * @param      corner_angle_degrees   Turn angle above which a vertex with two
- *                                    feature edges is a CORNER rather than a
- *                                    slidable ridge point.
- * @param[out] stats                  May be #MFTL_NULL. Receives the edge and
- *                                    vertex-class counts.
+ * @param      obj                  The mesh. Flags rewritten, `tris.normal`
+ *                                  refreshed.
+ * @param      angle_degrees        Normal-angle threshold in degrees;
+ *                                  \f$\ge 180\f$ disables it, leaving only
+ *                                  boundaries as features.
+ * @param      corner_angle_degrees Turn angle above which a two-edge vertex is a
+ *                                  corner.
+ * @param[out] stats                May be #MFTL_NULL. Receives the edge and
+ *                                  vertex-class counts.
  * @return The number of undirected feature edges.
  * @rank_local
  */
 int MFTLDetectFeatures(MFTL_Object *obj, double angle_degrees, double corner_angle_degrees, MFTL_RemeshStats *stats);
 
 /**
- * @brief Tangential Laplacian smoothing, @p iterations Jacobi sweeps.
+ * @brief Tangential smoothing: @p iterations Jacobi sweeps in which each vertex
+ *        moves towards its neighbourhood centre, PROJECTED onto the subspace its
+ *        feature class allows.
  *
- * Each vertex is treated according to the class MFTLDetectFeatures() gave it,
- * and the three cases differ in the SUBSPACE the displacement is projected onto
- * -- 0D, 1D and 2D respectively:
+ * - **Corner:** locked (0D).
+ * - **Ridge:** the pull towards the midpoint of its two feature neighbours,
+ *   projected onto the ridge tangent (1D). Moving to the midpoint itself cuts
+ *   the chord and erodes the ridge.
+ * - **Free:** the pull towards the target point of `smooth_mode`, minus its
+ *   component along the area-weighted vertex normal (2D). Without the
+ *   projection, Laplacian smoothing shrinks the surface.
  *
- *   CORNER   locked. Zero degrees of freedom.
+ * Vertex normals come from MFTLComputeVertexNormals(), refreshed every sweep; a
+ * vertex whose normal is zero (degenerate one-ring) stays put. Steps are scaled
+ * by `smooth_relaxation` and capped at `smooth_max_step_fraction` of the
+ * shortest incident edge. All differences are minimum-image vectors and
+ * positions are wrapped, so the smoother is seam-safe. Frozen vertices and
+ * ghosts are not moved but are read, which makes a distributed sweep exact
+ * without communication. Jacobi updates make the result independent of pool
+ * order.
  *
- *   RIDGE    the Laplacian displacement towards the midpoint of the two feature
- *            neighbours, projected onto the ridge TANGENT. This redistributes
- *            the vertex along its feature curve without moving the curve.
+ * @param obj        The mesh; positions updated in place.
+ * @param params     Supplies `smooth_mode`, `smooth_relaxation` and
+ *                   `smooth_max_step_fraction`.
+ * @param iterations Sweeps to perform.
  *
- *            The projection is the whole point. Moving to the midpoint itself,
- *            at full strength and ignoring the relaxation factor, is a chord
- *            cut: it pulls the
- *            vertex off the curve towards the straight line between its
- *            neighbours, so a repeatedly smoothed ridge shrinks. Over the tens
- *            of sweeps a remeshing pass performs, that is a large systematic
- *            error, and it is applied precisely where the geometry was supposed
- *            to be PRESERVED.
- *
- *   FREE     the displacement towards the area-weighted centroid of the incident
- *            triangles (or the umbrella centroid, per params->smooth_mode),
- *            projected onto the TANGENT PLANE by removing its component along
- *            the exact area-weighted vertex normal.
- *
- * The normal comes from MFTLComputeVertexNormals(), refreshed each sweep, which
- * uses a flat triangle pass with no fan walk or dependent topology loads.
- *
- * Every difference is a minimum-image vector and every result is wrapped, so the
- * smoother is correct across a periodic seam.
- *
- * @param obj        The mesh. Positions are updated in place.
- * @param params      Supplies `smooth_mode`, `smooth_relaxation` and
- *                    `smooth_max_step_fraction`.
- * @param iterations  Sweeps to perform. Each is a full Jacobi update: all new
- *                    positions are computed from the old ones, then applied.
- *
- * @note Requires #MFTL_DERIVED_TOPOLOGY.
+ * @note Requires #MFTL_DERIVED_TOPOLOGY and a current feature classification.
  * @rank_local
  */
 void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params, int iterations);
@@ -1492,21 +915,19 @@ void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params,
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Remeshes one object to params->target_length. The serial entry point.
+ * @brief Remeshes one whole object towards `params->target_length`: the serial
+ *        entry point.
  *
- * Asserts the object holds no ghosts: an edge with an endpoint on another rank
- * cannot be collapsed without agreement, so a "serial" remesh of a partitioned
- * object would silently produce a different mesh on each rank.
- *
- * On return the object has valid topology, derived connectivity current, and
- * current `tris.area/normal/center`. `verts.normal` is NOT refreshed after the
- * final position update: it holds the normals the last smoothing sweep moved
- * against (and is untouched if no sweep ran), so a caller that reads vertex
- * normals owes MFTLComputeVertexNormals(). No integrity check is run; call
- * MFTLCheckMeshIntegrity() for one.
+ * Asserts that the object holds no ghosts -- a partitioned object needs
+ * MFTLRemeshEnsemble(). Zeroes @p stats, runs up to `params->iterations`
+ * iterations (see the file header), renumbers ids if requested, and returns an
+ * object with valid topology, current derived arrays and current
+ * `tris.area/normal/center`. `verts.normal` holds the normals of the last
+ * smoothing sweep, not of the final positions; call MFTLComputeVertexNormals()
+ * if needed.
  *
  * @param      obj    The mesh, remeshed in place.
- * @param      params The parameter block. See MFTLInitRemeshParams().
+ * @param      params The parameter block (MFTLInitRemeshParams()).
  * @param[out] stats  May be #MFTL_NULL.
  * @return #MFTL_SUCCESS.
  * @rank_local
@@ -1514,51 +935,28 @@ void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params,
 int MFTLRemeshObject(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats);
 
 /**
- * @brief Remeshes every object of an ensemble. The entry point to use.
+ * @brief Remeshes every object of an ensemble: the entry point to use.
  *
- * Dispatches on the rank count, and the paths are genuinely different algorithms
- * rather than one with a fast case:
+ *     nproc == 1 -> MFTLRemeshObject() per object (no MPI; the serial answer)
+ *     SPANNING   -> MFTLRemeshEnsembleParallel()
+ *     DISPERSED  -> MFTLRemeshEnsembleDispersed()
+ *     AUTO       -> measure the bodies once (MFTLRemeshMeasureBodies()), then
+ *                   r_max > dispersed_radius_fraction * box ? SPANNING : DISPERSED
  *
- *   MFTLRemeshEnsemble
- *   |
- *   +-- nproc == 1 ?  --yes-->  MFTLRemeshObject per object.  NO MPI AT ALL, and
- *   |                           the result is bit-identical to the serial answer.
- *   |
- *   +-- params->parallel_strategy
- *       |
- *       +-- SPANNING  ------------------->  MFTLRemeshEnsembleParallel
- *       +-- DISPERSED ------------------->  MFTLRemeshEnsembleDispersed
- *       +-- AUTO
- *           |
- *           +-- MFTLRemeshChooseStrategyMeasured        two Allreduces
- *               |  (centroid, radius and triangle count of every body)
- *               |
- *               +-- max radius > dispersed_radius_fraction * box ?
- *                     yes -->  MFTLRemeshEnsembleParallel    move the PLANES
- *                     no  -->  MFTLRemeshEnsembleDispersed   move the BODIES
- *
- * The measurement AUTO takes is handed straight to the dispersed driver rather
- * than retaken, so the choice costs two collectives and not four.
- * MFTL_RemeshStats::strategy reports what actually ran.
- *
- * The call graph of each driver, with the decision taken at every branch and the
- * cost of every collective, is in src/remeshing/README.md (@ref rem_dispatch,
- * @ref rem_spanning_flow, @ref rem_dispersed_flow).
+ * The AUTO measurement is handed to the dispersed driver rather than retaken.
+ * MFTL_RemeshStats::strategy reports what ran. Call graphs: @ref rem_dispatch,
+ * @ref rem_spanning_flow, @ref rem_dispersed_flow.
  *
  * @param      ens    The ensemble, remeshed in place.
- * @param      params The parameter block.
- * @param[out] stats  May be #MFTL_NULL. Receives the SUM over all objects; in
- *                    the parallel case the counts are this rank's, except
- *                    `converged` and `n_edges_hidden*`, which are global.
- * @return #MFTL_SUCCESS, or #MFTL_ERROR if any object failed.
+ * @param      params The parameter block, identical on every rank (checked in
+ *                    Debug).
+ * @param[out] stats  May be #MFTL_NULL. Sums over the objects; see
+ *                    #MFTL_RemeshStats for which fields are rank-local.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR if any object or migration failed.
  *
- * @collective For `nproc > 1`, including ranks holding no triangles of any
- *             object -- they still take part in every migration and every
- *             reduction.
- *
- * @warning **Both drivers must be reached by every rank.** The choice is made
- *          from REDUCED data and never from anything local; two ranks entering
- *          different drivers is an immediate deadlock with no diagnostic.
+ * @collective For `nproc > 1`, including ranks holding nothing. The strategy
+ *             is decided from reduced data only; two ranks in different
+ *             drivers would deadlock.
  */
 int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats);
 
@@ -1567,53 +965,39 @@ int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, 
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Remeshes a distributed ensemble by shifting the cut planes.
+ * @brief Remeshes a distributed ensemble by shifting the cut planes (SPANNING).
  *
- * Reached through MFTLRemeshEnsemble; exposed separately because a caller may
- * want to run the phase schedule at nproc == 1 to compare it against the serial
- * answer, which is what the test suite does.
+ * Normally reached through MFTLRemeshEnsemble(); public so the schedule can be
+ * run at `nproc == 1` against the serial answer.
  *
- * ── The loop ───────────────────────────────────────────────────────────────
+ *     [optional pre-pass: measure band and frozen share, choose coarsening]
+ *     per placement: migrate (skipped if identity) -> MFTLRemeshMarkFrozen
+ *                    -> count hidden edges -> MFTLRemeshIterate on the interior
+ *                    -> per-body id prefix sums over the holders
+ *                    -> 3-int Allreduce (operations, hidden long, hidden short)
+ *                    -> converged?
+ *     at the end:    re-densify ids (ghost vertex ids exchanged)
+ *                    -> MFTLRedistribute to the canonical partition -> geometry
  *
- *   per phase:  place the planes  ->  migrate  ->  classify frozen  ->
- *               run the serial kernel on the interior  ->  one Exscan and one
- *               Allreduce (new ids, and the verdict)
- *   at the end: canonical planes  ->  re-densify ids  ->  migrate  ->  geometry
+ * No ghost position sync is needed inside the loop: every ghost in a rank's
+ * pool is frozen on its owner, so the copies are still exact after the sweeps.
  *
- * TWO COLLECTIVES PER PHASE plus one migration, and neither scales with the mesh
- * size. There is deliberately NO ghost position sync in the loop: every ghost in
- * a rank's pool is frozen on its owner, so the copies are still exact when the
- * sweeps finish. That is a theorem about the classification, not an
- * approximation -- the argument is in src/remeshing/remesh_parallel.c and it is
- * what one otherwise-unavoidable neighbour exchange per phase rests on.
+ * Preconditions: MFTLRegisterMpiTypes() called; the same bodies on every rank
+ * in the same order with agreeing `next_*_gid` (checked in Debug); a positive
+ * length band; \f$h > 4\delta\f$ (warned about once, see
+ * MFTL_RemeshStats::converged).
  *
- * ── Preconditions ──────────────────────────────────────────────────────────
- *
- *   - MFTLRegisterMpiTypes() has been called (the driver migrates).
- *   - Every rank added the same bodies in the same order, and every holder of a
- *     body agrees on its next_*_gid. Both are checked in Debug.
- *   - h_min > 4 * delta, delta ~ (3 + freeze_dilation_rings) * max_edge_length.
- *     Warned about once rather than enforced; see MFTL_RemeshStats.converged.
- *
- * ── Postconditions ─────────────────────────────────────────────────────────
- *
- *   - Canonical decomposition restored: the mesh is partitioned exactly as
- *     MFTLRedistribute would have partitioned it, because the closing migration
- *     IS MFTLRedistribute.
- *   - Global ids dense over the whole mesh again, and consistent between every
- *     ghost and its owner.
- *   - Valid topology, current derived connectivity, current `tris.area/normal/center`.
- *     `verts.normal` is NOT current -- the closing migration discards it; call
- *     MFTLEnsembleUpdateVertexNormals if you need it.
- *   - MFTL_FLAG_FROZEN cleared everywhere.
+ * Postconditions: the canonical partition (the closing migration IS
+ * MFTLRedistribute()); dense global ids, consistent between ghosts and owners;
+ * valid topology, current derived arrays and `tris.area/normal/center`;
+ * `verts.normal` NOT current (use MFTLEnsembleUpdateVertexNormals());
+ * #MFTL_FLAG_FROZEN cleared.
  *
  * @param      ens    The ensemble, remeshed in place.
- * @param      params The parameter block. `parallel_phase_budget` and
- *                    `parallel_coarsen` are read here and nowhere else.
- * @param[out] stats  May be #MFTL_NULL. The phase, migration and band fields are
- *                    GLOBAL; the operation counts are rank-local.
- * @return #MFTL_SUCCESS, or #MFTL_ERROR if a migration or the id exchange failed.
- *
+ * @param      params The parameter block.
+ * @param[out] stats  May be #MFTL_NULL.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR if the band is not positive or a
+ *         migration or the id exchange failed.
  * @collective
  */
 int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats);
@@ -1623,298 +1007,166 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Remeshes a distributed ensemble by moving the BODIES, not the planes.
+ * @brief Remeshes a distributed ensemble by moving the BODIES (DISPERSED).
  *
- * The strategy for an ensemble of objects each smaller than a rank box -- an
- * emulsion, a spray, a bubbly flow -- and it is not a variant of the shift
- * schedule but its opposite. Every entity of a body is migrated to the rank
- * owning the body's global centroid, so the body arrives complete on one rank
- * with no ghosts; the UNMODIFIED serial kernel then runs on 100 % of it.
+ * For bodies smaller than a rank box (emulsions, sprays, bubbly flows). Every
+ * entity of a body is migrated to one rank -- its centroid's owner, adjusted by
+ * the load balancer (`dispersed_balance_slack`) -- so the body arrives whole
+ * with no ghosts and MFTLRemeshObject() runs on it unchanged. No freezing, no
+ * phases, exactly two migrations (out, and the closing MFTLRedistribute()); ids
+ * need only a per-body MAX of the id counters over the holders.
  *
- * ── What that removes ──────────────────────────────────────────────────────
- *
- * Three things the spanning driver needs, and none of them for free:
- *
- *   the frozen classification   there is nothing replicated, so nothing to
- *                               freeze and no operation refused. The gates in
- *                               the sweeps are the no-ops they already are in
- *                               serial.
- *   the phase schedule          one migration out, one back, whatever the mesh
- *                               looks like -- against 4-17 measured for the
- *                               shift schedule on the same sphere.
- *   the per-phase id collective ONE rank owns a whole body, so the operators'
- *                               local ids are already globally unique for it.
- *                               The only agreement needed is a single
- *                               Allreduce(MAX) of the id counters at the end,
- *                               so that every rank sizes its arrival tables the
- *                               same way.
- *
- * ── What it costs ──────────────────────────────────────────────────────────
- *
- * LOAD BALANCE. Bodies go where their centroids are, so a rank holding no
- * droplet does no remeshing work, and a rank holding six does six bodies' worth.
- * For N_bodies >> P that averages out; for N_bodies < P it does not, and nothing
- * fixes it, because there is no remeshing work for a rank that holds no body.
- * `parallel_coarsen` is NOT the answer here -- it addresses the spanning path's
- * band precondition, not this.
- *
- * ── The fallback ───────────────────────────────────────────────────────────
- *
- * If any body fails to become wholly local -- it grew past a rank box since it
- * was measured, or the caller forced this strategy on a spanning mesh -- the
- * whole ensemble is handed to MFTLRemeshEnsembleParallel BEFORE anything is
- * remeshed, so there is never a half-remeshed intermediate state. The decision
- * is one Allreduce of one int. `MFTL_RemeshStats.n_bodies_not_centred` reports
- * it; the answer is correct either way, the cost is one wasted migration.
- *
- * Preconditions and postconditions are exactly MFTLRemeshEnsembleParallel's,
- * minus the h > 4*delta band condition, which this strategy does not have --
- * that is the point of it.
+ * Admission is tested BEFORE anything moves, on the body radius (a
+ * one-destination migration would make any body local, even one spanning the
+ * domain, and serialise it onto one rank): if any body is too large, the whole
+ * ensemble goes to MFTLRemeshEnsembleParallel() untouched
+ * (MFTL_RemeshStats::n_bodies_not_centred). Pre- and postconditions are those
+ * of MFTLRemeshEnsembleParallel() without the band condition.
  *
  * @param      ens    The ensemble, remeshed in place.
- * @param      params The parameter block. `dispersed_radius_fraction` is read
- *                    here and in MFTLRemeshChooseStrategy().
+ * @param      params The parameter block.
  * @param[out] stats  May be #MFTL_NULL.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR if a migration failed.
- *
  * @collective
  */
 int MFTLRemeshEnsembleDispersed(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats);
 
 /**
- * @brief Resolves MFTL_REMESH_PARALLEL_AUTO against the ensemble as it stands.
+ * @brief Resolves #MFTL_REMESH_PARALLEL_AUTO for the ensemble as it stands.
  *
- * The whole decision is one ratio: the largest body radius anywhere against the
- * narrowest rank box. Above `params->dispersed_radius_fraction` the bodies
- * cannot be made local to anybody and the planes have to move; below it, moving
- * the bodies is strictly cheaper.
+ * DISPERSED iff the largest body radius is at most `dispersed_radius_fraction`
+ * times the narrowest rank box -- or, with `parallel_coarsen` armed and at
+ * least as many bodies as ranks, the coarsened box (never the whole grid). The
+ * test is on the LARGEST body, so a mixed ensemble resolves to SPANNING.
  *
- * A MIXED ensemble resolves to SPANNING, because the test is on the largest
- * body. That is the safe direction and it is also the correct one: an ensemble
- * is the unit of parallelisation policy, so one jet among a thousand droplets
- * means the ensemble is a jet. Splitting it is the caller's decision, and the
- * library will not make it silently.
- *
- * @note COLLECTIVE -- it measures the bodies, which needs two Allreduces
- *       (MFTLRemeshMeasureBodies). Returns SPANNING unchanged at nproc == 1,
- *       where the question is meaningless.
  * @param ens    The ensemble whose bodies are measured.
- * @param params May be #MFTL_NULL, in which case the default fraction is used.
- * @return #MFTL_REMESH_PARALLEL_SPANNING or #MFTL_REMESH_PARALLEL_DISPERSED.
- *         Never #MFTL_REMESH_PARALLEL_AUTO -- that is what it resolves.
+ * @param params May be #MFTL_NULL for the default fraction.
+ * @return #MFTL_REMESH_PARALLEL_SPANNING or #MFTL_REMESH_PARALLEL_DISPERSED;
+ *         SPANNING at `nproc == 1`, where the question does not arise.
+ * @collective Measures the bodies (MFTLRemeshMeasureBodies()).
  */
 MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategy(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params);
 
 /**
- * @brief The GLOBAL centroid and radius of every body, in two collectives.
+ * @brief Global centroid, radius and weight of every body this rank holds.
  *
- * What the strategy choice is made from, published because a caller has the same
- * question: rebalancing an ensemble is exactly "measure the bodies, then
- * decide", and deciding is the caller's business.
+ * Each quantity is reduced over the body's HOLDERS
+ * (MFTLEnsembleReduceBodies()), so it describes the whole body; rows are
+ * indexed by LOCAL SLOT (row `o` is `ens->local_objects[o]`).
  *
- * Both are reduced over the body's HOLDERS and are therefore global answers about
- * each body, even though the buffers are local. A rank's own share of a body has
- * a centroid somewhere inside its own box, so an unreduced answer would centre
- * nothing and measure nothing.
+ * - **Centroid:** area-weighted mean of the owned triangle centres. A periodic
+ *   axis is averaged as an angle (circular mean: map
+ *   \f$\theta = 2\pi(x-x_{\min})/L\f$, average \f$(\cos\theta,\sin\theta)\f$
+ *   with the area weights, return via `atan2`), because the arithmetic mean of a
+ *   seam-straddling body lies in the middle of the domain.
+ * - **Radius:** largest minimum-image distance from the centroid to a triangle
+ *   CORNER.
+ * - **Weight:** global owned-triangle count, a proxy for sweep time; it rides
+ *   the centroid reduction.
+ * - **Lowest holder:** the lowest rank holding the body, which designates one
+ *   holder to count a body in sums over ranks.
  *
- * ── Periodicity is not a detail here ───────────────────────────────────────
+ * @param      ens           The ensemble.
+ * @param[out] centroid      `[3 * n_local_objects]`, or #MFTL_NULL.
+ * @param[out] radius        `[n_local_objects]`, or #MFTL_NULL.
+ * @param[out] weight        `[n_local_objects]` (as double), or #MFTL_NULL.
+ * @param[out] r_max         The largest radius over the WHOLE ensemble,
+ *                           bit-identical on every rank, or #MFTL_NULL.
+ * @param[out] lowest_holder `[n_local_objects]`, or #MFTL_NULL.
  *
- * The arithmetic mean of wrapped coordinates puts a body straddling a seam in
- * the MIDDLE OF THE DOMAIN -- the one place it certainly is not -- and the
- * radius derived from it then comes out as half the box. Both are silent. So a
- * periodic axis is averaged as an ANGLE: x is mapped to
- * theta = 2*pi*(x - min)/L, the area-weighted mean of (cos, sin) is reduced, and
- * atan2 brings it back. That is the circular mean, exact for any placement
- * including the seam.
- *
- * The radius is the minimum-image distance to the furthest CORNER, not to the
- * furthest centre: a triangle sticking out is part of the body, and the
- * difference is one edge length -- the same order as the band widths this is
- * compared against.
- *
- * ── The weight rides along, and that is the whole reason it is here ────────
- *
- * @p weight is each body's GLOBAL owned-triangle count, and it is produced by
- * widening this function's existing per-body reduction by one slot rather than
- * by taking a second one. That matters more than it sounds: this is the module's
- * only per-body collective, so how many of them a pass takes is what decides its
- * cost at ten thousand droplets -- and the number is one. Asking for the weights
- * separately would have made it two.
- *
- * A count rather than an area, because it is a proxy for SWEEP TIME: the
- * operators iterate over half-edges, and a body of many small triangles costs
- * more to remesh than one of few large ones covering the same area.
- *
- * ── THE OUTPUTS ARE INDEXED BY LOCAL SLOT, NOT BY BODY ID ──────────────────
- *
- * Row `o` describes `ens->local_objects[o]`. The arrays used to be
- * `[n_bodies_global]` and replicated, because an `MPI_Allreduce` aligns element
- * k of every rank's buffer and the body id is the only index two ranks holding
- * different bodies agree about -- 72 bytes per body on every rank, to learn
- * about the handful it holds. The reduction now goes through
- * MFTLEnsembleReduceBodies(), which moves that indexing inside itself and only
- * onto the route that still needs it.
- *
- * @p r_max is what the replication was mostly FOR: the largest body in the
- * ensemble, which the strategy ratio and the dispersed admission test are both
- * taken against and which every rank must therefore agree about to the bit. One
- * `MPI_MAX` of one double gives it, at a cost that does not grow with the body
- * count.
- *
- * A caller that genuinely needs a replicated per-body array -- the dispersed
- * load balancer is the only one, because its assignment must be identical on
- * every rank -- has to broadcast these rows itself and pay the `O(bodies)` for
- * it explicitly.
- *
- * @param      ens      The ensemble.
- * @param[out] centroid `[3 * n_local_objects]`, may be #MFTL_NULL.
- * @param[out] radius   `[n_local_objects]` max corner distance from the centroid,
- *                      may be #MFTL_NULL.
- * @param[out] weight   `[n_local_objects]` global owned-triangle count per body,
- *                      as a double so it rides the same reduction. May be
- *                      #MFTL_NULL, which costs nothing either way -- the slot is
- *                      reduced regardless.
- * @param[out] r_max    The largest radius over the WHOLE ensemble, or #MFTL_NULL.
- * @param[out] lowest_holder `[n_local_objects]` the lowest-numbered rank holding
- *                      each body, or #MFTL_NULL. It is the answer to "may I count
- *                      this body": every holder gets the same reduced values, so
- *                      summing a per-body verdict over ranks counts a shared body
- *                      once per holder unless one of them is designated. Free --
- *                      it is a MIN slot on the reduction already being taken.
- * @note Collective: one per-body reduction of 9 values, then one of 1 value when
- *       @p radius or @p r_max is asked for, plus one scalar `MPI_MAX` for
- *       @p r_max. Which of them are taken depends only on which POINTERS are
- *       null, so it must be the same on every rank -- it is a property of the
- *       call and never of this rank's data. Reads `tris.area` and `tris.center`,
- *       so the caller owes a current geometry pass.
+ * @collective One per-body reduction of 9 values, then one of 1 value when
+ *             @p radius or @p r_max is requested, plus one scalar `MPI_MAX` for
+ *             @p r_max. Which are taken depends only on which pointers are
+ *             null, so that must agree on every rank. Reads `tris.area` and
+ *             `tris.center`: call MFTLComputeTriangleGeometry() first.
  */
 void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radius, double *weight, double *r_max, double *lowest_holder);
 
 /**
- * @brief The per-axis coarsening the shift schedule needs, from a MEASURED band.
+ * @brief Per-axis coarsening factors that restore \f$g_k h_k > 4\delta\f$.
  *
- * `g[k] = ceil(4*delta / h_k)` for every axis that is actually cut, and 1
- * everywhere else, clamped to `cuts[k]`. It is PER AXIS because the precondition
- * is -- MFTLDomainGetHMin takes a minimum precisely because one thin axis is
- * enough to break it -- so a single factor cubed would throw away parallelism on
- * the two axes that were fine. A domain thin in x only costs 2x, not 8x.
- *
- * A coarsened decomposition is only an OWNER FUNCTION (MFTLRemeshCoarseOwnerProc),
- * which redistribution accepts through #MFTL_OwnerMap -- no second communicator,
- * no gather onto a group master. The driver caps the factors separately with
- * `parallel_coarsen`; this function does not.
+ * \f$g_k = \lceil 4\delta/h_k \rceil\f$ on every axis with at least two cells,
+ * 1 elsewhere, clamped to `cuts[k]`. Per axis because the precondition is: a
+ * domain thin in x only loses a factor 2, not 8. A coarsened decomposition is
+ * only an owner function (#MFTL_OwnerMap), so no second communicator exists.
+ * The `parallel_coarsen` cap is applied by the driver, not here.
  *
  * @param      domain    The MPI/physical world.
  * @param      params    Supplies `max_edge_length` and `freeze_dilation_rings`
- *                       for the estimate when @p band is 0.
- * @param      band      The frozen band half-width. Pass
- *                       `MFTL_RemeshStats::band_bound` from a previous pass for
- *                       a measured answer, or 0 to fall back to the
- *                       \f$\texttt{MFTL\_REMESH\_BAND\_EDGES} \cdot
- *                       \texttt{max\_edge\_length}\f$ estimate -- which
- *                       overstates the real band by about a factor of three and
- *                       will therefore coarsen further than necessary.
- * @param[out] out_group [3] receives the per-axis factors, each \f$\ge 1\f$.
- *
- * A pure function of replicated data (`domain`, `params`, and a reduced `band`),
- * which is what lets every rank compute the same groups without agreeing about
- * them -- two ranks with different groups is an immediate deadlock.
+ *                       for the estimate used when @p band is 0.
+ * @param      band      The band half-width \f$\delta\f$, e.g. a measured
+ *                       MFTL_RemeshStats::band_bound; 0 falls back to
+ *                       \f$(\texttt{MFTL\_REMESH\_BAND\_EDGES} +
+ *                       \texttt{rings})\cdot\texttt{max\_edge\_length}\f$, which
+ *                       overstates the real band about threefold.
+ * @param[out] out_group [3] per-axis factors, each \f$\ge 1\f$.
+ * @rank_local A pure function of replicated data, so all ranks agree without
+ *             communicating.
  */
 void MFTLRemeshCoarseningFactors(const MFTL_Domain *domain, const MFTL_RemeshParameters *params, double band, int out_group[3]);
 
 /**
- * @brief Marks every entity this rank may not modify. LOCAL, no MPI.
+ * @brief Flags #MFTL_FLAG_FROZEN on every entity this rank may not modify.
  *
- * Sets MFTL_FLAG_FROZEN on every ghost, on every owned triangle of which a
- * neighbour holds a copy, and on every vertex of such a triangle; clears it
- * everywhere else. On a ghost-free object it clears the flag and returns, which
- * is why the gated sweeps behave identically in serial.
+ * An owned entity is frozen exactly when another rank holds a copy of it.
+ * Redistribution sends a triangle to the owner of each of its corners and edge
+ * neighbours, so an owned triangle is replicated iff
+ * `corner >= verts.n_local || neighbour >= tris.n_local` -- read from
+ * `tris.verts` and `tris.neighbors`, no distance, no message. Frozen are: every
+ * ghost, every replicated owned triangle, and every vertex of a frozen
+ * triangle; the flag is cleared elsewhere. Hence an unfrozen vertex has only
+ * owned, unreplicated incident triangles, and (with the vertex-complete halo)
+ * its whole fan is local. On a ghost-free object nothing is frozen. Stamps the
+ * partition dirty, since flags travel with kept ghosts.
  *
- * "A neighbour holds a copy" is not estimated. It is re-derived from the rule
- * redistribution sent by -- a triangle travels to the owner of each of its three
- * corners and each of its three edge neighbours -- so the test is
- * `corner >= verts.n_local || neighbour >= tris.n_local`, evaluated over
- * `tris.verts` and `tris.neighbors`.
- *
- * @param obj The mesh. #MFTL_FLAG_FROZEN is set or cleared on every entity.
- *
- * @note Requires #MFTL_DERIVED_TOPOLOGY. A redistribution leaves it current.
- * @rank_local Despite describing a property of the PARTITION -- it is a
- *             statement about THIS rank's halo, so a received copy of it would
- *             be another rank's answer to a different question.
+ * @param obj The mesh.
+ * @note Requires #MFTL_DERIVED_TOPOLOGY (current after a redistribution).
+ * @rank_local It describes this rank's halo; no other rank's answer applies.
  */
 void MFTLRemeshMarkFrozen(MFTL_Object *obj);
 
 /**
- * @brief Grows the frozen band by @p rings triangle rings. LOCAL, no MPI.
+ * @brief Grows the frozen band by @p rings triangle rings.
  *
- * Not needed for correctness -- see MFTL_RemeshParameters.freeze_dilation_rings
- * for why the classification is already exact. Exposed so that the exactness
- * claim can be tested against a conservative alternative rather than only
- * argued.
- *
- * One ring is "freeze every triangle with a frozen corner, then freeze every
- * corner of a frozen triangle". The two halves read and write different flag
- * arrays, so neither propagates within itself and a pass is exactly one ring
- * regardless of pool order -- which is what a same-array vertex-to-vertex sweep
- * cannot promise.
+ * Not needed for correctness (see MFTL_RemeshParameters::freeze_dilation_rings);
+ * exposed to test that claim. One ring freezes every triangle with a frozen
+ * corner, then every corner of a frozen triangle; the two halves read and write
+ * different flag arrays, so a pass is exactly one ring whatever the pool order.
  *
  * @param obj   The mesh.
- * @param rings Rings to add. 0 is a no-op.
- *
+ * @param rings Rings to add; 0 is a no-op.
  * @rank_local
  */
 void MFTLDilateFrozenBand(MFTL_Object *obj, int rings);
 
 /**
- * @brief Mean edge length over the whole mesh -- the usual source of a target.
+ * @brief Mean length of the undirected edges in this rank's pool.
  *
- * Averages over UNDIRECTED edges, so an interior edge counts once. Averaging
- * over half-edges instead gives the same number on a closed mesh and a slightly
- * wrong one on an open surface, where boundary edges would be under-weighted by
- * a factor of two.
- *
- * ── DO NOT USE THIS TO DERIVE A TARGET ON A DISTRIBUTED MESH ──────────────
- *
- * It averages over THIS RANK'S POOL, so on a partitioned object every rank gets
- * a different answer and a rank holding no part of the body gets ZERO. Feeding
- * that to MFTLInitRemeshParams gives that rank a length band of [0, 0], under
- * which every edge it owns is too long, and the pass refines without bound until
- * the job is killed. Nothing reports it, because a per-rank length band is not
- * something the algorithm ever communicates.
- *
- * The trap is easy to walk into because the generators are COLLECTIVE and
- * already distribute -- so `MFTLGenerateSphere(obj, ...); MFTLMeanEdgeLength(obj)`
- * looks like it measures the sphere and measures one rank's share of it. Use
- * MFTLEnsembleMeanEdgeLength(). In Debug the drivers additionally check that all
- * ranks were handed the same band (MFTLRemeshParamsAgree).
+ * Every undirected edge counts once (a boundary edge is not under-weighted).
+ * RANK-LOCAL: on a partitioned object it covers this rank's owned and ghost
+ * triangles only, and a rank holding nothing of the body gets 0 -- a length band
+ * of [0, 0], under which the pass refines without bound. Use
+ * MFTLEnsembleMeanEdgeLength() on distributed meshes; the drivers refuse a
+ * non-positive band and check in Debug that all ranks received the same one.
  *
  * @param obj The mesh.
- * @return The arithmetic mean of the OWNED half-edge lengths, or 0 for an empty
- *         mesh.
+ * @return The mean edge length, or 0 for an empty pool.
  * @rank_local
  */
 double MFTLMeanEdgeLength(const MFTL_Object *obj);
 
 /**
- * @brief Mean edge length over the WHOLE distributed mesh: the collective form.
+ * @brief Mean edge length over every body of the distributed ensemble.
  *
- * What a caller deriving a remeshing target from the mesh itself actually wants,
- * and the reason MFTLMeanEdgeLength is not it -- see the warning there.
- *
- * Sums lengths and counts over every body and reduces both, so the result is the
- * edge-weighted mean over the entire ensemble and is bit-identical on every
- * rank. Each undirected edge is counted exactly once mesh-wide: an edge cut by a
- * partition is attributed to the owner of the incident triangle of smaller
- * global id, because "my triangle whose twin is a ghost" would count every cut
- * edge twice -- by an amount that grows with the rank count.
+ * Each undirected edge is counted exactly once mesh-wide: an edge between two
+ * owned triangles by its smaller half-edge, an edge cut by the partition by the
+ * owner of the incident triangle with the smaller global id (counting both
+ * sides would bias the mean by an amount growing with the rank count). The
+ * result is identical on every rank.
  *
  * @param ens The ensemble.
- * @return The mean edge length over every object's owned half-edges, on every
- *         rank.
- *
- * @collective One `MPI_Allreduce` of two doubles. Returns 0 for an empty
- *       ensemble, which is the only case a caller must still handle.
+ * @return The mean edge length, or 0 for an empty ensemble.
+ * @collective One `MPI_Allreduce` of two doubles.
  */
 double MFTLEnsembleMeanEdgeLength(MFTL_Ensemble *ens);
 

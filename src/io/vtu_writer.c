@@ -7,30 +7,11 @@
  * @brief The parallel VTK XML writer: selection, periodic unwrapping, block
  *        assembly, and the two output backends (POSIX per rank, MPI-IO shared).
  *
- * ## THE SHAPE OF THE THING
- *
- * A .vtu file is a short XML header followed by a handful of flat arrays. So the
- * writer is three phases, and every one of them is separable from the others:
- *
- *   ANALYSE   decide which cells go in the file, which points they reference,
- *             and which cells straddle a periodic face. Per rank, no MPI.
- *   ASSEMBLE  build each DataArray as one contiguous byte block in memory.
- *             Per rank, no MPI.
- *   EMIT      put those blocks on disk. THIS is the only phase that differs
- *             between the encodings and the layouts.
- *
- * That split is what lets one code path serve ascii/binary x per-rank/shared:
- * ANALYSE and ASSEMBLE never learn which backend they are feeding, and the
- * backends never learn what a triangle is.
- *
- * ## WHAT COSTS WHAT, MEASURED RATHER THAN ASSUMED
- *
- * A VTK writer spends its time in printf, not in the kernel and not on the disk.
- * Formatting one double as "%.10e" is ~100 ns and 17 bytes for an
- * 8-byte value; ASSEMBLE for the binary path is a memcpy. That is the single
- * biggest factor and it is entirely independent of MPI.
- *
- * MPI-IO changes something else: WHERE the bytes go. See §6.
+ * Three separable phases: ANALYSE (which cells and points, which triangles
+ * straddle a seam; per rank, no MPI), ASSEMBLE (one contiguous byte block per
+ * DataArray; per rank) and EMIT (the only phase that differs between encodings
+ * and layouts). The time of an ASCII writer is spent in `printf`; the binary
+ * path's assembly is a memcpy.
  */
 
 #include "mftl_io.h"
@@ -106,23 +87,10 @@ static const char *host_byte_order(void)
   return first ? "LittleEndian" : "BigEndian";
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * 1. A growable text buffer, for the XML header only
- *
- * The header is a few kilobytes whatever the mesh size, so this is not a hot
- * path -- it exists so that the header can be BUILT before its length is needed.
- * In the shared-file layout every rank builds the identical header text and uses
- * its length to place the appended section; that is the whole reason it is a
- * string in memory rather than a sequence of fprintf calls.
- * ═══════════════════════════════════════════════════════════════════════════ */
-
 /**
- * @brief Growable text buffer, used for the XML header only.
- *
- * The header is a few kilobytes whatever the mesh size, so this is not a hot
- * path. It exists so the header can be BUILT before its length is needed: in the
- * shared-file layout every rank builds the identical header text and uses its
- * length to place the appended section.
+ * @brief Growable text buffer for the XML header. In the shared layout every
+ *        rank builds the identical header and uses its LENGTH to place the
+ *        appended data, so it must exist in memory before anything is written.
  */
 typedef struct
 {
@@ -190,65 +158,19 @@ static void sb_addf(sbuf *b, const char *fmt, ...)
 /* ═══════════════════════════════════════════════════════════════════════════
  * 2. ANALYSE: which cells, which points, which of them straddle a seam
  *
- * ── Cell selection ─────────────────────────────────────────────────────────
+ * Cells: owned triangles (`[0, tris.n_local)`), or all with `include_ghosts`.
+ * Points: every vertex a written triangle references (possibly a ghost), found
+ * by one marking pass and a prefix scan; unreferenced vertices are dropped. A
+ * seam vertex is thus written by every rank with a triangle on it -- cracked in
+ * the point topology, seamless in the picture.
  *
- * Owned triangles only, by default. Ownership is an array PREFIX, so "owned
- * only" is the loop bound `tris.n_local` and costs nothing. Writing all
- * `n_triangles`, ghosts included, puts a triangle owned by rank A and held as a
- * ghost by ranks B and C THREE times into the merged dataset.
- * Nothing about the picture changes -- the copies are coincident -- but every
- * integral the visualisation tool computes over the surface is then wrong by the
- * halo fraction, silently, and the halo fraction is 10-30 % in a normal run.
- *
- * ── Point selection ────────────────────────────────────────────────────────
- *
- * A written triangle can reference a GHOST vertex (its three corners may belong
- * to three different ranks), so the point list is not the owned prefix: it is
- * "every vertex some written triangle references". One marking pass over
- * `tris.verts` -- 12 contiguous bytes per triangle -- and one prefix scan turn
- * that into a compact per-piece index. Vertices referenced by nothing (they
- * exist: a vertex owned here whose entire one-ring is owned elsewhere) are
- * dropped rather than written as an unused point.
- *
- * The duplication this leaves is intentional and standard: a seam vertex is
- * written by every rank that has a triangle on it, so the surface is "cracked"
- * in the point topology and seamless in the picture.
- *
- * ── Periodic unwrapping ────────────────────────────────────────────────────
- *
- * Vertex positions are wrapped into the primary cell, so a triangle straddling a
- * periodic face has corners at opposite ends of the box and, drawn naively,
- * stretches across the entire domain. The fix is per-triangle and write-time:
- * emit THREE PRIVATE points holding unwrapped coordinates and point that one
- * triangle's connectivity at them. Other triangles sharing those vertices are
- * unaffected, and the mesh in memory is never touched.
- *
- * The analysis pass computes the two minimum-image vectors once for each
- * triangle that may wrap and retains the nine output coordinates only for
- * triangles that actually cross a seam:
- *
- *     unwrapped corners = p0, p0 + e1, p0 + e2
- *
- * Subsequent output blocks reuse those retained coordinates.
- *
- * ── The detection criterion, and why it is the safe one to get wrong ────────
- *
- * A triangle straddles iff a reconstructed corner falls OUTSIDE the domain box
- * on a periodic axis. If no minimum-image correction applied on that axis then
- * e[d] is exactly p1[d]-p0[d], so p0+e reproduces an in-box position to within
- * one rounding. If a
- * correction did apply, the reconstruction sits a FULL domain length outside the
- * box -- not a close call.
- *
- * So the only way this errs is a false POSITIVE, for a corner within one ulp of
- * a box face, and a false positive costs three extra points that carry the
- * correct coordinates and render identically. A false NEGATIVE would put a
- * triangle across the whole domain on screen. The test is therefore written with
- * NO tolerance: any slack traded for fewer false positives buys them at the
- * price of false negatives, which is the wrong direction.
- *
- * Comparing each minimum-image edge against its raw difference makes the seam
- * decision exact in both directions.
+ * Periodic unwrapping: vertices are stored wrapped, so a triangle straddling a
+ * periodic face would be drawn across the whole domain. It gets three PRIVATE
+ * points at its unwrapped corners p0, p0 + e1, p0 + e2 (minimum-image edges),
+ * which may lie outside the box. A triangle wraps iff some minimum-image edge
+ * differs from its raw difference, i.e. iff a periodic correction was applied:
+ * `d - L*nearbyint(d/L)` returns `d` bit-exactly when the rounding is 0, and
+ * differs by about L otherwise. The test is exact, with no tolerance.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /** @brief Growable double buffer for the unwrapped corner coordinates. */
@@ -315,14 +237,12 @@ typedef struct
 /**
  * @brief Fills @p p for one object and appends its unwrapped corners to @p wpos.
  *
- * Two loop shapes rather than one with branches in it, because the periodic
- * test is loop-invariant and the non-periodic case is common:
- *
- *   (a) non-periodic   mark connectivity only; nothing can straddle
- *   (b) periodic       gather current positions and apply the exact seam test
+ * Two loop shapes, because periodicity is loop-invariant: (a) non-periodic --
+ * mark connectivity only; (b) periodic -- also compute each triangle's
+ * minimum-image edges once and apply the exact wrap test.
  *
  * @param      obj            The mesh.
- * @param      include_ghosts Count ghost triangles too. Off in production.
+ * @param      include_ghosts Count ghost triangles too.
  * @param[out] p              Piece description: which vertices become shared
  *                            points, which triangles wrap, and the two totals.
  * @param[out] wpos           Receives the unwrapped corners of the wrapping
@@ -426,16 +346,9 @@ static void analyze_piece(const MFTL_Object *obj, bool include_ghosts, piece *p,
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 3. ASSEMBLE: one contiguous byte block per DataArray
- *
- * Every block is described the same way, which is what makes the header
- * generator, the ascii formatter and the MPI-IO offset arithmetic each a single
- * loop over an array of descriptors rather than nine special cases.
- *
- * A block's size is `unit` bytes times either the piece's point count or its
- * cell count -- there is no third possibility -- so ONE exclusive scan of the
- * pair {points, cells} places every block of the shared file. That is why the
- * collective cost of this writer is O(1) messages in the number of arrays.
+ * 3. ASSEMBLE: one contiguous byte block per DataArray, all described by the
+ * same descriptor (io_block), so the header, the ASCII formatter and the MPI-IO
+ * offsets are each one loop over the table.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /** @brief Element type of one output block. */
@@ -447,12 +360,9 @@ typedef enum
 } scalar_kind;
 
 /**
- * @brief One output array, described uniformly so both backends share the code.
- *
- * A block's size is `unit` bytes times EITHER the piece's point count OR its
- * cell count -- there is no third possibility -- so one exclusive scan of the
- * pair {points, cells} places every block of the shared file. That is why the
- * collective cost of this writer is \f$O(1)\f$ messages in the number of arrays.
+ * @brief One output array. Its size is `unit` bytes times EITHER the piece's
+ *        point count OR its cell count, so one exclusive scan of the pair
+ *        {points, cells} places every block of the shared file.
  */
 typedef struct
 {
@@ -494,10 +404,8 @@ static size_t scalar_size(scalar_kind k) { return (k == SC_F64) ? sizeof(double)
 
 /**
  * @brief Points of one object: the referenced vertices, then the private
- *        unwrapped corners.
- *
- * The order is load-bearing -- emit_conn() addresses the private points as
- * `n_marked + 3*w`, so they must follow all the shared ones.
+ *        unwrapped corners (emit_conn() addresses them as `n_marked + 3*w`, so
+ *        the order is load-bearing).
  *
  * @param      obj  The mesh.
  * @param      p    Piece description from analyze_piece().
@@ -511,9 +419,7 @@ static void emit_points(const MFTL_Object *obj, const piece *p, const dbuf *wpos
 
   if (p->n_marked == nv)
   {
-    /* Every vertex is referenced -- the common case for a closed surface whose
-     * halo came from a redistribution. The compaction is then the identity, so
-     * skip it and move the array at memory bandwidth. */
+    /* Every vertex referenced (the common case): the compaction is the identity. */
     memcpy(out, pos, (size_t) (3 * nv) * sizeof(double));
     out += 3 * nv;
   }
@@ -589,10 +495,11 @@ static void emit_conn(const MFTL_Object *obj, const piece *p, int point_base, in
 }
 
 /**
- * @brief A per-point Int32 array: owner rank or global id.
+ * @brief A per-point Int32 array: owner rank or global id. Private corners
+ *        inherit the values of the vertices they stand in for.
  *
- * The one loop in this writer that reads the AoS records with a stride. It is
- * left that way deliberately -- see the note at the end of this file.
+ * Reads the AoS records with a 16-byte stride; an SoA owner array would cost
+ * 4 B per vertex permanently for an output path dominated by the disk write.
  *
  * @param      obj      The mesh.
  * @param      p        Piece description from analyze_piece().
@@ -622,20 +529,15 @@ static void emit_point_ints(const MFTL_Object *obj, const piece *p, bool want_gi
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 4. The XML header
- *
- * Built as a string rather than fprintf'd, because the shared-file backend needs
- * its LENGTH before it can place anything: the appended data begins at exactly
- * `strlen(header)`. Every rank builds it from global counts only, so all ranks
- * produce byte-identical text and agree on that length without communicating it.
- *
- * The `offset` attributes are relative to the first byte after the `_` marker,
- * NOT absolute in the file, so they do not depend on the header's own length.
- * That is what keeps this non-circular and is why no fixed-width padding trick
- * is needed here.
+ * 4. The XML header, built from GLOBAL counts only, so every rank produces
+ * byte-identical text. The appended-data `offset` attributes are relative to the
+ * byte after the `_` marker, so they do not depend on the header's own length.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
+ * @brief Appends one `<DataArray>` tag (self-closing for appended data, open for
+ *        inline ASCII).
+ *
  * @param h          Header buffer the tag is appended to.
  * @param b          The block being described.
  * @param binary     `true` for the appended-raw form, `false` for inline ASCII.
@@ -652,12 +554,12 @@ static void emit_dataarray_tag(sbuf *h, const io_block *b, bool binary, unsigned
 }
 
 /**
- * @brief Names of the enabled arrays in a group, for the Scalars= hint.
+ * @brief Name of the first enabled array of a group, for the `Scalars=` hint.
  *
  * @param blocks The block table.
- * @param ids   Candidate block indices.
- * @param n      Length of @p list.
- * @return The first enabled block index, or -1 if none is.
+ * @param ids    Candidate block indices.
+ * @param n      Length of @p ids.
+ * @return The array name, or #MFTL_NULL if none is enabled.
  */
 static const char *first_enabled(const io_block *blocks, const int *ids, int n)
 {
@@ -893,9 +795,9 @@ static int write_piece_file(const char *prefix, int rank, io_block *blocks, long
 }
 
 /**
- * @brief Rank 0's .pvtu index: the piece list plus the array declarations.
+ * @brief Writes rank 0's `.pvtu` index: array declarations and one piece file
+ *        per rank (paths relative to the index).
  *
- * @brief Writes the `.pvtu` index that names every piece file.
  * @param prefix File name prefix.
  * @param nproc  Number of piece files to reference.
  * @param blocks The block table, for the array declarations.
@@ -953,59 +855,23 @@ static int write_pvtu(const char *prefix, int nproc, const io_block *blocks)
 /* ═══════════════════════════════════════════════════════════════════════════
  * 6. Backend B: one shared file (MPI-IO)
  *
- * ── The file layout ────────────────────────────────────────────────────────
+ *   [0, H)                          XML header                       (rank 0)
+ *   H + rel[b]                      UInt64 length of block b         (rank 0)
+ *   H + rel[b] + 8 + my_offset[b]   this rank's slice of block b     (every rank)
+ *   H + total                       footer                           (rank 0)
  *
- *   [0, H)                          the XML header, written by rank 0
- *   H + rel[b]                      UInt64 length of block b, written by rank 0
- *   H + rel[b] + 8 + my_offset[b]   THIS rank's slice of block b
- *   H + total                       the footer, written by rank 0
- *
- * Every rank knows H because every rank builds the same header text, and knows
- * my_offset because it did the exclusive scan. So there is no second round of
- * communication to distribute offsets -- which is the mistake that makes naive
- * shared-file writers scale badly.
- *
- * ── Why the two reductions are non-blocking and the writes are not ─────────
- *
- * The Exscan (where do my bytes go) and the Allreduce (how big is the file) are
- * INDEPENDENT reductions over the same two integers, so they are issued together
- * as MPI_Iexscan + MPI_Iallreduce and waited on once: two latencies overlap
- * instead of adding. Both are O(log P) messages of 16 bytes and everything after
- * them depends on both, so there is no computation left to hide behind them --
- * the blocks were assembled before the scan precisely because assembling them
- * does not need it.
- *
- * The data writes use MPI_File_write_at_all, and THAT is the entire point of
- * this backend. The independent MPI_File_write_at would produce the same file
- * and would be the classic mistake: each rank's slice of a block is a small,
- * non-contiguous piece of the file, and only the COLLECTIVE call lets the MPI
- * implementation run two-phase I/O -- exchange the pieces among a subset of
- * aggregator ranks so the filesystem sees a few large stripe-aligned writes
- * instead of P small ones. On a parallel filesystem that is the difference
- * between scaling and not.
- *
- * Deadlock freedom: every rank calls write_at_all once per ENABLED block, and
- * the enabled set is derived from the options struct, which is an argument all
- * ranks pass identically. A rank with nothing to contribute calls it with count
- * zero rather than skipping it.
+ * Every rank knows H (identical header text) and its offsets (one exclusive
+ * scan), so no offsets are distributed. The slices are written with
+ * MPI_File_write_at_all, once per enabled block on every rank (count zero if
+ * nothing to contribute), so the MPI library can aggregate the many small
+ * non-contiguous slices into a few large stripe-aligned writes (two-phase
+ * collective buffering) -- the independent MPI_File_write_at would not.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief The one round of communication this writer needs: where my slice goes
- *        and how big the file is.
- *
- * Two INDEPENDENT reductions over the same pair {points, cells}: an exclusive
- * scan for this rank's base indices and an all-reduce for the totals the header
- * quotes. Issued together as non-blocking collectives and waited on once, so the
- * two latencies overlap rather than add -- the same reason MFTLEnsembleUpdate
- * issues its three reductions that way.
- *
- * They are not overlapped with COMPUTATION, and that is a deliberate call rather
- * than an omission: both are O(log P) messages of 16 bytes, on the order of tens
- * of microseconds, against an operation that will spend milliseconds in memcpy
- * and tens of milliseconds in the filesystem. Splitting the assembly loop into a
- * scan-independent half and a scan-dependent half to hide that would be real
- * complexity bought for a fraction of a percent.
+ * @brief The one round of communication of the shared layout: an exclusive scan
+ *        of {points, cells} (where this rank's slices go) and an all-reduce (the
+ *        totals the header quotes), posted together as non-blocking collectives.
  *
  * @param      comm      The communicator.
  * @param      my_points This rank's point count.
@@ -1023,9 +889,7 @@ static void scan_placement(MPI_Comm comm, long long my_points, long long my_cell
   MPI_Iallreduce(mine, total, 2, MPI_LONG_LONG, MPI_SUM, comm, &req[1]);
   MPI_Waitall(2, req, MPI_STATUSES_IGNORE);
 
-  /* MPI leaves rank 0's exclusive-scan receive buffer UNDEFINED -- zeroing it
-   * before the call is no guarantee. These are file offsets, so garbage here
-   * writes rank 0's slice over another rank's. Its prefix is zero by definition. */
+  /* MPI leaves rank 0's exscan result UNDEFINED; its prefix is zero. */
   int rank = 0;
   MPI_Comm_rank(comm, &rank);
   if (rank == 0) base[0] = base[1] = 0;
@@ -1043,10 +907,8 @@ static void scan_placement(MPI_Comm comm, long long my_points, long long my_cell
  */
 static int write_shared_file(MPI_Comm comm, int rank, const char *prefix, io_block *blocks, const long long base[2], const long long total[2])
 {
-  /* Both limits are on the GLOBAL totals, which every rank holds identically, so
-   * the early return is a collective decision. The cell offsets are
-   * `3 * cumulative cells`, which leaves the Int32 range at 715 827 883 triangles
-   * -- long before the point ids do on a closed surface, where V ~ T/2. */
+  /* Int32 limits on the GLOBAL totals (identical everywhere, so returning is a
+   * collective decision): point ids, and offsets = 3 x cumulative cells. */
   if (total[0] > 2147483647LL || 3 * total[1] > 2147483647LL)
   {
     if (rank == 0) fprintf(stderr, "MFTLWriteVtu: %lld points / %lld cells exceed the Int32 connectivity and offset limits.\n", total[0], total[1]);
@@ -1079,10 +941,7 @@ static int write_shared_file(MPI_Comm comm, int rank, const char *prefix, io_blo
   const int np = snprintf(path, sizeof path, "%s.vtu", prefix);
   if (np < 0 || (size_t) np >= sizeof path) local_bad = 1;
 
-  /* Every check above is LOCAL -- block sizes differ by rank -- and the next call
-   * is the collective MPI_File_open. A rank returning alone here would leave the
-   * others blocked inside it, so the verdict is agreed first and every rank
-   * returns together. */
+  /* Local checks, agreed before the collective MPI_File_open. */
   int any_bad = 0;
   MPI_Allreduce(&local_bad, &any_bad, 1, MPI_INT, MPI_MAX, comm);
   if (any_bad) return MFTL_ERROR;
@@ -1105,9 +964,7 @@ static int write_shared_file(MPI_Comm comm, int rank, const char *prefix, io_blo
 
   int status = MFTL_SUCCESS;
 
-  /* Truncate to the exact final size. Without this, overwriting a longer file
-   * from a previous, larger step leaves trailing bytes that make the XML
-   * unparseable -- a failure that only shows up when the mesh SHRINKS. */
+  /* Truncate: overwriting a longer file would leave trailing bytes. */
   if (MPI_File_set_size(fh, footer_at + (MPI_Offset) strlen(k_footer)) != MPI_SUCCESS) status = MFTL_ERROR;
 
   if (rank == 0 && status == MFTL_SUCCESS)
@@ -1126,8 +983,7 @@ static int write_shared_file(MPI_Comm comm, int rank, const char *prefix, io_blo
       status = MFTL_ERROR;
   }
 
-  /* Collective, once per enabled block, on every rank -- including ranks whose
-   * count is zero. Skipping those would hang the others. */
+  /* Collective, once per enabled block, on every rank (zero counts included). */
   for (int i = 0; i < BLK_COUNT; ++i)
   {
     if (!blocks[i].enabled) continue;
@@ -1218,11 +1074,8 @@ int MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix, const MFT
     blocks[i].data = MFTLMallocOrDie(blocks[i].bytes > 0 ? blocks[i].bytes : 1, "MFTL vtu data block");
   }
 
-  /* In the shared layout there is ONE Piece spanning every rank, so connectivity
-   * and offsets are numbered across the whole file and need this rank's base
-   * indices before the arrays can be filled. In the per-rank layout each piece
-   * is numbered from zero, so the bases are zero and no communication happens.
-   * Same assembly code either way -- only the constant differs. */
+  /* Shared layout: one Piece, so numbering needs this rank's base indices.
+   * Per-rank layout: bases are zero. */
   long long base[2] = {0, 0}, total[2] = {0, 0};
   if (shared) scan_placement(dom->comm_world, my_points, my_cells, base, total);
 
@@ -1291,27 +1144,8 @@ int MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix, const MFT
   free(pieces);
   db_free(&wpos);
 
-  /* One rank failing to open its piece file must not leave the others believing
-   * the dump succeeded -- rank 0's .pvtu already promised that piece exists. One
-   * int, and the call is collective in both layouts anyway. */
+  /* Agree on the outcome (the .pvtu promised every piece). */
   int worst = status;
   MPI_Allreduce(&status, &worst, 1, MPI_INT, MPI_MIN, dom->comm_world);
   return worst;
 }
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * A NOTE ON THE ONE AoS READ IN HERE, SINCE IT LOOKS LIKE AN OVERSIGHT
- *
- * emit_point_ints() walks `verts.rec[v].owner_proc` with a 16-byte stride and
- * uses 4 of every 16 bytes it touches -- exactly the access pattern the SoA half
- * of this library exists to avoid, and the obvious "fix" is an SoA owner array.
- *
- * It is deliberately not fixed. The array is optional, written once every N
- * timesteps, and the pass that produces it is followed immediately by a disk
- * write of the same data that is three orders of magnitude slower. Adding
- * `verts.owner[]` would cost 4 bytes per vertex of permanent residency in the
- * pool block, a new field for every growth and permutation site to carry, and a
- * second place for ownership to be recorded -- the exact "SoA island" that
- * mftl_types.h argues against -- to speed up a debug output path by an amount no
- * measurement would resolve. The record stays the single home of ownership.
- * ═══════════════════════════════════════════════════════════════════════════ */

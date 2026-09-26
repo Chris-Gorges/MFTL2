@@ -4,19 +4,11 @@
  * @date 2026-08-25
  * @ingroup mftl_communication
  *
- * @brief The one accumulator behind #MFTL_RedistributeStats.
+ * @brief The rank-local accumulator behind #MFTL_RedistributeStats.
  *
- * There is exactly one, it is rank-local, and it is written from every
- * translation unit of this module through the CS_BEGIN/CS_END macros in
- * comm_internal.h. Nothing here takes a collective: a reduction inside the
- * measurement would synchronise the phases it is trying to time, and the whole
- * point of these counters is that they are cheap enough to leave on.
- *
- * A singleton rather than a `MFTL_RedistributeStats *` parameter, which is what
- * the remesher does. The remesher's call sites are a handful; the
- * redistribution's are some sixty across tests and examples, and threading a
- * diagnostic through four public signatures to reach them is a worse trade than
- * one file-scope object in a library that is process-per-rank by construction.
+ * A file-scope singleton written through the CS_* macros of comm_internal.h
+ * (the library is process-per-rank, so one accumulator per process suffices).
+ * It takes no collective, so leaving it on never synchronises what it measures.
  */
 
 #include <string.h>

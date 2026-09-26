@@ -4,10 +4,9 @@
  * @date 2026-08-14
  * @ingroup mftl_topology
  *
- * @brief Half-edge connectivity maintenance and validation.
- *
- * The navigation accessors live inline in mftl_topology.h; this file holds the
- * three operations that need real work.
+ * @brief Whole-mesh connectivity operations: twin rebuilding, boundary marking,
+ *        integrity checking and connected-component labelling. Navigation is
+ *        inline in mftl_topology.h.
  */
 
 #include "mftl_topology.h"
@@ -29,25 +28,13 @@ void MFTLRebuildTwins(MFTL_Object *obj)
 
   if (n_he < 1 || n_vert < 1) return;
 
-  /* ── Allocation ───────────────────────────────────────────────────────────
+  /* Half-edges are bucketed by ORIGIN vertex in an intrusive singly linked list:
    *
-   * Half-edges are bucketed by their ORIGIN vertex through an intrusive singly
-   * linked list -- an O(V + H) build with no hashing and no per-edge allocation:
+   *   v_heads[u] = first half-edge whose origin is u
+   *   he_next[h] = next half-edge sharing h's origin
    *
-   *   v_heads[u] = index of the first half-edge whose origin is u
-   *   he_next[h] = index of the next half-edge sharing h's origin
-   *
-   * Finding the twin of (u -> v) is then a walk of the bucket of v looking for
-   * the edge that ends at u. Bucket length is the vertex valence, so this is
-   * effectively constant time per half-edge.
-   *
-   * One allocation for both arrays: same lifetime, and two separate multi-MB
-   * mallocs would be two mmap/first-touch fault storms per call.
-   *
-   * A third array caching each half-edge's ORIGIN would pay for itself if
-   * reaching it cost two dependent pointer hops. With implicit indexing it is one
-   * arithmetic op and one load from a record in the same 64-byte neighbourhood,
-   * so the cache array is more expensive than the thing it avoids. */
+   * The twin of (u -> v) is found by walking the bucket of v for an edge ending
+   * at u; a bucket is as long as the valence. Both arrays share one allocation. */
   int *scratch = (int *) MFTLMallocOrDie(sizeof(int) * ((size_t) n_vert + (size_t) n_he), "MFTLRebuildTwins");
 
   int *const v_heads = scratch;
@@ -69,15 +56,10 @@ void MFTLRebuildTwins(MFTL_Object *obj)
 
   /* ── Pass 2: pair them off ─────────────────────────────────────────────────
    *
-   * Twins come in PAIRS, so a search that finds (v -> u) for (u -> v) has found
-   * both halves of the answer: writing the partner as well and skipping any
-   * half-edge that is already linked halves the number of bucket walks.
-   *
-   * Requiring the candidate to be UNLINKED is what keeps the relation symmetric
-   * on non-manifold input, where three or more half-edges share an undirected
-   * edge. Pairing them off first-come-first-served leaves the surplus as
-   * boundary, which MFTLCheckMeshIntegrity can report; a one-directional search
-   * would silently produce twin links that do not point back at each other. */
+   * Each match links both halves, so already-linked half-edges are skipped.
+   * Requiring the candidate to be UNLINKED keeps the relation symmetric on
+   * non-manifold input (three or more half-edges on one undirected edge): the
+   * surplus stays twin-less for MFTLCheckMeshIntegrity() to report. */
   for (int h = 0; h < n_he; ++h)
   {
     if (he[h].twin_idx != MFTL_ERROR) continue;  // already linked by its partner
@@ -113,13 +95,11 @@ int MFTLMarkMeshBoundary(MFTL_Object *obj)
   const int n_verts = obj->verts.n;
   const int n_he = 3 * obj->tris.n;
 
-  /* Pass 1: clear. Unconditional, so a re-run after a topological edit retires
-   * the previous marking instead of accumulating on top of it. */
+  /* Pass 1: clear, so a re-run replaces the previous marking. */
   for (int i = 0; i < n_verts; ++i) vr[i].flags &= ~MFTL_FLAG_BOUNDARY;
   for (int i = 0; i < n_he; ++i) he[i].flags &= ~MFTL_FLAG_BOUNDARY;
 
-  /* Pass 2: set. The vertex writes are scattered, but only for boundary edges --
-   * O(sqrt(T)) of them on a patch, none at all on a closed surface. */
+  /* Pass 2: set on every twin-less half-edge and both its endpoints. */
   int n_boundary = 0;
   for (int h = 0; h < n_he; ++h)
   {
@@ -153,14 +133,8 @@ int MFTLCheckMeshIntegrity(const MFTL_Object *obj)
   const int n_tris = obj->tris.n;
   const int n_hes = 3 * n_tris;
 
-  /* ── What is NOT checked here, because it cannot be wrong ─────────────────
-   *
-   * An explicitly-indexed half-edge mesh has to validate the next-cycle of every
-   * triangle, the triangle <-> half-edge back-reference, and that every triangle
-   * has a half-edge at all. Implicit indexing (mftl_topology.h) makes all three
-   * tautologies: next(3t+k) is computed, not stored, and half-edge h belongs to
-   * triangle h/3 by definition. Three of the six failure modes such a checker
-   * looks for are not expressible here. */
+  /* The next-cycle, the face back-reference and "every triangle has half-edges"
+   * are tautologies under implicit indexing and need no check. */
 
   /* ── Vertices ─────────────────────────────────────────────────────────── */
   for (int v = 0; v < n_verts; ++v)
@@ -179,11 +153,8 @@ int MFTLCheckMeshIntegrity(const MFTL_Object *obj)
     }
     else if (he[MFTLHePrevIdx(oh)].vertex_idx != v)
     {
-      /* out_he_idx must be OUTGOING from this vertex, i.e. its origin is v. A
-       * stale value here is the classic symptom of a topology edit that moved a
-       * half-edge without updating the vertex that pointed at it, and it makes
-       * every one-ring walk from this vertex silently traverse someone else's
-       * fan. */
+      /* out_he_idx must be OUTGOING from v. A stale value (a topology edit that
+       * forgot the vertex) makes every one-ring walk from v traverse another fan. */
       fprintf(stderr, "[MeshCheck] Vertex %d: half-edge %d does not start at it\n", vr[v].global_id, oh);
       ok = MFTL_ERROR;
     }
@@ -233,9 +204,7 @@ int MFTLCheckMeshIntegrity(const MFTL_Object *obj)
 
   if (ok == MFTL_SUCCESS)
   {
-    /* Reporting the count rather than asserting "closed": an open surface is a
-     * legitimate mesh, and the number is what tells a caller whether the mesh it
-     * believed to be closed actually is. */
+    /* Twin-less half-edges are legal (open surfaces); report their count. */
     if (n_boundary == 0)
       printf("[MeshCheck] Mesh is consistent and closed (%d vertices, %d triangles).\n", n_verts, n_tris);
     else
@@ -262,8 +231,8 @@ int MFTLLabelConnectedComponents(const MFTL_Object *obj, int *labels)
   const MFTL_HalfEdge *const he = obj->tris.he;
   int n_comp = 0;
 
-  /* Seeds in ascending triangle index, so a component's label is the order of
-   * its smallest triangle -- a function of the pool alone, not of the sweep. */
+  /* Seeds in ascending index: a component's label is the rank of its smallest
+   * triangle, a function of the pool alone. */
   for (int seed = 0; seed < nt; ++seed)
   {
     if (lab[seed] != MFTL_ERROR) continue;

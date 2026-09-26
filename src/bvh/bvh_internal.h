@@ -23,31 +23,23 @@
 /* ═══════════════════════════════════════════════════════════════════════════
  * 1. Float bounds that are always a superset of the double ones
  *
- * The node AABB is float and the geometry is double, so a naive (float) cast
- * rounds to NEAREST and can shrink the box by one ulp on either side. One ulp is
- * enough: a triangle whose vertex sits exactly on the max face of its own leaf
- * gets excluded from it, and the traversal then reports a clean miss for a pair
- * that touches.
- *
- * Rounding the min DOWN and the max UP makes the float box a conservative
- * superset, which is the only direction a broad phase may ever be wrong in. The
- * cost is one nextafter-free trick: adding/subtracting one ulp via nextafterf is
- * a libm call, while multiplying by (1 +/- 2^-23) is two instructions and is
- * conservative for every magnitude including zero-crossings, provided the offset
- * is applied additively for values near zero. The form below does both: scale
- * for the magnitude, plus a denormal-proof absolute nudge.
+ * A plain (float) cast rounds to nearest and can shrink a box by one ulp, which
+ * is enough to exclude a vertex lying on its own leaf's face and report a clean
+ * miss. Rounding the minimum DOWN and the maximum UP keeps the float box a
+ * conservative superset: scaling by (1 -/+ 2.4e-7), i.e. two float ulps
+ * relative, leaves a margin of at least one ulp after both roundings, and an
+ * absolute 1e-30 keeps the rounding outward through zero and the denormals.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/** @brief Relative slack of one float ulp, doubled for safety against the cast. */
+/** @brief Relative slack, about two float ulps (\f$2^{-22}\f$). */
 #define MFTL_BVH_FLOAT_SLACK 2.4e-7f
 /** @brief Absolute slack, so the rounding is still outward through zero. */
 #define MFTL_BVH_FLOAT_TINY 1.0e-30f
 
 /**
- * @brief Largest float not exceeding @p v, with slack.
+ * @brief A float guaranteed to be below @p v (outward rounding of a minimum).
  * @param v The double to round down.
- * @return A float strictly below @p v. Rounding the box minimum DOWN is the only
- *         direction a broad phase may ever be wrong in.
+ * @return A float strictly below @p v.
  */
 static inline float mftl_bvh_floor_f(double v)
 {
@@ -56,7 +48,7 @@ static inline float mftl_bvh_floor_f(double v)
 }
 
 /**
- * @brief Smallest float not below @p v, with slack.
+ * @brief A float guaranteed to be above @p v (outward rounding of a maximum).
  * @param v The double to round up.
  * @return A float strictly above @p v.
  */
@@ -67,12 +59,7 @@ static inline float mftl_bvh_ceil_f(double v)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 2. AABB overlap, with a shift on the B side
- *
- * The shift is the periodic image offset. It is added to B rather than
- * subtracted from A because A is the outer loop of the traversal and its node is
- * already in registers; a zero shift costs three adds the compiler hoists out of
- * the leaf case entirely.
+ * 2. AABB overlap, with the periodic image offset added to the B side.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -105,67 +92,39 @@ static inline float mftl_bvh_node_volume(const MFTL_BVHNode *n)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 3. Shared build-side helpers
- *
- * These two are MODULE-PRIVATE -- declared here, defined in bvh_build.c, called
- * from bvh_ghosts.c, and absent from mftl_bvh.h. They still carry the MFTL
- * prefix because they need external linkage to cross a translation unit, and
- * the library's symbol rule ("nothing but MFTL* may be exported", CLAUDE.md) is
- * checked on the archive rather than on the headers. Do not call them from
- * outside src/bvh/.
+ * 3. Module-private build helpers, defined in bvh_build.c. They carry the MFTL
+ * prefix only because every external symbol must; do not call them from outside
+ * src/bvh/.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Refits every node's AABB, and resolves the tolerance while doing it.
+ * @brief Refits every node's box and resolves the tolerance, in three linear
+ *        passes with no recursion.
  *
- * Three linear passes over the node array, no recursion and no explicit stack:
+ * 1. Reverse scan over `[nodes_used-1 .. 0]`: leaves fit their primitives,
+ *    internal nodes merge their children (every child index exceeds its
+ *    parent's, so children are always visited first).
+ * 2. `bounding_radius` from the root box; `tolerance` from it (or from
+ *    `radius_hint`).
+ * 3. Forward scan inflating every node by the tolerance -- valid because a
+ *    uniform inflation commutes with the min/max merge.
  *
- *   1. REVERSE SCAN over [nodes_used-1 .. 0], fitting each leaf to its
- *      primitives and each internal node to its two children. The build
- *      allocates a child pair by post-incrementing `nodes_used`, so a child
- *      index is always greater than its parent's -- walking backwards therefore
- *      visits both children before the parent that merges them. That property is
- *      the whole reason the refit-only fast path is worth having.
- *   2. The root box now bounds every primitive, so `bounding_radius` and
- *      `tolerance` come straight off it.
- *   3. FORWARD SCAN inflating every node by the tolerance.
+ * Shared by MFTL_GenerateLBVH() and MFTL_RefitLBVH()
+ * (`test_refit_only_matches_full_rebuild`).
  *
- * ── Why the inflation is a separate pass and not part of pass 1 ────────────
- *
- * The tolerance depends on the bounding radius, which is only known once pass 1
- * has finished -- so inflating the leaves inside pass 1 would need the radius
- * from a pass that has not run yet. The alternative is a preliminary sweep over
- * the PRIMITIVES to find the box first, which costs nine doubles per primitive.
- *
- * Pass 3 avoids it because a uniform inflation COMMUTES with the min/max merge:
- * growing every leaf by `tol` and re-merging gives exactly the same tree as
- * merging first and growing every node by `tol`. So the correction is applied
- * once per NODE, over an array that is still in cache from pass 1, instead of
- * once per primitive over the mesh.
- *
- * Shared by MFTL_GenerateLBVH (as its last build step) and MFTL_RefitLBVH (as
- * the entire operation), so the two can never disagree about what a fitted tree
- * looks like -- which is what `test_refit_only_matches_full_rebuild` asserts.
- *
- * @param bvh The hierarchy. Every node's box, plus `bounding_radius` and
- *            `tolerance`, are rewritten.
+ * @param bvh The hierarchy; boxes, `bounding_radius` and `tolerance` rewritten.
  */
 void MFTLBVHRefit(MFTL_BVH *bvh);
 
 /**
- * @brief Morton codes, radix sort, tree build and fit over the CURRENT primitive
- *        set -- everything in a build that does not depend on where the
- *        primitives came from.
+ * @brief Keys, sort, split and fit over the CURRENT primitive set -- the part of
+ *        a build independent of where the primitives came from. Used by
+ *        MFTL_GenerateLBVH() and, after attaching a patch, MFTL_BVHSetHalo()
+ *        (the order is a function of the whole set, so leaves cannot be
+ *        appended to an existing tree).
  *
- * Split out because MFTL_CreateSpatialGhosts has to redo exactly this after
- * appending remote primitives. The Morton order, the tree and the fit are all
- * functions of the FULL primitive set, so a tree built over the local half
- * cannot have leaves bolted onto it afterwards -- the sorted order the leaves
- * address would no longer be sorted.
- *
- * @param bvh The hierarchy. Expects `n_prims`, `n_local_prims`, the remote
- *            arrays, `nodes` and `prim_indices` to be sized and populated;
- *            rewrites the tree in place.
+ * @param bvh The hierarchy, with `n_prims`, `n_local_prims`, `halo`, `nodes`
+ *            and `prim_indices` sized; the tree is rewritten in place.
  */
 void MFTLBVHBuildFromPrims(MFTL_BVH *bvh);
 

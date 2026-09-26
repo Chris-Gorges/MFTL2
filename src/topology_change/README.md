@@ -49,19 +49,18 @@ module it belongs to rather than here:
 
 ## The pipeline {#topo_pipeline}
 
-```mermaid
-flowchart TD
-  D[DETECT: opposing triangle pairs within delta, self and pairwise] --> A[AGREE: gather, canonicalise, identical list on every rank]
-  A --> C[CLUSTER: union-find over bodies joined by a two-body event]
-  C --> R[RASTERISE owned triangles into a window per cluster]
-  R --> X[EXCHANGE overlap nodes with the neighbours, merge]
-  X --> B[BIAS at every event]
-  B --> M[MARCHING CUBES on own cells plus one ghost layer]
-  M --> L[LABEL components: smallest triangle key, until nothing changes]
-  L --> I[DECIDE ids, BUILD objects, dense ids by scan]
-  I --> RD[MFTLRedistribute to the canonical partition]
-  RD --> RM[optional MFTLRemeshEnsemble, second size floor]
-  RM --> V[VOLUME: three Newton steps per cluster]
+```
+DETECT      opposing triangle pairs within delta, within and between bodies
+AGREE       gather, canonicalise: an identical list on every rank
+CLUSTER     union-find over bodies joined by a two-body event
+RASTERISE   owned triangles into a window per cluster; exchange and merge overlap nodes
+BIAS        a bump at every event
+EXTRACT     marching cubes on own cells plus one ghost layer
+LABEL       components by their smallest triangle key, until nothing changes
+BUILD       decide ids, build objects, dense ids by holder scans
+REDISTRIBUTE to the canonical partition
+REMESH      optional; then the size floor a second time
+VOLUME      three Newton steps per cluster
 ```
 
 `MFTLEnsembleApplyTopologyChanges` is `MFTLTopologyDetectEvents` followed by
@@ -91,8 +90,7 @@ Two triangles $A$, $B$ — of one body or of two — are an EVENT when
    **coalescence**. Mixed signs are a fold seen edge-on and are not events;
 4. their distance is within the threshold of THAT kind.
 
-Condition 3 is what the draft's two criteria leave implicit, and it is the one that
-lets one predicate serve both directions. A Rayleigh–Taylor cap rolling onto its own
+Condition 3 is what lets one predicate serve both directions. A Rayleigh–Taylor cap rolling onto its own
 stem and a jet's neck thinning are both "two opposing triangles within $\delta$ on
 one body"; only the side the gap is on tells them apart, so "intra-body means
 breakup, inter-body means coalescence" is wrong in both directions — a film inside
@@ -103,8 +101,8 @@ The pairs come from `MFTLEnsembleIntersectObjects` with `self_pairs` set — the
 existing distributed contact pipeline, with its halo, its broad phase and its
 ownership rule (a pair is reported by the owner of its A-side triangle) — and the
 opposing-normal test runs as a `pair_filter` BEFORE the narrow phase, since
-`MFTL_TriTriProximity` costs 176 ns per pair (deferred issue 12 in `CLAUDE.md`)
-against one dot product, and most candidate pairs on a curved surface are
+`MFTL_TriTriProximity` costs 176 ns per pair (@ref mftl_mod_bvh) against one dot
+product, and most candidate pairs on a curved surface are
 neighbours facing the same way. The A-side tree is built with a zero
 envelope (the B side carries the whole $\max\delta$), which took the candidates from
 129 to 45 per triangle at the same hit count.
@@ -124,7 +122,7 @@ over both surfaces sees the film.
 
 ---
 
-## The lattice {#MFTL_TopoLattice}
+## The lattice {#topo_lattice}
 
 $$
   \texttt{cells}_k = \texttt{cuts}_k\cdot\max\!\Big(1,\ \operatorname{round}\frac{L_k}{\texttt{cuts}_k\,\Delta x}\Big),
@@ -139,8 +137,8 @@ anchored at `global_min`. Two properties follow and everything rests on them:
 - **a node plane lies on every rank's cut plane**, so every lattice cell belongs to
   exactly one rank, and "who triangulates this cell" has one answer everywhere.
 
-The lattice is GLOBAL rather than one grid per cluster, as the draft proposed, and
-the reason is the second property: a per-cluster grid anchored at the cluster's box
+The lattice is GLOBAL rather than one grid per cluster because of the second
+property: a per-cluster grid anchored at the cluster's box
 puts cell faces at arbitrary offsets from the cut planes, so the question "which rank
 extracts this cell" needs either a negotiation or an overlap. Memory is not the price
 it looks like — a rank allocates only a WINDOW (`MFTLSdfGridInitWindow`): its own box
@@ -334,12 +332,12 @@ collective.
 
 ---
 
-## Where this departs from the draft {#topo_departures}
+## Design alternatives {#topo_departures}
 
-The implementation plan this module was built from (an SDF + marching-cubes draft, since retired) was the starting point. Each departure
-below was either agreed before implementation or forced by a measurement.
+Each choice below was either made before implementation or forced by a
+measurement.
 
-| Draft | Here | Why |
+| Alternative | Chosen | Why |
 |---|---|---|
 | migrate a dispersed cluster to one rank; a sub-communicator grid for a spanning one | nothing migrates; every rank works on its own box | one code path at every body size; no second partition to keep consistent; the field is partition-independent by the merge rule |
 | one grid per cluster, `[min − 3Δx, max + 3Δx]` | one global wall-aligned lattice, windows per rank | a node plane on every cut plane and every wall: unique cell owners, rims on walls |
@@ -389,7 +387,7 @@ t ≈ 3.5) and `test_travelling_waves_topology` (a plunging lip reconnects with 
   ensemble's surface rather than with the change: one self- and pair-proximity query
   over every body. It dominates a call that finds nothing, which is most calls.
 - **There is no continuous-time detection.** Two surfaces that approach by more than
-  $\delta$ in one step are not found; the contact module's deferred issue 16 applies
-  unchanged.
+  $\delta$ in one step are not found, exactly as for contact detection
+  (@ref bvh_deferred).
 - **Rims off the walls are refused, not handled.** A level set cannot represent them;
   a surface with a free rim needs a different reconstruction.

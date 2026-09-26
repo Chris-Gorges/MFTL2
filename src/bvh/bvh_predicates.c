@@ -7,103 +7,37 @@
  * @brief The narrow phase: exact orientation, triangle-triangle intersection,
  *        and exact triangle-triangle distance.
  *
- * Everything in this file is DOUBLE and stays double. The broad phase may round
- * outward and be loose; this may not be wrong at all, because it is the last
- * thing that runs before a contact force is applied.
+ * Everything here is double precision. The broad phase may be loose (outward
+ * rounded float boxes); the narrow phase may not be wrong.
  *
- * ## WHY THE ORIENTATION TEST IS ADAPTIVE AND NOTHING ELSE HERE IS
+ * **Why only the orientation test is adaptive.** It is the only predicate whose
+ * SIGN decides the answer: Guigue-Devillers branches on it up to eight times per
+ * pair (six plane classifications, two in check_min_max; the permutation
+ * cascade branches on signs already computed). A wrong sign sends the algorithm
+ * down a branch for a configuration that does not exist and typically reports a
+ * clean miss for two crossing triangles. Distances and interval endpoints
+ * degrade continuously and only move decisions sitting on the tolerance.
  *
- * MFTL_Orient3D is the only predicate in the module whose SIGN decides the
- * answer. Guigue-Devillers evaluates it up to EIGHT times per triangle pair and
- * branches on each result -- six for the plane classification, two in
- * check_min_max, and none at all in the permutation cascade, which branches on
- * signs it already has; every other quantity here -- distances, areas,
- * interval endpoints -- degrades continuously, so a last-ulp error moves a
- * contact decision only for pairs sitting exactly on the tolerance, which is a
- * tie the caller accepted when it chose a tolerance.
+ * The determinant is ill-conditioned exactly where this library works: thin
+ * films (four points coplanar to within the gap) and small features at large
+ * coordinates (the differences cancel the offset and its digits). Measured with
+ * examples/orient3d_predicate_profile.c (20 000 samples per row, adaptive form
+ * as the exact reference): the plain determinant misclassified 0 % at
+ * gap/L >= 1e-12, up to 0.035 % at 1e-14, 0.125 % at 1e-15 and 4.7 % at 1e-16.
+ * The adaptive form costs 3.66 ns against 1.83 ns in general position (40 ns
+ * only for exactly coplanar input), i.e. at most 6.2 % of a 176 ns
+ * MFTL_TriTriProximity() call. It is kept because the failure it removes is
+ * silent; MFTL_Orient3DFast() is the plain form.
  *
- * A wrong SIGN is different in kind. It sends the algorithm down a branch that
- * describes a configuration which does not exist, and the usual outcome is a
- * clean "no intersection" reported for two triangles that plainly cross.
- *
- * ### The failure is not hypothetical, and it is aimed at this library
- *
- * The determinant is a difference of products of coordinate DIFFERENCES. Its
- * condition number is the ratio of the terms' magnitude to the result's, and for
- * a nearly coplanar tetrahedron that ratio is unbounded. Two configurations this
- * code exists to handle sit exactly there:
- *
- *   THIN FILM / LUBRICATION. Two surfaces separated by a gap orders of magnitude
- *   below their own size -- a draining film between coalescing droplets. The four
- *   points of the predicate are then coplanar to within the film thickness.
- *
- *   LARGE COORDINATES, SMALL FEATURES. A millimetre droplet at x = 0.5 m spends
- *   most of its mantissa on the OFFSET. The differences taken inside the
- *   determinant cancel that offset, and the cancellation is where the digits go:
- *   the same droplet at the origin is well conditioned, and translating it is not
- *   supposed to change whether two triangles touch.
- *
- * ### What was actually measured, and what it says
- *
- * examples/orient3d_predicate_profile.c, Apple silicon, Release, best of five.
- * The adaptive form is the reference, its sign being exact by construction, so
- * any disagreement IS a misclassification by the plain determinant:
- *
- *   MISCLASSIFICATION vs GAP  (triangle size L, general-orientation plane)
- *
- *       gap/L >= 1e-12     0.000 %   of 20 000 samples, at EVERY offset tried
- *       gap/L  = 1e-14     0.000 - 0.035 %
- *       gap/L  = 1e-15     0.000 - 0.125 %
- *       gap/L  = 1e-16     0.135 - 4.745 %
- *
- *   COST                      general position    exactly coplanar
- *       plain determinant        1.83 ns              1.83 ns
- *       adaptive                 3.66 ns             40.13 ns
- *                               (2.00x)             (21.9x)
- *
- * The honest reading is that THE PLAIN DETERMINANT IS FINE FOR THE PHYSICS AS
- * STATED. A lubrication or thin-film model works at gaps of 1e-6 to 1e-9 of the
- * body size, and at 1e-12 -- three orders below that -- the plain form did not
- * misclassify once in 20 000 samples. The failures only start within about two
- * orders of magnitude of the double epsilon itself.
- *
- * The adaptive form is kept anyway, on the cost side of the argument rather than
- * the accuracy side:
- *
- *   - the 2x is on the PREDICATE, not on the query. A full
- *     MFTL_TriTriProximity call costs 176 ns, of which six orientation tests at
- *     1.83 ns of extra each is AT MOST 6.2 %. The narrow phase is dominated by
- *     the fifteen distance sub-tests, not by the determinant;
- *   - the 21.9x worst case needs EXACT coplanarity, which moving geometry
- *     essentially never produces. It is the price of a constructed test mesh,
- *     not of a timestep;
- *   - the failure it removes is silent and unbounded: a clean "no intersection"
- *     for two triangles that cross, from which a contact force is then never
- *     applied. There is no error term to bound it with and nothing downstream
- *     that can notice.
- *
- * 6.2 % of the narrow phase to make a whole class of silent wrong answers
- * unreachable is the same trade CLAUDE.md records for the unit-normal guard
- * (+1.1 % to remove a silently short normal) and it is taken the same way.
- * REVISIT IT if a profile ever shows the narrow phase dominating a timestep --
- * the plain form is one call away in MFTL_Orient3DFast, and the measurement to
- * repeat is in the example.
- *
- * ### Why the cost is as low as it is
- *
- * Shewchuk's construction is a filter, not a slow path: the plain determinant
- * plus a comparison against a rigorous relative error bound, and exact expansion
- * arithmetic ONLY when the estimate falls inside that bound. Well-conditioned
- * input -- which is every pair the broad phase rejects and most of what it does
- * not -- pays one extra compare and nothing else.
+ * Shewchuk's construction (Discrete Comput. Geom. 18, 1997) is a filter: the
+ * plain determinant plus a comparison against a rigorous relative error bound,
+ * with exact expansion arithmetic only when the estimate cannot certify the sign.
  */
 
-/* The exact expansion arithmetic below depends on a*b being computed with a
- * single rounding, so that Two_Product's error term is the true residue. A fused
- * multiply-add contracts `x - a*b` into one operation with one rounding, which
- * makes that residue come out zero and silently destroys every guarantee in this
- * file. The pragma is the portable statement of that requirement; CMake also sets
- * -ffp-contract=off on this source, because not every compiler honours it. */
+/* The exact arithmetic requires a*b and x - a*b to be rounded SEPARATELY: a
+ * fused multiply-add makes Two_Product's residue zero and silently voids every
+ * guarantee. Hence the pragma, and -ffp-contract=off in CMakeLists.txt for
+ * compilers that ignore it. */
 #if defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 12)
 #pragma STDC FP_CONTRACT OFF
 #endif
@@ -816,29 +750,20 @@ double MFTL_Orient3D(const double pa[3], const double pb[3], const double pc[3],
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 3. Guigue-Devillers triangle-triangle intersection
- *
- * The published decision tree, expressed over MFTL_Orient3D so that every branch
- * it takes is one the exact predicate agreed to. The tempting shortcut is a
- * hand-rolled interval permutation, and it fails in two ways that are easy to
- * miss: a permutation that normalises only WHICH vertex is isolated, and not the
- * ORIENTATION of the second triangle, gets the sign of the interval test wrong on
- * half its inputs, and a coplanar case that returns "intersect" unconditionally
- * reports contact for two coplanar triangles a metre apart.
+ * 3. Guigue-Devillers triangle-triangle intersection (J. Graphics Tools 8(1),
+ * 2003), with every branch taken on an exact MFTL_Orient3D sign. The
+ * permutations normalise both WHICH vertex is isolated and the ORIENTATION of
+ * the second triangle; the coplanar case gets a real 2D test.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief The terminal test of the decision tree.
+ * @brief The terminal test of Guigue-Devillers, once both triangles are in
+ *        canonical position.
  *
- * Both triangles have been permuted so that the intersection of each with the
- * other's plane is an interval on a common line, with a known orientation. Two
- * orientation tests then decide whether those intervals overlap. Expressed as
- * determinants of the original points rather than as explicit interval
- * endpoints, which is the whole point of the method: no division, no
- * intersection point is ever constructed, and therefore nothing to be
- * ill-conditioned.
+ * Each triangle meets the line of intersection of the two planes in an
+ * interval; the intervals overlap iff both orientation tests below are
+ * non-positive. No interval endpoint or intersection point is constructed.
  *
- * @brief The Guigue-Devillers decision tree, once the vertex permutation is fixed.
  * @param p1 First triangle's first corner.
  * @param q1 First triangle's second corner.
  * @param r1 First triangle's third corner.
@@ -911,25 +836,11 @@ int MFTL_TriTriIntersect(const double A[3][3], const double B[3][3])
   const double *p1 = A[0], *q1 = A[1], *r1 = A[2];
   const double *p2 = B[0], *q2 = B[1], *r2 = B[2];
 
-  /* Signed distances of A's vertices to B's plane. If all three are strictly on
-   * the same side there is nothing to test -- and this is the branch the great
-   * majority of leaf pairs take, so it comes first.
-   *
-   * ── The argument order is load-bearing ──────────────────────────────────
-   *
-   * The QUERY POINT COMES FIRST and the plane's three vertices follow, because
-   * that is the convention the decision tree below and check_min_max were
-   * derived under. Writing it the other way round -- plane first, point last,
-   * which reads more naturally -- is a CYCLIC permutation of four arguments,
-   * and a 4-cycle is an ODD permutation, so it negates every one of these six
-   * values.
-   *
-   * The early-out tests survive that (they compare products, which are
-   * sign-invariant), and so does any picture: the sign flip is invisible until
-   * the dispatch below branches on an individual sign and takes the mirror
-   * branch of the tree. The observable symptom is a clean "no intersection" for
-   * a triangle pair that visibly crosses. Guarded by
-   * test_tri_tri_intersect_basic_cases. */
+  /* A's corners against B's plane; all strictly on one side -> disjoint (the
+   * common case, 3 predicates). The QUERY POINT comes first: plane-first order
+   * is an odd permutation of the four arguments and negates every sign, which
+   * the early-outs survive but the dispatch does not
+   * (test_tri_tri_intersect_basic_cases). */
   const double dp1 = MFTL_Orient3D(p1, p2, q2, r2);
   const double dq1 = MFTL_Orient3D(q1, p2, q2, r2);
   const double dr1 = MFTL_Orient3D(r1, p2, q2, r2);
@@ -985,25 +896,12 @@ int MFTL_TriTriIntersect(const double A[3][3], const double B[3][3])
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 4. The coplanar case
- *
- * Reached only when all six orientation tests returned exactly zero, i.e. when
- * the two triangles are coplanar to the last bit of the EXACT predicate. That is
- * a measure-zero configuration in a moving simulation and a common one in a
- * constructed test, which is the split this implementation is sized for: correct
- * and simple rather than fast.
- *
- * Projected onto the coordinate plane the normal is most aligned with -- the
- * projection with the largest Jacobian, so the flattest of the three and the
- * best conditioned. Then a complete 2D overlap test: nine segment crossings
- * catch every boundary intersection, and two containment tests catch the case of
- * one triangle strictly inside the other, which has no crossing at all.
- *
- * The 2D orientation here is a plain determinant, not the adaptive predicate.
- * That is a deliberate stopping point: this branch already required an exact
- * coplanarity verdict to be reached, and the production predicate the traversal
- * uses is MFTL_TriTriProximity, whose distance test resolves a coplanar pair
- * within the tolerance regardless of what the overlap test decides.
+ * 4. The coplanar case: reached only when all six exact predicates are zero
+ * (measure zero for moving geometry). Projected by dropping the axis the normal
+ * is most aligned with (the best-conditioned projection); nine segment
+ * crossings plus two containment tests are a complete 2D overlap test. The 2D
+ * determinant is plain, not adaptive: in production MFTL_TriTriProximity()'s
+ * distance test resolves coplanar pairs within the tolerance anyway.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -1020,9 +918,9 @@ static inline double orient2d(const double a[2], const double b[2], const double
 }
 
 /**
- * @brief True if the closed segments p1p2 and q1q2 share at least one point.
+ * @brief Do the closed 2D segments p1p2 and q1q2 share a point (collinear
+ *        touching and zero-length segments included)?
  *
- * @brief Do the two closed 2D segments cross?
  * @param p1 First endpoint of segment 1.
  * @param p2 Second endpoint of segment 1.
  * @param q1 First endpoint of segment 2.
@@ -1059,9 +957,8 @@ static int seg_seg_2d(const double p1[2], const double p2[2], const double q1[2]
 }
 
 /**
- * @brief True if @p p lies in the closed triangle (a, b, c), either winding.
+ * @brief Is @p p in the closed 2D triangle (a, b, c), of either winding?
  *
- * @brief Is @p p inside the closed 2D triangle (a, b, c)?
  * @param p The query point.
  * @param a First corner.
  * @param b Second corner.
@@ -1080,13 +977,7 @@ static int point_in_tri_2d(const double p[2], const double a[2], const double b[
 }
 
 /**
- * @brief 2D overlap test for two triangles already known to be COPLANAR.
- *
- * Projected onto the coordinate plane @p normal is most aligned with -- the
- * projection with the largest Jacobian, so the flattest of the three and the
- * best conditioned. Then nine segment-crossing tests catch every boundary
- * intersection, and two containment tests catch one triangle lying strictly
- * inside the other, which has no crossing at all.
+ * @brief 2D overlap test for two triangles known to be COPLANAR.
  *
  * @param p1     First triangle's first corner.
  * @param q1     First triangle's second corner.
@@ -1147,27 +1038,14 @@ static int coplanar_tri_tri(const double *p1, const double *q1, const double *r1
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 5. Exact distance between two DISJOINT triangles
+ * 5. Exact distance between two DISJOINT closed triangles: the minimum is
+ * attained between two edges or between a vertex and the interior of the other
+ * face, so nine edge-edge and six point-face terms are a complete cover.
  *
- * The minimum distance between two disjoint closed triangles is attained either
- * between two edges or between a vertex and the interior of the other face.
- * Nine edge pairs and six point-face projections is a complete cover of both, so
- * the minimum over the fifteen is exact -- no iteration, no tolerance.
- *
- * ── Why every test here is DIMENSIONLESS ───────────────────────────────────
- *
- * Guarding either routine with an ABSOLUTE threshold puts it on a quantity that
- * does not have units of length. `det < 1e-12` in the point-face routine tests a
- * Gram determinant, which has units of length^4: for a droplet
- * meshed at 20 um the determinant of a healthy triangle is around 1e-19, so the
- * guard fired on EVERY triangle and the point-face branch returned "no
- * contribution" every time. The distance was then whatever the edge-edge tests
- * found, which misses exactly the vertex-into-face configuration that a resolved
- * contact consists of -- silently, and only at small scales.
- *
- * The tests here are dimensionless: `det <= tiny * a * c` compares the Gram
- * determinant against the product of the two edge norms it is built from, which
- * is the only formulation that means the same thing at 1e-5 m and at 1 m.
+ * Degeneracy tests are DIMENSIONLESS: a Gram determinant D = ac - b^2 (units
+ * length^4) is compared with a*c, i.e. D/(ac) = sin^2 of the angle between the
+ * two directions. An absolute threshold (1e-12) made the point-face term vanish
+ * for every triangle of a 20 um mesh.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -1286,18 +1164,17 @@ static double edge_edge_dist_sq(const double P0[3], const double P1[3], const do
 }
 
 /**
- * @brief Squared distance from @p P to the INTERIOR of triangle (A, B, C).
+ * @brief Squared distance from @p P to its orthogonal projection onto the plane
+ *        of triangle (A, B, C), if that projection lies inside the triangle.
  *
- * Returns MFTL_DBL_MAX when the orthogonal projection falls outside the
- * triangle: the closest point is then on the boundary, which the edge-edge pass
- * covers exactly. Returning a sentinel rather than clamping keeps the two passes
- * from computing the same boundary answer twice.
+ * Otherwise the closest point is on the boundary, which the edge-edge terms
+ * cover, and the sentinel #MFTL_DBL_MAX is returned.
  *
  * @param P Query point.
  * @param A First corner of the triangle.
  * @param B Second corner.
  * @param C Third corner.
- * @return Squared distance from @p P to the closed triangle.
+ * @return The squared distance, or #MFTL_DBL_MAX.
  */
 static double point_face_dist_sq(const double P[3], const double A[3], const double B[3], const double C[3])
 {
@@ -1367,10 +1244,8 @@ static double tri_tri_dist_sq_disjoint(const double A[3][3], const double B[3][3
 
 double MFTL_TriTriDistanceSq(const double A[3][3], const double B[3][3])
 {
-  /* Intersecting triangles are at distance zero, and the fifteen sub-tests would
-   * NOT find that: an edge piercing the interior of the other face has a
-   * positive distance to every edge and to every vertex. The predicate is the
-   * only thing that sees it, so it has to run first. */
+  /* An edge piercing the other face has positive distance to every edge and
+   * vertex, so only the intersection predicate sees it: it runs first. */
   if (MFTL_TriTriIntersect(A, B)) return 0.0;
   return tri_tri_dist_sq_disjoint(A, B);
 }

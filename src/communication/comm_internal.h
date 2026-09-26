@@ -23,44 +23,16 @@
 #include "mftl_memory.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 1. Instrumentation
- *
- * One file-scope accumulator, defined in comm_stats.c, written from every
- * translation unit of this module. A singleton rather than a `stats` parameter
- * because the alternative is a signature change on four public functions and
- * some sixty call sites in tests and examples, for a diagnostic.
- *
- * The macros exist to make the cost of measuring visible in the same place it is
- * paid: every one of them bumps `n_clock_reads`, so the perturbation can be
- * subtracted afterwards rather than assumed negligible.
+ * 1. Instrumentation: one accumulator (comm_stats.c). Counters are always on
+ * (a few integer adds per call or body). Phase TIMERS are compiled in only with
+ * -DMFTL_COMM_PROFILE=ON: the per-body timeline reads MPI_Wtime at ten
+ * boundaries per body (25-37 ns each on the development machine, 1.5-2 % of a
+ * 10 ms phase at a thousand bodies). Every clock read is counted in
+ * `n_clock_reads`, so the perturbation can be estimated.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /** @brief The accumulator. Rank-local, zeroed by MFTLRedistributeStatsReset(). */
 extern MFTL_RedistributeStats MFTLCommStats;
-
-/* ── What is always on, and what has to be asked for ─────────────────────────
- *
- * The COUNTERS are unconditional. They are a handful of integer adds per call or
- * per body, they answer most of the questions anyone asks of this module -- how
- * much moved, how many bytes, how many bodies were empty, how many allocations --
- * and they cost nothing measurable.
- *
- * The TIMERS are not, and MFTL_COMM_PROFILE is off by default. Two of them are
- * genuinely expensive:
- *
- *   - the per-body timeline reads the clock at ten phase boundaries per BODY, so
- *     a thousand-droplet ensemble reads it some sixteen thousand times per
- *     timestep. MPI_Wtime measures 25-37 ns on the development machine, which is
- *     1.5-2 % of a ten-millisecond phase;
- *   - the ownership-change count adds a compare to compute_owners' two hot loops,
- *     and those run once per entity per timestep. CLAUDE.md records a previous
- *     modification to exactly those loops measuring 1.70x.
- *
- * Neither is acceptable in a production timestep, and both are indispensable when
- * the question is where the time goes -- so they are a build option rather than a
- * judgement call baked into the source. Configure with
- * `-DMFTL_COMM_PROFILE=ON`; with it off the timer fields of
- * #MFTL_RedistributeStats stay at zero and the counters are still filled in. */
 
 #ifdef MFTL_COMM_PROFILE
 
@@ -95,7 +67,7 @@ static inline double cs_now(void)
     (tm) = cs_lap_now_;                                                                                                                                        \
   } while (0)
 
-/** @brief True when the ownership-change counters are wanted. */
+/** @brief 1 in a profiling build. Currently unused: owner changes are always counted. */
 #define CS_COUNT_OWNER_CHANGES 1
 
 #else
@@ -132,22 +104,13 @@ static inline void cs_galloc(size_t bytes)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 2. Growable int list
- *
- * One per destination rank, so there are nproc of them. Allocation is LAZY: a
- * redistribution touches its 26 neighbours and nobody else, and eagerly giving
- * every rank a 4 KB buffer costs 32 MB of untouched pages at nproc = 4096. The
- * first append jumps straight to the density-derived hint, so the lazy path does
- * not pay for a growth staircase either.
+ * 2. Growable int list, one per destination rank. Allocation is LAZY (at
+ * nproc = 4096 an eager 4 KB buffer each would be 32 MB of untouched pages), and
+ * the first append jumps straight to a density-derived hint.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief A growable `int` list that allocates NOTHING until first used.
- *
- * One of these exists per destination rank, so at `nproc = 4096` a 4 KB eager
- * buffer would cost 32 MB of untouched pages on every rank. The first append
- * jumps straight to the density-derived @c hint, so the lazy path does not pay
- * for a growth staircase either.
+ * @brief A growable `int` list that allocates nothing until first used.
  */
 typedef struct
 {
@@ -248,59 +211,33 @@ static inline void ib_free(mftl_int_buffer *b)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 3. Global id -> local slot table -- what replaced khash, and why it is a hash
+ * 3. Global id -> local slot table
  *
- * "Have I already got global id g, and in which slot" is asked once per arriving
- * entity. CLAUDE.md's standing rule is that there are no hash maps in this
- * library, because global ids are DENSE per entity class and a dense id is
- * already an array index.
+ * "Do I already hold global id g, and in which slot?" is asked once per arriving
+ * entity. Ids are dense per BODY, but a rank holds a scattered subset of a
+ * body's range, so a direct-address array is sized by the global count while
+ * holding the local one (measured: 15-62 MB per rank per step at np = 2-8 for
+ * one 327 680-triangle body, 97 % empty at np = 8). The table therefore has two
+ * modes chosen per use from the ratio of id range to entries: DIRECT
+ * (`tag[gid]`) when the ids are dense enough, SPARSE (open addressing, linear
+ * probing, load factor <= 1/2) otherwise. This is the library's one hash table.
  *
- * That rule holds mesh-wide and fails on a rank. Ids are dense across the whole
- * BODY; a rank holds a partition of it, so the ids it must look up are a sparse
- * subset scattered over the body's whole range. A direct-address array is
- * therefore sized by the GLOBAL entity count while holding only the LOCAL one --
- * and it is rebuilt every call, because the scratch does not survive between
- * redistributions.
- *
- * Measured, before this was changed: one 327 680-triangle body at np = 2/4/8 asked
- * for 15.2 / 31.0 / 62.0 MB of id table PER RANK PER TIMESTEP, allocated and
- * zeroed each time. Linear in the process count at a FIXED problem size, which in
- * a weak-scaling sweep is quadratic. The table held 163 842 entries at np = 1 and
- * roughly 20 000 at np = 8, so at np = 8 it was 97 % empty.
- *
- * Hence: an open-addressed table sized from the LOCAL entry count, and the
- * documented exception to the no-hash-map rule. Everything that made the direct
- * array attractive is kept --
- *
- *   - EPOCH STAMPS instead of clearing. A slot belongs to the current epoch only
- *     if its stamp matches, so retiring every entry is `epoch++` rather than a
- *     memset. That is what makes a per-object table free to reuse across the
- *     bodies of one call.
- *   - NO DELETION, ever. Without tombstones a probe stops at the first slot whose
- *     stamp is stale, which is what keeps the probe loop two compares.
- *   - LOAD FACTOR AT MOST 1/2, capacity a power of two, so the probe is a mask
- *     rather than a modulo and clustering stays bounded.
- *
- * Growth DISCARDS rather than rehashes, which is free here: gt_begin() retires
- * every entry anyway, so there is nothing worth carrying across a resize.
+ * - EPOCH stamps instead of clearing: a slot is live only if its tag carries the
+ *   current epoch, so retiring every entry is `epoch++`.
+ * - No deletion ever, so a probe stops at the first stale slot.
+ * - Capacity is a power of two in both modes, so a mode change never
+ *   reallocates; growth discards instead of rehashing (every entry is retired
+ *   anyway).
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Global-id to local-slot map. Two indexing modes, chosen per use.
- *
- * Sized from the number of ENTRIES it will hold and the ID RANGE they are drawn
- * from, and it picks its indexing from the ratio. See the section comment.
+ * @brief Global-id to local-slot map with a direct and a sparse (hashed) mode.
  */
 typedef struct
 {
   /**
-   * `[capacity]` epoch in the high 32 bits, global id in the low 32.
-   *
-   * ONE array rather than a separate stamp and key, and the reason is the probe:
-   * it must answer "is this slot live, and is it mine" on every step, and two
-   * arrays make that two loads that miss the cache independently. Packed into one
-   * 64-bit word it is a single load and a single compare against a value the
-   * caller already has in a register.
+   * `[capacity]` epoch in the high 32 bits, global id in the low 32: one load
+   * and one compare decide "live, and mine".
    */
   uint64_t *tag;
   int *value;  ///< [capacity] the local slot. Touched only on a hit.
@@ -331,16 +268,12 @@ static inline void gt_free(mftl_gid_table *t)
 }
 
 /**
- * @brief Scatters a global id over a sparse table's index space.
+ * @brief Scatters a global id over a sparse table's index space (multiplicative
+ *        avalanche hash).
  *
- * An avalanche multiply. The identity index is the obvious alternative -- global
- * ids are dense, so consecutive ids would land in consecutive slots and the table
- * would be read almost sequentially -- and it measured 127 ms against 0.76 ms on
- * a 327 680-triangle body. Dense runs that ALIAS under the fold are the textbook
- * primary-clustering input: the second run probes past the whole of the first, one
- * slot further each time, and insertion becomes quadratic. A partition's ids are
- * many runs scattered over the body's range by a subdivision order unrelated to
- * space, so aliasing is the normal case rather than the unlucky one.
+ * The identity index clusters badly: a partition's ids are many dense runs that
+ * alias under the mask, and linear probing then degrades to quadratic insertion
+ * (measured 127 ms against 0.76 ms on a 327 680-triangle body).
  *
  * @param gid The global id.
  * @return A well-mixed 32-bit value.
@@ -353,13 +286,9 @@ static inline unsigned gt_hash(int gid)
 }
 
 /**
- * @brief How dense the ids must be for direct addressing to be worth its memory.
- *
- * At `range <= 4 * n_entries` the direct table costs `range` slots against the
- * sparse table's `2 * n_entries` rounded up to a power of two -- so at most about
- * twice the memory, for a lookup that is one load instead of a multiply, a mask
- * and a probe. Beyond that ratio the memory gap grows without bound while the
- * speed gap does not, which is the whole content of the measurement.
+ * @brief Direct addressing is used when `range <= 4 * n_entries + 64`: then it
+ *        costs at most about twice the memory of the sparse table for a
+ *        one-load lookup.
  */
 #define MFTL_GT_DIRECT_RATIO 4
 
@@ -376,28 +305,17 @@ static inline void gt_begin(mftl_gid_table *t, int n_entries, int range)
 {
   const bool direct = (range <= MFTL_GT_DIRECT_RATIO * n_entries + 64);
 
-  /* A POWER OF TWO IN BOTH MODES, and the reason is thrash rather than the mask.
-   * Sparse mode needs it for `capacity - 1` to be a probe mask; direct mode does
-   * not, and sizing direct mode to exactly `range` looks like the tighter choice.
-   * It is not, because ONE table serves every body of a call: a body this rank
-   * holds most of chooses direct, the next body it holds a sliver of chooses
-   * sparse, and a mode change that also changes the size frees and reallocates on
-   * every one of them. Measured on a thousand-droplet ensemble: 19x the id-table
-   * bytes per step and three times the allocation count, for tables of a few
-   * kilobytes.
-   *
-   * With one size rule the allocation survives a mode change untouched. Nothing
-   * else has to: the epoch bump below retires every entry, so slots written under
-   * the other interpretation read as absent, which is exactly what a retired
-   * entry should do. Direct mode pays up to 2x the memory for it. */
+  /* A power of two in both modes: one table serves every body of a call, and a
+   * size rule shared by both modes lets it survive mode changes without
+   * reallocating (sizing direct mode exactly measured 19x the table bytes on a
+   * thousand-droplet ensemble). The epoch bump retires entries of either mode. */
   const int need = direct ? range : 2 * n_entries + 2;
   int want = 16;
   while (want < need) want <<= 1;
 
   if (want > t->capacity)
   {
-    /* Discarded rather than rehashed: every entry is retired by this call
-     * regardless, so carrying them across would be work for nothing. */
+    /* Discarded, not rehashed: every entry is retired anyway. */
     free(t->tag);
     free(t->value);
     t->tag = (uint64_t *) MFTLCallocOrDie((size_t) want, sizeof(uint64_t), "MFTL gid table tags");
@@ -420,11 +338,8 @@ static inline void gt_begin(mftl_gid_table *t, int n_entries, int range)
 
   t->direct = direct;
 
-  /* The one case where "never cleared" cannot hold: after 2^32 epochs the counter
-   * comes back to a value some ancient tag still carries, and that entry would
-   * read as present. Wrapping to 0 is defined for unsigned, so it is detectable,
-   * and the table is wiped exactly once every four billion uses. Epochs start at
-   * 1 so that a zeroed slot always means "absent". */
+  /* Epochs start at 1 (a zero tag is always absent). On unsigned wrap-around,
+   * after 2^32 uses, the table is wiped once. */
   t->epoch++;
   if (t->epoch == 0u)
   {
@@ -436,12 +351,9 @@ static inline void gt_begin(mftl_gid_table *t, int n_entries, int range)
 /**
  * @brief Finds the slot @p gid occupies, or the free slot it would occupy.
  *
- * In sparse mode the probe stops at the first slot that is not of the current
- * epoch, which is sound only because entries are never deleted -- a tombstone
- * would need a third state and a second compare in this loop.
- *
- * The mode test is a branch on a value that is constant for the whole of a
- * body's rebuild, so it predicts perfectly and costs nothing measurable.
+ * Sparse mode stops at the first slot not of the current epoch (sound because
+ * nothing is ever deleted). The mode branch is constant per use and predicts
+ * perfectly.
  *
  * @param      t     The table.
  * @param      gid   The global id.
@@ -454,13 +366,8 @@ static inline int gt_probe(const mftl_gid_table *t, int gid, bool *found)
 
   if (t->direct)
   {
-    /* An id above the declared range is ABSENT, not an error. Callers legitimately
-     * probe ids they have no reason to expect -- the spatial halo asks whether an
-     * arriving triangle's corner is among the vertices that arrived with it, and a
-     * corner whose vertex was not sent has an id from anywhere in the body. The
-     * test costs one compare and it is what makes the two indexing modes actually
-     * interchangeable: a sparse table answers such a probe without it, so leaving
-     * it out would make the modes disagree on exactly the inputs nothing tests. */
+    /* An id beyond the table is ABSENT, as in sparse mode (the spatial halo
+     * legitimately probes ids of vertices that were not sent). */
     if (gid >= t->capacity)
     {
       *found = false;
@@ -538,18 +445,12 @@ static inline void gt_put(mftl_gid_table *t, int gid, int value)
 }
 
 /**
- * @brief The ghost sync's persistent owner-side id table, on the ensemble.
+ * @brief The ghost sync's persistent owner-side id table, held by the ensemble's
+ *        communication workspace (created on first use). Internal, although it
+ *        carries the MFTL prefix required of every external symbol.
  *
- * INTERNAL despite the MFTL prefix -- it takes a type that only exists inside
- * this module, so it can never appear in a public header. The prefix is there
- * because it has external linkage and the library exports nothing else.
- *
- * Defined in redistribute.c, which owns the workspace type. Both paths need a
- * table sized by a body's id range and neither wants to build one per timestep,
- * so they share the one handle rather than each keeping their own.
- *
- * @param ens The ensemble. Its workspace is created on first use.
- * @return The table. Owned by the ensemble; never freed by the caller.
+ * @param ens The ensemble.
+ * @return The table; owned by the ensemble, never freed by the caller.
  */
 mftl_gid_table *MFTLCommWorkspaceGhostTable(MFTL_Ensemble *ens);
 

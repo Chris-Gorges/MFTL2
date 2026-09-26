@@ -4,70 +4,40 @@
  * @date 2026-08-14
  * @ingroup mftl_types
  *
- * @brief Core data structures of MFTL.
+ * @brief Core data structures of MFTL -- the single place every struct is defined.
  *
- * The lowest layer that knows about MFTL entities. It defines the structs and
- * nothing else -- no behaviour, no module APIs -- which keeps the type
- * definitions in exactly one place and prevents module headers from having to
- * include each other.
+ * Layer 1: types only, no behaviour, so module headers never include each other.
  *
- * ## THE ONE IDEA THIS FILE EXISTS TO EXPRESS
+ * ## Layout: topology in AoS, geometry in SoA, one allocation per pool
  *
- * A mesh is described by two things that want opposite memory layouts, and MFTL
- * stores each in the layout it wants:
+ * - **Topology and identity -> Array of Structures.** #MFTL_Vertex (16 B),
+ *   #MFTL_Triangle (12 B), #MFTL_HalfEdge (16 B). A remesher edits one entity at
+ *   a time and touches most of its record when it does.
+ * - **Geometry -> Structure of Arrays.** Positions, normals, areas, centroids:
+ *   kernels touch one component of every entity, every timestep.
  *
- *   TOPOLOGY AND IDENTITY -> Array of Structures.
- *   Who is my twin, which vertex do I end at, what is my global id, am I on the
- *   boundary. A remesher edits ONE entity at a time and touches most of its
- *   record when it does; an edge collapse is a handful of random accesses, not a
- *   sweep. AoS is right for that, and these records are deliberately small
- *   (12-16 bytes) so one cache line carries four of them.
+ * Both live in ONE allocation per entity class, cut into cache-line-aligned
+ * sub-arrays (mftl_memory.h, src/object/object.c):
  *
- *   GEOMETRY -> Structure of Arrays.
- *   Positions, normals, areas and centroids. These are read and written by kernels that touch ONE
- *   component of EVERY entity, every timestep. That is the access pattern AoS is
- *   worst at, and it is where all the time goes.
+ *     MFTL_VertexPool   = one block -> rec[] pos[] normal[]
+ *     MFTL_TrianglePool = one block -> rec[] he[] area[] normal[] center[] verts[] neighbors[]
  *
- * The split is easy to arrive at incrementally and hard to arrive at safely. Bolt
- * the geometry arrays onto the object with their own capacity (`geom_cap_*`),
- * then bolt a family of "flattened" arrays next to those with a third capacity
- * (`flat_cap_*`) and a fourth staleness counter (`flat_n_*`), and the result is
- * three capacities for one set of entities, kept in step by a comment that says
- * every growth site must remember to call three functions.
+ * so a pool has exactly one `capacity`, and "the AoS grew but an SoA array did
+ * not" cannot be expressed.
  *
- * Here there is ONE capacity per entity class, because a pool is ONE allocation:
+ * ## Three invariants every module may assume
  *
- *     MFTL_VertexPool  = one block  -> rec[] pos[] normal[]
- *     MFTL_TrianglePool= one block  -> rec[] he[] area[] normal[] center[]
- *                                      verts[] neighbors[]
- *
- * "The AoS grew but the SoA did not" is not a bug that can be made here; it is
- * not expressible. See mftl_memory.h (MFTLLayoutAdd) and src/object/object.c.
- *
- * ## THREE INVARIANTS THE REST OF THE LIBRARY IS ALLOWED TO ASSUME
- *
- * 1. HALF-EDGES ARE TRIANGLE-INDEXED. Half-edge 3t+k belongs to triangle t, and
- *    next(3t+k) == 3t+(k+1)%3. Therefore `he_idx`, `next_idx` and `triangle_idx`
- *    are not stored -- they are arithmetic (mftl_topology.h). The half-edge
- *    array lives INSIDE the triangle pool at 3x its capacity, so there is no
- *    separate half-edge capacity to keep in sync either. Anything that creates
- *    triangles must create their three half-edges at 3t, 3t+1, 3t+2.
- *
- * 2. OWNERSHIP IS A PREFIX. Entities [0, n_local) are owned by this rank;
- *    [n_local, n) are ghosts. There is no `is_ghost` field: it would be a second
- *    copy of a fact the index already carries -- and an index test, a flag and an
- *    `owner_proc == rank` comparison are three competing notions of ownership
- *    that can disagree. `owner_proc` survives on the records, because for a
- *    GHOST the interesting question is not "is it mine" (the index answers that)
- *    but "whose is it" (only the field answers that).
- *
- * 3. POSITIONS LIVE IN THE SoA, AND ONLY THERE. `verts.pos[3*v+k]` is the
- *    authoritative position of vertex v. Storing it in the entity struct AND in a
- *    second, Morton-ordered `flat_vert_pos` array forces a second index space, a
- *    sync function, a staleness flag and an "unwrapped or not" mode flag onto
- *    every consumer, and every one of those four is silent when it is wrong.
- *    Here the Morton order is applied to the POOL (MFTLObjectReorderMorton), so
- *    there is exactly one index space and exactly one copy of every coordinate.
+ * 1. **Half-edges are triangle-indexed.** Half-edge \f$3t+k\f$ belongs to
+ *    triangle \f$t\f$ and \f$\mathrm{next}(3t+k) = 3t+(k+1) \bmod 3\f$, so
+ *    `next`, `prev` and `face` are arithmetic (mftl_topology.h), and the
+ *    half-edge array lives inside the triangle pool at 3x its capacity. Anything
+ *    that creates a triangle creates its half-edges at 3t, 3t+1, 3t+2.
+ * 2. **Ownership is a prefix.** Entities `[0, n_local)` are owned by this rank,
+ *    `[n_local, n)` are ghosts. There is no `is_ghost` flag; `owner_proc` only
+ *    answers "whose is it" for a ghost.
+ * 3. **Positions live in `verts.pos` and only there.** Spatial (Morton) ordering
+ *    is applied to the pool itself (MFTLObjectReorderMorton()), never stored as
+ *    a permutation, so there is one index space and one copy of each coordinate.
  */
 
 #ifndef MFTL_TYPES_H
@@ -99,17 +69,14 @@ struct MFTL_Ensemble;
  * @struct MFTL_Vertex
  * @brief Identity and topology of one vertex. Its POSITION is not here.
  *
- * Everything geometric about a vertex -- its position and its normal -- lives in
- * the SoA arrays of MFTL_VertexPool at the same index.
- * What stayed is what a remesher edits one entity at a time.
- *
- * 16 bytes exactly: four records per cache line, and no padding to explain.
+ * Its position and normal live in the SoA arrays of #MFTL_VertexPool at the same
+ * index. 16 bytes: four records per cache line.
  */
 typedef struct MFTL_Vertex
 {
   int out_he_idx;  ///< Index of ONE outgoing half-edge, MFTL_ERROR if isolated. The 1-ring walk starts here.
-  int global_id;  ///< Unique across all ranks. Stable under redistribution and under MFTLObjectReorderMorton.
-  int owner_proc;  ///< The rank that owns this vertex. Equals domain->rank exactly for indices < n_local.
+  int global_id;  ///< Unique across ranks; stable under redistribution and reordering, renumbered by remeshing.
+  int owner_proc;  ///< Owning rank; equals this rank exactly for indices < n_local.
   int flags;  ///< Bit flags, see MFTL_FLAG_* in mftl_topology.h.
 } MFTL_Vertex;
 
@@ -117,14 +84,9 @@ typedef struct MFTL_Vertex
  * @struct MFTL_Triangle
  * @brief Identity of one triangle. Its topology AND its geometry are implicit.
  *
- * There is no `he_idx`: the three half-edges of triangle t are 3t, 3t+1, 3t+2 by
- * construction (invariant 1 at the top of this file). There is no area, normal
- * or centroid either -- those are SoA arrays on MFTL_TrianglePool.
- *
- * What is left is 12 bytes of pure identity. That is not an accident of
- * trimming: a triangle in a half-edge mesh genuinely IS just a name for a cycle
- * of three half-edges, and every attempt to store more of it here was storing
- * something derivable.
+ * Its half-edges are 3t, 3t+1, 3t+2 (invariant 1) and its area, normal and
+ * centroid are SoA arrays of #MFTL_TrianglePool, so what remains is 12 bytes of
+ * identity: a triangle is a name for a cycle of three half-edges.
  */
 typedef struct MFTL_Triangle
 {
@@ -140,18 +102,11 @@ typedef struct MFTL_Triangle
  * Each undirected edge of a closed mesh is two opposite half-edges; on an open
  * surface the boundary edges have no partner and carry `twin_idx == MFTL_ERROR`.
  *
- * Only TWO topological fields are stored:
- *
- *   vertex_idx  the vertex this half-edge ENDS at
- *   twin_idx    the oppositely oriented half-edge, or MFTL_ERROR
- *
- * `next_idx` and `triangle_idx` are arithmetic on the half-edge's own index
- * (mftl_topology.h), and so is the origin vertex: origin(h) == target(prev(h)).
- * There is no `boundary` bool either -- it was an exact mirror of
- * `twin_idx == MFTL_ERROR`, and two spellings of one fact is one too many.
- *
- * 16 bytes: four half-edges per cache line, so a triangle's three half-edges
- * span one line or two, never three.
+ * Only two topological fields are stored: `vertex_idx` (the vertex the
+ * half-edge ENDS at) and `twin_idx`. `next`, `prev` and the triangle are
+ * arithmetic on the index, and \f$\mathrm{origin}(h) =
+ * \mathrm{target}(\mathrm{prev}(h))\f$ (mftl_topology.h). 16 bytes, so a
+ * triangle's three half-edges span one or two cache lines.
  */
 typedef struct MFTL_HalfEdge
 {
@@ -169,30 +124,17 @@ typedef struct MFTL_HalfEdge
  * @struct MFTL_VertexPool
  * @brief Every vertex of one object: AoS records plus the per-vertex SoA arrays.
  *
- * All pointers address one block owned by `block`, cut into cache-line-aligned
- * sub-arrays. They are all sized for `capacity` entities, always, because they
- * are all reserved by the same call. Never assign to `capacity` or to any of the
- * pointers outside src/object/object.c.
- *
- * Which arrays are AUTHORITATIVE (nothing else holds the value) and which are
- * DERIVED (recomputable from the mesh) matters for MFTLObjectReorderMorton,
- * which must permute the former and may simply rebuild the latter:
- *
- *   authoritative : rec, pos
- *   cached        : normal   (recomputed per step, but permuted anyway -- a
- *                   reorder must not silently discard geometry the caller just
- *                   computed)
- *
- * A vertex-area or curvature array belongs here only together with the pass that
- * computes it: an array nothing writes is 8 B per vertex copied by every resize,
- * reorder and compaction for a value nobody can read.
+ * All pointers address sub-arrays of the one allocation `block`, all sized for
+ * `capacity` vertices. Only src/object/object.c may assign `capacity`, `block`
+ * or any pointer. `rec` and `pos` are authoritative; `normal` is computed
+ * (MFTLComputeVertexNormals()) but is preserved by resizes and reorders.
  */
 typedef struct MFTL_VertexPool
 {
   MFTL_Vertex *rec;  ///< [capacity]      identity + topology, AoS.
 
   double *pos;  ///< [3*capacity]    AUTHORITATIVE position, xyz interleaved.
-  double *normal;  ///< [3*capacity]    vertex normal, xyz interleaved.
+  double *normal;  ///< [3*capacity]    unit vertex normal, xyz interleaved; valid only after MFTLComputeVertexNormals().
 
   int n;  ///< Active vertices (owned + ghost).
   int n_local;  ///< Owned vertices; they occupy [0, n_local).
@@ -205,28 +147,24 @@ typedef struct MFTL_VertexPool
  * @struct MFTL_TrianglePool
  * @brief Every triangle AND every half-edge of one object.
  *
- * Half-edges live here rather than in a pool of their own because there is
- * nothing independent about them: a triangle has exactly three, and they are at
- * 3t..3t+2. Giving them their own capacity would recreate exactly the
- * "reallocated independently" problem this layout exists to remove.
+ * A triangle has exactly three half-edges at 3t..3t+2, so they share the
+ * triangle block (at 3x its capacity) instead of having a capacity of their own.
  *
- * The two derived connectivity arrays are the hot-loop representation. They are
- * rebuilt by MFTLObjectBuildDerived and are meaningful only while
- * MFTL_DERIVED_TOPOLOGY is set.
+ * `verts` and `neighbors` are derived, compact connectivity for hot loops, valid
+ * only while #MFTL_DERIVED_TOPOLOGY is set (MFTLObjectBuildDerived()). They are
+ * redundant with the half-edge records -- `verts[3t+k] = he[3t+(k+2)%3].vertex_idx`
+ * and `neighbors[3t+k] = he[3t+k].twin_idx / 3` -- and are stored because a
+ * connectivity-only loop then streams 12 B per triangle instead of 48 B.
  *
- * On what they duplicate, stated plainly so nobody has to rediscover it:
- * `verts[3t+k]` is a rotation of `he[3t+k'].vertex_idx`, and `neighbors[3t+k]`
- * is `he[3t+k].twin_idx / 3`. Both are stored anyway because a kernel that wants
- * only connectivity streams 12 B per triangle out of them, against 48 B if it
- * reads the half-edge records -- a 4x traffic reduction on exactly the loops
- * that are memory bound. See src/object/derived.c for the full accounting.
+ * `area`, `normal` and `center` are written by MFTLComputeTriangleGeometry() /
+ * MFTLEnsembleUpdate(); a redistribution leaves them unspecified.
  */
 typedef struct MFTL_TrianglePool
 {
   MFTL_Triangle *rec;  ///< [capacity]      identity, AoS.
   MFTL_HalfEdge *he;  ///< [3*capacity]    topology, AoS. Half-edge 3t+k belongs to triangle t.
 
-  /* --- Geometry: authoritative storage, written by the per-timestep pass --- */
+  /* --- Geometry: written by the per-timestep geometry pass ------------------ */
   double *area;  ///< [capacity]      triangle area.
   double *normal;  ///< [3*capacity]    unit normal, xyz interleaved.
   double *center;  ///< [3*capacity]    centroid, xyz interleaved, WRAPPED into the domain.
@@ -250,9 +188,10 @@ typedef struct MFTL_TrianglePool
  * @struct MFTL_ObjectQualityStatistics
  * @brief Global mesh-quality summary of one object, filled by MFTLEnsembleUpdate.
  *
- * Every field is a GLOBAL value: the min/max are reduced across all ranks and
- * the averages are taken against the global entity counts, never as an average
- * of per-rank averages.
+ * Every field is a value for the WHOLE body: min/max are reduced over the ranks
+ * holding it and averages are divided by global counts over owned entities
+ * (never an average of per-rank averages). The reduction folds contributions in
+ * a fixed rank order, so every holder gets bit-identical values.
  */
 typedef struct MFTL_ObjectQualityStatistics
 {
@@ -261,12 +200,10 @@ typedef struct MFTL_ObjectQualityStatistics
   double avg_triangle_area;  ///< Total area divided by the GLOBAL triangle count.
 
   /**
-   * Worst mean-ratio quality in the mesh, \f$q = 4\sqrt{3}A/(a^2+b^2+c^2)\f$.
-   *
-   * 1 for an equilateral triangle, tending to 0 as one degenerates. It is
-   * bounded above by 1 for every non-degenerate triangle, which is what makes an
-   * average above 1 a usable alarm: it was measured at 1.023 on a mesh whose
-   * areas were being floored by a clamped normalisation.
+   * Worst mean-ratio quality in the mesh, \f$q = 4\sqrt{3}A/(a^2+b^2+c^2)\f$
+   * (#MFTL_FOUR_SQRT3): 1 for an equilateral triangle, \f$\to 0\f$ as one
+   * degenerates, never above 1. Despite the name it is a quality, not an aspect
+   * ratio: larger is better.
    */
   double min_aspect_ratio;
   double max_aspect_ratio;  ///< Best mean-ratio quality in the mesh. Never exceeds 1.
@@ -299,67 +236,42 @@ typedef struct MFTL_Object
   /** Which derived arrays are current; see MFTL_DERIVED_* above. */
   unsigned derived;
 
-  /* Global ID counters. Handing out an ID always means post-incrementing one of
-   * these, so after generation each equals the entity count of its class.
-   *
-   * Density is not cosmetic: src/communication/ sizes its arrival lookup tables
-   * from these counters, so holes accumulated over a few hundred timesteps
-   * become an unboundedly growing table for a mesh of constant size. That is why
-   * MFTLRemeshRenumberGlobalIds() runs at the end of every remeshing pass. */
+  /* Global id counters. Ids are handed out by post-incrementing them, and are
+   * kept DENSE: after generation and after every remeshing pass (which
+   * renumbers) each equals the global entity count of its class. Density
+   * matters because src/communication/ sizes its arrival lookup tables from
+   * these counters. */
   int next_vertex_gid;  ///< Next unused vertex global id. Equals the global vertex count when dense.
   int next_triangle_gid;  ///< Next unused triangle global id.
-  int next_halfedge_gid;  ///< Next unused half-edge global id. Always 3x next_triangle_gid.
+  int next_halfedge_gid;  ///< Next unused half-edge global id; always 3 x next_triangle_gid, since the id of half-edge k of triangle g is 3g+k.
 
   int global_n_vertices;  ///< Owned vertices summed over all ranks.
   int global_n_triangles;  ///< Owned triangles summed over all ranks.
 
-  int global_id;  ///< Identifies this object across all ranks.
+  int global_id;  ///< Body id, dense in [0, n_bodies_global), assigned by MFTLEnsembleAddObject(). The one handle that survives a redistribution.
 
   /**
-   * Something changed this mesh in a way the CURRENT partition does not describe.
+   * Something other than the owner map changed this mesh (entity counts, global
+   * ids or flags), so the current partition no longer describes it and the next
+   * redistribution must rebuild the body even if no entity changed owner.
    *
-   * Redistribution may leave a body entirely alone when no entity of it changed
-   * owner -- the local state of a rank after a redistribution is a pure function
-   * of (global topology, owner map), and neither input moved. This flag is the
-   * second half of that precondition: it says that something OTHER than the owner
-   * map changed, so the partition has to be rebuilt even though nothing moved.
-   *
-   * Set by MFTLObjectMarkPartitionDirty() (mftl_object.h), which is where the
-   * complete list of the things that must set it lives. Cleared by redistribution
-   * once the body has actually been rebuilt. It is deliberately CONSERVATIVE: a
-   * spurious `true` costs one body's rebuild, a missed one is silent corruption
-   * that surfaces several timesteps later.
-   *
-   * It occupies padding that was already there -- `global_id` is followed by four
-   * bytes of it before the 8-aligned `domain` pointer -- so sizeof(MFTL_Object)
-   * is unchanged.
+   * Set by MFTLObjectMarkPartitionDirty() -- and by MFTLObjectSetCounts(), the
+   * choke point for every creation and destruction -- and cleared by
+   * redistribution after a rebuild. Conservative by design: a spurious `true`
+   * costs one rebuild, a missing one silently corrupts ghost ids.
    */
   bool partition_dirty;
 
   /**
-   * The last redistribution found this body globally unchanged, so its layout is
-   * at a fixed point and the next one may leave it alone entirely.
+   * The body has been rebuilt at least once since it last changed, so its pool
+   * layout is at a fixed point and the next redistribution may skip it.
    *
-   * The second half of the skip precondition, and it is a SEPARATE statement from
-   * `partition_dirty`: that one says "something changed and the current partition
-   * does not describe it", this one says "the current partition has already been
-   * rebuilt once since anything last changed".
-   *
-   * Both are needed because rebuild_object() is not idempotent -- an owned vertex
-   * whose incident triangles are all remote is dropped and re-received, so it
-   * lands at the END of the run. A body must therefore be clean TWICE before a
-   * skip reproduces the full rebuild SLOT FOR SLOT rather than merely as a set.
-   * `test_skipping_reproduces_the_full_rebuild` compares both digests and it is
-   * the order one that catches this.
-   *
-   * It lives on the object rather than in redistribution's workspace because it
-   * is per rank per BODY, and a workspace bitset indexed by list position has to
-   * be thrown away whenever the list changes -- which un-settles every body to
-   * answer a question about one. Here a body created on arrival simply starts
-   * unsettled, which is both correct and free.
-   *
-   * It occupies padding that was already there, next to `partition_dirty`, so
-   * sizeof(MFTL_Object) is unchanged.
+   * Separate from `partition_dirty` because a rebuild is not idempotent: an
+   * owned vertex whose incident triangles are all remote is dropped and
+   * re-received, landing at the end of the pool. A body must therefore be clean
+   * TWICE before a skipped pool equals a rebuilt one slot for slot
+   * (`test_skipping_reproduces_the_full_rebuild`). Kept per body on the object,
+   * so adding or removing a body never un-settles the others.
    */
   bool partition_settled;
 
@@ -376,9 +288,9 @@ typedef struct MFTL_Object
  * @struct MFTL_Domain
  * @brief The computational environment shared by every object of an ensemble.
  *
- * Decouples the container from the contents: MPI communicators, the process
- * grid, the physical bounds and the periodicity live here once, and objects
- * point at it.
+ * The MPI communicators, the Cartesian process grid, the physical bounds and the
+ * periodicity, stored once; every object holds a borrowed pointer. Read-only
+ * after MFTLEnsembleCreate().
  */
 typedef struct MFTL_Domain
 {
@@ -394,20 +306,10 @@ typedef struct MFTL_Domain
   int *neighbors;  ///< [num_neighbors] neighbour ranks, in the order MPI reports them.
 
   /**
-   * `[26][3]`, parallel to `neighbors`: the cell offset of that neighbour from
-   * this rank, each component in {-1, 0, +1}.
-   *
-   * It is the RELATIVE form on purpose. Absolute cell coordinates would answer
-   * the same question and would need MPI_Cart_coords per neighbour per query,
-   * plus a periodic-wrap correction at the seam; an offset needs neither, and
-   * "are these two cells 26-neighbours" becomes "is every component of the
-   * difference within 1".
-   *
-   * With a thin decomposition several of the 26 stencil offsets map onto the
-   * SAME rank (cuts = {2,1,1} periodic reaches its one neighbour both ways), so
-   * this records the FIRST offset that produced the neighbour. That is not a
-   * loss: at two cells per axis every cell is every other cell's neighbour, so
-   * either offset gives the same verdict. See MFTLEnsembleReduceBodies().
+   * `[26][3]`, parallel to `neighbors`: the cell offset of each neighbour from
+   * this rank, components in {-1, 0, +1}, so "are two cells 26-neighbours" is a
+   * componentwise test. On thin periodic grids several stencil offsets map to
+   * the same rank (e.g. cuts = {2,1,1}); the FIRST offset found is recorded.
    */
   signed char neighbor_offset[26][3];
 
@@ -418,12 +320,11 @@ typedef struct MFTL_Domain
   double global_min[3];  ///< Lower corner of the domain box, per axis.
   double global_max[3];  ///< Upper corner of the domain box, per axis.
   double domain_size[3];  ///< global_max - global_min.
-  double inv_domain_size[3];  ///< 1 / domain_size, 0 on a zero-length axis. Minimum-image wrapping is a
-  ///< multiply-and-round, so the reciprocal is precomputed once here.
+  double inv_domain_size[3];  ///< 1 / domain_size (0 on a zero-length axis), so the minimum image is a multiply-and-round.
 
   bool is_periodic[3];  ///< Per-axis periodicity.
 
-  int *rank_map;  ///< [nproc] rank_map[i + j*nx + k*nx*ny] = rank. MPI_Cart_rank is too slow for a hot path.
+  int *rank_map;  ///< [nproc] rank of Cartesian cell (i,j,k) at i + j*nx + k*nx*ny; a table lookup instead of MPI_Cart_rank.
   double grid_factors[3];  ///< cuts[i] / domain_size[i], so owner lookup is a multiply.
 } MFTL_Domain;
 
@@ -441,56 +342,37 @@ typedef struct MFTL_Ensemble
 
   /**
    * The bodies THIS RANK holds entities of, sorted by ascending
-   * #MFTL_Object::global_id (see "The local object directory" in
-   * mftl_ensemble.h). Owned; MFTLEnsembleDestroy() destroys each of them.
+   * #MFTL_Object::global_id; owned (MFTLEnsembleDestroy() destroys them). A
+   * redistribution destroys bodies that left the rank and creates bodies that
+   * arrived, so object pointers, list slots and `n_local_objects` are all
+   * invalid afterwards; `global_id` + MFTLEnsembleFindLocalObject() is the
+   * handle that survives.
    *
-   * Bodies are identified ON THE WIRE by #MFTL_Object::global_id, which
-   * MFTLEnsembleAddObject() hands out densely in add order -- never by their
-   * position in this list, which differs between ranks and changes whenever a
-   * redistribution creates or destroys a local object.
-   *
-   * @warning Every rank must still add the same bodies in the same order, so that
-   *          the same id names the same body everywhere. A Debug-only checksum
-   *          reduction inside the redistribution reports a violation rather than
-   *          silently merging entities into the wrong body.
+   * @warning Every rank must add the same bodies in the same order, so the same
+   *          id names the same body everywhere (checked by a Debug checksum).
    */
   MFTL_Object **local_objects;
   int n_local_objects;  ///< Bodies THIS RANK holds. Never a global quantity.
   int capacity_objects;  ///< Slots allocated in `local_objects`.
 
   /**
-   * Size of the body-id space: every body's `global_id` is in [0, n_bodies_global).
+   * Size of the body-id space: every `global_id` is in [0, n_bodies_global).
+   * Identical on every rank and never decreasing -- a topology change raises it
+   * for each new body and retires, never reuses, the ids of vanished ones, so it
+   * may exceed the number of live bodies.
    *
-   * MFTLEnsembleAddObject() hands out the ids, so they are DENSE by construction
-   * -- the same rule vertices and triangles already follow (see
-   * MFTL_Object::next_vertex_gid). Density is what lets a body id be an array
-   * index rather than a lookup, which is why the counter is a scalar here and
-   * never an array: an array indexed by body is exactly the thing that stops
-   * scaling once the body count grows with the rank count.
-   *
-   * It is identical on every rank because every rank adds the same bodies in the
-   * same order, and it never decreases -- an id is retired with its body, not
-   * reused, so nothing that stored one can be silently pointed at another. A
-   * topology change raises it for every body it creates, so it is the size of the
-   * id SPACE and may exceed the number of live bodies.
-   *
-   * Being the one body count every rank agrees about, it is the count a
-   * collective may be guarded by. `n_local_objects` is not: returning early on it
-   * is a rank-local decision about a collective call, i.e. a deadlock.
+   * This, not `n_local_objects`, is the count a collective may be guarded by:
+   * an early return on a local count is a deadlock.
    */
   int n_bodies_global;
 
-  int total_global_triangles;  ///< Sum over all objects of global_n_triangles.
+  int total_global_triangles;  ///< Owned triangles summed over all bodies and ranks (MFTLEnsembleUpdateGlobalCounts()).
 
   /**
-   * Opaque scratch owned by the communication module, created on the first
-   * MFTLRedistribute() and released by MFTLEnsembleDestroy().
-   *
-   * It holds only per-call working storage -- rank-sized arrays, per-destination
-   * payload buffers, the rebuild scratch and its id tables -- never mesh state.
-   * Keeping it here rather than on #MFTL_Domain is deliberate: the domain is
-   * read-only for the duration of a redistribution and a good deal of reasoning
-   * about who may touch what depends on that staying true.
+   * Opaque per-call scratch of the communication module (rank-sized arrays,
+   * payload buffers, rebuild scratch), created on the first MFTLRedistribute()
+   * and freed by MFTLEnsembleDestroy(). Never mesh state; kept off
+   * #MFTL_Domain so the domain stays read-only during a redistribution.
    */
   void *comm_workspace;
 } MFTL_Ensemble;

@@ -143,25 +143,14 @@ static inline void he_pair_outer(MFTL_Object *obj, int inner, int outer)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Appends a vertex at @p pos with a fresh global id. @return Its index.
+ * @brief Appends a vertex at @p pos with a fresh global id.
  *
- * ── Why the owned count is not always incremented ──────────────────────────
- *
- * Ownership is an array PREFIX (mftl_types.h, invariant 2), and an append lands
- * at the END of the pool. On a ghost-free object those are the same slot, so the
- * prefix grows with the pool and the entity is owned immediately.
- *
- * On a PARTITIONED object they are not, and incrementing `n_local` anyway --
- * which is what this function did while remeshing was serial-only -- would
- * declare the first ghost to be an owned vertex and shift every subsequent one
- * out from under the prefix. The new entity therefore sits PAST the prefix until
- * the end of the sweep, and is recognisable as this rank's by `owner_proc`;
- * MFTLRemeshCompactObject() re-establishes the prefix when it compacts.
- *
- * Nothing in between may use the index test to decide ownership, which is why
- * the parallel gate is MFTL_FLAG_FROZEN rather than `>= n_local`
- * (mftl_topology.h). A brand-new entity is owned, unreplicated and free, and its
- * cleared flag word says exactly that.
+ * Ownership is an array prefix and an append lands at the END of the pool. On a
+ * ghost-free object those coincide and `n_local` grows with the pool. On a
+ * partitioned object the new vertex stays past the ghosts, recognisable by
+ * `owner_proc`, until MFTLRemeshCompactObject() restores the prefix; nothing in
+ * between may decide ownership by index, which is why the parallel gate is
+ * #MFTL_FLAG_FROZEN. A new entity is owned, unreplicated and unfrozen.
  *
  * @param obj The mesh. **May reallocate both pool blocks.**
  * @param pos Position of the new vertex.
@@ -189,7 +178,7 @@ static inline int remesh_new_vertex(MFTL_Object *obj, const double pos[3])
 }
 
 /**
- * @brief Appends a triangle AND its three half-edges. @return Its index.
+ * @brief Appends a triangle AND its three half-edges.
  *
  * There is no separate half-edge allocator, and there cannot be one: the three
  * half-edges of triangle t are 3t..3t+2 in the same block, so they come into
@@ -237,15 +226,12 @@ static inline int remesh_new_triangle(MFTL_Object *obj)
  * @brief Squared sine of a corner angle at or below which a fold test treats the
  *        triangle as degenerate.
  *
- * DIMENSIONLESS, because the verdict has to be the same at every length scale:
- * a front-tracking run in SI units meshes a millimetre droplet with edges near
- * 1e-4. The test this replaces compared the squared area vector -- dimension
- * L^4 -- against 1e-15, i.e. a cutoff of sin(theta) ~ 3.2e-8 / l^2 for edge
- * length l: 1e-5 at l = 0.05, 3 % at l = 1e-3, and EVERY triangle below
- * l ~ 1.8e-4, so that every collapse and every flip was refused and the mesh could
- * only ever be refined. The same 1e-15 as a ratio is the precision floor the
- * closest-point and BVH degeneracy tests already use: below it the cross product
- * is rounding noise and its direction means nothing.
+ * DIMENSIONLESS, so the verdict is the same at every length scale. An absolute
+ * threshold on the squared area vector (dimension L^4, compared with 1e-15)
+ * refused every collapse and flip for edges below about 1.8e-4 -- a millimetre
+ * droplet in SI units -- so the mesh could only be refined
+ * (`test_remeshing_is_independent_of_the_length_unit`). 1e-15 as a ratio is the
+ * floor below which the cross product is rounding noise.
  */
 #define MFTL_REMESH_DEGENERATE_SIN2 MFTL_VERYVERYSMALL
 
@@ -446,22 +432,18 @@ static inline void remesh_stats_accumulate(MFTL_RemeshStats *dst, const MFTL_Rem
 }
 
 /**
- * @brief The split/collapse/compact/flip/smooth loop, gated by MFTL_FLAG_FROZEN.
+ * @brief The detect/split/collapse/compact/flip/smooth loop, gated by
+ *        #MFTL_FLAG_FROZEN.
  *
- * The whole of MFTLRemeshObject() except its no-ghost assertion, its stats
- * zeroing, its global-id renumbering and its closing geometry pass -- i.e. the
- * part both drivers need and neither may re-implement, since the sweep ORDER is
- * itself a correctness argument (see the header of remesh_driver.c).
- *
- * MFTLPascalCase despite being private to src/remeshing/, because it has
- * external linkage and nothing without the MFTL prefix may be exported from the
- * library (CLAUDE.md; the same reason MFTLBVHBuildFromPrims is spelled that way
- * in src/bvh/bvh_internal.h). It is absent from include/ and that is what makes
- * it private.
+ * MFTLRemeshObject() without its no-ghost assertion, stats zeroing, id
+ * renumbering and closing geometry pass: the part both distributed drivers need
+ * and neither may re-implement, because the sweep order is itself part of the
+ * correctness argument (remesh_driver.c). MFTL-prefixed because it has external
+ * linkage; absent from include/, hence private.
  *
  * @param      obj        The mesh.
  * @param      params     The parameter block.
- * @param[out] stats      May be #MFTL_NULL.
+ * @param[out] stats      Accumulates the counts; must not be #MFTL_NULL.
  * @param      iterations Outer iterations to run, overriding `params->iterations`.
  * @return Operations performed.
  */
@@ -469,16 +451,11 @@ int MFTLRemeshIterate(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFT
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Measure once, decide once
- * ═══════════════════════════════════════════════════════════════════════════
  *
- * The public pair -- MFTLRemeshChooseStrategy then MFTLRemeshEnsembleDispersed
- * -- measures the bodies TWICE, and the first measurement throws away the
- * centroids the second one recomputes. That is four per-body reductions where
- * two do.
- *
- * These two take the measurement as an argument instead. The public functions
- * become thin wrappers that measure and forward, so an external caller sees no
- * change; MFTLRemeshEnsemble uses these and pays for one measurement.
+ * The public pair MFTLRemeshChooseStrategy() + MFTLRemeshEnsembleDispersed()
+ * would measure the bodies twice. These take the measurement as an argument;
+ * the public functions measure and forward, and MFTLRemeshEnsemble() measures
+ * once.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**

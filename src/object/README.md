@@ -4,237 +4,156 @@
 **Public header:** `include/mftl_object.h` · **Layer:** 3 ·
 **Module group:** @ref mftl_object
 
-Two translation units:
-
 | File | Owns |
 |---|---|
-| `object.c` | the pool lifecycle. **The only file in MFTL allowed to write a pool pointer, a `capacity`, or a `block`.** |
-| `derived.c` | the rebuildable per-triangle arrays, and the Morton renumbering of both pools |
+| `object.c` | the pool lifecycle — **the only file allowed to write a pool pointer, a `capacity` or a `block`** |
+| `derived.c` | the derived connectivity arrays and the Morton renumbering of both pools |
 
 ---
 
 ## One pool is one allocation {#object_one_block}
 
-A mesh entity class needs an AoS record array *and* a family of SoA geometry
-arrays, and they describe the same entities, so they must always have the same
-capacity.
-
-Expressed as a **rule** — three capacity fields (`capacity_*`, `geom_cap_*`,
-`flat_cap_*`) and a comment saying every growth site must update all three — that
-requirement fails at the first site that updates two of them, and it fails as a
-heap overflow: not a wrong number, a corruption somewhere else entirely.
-
-Here the rule is replaced by a **structure**. `vertex_layout_compute` and
-`triangle_layout_compute` walk one cursor through every field:
+An entity class needs an AoS record array *and* several SoA geometry arrays that
+describe the same entities, so all of them must always have the same capacity.
+Rather than keeping several capacity fields in step by convention, each pool is
+**one** 64-byte-aligned block. `vertex_layout_compute` / `triangle_layout_compute`
+walk one cursor through the fields,
 
 $$
   o_0 = 0, \qquad
-  o_{i+1} = \left\lceil \frac{o_i + n_i s_i}{L} \right\rceil L,
-  \qquad L = \texttt{MFTL\_CACHE\_LINE} = 64
+  o_{i+1} = L\left\lceil \frac{o_i + n_i s_i}{L} \right\rceil,
+  \qquad L = \texttt{MFTL\_CACHE\_LINE} = 64,
 $$
 
-and the total is the block size. One `aligned_alloc`, one `capacity`, one pointer
-to free. **"The AoS grew but the SoA did not" is not a bug that can be made — it
-is not expressible.**
+($n_i$ elements of size $s_i$), and the final cursor is the block size:
 
 ```
-vertex block    rec[cap]  pos[3cap]  normal[3cap]
-triangle block  rec[cap]  he[3cap]   area[cap]  normal[3cap]  center[3cap]
-                verts[3cap]  neighbors[3cap]
+vertex block    rec[cap]  pos[3cap]  normal[3cap]                          64 B / vertex
+triangle block  rec[cap]  he[3cap]  area[cap]  normal[3cap]  center[3cap]
+                verts[3cap]  neighbors[3cap]                              140 B / triangle
 ```
 
-### Field order is not arbitrary
+One allocation, one `capacity`, one `free`: "the AoS grew but an SoA array did
+not" cannot be expressed. The half-edges live in the triangle block because a
+triangle has exactly three, at $3t\ldots3t+2$ (@ref arch_inv_implicit); a
+separate half-edge capacity would describe an impossible mesh. Cache-line
+alignment keeps arrays written by different kernels on different lines.
 
-`rec` and `pos` come first in the vertex block because they are the two arrays
-every pass touches, so they share the front of the block and the TLB entries that
-go with it.
-
-### Why the half-edges live in the triangle block
-
-Not packaging. A triangle has exactly three half-edges, at $3t \ldots 3t+2$
-(@ref arch_inv_implicit), so a half-edge capacity that could differ from
-$3\times$ the triangle capacity would describe **a mesh that cannot exist**.
-Giving them their own pool would recreate exactly the problem this layout removes.
-
-### What 64-byte alignment buys
-
-- A streaming kernel over one component never shares a cache line with a
-  neighbouring component, so a write to `tris.area` cannot false-share with a
-  read of `tris.normal`.
-- 64 bytes is a whole number of every element type in the pools (8 `double`,
-  16 `int`, 4 #MFTL_Vertex records), so an aligned sub-array start is also an
-  aligned *element* start and the vectoriser never needs a peel loop.
+An icosphere of refinement $r$ ($F = 20\cdot4^r$, $V = 10\cdot4^r+2$) therefore
+occupies $140F + 64V = 3440\cdot4^r + 128$ bytes, padding aside.
 
 ---
 
 ## The size API {#object_size_api}
 
 ```c
-MFTLObjectReserve(obj, nv, nt);            /* exact, for bulk loads          */
-MFTLObjectReserveAdditional(obj, dv, dt);  /* geometric, for incremental use */
-MFTLObjectSetCounts(obj, nv, nvl, nt, ntl);
-MFTLObjectShrinkToFit(obj, slack);         /* the only way DOWN, and gated   */
+MFTLObjectReserve(obj, nv, nt);            /* exact; for bulk loads               */
+MFTLObjectReserveAdditional(obj, dv, dt);  /* geometric; for incremental appends  */
+MFTLObjectSetCounts(obj, nv, nvl, nt, ntl);/* reserves, then assigns              */
+MFTLObjectShrinkToFit(obj, slack);         /* the only way down, explicit + gated */
+MFTLObjectReleasePools(obj);               /* free both blocks of an empty object */
 ```
 
-`MFTLObjectSetCounts` **reserves before it assigns**, so the postcondition
-`n <= capacity` holds unconditionally. That is the function that makes "counts
-and capacity disagree" unreachable, and it is why nothing else needs to check.
+`MFTLObjectSetCounts` **reserves before it assigns**, so `n <= capacity` holds
+unconditionally. It also clears the derived bit and stamps the body
+*partition-dirty*: every entity creation or destruction passes through it, which
+is what the redistribution's skip of unchanged bodies relies on
+(MFTLObjectMarkPartitionDirty()).
 
-Setting a count invalidates the derived arrays: they describe a different number
-of entities than they did a moment ago.
+**Growth is a ratchet.** The first three calls never lower a capacity, so a mesh
+of stable size does not re-fault its pages every timestep, and redistribution
+pre-grows a body and relies on the next reserve returning early.
+`MFTLObjectShrinkToFit` is the only way down: a pool with
+$\mathrm{capacity} > s\,n$ is moved to the smallest ladder capacity
+$128\cdot2^k \ge n$. Because growth and shrink both leave
+$\mathrm{capacity} \in [n, 2n)$, a gate $s = 2$ fires on any decrease and a
+count dithering around a power of two would reallocate every step; $s = 4$
+(#MFTL_SHRINK_SLACK_DEFAULT) re-fires only when the count halves, bounding the
+number of reallocations over a run by $O(\log(n_{max}/n_{min}))$
+(`test_shrink_to_fit_does_not_thrash_against_the_grow_ladder`). The shrink
+changes no count, content, derived bit or partition stamp.
 
-### Growth is a ratchet, and shrinking is deliberate
-
-The first three never lower a capacity. That is not an oversight: a mesh of
-stable size must not re-fault its pages every timestep, and
-`src/communication/redistribute.c` pre-grows a body and then relies on the
-reserve inside `MFTLObjectSetCounts` early-returning. A shrink reachable from
-`SetCounts` would also be a heap overflow, because `SetCounts` reserves *before*
-it lowers `n` and the copy-forward is sized by `n`.
-
-So `MFTLObjectShrinkToFit` is separate, explicit and gated: it moves a pool only
-when `capacity > slack * n`, and lands it at `MFTLGrowCapacity(0, n)`, i.e. back
-on the doubling ladder in `[n, 2n)`. The slack must be at least **4** — both
-operators leave capacity within a factor of two of the count, so a gate of 2 is
-met by any decrease at all and the two take turns reallocating every timestep.
-`MFTL_SHRINK_SLACK_DEFAULT` derives it with a worked sequence, and
-`test_shrink_to_fit_does_not_thrash_against_the_grow_ladder` asserts it.
-
-It changes no count, no content, no derived bit and no partition stamp — it is a
-memory operation, not a mesh operation. `MFTLObjectReleasePools` is the
-all-or-nothing form, for a body that has left the rank entirely, and after the
-resize refactor it *is* this operation at zero capacity.
-
-@warning Every pool-**resizing** call, in either direction, may reallocate both
-         blocks. Any raw pointer into `obj->verts.*` or `obj->tris.*` taken
-         before such a call is dangling afterwards. Hold indices.
+@warning Any call that can resize a pool may move both blocks. Raw pointers into
+         `obj->verts.*` or `obj->tris.*` taken before it dangle afterwards —
+         hold indices.
 
 ---
 
-## Derived arrays {#object_derived}
-
-`derived.c` maintains two per-triangle arrays that are *functions of topology*,
-tracked by one bit:
+## Derived connectivity {#object_derived}
 
 | Bit | Arrays | Rebuilt by | Invalidated by |
 |---|---|---|---|
-| #MFTL_DERIVED_TOPOLOGY | `verts`, `neighbors` | `build_topology_arrays` | any topology change |
+| #MFTL_DERIVED_TOPOLOGY | `tris.verts`, `tris.neighbors` | `MFTLObjectBuildDerived` (and redistribution's rebuild) | any topology change |
 
-### They are redundant, and that is the price
-
-Both connectivity arrays are functions of the half-edge records at the same index:
+Both arrays are functions of the half-edge records:
 
 ```
-verts[3t+k]     == he[3t+(k+2)%3].vertex_idx     (a fixed rotation)
-neighbors[3t+k] == he[3t+k].twin_idx / 3         (a fixed arithmetic op)
+verts[3t+k]     == he[3t+(k+2)%3].vertex_idx     (origin of half-edge 3t+k)
+neighbors[3t+k] == he[3t+k].twin_idx / 3         (MFTL_ERROR without a twin)
 ```
 
-They are stored because of **traffic**, not instructions. A kernel that wants only
-connectivity — I/O, a triangle-to-vertex scatter, redistribution's halo analysis,
-a BVH build — streams **12 bytes per triangle** out of one of these arrays.
-Reading the same information from the half-edge records touches all three 16-byte
-records, **48 bytes per triangle**, of which 36 are fields it does not want. On a
-mesh that does not fit in cache, that 4× is the whole cost of the loop.
+They are redundant and stored for **traffic**: a connectivity-only loop (I/O,
+vertex-normal scatter, redistribution's halo analysis, BVH build) streams
+12 B per triangle instead of the 48 B of three half-edge records. The 4× figure
+is arithmetic, not a measurement (docs/analysis.md).
 
-The redundancy is bounded and cheap to pay because both arrays are rebuilt by one
-function, from one pass, and are marked stale by a single bit the moment topology
-changes.
-
-@note The 4× figure is arithmetic, not a measurement — see deferred issue 3 in
-      `CLAUDE.md`. Re-examine when a consumer that isolates them exists.
-
-### Why position-derived triangle arrays are absent
-
-Triangle consumers stream `verts`, gather the authoritative `verts.pos`, and
-form minimum-image edges in registers. This saves 72 bytes per triangle and
-removes rebuild/invalidation work after motion, redistribution and every
-smoothing sweep. Periodic correctness remains centralized in the shared
-geometry iterator rather than stored as mutable mesh state.
-
-### What was deleted, and why it stays deleted
-
-Two derived arrays are kept, and the ones that are not are listed in
-`derived.c` with the reason. The vertex→triangle **CSR** is the one worth naming:
-`derived.c` asked for it to be reconsidered when a consumer appeared. Vertex normals are that consumer, and §1.5 of
-`docs/analysis.md` measures a CSR gather as a **dead heat** with the
-triangle scatter while costing 16 B/triangle of permanent state and a rebuild per
-topology change. It stays deleted.
+**No position-derived array is stored.** Geometric consumers stream `verts`,
+gather `verts.pos` and form minimum-image edges in registers
+(#MFTL_FOREACH_TRIANGLE_GEOMETRY), so vertex motion invalidates nothing. Stored
+per-triangle frames (72 B/triangle) were measured and removed: their build cost
+did not amortise in moving or remeshed workflows (docs/analysis.md §1.2). A
+vertex→triangle CSR was measured as a dead heat against the triangle scatter for
+vertex normals while costing 16 B/triangle and a rebuild per topology change
+(§1.5), and is not stored either.
 
 ---
 
 ## Morton renumbering {#object_morton}
 
-`MFTLObjectReorderMorton` sorts both pools along a Z-order curve. A position is
-quantised to 21 bits per axis against the object's own bounding box, and the bits
-are interleaved:
+`MFTLObjectReorderMorton` sorts both pools along a Z-order curve. Positions are
+quantised to 21 bits per axis against the object's bounding box with one common
+scale (cubic cells), and the bits are interleaved into a 63-bit key:
 
 $$
-  Z(x,y,z) = \sum_{i=0}^{20} \Big( x_i\,2^{3i} + y_i\,2^{3i+1} + z_i\,2^{3i+2} \Big)
+  Z(x,y,z) = \sum_{i=0}^{20} \Big( x_i\,2^{3i} + y_i\,2^{3i+1} + z_i\,2^{3i+2} \Big).
 $$
 
-giving a 63-bit key in one `uint64_t`. Two points close in space have keys
-agreeing in their high bits, so sorting by $Z$ puts spatial neighbours near each
-other in memory.
+Points in a common octree cell share a key prefix, so sorting by $Z$ places
+spatial neighbours close in memory. `MFTLMortonSpread3` performs the interleave
+with five shift-and-mask steps.
 
-The interleave itself (`MFTLMortonSpread3`) is the classic five-step magic-number
-bit spread — $O(\log b)$ instead of the 21 iterations a bit-by-bit loop takes.
+1. Key per vertex; stable radix sort of `[0, n_local)` and, separately,
+   `[n_local, n)` — the ownership prefix survives.
+2. Permute every vertex array; remap `he.vertex_idx`.
+3. Order triangles by their **smallest** (already Morton-ordered) vertex index —
+   spatial by construction, no centroid (and no question of what a centroid is
+   across a periodic seam), independent of which corner is corner 0. Records,
+   half-edge triples and geometry arrays move together; `twin_idx` and
+   `out_he_idx` keep their corner $h \bmod 3$ and remap $\lfloor h/3\rfloor$.
+4. Rebuild the derived arrays.
 
-### What it does, in order
+The permutation is **applied to the pools**, never stored, so there is one index
+space and one copy of each coordinate (@ref arch_inv_positions). Global ids are
+untouched; pool indices are not stable across the call. A body straddling a
+periodic seam gets a domain-wide box and coarser cells — a locality cost only.
+The call is local (no MPI).
 
-1. Morton key per vertex from `verts.pos`, quantised against the object's own
-   bounding box so the resolution is spent where the mesh is.
-2. A **stable sort within `[0, n_local)` and, separately, within
-   `[n_local, n)`**, so the ownership prefix survives.
-3. Permute every vertex array; remap `he.vertex_idx`.
-4. Order triangles by their **smallest** (already Morton-ordered) vertex index —
-   a spatial key by construction, needing no second geometric pass, no centroid,
-   and no question about what a centroid means across a periodic seam. Using
-   `min()` rather than the first corner makes the key independent of which corner
-   the generator happened to call corner 0.
-5. Remap `he.twin_idx` and `rec.out_he_idx`, then rebuild the derived arrays.
-
-### This is where `sfc_perm` went
-
-The alternative is to store the permutation *and* a second, SFC-ordered copy of
-every position. That forces a second index space, a sync function, a staleness
-flag and an "unwrapped or not" mode flag onto every consumer, and every one of
-those four is silent when it is wrong.
-
-Here the permutation is **applied to the pools**. Both the AoS records and every
-SoA array move together and all indices are remapped, so afterwards there is
-still exactly one index space and exactly one copy of every coordinate.
-
-Global IDs are **not** touched: they are the stable name of an entity across
-ranks and across reorderings. Pool **indices** are, by definition, not stable
-across this call.
-
-### A straddling object's bounding box legitimately spans the domain
-
-The quantisation box is a plain min/max over the object's positions, so a body on
-a periodic seam gets a box the size of the domain and the Morton cells coarsen
-accordingly. That is an accepted cost, and it is the same accepted cost the BVH's
-root box carries for the same reason.
-
-@note **Morton renumbering has no proven benefit on the development machine.**
-      It is kept because it is what makes one index space possible (its real
-      justification) and because it is a prerequisite for an LBVH — not because
-      it was measured to be faster. It cuts mean edge index distance 160× and
-      buys no measurable time on Apple silicon; **needs re-measuring on an x86
-      node with 1–2 MiB L2 per core.**
+@note No wall-clock benefit of the renumbering has been measured on the
+      development machine (Apple silicon), although it reduces the mean edge
+      index distance 160×. It is kept for the single index space and as the LBVH
+      prerequisite; re-measure on an x86 node with 1–2 MiB L2 per core.
 
 ---
 
-## The hot-loop iterators {#object_iterators}
+## Hot-loop iterators {#object_iterators}
 
-Three macros in the header, each pinned to one access pattern:
-
-| Macro | Streams | Asserts |
+| Macro | Streams | In scope for the body |
 |---|---|---|
-| #MFTL_FOREACH_TRIANGLE_GEOMETRY | `tris.verts`, gathered `verts.pos` | topology current |
-| #MFTL_FOREACH_VERTEX_POS | `verts.pos`, read-only | — |
-| #MFTL_FOREACH_OWNED_VERTEX | `verts.pos`, writable, `[0, n_local)` | — |
+| #MFTL_FOREACH_TRIANGLE_GEOMETRY | `tris.verts`, gathered `verts.pos` | `t`, `v0..v2`, corner `p0`, minimum-image edges `e1`, `e2` |
+| #MFTL_FOREACH_VERTEX_POS | `verts.pos`, read-only | `v`, `px, py, pz` |
+| #MFTL_FOREACH_OWNED_VERTEX | `verts.pos`, writable, `[0, n_local)` | `v`, `pos`, `rec` |
 
-#MFTL_FOREACH_TRIANGLE_GEOMETRY unswitches periodicity once per call. Its body
-receives the three vertex indices, corner 0 and two seam-consistent edges. Vertex
-motion needs no cache invalidation because every geometric value comes from the
-current position array.
+They are macros because C has no closures: the body is pasted into one flat loop
+with `restrict` locals, a hoisted bound and no pointer chasing. The triangle
+iterator decides periodicity once per call; its periodic branch applies
+$d - L\,\mathrm{nearbyint}(d/L)$ without a per-triangle branch.

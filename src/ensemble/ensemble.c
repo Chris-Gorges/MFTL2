@@ -20,30 +20,23 @@
 #include "mftl_object.h"
 
 /**
- * @brief Builds the MPI topology of a domain: Cartesian grid, rank map, neighbour graph.
+ * @brief Builds the MPI topology of a domain, once, so no hot path calls an MPI
+ *        topology function again.
  *
- * All three are set up ONCE here so that nothing on a hot path has to call an
- * MPI topology function again:
+ * - `comm_cart`: the Cartesian communicator (no reordering), which defines the
+ *   grid-coordinate-to-rank mapping;
+ * - `rank_map`: that mapping as a flat array (owner lookup is per entity);
+ * - `comm_graph`: a symmetric distributed graph over the distinct ranks of the
+ *   26 surrounding cells, for neighbourhood collectives whose message count is
+ *   bounded by the degree rather than the process count. On thin periodic grids
+ *   several offsets alias one rank (listed once, with its first offset in
+ *   `neighbor_offset`), and the graph may contain this rank itself.
  *
- *   comm_cart   the Cartesian communicator, which is what defines the mapping
- *               from grid coordinates to ranks;
- *   rank_map    that mapping materialised as a flat array, because
- *               MPI_Cart_rank is a function call with internal bookkeeping and
- *               owner lookup happens once per triangle per redistribution;
- *   comm_graph  a distributed graph over the (up to) 26 surrounding ranks, which
- *               is what makes neighbourhood collectives available. Those are the
- *               right primitive for halo exchange: the message count per rank is
- *               bounded by the neighbourhood degree rather than by P, so the
- *               communication cost does not grow when the job does.
+ * On failure the communicators created so far are reset to `MPI_COMM_NULL` so
+ * MFTLEnsembleDestroy() can clean up.
  *
- * On failure the domain is left with whatever communicators were created so far
- * set back to MPI_COMM_NULL, so MFTLEnsembleDestroy() can clean up safely.
- *
- * @param domain The domain whose `comm_cart`, `comm_graph`, `rank_map`,
- *               `neighbors` and `num_neighbors` are established. `comm_world` must
- *               already be set.
- * @return #MFTL_SUCCESS, or #MFTL_ERROR if the Cartesian or graph communicator
- *         could not be created.
+ * @param domain The domain; `comm_world` must be set.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR if a communicator could not be created.
  */
 static int domain_init_comm(MFTL_Domain *domain)
 {
@@ -122,10 +115,8 @@ static int domain_init_comm(MFTL_Domain *domain)
         int neighbor_rank;
         MPI_Cart_rank(domain->comm_cart, nc, &neighbor_rank);
 
-        /* De-duplicate as we go. With a thin decomposition (e.g. cuts = {2,1,1})
-         * periodic wrap-around maps several offsets onto the same rank, and a
-         * distributed graph must not list a neighbour twice. The list is at most
-         * 26 entries, so the linear scan is cheaper than any hash. */
+        /* De-duplicate: on thin periodic grids (e.g. cuts = {2,1,1}) several
+         * offsets map to one rank, which the graph must list once. */
         bool present = MFTL_FALSE;
         for (int n = 0; n < num_unique; ++n)
         {
@@ -137,11 +128,8 @@ static int domain_init_comm(MFTL_Domain *domain)
         }
         if (!present)
         {
-          /* The OFFSET is kept with the rank, not the wrapped cell coordinate:
-           * it is what MFTLEnsembleReduceBodies() tests a body's holder set
-           * against, and it needs no seam correction. The first offset wins
-           * where wrap-around aliases several onto one rank -- see
-           * MFTL_Domain::neighbor_offset. */
+          /* Keep the (first) OFFSET with the rank: the per-body reduction tests
+           * holder sets against it, and it needs no seam correction. */
           unique_offsets[num_unique][0] = (signed char) dx;
           unique_offsets[num_unique][1] = (signed char) dy;
           unique_offsets[num_unique][2] = (signed char) dz;
@@ -174,9 +162,7 @@ static int domain_init_comm(MFTL_Domain *domain)
   MPI_Dist_graph_neighbors(domain->comm_graph, indegree, domain->neighbors, MPI_UNWEIGHTED, outdegree, dest, MPI_UNWEIGHTED);
   free(dest);
 
-  /* MPI is free to report the neighbours in an order of its own, so the offsets
-   * are matched back by RANK rather than by position. 26 entries against 26 is
-   * the same linear scan the de-duplication above uses, for the same reason. */
+  /* MPI may report the neighbours in its own order: match offsets by RANK. */
   for (int n = 0; n < indegree; ++n)
   {
     domain->neighbor_offset[n][0] = 0;
@@ -204,10 +190,8 @@ MFTL_Ensemble *MFTLEnsembleCreate(MPI_Comm comm, int cuts[3], double global_min[
 
   MFTL_Domain *dom = &ens->domain;
 
-  /* calloc zeroes the struct, but MPI_COMM_NULL is not guaranteed to be 0 (in
-   * Open MPI it is a pointer to a static object). The handles must therefore be
-   * set explicitly, otherwise the cleanup path would call MPI_Comm_free on a
-   * zeroed handle. */
+  /* MPI_COMM_NULL is not necessarily 0 (Open MPI: a pointer to a static object),
+   * so the handles are set explicitly for the cleanup path. */
   dom->comm_world = MPI_COMM_NULL;
   dom->comm_cart = MPI_COMM_NULL;
   dom->comm_graph = MPI_COMM_NULL;
@@ -224,8 +208,7 @@ MFTL_Ensemble *MFTLEnsembleCreate(MPI_Comm comm, int cuts[3], double global_min[
   MPI_Comm_rank(dom->comm_world, &dom->rank);
 
   // --- 2. Validate the process grid and the bounds ---
-  /* The product in 64 bits: three int cuts can overflow an int before the
-   * comparison, and an overflow that happens to equal nproc would be accepted. */
+  /* The product in 64 bits, so an int overflow cannot fake a match. */
   if (cuts[0] < 1 || cuts[1] < 1 || cuts[2] < 1 || (long long) cuts[0] * cuts[1] * cuts[2] != (long long) dom->nproc)
   {
     if (dom->rank == 0)
@@ -236,10 +219,8 @@ MFTL_Ensemble *MFTLEnsembleCreate(MPI_Comm comm, int cuts[3], double global_min[
     return MFTL_NULL;
   }
 
-  /* A zero-length axis is legal (a flat decomposition), an inverted or non-finite
-   * one is not: it would silently produce negative sizes, a negative reciprocal
-   * and owner lookups that clamp everything into one cell. `!(a >= b)` also
-   * rejects NaN. */
+  /* A zero-length axis is legal; an inverted or non-finite one is not.
+   * `!(a >= b)` also rejects NaN. */
   for (int i = 0; i < 3; ++i)
   {
     if (!(global_max[i] >= global_min[i]) || !isfinite(global_min[i]) || !isfinite(global_max[i]))
@@ -307,54 +288,20 @@ int MFTLEnsembleAddObject(MFTL_Ensemble *ensemble, MFTL_Object *object)
 
   object->domain = &ensemble->domain;
 
-  /* ── The ensemble hands out the body id, the caller does not ─────────────
-   *
-   * Whatever MFTLObjectCreate() was given is provisional and is overwritten
-   * here, so `global_id` is DENSE in [0, n_bodies_global) by construction. Two
-   * things follow and both are the point:
-   *
-   * A dense id is an ARRAY INDEX. Every keyed per-body structure -- a vote
-   * bitset, an owner map, an arrival lookup -- can be a plain array without a
-   * hash, which is the same argument that keeps vertex and triangle ids dense.
-   *
-   * And it is the identity bodies are travelling under. While every rank holds
-   * the same list in the same order, `global_id == ` the list position, so
-   * nothing observable changes; what changes is which of the two the code NAMES,
-   * and the position is the one that cannot survive a rank holding only some of
-   * the bodies.
-   *
-   * Every rank must therefore add the same bodies in the same order -- which was
-   * already required, and is now checked by the redistribution's Debug
-   * checksum rather than merely assumed. */
+  /* The ensemble hands out the body id, so ids are DENSE in [0, n_bodies_global)
+   * and identical on every rank as long as every rank adds the same bodies in
+   * the same order (checked by the redistribution's Debug checksum). A dense id
+   * is an array index, which is why no per-body lookup needs a hash. */
   object->global_id = ensemble->n_bodies_global++;
 
-  /* Ids are handed out in add order and the list is appended to, so it stays
-   * sorted -- which is the directory invariant, not a coincidence. */
+  /* Ids ascend in add order, so appending keeps the directory sorted. */
   return MFTLEnsembleInsertLocalObject(ensemble, object);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * The local object directory
- *
- * `local_objects` is SORTED BY ASCENDING global_id, strictly increasing, and
- * three things depend on that rather than one:
- *
- *   1. `gid -> slot` is a BINARY SEARCH -- an array, not a hash. That is what
- *      "there are no hash maps" asks for, and the justification it asks for is
- *      that the id space is dense and global while the holding is sparse, so the
- *      only array form of the lookup is O(bodies in the ensemble).
- *
- *   2. Iterating the local list visits bodies in ascending gid, i.e. in the
- *      GLOBAL order restricted to this rank. Every deterministic tie-break that
- *      says "bodies in order" therefore keeps meaning the same thing on a rank
- *      that holds only some of them.
- *
- *   3. Arrival runs arrive grouped, so they join against the directory with a
- *      merge rather than a search per record.
- *
- * Insert and erase are ORDERED -- a memmove of at most `n_local_objects`
- * pointers. Swap-with-tail would be O(1) and is wrong: it destroys the order and
- * with it points 1 and 2.
+ * The local object directory: sorted by ascending global id (see
+ * mftl_ensemble.h). Insert and erase are ordered memmoves -- swap-with-tail would
+ * break the order.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 int MFTLEnsembleFindLocalSlot(const MFTL_Ensemble *ens, int body_gid)
@@ -386,17 +333,11 @@ int MFTLEnsembleInsertLocalObject(MFTL_Ensemble *ens, MFTL_Object *object)
 {
   if (ens == MFTL_NULL || object == MFTL_NULL) return MFTL_ERROR;
 
-  /* GEOMETRIC, not exact. Bodies are added one at a time, so the exact form
-   * reallocates once per add: N adds past the initial capacity are N reallocs
-   * and N copies of the whole list, i.e. O(N^2) bytes moved to build an ensemble.
-   * The slack a doubling schedule leaves behind is one pointer per body, against
-   * the 264 B object it points at. */
+  /* Geometric growth: bodies are added one at a time. */
   MFTL_ENSURE_CAPACITY(ens->local_objects, &ens->n_local_objects, &ens->capacity_objects, 1, MFTL_Object *);
 
-  /* Scan from the END. Both callers append in ascending id -- MFTLEnsembleAddObject
-   * hands out the next id, and a body arriving in a redistribution is resolved
-   * from a run stream that is itself ascending -- so the common case is zero
-   * iterations and the memmove below moves nothing. */
+  /* Scan from the END: both callers insert in ascending id, so the common case
+   * moves nothing. */
   int i = ens->n_local_objects;
   while (i > 0 && ens->local_objects[i - 1]->global_id > object->global_id) --i;
 
@@ -425,9 +366,8 @@ void MFTLEnsembleUpdateGlobalCounts(MFTL_Ensemble *ensemble)
 {
   if (!ensemble) return;
 
-  /* GLOBAL, not local: collectives follow, so the guard has to be a number every
-   * rank agrees about. Returning on the LOCAL count would have a rank holding
-   * nothing skip a collective the others are inside. */
+  /* Guard on the GLOBAL count: collectives follow, and an early return on the
+   * local count would leave the other ranks waiting. */
   if (ensemble->n_bodies_global == 0)
   {
     ensemble->total_global_triangles = 0;
@@ -436,24 +376,13 @@ void MFTLEnsembleUpdateGlobalCounts(MFTL_Ensemble *ensemble)
 
   const int n_local = ensemble->n_local_objects;
 
-  /* ── Two sums per body, over the body's HOLDERS ──────────────────────────
-   *
-   * Indexed by LOCAL SLOT, so the buffer is what this rank holds rather than
-   * the id space. That is the whole change: the reduction used to be an
-   * `MPI_Allreduce` of `2 * bodies` ints over comm_world on every rank, so a
-   * rank learned two numbers about a hundred bodies by reducing two million.
-   * MFTLEnsembleReduceBodies() decides which communicator that becomes.
-   *
-   * Doubles rather than ints because the reduction is one mechanism for every
-   * per-body payload in the library, and an entity count is exact in a double
-   * far past any mesh that fits in memory. */
+  /* Two sums per body over its HOLDERS, indexed by local slot. Doubles hold
+   * integer counts exactly up to 2^53. */
   static const MFTL_BodyReduceOp ops[2] = {MFTL_BODY_REDUCE_SUM, MFTL_BODY_REDUCE_SUM};
 
   double *const counts = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(2 * n_local, 1) * sizeof(double), "MFTLEnsembleUpdateGlobalCounts");
 
-  /* The local half is two array reads per body held. Scanning every vertex and
-   * every triangle for an `is_ghost` flag first is O(V + T) of pure memory
-   * traffic to recover a number the ownership prefix already carries. */
+  /* The local half is `n_local`, thanks to the ownership prefix. */
   long local_tris = 0;
   for (int o = 0; o < n_local; ++o)
   {
@@ -475,10 +404,7 @@ void MFTLEnsembleUpdateGlobalCounts(MFTL_Ensemble *ensemble)
 
   free(counts);
 
-  /* The ensemble total is a genuinely ensemble-wide scalar, so it gets a scalar
-   * collective -- ONE long, whatever the body count. Summing the reduced
-   * per-body counts instead would need every body's answer on every rank, which
-   * is precisely the O(bodies) buffer the reduction above stopped allocating. */
+  /* The ensemble total is one scalar reduction. */
   long total = 0;
   MPI_Allreduce(&local_tris, &total, 1, MPI_LONG, MPI_SUM, ensemble->domain.comm_world);
   ensemble->total_global_triangles = (int) total;
@@ -495,10 +421,7 @@ double MFTLDomainGetHMin(const MFTL_Domain *domain)
   double h_min = MFTL_DBL_MAX;
   for (int k = 0; k < 3; ++k)
   {
-    /* A degenerate axis (zero extent, or a single cut) is not a constraint on
-     * the frozen band, so it must not be allowed to become the minimum -- an
-     * ensemble that is effectively 2D would otherwise report h_min = 0 and fail
-     * every geometric precondition the shift scheme has. */
+    /* An uncut or zero-extent axis has no interior plane and constrains nothing. */
     if (domain->cuts[k] < 2 || domain->domain_size[k] <= 0.0) continue;
     h_min = MFTL_MIN(h_min, domain->domain_size[k] / (double) domain->cuts[k]);
   }

@@ -4,12 +4,8 @@
  * @date 2026-08-16
  * @ingroup mftl_bvh
  *
- * @brief Building, refitting and destroying the hierarchy.
- *
- * The pipeline is the classic linear BVH -- Morton codes, radix sort, top-down
- * split at the highest differing bit, bottom-up AABB fit -- with two departures
- * from the textbook form, both of which are about periodicity or scale rather
- * than about the tree.
+ * @brief Primitive access, and building, refitting and destroying the hierarchy:
+ *        Morton keys, stable radix sort, top-down radix split, bottom-up fit.
  */
 
 #include "mftl_bvh.h"
@@ -27,28 +23,17 @@
 #include "mftl_topology.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 1. Primitive geometry
- *
- * Everything downstream -- centroids, leaf boxes, the narrow phase -- reads the
- * mesh through this one function, which is what lets local and remote
- * primitives be the same thing to every consumer.
+ * 1. Primitive access: every consumer reads the mesh through prim_source(), so
+ * local and halo primitives are the same thing to it.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
  * @brief Resolves a primitive index to its source object and triangle index.
  *
- * The whole local/remote distinction, in three lines. It used to be more:
- * remote primitives lived in a private array of nine doubles per triangle,
- * which meant a second geometry representation, a second growth path and a
- * second periodic-consistency argument. A halo patch is an ordinary
- * MFTL_Object, so both kinds of primitive are just "triangle t of some object"
- * and everything downstream reads them through MFTLGetTriangleCorners.
- *
  * @param      bvh   The hierarchy.
  * @param      p     Primitive index in `[0, n_prims)`.
  * @param[out] t_out Receives the triangle index within the returned object.
- * @return The owning object: `bvh->obj` for a local primitive, `bvh->halo` for
- *         a remote one.
+ * @return `bvh->obj` for a local primitive, `bvh->halo` for a remote one.
  */
 static inline const MFTL_Object *prim_source(const MFTL_BVH *bvh, int p, int *t_out)
 {
@@ -96,34 +81,20 @@ int MFTL_BVHPrimOwner(const MFTL_BVH *bvh, int p)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Length of the common prefix of the sorted keys at @p i and @p j.
+ * @brief Common-prefix length of the 95-bit keys (Morton code, index) at sorted
+ *        slots @p i and @p j.
  *
- * ── Why the index takes part in the key ────────────────────────────────────
- *
- * A radix split needs every primitive to have a UNIQUE key: two primitives
- * sharing one code have a common prefix of the full key length, the search for
- * the highest differing bit finds nothing, and the node fails to split -- which
- * in a recursive builder is an infinite descent, and in its guarded form is a
- * leaf containing an unbounded number of primitives.
- *
- * Duplicate codes are not exotic. Two triangles smaller than one Morton cell
- * share a code, which for a resolved interface mesh is most of the mesh at low
- * bit counts -- the customary 10 bits per axis put a 1024^3 grid over the object,
- * and any mesh finer than that in any region collides.
- *
- * Extending the key with the primitive's INDEX makes it unique by construction
- * without another sort: the array is already sorted, so indices are ascending,
- * and comparing (key, index) lexicographically is exactly what a 95-bit radix
- * tree over unique keys does. It also bounds the recursion depth at 95 rather
- * than at the primitive count.
- *
- * Two levels because 63 + 32 does not fit a machine word: equal keys fall
- * through to the index difference, offset by 64 so the ordering is consistent.
+ * A radix split needs UNIQUE keys: equal codes (two triangles in one Morton
+ * cell -- common at fine resolution) would never split. Appending the slot index
+ * (ascending, since the array is sorted) makes the keys unique without another
+ * sort and bounds the tree depth by 95 (Karras 2012):
+ * \f$\delta = \clz_{64}(Z_i \oplus Z_j)\f$ if the codes differ, else
+ * \f$64 + \clz_{32}(i \oplus j)\f$.
  *
  * @param keys The sorted Morton codes.
  * @param i    First slot.
- * @param j    Second slot. Must differ from @p i.
- * @return Common prefix length of the 95-bit (code, index) keys, in bits.
+ * @param j    Second slot; must differ from @p i.
+ * @return Common prefix length in bits.
  */
 static inline int prefix_len(const uint64_t *restrict keys, int i, int j)
 {
@@ -131,25 +102,18 @@ static inline int prefix_len(const uint64_t *restrict keys, int i, int j)
   if (x != 0u) return __builtin_clzll(x);
 
   const unsigned d = (unsigned) i ^ (unsigned) j;
-  /* i != j is guaranteed by every call site: the split search never compares a
-   * slot with itself. A zero here would make __builtin_clz undefined. */
+  /* i != j at every call site (clz of 0 is undefined). */
   MFTL_ASSERT(d != 0u && "prefix_len: called with i == j");
   return 64 + (int) __builtin_clz(d);
 }
 
 /**
- * @brief Populates node @p node_idx and, recursively, everything below it.
+ * @brief Populates node @p node_idx and, recursively, its subtree.
  *
- * The split is a binary search for the last primitive still sharing the range's
- * common prefix -- the radix point of the Morton curve, so the two children are
- * separated by a real axis-aligned plane rather than by a median that happens to
- * fall wherever the primitive count does.
- *
- * Recursion is kept here, unlike in the traversal and the refit. The depth is
- * bounded by the key length (95) because the keys are unique, so there is no
- * stack-overflow case to defend against, and the build runs once per
- * re-triangulation rather than once per timestep -- the two reasons that made
- * the traversal worth converting do not apply.
+ * The split is the last slot still sharing a longer prefix with the first than
+ * the range's common prefix, found by binary search (\f$\delta(f,\cdot)\f$ is
+ * non-increasing over sorted keys). The children are therefore separated by a
+ * dyadic plane of the Morton grid. Recursion depth is bounded by 95.
  *
  * @param bvh        The hierarchy being built.
  * @param node_idx   Node to populate.
@@ -180,9 +144,8 @@ static void build_topology(MFTL_BVH *bvh, int node_idx, int first_prim, int prim
 
   const int left_count = split_idx + 1 - first_prim;
 
-  /* Children are allocated as a contiguous pair, so the parent stores only the
-   * left index. Both are greater than the parent's own index, which is what the
-   * reverse-scan refit relies on. */
+  /* Children as a contiguous pair after the parent (the refit's reverse scan
+   * relies on child > parent). */
   const int left_child = bvh->nodes_used;
   bvh->nodes_used += 2;
   MFTL_ASSERT(bvh->nodes_used <= bvh->nodes_capacity && "BVH node capacity exceeded");
@@ -199,8 +162,7 @@ static void build_topology(MFTL_BVH *bvh, int node_idx, int first_prim, int prim
 
 void MFTLBVHRefit(MFTL_BVH *bvh)
 {
-  /* An empty hierarchy still has a tolerance, because a ghost exchange may be
-   * about to put remote primitives into it. */
+  /* An empty hierarchy still gets a tolerance. */
   if (bvh->nodes_used <= 0)
   {
     bvh->bounding_radius = (bvh->radius_hint > 0.0) ? bvh->radius_hint : 0.0;
@@ -239,8 +201,7 @@ void MFTLBVHRefit(MFTL_BVH *bvh)
         }
       }
 
-      /* An empty leaf cannot arise from build_topology, but a defensive box that
-       * overlaps nothing is cheaper than a NaN propagating to the root. */
+      /* Defensive: an empty leaf gets a box that overlaps nothing. */
       if (count == 0)
       {
         for (int k = 0; k < 3; ++k)
@@ -250,8 +211,7 @@ void MFTLBVHRefit(MFTL_BVH *bvh)
         }
       }
 
-      /* Rounded OUTWARD into float: the broad phase must never exclude geometry
-       * the narrow phase would have accepted. See bvh_internal.h. */
+      /* Rounded OUTWARD into float (bvh_internal.h). */
       for (int k = 0; k < 3; ++k)
       {
         n->aabb_min[k] = mftl_bvh_floor_f(lo[k]);
@@ -275,14 +235,8 @@ void MFTLBVHRefit(MFTL_BVH *bvh)
 
   /* ── Pass 2: the tolerance, from the root box ─────────────────────────── */
   {
-    /* HALF THE LONGEST SIDE of the root box, not half its diagonal.
-     *
-     * Both bound the object, but only this one equals R for a sphere of radius
-     * R -- and `proximity_factor` is documented as a fraction of the body, so a
-     * caller writing 1e-3 for a 1 mm droplet is entitled to get 1 um. Half the
-     * diagonal would hand them 1.73 um, a sqrt(3) inflation that is invisible
-     * (it just makes contact trigger earlier) and therefore exactly the kind of
-     * silent factor that should not be in a physical threshold. */
+    /* Half the LONGEST SIDE of the root box (R for a sphere), not half the
+     * diagonal, which would inflate every envelope by sqrt(3). */
     const MFTL_BVHNode *const root = &nodes[bvh->root_index];
     double longest = 0.0;
     for (int k = 0; k < 3; ++k)
@@ -292,9 +246,7 @@ void MFTLBVHRefit(MFTL_BVH *bvh)
     }
     bvh->bounding_radius = 0.5 * longest;
 
-    /* The GLOBAL radius wins whenever it is known. Scaling by the partition-local
-     * one would make the contact envelope a function of the process count -- see
-     * MFTL_BVH::radius_hint. */
+    /* The GLOBAL radius wins when known (MFTL_BVH::radius_hint). */
     const double radius = (bvh->radius_hint > 0.0) ? bvh->radius_hint : bvh->bounding_radius;
 
     const double scaled = bvh->params.proximity_factor * radius;
@@ -321,21 +273,13 @@ int MFTL_RefitLBVH(MFTL_BVH *bvh, const MFTL_Object *obj)
 {
   if (bvh == MFTL_NULL || obj == MFTL_NULL) return MFTL_ERROR;
 
-  /* The leaves address primitives by index and the Morton order was decided from
-   * the geometry at build time, so a changed primitive count means the indices
-   * no longer name the same triangles. Refusing is the only safe answer: a
-   * partial refit would leave a tree whose boxes describe triangles that have
-   * been renumbered, which produces wrong contacts rather than missing ones. */
+  /* Leaves address primitives by index: after a re-triangulation the indices no
+   * longer name the same triangles, and a refit would give WRONG contacts. */
   const int n_local = bvh->params.include_ghosts ? obj->tris.n : obj->tris.n_local;
   const int n_halo = (bvh->halo != MFTL_NULL) ? bvh->halo->tris.n : 0;
   if (n_local != bvh->n_local_prims || n_halo != bvh->n_halo_prims || (n_local + n_halo) != bvh->built_for_n_prims)
   {
-    /* Deliberately NOT an assertion. "Refit if you can, otherwise rebuild" is a
-     * supported way to drive this -- the header documents MFTL_ERROR as the
-     * signal to call MFTL_GenerateLBVH -- so a caller that probes with a refit
-     * after a remesh is using the API correctly, and aborting in Debug would
-     * make the documented control flow unusable in the build the library is
-     * developed in. The object is left untouched, so the fallback is free. */
+    /* Not an assertion: "refit if you can, otherwise rebuild" is supported. */
     return MFTL_ERROR;
   }
 
@@ -368,10 +312,7 @@ MFTL_BVH *MFTL_GenerateLBVH(const MFTL_Object *obj, const MFTL_BVHBuildParams *p
   bvh->n_prims = n_local;
   bvh->root_index = 0;
 
-  /* Worst case is one primitive per leaf, i.e. n leaves and 2n-1 nodes. The
-   * capacity is not a heuristic that can be undershot, so it is not one. The
-   * MFTL_MAX keeps a zero-primitive object from asking the allocator for zero
-   * bytes -- an empty hierarchy is a legal thing to hold, see the header. */
+  /* A binary tree over n leaves has at most 2n - 1 nodes. */
   bvh->nodes_capacity = MFTL_MAX(2 * bvh->n_prims, 1);
   bvh->nodes = (MFTL_BVHNode *) MFTLAlignedAllocOrDie((size_t) bvh->nodes_capacity * sizeof(MFTL_BVHNode), "BVH nodes");
   bvh->prim_indices = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(bvh->n_prims, 1) * sizeof(int), "BVH primitive indices");
@@ -386,9 +327,7 @@ void MFTLBVHBuildFromPrims(MFTL_BVH *bvh)
 {
   const int n = bvh->n_prims;
 
-  /* An empty hierarchy: no nodes, and a tolerance that still reflects whatever
-   * absolute floor the caller set, so a later ghost exchange that fills this
-   * BVH with remote primitives starts from a sane envelope rather than zero. */
+  /* Empty: no nodes, but a tolerance from the floor / radius hint. */
   if (n <= 0)
   {
     bvh->nodes_used = 0;
@@ -399,20 +338,9 @@ void MFTLBVHBuildFromPrims(MFTL_BVH *bvh)
     return;
   }
 
-  /* ── Centroids and their bounding box ─────────────────────────────────────
-   *
-   * The centroid is the mean of the three SEAM-CONSISTENT corners, so for a
-   * triangle straddling a periodic face it is the true centroid just outside the
-   * box rather than a point in the middle of the domain. This is the second half
-   * of the periodic fix; the first is in MFTL_BVHPrimVerts.
-   *
-   * Note that the centroid is deliberately NOT wrapped back into the domain
-   * afterwards, which is where MFTLGetTriangleProperties differs. A wrapped
-   * centroid is the right answer for "where is this triangle" -- it is a
-   * position, and redistribution routes by it. It is the wrong answer for a
-   * spatial SORT KEY, because wrapping puts two triangles that are neighbours
-   * across the seam at opposite ends of the key range, which is the corruption
-   * the TODO was about. */
+  /* Centroids of the SEAM-CONSISTENT corners, deliberately NOT wrapped: as a
+   * sort key a wrapped centroid would put neighbours across the seam at
+   * opposite ends of the key range. */
   double *const centroids = (double *) MFTLMallocOrDie(3 * (size_t) n * sizeof(double), "BVH centroids");
 
   double lo[3] = {MFTL_DBL_MAX, MFTL_DBL_MAX, MFTL_DBL_MAX};
@@ -432,24 +360,12 @@ void MFTLBVHBuildFromPrims(MFTL_BVH *bvh)
     }
   }
 
-  /* ── Morton codes ────────────────────────────────────────────────────────
-   *
-   * MFTLMorton3D from mftl_object.h -- the same 63-bit, 21-bit-per-axis key the
-   * pool renumbering uses, rather than a separate 30-bit implementation. Two
-   * reasons to share it: a 1024^3 grid puts many triangles
-   * of any resolved interface into one cell (see prefix_len), and a module that
-   * carries its own copy of a spatial key will eventually disagree with the one
-   * the pools are ordered by.
-   *
-   * ONE shared scale for all three axes, so the cells stay cubic. Scaling per
-   * axis stretches the curve and makes locality worse on a flat object -- the
-   * same choice, for the same reason, as reorder_vertices in src/object/derived.c. */
+  /* MFTLMorton3D (21 bits per axis), one common scale so the cells are cubic --
+   * the same key as the pool renumbering. */
   double range = hi[0] - lo[0];
   if (hi[1] - lo[1] > range) range = hi[1] - lo[1];
   if (hi[2] - lo[2] > range) range = hi[2] - lo[2];
-  /* The only condition is that the scale be FINITE. An absolute floor here (it
-   * was 1e-12) collapses every key of a small but perfectly valid object onto
-   * one value, and ordering then silently stops meaning anything. */
+  /* Any FINITE scale is valid (no absolute floor). */
   const double inv_range = (range > MFTL_MORTON_MAX / MFTL_DBL_MAX) ? MFTL_MORTON_MAX / range : 0.0;
 
   uint64_t *const keys = (uint64_t *) MFTLMallocOrDie((size_t) n * sizeof(uint64_t), "BVH Morton keys");
@@ -465,9 +381,7 @@ void MFTLBVHBuildFromPrims(MFTL_BVH *bvh)
 
   free(centroids);
 
-  /* Stable radix sort, keys and values moving together. Stability is what makes
-   * the tree deterministic for a given input, which is what lets
-   * `test_refit_only_matches_full_rebuild` compare two trees node by node. */
+  /* Stable sort: the tree is a deterministic function of the input. */
   MFTLSortPairs64(keys, bvh->prim_indices, n);
 
   bvh->nodes_used = 1;
@@ -498,8 +412,7 @@ int MFTL_BVHSetHalo(MFTL_BVH *bvh, const MFTL_Object *patch)
     bvh->nodes = (MFTL_BVHNode *) MFTLAlignedAllocOrDie((size_t) bvh->nodes_capacity * sizeof(MFTL_BVHNode), "BVH nodes");
   }
 
-  /* The index array is reassigned wholesale by the build, so there is nothing to
-   * preserve across the growth -- free and allocate rather than realloc. */
+
   free(bvh->prim_indices);
   bvh->prim_indices = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n, 1) * sizeof(int), "BVH primitive indices");
 

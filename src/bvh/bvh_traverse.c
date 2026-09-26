@@ -4,50 +4,19 @@
  * @date 2026-08-16
  * @ingroup mftl_bvh
  *
- * @brief Dual-tree traversal: an explicit stack of node pairs, and a batched
- *        leaf-leaf narrow phase.
+ * @brief Dual-tree traversal over an explicit stack, the batched leaf-leaf
+ *        narrow phase, and the ensemble contact pipeline.
  *
- * ## WHY THE RECURSION WENT
+ * An explicit stack of (nodeA, nodeB) pairs keeps the loop-invariant state in
+ * registers, cannot overflow the call stack (a dual traversal is not
+ * tail-recursive), and lets leaf-leaf candidates be collected into batches of
+ * 64 independent tests -- the shape a future SIMD narrow phase needs, which
+ * would then change flush_batch() only. The batch is not vectorised yet.
  *
- * The natural way to write a dual-tree descent is a four-argument recursive call.
- * An explicit stack buys three things over it, and only the third one is really
- * about speed:
- *
- *   1. THE HOT STATE STAYS IN REGISTERS. Both objects, both node arrays, the
- *      callback and the image shift are loop-invariant, and a recursive call has
- *      to re-establish all of them per node pair. The loop form loads them once.
- *
- *   2. THE "WHAT NEXT" DATA BECOMES CONTIGUOUS. A pair stack is two ints per
- *      entry in one array. A call stack is a frame per entry, interleaved with
- *      spill slots and a return address.
- *
- *   3. LEAF PAIRS CAN BE BATCHED, and this is the one that matters going
- *      forward. A leaf-leaf hit does not run the narrow phase where it is found;
- *      it appends to a fixed-size array of (primA, primB) and the array is
- *      flushed when full. The traversal therefore hands the narrow phase a
- *      CONTIGUOUS RUN OF INDEPENDENT TESTS, which is the shape a vectorised
- *      triangle-triangle kernel needs. Making that kernel SIMD is then a change
- *      to flush_batch() alone -- the traversal above it does not move.
- *
- * The batch is deliberately NOT vectorised yet. MFTL_TriTriIntersect is a
- * decision tree over exact predicates with early-out at every level, so the
- * useful SIMD form is a gather of the first orientation test across a batch, not
- * a naive widening of the whole function; that is a measurement exercise, and
- * the batch exists so it can be done without touching anything else.
- *
- * ## PERIODIC IMAGES
- *
- * Two bodies on opposite faces of a periodic domain are neighbours, and no
- * amount of per-triangle unwrapping can see that -- each body is internally
- * consistent and they are genuinely a domain-length apart in stored
- * coordinates. So the pair is traversed once per periodic IMAGE of B: the
- * offsets {-L, 0, +L} on each periodic axis, up to 27 of them, each admitted or
- * rejected by a single root-AABB test before any descent happens.
- *
- * A non-periodic domain generates exactly one image and pays one root test it
- * was going to pay anyway. A periodic domain typically admits one image and
- * rejects the other 26 in 26 compares -- the bodies would have to span half the
- * domain for two images to survive.
+ * Periodic images: two bodies on opposite faces of a periodic domain are
+ * neighbours although a domain length apart in stored coordinates, so the pair
+ * is traversed once per image offset in {-L, 0, +L} per periodic axis (at most
+ * 27), each gated by one root-box test.
  */
 
 #include "mftl_bvh.h"
@@ -73,27 +42,15 @@ typedef struct
 } node_pair;
 
 /**
- * @brief Initial stack depth.
- *
- * A dual traversal pushes at most one extra pair per descent, and the depth of
- * each tree is bounded by the Morton key length (95 bits, see prefix_len in
- * bvh_build.c), so 256 covers every non-pathological case without a single
- * growth step. It grows anyway rather than asserting, because "non-pathological"
- * is not something a library should require of its caller.
+ * @brief Initial traversal stack depth; each tree is at most 95 levels deep, so
+ *        256 is ample, and the stack grows by doubling if not.
  */
 #define MFTL_BVH_STACK_INIT 256
 
 /** @brief Leaf pairs collected before the narrow phase runs. */
 #define MFTL_BVH_BATCH_SIZE 64
 
-/**
- * @brief Explicit traversal stack, replacing the recursion of the original.
- *
- * A dual tree traversal is not tail-recursive in either branch, so the depth is
- * the sum of two tree depths and a pathological pair could exhaust the machine
- * stack with no diagnostic. An explicit stack makes the bound a `malloc` failure
- * instead, and lets the batch below span node pairs.
- */
+/** @brief Explicit traversal stack of node pairs. */
 typedef struct
 {
   node_pair *data;  ///< [capacity] the stack itself.
@@ -149,19 +106,16 @@ typedef struct
 } narrow_ctx;
 
 /**
- * @brief The self-proximity rules, applied BEFORE the exact test.
+ * @brief Self-proximity rules, applied before the exact test: drop pairs that
+ *        share a vertex (compared by vertex GLOBAL id, since B may be a patch),
+ *        and keep a pair only if `gid(A) < gid(B)` -- one of the two local
+ *        orderings, and exactly one of the two owners of a cross-rank pair.
  *
- * ADJACENT PAIRS: triangles sharing a vertex touch by construction. Compared by
- * vertex GLOBAL id, because the B side may be a halo patch, whose vertex slots
- * mean nothing in the body's pool.
- *
- * REPORTED ONCE: a local pair is found twice, as (t1, t2) and (t2, t1), and a
- * cross-rank one once on each owner. Keeping only `gid(A) < gid(B)` keeps
- * exactly one in both cases -- the analogue of the smaller-body-id rule, one
- * level down.
- *
- * Both are integer compares on records the narrow phase would have to load
- * anyway, against an exact test that costs two orders of magnitude more.
+ * @param bvhA A-side hierarchy.
+ * @param pa   A-side primitive.
+ * @param bvhB B-side hierarchy.
+ * @param pb   B-side primitive.
+ * @return `true` if the pair should be tested.
  */
 static bool self_pair_admissible(const MFTL_BVH *bvhA, int pa, const MFTL_BVH *bvhB, int pb)
 {
@@ -182,17 +136,11 @@ static bool self_pair_admissible(const MFTL_BVH *bvhA, int pa, const MFTL_BVH *b
 /**
  * @brief Runs the exact test on every batched pair and reports the hits.
  *
- * THE SIMD SEAM. Everything above this function produces a contiguous run of
- * independent (primA, primB) tests; everything below it is scalar double
- * precision. A vector narrow phase replaces the body of this loop and nothing
- * else in the module changes.
+ * The SIMD seam: everything above produces a contiguous run of independent
+ * tests. The periodic shift is applied to the B corners here, because it
+ * belongs to the image being traversed, not to the primitive.
  *
- * The B-side coordinates get the periodic shift applied HERE rather than in
- * MFTL_BVHPrimVerts, because the shift belongs to the pair being traversed and
- * not to the primitive -- the same primitive is tested against several images of
- * the same object when the bodies are large.
- *
- * @param ctx The narrow-phase context. Its batch is emptied.
+ * @param ctx The narrow-phase context; its batch is emptied.
  */
 static void flush_batch(narrow_ctx *ctx)
 {
@@ -241,16 +189,13 @@ static inline void batch_add(narrow_ctx *ctx, int pa, int pb)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Traverses one periodic image of the pair, reporting every contact.
- *
- * The descent rule: when both nodes are internal, split the one whose box is
- * LARGER. Splitting the smaller one makes
- * the pair of boxes converge more slowly, so the traversal visits more pairs for
- * the same set of leaf tests.
+ * @brief Traverses one periodic image of the pair. When both nodes are internal
+ *        the one with the larger box volume is split (the boxes then converge
+ *        faster); leaf pairs with a remote A-side primitive are skipped.
  *
  * @param ctx      The narrow-phase context, including the image shift.
  * @param stack    Scratch stack, reused across images.
- * @param shift_f  The same shift in `float`, for the AABB tests.
+ * @param shift_f  The same shift in `float`, for the box tests.
  */
 static void traverse_image(narrow_ctx *ctx, pair_stack *stack, const float shift_f[3])
 {
@@ -285,13 +230,7 @@ static void traverse_image(narrow_ctx *ctx, pair_stack *stack, const float shift
       {
         const int pa = primsA[firstA + i];
 
-        /* OWNERSHIP OF THE PAIR. Only the rank that owns the A-side primitive
-         * reports the contact, so a pair whose A side arrived as a spatial ghost
-         * is skipped -- the rank that owns it is testing the mirror image of
-         * this same pair and will report it. Without this, every contact that
-         * straddles a rank boundary is reported twice and every contact force
-         * built from it is doubled. The test is one compare against a value
-         * already in a register, hoisted out of the inner loop. */
+        /* Only the owner of the A-side primitive reports: skip remote A. */
         if (pa >= n_local_a) continue;
 
         for (int j = 0; j < countB; ++j) batch_add(ctx, pa, primsB[firstB + j]);
@@ -347,15 +286,8 @@ void MFTL_IntersectObjects(const MFTL_Object *objA, MFTL_BVH *bvhA, const MFTL_O
   ctx.self = (objA == objB);
   ctx.filter = bvhA->params.pair_filter;
 
-  /* ── The pair's tolerance ────────────────────────────────────────────────
-   *
-   * The LARGER of the two envelopes. Each BVH's leaves are already inflated by
-   * its own tolerance, so the broad phase admits any pair within
-   * tol_A + tol_B -- taking the maximum keeps the narrow-phase threshold inside
-   * what the broad phase can deliver, which is the direction that cannot lose a
-   * contact. Taking the minimum would let the smaller body's envelope silently
-   * govern a contact with a body a thousand times its size, which is exactly the
-   * two-length-scale failure the fixed 1e-6 produced. */
+  /* MAX(tol_A, tol_B) <= tol_A + tol_B, the separation the inflated boxes
+   * admit, so the broad phase cannot cull a contact the narrow phase accepts. */
   ctx.tolerance = MFTL_MAX(bvhA->tolerance, bvhB->tolerance);
 
   pair_stack stack;
@@ -363,12 +295,8 @@ void MFTL_IntersectObjects(const MFTL_Object *objA, MFTL_BVH *bvhA, const MFTL_O
   stack.size = 0;
   stack.data = (node_pair *) MFTLMallocOrDie((size_t) stack.capacity * sizeof(node_pair), "BVH traversal stack");
 
-  /* ── Enumerate the periodic images of B ──────────────────────────────────
-   *
-   * Offsets are built per axis so a non-periodic domain contributes exactly one
-   * value and the product collapses to a single image. The root test inside the
-   * loop is what makes trying 27 of them cheap: it is the same six compares the
-   * traversal would have done first anyway. */
+  /* Image offsets per axis: {0}, or {0, -L, +L} on a periodic axis; each image
+   * is gated by one root-box test. */
   const MFTL_Domain *const domain = objA->domain;
 
   double off[3][3];
@@ -420,38 +348,18 @@ int MFTLEnsembleIntersectObjects(MFTL_Ensemble *ens, const MFTL_BVHBuildParams *
 
   const bool self = (params != MFTL_NULL) && params->self_pairs;
 
-  /* THE GLOBAL count, because everything below is collective. One body in the
-   * whole ensemble cannot collide with another, and that is a statement every
-   * rank makes identically; the LOCAL count is not, and returning early on it
-   * would leave the ranks that still held two bodies inside a collective on
-   * their own. With self-proximity one body is enough to have work. */
+  /* Guard on the GLOBAL body count: everything below is collective. */
   if (ens->n_bodies_global < (self ? 1 : 2)) return MFTL_SUCCESS;
 
   const int nb = ens->n_local_objects;
 
-  /* ── One hierarchy per body THIS RANK HOLDS ─────────────────────────────
-   *
-   * The version this replaces built one per body in the ENSEMBLE, over a dense
-   * view in which a body this rank held nothing of was a shared empty object --
-   * so a rank near ten droplets out of a million allocated a million empty
-   * hierarchies per timestep, and then enumerated 5*10^11 pairs of them. Both
-   * terms are gone: the trees are `O(local bodies)` and the pairs come from the
-   * halo's broad phase. */
+  /* One tree per body this rank holds. */
   MFTL_BVH **const bvhs = (MFTL_BVH **) MFTLCallocOrDie((size_t) MFTL_MAX(nb, 1), sizeof(MFTL_BVH *), "BVH list");
   for (int o = 0; o < nb; ++o) bvhs[o] = MFTL_GenerateLBVH(ens->local_objects[o], params);
 
-  /* ── The body scales, then ONE halo exchange for the whole ensemble ──────
-   *
-   * Two collectives, neither of which grows with the body count: a per-body
-   * reduction over each body's holders for the radii, and one neighbourhood
-   * exchange for the extents and the payload. The version before that ran a full
-   * neighbour alltoall PER OBJECT PAIR, so 500 droplets meant 124 750 rounds of
-   * collectives per timestep before a single triangle moved.
-   *
-   * The radii come first because the envelope is a fraction of the body and the
-   * body's size is only knowable collectively -- see MFTL_BVH::radius_hint for
-   * why using this rank's share instead would make detection depend on the
-   * process count. */
+  /* Global radii first (the envelope is a fraction of the body, and this rank's
+   * share would make it depend on the process count), then one halo exchange
+   * for the whole ensemble. */
   MFTL_SpatialHalo *halo = MFTLSpatialHaloCreate(ens);
   MFTLSpatialHaloResolveRadii(ens, halo);
 
@@ -462,22 +370,14 @@ int MFTLEnsembleIntersectObjects(MFTL_Ensemble *ens, const MFTL_BVHBuildParams *
     tol[o] = bvhs[o]->tolerance;
   }
 
-  /* The envelopes go ON THE WIRE, and that is what removes the request list. A
-   * rank deciding whether its droplet B is worth sending towards a neighbour's
-   * droplet A needs A's envelope, and the envelope scales with A; published
-   * alongside the extent, it costs one double per body per rank and replaces an
-   * `O(bodies^2)` array that every rank built and every rank agreed on. */
+  /* The envelopes travel with the extents, so the candidate pairs are derived
+   * from them rather than enumerated. */
   halo->self_pairs = self;
   MFTLExtendSpatialHaloNearBodies(ens, tol, halo);
   free(tol);
 
-  /* ── A hierarchy for every body in the directory ─────────────────────────
-   *
-   * The directory is wider than the local list by exactly the bodies this rank
-   * received a patch of and holds nothing of -- which is the whole point of a
-   * spatial halo, and which is why those need a B-side tree with NO local
-   * primitives. They share one empty object: `n_local_prims` is zero, so every
-   * primitive resolves through the patch and the object is never read. */
+  /* A tree for every directory entry. A body only PATCHED here gets a tree over
+   * a shared empty object: every primitive resolves through the patch. */
   const int ne = halo->num_objects;
   MFTL_BVH **const by_entry = (MFTL_BVH **) MFTLCallocOrDie((size_t) MFTL_MAX(ne, 1), sizeof(MFTL_BVH *), "BVH directory");
   const MFTL_Object **const obj_by_entry = (const MFTL_Object **) MFTLCallocOrDie((size_t) MFTL_MAX(ne, 1), sizeof(MFTL_Object *), "BVH object directory");
@@ -505,23 +405,16 @@ int MFTLEnsembleIntersectObjects(MFTL_Ensemble *ens, const MFTL_BVHBuildParams *
       continue;
     }
 
-    /* Only when there IS one: MFTL_BVHSetHalo rebuilds the hierarchy, so calling
-     * it with a null patch would rebuild every local body's tree to arrive at
-     * the tree it already had. */
+    /* Attach only a real patch (attaching rebuilds the tree). */
     if (halo->patch[e] != MFTL_NULL) MFTL_BVHSetHalo(by_entry[e], halo->patch[e]);
 
-    /* AFTER the halo, and after the exchange: a patch is this rank's only handle
-     * on a body it holds nothing of, so the radius that sets that body's
-     * envelope arrives with it. Refitting last is what makes the envelope the
-     * same number on every rank that can report the pair -- the property
-     * test_tolerance_is_independent_of_the_partition exists to pin. */
+    /* Radius last, so every rank that can report the pair uses the same
+     * envelope (test_tolerance_is_independent_of_the_partition). */
     MFTL_BVHSetGlobalRadius(by_entry[e], MFTLSpatialHaloRadius(halo, gid));
   }
 
-  /* ── The pairs the broad phase kept ──────────────────────────────────────
-   *
-   * `body_a < body_b` and A is held here, so the A-side filter in the traversal
-   * still decides who reports: exactly the rank owning the A-side primitive. */
+  /* The candidate pairs (body_a < body_b, A held here); the traversal's A-side
+   * filter decides which rank reports. */
   for (int i = 0; i < halo->n_pairs; ++i)
   {
     const int ea = MFTLSpatialHaloFindBody(halo, halo->pair[i].body_a);
@@ -535,21 +428,11 @@ int MFTLEnsembleIntersectObjects(MFTL_Ensemble *ens, const MFTL_BVHBuildParams *
       continue;
     }
 
-    /* ── A body against itself ─────────────────────────────────────────────
-     *
-     * The B side is the body's tree WITH its patch: its own owned triangles
-     * plus the neighbours' share near this one. The A side has to be a second,
-     * patch-free tree over the same owned triangles -- MFTL_IntersectObjects
-     * refuses one tree against itself, and a patch primitive may never be the
-     * reporting side. Built only for the bodies that actually have a self pair. */
-    /* TIGHT boxes on the A side: a zero envelope. The broad phase admits a
-     * pair when the two trees' inflated boxes overlap, i.e. within tol_A +
-     * tol_B, while the narrow phase tests MAX(tol_A, tol_B). Between two bodies
-     * that surplus is the price of each tree carrying its own tolerance; here
-     * both sides are one body and it is pure waste -- measured on a 17k
-     * triangle tube at an envelope of 1.5 edges, 129 candidate pairs per
-     * triangle. A tight A side halves the search radius and leaves the
-     * threshold exactly what it was, because the B side still carries it. */
+    /* A body against itself: B is its tree WITH the patch; A is a second,
+     * patch-free tree over the same owned triangles (a patch primitive may
+     * never report) with a ZERO envelope, so the broad phase admits tol_B
+     * rather than tol_A + tol_B -- 129 candidate pairs per triangle otherwise,
+     * measured on a 17k-triangle tube at an envelope of 1.5 edges. */
     const MFTL_Object *const obj = obj_by_entry[ea];
     MFTL_BVHBuildParams tight = (params != MFTL_NULL) ? *params : MFTL_BVHDefaultParams();
     tight.proximity_factor = 0.0;

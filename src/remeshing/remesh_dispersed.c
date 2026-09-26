@@ -7,58 +7,37 @@
  * @brief Distributed remeshing for bodies SMALLER than a rank box: move the
  *        bodies, not the cut planes.
  *
- * ## THE SAME PROBLEM FROM THE OPPOSITE END
+ * ## The same problem from the opposite end
  *
- * An edge whose endpoints belong to two ranks cannot be collapsed by either of
- * them. remesh_parallel.c answers that by moving the CUT PLANES until every
- * entity has been in somebody's interior. This file answers it by observing that
- * for a body that FITS INSIDE A RANK BOX the question need never arise: migrate
- * the whole body onto one rank and there are no split edges at all.
+ * An edge whose endpoints belong to two ranks can be collapsed by neither.
+ * remesh_parallel.c moves the cut planes until every entity has been interior
+ * somewhere; for a body that fits in a rank box it is simpler to migrate the
+ * whole body onto one rank, where no edge is shared. Both are exact; R/h
+ * decides which is cheaper:
  *
- * Both are exact. Which is cheaper is decided entirely by R_body / h:
+ *              R >> h                              R << h
+ *   move       the planes                          the bodies
+ *   phases     about 4 at budget 4 (np = 2..8)     1
+ *   migrations one per placement, plus one         exactly 2
+ *   frozen     O(delta/h) of the mesh              nothing
+ *   id cost    per-phase holder prefix sums        one per-body MAX, total
+ *   weakness   phase count, band precondition      load balance at N_bodies < P
  *
- *              R >> h                          R << h
- *   move       the planes                      the bodies
- *   phases     4-17 measured (np = 1..8)       1
- *   migrations one per phase, plus one         exactly 2
- *   frozen     O(delta/h) of the mesh          nothing
- *   id cost    one Exscan+Allreduce per phase  one Allreduce(MAX), total
- *   weakness   phase count at large P          load balance at N_bodies < P
+ * ## Why the ids need almost nothing
  *
- * The dispersed regime is what a real emulsion, spray or bubbly flow is in, and
- * there the difference is not marginal: a pass over ten thousand droplets costs
- * two migrations instead of thirty-four.
+ * After centering exactly ONE rank holds any entity of a body, and ids live in a
+ * per-body space (`next_*_gid` is per object), so that rank's counter is already
+ * unique for the body. The operators run untouched, MFTLRemeshRenumberGlobalIds()
+ * makes the ids dense on the owner, and the other holders learn the counters by
+ * one per-body MAX over the holders (a rank holding nothing contributes zero).
  *
- * ## WHY THE IDS NEED ALMOST NOTHING
+ * ## Ordering
  *
- * The spanning driver's most delicate machinery is the per-phase MPI_Exscan that
- * makes concurrently-created global ids disjoint. None of it is needed here, and
- * the reason is worth stating because it is easy to add the machinery back out
- * of habit:
- *
- *   after centering, exactly ONE rank holds any entity of a given body,
- *   so that rank's own counter is already globally unique FOR THAT BODY.
- *
- * Two ranks remeshing two different bodies cannot collide, because ids live in a
- * per-body space (`obj->next_vertex_gid` is per object). So the operators run
- * completely untouched, MFTLRemeshRenumberGlobalIds makes the ids dense on the
- * owner, and the only thing the other ranks need is the resulting COUNTS -- one
- * Allreduce(MAX) over 2*num_objects ints, because a rank holding nothing of a
- * body contributes zero and the owner's value wins.
- *
- * Densifying is not cosmetic: redistribution and the ghost exchanges size their
- * arrival tables from `next_*_gid`, so holes accumulated over a few hundred
- * timesteps would become an unboundedly growing table for a mesh of constant
- * size (CLAUDE.md, deferred issue 15).
- *
- * ## ORDERING, AND THE ONE THING THAT MUST NOT HAPPEN
- *
- * The locality check comes BEFORE any remeshing. If some body did not become
- * local, this pass must not have modified anything yet -- the fallback hands the
- * whole ensemble to the spanning driver, and a half-remeshed ensemble entering
- * it would carry per-rank id blocks that no Exscan agreed on. The ordering costs
- * NOTHING: the radii it tests were already reduced for the strategy decision, so
- * the check is a loop over replicated data.
+ * Admission is decided BEFORE anything is modified: if a body is too large, the
+ * whole ensemble goes to the spanning driver, whose per-phase id scan assumes
+ * all holders enter with the same id counters -- which a half-remeshed
+ * ensemble would violate. The test uses radii already reduced for the strategy
+ * decision, so it costs one small reduction.
  */
 
 #include "mftl_remeshing.h"
@@ -245,14 +224,9 @@ MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategyMeasured(MFTL_Ensemble *ens,
 
   if (MFTLDomainGetHMin(&ens->domain) <= 0.0) return MFTL_REMESH_PARALLEL_SPANNING;
 
-  /* ONE SCALAR, and it has to be one. `radius` describes this rank's bodies and
-   * nothing else, so a maximum over it is a different number on every rank; the
-   * dispatch below would then split the ranks between two drivers, which is an
-   * immediate deadlock with no diagnostic. `r_max` came out of a scalar `MPI_MAX`
-   * inside the measurement and is identical to the bit everywhere.
-   *
-   * The replicated `[n_bodies_global]` radius array this replaces was, for this
-   * consumer, an expensive way of computing one number. */
+  /* ONE SCALAR, identical to the bit on every rank (a scalar MPI_MAX inside the
+   * measurement). A maximum over this rank's own radii would differ between
+   * ranks and split them between two drivers -- a deadlock. */
   const double box = dispersed_box_min(&ens->domain, params, m->r_max, ens->n_bodies_global);
   return (m->r_max > frac * box) ? MFTL_REMESH_PARALLEL_SPANNING : MFTL_REMESH_PARALLEL_DISPERSED;
 }
@@ -273,101 +247,52 @@ MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategy(MFTL_Ensemble *ens, const M
  * 1b. Load balancing
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * ══ NOBODY REPLICATES ANYTHING; ONE RANK DECIDES AND TELLS THE HOLDERS ══════
+ * ## One rank decides each body and tells the holders
  *
- * MFTL_OwnerMap is undefined -- not slow, undefined -- if two ranks name
- * different destinations for the same entity, so the destination of a body has
- * to be AGREED. There are exactly two ways to agree, and which one is chosen is
- * the whole scalability question for this driver:
+ * MFTL_OwnerMap is undefined if two ranks name different destinations for one
+ * entity, so a body's destination must be AGREED. Replicating every body's
+ * centroid and weight on every rank and running one deterministic greedy would
+ * cost O(bodies in the ensemble) payload and memory per rank. Instead one rank
+ * decides and sends the verdict: O(local bodies x degree), degree <= 26.
  *
- *   REPLICATE   give every rank every body's centroid and weight, and have all
- *               of them run the same deterministic greedy. That is what this
- *               file did until now, and it is `O(bodies in the ensemble)` in
- *               payload AND in per-rank memory: 32 bytes of staging per body on
- *               every rank, once per remesh, 32 MB each at a million droplets.
+ * ## The precondition is a local test
  *
- *   DECIDE ONCE one rank decides and SENDS the verdict to the ranks that need
- *               it. `O(local bodies x degree)`, and the degree is at most 26
- *               whatever `nproc` is.
- *
- * The second is what is below. It was the last `O(bodies in the ensemble)` term
- * in the library (docs/analysis.md §6.4).
- *
- * ── THE ONE PRECONDITION, AND IT IS A LOCAL TEST RATHER THAN AN ARGUMENT ───
- *
- * "Decide once and send it" needs the decider to be able to REACH every holder,
- * and the halo only ever ships one hop along `comm_graph`. Let
- * `home(o) = MFTLGetOwnerProc(centroid(o))` -- the rank that would hold body `o`
- * without any balancing, agreed by every holder to the bit because the centroid
- * came out of a reduction. The precondition is
+ * Let home(o) = MFTLGetOwnerProc(centroid(o)), identical on every holder because
+ * the centroid is reduced. Required:
  *
  *     for every body o and every holder H of o:  home(o) is H or a neighbour of H
  *
- * and the elegant part is that a holder can test its own half of it with no
- * communication at all, so an `MPI_LAND` over the job establishes the whole
- * statement. Two consequences fall straight out of it and they are exactly what
- * the scheme needs:
+ * Each holder tests its own half without communication; one reduction agrees
+ * it. It gives exactly the two messages needed: home can be told about o
+ * (lowest_holder(o), a genuine holder, is its neighbour; the graph is
+ * symmetric), and home can tell every holder. Not required: a clique of holders,
+ * a holder owning an entity, or home holding the body
+ * (MFTLEnsembleBodyHoldersFitTheGraph() is strictly stronger and deliberately
+ * not used). On failure the pass reports n_bodies_unreachable and uses plain
+ * centroid ownership -- never an O(B) replicated fallback.
  *
- *   home(o) CAN BE TOLD ABOUT o. The graph is symmetric, so `lowest_holder(o)`
- *   -- a genuine holder, already reduced by MFTLRemeshMeasureBodies, and the
- *   same rank in everybody's opinion -- is a neighbour of home(o) and its
- *   `(gid, home, weight)` record arrives there.
+ * ## A negotiation, because a local rule cannot see the global load
  *
- *   home(o) CAN TELL EVERY HOLDER. Each holder is a neighbour of home(o), so one
- *   neighbourhood gather of `(gid, dest, weight)` reaches all of them.
+ * Every overloaded rank sees the same idle neighbour. So each rank advertises
+ * its room (cap - load); an overloaded rank asks a FEW neighbours, emptiest
+ * first, for all of their room until its excess (plus one body) is covered; each
+ * neighbour grants its real room to its askers neediest first, so
+ * SUM(grants) <= room and nobody is pushed past the cap however many ship at
+ * once. Two failure modes shaped this, both silent: a proportional ask over 26
+ * neighbours yields grants smaller than one body, so nothing moves (108 bodies
+ * over 27 ranks stayed at imbalance 2.00); and a tie-break identical on every
+ * rank starves one target, so ties break on the neighbour's cell offset
+ * relative to the asker. Rounds are bounded (MFTL_DISPERSED_BALANCE_ROUNDS):
+ * running out leaves an imbalance that is reported, never a wrong mesh.
  *
- * Note what is NOT required: the holder set does not have to be a clique, no
- * holder has to own an entity (an empty holder still READS the verdict, it just
- * cannot be discovered -- and nothing here needs to discover it), and home(o)
- * does not have to hold the body. `MFTLEnsembleBodyHoldersFitTheGraph()` is a
- * strictly stronger statement and is deliberately not what is tested here.
+ * ## What one hop costs
  *
- * When the precondition fails anywhere the pass reports it and falls back to
- * PURE CENTROID OWNERSHIP -- correct, unbalanced, and visible as
- * `MFTL_RemeshStats::n_bodies_unreachable`. It does not fall back to
- * replicating, because a fallback that is `O(B)` is an `O(B)` term.
+ * Weight moves at most one cell per pass: a pile-up in one rank box is fixed
+ * when its neighbours have room; one spanning many cells only partly.
  *
- * ── WHY IT IS A NEGOTIATION AND NOT A GREEDY ──────────────────────────────
- *
- * The replicated greedy could see every rank's load, so it could hand a body to
- * the least-loaded rank in the job and know that nobody else was doing the same.
- * A local rule cannot: every overloaded rank sees the same idle neighbour and,
- * left alone, they all dump on it. The fix is two directed exchanges of one
- * double each -- a rank asks its neighbours for room in proportion to the room
- * they advertise, and each neighbour divides the room IT ACTUALLY HAS among the
- * askers in proportion to what they asked:
- *
- *     spare_r  = MAX(0, cap - load_r)                       published to all
- *     dem_sr   = excess_s * spare_r / SUM_r spare_r         s asks r
- *     grant_sr = spare_r * dem_sr / SUM_s dem_sr            r answers s
- *
- * `SUM_s grant_sr == spare_r` exactly, so NO RANK CAN BE PUSHED OVER ITS CAP no
- * matter how many neighbours ship at once -- that is the property a greedy over
- * stale loads does not have. An uncontended sender is granted the whole spare
- * rather than the fraction it asked for, which matters because bodies are
- * indivisible and a grant equal to the request rounds down to fewer bodies than
- * it should.
- *
- * ── WHAT THE ONE HOP COSTS, STATED RATHER THAN HIDDEN ─────────────────────
- *
- * Weight moves at most one cell per pass. A pile-up confined to one rank box is
- * fully fixed whenever the grid is small enough that the 26-neighbourhood is the
- * whole machine (every shape up to 2 cells per axis, i.e. np <= 8) and, at
- * larger `P`, whenever the neighbours have room -- which is the case a dispersed
- * ensemble is actually in, because droplet clustering is a local phenomenon. A
- * pile-up SPANNING many cells is not fully fixed, and the replicated greedy
- * would not have fixed it either: its own locality-first rule tries the 26 cells
- * before anywhere else, and its global fallback is precisely the case where a
- * body leaves the stencil and redistribution drops to its all-to-all path.
- *
- * ── DETERMINISM IS NOW A WEAKER REQUIREMENT, WHICH IS THE OTHER WIN ───────
- *
- * Every body is decided by exactly ONE rank, so two ranks can no longer disagree
- * about it -- the failure mode the replicated version had to defend against with
- * a total ordering on every tie-break, a ban on reading `dom->neighbors`, and a
- * comment explaining that qsort is not stable. Run-to-run reproducibility is
- * still wanted, and the tie-breaks below still deliver it, but a mistake in one
- * is now a different assignment rather than a corrupt mesh.
+ * Every body is decided by exactly one rank, so a flawed tie-break yields a
+ * different assignment, never a corrupt mesh; the tie-breaks are total anyway,
+ * for run-to-run reproducibility.
  */
 
 /**
@@ -449,33 +374,20 @@ static int by_gid_asc(const void *a, const void *b)
 static inline double balance_weight(double w) { return (w > 0.0) ? w : 1.0; }
 
 /**
- * @brief How many ask/grant/ship rounds one balancing pass runs.
+ * @brief Ask/grant/ship rounds per balancing pass: bounded, not convergent.
  *
- * BOUNDED RATHER THAN CONVERGENT, and the difference is the safety argument:
- * running out of rounds leaves an imbalance that the pass reports in
- * `load_imbalance`, never a wrong mesh. There is no fixed point to detect and no
- * collective spent detecting one.
- *
- * Measured on `examples/remesh_regime_sweep -only l`, the clustered and the
- * spread fixture, at np = 4, 8 and 27 -- the resulting imbalance against a slack
- * of 1.25:
+ * Imbalance reached against a slack of 1.25 (`examples/remesh_regime_sweep
+ * -only l`):
  *
  *   rounds   np=4   np=8   np=27 spread   np=27 clustered
  *   1        1.25   1.25   1.50           1.25
  *   2        1.25   1.25   1.25           1.25
- *   3        1.25   1.25   1.25           1.25
- *   4        1.25   1.25   1.25           1.25
+ *   3, 4     1.25   1.25   1.25           1.25
  *
- * A lone pile-up settles in ONE round because its ask is uncontended; it is the
- * SPREAD imbalance over a full 26-neighbourhood that needs a second, because
- * every overloaded rank asks the same emptiest neighbours first and only the
- * served ones drop out of the next round's advertisement -- see the ask step.
- *
- * Two is what the measurement needs and three is what ships, because the two
- * errors are not symmetric: one round too few is a silently unbalanced pass --
- * the failure this loop exists to fix -- and one too many is three directed
- * exchanges of one or two doubles per neighbour, which is latency and not
- * volume.
+ * A lone pile-up settles in one round (its ask is uncontended); a spread
+ * imbalance over a full 26-neighbourhood needs two. Three ship: one round too
+ * few is a silently unbalanced pass, one too many costs three directed
+ * exchanges of one or two doubles per neighbour.
  */
 enum
 {
@@ -708,12 +620,8 @@ static void assign_destinations(MFTL_Ensemble *ens, const MFTL_RemeshParameters 
     if (mine[i].w > heaviest) heaviest = mine[i].w;
   }
 
-  /* ── 2. The two scalars a cap needs ──────────────────────────────────────
-   *
-   * `total` for the mean and `heaviest` for the floor, and both are ONE double.
-   * The `[nproc]` load table this replaces was the other thing in this file that
-   * did not scale: correct, cheap at 27 ranks, and 800 kB per rank per remesh at
-   * a hundred thousand. */
+  /* ── 2. The two scalars a cap needs: `total` for the mean and `heaviest` for
+   * the floor -- no per-rank load table. */
   double total = load;
   MFTLRemeshAgreeDouble(dom, &total, 1);
   MFTLRemeshAgreeDoubleMax(dom, &heaviest, 1);
@@ -738,11 +646,8 @@ static void assign_destinations(MFTL_Ensemble *ens, const MFTL_RemeshParameters 
   double shipped_out = 0.0;
   double received_in = 0.0;
 
-  /* FIVE ARRAYS, SEVEN SLOTS OF LENGTH `d`, AND NOTHING ELSE. Every buffer the
-   * negotiation touches is sized by the graph degree -- at most 26, whatever
-   * `nproc` is -- which is the whole difference from the `[nproc]` load table and
-   * the `4 * n_bodies_global` staging this replaced. One allocation rather than
-   * five because they have the same lifetime and none of them is large. */
+  /* Every buffer of the negotiation is sized by the graph degree (at most 26),
+   * in one allocation. */
   double *const nb_buf = (double *) MFTLCallocOrDie(7 * (size_t) MFTL_MAX(nh.d, 1), sizeof(double), "dispersed neighbourhood scalars");
   double *const spare_nb = nb_buf;  // [d] room each neighbour last advertised
   double *const demand = nb_buf + nh.d;  // [d] what this rank asks of each
@@ -777,44 +682,24 @@ static void assign_destinations(MFTL_Ensemble *ens, const MFTL_RemeshParameters 
 
     for (int round = 0; round < MFTL_DISPERSED_BALANCE_ROUNDS; ++round)
     {
-      /* ── 4. Ask FEW NEIGHBOURS FOR A LOT, and ask again next round ───────
+      /* ── 4. Ask FEW neighbours for a lot, and ask again next round ─────────
        *
-       * ══ THE THING A BODY IS THAT A LOAD IS NOT: INDIVISIBLE ════════════
+       * Bodies are indivisible: splitting the excess over all neighbours in
+       * proportion to their room returns grants smaller than one body, nothing
+       * is placeable, and the pass reports an unchanged imbalance with
+       * `n_bodies_reassigned == 0` -- indistinguishable from an ensemble that
+       * needed nothing (measured: 108 bodies over 27 ranks stuck at 2.00). So
+       * the ask is CONCENTRATED: neighbours emptiest first, each asked for all
+       * it advertises, until the budget is covered.
        *
-       * The obvious rule -- split the excess over the neighbours in proportion
-       * to the room each advertises -- is right for a fluid and wrong here, and
-       * the way it fails PASSES EVERY TEST OF THE ANSWER. On a 3x3x3 grid a rank
-       * asks each of 26 neighbours for a twenty-sixth of its excess; each of
-       * those, contended by several askers, replies with a slice of that; and
-       * the grant that comes back is SMALLER THAN ONE BODY. Nothing is
-       * placeable, nothing moves, and the pass reports an unchanged imbalance
-       * with `n_bodies_reassigned == 0` -- which is exactly what an ensemble
-       * that needed no balancing reports. Measured before this was fixed: 108
-       * bodies over 27 ranks stayed at an imbalance of 2.00, while the same code
-       * balanced a single clustered rank -- whose ask was uncontended -- to 1.25.
+       * Concentrating makes every overloaded rank ask the same emptiest
+       * neighbour, which can serve one of them; hence ROUNDS -- served targets
+       * advertise less next time and the others move on.
        *
-       * So the ask is CONCENTRATED: walk the neighbours emptiest first and ask
-       * each for everything it advertises until the budget is covered.
-       *
-       * ── And that is why there are ROUNDS ────────────────────────────────
-       *
-       * Concentrating creates the opposite failure: every overloaded rank
-       * computes the same ordering over the same advertisements and they all ask
-       * the SAME emptiest neighbour, which can serve one of them. One round of
-       * this balances a lone pile-up perfectly and a spread-out imbalance barely
-       * at all. A round is cheap -- three directed exchanges of one or two
-       * doubles per neighbour -- and after each one the served target advertises
-       * less, so the unserved askers move on. Four is enough for every fixture
-       * measured and the loop is bounded rather than convergent by argument: a
-       * pass that runs out of rounds leaves an imbalance, never a wrong mesh.
-       *
-       * ── The budget overshoots by one body, deliberately ─────────────────
-       *
-       * `cur - cap` is what has to leave, but only whole bodies can leave, so
-       * asking for exactly that is routinely one body short of reaching the cap.
-       * The heaviest body still unplaced is added, which is the smallest
-       * addition that always suffices. It cannot push a TARGET over its cap: a
-       * grant is bounded by the target's own room whatever was asked. */
+       * The budget is `cur - cap` plus the heaviest unplaced body, because only
+       * whole bodies leave and asking for exactly the excess is routinely one
+       * body short. A target cannot be pushed over its cap: a grant is bounded
+       * by its own room. */
       for (int i = 0; i < nh.d; ++i) demand[i] = 0.0;
 
       if (cur > cap)
@@ -1078,14 +963,12 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
 
   MFTL_Domain *const dom = &ens->domain;
 
-  /* The GLOBAL body count, and only for the guard and for the balancer's
-   * replicated table: everything below is collective, so a rank holding nothing
-   * must still reach it.
+  /* The GLOBAL body count for the guard: everything below is collective, so a
+   * rank holding nothing must still reach it.
    *
-   * There is deliberately NO cached local count. A migration destroys the object
-   * of a body a rank keeps nothing of and creates one for a body arriving, so
-   * `ens->n_local_objects` and `ens->local_objects` both change under this
-   * function -- every loop below re-reads them. */
+   * No cached local count: migrations destroy and create local objects, so
+   * `ens->n_local_objects` and `ens->local_objects` change under this function
+   * and every loop re-reads them. */
   const int n = ens->n_bodies_global;
 
   MFTL_RemeshStats sink;
@@ -1130,16 +1013,9 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
 
   /* ── 1. Where is each body, and how big is it? ───────────────────────────
    *
-   * Handed in, not measured here. MFTLRemeshMeasureBodies is two per-body
-   * reductions and a scalar, and the caller has already paid them to decide the
-   * strategy. Measuring again would double the collectives of the whole pass to
-   * recompute an identical answer.
-   *
-   * The radius is not diagnostic here. It is the ADMISSION TEST, and it has to
-   * be taken before the migration rather than after it -- see step 2.
-   *
-   * The rows describe THIS RANK'S bodies. That is enough for everything except
-   * the balancer, which needs the whole ensemble and says so. */
+   * Handed in by the caller, who already measured to choose the strategy.
+   * The radius is the ADMISSION TEST (step 2); the rows describe this rank's
+   * bodies, which is all the driver and the balancer need. */
   MFTL_ASSERT(m->n_local == ens->n_local_objects &&
               "MFTLRemeshEnsembleDispersedMeasured: the measurement describes a different local list -- something migrated between the two calls");
 
@@ -1170,8 +1046,8 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
    *            design promised a neighbourhood.
    *
    * Taking the decision here also means NOTHING HAS MOVED YET when the fallback
-   * fires. That matters: the spanning driver's per-phase Exscan assumes every
-   * rank entered with the same id watermarks, which a half-migrated,
+   * fires. That matters: the spanning driver's per-phase id scan assumes every
+   * holder entered with the same id counters, which a half-migrated,
    * half-remeshed ensemble would not have.
    *
    * The threshold is MFTLRemeshChooseStrategy's, so a caller who let AUTO decide
@@ -1187,17 +1063,9 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
    * spanning -- visible only as `n_bodies_not_centred`. */
   const double h_min = dispersed_box_min(dom, params, m->r_max, n);
 
-  /* Counted over THIS RANK'S bodies and summed, rather than read off a
-   * replicated radius array. The verdict `too_large > 0` was already agreed by a
-   * collective -- it decides whether the whole ensemble falls back to the
-   * spanning driver, so it always was -- and this only changes what is summed
-   * into it.
-   *
-   * ONCE PER BODY, NOT ONCE PER HOLDER. Every holder of a body reduced to the
-   * same radius, so an unqualified sum reports a body held by four ranks four
-   * times -- which the regime sweep printed as "4 of 1 bodies are wider than a
-   * rank box". `lowest_holder` designates one of them and costs no collective;
-   * see MFTL_RemeshMeasurement. */
+  /* Counted over THIS RANK'S bodies, once per body rather than once per holder:
+   * every holder reduced to the same radius, so an unqualified sum reports a
+   * body held by four ranks four times. `lowest_holder` designates one. */
   /* TWO VERDICTS ON ONE MESSAGE, because both are gates and both are sums of a
    * local count. `gate[0]` decides whether this driver runs at all; `gate[1]`
    * decides whether it may BALANCE, and it is the reachability precondition of
@@ -1246,15 +1114,9 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
 
   /* ── Centroid ownership, then balance ────────────────────────────────────
    *
-   * ONE path now, and its payload is bounded by what this rank holds times the
-   * graph degree -- never by `n_bodies_global` and never by `nproc`. A body goes
-   * to the rank owning its centroid unless that rank is over the cap and a
-   * neighbour granted it room; the verdict is decided on ONE rank and delivered
-   * one hop, which is what removes the replicated table this used to need.
-   *
-   * With the balancer off the same call reports the imbalance and changes
-   * nothing, so the diagnostic no longer costs a different code path -- and it
-   * costs four scalars rather than the `[nproc]` reduction it used to. */
+   * A body goes to the rank owning its centroid unless that rank is over the
+   * cap and a neighbour granted room; decided on ONE rank, delivered one hop.
+   * With the balancer off the same call only reports the imbalance. */
   assign_destinations(ens, params, m, gate[1], dest, st);
 
   /* ── 3. Move each body whole ─────────────────────────────────────────────── */
@@ -1310,17 +1172,12 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
   }
   st->t_sweep += MFTLRemeshWallTime() - t_mark;
 
-  /* ── 5. Make the id counters agree, in one collective ────────────────────
+  /* ── 5. Make the id counters agree ───────────────────────────────────────
    *
-   * Exactly one rank holds any entity of a body, so its counter is the answer
-   * and everyone else contributes zero -- MAX picks the owner's value without
-   * anyone having to know who the owner is. Contributing the STALE pre-pass
-   * value instead would be wrong in the one direction that matters: a body that
-   * shrank would keep the larger old count, and the arrival tables would then be
-   * sized for ids nobody holds.
-   *
-   * The convergence counter rides the same message. It is reported rather than
-   * looped on -- there is only ever one pass here. */
+   * Exactly one rank holds entities of a body, so its counter is the answer
+   * and every other holder contributes zero: a per-body MAX over the holders
+   * picks it without anyone knowing who the owner is. Contributing the stale
+   * pre-pass value would be wrong for a body that shrank. */
   /* Re-read, not `n_local`: the migration in step 3 changed which bodies this
    * rank holds, which is the whole point of it. */
   const int n_held = ens->n_local_objects;
@@ -1334,20 +1191,10 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
     counters[2 * o + 1] = (obj->tris.n > 0) ? (double) obj->next_triangle_gid : 0.0;
   }
 
-  /* PER BODY, over that body's holders, and indexed by LOCAL SLOT. The staging
-   * buffer this replaces was `2 * n_bodies_global + 1` ints on every rank -- the
-   * id space, because an `MPI_Allreduce` aligns element k of every rank's buffer
-   * and the body id is the only index two ranks holding different bodies agree
-   * about. Moving that indexing inside MFTLEnsembleReduceBodies() is what makes
-   * the per-rank memory follow the holding rather than the ensemble.
-   *
-   * In this driver a body is normally held by exactly ONE rank when this runs --
-   * step 3 centred it -- so the reduction is the identity and costs the message
-   * and nothing else. It is taken anyway because "normally" is not "always": a
-   * rank can still hold an EMPTY object for a body, and such a rank goes on to a
-   * redistribution that sizes its arrival table from `next_*_gid`. An empty
-   * holder is also exactly what makes MFTLEnsembleBodyHoldersFitTheGraph() veto,
-   * so that case takes the global route and gets the right answer there. */
+  /* Per body, over its holders, indexed by LOCAL SLOT. Normally one holder per
+   * body at this point, but a rank can still hold an EMPTY object for a body
+   * and size its next arrival table from `next_*_gid`; such an empty holder
+   * vetoes the neighbourhood route, and the reduction takes the global one. */
   t_mark = MFTLRemeshWallTime();
   MFTLEnsembleReduceBodies(ens, counters, 2, cops, MFTL_BODY_REDUCE_SCOPE_AUTO);
 

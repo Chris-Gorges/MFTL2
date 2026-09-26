@@ -16,7 +16,7 @@
  *   layer 2   mftl_topology.h   mftl_geometry.h
  *   layer 3   mftl_object.h     mftl_ensemble.h   mftl_meshgen.h
  *             mftl_communication.h                mftl_io.h
- *             mftl_remeshing.h                    mftl_bvh.h
+ *             mftl_remeshing.h  mftl_bvh.h        mftl_topology_change.h
  *   layer 4   mftl_core.h  (this file)
  *
  * A header may only include headers from a strictly lower layer.

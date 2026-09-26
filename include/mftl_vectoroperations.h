@@ -6,10 +6,9 @@
  *
  * @brief Small fixed-size vector helpers.
  *
- * Layer 0: plain doubles in, plain doubles out, no MFTL types. All of these are
- * meant to be used on scalar, one-at-a-time code paths; a streaming kernel
- * should write the arithmetic out inline so the compiler sees the whole loop
- * body (see the MFTL_FOREACH_* iterators in mftl_object.h).
+ * Layer 0: plain doubles, no MFTL types. Meant for scalar code paths; streaming
+ * kernels write the arithmetic inline (see the `MFTL_FOREACH_*` iterators in
+ * mftl_object.h) so the compiler sees the whole loop body.
  */
 
 #ifndef MFTL_VECTOROPERATIONS_H
@@ -20,40 +19,27 @@
 #include "mftl_constants.h"
 
 /**
- * @brief Normalizes a 3D vector in-place. The result is UNIT LENGTH or zero.
+ * @brief Normalises a 3-vector in place: the result has unit length, or is zero.
  *
- * Exact for every input whose sum of squares is representable -- roughly
- * |v| in (1e-162, 7e153) -- and exactly zero outside it, which is a detectable
- * sentinel: a unit vector never has zero length, so "not normalisable" stays
- * distinguishable from "normalised".
+ * \f$\vect{v} \leftarrow \vect{v}/\norm{\vect{v}}\f$, with the magnitude computed
+ * UNCLAMPED and the zero vector mapped to itself:
+ * `inv = (mag > 0) ? 1/mag : 0`. The result is unit to rounding whenever
+ * \f$\norm{\vect{v}}^2\f$ is a normal double, i.e. for
+ * \f$1.5\cdot10^{-154} \lesssim \norm{\vect{v}} \lesssim 1.3\cdot10^{154}\f$;
+ * outside it the squared sum is subnormal, zero or infinite and the result loses
+ * precision or becomes the zero vector. Zero is a detectable sentinel: a unit
+ * vector never has zero length.
  *
- * ── Why this is not the guard the triangle kernels use ─────────────────────
+ * Every normalisation in the library uses this same expression. The two
+ * alternatives are both wrong for small vectors: clamping \f$\norm{\vect{v}}^2\f$
+ * before the square root floors the divisor and returns vectors SHORTER than
+ * unit (a vector of length \f$10^{-9}\f$ came out at \f$10^{-3}\f$), and
+ * `1/max(mag, tiny)` merely moves that floor. A short normal still points the
+ * right way, so every sign test passes while it silently scales whatever it
+ * multiplies. The select costs one instruction (+1.1 % in the per-triangle
+ * kernel). Guarded by `test_normalize_is_unit_across_magnitudes`.
  *
- * Until 2026-08-15 this clamped the SQUARED length before the square root, which
- * floors the magnitude at sqrt(MFTL_VERYSMALL) = 1e-6: any shorter vector was
- * divided by the clamp rather than by its own length and came out proportionally
- * SHORT. A vector of length 1e-9 normalised to length 1e-3.
- *
- * That is the most dangerous shape of wrong in a physics kernel. The direction is
- * still right, so every sign test, every orthogonality check and every picture
- * still looks correct, while the magnitude silently scales whatever the vector
- * multiplies -- a surface tension force, an advection step, a projection.
- *
- * MFTLGetTriangleProperties and the two geometry kernels carried the same defect.
- * They were first "fixed" with `1.0 / MFTL_MAX(mag, MFTL_VERYVERYSMALL)`, which
- * keeps the instruction count identical (one max, one sqrt, one divide) but only
- * MOVES the floor: a triangle with 1e-8 edges still came out with a normal of
- * length 0.112. All of them now use the same unclamped test against zero that is
- * written here, so the expression is identical in every kernel in the library --
- * which is what `test_triangle_geometry_paths_are_bit_identical` checks.
- *
- * The select is one instruction more than a max. Measured in the per-triangle
- * kernel at **7.33 -> 7.41 ns/tri, +1.1 %** (best of six over two rounds), and
- * the floor disappears entirely rather than moving from 1e-6 to 1e-15. Pay it.
- *
- * @param vec The vector to normalize, updated in place. On return it has length
- *            1, or length 0 if it arrived as the zero vector (or with a
- *            non-representable sum of squares).
+ * @param vec The vector, normalised in place.
  */
 static inline void MFTLNormalizeVector(double vec[3])
 {
@@ -75,9 +61,7 @@ static inline double MFTLVectorInProd(const double v1[3], const double v2[3]) { 
 /**
  * @brief Squared Euclidean length of a 3-vector.
  *
- * Preferred over MFTLVectorNorm() wherever the square root can be avoided --
- * comparing two lengths, or testing a length against a threshold, both work on
- * squares.
+ * Prefer it to MFTLVectorNorm() wherever lengths are only compared.
  *
  * @param v The vector.
  * @return \f$\norm{\vect{v}}^2\f$.

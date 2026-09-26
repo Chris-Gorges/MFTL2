@@ -6,183 +6,110 @@
 
 | File | Job |
 |---|---|
-| `vtk_legacy.c` | `MFTLWriteVtk` — a serial ASCII dump of **what is actually in memory** |
-| `vtu_writer.c` | `MFTLWriteVtu` — the parallel VTK XML writer, four combinations of encoding and file layout |
+| `vtk_legacy.c` | `MFTLWriteVtk` — a serial legacy ASCII dump of what is in memory |
+| `vtu_writer.c` | `MFTLWriteVtu` — the parallel VTK XML writer: ASCII or raw binary, one file per rank or one shared MPI-IO file |
 
-Nothing here is read back by the library. This is the module every other module's
-correctness is ultimately **judged** through, because it is how a human looks at
-what the rest produced.
+Nothing here is read back by the library.
 
 ---
 
-## The two writers have different contracts {#io_contracts}
+## Two writers, two contracts {#io_contracts}
 
 | | `MFTLWriteVtk` | `MFTLWriteVtu` |
 |---|---|---|
-| audience | a developer debugging | a visualisation tool, a post-processor |
-| entities | whatever the pool holds | **owned only**, by default |
-| `tris.area` / `tris.normal` | **written** | **never written** |
-| periodic seam | not handled | triangles unwrapped |
-| parallel | no — one rank, one file | yes |
+| audience | debugging | visualisation and post-processing |
+| entities | the whole pool, ghosts included | **owned** triangles (and the vertices they reference) |
+| arrays | owner, `verts.normal`, `tris.area` — unvalidated | owner, body id, optional global ids — never geometry |
+| periodic seam | not handled | straddling triangles unwrapped |
+| parallel | one rank, one file | collective, two layouts |
 
-@warning `MFTLWriteVtu` must **never** write `tris.area` or `tris.normal`.
-         Nothing on the object records whether they are current — `derived`
-         tracks connectivity, not geometry — and a
-         redistribution leaves them undefined by design, so a production file
-         containing them would look right and be stale. `MFTLWriteVtk` writes
-         them deliberately, because the raw dump's contract is to show what is in
-         memory.
+`MFTLWriteVtu` never writes `tris.area` or `tris.normal`: nothing records whether
+they are current and a redistribution leaves them unspecified, so such a file
+could be stale while looking right. `MFTLWriteVtk` writes them precisely to show
+the raw state.
 
 ---
 
 ## Only owned entities are written {#io_owned}
 
-Writing every triangle a rank holds, ghosts included, is the obvious loop and it
-is wrong. A ghost is a **copy** of a triangle another rank owns, so the merged
-dataset then contains every halo triangle two or more times.
+A ghost is a copy of a triangle another rank owns. Writing whole pools would put
+every halo triangle into the merged dataset once per holder: invisible in the
+picture (the copies coincide) but every integral a visualisation tool computes
+over the surface — area, enclosed volume — would be wrong by the halo fraction
+(10–30 % in a typical run). Ownership is an array prefix, so owned-only is a loop
+bound. `include_ghosts` restores the whole pool for inspecting the halo
+(`test_ghost_inclusion`, `test_cell_count_is_the_owned_count`).
 
-Invisible when you look at the surface — the copies are coincident — but **any
-integral the visualisation tool computes over it is silently wrong by the halo
-fraction**, which is 10–30 % in a typical run.
-
-Ownership is an array prefix here, so writing owned-only costs nothing but a loop
-bound. `include_ghosts` restores the old behaviour for when the halo itself is
-what you want to look at.
-
-Guarded by `test_ghost_inclusion` and `test_cell_count_is_the_owned_count`.
+The points of a piece are the vertices referenced by its written triangles (some
+of them ghosts), found by one marking pass over `tris.verts` and a prefix scan. A
+seam vertex is therefore written by every rank with a triangle on it.
 
 ---
 
-## Periodic unwrapping is computed once {#io_unwrap}
+## Periodic unwrapping {#io_unwrap}
 
-A triangle straddling a periodic face has corners stored at opposite ends of the
-box; drawn naively it stretches across the whole domain.
-
-`analyze_piece` gathers each triangle once and computes two minimum-image edge
-vectors. The unwrapped corners are
+Vertices are stored wrapped into the domain box, so a triangle straddling a
+periodic face would be drawn across the whole domain. Such a triangle is given
+**three private points** at its unwrapped corners
 
 $$
   \mathbf{p}_0, \quad \mathbf{p}_0 + \mathbf{e}_1, \quad \mathbf{p}_0 + \mathbf{e}_2
 $$
 
-Only wrapped triangles retain those nine coordinates. All subsequent output
-blocks reuse them instead of recomputing the geometry.
+(minimum-image edges $\mathbf{e}_i$), which may lie outside the box; all other
+triangles keep sharing their points. The mesh in memory is untouched.
 
-### Shared points and private points
-
-A triangle that does *not* wrap references three existing points, shared with its
-neighbours. A triangle that **does** wrap gets **three private points of its own**
-carrying the unwrapped coordinates, which may lie just outside the domain box.
-
-`analyze_piece` produces both sets in one pass; `emit_points` writes the shared
-ones first and the private ones after, and `emit_conn` addresses the private ones
-as `n_marked + 3*w`. **That order is load-bearing** — the connectivity depends on
-it.
-
-### The detection test has no tolerance, on purpose {#io_wrap_test}
-
-It compares each minimum-image edge with the corresponding raw position
-difference. The comparison is exact and has no epsilon.
-
-- A **false positive** costs three extra points carrying correct coordinates, and
-  renders identically.
-- A **false negative** draws a triangle across the whole domain.
-
-Any slack added to suppress the first buys the second, so there is none.
-`test_wrap_detection_paths_agree` pins compact connectivity against the half-edge
-fallback on the same seam-straddling surface.
+A triangle wraps iff some minimum-image edge differs from its raw difference, i.e.
+iff a periodic correction was applied: $d - L\,\mathrm{nearbyint}(d/L)$ returns
+$d$ bit-exactly when the rounding is 0 and differs by about $L$ otherwise. The test
+is exact, with no tolerance (`test_wrap_detection_paths_agree` checks both
+connectivity paths). The private points follow all shared points of a piece, and
+the connectivity addresses them as `n_marked + 3*w` — that order is load-bearing.
 
 ---
 
-## Encoding: raw binary by default {#io_encoding}
+## Encoding and layout {#io_encoding}
 
-The straightforward writer emits one `fprintf("%.10e %.10e %.10e\n")` per point
-and one per cell record. Decimal formatting of a `double` costs on the order of a
-hundred nanoseconds and produces ~25 bytes where the value occupies 8 — so an
-ASCII writer is CPU-bound on `printf` long before it is bound by the disk.
-
-VTK's XML format has carried a **raw appended-binary** section since 2003
-precisely for this. Using it turns the emit phase into a `memcpy`.
-
-$$
-  \text{speed-up} = \mathbf{23\text{–}32\times}
-$$
-
-ASCII (`MFTL_VTK_ASCII`) is kept because a text file you can `less` is worth a
-great deal when a mesh is wrong, and because it is the honest baseline the binary
-path is measured against.
-
-The file's byte order is the machine's, since the appended section is a plain
-`memcpy`, so `host_byte_order()` **detects** it rather than assuming — the library
-is expected to run on whatever the cluster has.
-
----
-
-## Layout: one file per rank, or one shared file {#io_layout}
+**Raw binary is the default.** Formatting a double as `%.10e` costs about 100 ns
+and 17 bytes, so an ASCII writer is bound by `printf`, not by the disk. VTK XML's
+raw appended section turns the emit phase into a memcpy: 23–32× faster
+(docs/analysis.md §3). Its byte order is the host's and is declared in the header.
 
 | | `MFTL_IO_FILE_PER_RANK` | `MFTL_IO_SINGLE_FILE` |
 |---|---|---|
-| files per dump | $P + 1$ (pieces + `.pvtu` index) | 1 |
-| collectives | none | **one** `MPI_Exscan` |
-| mechanism | POSIX `fwrite` per rank | `MPI_File_write_at_all` |
-| contention | none | two-phase collective buffering merges slices into large stripe-aligned writes issued by aggregator ranks |
+| files per dump | $P+1$ (pieces + `.pvtu` index) | 1 |
+| mechanism | buffered POSIX writes per rank | `MPI_File_write_at_all` |
+| collectives | one reduction of the return code | one `MPI_Iexscan` + `MPI_Iallreduce` pair, the collective open/writes, the return code |
+| encodings | ASCII or binary | binary only |
 
-### One exclusive scan places every block
+### Placing blocks in the shared file {#io_layout}
 
-A block's size is `unit` bytes times **either** the piece's point count **or** its
-cell count — there is no third possibility. So one exclusive scan of the *pair*
-$\{\text{points}, \text{cells}\}$ places every block of the shared file:
+Each of the up to nine arrays (points, connectivity, offsets, types, vertex owner
+and id, triangle owner, body id, triangle id) is one contiguous block whose size
+is `unit` bytes times either the point or the cell count. One exclusive scan of the
+pair $(n_\text{points}, n_\text{cells})$ therefore places every rank's slice of
+every block:
 
 $$
-  \text{offset}_b = \text{header} + \sum_{b' < b} S_{b'}
-                  + u_b \cdot \Big(\textstyle\sum_{r < \text{rank}} n^{(r)}_{\text{kind}(b)}\Big)
+  \text{offset}_b = H + \sum_{b' < b} (8 + S_{b'}) + 8
+                  + u_b \sum_{r < \text{rank}} n^{(r)}_{\text{kind}(b)} ,
 $$
 
-That is why the collective cost of this writer is $O(1)$ messages in the number of
-arrays, not $O(\text{arrays})$.
+where $H$ is the length of the XML header — identical on every rank because it is
+built from global counts only — and the 8 bytes are each block's UInt64 length
+prefix. Rank 0 writes the header, the length prefixes and the footer; every rank
+writes its slices with `MPI_File_write_at_all`, which lets the MPI library merge
+many small non-contiguous slices into a few large stripe-aligned writes (two-phase
+collective buffering). The file is truncated to its exact size. Connectivity and
+offsets are Int32, which bounds a shared file at $2^{31}-1$ points and
+$(2^{31}-1)/3$ cells.
 
-Every rank builds the **identical** header text and uses its length to place the
-appended section — which is the whole reason the header is assembled into an
-in-memory string buffer (`sbuf`) rather than being a sequence of `fprintf` calls.
+### Which layout is faster depends on the machine
 
-### Which is faster is a property of the machine
-
-This library will not pretend otherwise.
-
-- On a laptop with one local SSD the **per-rank** layout usually wins: there is no
-  aggregation to be had, and a shared file only adds contention. **Measured 1.0×
-  at $P=1$ and 0.45× at $P=4$.**
-- On a Lustre/GPFS system with $P$ in the thousands the **single file** wins by a
-  margin that grows with $P$, and the per-rank layout eventually stops working at
-  all — $P+1$ files per dump is what makes the metadata server, not the bandwidth,
-  fall over first.
-
-@note **MPI-IO did not make output faster; dropping ASCII did.** The 23–32× came
-      entirely from raw binary replacing `printf`. `MFTL_IO_SINGLE_FILE` is kept
-      for the property that was **not** measured, and it is the only one that
-      matters at scale.
-
-@note The shared-file backend passes `MPI_INFO_NULL`. Collective-buffering hints
-      (`cb_nodes`, `striping_unit`, …) are untouched and are where the remaining
-      tuning lives.
-
----
-
-## The block table {#io_blocks}
-
-Nine arrays, described uniformly so both backends share the emit code:
-
-| Block | Type | Sized by | Written when |
-|---|---|---|---|
-| `BLK_POINTS` | `Float64` ×3 | points | always |
-| `BLK_CONN` | `Int32` ×3 | cells | always |
-| `BLK_OFFSETS` | `Int32` | cells | always |
-| `BLK_TYPES` | `UInt8` | cells | always (5 = `VTK_TRIANGLE`) |
-| `BLK_VOWNER` | `Int32` | points | `write_owner` |
-| `BLK_VGID` | `Int32` | points | `write_global_id` |
-| `BLK_TOWNER` | `Int32` | cells | `write_owner` |
-| `BLK_BODYID` | `Int32` | cells | `write_body_id` |
-| `BLK_TGID` | `Int32` | cells | `write_global_id` |
-
-Adding an array is one `DECL(...)` row plus one `emit_*` call. Neither backend
-knows what any block *means*.
+On the development laptop (one SSD) the shared file measured 1.0× at $P = 1$ and
+0.45× at $P = 4$ relative to one file per rank: there is nothing to aggregate. On
+a parallel file system with thousands of ranks, $P+1$ files per dump is what
+overloads the metadata server first, which is why the shared layout exists.
+**Measure on the target system before choosing.** `MPI_INFO_NULL` is passed, so
+collective-buffering hints (`cb_nodes`, `striping_unit`, …) are the remaining
+tuning knobs.

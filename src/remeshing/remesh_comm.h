@@ -4,105 +4,48 @@
  * @date 2026-08-17
  * @ingroup mftl_remeshing
  *
- * @brief EVERY MPI CALL THE REMESHING MODULE MAKES, AND NOTHING ELSE.
+ * @brief Every MPI call the remeshing module makes, and nothing else.
  *
- * ## WHY THIS FILE EXISTS
+ * ## Why this file exists
  *
- * The first version of the distributed remesher reached the network by growing
- * the production communication primitives:
+ * Of every source in src/remeshing only remesh_comm.c may call MPI
+ * (`test_remeshing_mpi_is_confined`, a build-time source check); the operators,
+ * the smoother, the compaction and both drivers are local computation over a
+ * partition arranged here. The rule exists because the first distributed
+ * version grew the production primitives instead: a cut-plane offset inside
+ * MFTLGetOwnerProc() (1.70x slower `compute_owners`, which runs per entity per
+ * timestep) and a "new global id" field in the per-timestep ghost exchange.
+ * Both were reverted in favour of this file plus one seam in redistribution,
+ * #MFTL_OwnerMap (NULL on the production path).
  *
- *   - MFTLGetOwnerProc gained a per-axis cut-plane offset and a periodicity
- *     branch, so that a shifted decomposition could be expressed by subtracting
- *     from the position. That function is the body of `compute_owners`, i.e. it
- *     runs once per vertex and once per triangle on every redistributed
- *     timestep, forever, to serve a routine that runs a few times per hundred.
+ * ## What is here, and how each scales
  *
- *   - The per-timestep ghost exchange gained a third field, "tell me my new
- *     global id", and with it two `field ==` tests inside the loop that applies
- *     replies to ghost vertices.
- *
- * Neither was large and both were the wrong shape: a feature used once per
- * remesh was paid for once per timestep, inside the two loops the library is
- * most careful about. Both are reverted. What replaces them is this file, plus
- * ONE seam in redistribution -- MFTL_OwnerMap (mftl_communication.h), a NULL
- * pointer on the production path and one predicted branch per body.
- *
- * ## THE PROPERTY THIS FILE IS FOR
- *
- *     Of every source in src/remeshing, only this one may contain an MPI call.
- *
- * remesh_ops.c, remesh_smooth.c, remesh_compact.c, remesh_driver.c,
- * remesh_parallel.c and remesh_dispersed.c contain no MPI at all: the operators
- * and the two drivers are pure local computation over a partition somebody else
- * arranged. Checked by `test_remeshing_mpi_is_confined` in the test suite, and
- * it is what makes the serial path provably unaffected by any of this.
- *
- * ## WHAT IS HERE, AND HOW EACH ONE SCALES
- *
- *   MFTLRemeshMigrateShifted    26-neighbour. One redistribution under moved
- *                               cut planes. Volume is a LARGE FRACTION OF THE
- *                               MESH -- see below -- plus one int of latency for
- *                               the identity test that skips it entirely when
- *                               the placement is the one already in force.
- *   MFTLRemeshMigrateToRanks    26-neighbour when the bodies are smaller than a
- *                               rank box, which is the regime that asks for it;
- *                               redistribution detects the exception itself and
- *                               falls back to the global path.
- *   MFTLRemeshSumInts           1 Allreduce of 3 ints. Pure latency. Once per
- *                               phase, carrying the convergence certificate.
+ *   MFTLRemeshMigrateShifted    26-neighbour redistribution under moved planes;
+ *                               skipped (one int, LOR) when it is the identity.
+ *   MFTLRemeshMigrateToRanks    26-neighbour while bodies fit a rank box;
+ *                               redistribution falls back to its global path
+ *                               otherwise.
+ *   MFTLRemeshSumInts           Allreduce of 3 ints per phase (certificate).
  *   MFTLRemeshSyncGhostIds      3 neighbourhood collectives, 4 bytes per ghost
- *                               vertex. Once per remeshing call. Falls back to
- *                               the GLOBAL communicator when any ghost's owner
- *                               is not a graph neighbour -- which is what the
- *                               coarsened placement makes normal.
- *   MFTLRemeshMeasureBodies     9 SUM/MIN values per LOCAL body over that body's
- *                               holders, then 1 MAX value per local body, then
- *                               one scalar MPI_MAX for the largest body in the
- *                               ensemble. Nothing here is proportional to the id
- *                               space. ONCE per pass, not once per driver:
- *                               MFTLRemeshEnsemble threads the measurement from
- *                               the strategy choice into the dispersed driver.
- *   MFTLRemeshAgreeIntMax       1 Allreduce of n ints, n a small constant. Id
- *                               counters and watermarks are per-body and go
- *                               through MFTLEnsembleReduceBodies() instead.
- *   MFTLRemeshAgreeDoubleMax    1 Allreduce of 8 doubles. The profile and the
- *                               band measurement, once per pass.
- *   MFTLRemeshNeighborGather    26-neighbour, variable length. What one rank
- *                               holds, delivered one hop. The dispersed
- *                               balancer's two publishes: `(body, home, weight)`
- *                               for the bodies a rank speaks for, and
- *                               `(body, destination, weight)` for the ones it
- *                               moves. Three doubles each, and NOTHING sized by
- *                               `n_bodies_global`.
- *   MFTLRemeshNeighborAllgather 26-neighbour, fixed length. One double: the room
- *                               a rank advertises before the negotiation starts.
- *   MFTLRemeshNeighborAlltoall  26-neighbour, DIRECTED, one or two doubles. The
- *                               ask, the grant and the shipping report of one
- *                               balancing round, three times over. Latency, not
- *                               volume -- and it is what a purely local balancer
- *                               costs instead of the `4 * n_bodies_global`
- *                               doubles the replicated one broadcast.
+ *                               vertex, once per pass; global fallback when a
+ *                               ghost's owner is not a graph neighbour (normal
+ *                               under coarsening).
+ *   MFTLRemeshMeasureBodies     per-body holder reductions (9 values, then 1)
+ *                               plus one scalar MPI_MAX; once per pass.
+ *   MFTLRemeshAgree*            small fixed-size Allreduces (profile, band,
+ *                               frozen counts, balancer scalars, Debug checks).
+ *   MFTLRemeshNeighbor*         the balancer's one-hop exchanges: O(local
+ *                               bodies) or O(1) per neighbour, never sized by
+ *                               n_bodies_global.
  *
- * ### HOW MUCH A SHIFTED MIGRATION ACTUALLY MOVES
- *
- * This used to read "O(band), not O(mesh)" and that was simply wrong. Between a
- * placement at shift `a` and one at shift `b`, an entity changes owner on axis k
- * exactly when its coordinate falls in [a_k, b_k) modulo h_k, so the moved
- * fraction is
- *
- *     1 - PROD_k (1 - |b_k - a_k| / h_k)
- *
- * and for the actual table that is 87.5 % for (0,0,0) -> (1,1,1), 50 % for a
- * single-axis change and 75 % for two. Measured directly: MFTL_RemeshStats
- * .n_entities_migrated. The band is what gets FROZEN; it is not what moves.
- *
- * Nor is the claim that nothing here allocates or messages O(nproc) true, and it
- * never was: MFTLRemeshSyncGhostIds allocates one int per rank to invert the
- * neighbour list, and every migration goes through redistribute_core, which
- * allocates several arrays sized by nproc and loops over them. At P in the
- * hundreds that is noise; at P in the thousands, times the phase count, it is
- * the wall. Recorded here rather than fixed -- it is deferred issue 6 in
- * CLAUDE.md and it belongs to redistribution, not to this file.
+ * A shifted migration moves far more than the band: between shifts a and b an
+ * entity changes owner on axis k iff its coordinate lies in [a_k, b_k) modulo
+ * h_k, so the moved fraction is 1 - PROD_k (1 - |b_k - a_k| / h_k): 87.5 % for
+ * (0,0,0) -> (1,1,1), 50 % for one axis, 75 % for two
+ * (MFTL_RemeshStats::n_entities_migrated). The band is what is FROZEN, not what
+ * moves. Not everything here is O(degree) either: MFTLRemeshSyncGhostIds() and
+ * the redistribution behind every migration allocate arrays sized by nproc,
+ * which matters at P in the thousands times the phase count.
  */
 
 #ifndef MFTL_REMESH_COMM_H
@@ -227,60 +170,30 @@ static inline int MFTLRemeshOwnerProc(const MFTL_Domain *domain, const double sh
 }
 
 /**
- * @brief MFTLRemeshOwnerProc on a decomposition COARSENED by @p group per axis.
+ * @brief MFTLRemeshOwnerProc() on a decomposition COARSENED by @p group per axis.
  *
- * ═══════════════════════════════════════════════════════════════════════════
- * REGIME C WITHOUT A SECOND COMMUNICATION SUBSYSTEM
- * ═══════════════════════════════════════════════════════════════════════════
+ * The shift schedule needs \f$h > 4\delta\f$; when more ranks shrink h below
+ * that, bands along the cut planes are silently never remeshed. A coarser
+ * decomposition needs no second communicator: redistribution accepts any
+ * destination per entity (#MFTL_OwnerMap), so coarsening is just a different
+ * owner function -- fine cell, integer-divided by the group size, mapped to a
+ * representative fine cell's rank. Every rank still enters every collective;
+ * non-representatives receive nothing. The freeze rule (`index >= n_local`) and
+ * the covering argument transfer with \f$H_k = g_k h_k\f$, and the closing
+ * MFTLRedistribute() restores the fine partition.
  *
- * The shift schedule needs `h > 4*delta`. Raise the rank count on a fixed domain
- * and h shrinks until it does not, and then the scheme DEGRADES SILENTLY: bands
- * along the cut planes that no placement ever offers to anyone, every one of
- * them a perfectly valid piece of mesh. That is the regime the implementation
- * plan calls C, and its answer there was MPI_Comm_split plus a gather onto a
- * group master plus a scatter back -- a whole second communication subsystem,
- * which is why it was never built.
- *
- * It is not needed. Redistribution already accepts an arbitrary destination per
- * entity (MFTL_OwnerMap), which is how the dispersed strategy routes by body
- * rather than by plane. So a coarser decomposition is just a different OWNER
- * FUNCTION: take the fine cell, integer-divide by the group size, map back to a
- * representative fine cell, look up its rank. Every rank still enters every
- * collective; the ones that are not representatives simply receive nothing and
- * contribute zeros -- exactly the situation the dispersed driver is already in
- * whenever there are fewer bodies than ranks.
- *
- * Nothing else in the driver changes. The freeze rule is `index >= n_local` and
- * is therefore partition-agnostic. The covering argument transfers verbatim with
- * `H_k = group[k] * h_k`, and since `delta` is unchanged and H grows, making it
- * hold IS the point. The closing MFTLRedistribute passes no owner map at all, so
- * the fine canonical partition comes back by construction.
- *
- * ── WHAT IT COSTS, STATED PLAINLY ──────────────────────────────────────────
- *
- * `1 / (group[0]*group[1]*group[2])` of the ranks do all of the sweep work. The
- * remesh is 96-99 % of a timestep in the measured case, so this is a CORRECTNESS
- * ESCAPE HATCH, NOT A PERFORMANCE FEATURE. Remeshing to a longer target length,
- * or running on fewer ranks, beats it whenever either is available. And because
- * a destination is now up to `group[k]` cells away, it is outside the
- * 26-neighbourhood, so redistribution falls back to its global exchange path and
- * MFTLRemeshSyncGhostIds falls back to its -- both detect it themselves.
- *
- * The factors are PER AXIS and that is not a detail. The precondition is per
- * axis (`h_k > 4*delta` for every cut axis; MFTLDomainGetHMin takes the minimum
- * precisely because of that), so a domain that is thin in x only needs merging
- * in x only: 2x parallelism lost instead of 8x.
- *
- * @p group entries are >= 1; {1,1,1} is bit-for-bit MFTLRemeshOwnerProc.
- * @p pos must be WRAPPED into the domain.
+ * Cost: \f$1/(g_0g_1g_2)\f$ of the ranks do all the sweeping, and destinations
+ * leave the 26-neighbourhood, so redistribution and MFTLRemeshSyncGhostIds()
+ * take their global paths. Per-axis factors keep the loss to the axes that need
+ * it.
  *
  * @param domain The MPI/physical world.
- * @param group  Per-axis coarsening factors, each >= 1.
+ * @param group  Per-axis coarsening factors, each >= 1; {1,1,1} is bit-for-bit
+ *               MFTLRemeshOwnerProc().
  * @param shift  Per-axis cut-plane offset.
  * @param pos    A position, already wrapped into the domain.
- * @return The rank owning @p pos under the COARSENED, shifted decomposition.
- *         Every rank of a group maps to the same answer, so a group has one
- *         owner and no second communicator is needed.
+ * @return The rank owning @p pos under the coarsened, shifted decomposition;
+ *         all ranks of a group map to the same one.
  */
 static inline int MFTLRemeshCoarseOwnerProc(const MFTL_Domain *domain, const int group[3], const double shift[3], const double pos[3])
 {
@@ -350,23 +263,14 @@ static inline void MFTLRemeshCapGroups(int group[3], int cap)
 
 /**
  * @struct MFTL_RemeshMigrator
- * @brief Reusable scratch for the owner maps a remeshing pass builds.
+ * @brief Reusable scratch for the owner maps of a remeshing pass.
  *
- * A spanning pass migrates up to `parallel_phase_budget` times and each
- * migration needs one destination per entity of every body. Allocating that per
- * phase would repeat the first-touch page faults every time -- which is
- * measured, on the redistribution's own send buffers, as the largest single
- * source of timing noise in the per-timestep loop (deferred issue 6, CLAUDE.md).
- *
- * So the arena is grown geometrically and reused, and it belongs to the CALLER
- * rather than to MFTL_Domain: the domain is read-only during a redistribution,
- * and a phase-local buffer hanging off it would be mutable per-call state on a
- * struct whose whole contract is that it is not.
- *
- * BOTH ARRAYS ARE SIZED BY WHAT THIS RANK HOLDS, never by the id space. `maps`
- * is indexed by local slot because the only thing that reads it walks the same
- * list in the same order on the same rank; keyed by body gid it was the last
- * `O(bodies in the ensemble)` allocation on the per-phase path.
+ * A spanning pass migrates up to `parallel_phase_budget` times, each needing one
+ * destination per entity; the arena grows geometrically and is reused so later
+ * migrations do not pay first-touch page faults again. It belongs to the
+ * caller, not to #MFTL_Domain, which is read-only during a redistribution.
+ * Both arrays are sized by what this rank holds; `maps` is indexed by local
+ * slot, because its only reader walks the same list in the same order.
  */
 typedef struct MFTL_RemeshMigrator
 {
@@ -464,34 +368,23 @@ int MFTLRemeshMigrateToRanks(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const i
 /**
  * @brief In-place `MPI_Allreduce(MPI_SUM)` of @p n ints over the world.
  *
- * The convergence certificate and nothing else: three ints, once per phase, of
- * pure latency.
- *
- * ## THE COLLECTIVE THIS REPLACED, AND WHY IT WENT
- *
- * The phase used to hand out its new global ids with an `MPI_Exscan` plus an
- * `MPI_Allreduce` of `2 * n_bodies_global` ints, and these three counters rode
- * along in the same message -- free, because the message was already
- * ensemble-sized. The ids now go through MFTLEnsembleExscanBodies(), which is a
- * per-body scan over that body's HOLDERS and `O(local bodies)`, so appending
- * three ensemble-wide ints to it would put a `comm_world` reduction back on
- * every phase. One small latency is the price of removing an
- * `O(bodies in the ensemble)` payload.
+ * The spanning driver's convergence certificate (3 ints per phase) and the
+ * dispersed driver's gates and idle/reassigned counts. The certificate does not
+ * ride the per-body id scan, which goes over each body's holders.
  *
  * @param domain The MPI/physical world.
  * @param values `[n]` values, replaced by their sums over all ranks.
- * @param n      How many. Less than 1 is a no-op.
+ * @param n      How many; less than 1 is a no-op.
  * @collective
  */
 void MFTLRemeshSumInts(const MFTL_Domain *domain, int *values, int n);
 
 /**
- * @brief In-place MPI_Allreduce(MPI_SUM) of @p n doubles over the world.
+ * @brief In-place `MPI_Allreduce(MPI_SUM)` of @p n doubles over the world.
  *
- * The mean-edge-length reduction and nothing else so far. Sum rather than a
- * ready-made mean, because a mean of per-rank means is weighted by RANKS and not
- * by edges -- and a rank holding no part of the mesh would contribute a zero
- * that drags the answer down without being anybody's edge.
+ * Mean edge length (sum and count), frozen-share counts, the balancer's total
+ * weight. Always sums, never per-rank means, which would weight ranks rather
+ * than entities.
  *
  * @param domain The MPI/physical world.
  * @param values `[n]` values, replaced by their sums over all ranks.
@@ -525,11 +418,10 @@ void MFTLRemeshAgreeDouble(const MFTL_Domain *domain, double *values, int n);
 bool MFTLRemeshParamsAgree(const MFTL_Domain *domain, const MFTL_RemeshParameters *params);
 
 /**
- * @brief In-place MPI_Allreduce(MPI_MAX) of @p n ints over the world.
+ * @brief In-place `MPI_Allreduce(MPI_MAX)` of @p n ints over the world.
  *
- * Used where a value is known exactly by ONE rank and is zero or stale on the
- * others -- the id counters of a body that a dispersed pass put wholly on its
- * owner, and the Debug watermark agreement check.
+ * The dispersed driver's busiest-rank operation count and the Debug watermark
+ * check. Per-body id counters go through MFTLEnsembleReduceBodies() instead.
  *
  * @param domain The MPI/physical world.
  * @param values `[n]` values, replaced by their maxima over all ranks.
@@ -539,16 +431,11 @@ bool MFTLRemeshParamsAgree(const MFTL_Domain *domain, const MFTL_RemeshParameter
 void MFTLRemeshAgreeIntMax(const MFTL_Domain *domain, int *values, int n);
 
 /**
- * @brief In-place MPI_Allreduce(MPI_MAX) of @p n doubles over the world.
+ * @brief In-place `MPI_Allreduce(MPI_MAX)` of @p n doubles over the world.
  *
- * The double-precision twin of MFTLRemeshAgreeIntMax, for the two things a pass
- * measures rather than assumes: the wall-clock profile (where the interesting
- * number is the SLOWEST rank, because the phase loop is barrier-synchronised by
- * the id collective) and the observed width of the frozen band.
- *
- * MPI_MAX on doubles is order-independent, so the result is bit-identical on
- * every rank and anything derived from it stays a pure function of replicated
- * data -- which is what lets a driver branch on it without splitting the ranks.
+ * The measured band, the balancer's heaviest body and peak load. `MPI_MAX` is
+ * order-independent, so the result is bit-identical everywhere and safe to
+ * branch on.
  *
  * @param domain The MPI/physical world.
  * @param values `[n]` values, replaced by their maxima over all ranks.
@@ -582,14 +469,8 @@ void MFTLRemeshAgreeDoubleMax(const MFTL_Domain *domain, double *values, int n);
 void MFTLRemeshAgreeProfile(const MFTL_Domain *domain, MFTL_RemeshStats *st, double *extra, int n_extra);
 
 /**
- * @brief Seconds from an arbitrary fixed origin. MPI_Wtime, and nothing else.
- *
- * It looks like a pointless wrapper and it is not: `test_remeshing_mpi_is_confined`
- * is a source scan for `MPI_*(` outside this file, so a bare MPI_Wtime() in
- * remesh_parallel.c fails the BUILD. The rule is worth more than the indirection
- * -- see the header of this file for what it cost the first time it was broken --
- * and the call is not on any hot path: six per phase, against a migration.
- *
+ * @brief `MPI_Wtime()`, wrapped so that the drivers contain no MPI call
+ *        (`test_remeshing_mpi_is_confined` is a source scan).
  * @return Seconds from an arbitrary fixed origin.
  */
 double MFTLRemeshWallTime(void);
@@ -629,34 +510,17 @@ double MFTLRemeshWallTime(void);
 int MFTLRemeshSyncGhostIds(MFTL_Ensemble *ens, const int *vertex_gid_base);
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 4. Neighbourhood exchange -- the three shapes a bounded-degree pass needs
- * ═══════════════════════════════════════════════════════════════════════════
+ * 4. Neighbourhood exchange -- the three shapes the dispersed balancer needs
  *
- * THE POINT OF THESE IS WHAT THEY CANNOT EXPRESS. Every one of them moves a
- * payload proportional to `num_neighbors` -- at most 26, whatever `nproc` is --
- * and to what THIS RANK holds. Nothing here can be handed an array indexed by
- * the body id space or by the rank space, so a call site that needs one has to
- * say so by reaching for MFTLRemeshAgreeDouble() instead, where the cost is
- * visible.
+ * Each moves a payload proportional to `num_neighbors` (<= 26) and to what THIS
+ * rank holds; none can carry an array indexed by body id or by rank.
  *
- * They exist for the dispersed load balancer, which used to replicate
- * `4 * n_bodies_global` doubles onto every rank once per remesh so that every
- * rank could compute the same greedy over the same table. It now decides each
- * body on ONE rank and delivers the verdict one hop, which is these three
- * collectives and no replicated table at all.
- *
- * ── The self-loop, which is not a corner case ─────────────────────────────
- *
- * `domain->neighbors` is built from the 26 non-zero cell OFFSETS, so on a grid
- * with a single cut on a periodic axis two opposite offsets wrap onto this rank
- * and `comm_graph` carries a SELF-LOOP -- shapes {2,1,1} and {2,2,1} have one,
- * {2,2,2} and {3,3,3} do not. A gather then delivers this rank's own block back
- * to it, and a caller that also folds in its own contribution locally counts it
- * twice. Every consumer here must skip the slot
- * `MFTLDomainNeighborIndex(domain, domain->rank)` (mftl_ensemble.h) reports, and
- * the same trap doubled every SUM in MFTLEnsembleReduceBodies() before it was
- * found.
- */
+ * The self-loop: `domain->neighbors` comes from the 26 cell OFFSETS, so on a
+ * grid with a single cut on a periodic axis (shapes {2,1,1}, {2,2,1}) two
+ * offsets wrap onto this rank and a gather returns this rank's own block. A
+ * caller that also folds in its own contribution locally must skip the slot
+ * `MFTLDomainNeighborIndex(domain, domain->rank)` reports, or every SUM doubles.
+ * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
  * @brief Variable-length allgatherv of doubles over `comm_graph`.

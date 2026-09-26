@@ -156,8 +156,7 @@ mftl_add_mpi_test(test_remeshing 1)
 #   4   2x2x1: the first grid where an entity can be near the planes of TWO axes
 #       at once, which is the TUBE conflict the even-parity phases exist for.
 #   8   2x2x2: CORNER conflicts, i.e. entities near all three axes' planes, which
-#       only the odd-parity phases resolve. Also the count at which the initial
-#       scatter from rank 0 reaches non-neighbours and forces the global path.
+#       only the odd-parity phases resolve.
 mftl_add_mpi_test(test_remeshing_parallel 1)
 mftl_add_mpi_test_at(test_remeshing_parallel_np2 test_remeshing_parallel 2)
 mftl_add_mpi_test_at(test_remeshing_parallel_np4 test_remeshing_parallel 4)
@@ -167,10 +166,9 @@ mftl_add_mpi_test_at(test_remeshing_parallel_np8 test_remeshing_parallel 8)
 #       questions. First, at cuts[k] == 2 a periodic axis has the SAME rank on
 #       both sides of a cell, so the shifted ownership rule can confuse "one cell
 #       left" with "one cell right" and no test at np <= 8 notices; three is the
-#       smallest count where those are different ranks. Second, h falls to 2/3 of
-#       the domain, so the h > 4*delta precondition stops being comfortable and
-#       the band measurement is exercised against a real margin rather than a
-#       generous one.
+#       smallest count where those are different ranks. Second, h falls to L/3,
+#       so the h > 4*delta precondition stops being comfortable and the band
+#       measurement is exercised against a real margin rather than a generous one.
 mftl_add_mpi_test_oversub(test_remeshing_parallel_np27 test_remeshing_parallel 27)
 
 # The OTHER distributed strategy: move the bodies instead of the planes. Same
@@ -242,9 +240,9 @@ mftl_add_mpi_test_oversub(test_body_reduce_np27 test_body_reduce 27)
 #   2   a thin 2x1x1 grid: periodic wrap maps several of the 26 neighbour offsets
 #       onto the same rank, so the neighbour list is shorter than the stencil
 #   4   2x2x1: the first grid with a real diagonal neighbour
-#   8   2x2x2: every one of the 26 offsets is populated, and the initial scatter
-#       from rank 0 reaches ranks that are not its neighbours -- which is what
-#       forces the global communication path
+#   8   2x2x2: every one of the 26 offsets is populated (every cell is still a
+#       26-neighbour of every other, so the scatter stays on the graph route;
+#       the global route needs a cell two or more cells away, e.g. 3x3x3)
 mftl_add_mpi_test(test_redistribution 1)
 mftl_add_mpi_test_at(test_redistribution_np2 test_redistribution 2)
 mftl_add_mpi_test_at(test_redistribution_np4 test_redistribution 4)

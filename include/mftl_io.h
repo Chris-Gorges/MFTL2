@@ -4,74 +4,29 @@
  * @date 2026-08-14
  * @ingroup mftl_io
  *
- * @brief Mesh output in VTK formats: a serial debug dump and a parallel writer.
+ * @brief Mesh output in VTK formats: a serial legacy debug dump and a parallel
+ *        VTK XML (`.vtu`) writer.
  *
- * Nothing here is read back by the library -- this is the module every other
- * module's correctness is ultimately JUDGED through, because it is how a human
- * looks at what the rest of the library produced.
+ * Nothing is read back by the library. Four decisions define MFTLWriteVtu():
  *
- * ## THREE DECISIONS THAT DECIDE WHAT THIS MODULE COSTS AND WHAT IT MEANS
+ * 1. **Raw binary by default.** Decimal formatting of a double costs about
+ *    100 ns and ~17 bytes, so an ASCII writer is bound by `printf`, not by the
+ *    disk; the appended raw section is a memcpy (23-32x faster, docs/analysis.md
+ *    §3). ASCII is kept for inspection.
+ * 2. **Two file layouts.** One piece per rank plus a `.pvtu` index (no
+ *    contention, but P+1 files per dump -- what overloads a parallel file
+ *    system's metadata server first), or one shared file written collectively
+ *    with MPI-IO. On one local SSD the per-rank layout was faster (the shared
+ *    file: 1.0x at P = 1, 0.45x at P = 4); re-measure on the target system.
+ * 3. **Only owned entities are written.** A ghost is a copy of a triangle another
+ *    rank owns; writing it would count every halo triangle once per holder and
+ *    bias every integral a visualisation tool computes (10-30 % in a typical
+ *    run). `include_ghosts` exists for inspecting the halo.
+ * 4. **Periodic unwrapping at write time.** A triangle straddling a periodic face
+ *    gets three private points at its unwrapped corners; the mesh in memory is
+ *    untouched.
  *
- * 1. THE DEFAULT ENCODING IS RAW BINARY, NOT ASCII.
- *
- *    The straightforward writer emits one `fprintf("%.10e %.10e %.10e\n")` per
- *    point and one per cell record. Decimal formatting of a double costs on the order
- *    of a hundred nanoseconds and produces ~25 bytes where the value occupies 8,
- *    so an ASCII writer is CPU-bound on `printf` long before it is bound by the
- *    disk. VTK's XML format has carried a raw appended-binary section since 2003
- *    precisely for this; using it turns the emit phase into a memcpy.
- *
- *    ASCII is kept (MFTL_VTK_ASCII) because a text file you can `less` is worth
- *    a great deal when a mesh is wrong, and because it is the honest baseline the
- *    binary path is measured against.
- *
- * 2. THERE ARE NOW TWO FILE LAYOUTS, AND THE CHOICE IS A SCALING DECISION.
- *
- *    MFTL_IO_FILE_PER_RANK  P pieces plus a .pvtu index. No shared file, so the
- *                           ranks never contend; but it creates P+1 files per
- *                           dump, and on a parallel filesystem the metadata
- *                           server -- not the bandwidth -- is what falls over
- *                           first.
- *
- *    MFTL_IO_SINGLE_FILE    ONE .vtu written collectively with MPI-IO. Every
- *                           rank contributes a slice of each data array at an
- *                           offset it computes from one MPI_Exscan, and
- *                           MPI_File_write_at_all lets the MPI implementation's
- *                           two-phase collective buffering merge those slices
- *                           into a few large, stripe-aligned writes issued by a
- *                           subset of aggregator ranks.
- *
- *    Which is faster is a property of the MACHINE, not of the code, and this
- *    library will not pretend otherwise: on a laptop with one local SSD the
- *    per-rank layout usually wins, because there is no aggregation to be had and
- *    a shared file only adds contention. On a Lustre/GPFS system with P in the
- *    thousands the single file wins by a margin that grows with P, and the
- *    per-rank layout eventually stops working at all. docs/analysis.md §3
- *    carries the measurement on the development machine; RE-RUN IT on the target.
- *
- * 3. ONLY OWNED ENTITIES ARE WRITTEN.
- *
-    Writing every triangle the rank holds, ghosts included, is the obvious loop
- *    and it is wrong. A ghost is a COPY of a triangle another rank owns, so the
- *    merged dataset then contains every halo triangle two or more times:
- *    invisible when you look at the surface, but any integral ParaView computes
- *    over it (total area, enclosed volume) is silently wrong by the halo fraction
- *    -- 10-30 % in a typical run. Ownership is an array prefix here, so writing
- *    owned-only costs nothing but a loop bound. `include_ghosts` asks for the
- *    whole pool deliberately, for when the halo itself is what you want to look
- *    at.
- *
- * 4. PERIODIC UNWRAPPING IS COMPUTED ONCE.
- *
- *    A triangle straddling a periodic face has corners stored at opposite ends of
- *    the box; drawn naively it stretches across the whole domain. The previous
- *    version detected this by calling MFTLGetMinimumImageVector twice per
- *    triangle inside a helper it then called FOUR TIMES per triangle per file
- *    (its own src/io/README.md §3.3 records the redundancy).
- *
- *    The analysis now gathers each triangle once, computes its minimum-image
- *    edges, and retains private coordinates only for triangles that wrap.
- *    Subsequent output blocks reuse that result. See src/io/vtu_writer.c §2.
+ * Theory: src/io/README.md.
  */
 
 #ifndef MFTL_IO_H
@@ -86,14 +41,13 @@
 /** @brief How the numbers are encoded in a .vtu file. */
 typedef enum
 {
-  /** Raw little-endian binary in an appended section. The default: ~10x faster
-   *  to write and ~2.5x smaller than ASCII, and read natively by ParaView/VisIt. */
+  /** Raw binary in an appended section, in the host byte order (declared in
+   *  the header). The default: 23-32x faster to write than ASCII and about half
+   *  the size; read natively by ParaView and VisIt. */
   MFTL_VTK_BINARY = 0,
 
-  /** Decimal text inside the DataArray elements. Human-readable and diffable,
-   *  and the only encoding whose file you can inspect without a tool. Costs
-   *  roughly an order of magnitude in write time. Not available with
-   *  MFTL_IO_SINGLE_FILE -- see MFTLWriteVtu(). */
+  /** Decimal text inside the DataArray elements: human-readable and diffable.
+   *  Not available with #MFTL_IO_SINGLE_FILE. */
   MFTL_VTK_ASCII = 1
 } MFTL_VtkEncoding;
 
@@ -111,16 +65,13 @@ typedef enum
 
 /**
  * @struct MFTL_VtkOptions
- * @brief What to write and how. Get a filled-in default from MFTLVtkDefaults().
+ * @brief What to write and how; start from MFTLVtkDefaults().
  *
- * The optional arrays are all things that are ALWAYS well-defined: identity and
- * ownership. Note what is deliberately absent -- there is no option to write
- * `tris.area` or `tris.normal`. Nothing on the object records whether those are
- * current (`derived` tracks connectivity, not geometry), and
- * a redistribution leaves them holding unspecified values by design. A writer
- * that emitted them would produce a file that looks right and is stale, which is
- * the exact failure mode this library spends its architecture avoiding. Compute
- * them and write your own array if you need them.
+ * The optional arrays are identity and ownership, which are always
+ * well-defined. There is deliberately no option for `tris.area` or
+ * `tris.normal`: nothing records whether they are current and a redistribution
+ * leaves them unspecified, so a file containing them could be stale while
+ * looking right. Compute and write them yourself if needed.
  */
 typedef struct MFTL_VtkOptions
 {
@@ -158,70 +109,52 @@ MFTL_VtkOptions MFTLVtkDefaults(void);
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Writes the object held by the CALLING rank to a legacy ASCII .vtk file.
+ * @brief Writes the calling rank's pool of one object to a legacy ASCII `.vtk`
+ *        file: the raw debug dump.
  *
- * The debug dump: every entity the rank currently holds, ghosts included, with
- * no filtering, no periodic unwrapping and no communication. What you see is
- * exactly the object's raw in-memory state, which is the point -- when a mesh is
- * broken you want the broken thing on screen, not a cleaned-up rendering of it.
+ * Every entity the rank holds, ghosts included, with no filtering, no periodic
+ * unwrapping and no communication. It also writes `VertexOwner`,
+ * `TriangleOwner`, `verts.normal` and `tris.area` UNVALIDATED -- its contract is
+ * to show what is in memory, including arrays a redistribution left undefined.
  *
- * It writes `verts.normal` and `tris.area` UNVALIDATED, which is the one place
- * in this module that does. MFTLWriteVtu refuses to, because nothing on the
- * object says whether they are current and a stale-but-plausible production file
- * is a trap; here showing you an array a redistribution left undefined is how
- * you find out that it is undefined.
+ * Strictly single-rank: several ranks writing the same path race. Call it from
+ * one rank, or give every rank its own name.
  *
- * Strictly single-rank. It takes no domain and issues no MPI call, so calling it
- * from several ranks with the SAME path is a filesystem-level race. Either call
- * it from rank 0 on a rank-0-resident mesh (what examples/sphere_creation_serial.c
- * does) or give every rank a distinct name.
- *
- * @param object        The object to write. Must have valid topology (half-edges).
+ * @param object        The object (valid topology required).
  * @param base_filename Base path; ".vtk" is appended.
- * @return MFTL_SUCCESS, or MFTL_ERROR on a NULL argument or an unwritable path.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on a NULL argument or an I/O failure.
  */
 int MFTLWriteVtk(const MFTL_Object *object, const char *base_filename);
 
 /**
- * @brief Writes every object of an ensemble as one VTK XML unstructured grid.
+ * @brief Writes every local object of an ensemble as one VTK XML unstructured
+ *        grid (all bodies in one point/cell list per piece).
  *
- * All objects are aggregated into a single point/cell list per piece, with each
- * object's connectivity shifted by a running vertex offset so that body 2's
- * vertex 0 does not collide with body 1's.
+ * Points are the vertices referenced by the written triangles (owned triangles
+ * may reference ghost vertices), plus three private points per triangle that
+ * straddles a periodic face; a seam vertex is therefore written by every rank
+ * with a triangle on it. Cells carry `TriangleOwner`, `BodyID` and optionally
+ * `TriangleGID`; points `VertexOwner` and optionally `VertexGID`. Uses compact
+ * connectivity when current, the half-edge records otherwise; no geometry
+ * precondition.
  *
- * ── Collective ─────────────────────────────────────────────────────────────
+ * - #MFTL_IO_FILE_PER_RANK writes `<prefix>_%05d.vtu` per rank and
+ *   `<prefix>.pvtu` on rank 0.
+ * - #MFTL_IO_SINGLE_FILE writes one `<prefix>.vtu` with one Piece: one
+ *   non-blocking `MPI_Exscan` + `MPI_Allreduce` pair places every block, rank 0
+ *   writes header, length prefixes and footer, and every rank writes its slice of
+ *   each block with `MPI_File_write_at_all` (enabling two-phase collective
+ *   buffering). The file is truncated to its exact size. Requires
+ *   #MFTL_VTK_BINARY and at most \f$2^{31}-1\f$ points and
+ *   \f$(2^{31}-1)/3\f$ cells (Int32 connectivity and offsets).
  *
- * Every rank of the ensemble must call it, at both layouts:
+ * @param ensemble        The ensemble; zero objects yield a valid empty dataset.
+ * @param filename_prefix Base path/name; suffixes are appended.
+ * @param options         #MFTL_NULL for MFTLVtkDefaults().
+ * @return #MFTL_SUCCESS if every rank succeeded, #MFTL_ERROR otherwise -- the same
+ *         value on every rank.
  *
- *   MFTL_IO_SINGLE_FILE     genuinely collective -- MPI_Exscan, MPI_Allreduce and
- *                           MPI_File_*_all, all on the domain communicator.
- *   MFTL_IO_FILE_PER_RANK   the piece writes are independent, but rank 0's .pvtu
- *                           index promises one piece file per rank, and the
- *                           return code is MPI_Allreduce'd so that a rank which
- *                           failed to open its file is not the only one that
- *                           knows. Both make it collective in practice.
- *
- * ── Preconditions ──────────────────────────────────────────────────────────
- *
- * None on the geometry: positions are authoritative. Current compact
- * connectivity is used when present; otherwise the writer obtains the same
- * indices from implicit half-edge records.
- *
- * ── Restrictions ───────────────────────────────────────────────────────────
- *
- * - MFTL_IO_SINGLE_FILE with MFTL_VTK_ASCII returns MFTL_ERROR. A single shared
- *   file exists to be fast, and ASCII text of variable width in a shared file is
- *   a contradiction; refusing it is clearer than silently promoting it.
- * - Point indices are Int32, so a single file holding more than INT32_MAX points
- *   is rejected rather than written wrong. That is ~48 GB of coordinates; a
- *   visualisation that large wants a different tool, not a wider index.
- *
- * @param ensemble        The ensemble. Zero objects is legal and produces a
- *                        valid, empty dataset.
- * @param filename_prefix Base path/name; the suffixes are appended.
- * @param options         MFTL_NULL for MFTLVtkDefaults().
- * @return MFTL_SUCCESS if EVERY rank succeeded, MFTL_ERROR otherwise (the same
- *         value on every rank).
+ * @collective In both layouts (the return code is reduced).
  */
 int MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix, const MFTL_VtkOptions *options);
 

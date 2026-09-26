@@ -4,35 +4,25 @@
  * @date 2026-08-14
  * @ingroup mftl_object
  *
- * @brief The mesh container: pool lifecycle, derived arrays, spatial ordering,
- *        and the hot-loop iterators.
+ * @brief The mesh container: pool lifecycle, derived connectivity, Morton
+ *        ordering, and the hot-loop iterators.
  *
- * An MFTL_Object is one mesh. It owns two pools (mftl_types.h) and borrows the
- * MFTL_Domain of the ensemble it was added to.
+ * An #MFTL_Object is one mesh (one body). It owns two pools (mftl_types.h) and
+ * borrows the #MFTL_Domain of the ensemble it was added to.
  *
- * ## ONE ENTRY POINT FOR SIZE. THAT IS THE WHOLE POINT.
+ * **Size has one entry point.** Only src/object/object.c writes a pool's
+ * `capacity`, `block` or sub-array pointers. Counts change through
+ * MFTLObjectSetCounts(), which reserves before it assigns, so `n <= capacity`
+ * always holds; capacity grows through MFTLObjectReserve() /
+ * MFTLObjectReserveAdditional() and is given back only explicitly
+ * (MFTLObjectShrinkToFit(), MFTLObjectReleasePools()).
  *
- * Nothing outside src/object/object.c may write `verts.capacity`,
- * `tris.capacity`, any pool pointer, or `block`. Counts change through
- * MFTLObjectSetCounts(), which reserves before it assigns and therefore CANNOT
- * leave a count above a capacity. Capacity changes through MFTLObjectReserve()
- * or MFTLObjectReserveAdditional().
+ * **Derived connectivity** (`tris.verts`, `tris.neighbors`) is invalidated by
+ * any topology change and rebuilt by MFTLObjectBuildDerived(). Vertex motion
+ * invalidates nothing: geometric loops gather current positions and form
+ * seam-corrected edges in registers, so no position-derived cache exists.
  *
- * Three capacities per object (`capacity_*`, `geom_cap_*`, `flat_cap_*`) plus a
- * rule in a comment saying that every site which grows a pool must remember to
- * call two other functions is the arrangement this replaces. Here there is one
- * capacity per pool, because a pool is one allocation. A growth that forgets an
- * array is not a bug you can make.
- *
- * ## THE DERIVED CONNECTIVITY AND WHEN IT GOES STALE
- *
- *   tris.verts, tris.neighbors     rebuilt by MFTLObjectBuildDerived
- *                                  invalid after any TOPOLOGY change
- *
- * Vertex motion does not invalidate connectivity. Geometric loops gather the
- * three current positions through `tris.verts` and form seam-corrected edge
- * vectors in registers, so there is no position-derived cache to refresh or
- * accidentally leave stale.
+ * Theory: src/object/README.md.
  */
 
 #ifndef MFTL_OBJECT_H
@@ -49,26 +39,19 @@
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Allocates an empty object.
+ * @brief Allocates an empty object with zero-capacity pools and no domain.
  *
- * Both pools start with zero capacity; a mesh generator or an I/O reader fills
- * them. The object has no domain until it is handed to MFTLEnsembleAddObject().
- *
- * @param global_id PROVISIONAL body id. MFTLEnsembleAddObject() overwrites it
- *                  with the next dense id, because the ids have to be dense and
- *                  agreed on every rank and only the ensemble can guarantee
- *                  that. It is the object's real identity only for an object
- *                  that never joins an ensemble -- a spatial-halo shadow patch,
- *                  or a fixture in a serial test.
- * @return The new object, or MFTL_NULL if the struct allocation failed.
+ * @param global_id PROVISIONAL body id: MFTLEnsembleAddObject() overwrites it
+ *                  with the next dense id. It is the real identity only of an
+ *                  object that never joins an ensemble (a spatial-halo shadow
+ *                  patch, a serial test fixture).
+ * @return The new object, or #MFTL_NULL if the struct allocation failed.
  */
 MFTL_Object *MFTLObjectCreate(int global_id);
 
 /**
- * @brief Frees an object and NULLs the caller's pointer. Safe on NULL.
- *
- * Two free() calls do all the work -- one per pool block -- which is what a
- * single-allocation pool buys beyond the synchronisation guarantee.
+ * @brief Frees an object (two pool blocks and the struct) and NULLs the caller's
+ *        pointer. Safe on NULL.
  *
  * @param p_object Address of the object pointer. Set to #MFTL_NULL on return.
  */
@@ -79,33 +62,23 @@ void MFTLObjectDestroy(MFTL_Object **p_object);
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Grows both pools to hold at least the requested entity counts, exactly.
+ * @brief Grows both pools to hold at least the given counts, exactly.
  *
- * Exact growth, for bulk loads where the final size is known (generation, an I/O
- * read, the rebuild after a redistribution). A request at or below the current
- * capacity is a no-op: THIS function never shrinks, so a mesh of stable size
- * does not re-fault its pages every timestep, and callers may pre-grow and rely
- * on the next call early-returning. Giving capacity back is a separate, explicit
- * and gated operation -- MFTLObjectShrinkToFit().
+ * For bulk loads whose final size is known (generation, the rebuild after a
+ * redistribution). A request at or below the current capacity is a no-op --
+ * growth is a ratchet, so a mesh of stable size never re-faults its pages and a
+ * caller may pre-grow and rely on the next reserve returning early. Contents of
+ * every array, derived ones included, are preserved.
  *
- * Growth PRESERVES contents -- every array, including the derived ones. The
- * alternative is to discard the geometry on every resize on the grounds that the
- * caller is about to recompute it. It usually is; when it is not, the result is a
- * silent zero. The copy happens O(log n) times over a mesh's life and is a memcpy
- * at memory bandwidth, which is not where any measurable time goes.
- *
- * @param obj        Object to grow.
- * @param n_vertices Vertices the pool must hold.
- * @param n_triangles Triangles the pool must hold. The half-edge array is sized
- *                   at 3x this automatically -- it is in the same block.
+ * @param obj         Object to grow.
+ * @param n_vertices  Vertices the pool must hold.
+ * @param n_triangles Triangles the pool must hold (half-edges: 3x, same block).
  */
 void MFTLObjectReserve(MFTL_Object *obj, int n_vertices, int n_triangles);
 
 /**
- * @brief Grows both pools by at least the given amounts, geometrically.
- *
- * For incremental appends, where doubling keeps the total number of
- * reallocations O(log n).
+ * @brief Grows both pools by at least the given amounts, geometrically
+ *        (MFTLGrowCapacity()), for incremental appends.
  *
  * @param obj             The mesh.
  * @param extra_vertices  Vertices that must fit beyond the current count.
@@ -114,57 +87,41 @@ void MFTLObjectReserve(MFTL_Object *obj, int n_vertices, int n_triangles);
 void MFTLObjectReserveAdditional(MFTL_Object *obj, int extra_vertices, int extra_triangles);
 
 /**
- * @brief Sets the active and locally-owned counts of both pools.
+ * @brief Sets the active and owned counts of both pools.
  *
- * Reserves first, so the postcondition `n <= capacity` holds unconditionally --
- * this is the function that makes "counts and capacity disagree" unreachable.
- * Setting a count invalidates the derived arrays: they describe a different
- * number of entities than they did a moment ago.
+ * Reserves first, so `n <= capacity` holds unconditionally. Clears the derived
+ * bit and stamps the body partition-dirty (MFTLObjectMarkPartitionDirty()):
+ * this is the choke point every entity creation and destruction passes through.
  *
- * @param obj              The mesh.
- * @param n_vertices       Total vertices (owned + ghost).
- * @param n_local_vertices Owned vertices; they occupy [0, n_local_vertices).
- * @param n_triangles      Total triangles.
- * @param n_local_triangles Owned triangles.
+ * @param obj               The mesh.
+ * @param n_vertices        Total vertices (owned + ghost).
+ * @param n_local_vertices  Owned vertices; they occupy [0, n_local_vertices).
+ * @param n_triangles       Total triangles.
+ * @param n_local_triangles Owned triangles; they occupy [0, n_local_triangles).
  */
 void MFTLObjectSetCounts(MFTL_Object *obj, int n_vertices, int n_local_vertices, int n_triangles, int n_local_triangles);
 
 /**
- * @brief Empties the mesh, keeping the allocations.
+ * @brief Empties the mesh but keeps the allocations.
  *
- * Counts and the global-ID counters go to zero; capacity is untouched, so
- * refilling the object does not re-allocate. Giving the storage back is the
- * other half and is never implicit: MFTLObjectShrinkToFit() for a mesh that is
- * merely smaller, MFTLObjectReleasePools() for one that is gone.
+ * Counts, global-id counters and global counts go to zero and the body is
+ * stamped partition-dirty; capacity is untouched, so refilling does not
+ * reallocate.
  *
- * @param obj The mesh. Counts and the global-ID counters go to zero.
+ * @param obj The mesh.
  */
 void MFTLObjectClear(MFTL_Object *obj);
 
 /**
- * @brief Empties the mesh AND gives its two pool blocks back to the allocator.
+ * @brief Frees both pool blocks of an EMPTY object.
  *
- * The counterpart to MFTLObjectClear(), which deliberately keeps the allocations
- * so that a mesh of stable size does not re-fault its pages every timestep. This
- * one is for the opposite case: a body that is no longer here at all.
+ * The all-or-nothing counterpart of MFTLObjectShrinkToFit(), for a body that
+ * has left this rank entirely (src/communication/redistribute.c uses it after
+ * the opening scatter of a generated ensemble, where rank 0 held every body
+ * whole -- \f$3440 \cdot 4^r + 128\f$ bytes per icosphere of refinement r).
+ * Afterwards the object is exactly as MFTLObjectCreate() left it.
  *
- * Growth is a RATCHET (see vertex_pool_reserve in src/object/object.c, and it is
- * the right default), so an object keeps whatever capacity it ever reached until
- * something explicitly asks for it back. This is the all-or-nothing form of that
- * ask and it requires an empty mesh; MFTLObjectShrinkToFit() is the graduated
- * form, for a body that is merely smaller than it was.
- *
- * Both are needed. On the generation path bodies are built whole on rank 0 --
- * `3440 * 4^refine + 128` bytes each -- and the opening redistribution then
- * leaves rank 0 with a SLIVER of the ones it still overlaps and NOTHING of the
- * rest. This function is what src/communication/redistribute.c calls for the
- * second group; the shrink is what handles the first. See
- * docs/analysis.md §6.1 for what each is worth.
- *
- * @param obj The mesh. Must already hold no entities -- this frees storage, it
- *            does not decide what to discard. Afterwards the object is exactly as
- *            MFTLObjectCreate() left it, and the next MFTLObjectReserve()
- *            allocates from nothing.
+ * @param obj The mesh; must hold no entities (asserted).
  *
  * @warning Every pointer into either pool is dangling afterwards.
  *
@@ -173,43 +130,23 @@ void MFTLObjectClear(MFTL_Object *obj);
 void MFTLObjectReleasePools(MFTL_Object *obj);
 
 /**
- * @brief Gives back pool capacity a mesh has outgrown, if it is wasteful enough.
+ * @brief Gives back pool capacity a mesh has outgrown, if the waste is large.
  *
- * The only way a pool ever gets smaller. MFTLObjectReserve() and
- * MFTLObjectSetCounts() raise `capacity` and never lower it, deliberately -- a
- * mesh of stable size must not re-fault its pages every timestep -- so a rank
- * whose share of a body SHRANK keeps the block it held at its high-water mark
- * for the rest of the run. That is not hypothetical: MFTLGenerateSphere() builds
- * every body whole on rank 0, and after the opening MFTLRedistribute() rank 0
- * holds a sliver of each in a block sized for all of it.
+ * The only way a pool gets smaller. Each pool is resized independently when
  *
- * Both pools are considered independently. One is shrunk when
+ * \f[ \mathrm{capacity} > \mathrm{slack} \cdot n , \f]
  *
- *     capacity > slack * n
- *
- * and then to `MFTLGrowCapacity(0, n)`, the capacity an incrementally grown pool
- * would have reached -- which is `n` rounded up the doubling ladder, so the
- * result is in \f$[n, 2n)\f$ and the next append is still amortised. At `n == 0`
- * that target is 0 and the block is released outright, exactly as
- * MFTLObjectReleasePools() would.
- *
- * **No entity is ever discarded.** The target is at least `n` by construction;
- * this function moves STORAGE and does not decide what to drop. Lower the counts
- * first, through MFTLObjectSetCounts(), if that is what you meant.
- *
- * **Nothing observable changes.** `n`, `n_local`, every array's live prefix, the
- * #MFTL_DERIVED_TOPOLOGY bit and the partition-dirty stamp are exactly as they were --
- * this is a memory operation, not a mesh operation. In particular it must not be
- * spelled through MFTLObjectSetCounts(), which stamps the body dirty and would
- * silently defeat MFTLRedistributeSetSkipUnchangedBodies().
+ * to `MFTLGrowCapacity(0, n)` -- the smallest \f$128\cdot2^k \ge n\f$, i.e.
+ * back on the growth ladder -- and released entirely when `n == 0`. Counts,
+ * contents, the derived bit and the partition stamp are unchanged: this moves
+ * storage, it is not a mesh operation (and must not be spelled through
+ * MFTLObjectSetCounts(), which would stamp the body dirty and defeat the
+ * redistribution's skip of unchanged bodies).
  *
  * @param obj   The mesh.
- * @param slack Waste factor at which a pool is worth reallocating. Use
- *              #MFTL_SHRINK_SLACK_DEFAULT unless you have measured otherwise;
- *              values below 4 can thrash against the doubling growth ladder, and
- *              that constant's documentation derives why. Must be at least 1.
- * @return `true` if either pool actually reallocated, so a caller can count the
- *         event without asking a second question.
+ * @param slack Waste factor, at least 1; use #MFTL_SHRINK_SLACK_DEFAULT (4).
+ *              Smaller values thrash against the doubling growth ladder.
+ * @return `true` if either pool was reallocated.
  *
  * @warning Every pointer into either pool is dangling afterwards.
  *
@@ -218,39 +155,30 @@ void MFTLObjectReleasePools(MFTL_Object *obj);
 bool MFTLObjectShrinkToFit(MFTL_Object *obj, double slack);
 
 /**
- * @brief Bytes the two pool blocks currently occupy.
+ * @brief Bytes the two pool blocks currently occupy, padding included.
  *
- * What this object costs in memory: `capacity` entities' worth of every array of
- * both pools, including the cache-line padding between sub-arrays, which is the
- * only honest form of the question since a pool is one allocation. Sizes are
- * re-derived from the block layout, so adding an array to a pool cannot leave
- * this stale.
- *
- * It reports CAPACITY, not the live count, which is the point: the gap between
- * the two is exactly what MFTLObjectShrinkToFit() recovers. It is also not a
- * resident-set measurement -- whether free() hands pages back to the OS is
- * allocator-dependent, so a drop here is an upper bound on the drop in RSS.
+ * Derived from the block layout, so it cannot drift from it. It measures
+ * CAPACITY, not the live count (the gap is what MFTLObjectShrinkToFit()
+ * recovers), and is an upper bound on resident memory, since whether `free()`
+ * returns pages to the OS is up to the allocator.
  *
  * @param obj The mesh.
- * @return Total bytes in `verts.block` plus `tris.block`. Zero for an object
- *         whose pools have never been reserved or have been released.
+ * @return Bytes in `verts.block` plus `tris.block`; 0 for unallocated pools.
  *
  * @rank_local
  */
 size_t MFTLObjectPoolBytes(const MFTL_Object *obj);
 
 /**
- * @brief Debug-only structural check of the pools themselves.
+ * @brief Structural check of the pools themselves (not of the mesh).
  *
- * Verifies what the single-block layout is supposed to make true: counts within
- * capacity, owned counts within active counts, every pointer non-NULL exactly
- * when the capacity is non-zero, and each pointer inside its own block. Used by
- * the tests and by assertions; not a mesh validity check (that is
- * MFTLCheckMeshIntegrity).
+ * Counts within capacity, owned counts within active counts, and every
+ * sub-array pointer exactly where the layout for this capacity puts it inside
+ * `block` (NULL for an empty pool). For tests and assertions; mesh validity is
+ * MFTLCheckMeshIntegrity().
  *
  * @param obj The mesh.
- * @return `true` if every count, capacity and pointer agrees. Intended for
- *         assertions and tests, not for a hot path.
+ * @return `true` if every count, capacity and pointer agrees.
  */
 bool MFTLObjectPoolsAreConsistent(const MFTL_Object *obj);
 
@@ -272,50 +200,38 @@ static inline bool MFTLObjectHasTopology(const MFTL_Object *obj) { return (obj->
 static inline void MFTLObjectInvalidateDerived(MFTL_Object *obj) { obj->derived = 0u; }
 
 /**
- * @brief Declares that the CURRENT partition no longer describes this mesh.
+ * @brief Declares that the current partition no longer describes this mesh.
  *
- * MFTLRedistribute() may leave a body entirely alone when no entity of it changed
- * owner: a rank's local state after a redistribution is a pure function of
- * (global topology, owner map), so if neither input moved neither does the
- * output. This flag is the other half of that precondition -- it reports that
- * something which is NOT the owner map changed, so the body must be rebuilt even
- * though nothing moved.
+ * MFTLRedistribute() leaves a body untouched when no entity changed owner,
+ * because a rank's post-redistribution state is a function of (global
+ * topology, owner map) only. This stamp reports that something other than the
+ * owner map changed, so the body must be rebuilt anyway. Three kinds of change
+ * need it, and the library stamps all three:
  *
- * Three kinds of change need it, and the library already stamps all three:
+ * 1. entity counts -- MFTLObjectSetCounts() stamps;
+ * 2. global ids -- the remeshers' renumbering stamps (ghost triangle ids are
+ *    repaired only by being dropped and re-received in a rebuild);
+ * 3. entity flags -- MFTLRemeshMarkFrozen() stamps (a kept ghost vertex keeps
+ *    its local record through a redistribution).
  *
- *   1. ENTITY COUNTS. MFTLObjectSetCounts() is the enforced choke point for any
- *      creation or destruction, and it stamps.
- *   2. GLOBAL IDS. MFTLRemeshRenumberGlobalIds() and the spanning remesher's
- *      closing redensification rewrite ids of entities other ranks hold copies
- *      of. Ghost TRIANGLE ids in particular are repaired only by being dropped
- *      and re-received, so a skip would remove the repair and leave stale ids
- *      colliding with fresh ones -- silently, and several timesteps from the
- *      cause.
- *   3. ENTITY FLAGS. Redistribution replaces a ghost triangle's flags from its
- *      owner's copy but RETAINS a kept ghost vertex's local record, so a pass
- *      that writes flags without changing counts must stamp too.
- *      MFTLRemeshMarkFrozen() does.
+ * Any other in-place edit that bypasses MFTLObjectSetCounts() owes this call.
+ * A spurious stamp costs one rebuild; a missing one silently corrupts ids.
  *
- * Anything else that edits a mesh in place without going through
- * MFTLObjectSetCounts() owes this call. It is CONSERVATIVE by design: a spurious
- * stamp costs one body's rebuild, a missing one is silent corruption.
+ * @param obj The mesh; only `partition_dirty` is written.
  *
- * @param obj The mesh. Only `partition_dirty` is written; the derived bit is
- *            a separate question and is not touched.
- *
- * @rank_local It is a local statement about a local pool. Redistribution reduces
- *             the per-body votes of every rank before acting on any of them.
+ * @rank_local Redistribution reduces the per-body votes before acting.
  */
 static inline void MFTLObjectMarkPartitionDirty(MFTL_Object *obj) { obj->partition_dirty = MFTL_TRUE; }
 
 /**
- * @brief Rebuilds every derived per-triangle array from the half-edge structure.
+ * @brief Rebuilds `tris.verts` and `tris.neighbors` from the half-edge records
+ *        in one streaming pass and sets #MFTL_DERIVED_TOPOLOGY.
  *
- * One streaming pass emits `tris.verts` and `tris.neighbors`. Call it after any
- * topology change -- generation, remeshing, redistribution.
+ * `verts[3t+k]` is the ORIGIN of half-edge 3t+k and `neighbors[3t+k]` the
+ * triangle across it (#MFTL_ERROR without a twin). Call after any topology
+ * change that did not rebuild them itself.
  *
- * @param obj The mesh. `tris.verts` and `tris.neighbors` are rewritten and
- *            #MFTL_DERIVED_TOPOLOGY is set.
+ * @param obj The mesh.
  *
  * @rank_local
  */
@@ -325,19 +241,17 @@ void MFTLObjectBuildDerived(MFTL_Object *obj);
 // 4. SPATIAL (MORTON) ORDERING
 // -----------------------------------------------------------------------------
 
-/** Bits per axis in the Morton key: 3 * 21 = 63, the most a uint64 key holds. */
+/** @brief Bits per axis of a Morton key: \f$3 \times 21 = 63\f$ fit a `uint64_t`. */
 #define MFTL_MORTON_BITS 21
-/** Largest quantised coordinate, 2^21 - 1. */
+/** @brief Largest quantised Morton coordinate, \f$2^{21}-1\f$. */
 #define MFTL_MORTON_MAX 2097151.0
 
 /**
- * @brief Spreads the low 21 bits of @p x so that bit i ends up at position 3i.
+ * @brief Spreads the low 21 bits of @p x so that bit i moves to bit 3i.
  *
- * The classic magic-number bit interleave: five shift/mask steps double the gap
- * between bits each round, which is \f$O(\log b)\f$ instead of the 21 iterations
- * a bit-by-bit loop would take.
+ * Five shift-and-mask steps (magic-number bit interleave), \f$O(\log b)\f$.
  *
- * @param x Value whose low 21 bits are spread. Higher bits are masked off.
+ * @param x Value whose low 21 bits are spread; higher bits are masked off.
  * @return \f$\sum_i x_i 2^{3i}\f$.
  */
 static inline uint64_t MFTLMortonSpread3(uint64_t x)
@@ -352,23 +266,21 @@ static inline uint64_t MFTLMortonSpread3(uint64_t x)
 }
 
 /**
- * @brief 63-bit Morton (Z-order) key from three 21-bit integer coordinates.
+ * @brief 63-bit Morton (Z-order) key of three 21-bit coordinates.
  *
  * \f[
  *   Z(x,y,z) = \sum_{i=0}^{20} \Big( x_i 2^{3i} + y_i 2^{3i+1} + z_i 2^{3i+2} \Big)
  * \f]
  *
- * Sorting the keys ascending walks the Z-curve, and two points close in space
- * have keys agreeing in their high bits -- which is the locality property the
- * renumbering and the LBVH build both rely on.
+ * Ascending \f$Z\f$ traverses the Z-order curve; points in a common octree
+ * cell share a key prefix, which the renumbering and the LBVH rely on.
  *
  * @param x Quantised x coordinate, 21 bits.
  * @param y Quantised y coordinate, 21 bits.
  * @param z Quantised z coordinate, 21 bits.
- * @return The 63-bit interleaved key.
+ * @return The interleaved key.
  *
- * @warning Inputs above \f$2^{21}-1\f$ are MASKED, not clamped. Quantise
- *          against #MFTL_MORTON_MAX before calling.
+ * @warning Inputs above #MFTL_MORTON_MAX are MASKED, not clamped.
  */
 static inline uint64_t MFTLMorton3D(uint64_t x, uint64_t y, uint64_t z)
 {
@@ -376,96 +288,68 @@ static inline uint64_t MFTLMorton3D(uint64_t x, uint64_t y, uint64_t z)
 }
 
 /**
- * @brief Renumbers the mesh along a Morton curve so that neighbours in space are
- *        neighbours in memory.
+ * @brief Renumbers both pools along a Morton curve, so that neighbours in
+ *        space are neighbours in memory.
  *
- * This is what replaces an `sfc_perm` / `sfc_inv` pair. Rather than storing a
- * permutation and a second, SFC-ordered copy of every position -- two index
- * spaces, which is the arrangement silent corruption lives in -- the permutation
- * is APPLIED to the pools. Both the AoS records and every SoA array move
- * together, and all indices are remapped, so afterwards there is still exactly
- * one index space and exactly one copy of every coordinate.
+ * The permutation is APPLIED to the pools rather than stored, so there remains
+ * one index space and one copy of every coordinate:
  *
- * What it does, in order:
- *   1. Morton key per vertex from `verts.pos`, quantised against the object's
- *      own bounding box so the resolution is spent where the mesh is.
- *   2. A stable sort WITHIN [0, n_local) and, separately, within [n_local, n),
- *      so the ownership prefix survives.
- *   3. Permutes every vertex array; remaps `he.vertex_idx`.
- *   4. Orders triangles by their smallest (already Morton-ordered) vertex index,
- *      which is a spatial key by construction and needs no second geometric
- *      pass; permutes the triangle arrays and their half-edge triples together.
- *   5. Remaps `he.twin_idx` and `rec.out_he_idx`, then rebuilds the derived
- *      arrays.
+ * 1. a Morton key per vertex from `verts.pos`, quantised to 21 bits per axis
+ *    against the object's own bounding box with one common scale (cubic cells);
+ * 2. a stable sort of `[0, n_local)` and, separately, of `[n_local, n)`, so the
+ *    ownership prefix survives; all vertex arrays are permuted and
+ *    `he.vertex_idx` remapped;
+ * 3. triangles are ordered by their smallest (already Morton-ordered) vertex
+ *    index, again owned and ghost separately; records, half-edge triples and
+ *    geometry arrays move together, `twin_idx` and `out_he_idx` are remapped;
+ * 4. the derived arrays are rebuilt.
  *
- * Global IDs are NOT touched: they are the stable name of an entity across
- * ranks and across reorderings. Pool INDICES are, by definition, not stable
- * across this call -- anything holding one must refresh it.
+ * Global ids are untouched; pool indices are not stable across the call. A body
+ * straddling a periodic seam gets a domain-wide box and coarser cells -- a
+ * locality cost only. No time benefit has been measured on the development
+ * machine (docs/analysis.md); its value is the single index space and LBVH
+ * locality.
  *
- * Cost is one radix sort plus a handful of linear permutation passes. Call it
- * after generation and after a redistribution; calling it every timestep is
- * waste, since incremental vertex motion does not degrade Morton locality
- * quickly.
+ * @param obj The mesh; both pools are permuted in place.
  *
- * @param obj The mesh. Both pools are permuted in place.
- *
- * @rank_local Each rank orders its own partition.
+ * @rank_local Each rank orders its own partition; no MPI.
  */
 void MFTLObjectReorderMorton(MFTL_Object *obj);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 5. HOT-LOOP ITERATORS
  *
- * Macros, not functions, and deliberately so. C has no lambdas, so a function
- * taking the loop body would have to take a function POINTER -- which the
- * compiler cannot inline across a translation unit, cannot vectorise through,
- * and cannot hoist the loop-invariant setup out of. A macro pastes the body into
- * the loop textually, so the optimiser sees one flat loop over contiguous arrays
- * and nothing else.
- *
- * What every iterator guarantees, and what an open-coded loop often gets wrong:
- *
- *   - the arrays are hoisted into `restrict`-qualified locals, so the compiler
- *     may assume they do not alias each other or the output;
- *   - the loop bound is a local, not a struct member reloaded every iteration;
- *   - connectivity reads are sequential and there is no pointer chasing;
- *   - periodicity is unswitched once per call, never tested per triangle;
- *   - seam-corrected edges live only in registers.
- *
- * The body is variadic, so it may contain commas. `break` and `continue` behave
- * as in any for loop.
- *
- * ── An honest note on "SIMD" ──────────────────────────────────────────────
- *
- * These loops are shaped to expose the work to the compiler: restrict pointers,
- * an invariant bound and no branch per triangle. Position reads are indexed
- * gathers, so SIMD profitability remains architecture- and body-dependent.
- * They deliberately do NOT force it with a pragma: the caller's body may
- * legitimately carry a dependency the macro cannot see.
- *
- * The reliable properties are compact connectivity traffic and current
- * positions. There is no mesh-wide position-derived array to build, write,
- * invalidate or keep resident.
+ * Macros, because C has no closures: the body is pasted into one flat loop over
+ * contiguous arrays that the optimiser sees whole. Every iterator hoists the
+ * arrays into `restrict` locals and the bound into a local, reads connectivity
+ * sequentially and keeps seam-corrected edges in registers. The body is
+ * variadic (it may contain commas); `break` and `continue` work as in a `for`.
+ * Position reads are indexed gathers, so vectorisation is left to the compiler
+ * and never forced.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Iterates current triangle geometry from compact connectivity.
+ * @brief Iterates triangle geometry from compact connectivity.
  *
- * Streams `tris.verts`, gathers the three authoritative vertex positions and
- * forms two minimum-image edge vectors in registers. Periodicity is tested once
- * outside the triangle loop. In a non-periodic domain the hot loop contains only
- * the gathers and subtractions; in a periodic domain its correction is
- * branchless, with zero reciprocal on non-periodic axes.
+ * Streams `tris.verts`, gathers the three current positions and forms two
+ * minimum-image edge vectors in registers. Periodicity is decided once, outside
+ * the loop: the non-periodic branch is gathers and subtractions only, the
+ * periodic one applies \f$d - L\,\mathrm{nearbyint}(d/L)\f$ branch-free, with
+ * a zero reciprocal on non-periodic axes.
  *
  * In scope for the body:
- *   int    t                 triangle pool index
- *   int    v0, v1, v2        vertex pool indices
- *   double p0x, p0y, p0z     wrapped position of corner 0
- *   double e1x, e1y, e1z     v1 - v0, seam-consistent
- *   double e2x, e2y, e2z     v2 - v0, seam-consistent
  *
- * @param count Triangles to visit from index 0. Pass `obj->tris.n_local` for
- *        owned only (they are an array prefix) or `obj->tris.n` to include ghosts.
+ *     int    t              triangle pool index
+ *     int    v0, v1, v2     vertex pool indices (corner k = origin of half-edge 3t+k)
+ *     double p0x, p0y, p0z  stored position of corner 0
+ *     double e1x, e1y, e1z  p1 - p0, minimum image
+ *     double e2x, e2y, e2z  p2 - p0, minimum image
+ *
+ * Requires #MFTL_DERIVED_TOPOLOGY (asserted in Debug).
+ *
+ * @param obj   The mesh.
+ * @param count Triangles to visit from index 0: `obj->tris.n_local` for owned
+ *              only, `obj->tris.n` to include ghosts.
  */
 #define MFTL_FOREACH_TRIANGLE_GEOMETRY(obj, count, ...)                                                \
   do                                                                                                   \
@@ -521,16 +405,13 @@ void MFTLObjectReorderMorton(MFTL_Object *obj);
   } while (0)
 
 /**
- * @brief Iterates vertex positions, read-only and streaming.
+ * @brief Iterates vertex positions, read-only, as one contiguous stream.
  *
- * For anything that reduces over positions -- bounding boxes, centres of mass,
- * extents. This is now a plain contiguous walk of `verts.pos`; in the previous
- * version the equivalent loop either strode ~100 bytes through the vertex
- * records or read a second, duplicated position array.
+ * For reductions over positions (bounding boxes, centres of mass). In scope:
+ * `int v` (pool index) and `double px, py, pz` (the stored position).
  *
- * In scope:
- *   int    v                 vertex pool index
- *   double px, py, pz        position, wrapped into the domain
+ * @param obj   The mesh.
+ * @param count Vertices to visit from index 0 (`verts.n_local` or `verts.n`).
  */
 #define MFTL_FOREACH_VERTEX_POS(obj, count, ...)                                                    \
   do                                                                                                \
@@ -545,17 +426,13 @@ void MFTLObjectReorderMorton(MFTL_Object *obj);
   } while (0)
 
 /**
- * @brief Iterates the vertices this rank OWNS, writable.
+ * @brief Iterates the vertices this rank OWNS, writable -- the advection loop.
  *
- * The motion iterator: advection, smoothing, anything that moves a vertex. It
- * exploits the ownership PREFIX, so there is no `owner_proc == rank` test in the
- * loop -- a hand-written advection loop almost always carries that branch, and
- * it is pure waste on a correctly partitioned mesh.
+ * The ownership prefix is the loop bound, so there is no per-vertex
+ * `owner_proc == rank` test. In scope: `int v`, `double *pos` (three writable
+ * doubles) and `MFTL_Vertex *rec`.
  *
- * In scope:
- *   int      v               vertex pool index
- *   double  *pos             three writable doubles
- *   MFTL_Vertex *rec         the record, for flags and ids
+ * @param obj The mesh.
  */
 #define MFTL_FOREACH_OWNED_VERTEX(obj, ...)                                            \
   do                                                                                   \

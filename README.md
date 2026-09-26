@@ -34,8 +34,8 @@ Three invariants fall out, and every module is allowed to assume them:
 - **Positions live in the SoA and only there.** The space-filling-curve ordering is applied to the *pool*
   (`MFTLObjectReorderMorton`), not stored as a permutation, so there is exactly one index space.
 
-There are **no hash maps**. Global IDs are dense per entity class, and "the other side of this edge" is already an
-index.
+Lookups are arrays: global IDs are dense per entity class, and "the other side of this edge" is already an index.
+The one hash table is the global-id → slot table redistribution uses for arriving entities.
 
 ## Quick start
 
@@ -119,42 +119,45 @@ results as prominently as the positive ones.
 
 ## Documentation
 
-**The documentation build lives in a separate repository, `MFTL_Documentation`**, normally checked out beside
-this one. This tree carries the sources it reads — the Doxygen comments in `include/` and `src/**`, the eleven
-`src/<module>/README.md` theory chapters and the four measurement documents in `docs/` — and none of the
-machinery that renders them.
+- **Read without building anything:** the pre-built manual in the `MFTL_Documentation` repository —
+  `prebuilt/MFTL_Manual.pdf` (the whole manual in one PDF) and `prebuilt/html/index.html` (the web manual for
+  offline use, opened straight from disk).
+- **In this tree:** the Doxygen comments in `include/` and `src/**`, the eleven `src/<module>/README.md` theory
+  chapters (they render on GitHub next to the code) and one measurement document, `docs/analysis.md`.
+
+The documentation build lives in `MFTL_Documentation`, normally checked out beside this one:
 
 ```bash
 cd ../MFTL_Documentation
-python3 build_mkdocs.py                 # -> build/site/index.html   (the web manual)
-python3 build_mkdocs.py --serve --open  # live-reload dev server on :8000
-python3 build_docs.py --open            # -> build/docs/html         (Doxygen alone)
+python3 build_mkdocs.py --serve --open  # the web manual, live-reload on :8000
+python3 build_mkdocs.py                 # -> build/site/index.html (with the Doxygen manual at /doxygen/)
+python3 build_docs.py --open            # the Doxygen manual alone: call graphs, source browser
+python3 export_manual.py                # refresh prebuilt/ (offline HTML + PDF)
 ```
 
 It finds this checkout on its own when the two sit side by side; otherwise pass `--source-dir`, set
-`MFTL_SOURCE_DIR`, or write the path into its `mftl-source.txt`.
-
-`build_mkdocs.py` builds a MkDocs Material site — guides, the eleven module theory chapters, the four
-measurement documents and a browsable API reference — and mounts the complete Doxygen manual inside it at
-`/doxygen/`, so the call graphs, the include graphs and the annotated source browser come with it. No prose is
-duplicated to make this work: its `mkdocs/gen_pages.py` reads the same files Doxygen reads and rewrites the
-dialect at build time, resolving `@ref`, `#MFTL_Symbol` and `MFTLFunction()` against Doxygen's own
-`index.xml`. Both manuals build with **zero warnings**, and that is the acceptance criterion for each — so a
-new function here without `@param`/`@return` fails `build_docs.py --strict` there.
+`MFTL_SOURCE_DIR`, or write the path into its `mftl-source.txt`. Requirements: Python ≥ 3.9 and Doxygen (Graphviz
+optional); the MkDocs toolchain installs itself into a private virtual environment on first use. Both manuals build
+with **zero warnings**, and that is the acceptance criterion — a new function here without `@param`/`@return`
+fails `build_docs.py --strict` there.
 
 ## Status
 
-Present: ensemble/domain, object pools, half-edge topology, derived arrays and hot-loop iterators, Morton
-renumbering, periodic geometry, sphere generation, the fused per-timestep geometry+quality pass, area-weighted
-vertex normals, radix sort, redistribution and ghost synchronisation, VTK output, isotropic remeshing —
-serial and **distributed, by two strategies** (`src/remeshing/`) — the LBVH with exact object–object contact
-detection (`src/bvh/`), and the spatial halo that makes contact detection work across ranks.
+Present: ensemble/domain with sparse per-rank body lists, object pools, half-edge topology, derived arrays and
+hot-loop iterators, Morton renumbering, periodic geometry (area- or angle-weighted vertex normals, closest point on
+a triangle, signed-distance rasterisation), sphere generation and marching cubes, per-body reductions and prefix
+sums over each body's holders, the fused per-timestep geometry + per-body quality pass, radix sort, redistribution
+and ghost synchronisation, VTK output, isotropic remeshing — serial and **distributed, by two strategies**
+(`src/remeshing/`) — the LBVH with exact object–object and self-proximity contact detection (`src/bvh/`), the
+spatial halo that makes contact detection work across ranks, and **topology changes** (breakup and coalescence,
+`src/topology_change/`).
 
 Geometry is split by SCOPE, not by entity: `MFTLCompute*` works on one object and never touches MPI,
 `MFTLEnsembleUpdate*` iterates the object list and owns the collective its result needs — a reduction for the
 triangle quality statistics, an exchange for the vertex normals.
 
-Absent: open-surface generators, GTS I/O, topological ghost-layer growth, and a mesh reader of any format.
+Absent: open-surface generators (other than a level set through `MFTLBuildMeshFromLevelSet`), GTS I/O, topological
+ghost-layer growth, continuous-time (swept) contact or topology detection, and a mesh reader of any format.
 
 ## Output
 
@@ -172,6 +175,6 @@ Raw binary is 23–32× faster to write than ASCII and about half the size. The 
 laptop — it exists because P+1 files per dump is what stops working first on a parallel filesystem. See
 `docs/analysis.md` §3, and re-measure on the target machine before choosing.
 
-See `CLAUDE.md` for the architecture in detail and `docs/analysis.md` for what has actually been
-measured — including six results that did not come out the way the design predicted, and the seven measurement
-mistakes made while getting them.
+See `docs/analysis.md` for what has actually been measured — the decisions each result supports, the designs that
+were rejected, the silent failures found and how each is guarded, the open issues, and the measurement traps that
+produced plausible wrong answers first.

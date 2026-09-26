@@ -57,32 +57,15 @@ static void migrator_reserve(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens)
 {
   const int n = ens->n_local_objects;
 
-  /* ── The map array is indexed by LOCAL SLOT, and that is the whole of it ──
+  /* ── The map array is indexed by LOCAL SLOT ─────────────────────────────
    *
-   * It used to be indexed by BODY GID and sized `MAX(n_bodies_global, n)`, on
-   * the rule the wire follows: a list position is only an identity while every
-   * rank holds every body. THE MAP IS NOT ON A WIRE. It is an argument handed
-   * straight back to MFTLRedistributeWithOwners(), which walks the SAME list in
-   * the SAME order this function just walked, on this rank only -- so slot `o`
-   * names the same body at both ends by construction and no identity has to
-   * survive anything.
+   * It is not on a wire: MFTLRedistributeWithOwners() walks the same list in the
+   * same order on this rank, so slot `o` names the same body at both ends. Keyed
+   * by body gid it would be O(bodies in the ensemble) per rank per migration.
    *
-   * Keyed by gid it was the remesher's last `O(bodies in the ensemble)` term,
-   * and it was on the per-PHASE path: two pointers plus a NULL-fill for every
-   * body in the job, once per migration, on a rank that may hold none of them.
-   * 16 MB per rank at a million bodies, cleared four to eight times per remesh.
-   * This is the same correction MFTLEnsembleReduceBodies() makes to its caller's
-   * buffer, and for the same reason -- move the id indexing inside the one place
-   * that genuinely crosses a rank boundary, or the message shrinks and the
-   * per-rank memory does not.
-   *
-   * At least one slot even for a rank holding nothing, so that `m->maps` is
-   * never NULL: NULL is a legal argument to MFTLRedistributeWithOwners() and it
-   * means "use the geometric rule", which is emphatically not what a migration
-   * under moved cut planes is asking for. Nothing dereferences it -- the loops
-   * there are bounded by the same local count -- but a pointer whose value
-   * changes the documented meaning of the call must not depend on how many
-   * bodies happen to have landed here. */
+   * At least one slot even for a rank holding nothing, so `m->maps` is never
+   * NULL: NULL means "use the geometric rule", which a migration under moved
+   * planes must not get. */
   const int n_slots = MFTL_MAX(n, 1);
 
   int need = 0;
@@ -341,12 +324,8 @@ bool MFTLRemeshParamsAgree(const MFTL_Domain *domain, const MFTL_RemeshParameter
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief How many times MFTLRemeshMeasureBodies has run in this process.
- *
- * Not a statistic anybody tunes on -- it exists so that a test can assert the
- * number of measurements a pass takes, which is the only way the "measure once"
- * arrangement stays true. It was two before, and the second call recomputed an
- * identical answer at 7*num_objects doubles a time.
+ * @brief How many times MFTLRemeshMeasureBodies() has run in this process: a
+ *        test hook asserting that a pass measures once.
  */
 static int g_measurement_count = 0;
 
@@ -527,12 +506,9 @@ void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radiu
 
     /* ── The largest body in the ENSEMBLE, as ONE scalar ────────────────────
      *
-     * The strategy ratio and the admission test are both taken against it, and
-     * both must give the same answer on every rank or the ranks split between
-     * two drivers -- which is an immediate deadlock with no diagnostic. A
-     * replicated `[n_bodies_global]` radius array used to be how every rank
-     * could compute the maximum; one double through an `MPI_MAX` is the same
-     * number for a constant message. */
+     * The strategy ratio and the admission test are taken against it and must
+     * agree on every rank, or the ranks split between two drivers (deadlock).
+     * One double through MPI_MAX. */
     if (r_max != MFTL_NULL)
     {
       double mine = 0.0;

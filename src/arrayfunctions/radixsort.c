@@ -6,8 +6,8 @@
  *
  * @brief LSD radix sort over 8-bit digits, for keys and for key/value pairs.
  *
- * Derived from the public-domain-style radix sort by Cameron Hart (see the
- * licence notice below), specialised for MFTL: unified 32/64-bit key width,
+ * Derived from Cameron Hart's zlib-licensed radix sort (licence notice below),
+ * specialised for MFTL: unified 32/64-bit key width,
  * SoA key/value variants, signed 32-bit ordering, constant-digit pass skipping
  * and a small-array cutoff.
  */
@@ -48,20 +48,9 @@
 _Static_assert(sizeof(int) == sizeof(uint32_t), "MFTL radix sort assumes a 32-bit int");
 _Static_assert((-1 & 3) == 3, "MFTL radix sort assumes two's complement int");
 
-/* ─── Internal config ────────────────────────────────────────────────────────
- *
- *  RADIX_BITS    8       — process one byte per pass
- *  HIST_SIZE   256       — 2^8 buckets
- *  PASSES_32     4       — 32 / 8 = 4 passes
- *  PASSES_64     8       — 64 / 8 = 8 passes
- *
- *  Stack cost of the histogram arrays:
- *    32-bit:  4 * 256 * 4 bytes =  4 KB
- *    64-bit:  8 * 256 * 4 bytes =  8 KB
- *  Both fit comfortably in L1D, which is what makes the "count every digit in
- *  one pass over the data" strategy below worthwhile: the keys are streamed
- *  exactly once and every histogram update hits L1.
- * ─────────────────────────────────────────────────────────────────────────── */
+/* One byte per pass: 4 passes for 32-bit keys, 8 for 64-bit. All histograms
+ * together are 4 KB / 8 KB of stack, small enough for L1, which is what makes
+ * counting every digit in ONE pass over the keys worthwhile. */
 /** @brief Bits consumed per pass. One byte, so a histogram is 256 counters. */
 #define RADIX_BITS 8
 /** @brief Buckets per pass, \f$2^{\texttt{RADIX\_BITS}} = 256\f$. */
@@ -82,29 +71,14 @@ _Static_assert((-1 & 3) == 3, "MFTL radix sort assumes two's complement int");
  */
 #define SIGN_FLIP_32 0x80000000u
 
-/* Below this length a radix sort loses to insertion sort: the histogram memset,
- * the 256-entry-per-pass prefix sum and (in the wrapper functions) a malloc/free
- * pair are all independent of n, and together they outweigh the O(n^2/4) moves
- * of an array that never leaves L1. The redistribution code sorts one small
- * buffer per neighbour rank, so this is not a corner case -- it is the common
- * case there.
- *
- * 32 is where insertion sort still wins on BOTH input patterns, measured
- * (ns/call, Apple M-series, -O3, MFTLSortIds / MFTLSortPairs64):
- *
- *                        random keys            descending keys (worst case)
- *   n     radix    insertion            radix    insertion
- *   16     577          78               277          75
- *   32     749         496               323         287
- *   48     859         866               369         639   <- insertion loses
- *   64     973        1310               415        1299
- *
- * A larger cutoff looks better on random data (64-bit keys, 8 passes, still win
- * 1.6x at n = 64) but turns into a 1.4-3x loss on descending input, where
- * insertion sort hits its O(n^2) worst case and the radix path gets faster
- * because a narrow key range skips passes. One conservative cutoff for both key
- * widths keeps that trap closed. */
-/** @brief Below this element count, a stable insertion sort replaces the radix passes. */
+/* Below this length the n-independent costs of a radix sort (histogram clear,
+ * 256-entry prefix sums per pass, the wrappers' malloc/free) exceed the
+ * O(n^2/4) moves of an insertion sort that stays in L1. 32 is the largest size
+ * at which insertion sort wins on both random AND descending (its worst case)
+ * input; the measurement is tabulated in src/arrayfunctions/README.md. The
+ * redistribution sorts one small buffer per neighbour rank, so this is the
+ * common case there. */
+/** @brief At or below this element count a stable insertion sort replaces the radix passes. */
 #define INSERTION_CUTOFF 32
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -203,18 +177,9 @@ static void insertion_sort_pairs64(uint64_t *restrict k, int *restrict v, size_t
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Histogram counting
- *
- * All digit histograms are built in a single pass over the keys: each key is
- * loaded once and updates PASSES_* counters that all live in the same few KB of
- * L1. Doing one pass per digit instead would multiply the memory traffic by the
- * number of passes for no gain.
- *
- * The same pass also answers "is this already sorted?" for one extra compare
- * per key (branchless, so it costs nothing measurable next to the counter
- * updates). Redistribution feeds these sorts arrays of entity IDs collected in
- * array order, which are frequently ascending already -- detecting that here
- * removes every scatter pass instead of executing four of them.
+ * Histogram counting: every digit's histogram in ONE pass over the keys, plus a
+ * branchless "already sorted?" test. Id lists collected in pool order are often
+ * already ascending, and then no scatter pass runs at all.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -279,33 +244,20 @@ static bool init_histograms64(uint32_t *restrict hist, const uint64_t *restrict 
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Prefix sum: counts -> exclusive output offsets, plus the pass plan
- *
- * Two things happen here that the plain textbook version does not do, both for
- * free (this loop touches 256 * PASSES counters, never the data):
- *
- * 1. Constant-digit passes are dropped. If every key shares the same value in
- *    byte b, that pass is a pure copy of the array onto itself. Its histogram
- *    then has a single bucket holding all n keys, and the byte of the first key
- *    says which bucket to test -- an O(1) check that saves a full read+scatter
- *    over the data. Entity IDs never fill 32 bits, so this typically removes
- *    one or two of the four passes; on Morton codes it usually removes none.
- *
- * 2. Signed ordering. For the most significant pass of a signed key, the
- *    offsets are accumulated in the rotated bucket order 0x80..0xFF, 0x00..0x7F,
- *    so negative keys are placed before non-negative ones. Only the order in
- *    which 256 offsets are summed changes -- the scatter loop, and therefore the
- *    whole data path, is untouched.
- *
- * @return Bitmask of the passes that actually have to run.
+ * Prefix sums and the pass plan
  * ═══════════════════════════════════════════════════════════════════════════ */
 /**
  * @brief Turns each pass's counts into starting OFFSETS, in place.
  *
- * Also decides which passes can be skipped: a digit position whose histogram
- * has a single non-zero bucket takes the same value in all @p n keys, so its
- * pass is the identity. Mesh global ids are dense in \f$[0, n)\f$, so the top
- * bytes of a 32-bit id are usually constant and half the passes vanish.
+ * Two refinements, both touching only the \f$256 \times\f$ passes counters:
+ *
+ * - **Constant digits are skipped.** If the bucket of @p first_key's digit holds
+ *   all @p n keys, the digit is constant and its pass is the identity. Dense
+ *   global ids leave the top bytes constant, so typically half the passes of a
+ *   32-bit id sort vanish.
+ * - **Signed order.** For the most significant pass of a signed key the offsets
+ *   are accumulated in the rotated bucket order 0x80..0xFF, 0x00..0x7F, which
+ *   places negative keys first without modifying any key.
  *
  * @param hist       `passes * HIST_SIZE` counters, converted from counts to
  *                   exclusive prefix sums.
@@ -345,17 +297,9 @@ static uint32_t prefix_sum_histograms(uint32_t *restrict hist, uint32_t passes, 
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Scatter passes
- *
- * The one hot loop of the whole file. Reads are sequential (hardware prefetch
- * friendly), writes go to up to 256 independent output positions -- that
- * scattered write stream is the cost of a radix sort and the reason the pass
- * skipping above pays off directly.
- *
- * Not vectorisable in portable C: every store depends on a counter that the
- * previous iteration may have incremented (a read-after-write on hist[pos] that
- * only AVX-512 conflict detection could break), and the stores themselves are a
- * scatter. The loops are left in the plain form the compiler handles best.
+ * Scatter passes: sequential reads, writes to up to 256 streams. Not
+ * vectorisable in portable C (each store depends on a counter the previous
+ * iteration may have incremented), so they stay in their plain form.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -443,11 +387,6 @@ static inline void radixpass_soa64(uint32_t *restrict hist, uint32_t shift, cons
   }
 }
 
-/* Allocation is via MFTLMallocOrDie (mftl_memory.h): returning quietly on a
- * failed malloc leaves the caller with an array it believes is sorted, after
- * which MFTLUniqueIntArray drops the wrong elements. In HPC code OOM is not
- * considered recoverable. */
-
 /* ═══════════════════════════════════════════════════════════════════════════
  * Public: key-only sorts
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -473,10 +412,8 @@ void MFTLRadixSort32(int *keys_in, int *keys_temp, int size)
   if (init_histograms32(hist, ui, n)) return; /* already sorted */
   const uint32_t active = prefix_sum_histograms(hist, PASSES_32, n, (uint64_t) ui[0], true);
 
-  /* Ping-pong between input and scratch. With constant digits skipped the
-   * number of executed passes can be odd, so the result is copied back when it
-   * lands in the scratch buffer -- one sequential memcpy in exchange for the
-   * scatter pass that was skipped. */
+  /* Ping-pong between input and scratch; with skipped passes the count can be
+   * odd, in which case the result is copied back from the scratch buffer. */
   uint32_t *buf[2] = {ui, ut};
   uint32_t cur = 0u;
   for (uint32_t b = 0; b < PASSES_32; ++b)
@@ -533,11 +470,8 @@ void MFTLSortIds(int *data, int count)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Public: key/value pair sorts (SoA)
- *
- * The histogram is built before the scratch buffers are allocated, so an
- * already-sorted or single-valued input returns without touching the allocator
- * at all.
+ * Public: key/value pair sorts (SoA). The histogram is built before any scratch
+ * is allocated, so sorted or constant input never touches the allocator.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 void MFTLSortPairs32(int *keys, int *values, int count)

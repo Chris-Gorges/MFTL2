@@ -60,8 +60,7 @@
  * them and two memmoves.
  *
  * On a serial object there are no ghosts, an append increments `n_local` with
- * the pool, both trailing blocks are empty and every line below is the code that
- * was here before.
+ * the pool, and both trailing blocks are empty.
  */
 
 #include "mftl_remeshing.h"
@@ -121,12 +120,12 @@ typedef struct
 } pool_partition;
 
 /**
- * @brief Where compacted index @p i lands once the two trailing blocks swap.
+ * @brief Where a compacted index lands once the two trailing blocks are
+ *        swapped, i.e. the map that re-establishes the ownership prefix.
  *
- * @brief Re-establishes the ownership prefix and reports the new index of each entity.
- * @param      p     The three run lengths of the pool.
- * @param[out] i `[n]` new index per old index, or #MFTL_ERROR for a dead entity.
- * @return The new owned count, i.e. the prefix length.
+ * @param p The three run lengths of the pool.
+ * @param i Index after the forward compaction.
+ * @return Index after the block swap.
  */
 static inline int partition_remap(const pool_partition *p, int i)
 {

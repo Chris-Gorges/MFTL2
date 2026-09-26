@@ -4,59 +4,35 @@
  * @date 2026-08-15
  * @ingroup mftl_remeshing
  *
- * @brief Feature classification and tangential Laplacian smoothing.
+ * @brief Feature classification and tangential smoothing.
  *
- * ## THE SMOOTHER IS A PROJECTION, AND THE FEATURE CLASS PICKS THE SUBSPACE
+ * ## The smoother is a projection; the feature class picks the subspace
  *
- * Every vertex wants to move towards the centroid of its neighbourhood. Doing
- * that literally is Laplacian smoothing, and Laplacian smoothing shrinks
- * geometry: the displacement has a component along the surface normal, and that
- * component is exactly "cut the corner". A remesher must keep the surface where
- * it is while redistributing vertices ON it, so the displacement is PROJECTED
- * onto the subspace the vertex is allowed to move in:
+ * Plain Laplacian smoothing shrinks geometry: the pull towards the
+ * neighbourhood centre has a component along the normal ("cut the corner"). So
+ * the displacement is projected onto the subspace the vertex may move in:
  *
- *   FREE vertex    2D -- the tangent plane. Remove the component along the
- *                  vertex normal.
- *   RIDGE vertex   1D -- the feature curve. Keep only the component along the
- *                  ridge tangent.
- *   CORNER vertex  0D -- locked.
+ *   FREE    2D, the tangent plane (remove the normal component);
+ *   RIDGE   1D, the feature curve (keep the component along the ridge tangent);
+ *   CORNER  0D, locked.
  *
- * Stated that way the three cases are one idea, and the middle one is the easy
- * one to get wrong. Moving a ridge vertex TO the midpoint of its two feature
- * neighbours -- the full displacement, no projection, at full strength -- is the
- * 2D-shrinkage failure applied to a 1D curve: it cuts the corner of the ridge,
- * pulling the vertex towards the chord between its neighbours. Repeated over the
- * tens of sweeps a remeshing pass performs, a preserved feature curve is
- * systematically eroded, which is the opposite of what marking it a feature was
- * for.
+ * Moving a ridge vertex TO the midpoint of its feature neighbours is the same
+ * shrinkage on a curve: a regular 24-gon ridge collapses to 0.84 of its radius
+ * in 20 sweeps (`test_a_regular_ridge_is_a_fixed_point`).
  *
- * ## WHERE THE TARGET POINT COMES FROM
+ * ## The target point
  *
  * MFTL_SMOOTH_TRIANGLE_BASED is the AREA-WEIGHTED centroid of the incident
- * triangles,
+ * triangles, q = SUM(A_i c_i) / SUM(A_i). The weight equalises triangle areas;
+ * the unweighted mean is nearly the umbrella operator (docs/analysis.md §4:
+ * volume loss 6.0 % unweighted against 3.5 % weighted).
  *
- *     q = SUM(A_i * c_i) / SUM(A_i)
+ * ## The normal
  *
- * and the weight is the mechanism, not a refinement. It is what makes the
- * smoother equalise triangle AREA: a vertex with one large and one small incident
- * triangle is pulled towards the large one, which shrinks it and grows the small
- * one. The UNWEIGHTED mean of the same centroids is very nearly the umbrella
- * operator again -- it equalises edge lengths and does nothing about area -- so a
- * caller selecting "triangle based" for its isotropy would get a slightly more
- * expensive MFTL_SMOOTH_VERTEX_BASED instead. Measured in
- * docs/analysis.md §4, where dropping the weight costs volume
- * conservation (6.0 % against 3.5 %) rather than triangle quality.
- *
- * ## WHY THE NORMAL IS NOT COMPUTED HERE
- *
- * MFTLComputeVertexNormals() gives the exact area-weighted normal for every
- * vertex in one flat triangle pass -- no fan walk or dependent topology loads,
- * and correct across a periodic seam. Accumulating a
- * cross product per vertex over its own one-ring, inside this loop, is the same
- * arithmetic done 3.4x slower (src/geometry/vertex_geometry.c) and invites the
- * boundary bug on top: walking the ring with is_inner = true means the
- * (k+1) % degree wrap closes a fan that is not closed, and adds a cross product
- * between two edges that are not adjacent.
+ * MFTLComputeVertexNormals() gives the exact area-weighted normal of every
+ * vertex in one flat, seam-safe triangle pass; a per-vertex fan accumulation
+ * here would be slower (3.4x, src/geometry/vertex_geometry.c) and must handle
+ * open fans itself.
  */
 
 #include "mftl_remeshing.h"
@@ -116,17 +92,13 @@ static int fan_halfedges(const MFTL_Object *obj, int v, int *out, bool *open)
 }
 
 /**
- * @brief The neighbour reachable only through the closing edge of an open fan.
+ * @brief The neighbour an outgoing-half-edge walk cannot reach: the closing edge
+ *        of an open fan.
  *
- * @p first is the fan's first outgoing half-edge v->w. Its triangle is (v, w, x),
- * so next(first) targets x -- and the edge v-x exists in this partition only as
- * the incoming half-edge prev(first).
- *
- * @brief The neighbour an OUTGOING-half-edge walk cannot reach.
- *
- * The closing edge of an open fan exists only in the incoming direction, so a
- * walk over outgoing half-edges is short by exactly one neighbour -- and a
- * boundary vertex counted that way lands in the wrong feature class.
+ * @p first is the fan's first outgoing half-edge v->w. Its triangle is
+ * (v, w, x), so next(first) targets x, and the edge v-x exists only as the
+ * incoming half-edge prev(first). Without it a boundary vertex is short one
+ * neighbour and lands in the wrong feature class.
  *
  * @param obj   The mesh.
  * @param first First outgoing half-edge of the fan.
@@ -404,20 +376,16 @@ static bool ridge_displacement(const MFTL_Object *obj, int v, const int *fan, in
 /**
  * @brief Displacement of a FREE vertex, projected onto its tangent plane.
  *
- * Both neighbourhood sums are accumulated as OFFSETS from the vertex rather than
- * as absolute positions. On a periodic domain that is the only form that works --
- * averaging absolute coordinates of a fan straddling a seam produces a point in
- * the middle of the domain -- and it costs nothing, because the offsets are the
- * minimum-image vectors the loop needs regardless.
+ * The neighbourhood sums are accumulated as minimum-image OFFSETS from the
+ * vertex, so a fan straddling a periodic seam is averaged correctly.
  *
- * @brief The 2D case: displacement projected onto the TANGENT PLANE.
  * @param      obj         The mesh.
  * @param      v           A vertex with no feature edges.
  * @param      fan         Outgoing half-edges of @p v, from fan_halfedges().
  * @param      n_fan       Their count.
  * @param      open        `true` when the fan is open.
  * @param      mode        Which neighbourhood the target point is built from.
- * @param[out] disp        The displacement, projected onto the TANGENT PLANE.
+ * @param[out] disp        The displacement, projected onto the tangent plane.
  * @param[out] min_edge_sq Shortest incident squared edge length, for the step clamp.
  * @return `true` if a displacement was produced.
  */

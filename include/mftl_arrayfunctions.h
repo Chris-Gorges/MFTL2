@@ -6,27 +6,17 @@
  *
  * @brief Flat-array utilities: LSD radix sort and duplicate removal.
  *
- * These are plain array helpers -- they know nothing about MFTL types, which is
- * what puts them at layer 0 next to mftl_memory.h. Everything here is linear in
- * the array length: the sorts are least-significant-digit radix sorts over
- * 8-bit digits, the unique helpers are single scans over an already sorted
- * array.
+ * Layer 0, no MFTL types. The sorts are least-significant-digit radix sorts
+ * over 8-bit digits, \f$O(n)\f$ for a fixed key width (a stable insertion sort
+ * below 33 elements); the unique helpers are single scans over sorted input.
+ * Theory and measurements: src/arrayfunctions/README.md.
  *
- * ### Ordering contract
+ * **Ordering contract.** The key type is the contract: `int` keys sort in
+ * SIGNED order, `uint64_t` keys in UNSIGNED order. Do not sort unsigned 32-bit
+ * values through an `int *` cast (wrong for values \f$\ge 2^{31}\f$).
  *
- *   int      keys  ->  SIGNED order    (..., -2, -1, 0, 1, ...)
- *   uint64_t keys  ->  UNSIGNED order  (0, 1, ..., UINT64_MAX)
- *
- * The key type in the signature *is* the contract; there is no separate flag.
- * Sorting an unsigned 32-bit quantity by casting it to int* is therefore wrong
- * for values >= 2^31 -- add an explicit u32 entry point if that case ever comes
- * up rather than reinterpreting one of these.
- *
- * ### Stability
- *
- * Every sort here is stable: equal keys keep their original relative order.
- * That is what makes the "sort pairs, then unique" idiom used by redistribution
- * deterministic -- the surviving duplicate is always the one that came first.
+ * **Stability.** Every sort is stable, so "sort pairs, then MFTLUniquePairs()"
+ * keeps the value that came first -- a deterministic, rank-independent choice.
  */
 
 #ifndef MFTL_ARRAYFUNCTIONS_H
@@ -36,11 +26,8 @@
 #include <stddef.h>
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Typed function declarations
- *
- * These are the concrete implementations. Use the generic macros below
- * (MFTLRadixSort, MFTLSortPairs) for automatic dispatch; call the typed
- * functions directly when you need to be explicit about the key width.
+ * Typed entry points. The generic macros MFTLRadixSort / MFTLSortPairs below
+ * dispatch to them on the key type.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -72,9 +59,7 @@ void MFTLRadixSort64(uint64_t *keys_in, uint64_t *keys_temp, int size);
 /**
  * @brief High-level wrapper: sorts an int array in place, temp buffer internal.
  *
- * 32-bit only. For Morton codes use MFTLSortPairs / MFTLSortPairs64.
- * Allocation failure is fatal (the process aborts) -- a silently unsorted array
- * would be deduplicated wrongly by MFTLUniqueIntArray further downstream.
+ * 32-bit signed keys. Allocation failure aborts the process.
  *
  * @param data  Array of ints, sorted ascending in place.
  * @param count Number of elements.
@@ -84,9 +69,9 @@ void MFTLSortIds(int *data, int count);
 /**
  * @brief Sorts 32-bit key / 32-bit value pairs together (SoA layout).
  *
- * Keys and values live in two separate arrays and move as one, which avoids the
- * padding and the partial-cacheline writes an array of {key, value} structs
- * would cost. Temp buffers are allocated internally; allocation failure is fatal.
+ * Keys and values live in two arrays and are permuted together. Scratch is
+ * allocated internally (only when a pass actually runs); allocation failure
+ * aborts.
  *
  * @param keys   Signed keys. Sorted in place.
  * @param values Associated values, permuted to match the sorted keys.
@@ -97,9 +82,8 @@ void MFTLSortPairs32(int *keys, int *values, int count);
 /**
  * @brief Sorts 64-bit key / 32-bit int value pairs together (SoA layout).
  *
- * The Morton-code case: 64-bit spatial keys carrying the original entity index
- * along as the value. Temp buffers are allocated internally; allocation failure
- * is fatal.
+ * The Morton-code case: 64-bit spatial keys carrying an entity index as the
+ * value. Scratch is allocated internally; allocation failure aborts.
  *
  * @param keys   64-bit unsigned keys. Sorted in place.
  * @param values Associated int indices, permuted to match the sorted keys.
@@ -108,19 +92,9 @@ void MFTLSortPairs32(int *keys, int *values, int count);
 void MFTLSortPairs64(uint64_t *keys, int *values, int count);
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Generic dispatch macros  (C11 _Generic -- compile-time, zero overhead)
- *
- *   MFTLRadixSort(keys_in, keys_temp, size)
- *       keys_in is int*      -> MFTLRadixSort32
- *       keys_in is uint64_t* -> MFTLRadixSort64
- *
- *   MFTLSortPairs(keys, values, count)
- *       keys is int*         -> MFTLSortPairs32
- *       keys is uint64_t*    -> MFTLSortPairs64
- *
- * C99 fallback (no _Generic): the macros call the 32-bit variants, so passing
- * 64-bit keys is a compile error rather than a silent mis-sort. Code that needs
- * 64-bit sorting under C99 must call MFTLSortPairs64 / MFTLRadixSort64 directly.
+ * Generic dispatch (C11 _Generic, resolved at compile time). Under C99 the
+ * macros fall back to the 32-bit variants, so 64-bit keys fail to compile
+ * rather than mis-sort.
  * ═══════════════════════════════════════════════════════════════════════════ */
 #if defined(__STDC_VERSION__) && (__STDC_VERSION__ >= 201112L)
 
@@ -170,13 +144,11 @@ void MFTLSortPairs64(uint64_t *keys, int *values, int count);
 /**
  * @brief Collects the distinct values of an array, preserving first-seen order.
  *
- * O(input_count * num_unique) -- intended for the tiny fixed-capacity case
- * (a handful of destination ranks), not as a general deduplicator. For anything
- * larger, sort first and use MFTLUniqueIntArray, which is O(n) after the sort.
+ * \f$O(n \cdot u)\f$ for \f$u\f$ distinct values: for tiny sets (a handful of
+ * ranks). For larger inputs sort, then MFTLUniqueIntArray().
  *
- * @note Silently stops appending once @p output_capacity is reached; values
- *       beyond that are dropped, not reported. Size the output for the worst
- *       case the caller can actually produce.
+ * @note Values beyond @p output_capacity are dropped silently; size the output
+ *       for the worst case.
  *
  * @param      input_array     Values to scan. Not modified, need not be sorted.
  * @param      input_count     Number of values in @p input_array.
@@ -207,9 +179,8 @@ static inline int MFTLGetUniqueIntegers(const int *input_array, int input_count,
 /**
  * @brief Binary search for @p key in an ascending int array.
  *
- * The library keeps its sparse, id-keyed directories as SORTED arrays so that
- * `id -> slot` is a binary search rather than a hash map; this is that search,
- * spelled once.
+ * Sparse id-keyed directories in the library are sorted arrays, so an
+ * `id -> slot` lookup is this binary search rather than a hash map.
  *
  * @param sorted Ascending array.
  * @param n      Number of elements.
@@ -235,8 +206,7 @@ static inline int MFTLSortedIndexOf(const int *sorted, int n, int key)
 /**
  * @brief Removes adjacent duplicates from a SORTED int array, in place.
  *
- * Only compares neighbours, so the array must be sorted first (typically by
- * MFTLSortIds) -- on unsorted input it merely collapses runs.
+ * Compares neighbours only, so on unsorted input it merely collapses runs.
  *
  * @param arr Sorted array, compacted in place.
  * @param n   Number of elements on entry.
@@ -256,9 +226,8 @@ static inline int MFTLUniqueIntArray(int *arr, int n)
 /**
  * @brief Removes adjacent duplicate KEYS from a SORTED key/value pair, in place.
  *
- * The value kept for a run of equal keys is the first one. Combined with the
- * stability of the sorts above, that is the value whose entry came first in the
- * caller's original array -- a deterministic, rank-independent choice.
+ * Keeps the first value of each run of equal keys; after a stable sort that is
+ * the entry that came first in the caller's original array.
  *
  * @param keys   Sorted key array, compacted in place.
  * @param values Value array, compacted alongside @p keys.

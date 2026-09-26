@@ -6,37 +6,13 @@
  *
  * @brief The derived connectivity arrays, and the Morton renumbering of the pools.
  *
- * ## TWO DERIVED ARRAYS
- *
- * A "flattened" representation of a half-edge mesh naturally grows to about ten
- * arrays. Two are here. The others were removed after counting their
- * consumers, which is the only honest way to decide:
- *
- *   flat_vert_pos + flat_pos_unwrapped   DELETED. It was a second copy of every
- *     position, kept in a second index space, sometimes unwrapped and sometimes
- *     not depending on whether the object fitted in half a domain -- a mode a
- *     consumer had to query and branch on. Positions are now the authoritative
- *     SoA array `verts.pos`, in the one index space there is. Consumers compute
- *     minimum-image triangle edges directly from it.
- *
- *   sfc_perm + sfc_inv                   DELETED. The permutation is applied to
- *     the pools (MFTLObjectReorderMorton below), so there is nothing to store
- *     and no second index space to confuse with the first. Silent corruption
- *     lives in exactly that confusion, and it is now unrepresentable.
- *
- *   vert_offsets + vert_tris (CSR)       DELETED. Zero consumers outside its own
- *     unit test. Every vertex-neighbourhood operation in the library goes
- *     through the half-edge one-ring walk, which is what the half-edge structure
- *     is for. Bring it back when a kernel exists that streams it.
- *
- *   flat_he_verts                        DELETED. Zero consumers. The three edge
- *     vectors of a triangle are e1, e2 and e2-e1, all in consumer registers.
- *
- * The arrays that stay are `tris.verts` and `tris.neighbors`. They are redundant
- * with the half-edge records and are stored anyway; the accounting is in
- * build_topology_arrays() below. Seam-corrected edge vectors are intentionally
- * computed from these indices and `verts.pos` in consumer registers instead of
- * being retained as another mesh-wide cache.
+ * Only two derived arrays exist, `tris.verts` and `tris.neighbors`. Everything
+ * else a "flattened" half-edge mesh is often given was removed after counting
+ * consumers: a second (sometimes unwrapped) copy of the positions and a stored
+ * SFC permutation (both replaced by one index space, see
+ * MFTLObjectReorderMorton()), per-half-edge vertex pairs (edges are formed in
+ * registers), and a vertex-to-triangle CSR (measured as a dead heat against the
+ * triangle scatter for vertex normals, docs/analysis.md §1.5).
  */
 
 #include "mftl_object.h"
@@ -57,41 +33,17 @@
 /**
  * @brief Emits `tris.verts` and `tris.neighbors` in one streaming pass.
  *
- * ── On storing something derivable ─────────────────────────────────────────
+ * Both are functions of the half-edge records at the same index:
  *
- * Both arrays are functions of the half-edge records at the same index:
+ *     verts[3t+k]     == he[3t+(k+2)%3].vertex_idx     origin of half-edge 3t+k
+ *     neighbors[3t+k] == he[3t+k].twin_idx / 3         triangle across it
  *
- *     verts[3t+k]     == he[3t+(k+2)%3].vertex_idx     (a fixed rotation)
- *     neighbors[3t+k] == he[3t+k].twin_idx / 3         (a fixed arithmetic op)
+ * They are stored for TRAFFIC: a connectivity-only loop streams 12 B per
+ * triangle from one of them instead of the 48 B of three half-edge records.
  *
- * They are stored because of TRAFFIC, not because of instructions. A kernel that
- * wants only connectivity -- IO, a triangle-to-vertex scatter, redistribution's
- * halo analysis, a BVH build -- streams 12 bytes per triangle out of one of
- * these arrays. Reading the same information from the half-edge records means
- * touching all three 16-byte records, 48 bytes per triangle, of which 36 are
- * fields it does not want. On a mesh that does not fit in cache that 4x is the
- * whole cost of the loop.
- *
- * The redundancy is real and is the price. It is bounded and cheap to pay
- * because both arrays are rebuilt by this one function, from one pass, and are
- * marked stale by a single bit the moment topology changes.
- *
- * ── Why this loop is fast ──────────────────────────────────────────────────
- *
- * Implicit half-edge indexing means there is no pointer chase at all: triangle
- * t's three half-edges are at 3t, and their records are contiguous. The loop
- * reads a 48-byte block and writes two 12-byte blocks, all sequential.
- *
- * ── The one other place these two arrays are written ───────────────────────
- *
- * `rebuild_object()` (src/communication/redistribute.c) emits both arrays inside
- * its relink and arrival loops instead of calling MFTLObjectBuildDerived()
- * afterwards, because it already holds every input in registers -- so this
- * rotation and this `twin_idx / 3` are spelled twice in the library. They are
- * pinned together by inv_derived_matches_topology()
- * (tests/test_mesh_invariants.h), which re-derives both arrays from the records
- * and compares them element for element on every redistributed mesh. Change the
- * convention here and that test fails there, which is the point.
+ * `rebuild_object()` in src/communication/redistribute.c emits the same two
+ * arrays inside its relink loop; `inv_derived_matches_topology()`
+ * (tests/test_mesh_invariants.h) pins both spellings to this convention.
  *
  * @param obj The mesh. `tris.verts` and `tris.neighbors` are rewritten.
  */
@@ -106,9 +58,8 @@ static void build_topology_arrays(MFTL_Object *obj)
   {
     const int b = 3 * t;
 
-    /* Slot k is the ORIGIN of half-edge b+k, and origin(h) == target(prev(h)).
-     * This is the convention MFTLGetTriangleVertices uses; the two must agree or
-     * code that mixes them silently rotates its triangles. */
+    /* Slot k is the ORIGIN of half-edge b+k: origin(h) == target(prev(h)), the
+     * convention of MFTLGetTriangleVertices(). */
     tv[b + 0] = he[b + 2].vertex_idx;
     tv[b + 1] = he[b + 0].vertex_idx;
     tv[b + 2] = he[b + 1].vertex_idx;
@@ -128,8 +79,7 @@ void MFTLObjectBuildDerived(MFTL_Object *obj)
 
   if (obj->tris.n > 0) build_topology_arrays(obj);
 
-  /* An empty mesh is trivially described, so the bit is set: a hot loop over
-   * zero triangles is correct, not stale. */
+  /* An empty mesh is trivially described, so the bit is set. */
   obj->derived = MFTL_DERIVED_TOPOLOGY;
 }
 
@@ -137,13 +87,8 @@ void MFTLObjectBuildDerived(MFTL_Object *obj)
  * 2. Morton renumbering of the pools
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/*
- * Permutation helpers. Each gathers `field` into `scratch` in the new order and
- * copies it back, which is O(n) with sequential writes and one random read
- * stream -- the cheap direction. Permuting in place with cycle following would
- * save the scratch buffer at the cost of a visited bitmap and a random access
- * pattern on BOTH sides.
- */
+/* Permutation helpers: gather into scratch in the new order, copy back. O(n),
+ * sequential writes and one random read stream. */
 
 /**
  * @brief Permutes an interleaved double array by gather-then-copy-back.
@@ -218,14 +163,12 @@ static void permute_he_triples(MFTL_HalfEdge *field, MFTL_HalfEdge *scratch, con
 
 /**
  * @brief Orders the vertices along a Morton curve and remaps every reference.
- * @return true if a permutation was applied.
  *
  * @param      obj        The mesh.
  * @param[out] old_of_new `[verts.n]` old index per new position.
  * @param[out] new_of_old `[verts.n]` new index per old position.
  * @param      scratch    Buffer large enough for the widest per-vertex array.
- * @return `true` if a permutation was applied, `false` if the order was already
- *         Morton (or the mesh is empty).
+ * @return `true` if a permutation was applied (`false` for fewer than 2 vertices).
  */
 static bool reorder_vertices(MFTL_Object *obj, int *old_of_new, int *new_of_old, void *scratch)
 {
@@ -235,9 +178,8 @@ static bool reorder_vertices(MFTL_Object *obj, int *old_of_new, int *new_of_old,
   const double *restrict pos = obj->verts.pos;
 
   /* Bounding box of THIS object, so the 21 bits per axis are spent where the
-   * mesh actually is. An object straddling a periodic seam gets a box as wide as
-   * the domain and therefore coarser cells; the ordering is a locality
-   * heuristic, so that costs a little cache efficiency and nothing else. */
+   * mesh is. A seam-straddling object gets a domain-wide box and coarser cells:
+   * a locality cost only. */
   double lo[3] = {MFTL_DBL_MAX, MFTL_DBL_MAX, MFTL_DBL_MAX};
   double hi[3] = {-MFTL_DBL_MAX, -MFTL_DBL_MAX, -MFTL_DBL_MAX};
   for (int v = 0; v < nv; ++v)
@@ -250,14 +192,12 @@ static bool reorder_vertices(MFTL_Object *obj, int *old_of_new, int *new_of_old,
     }
   }
 
-  /* One shared scale for all three axes keeps the Morton cells cubic. Scaling
-   * per axis would stretch the curve and make locality worse on flat objects. */
+  /* One scale for all axes keeps the Morton cells cubic. */
   double range = hi[0] - lo[0];
   if (hi[1] - lo[1] > range) range = hi[1] - lo[1];
   if (hi[2] - lo[2] > range) range = hi[2] - lo[2];
-  /* The only condition is that the scale be FINITE. An absolute floor here (it
-   * was 1e-12) collapses every key of a small but perfectly valid object onto
-   * one value, and ordering then silently stops meaning anything. */
+  /* The only condition is a FINITE scale; an absolute floor would collapse every
+   * key of a small object onto one value. */
   const double inv_range = (range > MFTL_MORTON_MAX / MFTL_DBL_MAX) ? MFTL_MORTON_MAX / range : 0.0;
 
   uint64_t *keys = (uint64_t *) MFTLMallocOrDie((size_t) nv * sizeof(uint64_t), "MFTLObjectReorderMorton vertex keys");
@@ -271,10 +211,7 @@ static bool reorder_vertices(MFTL_Object *obj, int *old_of_new, int *new_of_old,
     old_of_new[v] = v;
   }
 
-  /* Owned and ghost vertices are sorted SEPARATELY, so that [0, n_local) still
-   * holds exactly the owned vertices afterwards. Sorting the whole pool at once
-   * would interleave them and destroy the prefix invariant that every ownership
-   * test in the library relies on. */
+  /* Owned and ghost vertices are sorted SEPARATELY to keep the ownership prefix. */
   const int n_local = obj->verts.n_local;
   MFTLSortPairs64(keys, old_of_new, n_local);
   MFTLSortPairs64(keys + n_local, old_of_new + n_local, nv - n_local);
@@ -283,15 +220,14 @@ static bool reorder_vertices(MFTL_Object *obj, int *old_of_new, int *new_of_old,
 
   for (int i = 0; i < nv; ++i) new_of_old[old_of_new[i]] = i;
 
-  /* Records first, then the SoA arrays. `pos` is authoritative and `normal` is
-   * cached geometry, but both are permuted: a reorder must not silently discard
-   * values the caller computed one line earlier. */
+  /* `normal` is computed geometry but is permuted too, so a reorder never
+   * discards values the caller just computed. */
   permute_vertex_recs(obj->verts.rec, (MFTL_Vertex *) scratch, old_of_new, nv);
   permute_doubles(obj->verts.pos, (double *) scratch, old_of_new, nv, 3);
   permute_doubles(obj->verts.normal, (double *) scratch, old_of_new, nv, 3);
 
-  /* Every reference INTO the vertex pool. `out_he_idx` is a half-edge index and
-   * travelled with its record, so it needs nothing here. */
+  /* Every reference INTO the vertex pool. (`out_he_idx` is a half-edge index;
+   * it is remapped with the triangles.) */
   MFTL_HalfEdge *restrict he = obj->tris.he;
   const int n_he = 3 * obj->tris.n;
   for (int h = 0; h < n_he; ++h) he[h].vertex_idx = new_of_old[he[h].vertex_idx];
@@ -302,12 +238,10 @@ static bool reorder_vertices(MFTL_Object *obj, int *old_of_new, int *new_of_old,
 /**
  * @brief Orders the triangles spatially and remaps every reference.
  *
- * The key is the SMALLEST of the triangle's three vertex indices, taken after
- * the vertices have been Morton-ordered. That is a spatial key by construction
- * and it costs three loads and two compares -- no second geometric pass, no
- * centroid, and no question about what a centroid means across a periodic seam.
- * Using min() rather than, say, the first corner makes the key independent of
- * which corner the generator happened to call corner 0.
+ * The key is the SMALLEST of the triangle's three (already Morton-ordered)
+ * vertex indices: spatial by construction, three loads and two compares, no
+ * centroid (and no question of what a centroid means across a periodic seam),
+ * and independent of which corner is called corner 0.
  *
  * @param      obj        The mesh.
  * @param[out] old_of_new `[tris.n]` old index per new position.
@@ -344,18 +278,15 @@ static bool reorder_triangles(MFTL_Object *obj, int *old_of_new, int *new_of_old
 
   for (int i = 0; i < nt; ++i) new_of_old[old_of_new[i]] = i;
 
-  /* Only the authoritative triangle state is permuted. `verts` and `neighbors`
-   * are derived and rebuilt by the caller in one pass. */
+  /* `verts` and `neighbors` are not permuted; the caller rebuilds them. */
   permute_triangle_recs(obj->tris.rec, (MFTL_Triangle *) scratch, old_of_new, nt);
   permute_he_triples(obj->tris.he, (MFTL_HalfEdge *) scratch, old_of_new, nt);
   permute_doubles(obj->tris.area, (double *) scratch, old_of_new, nt, 1);
   permute_doubles(obj->tris.normal, (double *) scratch, old_of_new, nt, 3);
   permute_doubles(obj->tris.center, (double *) scratch, old_of_new, nt, 3);
 
-  /* Every reference INTO the half-edge array. A half-edge index carries its
-   * corner slot in the low position, so the remap keeps h % 3 and moves only the
-   * triangle part -- which is precisely the implicit-indexing invariant being
-   * maintained through the permutation. */
+  /* Every reference INTO the half-edge array: keep the corner h % 3, remap the
+   * triangle h / 3 (implicit indexing survives the permutation). */
   he = obj->tris.he;
   const int n_he = 3 * nt;
   for (int h = 0; h < n_he; ++h)
@@ -385,10 +316,8 @@ void MFTLObjectReorderMorton(MFTL_Object *obj)
 
   const int n_max = (nv > nt) ? nv : nt;
 
-  /* One scratch block for every permutation. Sized for the widest element any
-   * permute_* call moves: the 3 half-edge records of a triangle, 48 bytes,
-   * against 24 for a position, normal or centroid. Allocating it once keeps the
-   * reorder at two mallocs plus the two the sorts make internally. */
+  /* One scratch block for every permutation, sized for the widest element moved:
+   * a triangle's three half-edge records, 48 bytes. */
   const size_t widest = 48;
   void *scratch = MFTLMallocOrDie((size_t) n_max * widest, "MFTLObjectReorderMorton scratch");
 

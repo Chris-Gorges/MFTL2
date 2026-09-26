@@ -4,29 +4,22 @@
  * @date 2026-08-14
  * @ingroup mftl_memory
  *
- * @brief Allocation policy, cache-line-aligned blocks, and array growth.
+ * @brief Allocation policy, cache-line-aligned pool blocks, and array growth.
  *
- * Layer 0. Two distinct jobs live here and it is worth keeping them apart:
+ * Layer 0. Two kinds of storage, handled differently:
  *
- *   SMALL, INDEPENDENT ARRAYS  -- the ensemble's object list, scratch buffers
- *   inside an algorithm. These use MFTLMallocOrDie / MFTLCallocOrDie and the
- *   growth macros.
+ * - **Pool blocks** (the vertex and triangle pools of an #MFTL_Object). The AoS
+ *   records and every SoA array of a pool describe the same entities, so they
+ *   must always have the same capacity. A pool is therefore ONE allocation, cut
+ *   into cache-line-aligned sub-arrays by MFTLLayoutAdd(): one pointer to free,
+ *   one capacity, and no way to grow half of it. Only `src/object/object.c`
+ *   calls MFTLLayoutAdd().
+ * - **Independent arrays** (object lists, per-neighbour buffers, algorithm
+ *   scratch) use MFTLMallocOrDie() / MFTLCallocOrDie() / MFTLReallocOrDie() and
+ *   the growth macros #MFTL_ENSURE_CAPACITY and #MFTL_RESERVE_ADDITIONAL.
  *
- *   POOL BLOCKS -- the vertex and triangle pools of an MFTL_Object. Those are
- *   NOT independent arrays: the AoS topology records and every SoA geometry
- *   array describe the SAME entities and must have the SAME capacity, always.
- *   Holding that together with three capacity fields and a rule ("every site that
- *   grows a pool must call Reserve") fails at the first missed site, and it fails
- *   as a heap overflow rather than as a wrong number.
- *
- *   Here the rule is replaced by a structure: one pool is ONE allocation, cut
- *   into cache-line-aligned sub-arrays by MFTLLayoutAdd below. There is one
- *   pointer to free, one capacity to update, and no way to grow half of it.
- *   src/object/object.c is the only file that calls MFTLLayoutAdd.
- *
- * Allocation failure is fatal everywhere. In HPC code OOM is not recoverable,
- * and a caller that quietly carries on with a NULL buffer corrupts data far away
- * from the actual failure.
+ * Allocation failure is fatal everywhere: in an MPI job an out-of-memory rank
+ * cannot recover, and a NULL buffer carried on corrupts data far from the cause.
  */
 
 #ifndef MFTL_MEMORY_H
@@ -82,9 +75,8 @@ static inline void *MFTLCallocOrDie(size_t count, size_t size, const char *what)
 /**
  * @brief `realloc` that aborts instead of returning NULL.
  *
- * For the growable scratch arrays of a single algorithm, where the element
- * counts of several arrays move together and one of the growth macros below
- * would need a separate capacity counter per array.
+ * For growable scratch arrays whose sizes move together, where the growth
+ * macros would need one capacity counter per array.
  *
  * @param ptr   Existing block, or NULL.
  * @param bytes New size in bytes.
@@ -119,13 +111,8 @@ static inline size_t MFTLAlignUp(size_t x, size_t a) { return (x + a - 1u) & ~(a
 /**
  * @brief Allocates @p bytes, 64-byte aligned, aborting on failure.
  *
- * C11 aligned_alloc requires the size to be a multiple of the alignment, so the
- * request is rounded up here rather than at every call site. The result is freed
- * with plain free().
- *
- * The alignment is what lets a pool block be cut into sub-arrays that each start
- * on a cache line: no false sharing between two components a kernel writes, and
- * no vectoriser peel loop at the head of a streaming loop.
+ * C11 `aligned_alloc` requires the size to be a multiple of the alignment, so the
+ * request is rounded up here.
  *
  * @param bytes Requested size. Rounded up internally; 0 is treated as 1.
  * @param what  Human-readable name of the caller, printed in the fatal message.
@@ -148,8 +135,9 @@ static inline void *MFTLAlignedAllocOrDie(size_t bytes, const char *what)
  * @brief Reserves one sub-array inside a pool block and returns its byte offset.
  *
  * Call it once per field, in order, starting from a zeroed @p cursor; afterwards
- * @p cursor holds the total block size. Every returned offset is a multiple of
- * MFTL_CACHE_LINE.
+ * @p cursor holds the total block size:
+ * \f$o_0 = 0,\; o_{i+1} = L\lceil (o_i + n_i s_i)/L \rceil\f$ with
+ * \f$L = \f$ #MFTL_CACHE_LINE.
  *
  *     size_t cursor = 0;
  *     const size_t o_rec = MFTLLayoutAdd(&cursor, cap,     sizeof(MFTL_Vertex));
@@ -157,9 +145,8 @@ static inline void *MFTLAlignedAllocOrDie(size_t bytes, const char *what)
  *     ...
  *     unsigned char *block = MFTLAlignedAllocOrDie(cursor, "vertex pool");
  *
- * The point of doing it this way rather than with one malloc per field: the
- * capacity is a property of the BLOCK, so "AoS grew but the SoA arrays did not"
- * is not an error that can be made. It is not expressible.
+ * Because the capacity is a property of the block, "the AoS grew but an SoA
+ * array did not" cannot be expressed.
  *
  * @param cursor    Running block size in bytes, updated in place. Start at 0.
  * @param count     Number of elements in this sub-array.
@@ -178,16 +165,15 @@ static inline size_t MFTLLayoutAdd(size_t *cursor, size_t count, size_t elem_siz
  * @brief Geometric growth policy: at least @p needed, at least MFTL_INIT_CAPACITY,
  *        otherwise double until it fits.
  *
- * Shared by both pools so that a mesh which grows entity by entity performs
- * \f$O(\log n)\f$ reallocations rather than \f$O(n)\f$, and so that both pools
- * follow the same schedule.
+ * A mesh that grows entity by entity therefore performs \f$O(\log n)\f$
+ * reallocations.
  *
  * @param current Present capacity. May be 0.
  * @param needed  Capacity that must fit afterwards.
- * @return @p current if it already suffices, otherwise the first value in
- *         \f$\{\texttt{MFTL\_INIT\_CAPACITY} \cdot 2^k\}\f$ that is at least
- *         @p needed. Saturates to exactly @p needed near `INT_MAX` rather than
- *         overflowing into a negative -- i.e. a silently undersized allocation.
+ * @return @p current if it already suffices, otherwise the smallest
+ *         \f$c_0 2^k \ge\f$ @p needed, with \f$c_0\f$ = @p current, or
+ *         #MFTL_INIT_CAPACITY when @p current is 0. Saturates to exactly
+ *         @p needed near `INT_MAX` instead of overflowing to a negative size.
  */
 static inline int MFTLGrowCapacity(int current, int needed)
 {
@@ -205,12 +191,8 @@ static inline int MFTLGrowCapacity(int current, int needed)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Growth macros for plain, independent arrays
- *
- * These are for arrays that genuinely stand alone (the ensemble's object list,
- * per-neighbour scratch buffers). Do NOT use them on anything that lives in a
- * pool block -- there the capacity belongs to the block, and the entry points in
- * mftl_object.h are the only correct way to change it.
+ * Growth macros for independent arrays. Never for pool storage: a pool's
+ * capacity belongs to its block and changes only through mftl_object.h.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -256,10 +238,7 @@ static inline int MFTLGrowCapacity(int current, int needed)
  * @param needed   Additional elements that must fit.
  * @param type     Element type.
  *
- * @warning For genuinely independent arrays only. Never use it on anything
- *          inside a pool block -- there the capacity belongs to the block, and
- *          the entry points in mftl_object.h are the only correct way to change
- *          it.
+ * @warning Independent arrays only; never pool storage (see mftl_object.h).
  */
 #define MFTL_ENSURE_CAPACITY(ptr, count, capacity, needed, type)                  \
   do                                                                              \
@@ -274,9 +253,8 @@ static inline int MFTLGrowCapacity(int current, int needed)
 /**
  * @brief Exact growth. For bulk loads where the final count is known up front.
  *
- * Allocates precisely `*count + needed` elements rather than rounding up to a
- * power of two, because a bulk load knows its own size and the slack a geometric
- * schedule leaves behind is never reclaimed.
+ * Allocates precisely `*count + needed` elements: a bulk load knows its size, and
+ * geometric slack would never be reclaimed.
  *
  * @param ptr      Lvalue holding the array pointer. Updated in place.
  * @param count    Pointer to the element counter. Read, never written.
@@ -284,7 +262,7 @@ static inline int MFTLGrowCapacity(int current, int needed)
  * @param needed   Additional elements that must fit.
  * @param type     Element type.
  *
- * @warning For genuinely independent arrays only. See #MFTL_ENSURE_CAPACITY.
+ * @warning Independent arrays only. See #MFTL_ENSURE_CAPACITY.
  */
 #define MFTL_RESERVE_ADDITIONAL(ptr, count, capacity, needed, type) \
   do                                                                \

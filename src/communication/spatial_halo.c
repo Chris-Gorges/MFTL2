@@ -4,24 +4,23 @@
  * @date 2026-08-16
  * @ingroup mftl_communication
  *
- * @brief The spatial halo: what of body B is near this rank's share of body A.
+ * @brief The spatial halo: the parts of body B near this rank's share of body A,
+ *        delivered as shadow objects. Design rationale: mftl_communication.h §6.
  *
- * The design argument -- why the arrivals get their own shadow object instead of
- * being appended to body B's ghost suffix -- is in mftl_communication.h §6 and
- * is not repeated here. What follows is how it is done.
+ * Shape of one extension:
  *
- * ## SHAPE OF THE PASS
+ *   0. one record per held body (id, extent, radius, envelope)
+ *   1. publish the records to the graph neighbours     count allgather + Iallgatherv
+ *   2. per-triangle extents of every sendable body      overlapped with 1
+ *   3. match partners (grid or request list), classify and pack triangles
+ *   4. exchange vertices and triangles                  one MFTLExchangeStart, 2 payloads
+ *   5. rebuild one shadow object per arriving body      MFTLBuildTopologyFromIndexList
+ *   6. derive the candidate pairs (near mode); prune the directory
  *
- *   0. index the request list BY BODY          O(bodies + requests)
- *   1. publish my extent of every body         MPI_Ineighbor_allgather  <-- async
- *   2. per-triangle boxes of every B body      overlapped with 1
- *   3. classify + pack                         one send buffer per destination
- *   4. exchange vertices and triangles         one MFTLExchangeStart, 2 payloads
- *   5. rebuild one shadow object per body      MFTLBuildTopologyFromIndexList
- *
- * Working per BODY rather than per PAIR (step 0) is what keeps a triangle that
- * is relevant to two different A bodies on the same destination from being
- * packed twice -- and therefore from being reported twice as a contact.
+ * Work is organised per BODY, not per pair, so a triangle wanted by two
+ * partners on the same destination is packed -- and reported -- once. Two
+ * allocations per call are `[nproc]` send-buffer descriptor arrays (only
+ * neighbour entries are ever filled).
  */
 
 #include "mftl_communication.h"
@@ -71,37 +70,14 @@ static inline bool box_is_empty(const double *lo, const double *hi) { return lo[
 /* ═══════════════════════════════════════════════════════════════════════════
  * EXTENTS ARE CENTRE + HALF-WIDTH, NOT MIN + MAX
  *
- * Everything geometric in this file is a question of the form "is this near
- * that", asked across a domain that wraps. A (lo, hi) box cannot express the
- * answer, for two reasons that look unrelated and are the same one:
- *
- *   IT MISSES CONTACTS. Two shares meeting across the seam are a domain length
- *   apart in stored coordinates -- rank p says "my part of A is at x ~ 9.9",
- *   rank q says "my part of B is at x ~ 0.1" -- and min/max comparison reports
- *   no overlap for two surfaces that are touching. The traversal tries every
- *   periodic image of B, but only for triangles it HAS, and this test is what
- *   decides whether they are sent at all. The miss therefore happens one stage
- *   before anything the BVH can see, and nobody reports the contact.
- *
- *   IT OVER-SENDS ENORMOUSLY. A share containing even one seam-straddling
- *   triangle has a min/max box spanning the WHOLE DOMAIN, because
- *   MFTLGetTriangleBounds is seam-consistent and correctly puts that triangle's
- *   corners just outside the box on one side. Such a share then overlaps
- *   everything, and every neighbour ships its entire share of every partner
- *   body. A droplet sitting on the seam -- routine in a periodic run -- turns
- *   the halo into an all-to-all broadcast of the mesh, every timestep, silently.
- *
- * Both disappear when an extent is stored as a CENTRE ON THE CIRCLE plus a
- * half-width. "Near" becomes the minimum-image distance between centres against
- * the sum of half-widths, which is the same predicate the rest of the library
- * already uses for every other periodic question (MFTLGetMinimumImageVector).
- * The wire payload is unchanged at six doubles per body per rank, and a
- * non-periodic axis reduces to exactly the old comparison.
- *
- * The representation degrades gracefully rather than failing: a share genuinely
- * wider than half the domain gets a half-width above L/2, the minimum-image test
- * then accepts everything, and the result is the old conservative behaviour --
- * extra traffic, never a missed contact.
+ * "Near" is the minimum-image distance between centres against the sum of
+ * half-widths. A (lo, hi) box fails both ways on a periodic domain: two shares
+ * touching across the seam are a domain length apart in stored coordinates (a
+ * MISSED contact, decided before the BVH ever sees the triangles), and a share
+ * containing one seam-straddling triangle has a box spanning the whole domain
+ * (every neighbour then ships everything). A share wider than half the domain
+ * degrades to a half-width above L/2, which accepts everything -- extra traffic,
+ * never a miss. On a non-periodic axis the test is the plain interval test.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -113,16 +89,15 @@ static inline bool box_is_empty(const double *lo, const double *hi) { return lo[
 static inline bool interval_is_empty(const double *h) { return h[0] < 0.0; }
 
 /**
- * @brief Are two circular intervals within reach of each other?
- *
  * @brief Minimum-image proximity of two centre/half-width extents.
+ *
  * @param domain Supplies the periodicity and the domain sizes.
  * @param ca     Centre of the first extent.
  * @param ha     Half-widths of the first extent.
  * @param cb     Centre of the second extent.
  * @param hb     Half-widths of the second extent.
- * @return `true` if the two extents are within `ha + hb` on every axis, measured
- *         as a MINIMUM-IMAGE distance between the CENTRES.
+ * @return `true` if on every axis the minimum-image distance between the
+ *         centres is at most `ha + hb`.
  */
 static inline bool interval_overlap(const MFTL_Domain *domain, const double *ca, const double *ha, const double *cb, const double *hb)
 {
@@ -153,18 +128,14 @@ static inline double wrap_axis(const MFTL_Domain *domain, int k, double v)
 }
 
 /**
- * @brief Bounds of the OWNED triangles of @p obj.
- *
- * Owned only, on both sides of the test: a rank's share of a body is what it
- * owns, and counting its topological ghosts would inflate the extent by one
- * halo layer in every direction for no gain -- the neighbour that owns those
- * ghosts is publishing them itself.
+ * @brief Bounds of the OWNED triangles of @p obj (ghosts would inflate the
+ *        extent by a halo layer that their owners publish themselves).
  *
  * @param      obj   The mesh.
- * @param[out] lo    Lower corner over the OWNED triangles.
+ * @param[out] lo    Lower corner over the owned triangles.
  * @param[out] hi    Upper corner.
- * @param      shift Optional per-axis offset applied before measuring, used to
- *                   take the second (half-domain shifted) frame. May be NULL.
+ * @param      shift Optional per-axis offset applied (with wrap) before
+ *                   measuring, for the half-domain-shifted frame. May be NULL.
  */
 static void owned_bounds(const MFTL_Object *obj, double *lo, double *hi, const double *shift)
 {
@@ -206,24 +177,19 @@ static void owned_bounds(const MFTL_Object *obj, double *lo, double *hi, const d
 }
 
 /**
- * @brief The owned extent of @p obj as a circular interval per axis.
+ * @brief The owned extent of @p obj as a centre and half-width per axis.
  *
- * Measured in TWO FRAMES and the tighter one kept per axis: the raw stored
- * coordinates, and a frame displaced by half a domain. A body straddling the
- * seam is contiguous in the shifted frame; one straddling the middle is
- * contiguous in the raw frame; no body can straddle both, provided its true
- * extent is under L/2 -- the same condition the minimum-image convention assumes
- * everywhere else in the library.
- *
- * That is what turns a seam-straddling share from "spans the whole domain" into
- * its actual size, and it is why the answer is a centre rather than a box: the
- * centre of the tighter frame has to be mapped back through the shift, and a
- * min/max pair cannot survive that mapping.
+ * Measured in two frames -- raw and displaced by half a domain -- keeping the
+ * tighter per axis: a share straddling the seam is contiguous in the shifted
+ * frame, one straddling the middle in the raw frame, and none can straddle both
+ * while its extent is under L/2 (the minimum-image assumption). The centre of
+ * the shifted frame is mapped back through the shift, which a (lo, hi) pair
+ * could not survive.
  *
  * @param      obj    The mesh.
  * @param      domain Supplies the periodicity and the domain sizes.
  * @param[out] c      Per-axis centre.
- * @param[out] h      Per-axis half-width. Negative on every axis when this rank
+ * @param[out] h      Per-axis half-width; negative on every axis when this rank
  *                    owns nothing of the body.
  */
 static void owned_interval(const MFTL_Object *obj, const MFTL_Domain *domain, double *c, double *h)
@@ -273,26 +239,10 @@ static void owned_interval(const MFTL_Object *obj, const MFTL_Domain *domain, do
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 2. The directory
- *
- * A SPARSE, SORTED KEY ARRAY, and every consumer in this file reads it that way.
- * The version this replaces was a `[n_bodies_global]` table of patch pointers
- * and radii -- the shape that has to be abandoned for exactly the reason
- * MFTL_Ensemble::local_objects was: it makes every rank pay for every droplet in
- * the simulation in order to describe the handful it is anywhere near.
- *
- * Two sets go in, and the second is why the directory cannot simply BE the
- * ensemble's local list:
- *
- *   - the bodies this rank HOLDS, so that a resolved radius has somewhere to
- *     live;
- *   - the bodies this rank RECEIVED A PATCH FOR, which is precisely the set it
- *     holds nothing of. A rank with droplet A and none of droplet B is the rank
- *     that must be told about B, and it has no local object to hang that on.
- *
- * Insertion is an ordered memmove rather than an append-and-sort, for the reason
- * the ensemble's own directory gives: the sort order is what makes `gid -> slot`
- * a binary search instead of a hash map the library does not have.
+ * 2. The directory: a sparse, sorted key array (binary search), holding the
+ * bodies this rank HOLDS and the bodies it RECEIVED A PATCH FOR -- the latter
+ * being exactly those it holds nothing of, which is why the directory cannot be
+ * the ensemble's local list. Inserts are ordered memmoves.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -358,14 +308,9 @@ static int halo_entry(MFTL_SpatialHalo *h, int gid)
 }
 
 /**
- * @brief Gives every body @p ens currently holds here a directory entry.
- *
- * Called at the top of every collective entry point, so a halo created before a
- * redistribution still works after one -- which matters, because a halo is
- * created once and a redistribution destroys and creates local objects on every
- * timestep. Entries for bodies that have LEFT are kept: they may still carry a
- * patch, and a patch is what a rank holding nothing of a body has instead of an
- * object.
+ * @brief Gives every body @p ens holds a directory entry. Called by every
+ *        collective entry point, so a halo outlives redistributions. Entries of
+ *        bodies that left are kept (they may carry a patch) until halo_prune().
  *
  * @param h   The halo.
  * @param ens The ensemble.
@@ -414,13 +359,9 @@ static int pair_cmp(const void *x, const void *y)
 }
 
 /**
- * @brief Sorts the pair list and removes duplicates in place.
- *
- * A pair can be produced twice -- once because both bodies are local and their
- * shares are near, once because a patch of the larger one also arrived -- and a
- * duplicate would traverse the same trees twice and report every contact in them
- * twice. Deduplicating here rather than at the two producers keeps the "reported
- * once" rule in one place.
+ * @brief Sorts the pair list and removes duplicates in place. A pair produced
+ *        twice (local-local and via a patch) would otherwise report every
+ *        contact twice.
  *
  * @param h The halo.
  */
@@ -478,36 +419,12 @@ int MFTLSpatialHaloResolveRadii(MFTL_Ensemble *ens, MFTL_SpatialHalo *halo)
 
   const int b = ens->n_local_objects;
 
-  /* ── Two frames, twelve slots, ONE per-body reduction ────────────────────
-   *
-   * The raw stored extent of a body STRADDLING A PERIODIC SEAM spans the whole
-   * domain: half its triangles sit at x ~ 0 and half at x ~ L, and min/max over
-   * them says "this body is L wide". A 1 mm droplet at the seam would then
-   * report a bounding radius of half the box, and every envelope scaled by it --
-   * the halo margin, the leaf inflation, the narrow-phase gap -- would grow by
-   * that same factor. Unlike the Morton bounding box, where a domain-wide root
-   * is accepted locality loss, this one changes the ANSWER: contact would be
-   * declared between surfaces that are nowhere near each other.
-   *
-   * So each body is measured twice, in the raw frame and in one displaced by
-   * half a domain, and the SMALLER extent per axis wins. A body straddling the
-   * seam is contiguous in the shifted frame; a body straddling the middle is
-   * contiguous in the raw one; no body can straddle both, provided its true
-   * extent is under L/2 -- the same condition the minimum-image convention
-   * already assumes everywhere else in the library. Above L/2 the result is
-   * still an upper bound, so the envelope errs wide rather than narrow.
-   *
-   * Cost is payload, not a second collective: 12 doubles per body instead of 6,
-   * every one of them a MIN because the upper corners are carried NEGATED.
-   *
-   * ── The route is the body's HOLDERS, not comm_world ──────────────────────
-   *
-   * This used to be an `MPI_Allreduce` on two `[12 * n_bodies_global]` staging
-   * buffers -- 192 bytes per body on every rank, to learn one number about each
-   * of the few bodies this rank is near, and the reduction itself proportional
-   * to the whole ensemble. It is a per-body reduction like any other, so it goes
-   * through the one place that chooses a communicator, indexed by LOCAL SLOT.
-   */
+  /* Twelve MIN slots per body: [0..2] lo, [3..5] -hi in the raw frame, [6..8]
+   * lo, [9..11] -hi in the half-domain-shifted frame (upper corners negated so
+   * every slot is a MIN). The smaller extent per axis wins, so a body on the
+   * seam does not measure as domain-wide -- which would inflate every envelope
+   * scaled by its radius and declare contacts between distant surfaces. One
+   * per-body reduction over the holders (MFTLEnsembleReduceBodies()). */
   enum
   {
     STRIDE = 12  /* [0..2] lo, [3..5] -hi, raw | [6..8] lo, [9..11] -hi, shifted */
@@ -558,9 +475,7 @@ int MFTLSpatialHaloResolveRadii(MFTL_Ensemble *ens, MFTL_SpatialHalo *halo)
       continue;
     }
 
-    /* Half the LONGEST SIDE, not half the diagonal: for a sphere of radius R
-     * this is R, so a caller scaling by "a thousandth of the body" gets what it
-     * asked for rather than a silent sqrt(3) inflation. */
+    /* Half the LONGEST SIDE (not the diagonal): R for a sphere of radius R. */
     double longest = 0.0;
     for (int k = 0; k < 3; ++k)
     {
@@ -579,24 +494,10 @@ int MFTLSpatialHaloResolveRadii(MFTL_Ensemble *ens, MFTL_SpatialHalo *halo)
 
   free(val);
 
-  /* ── And one hop further, because a MARGIN needs the OTHER body's size ────
-   *
-   * The reduction answers "how big is this body" only on the ranks that hold it.
-   * That is not enough for the rank that has to decide what to SEND: it holds
-   * body B and is asked for the parts of B within `MAX(tol_A, tol_B)` of a
-   * neighbour's share of body A, and it holds nothing of A. Under-estimating
-   * tol_A there is a MISSED CROSS-RANK CONTACT and nothing else -- silent, and
-   * only at a rank boundary, which is the worst place for it.
-   *
-   * So each rank publishes `(body id, radius)` for the bodies it holds to its
-   * 26 neighbours. One hop is exactly the right distance and not a guess: the
-   * halo only ever exchanges payload along `comm_graph`, so a rank that is not a
-   * graph neighbour is a rank this body will never be sent to.
-   *
-   * Two doubles per body per rank, `O(local bodies * degree)`. The dense form it
-   * replaces gave every rank every radius, which is a strict superset of this
-   * and `O(bodies in the ensemble)`.
-   */
+  /* Publish (body id, radius) one hop along comm_graph: a rank deciding what to
+   * SEND needs the size of the body it sends TOWARDS, which it may hold nothing
+   * of; underestimating it would miss cross-rank contacts. One hop suffices
+   * because the halo only ships along comm_graph. */
   const MFTL_Domain *const dom = &ens->domain;
   const int nn = dom->num_neighbors;
   if (dom->nproc < 2 || nn == 0) return MFTL_SUCCESS;
@@ -616,10 +517,7 @@ int MFTLSpatialHaloResolveRadii(MFTL_Ensemble *ens, MFTL_SpatialHalo *halo)
   double *const recv = MFTLNeighborAllgatherDoubles(dom, send, 2 * b, rcount, rdispl, &n_recv);
   const size_t total = (size_t) n_recv;
 
-  /* MAX, not assignment: a body held here already has the exact answer from the
-   * reduction, and a holder's published copy is the same number to the bit --
-   * the reduction is combined in ascending source-rank order precisely so that
-   * it is. Taking the maximum makes the two paths commute instead of racing. */
+  /* MAX: a held body already has the (bit-identical) reduced value. */
   for (size_t i = 0; i + 1 < total; i += 2)
   {
     const int g = (int) recv[i];
@@ -640,30 +538,17 @@ int MFTLSpatialHaloResolveRadii(MFTL_Ensemble *ens, MFTL_SpatialHalo *halo)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Turns the arrivals for one body into a valid, self-contained MFTL_Object.
+ * @brief Turns the arrivals for one body into a valid, self-contained patch
+ *        object (vertices first, then MFTLBuildTopologyFromIndexList()), and only
+ *        then marks nothing owned.
  *
- * The patch is built as if it were an ordinary little mesh -- vertices first,
- * then MFTLBuildTopologyFromIndexList to link its half-edges and twins -- and is
- * only afterwards told that none of it is owned. Two consequences are worth
- * spelling out because both are easy to get wrong:
+ * - **Vertex rotation.** The wire carries the TARGET of half-edge 3t+k; the
+ *   index list wants the ORIGIN, `origin(3t+k) = target(3t+(k+2)%3)`.
+ * - **Boundary flags are restored, not derived.** The topology build marks every
+ *   twin-less half-edge as mesh boundary, but a patch's rim is a cut through a
+ *   larger surface, so the transmitted flags overwrite the derived ones.
  *
- *   THE VERTEX ROTATION. `vertex_gid[k]` on the wire is the TARGET of half-edge
- *   3t+k, while MFTLBuildTopologyFromIndexList wants the ORIGIN of 3t+k. Origin
- *   and target differ by a rotation -- origin(3t+k) == target(3t+(k+2)%3) -- so
- *   tri_verts[3t+k] = slot(vertex_gid[(k+2)%3]). Getting this wrong rotates every
- *   triangle, which flips no normal and breaks no invariant; it just silently
- *   moves every corner one step round.
- *
- *   THE BOUNDARY FLAGS ARE RESTORED, NOT DERIVED. Building the topology runs
- *   MFTLMarkMeshBoundary, which sets MFTL_FLAG_BOUNDARY on every twin-less
- *   half-edge -- and a patch is a CUT out of a larger surface, so its whole rim
- *   is twin-less without being a mesh boundary. Left alone, the patch would
- *   claim its cut edges are the edge of the surface. The transmitted flags are
- *   written over the derived ones afterwards, which is exactly why he_flags[]
- *   and the vertex flags are on the wire at all (they are the one thing a
- *   receiver cannot re-derive; see mftl_communication.h §1).
- *
- * @param halo    The halo. `halo->patch[entry]` is REPLACED, not appended to.
+ * @param halo    The halo; `halo->patch[entry]` is REPLACED.
  * @param entry   Directory slot of the body, from halo_entry().
  * @param verts   Received vertex records.
  * @param n_verts Number of received vertices.
@@ -686,28 +571,20 @@ static void rebuild_patch(MFTL_SpatialHalo *halo, int entry, const MFTL_PackedVe
   if (patch == MFTL_NULL)
   {
     patch = MFTLObjectCreate(halo->body_gid[entry]);
-    /* Borrowed, exactly as MFTLEnsembleAddObject would set it. The patch is
-     * deliberately NOT added to the ensemble's object list: redistribution and
-     * the ghost syncs iterate that list, and a patch must be invisible to both. */
+    /* Borrowed domain; deliberately NOT in the ensemble's object list. */
     patch->domain = halo->domain;
     halo->patch[entry] = patch;
   }
 
-  /* ── De-duplicate the arriving vertices by global id ───────────────────────
-   *
-   * A vertex shared by two arriving triangles is sent once per triangle by the
-   * packer's own dedup only within a single destination; across senders it can
-   * still arrive twice. Collapsing them here is what makes the patch a connected
-   * surface rather than a bag of disjoint triangles -- which in turn is what
-   * lets MFTLBuildTopologyFromIndexList link twins across it. */
+  /* ── De-duplicate the arriving vertices by global id. A sender sends each
+   * vertex once per destination, but several senders may send the same one;
+   * merging them is what makes the patch connected, so twins link across it. */
   int max_gid = 0;
   for (int i = 0; i < n_verts; ++i)
   {
     if (verts[i].global_id > max_gid) max_gid = verts[i].global_id;
   }
-  /* Entry count and id range. A halo patch is a thin shell of another rank's
-   * share, so its ids are a sparse scattering over the whole body -- this is the
-   * case gt_begin()'s sparse mode exists for. */
+  /* Patch ids are sparse over the body's range: gt_begin() picks sparse mode. */
   gt_begin(tbl, n_verts, max_gid + 1);
 
   ib_reset(scratch);
@@ -822,8 +699,7 @@ static void rebuild_patch(MFTL_SpatialHalo *halo, int entry, const MFTL_PackedVe
     }
   }
 
-  /* The counters keep any consumer that sizes a table from them (ghost_sync
-   * does) from under-allocating. They are NOT dense on a patch. */
+  /* Id counters bound the ids (consumers size tables from them); not dense. */
   patch->next_vertex_gid = max_v_gid + 1;
   patch->next_triangle_gid = max_t_gid + 1;
   patch->next_halfedge_gid = 3 * (max_t_gid + 1);
@@ -834,33 +710,19 @@ static void rebuild_patch(MFTL_SpatialHalo *halo, int entry, const MFTL_PackedVe
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 4. The body-extent exchange, the broad phase and the payload
+ * 4. The record exchange, the broad phase and the payload
  *
- * ── WHAT A RANK PUBLISHES, AND WHY IT IS NOT A DENSE TABLE ────────────────
+ * Each rank publishes one record per body it HOLDS -- (id, centre[3],
+ * half-width[3], global radius, envelope), nine doubles -- so the payload is
+ * O(local bodies x degree), independent of the ensemble size. Radius and
+ * envelope ride along because deciding whether to send B towards A needs A's
+ * envelope.
  *
- * One record per body THIS RANK HOLDS: `(body id, centre, half-width, global
- * radius, contact envelope)`, nine doubles, through a neighbourhood
- * allgatherv. The version this replaces published `6 * n_bodies_global` doubles
- * to every neighbour whether or not it held any of them -- 48 bytes per body per
- * neighbour, i.e. 1.2 kB per body per rank on a full 26-neighbourhood, which is
- * a gigabyte at a million droplets to say "not mine" about almost all of them.
- * The sparse form is `O(local bodies * degree)`: constant in the ensemble.
- *
- * The extra three slots are what let the pair list be DERIVED rather than
- * enumerated. A rank cannot decide whether body B of its own is worth sending
- * towards body A of a neighbour without knowing A's envelope, and the envelope
- * scales with the body -- so the radius and the tolerance ride along rather than
- * being reconstructed from a second collective.
- *
- * ── THE BROAD PHASE ───────────────────────────────────────────────────────
- *
- * A uniform grid over the domain whose cell is at least as wide as the widest
- * body plus the largest envelope, so two extents that overlap are always within
- * one cell of each other and a query is the 27 cells around a centre. It is
- * built over the ARRIVING records and queried with this rank's own bodies, and
- * again over this rank's own bodies to find the local-local pairs. Cost is
- * `O(bodies + records)`; the all-pairs enumeration it replaces was `O(B^2)` on
- * every rank.
+ * Broad phase: a uniform grid whose cell is at least `2 x widest half-width +
+ * largest envelope` per axis, so overlapping extents are always in adjacent
+ * cells and a query visits 27 cells; O(bodies + records) instead of O(B^2). One
+ * domain-spanning body collapses the grid to one cell (all pairs within the
+ * neighbourhood) -- correct, and the right cost for a few large bodies.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /** @brief Doubles per published body record: gid, centre[3], half[3], radius, tol. */
@@ -869,11 +731,9 @@ static void rebuild_patch(MFTL_SpatialHalo *halo, int entry, const MFTL_PackedVe
 /**
  * @brief A uniform grid over the domain, one bucket list per cell.
  *
- * Sized so that one cell is at least `2*max_half + max_margin` on every axis,
- * which is what makes "within one cell" a superset of "extents overlap" and
- * therefore what makes a 27-cell query exhaustive. The cell COUNT is capped
- * against the item count so that a domain far larger than the bodies does not
- * turn into an allocation proportional to the domain rather than to the data.
+ * Cells are at least as wide as the reach on every axis, which makes a 27-cell
+ * query exhaustive. The cell count is capped at `4 x items + 64` so a domain much
+ * larger than the bodies does not allocate proportionally to the domain.
  */
 typedef struct
 {
@@ -886,11 +746,9 @@ typedef struct
 } body_grid;
 
 /**
- * @brief The cell holding coordinate @p x along axis @p k, clamped into the grid.
- *
- * Clamped in floating point BEFORE the cast, because a centre far outside the
- * box -- or a NaN -- would otherwise reach an int conversion that is undefined
- * out of range. Inside it this is the plain truncation, so no cell changes.
+ * @brief The cell holding coordinate @p x along axis @p k, clamped into the grid
+ *        in floating point before the cast (an out-of-range or NaN value would
+ *        otherwise be undefined behaviour).
  *
  * @param g The grid.
  * @param k Axis.
@@ -940,14 +798,8 @@ static void grid_build(body_grid *g, const MFTL_Domain *dom, const double *centr
     g->origin[k] = dom->global_min[k];
   }
 
-  /* A domain a thousand droplet radii wide would otherwise ask for a cell table
-   * proportional to the DOMAIN rather than to the data. Halve the longest axis
-   * until the table is proportional to what goes in it.
-   *
-   * The table size is carried in DOUBLE because three int axes overflow a long:
-   * exact below 2^53, and anything above that is far past the cap, so every
-   * comparison comes out as integer arithmetic would have. The cap is also held
-   * to INT_MAX, which is what lets a cell index stay an int. */
+  /* Cap the cell table at O(items): halve the longest axis until it fits
+   * (sizes compared in double, exact below 2^53; the cap stays <= INT_MAX). */
   const long cap = MFTL_MIN(4L * (long) MFTL_MAX(n_items, 1) + 64L, (long) INT_MAX);
   while ((double) g->n[0] * (double) g->n[1] * (double) g->n[2] > (double) cap)
   {
@@ -990,12 +842,10 @@ static void grid_free(body_grid *g)
 }
 
 /**
- * @brief The distinct cell indices to visit along one axis around @p ck.
- *
- * Three cells normally. FEWER when the axis has three cells or less, because
- * `{ck-1, ck, ck+1}` then wraps onto cells already visited and every duplicate
- * would produce a duplicate candidate -- which on the send path is a triangle
- * packed twice and therefore a contact reported twice.
+ * @brief The distinct cell indices to visit along one axis around @p ck: three
+ *        normally, fewer on an axis of at most three cells, where periodic
+ *        wrap-around would visit a cell twice (and a duplicate candidate would
+ *        pack a triangle twice).
  *
  * @param      g   The grid.
  * @param      dom Supplies the periodicity.
@@ -1106,12 +956,8 @@ static int sorted_insert(int **list, int *n, int *cap, int gid)
 }
 
 /**
- * @brief Drops directory entries this rank neither holds nor has a patch for.
- *
- * Without it the directory only ever grows: a droplet that drifted past this
- * rank three thousand timesteps ago would still own a slot. With it the
- * directory is bounded by what is actually near, which is the property the
- * sparse form exists to have.
+ * @brief Drops directory entries this rank neither holds nor has a patch for, so
+ *        the directory stays bounded by what is near.
  *
  * @param h   The halo.
  * @param ens The ensemble, for the "still held here" half of the test.
@@ -1133,23 +979,14 @@ static void halo_prune(MFTL_SpatialHalo *h, const MFTL_Ensemble *ens)
 }
 
 /**
- * @brief Fills `halo->pair` from this rank's own extents and its arrivals.
+ * @brief Fills `halo->pair` from this rank's own records and the neighbours'.
  *
- * ── TWO SOURCES, AND BOTH ARE NEEDED ──────────────────────────────────────
- *
- * LOCAL-LOCAL. Two bodies this rank holds shares of, whose shares are within the
- * pair's envelope. No halo is involved and none would ever arrive: the contact
- * is entirely inside this partition.
- *
- * LOCAL-ARRIVED. A body some neighbour holds, whose published extent is within
- * the envelope of one of this rank's bodies with a SMALLER id. That is precisely
- * the condition the sender applied when it decided to pack, mirrored -- so the
- * pair list and the patch that serves it are two readings of one decision rather
- * than two decisions that have to be kept in step.
- *
- * The A side is always the smaller body id and always held here, because only an
- * OWNED A-side primitive may report a contact. A pair produced by both sources
- * is deduplicated by halo_pairs_finish().
+ * Two sources: LOCAL-LOCAL pairs (two bodies held here whose shares are within
+ * the envelope; no halo involved) and LOCAL-ARRIVED pairs (a neighbour's record
+ * of a LARGER body id within the envelope of a body held here, kept only if
+ * something of it is visible here) -- the mirror of the sender's packing
+ * decision. Plus `(B, B)` for every held body when `self_pairs` is set. The A
+ * side is always held here and has the smaller id.
  *
  * @param ens       The ensemble.
  * @param halo      Receives the pairs.
@@ -1235,21 +1072,15 @@ static void build_near_pairs(MFTL_Ensemble *ens, MFTL_SpatialHalo *halo, const d
       for (int k = 0; k < 3; ++k) wh[k] = ri[4 + k] + m;
       if (!interval_overlap(domain, ri + 1, wh, rr + 1, rr + 4)) continue;
 
-      /* Only if something actually arrived. A neighbour whose share of the body
-       * is near but whose triangles all missed the per-triangle test leaves no
-       * patch, and traversing an empty B side would find nothing at a cost. */
+      /* Only if something of B is visible here. */
       if (MFTLSpatialHaloPatch(halo, gr) == MFTL_NULL && MFTLEnsembleFindLocalSlot(ens, gr) == MFTL_ERROR) continue;
 
       halo_pair_add(halo, gi, gr);
     }
   }
 
-  /* ── Every body against ITSELF, when asked ───────────────────────────────
-   *
-   * A record exists only for a body this rank owns something of, which is
-   * exactly the condition for having A-side triangles to report from. Whether
-   * any B side arrived does not matter: the local share alone can be within
-   * the envelope of itself -- a neck entirely inside one rank. */
+  /* ── Self pairs, when asked: every body with an owned share here (a neck may
+   * lie entirely inside one rank). */
   if (halo->self_pairs)
   {
     for (int i = 0; i < n_my; ++i)
@@ -1293,11 +1124,8 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
 
   MFTL_ASSERT(MFTL_MPI_PackedVertex != MPI_DATATYPE_NULL && "MFTLExtendSpatialHalo: call MFTLRegisterMpiTypes() first");
 
-  /* ── 0. This rank's own record for every body it holds ───────────────────
-   *
-   * Ascending by body id, because `local_objects` is: the neighbour blocks
-   * arrive in that order too, which is what makes a partner lookup a binary
-   * search over a sorted run rather than a table indexed by the id space. */
+  /* ── 0. One record per held body with an owned share, ascending by id (so a
+   * neighbour's block can be binary-searched). */
   double *const my_rec = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(nb, 1) * MFTL_HALO_REC * sizeof(double), "spatial halo body records");
   int n_my = 0;
 
@@ -1320,12 +1148,9 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
     n_my++;
   }
 
-  /* ── 1. Discard what this call is about to replace ───────────────────────
-   *
-   * The near-bodies form owns the whole directory, so every patch goes: last
-   * call's patches describe where the bodies were a timestep ago, and keeping
-   * one would report contacts against a surface nobody occupies any more. The
-   * request form only speaks for the bodies it was asked about. */
+  /* ── 1. Discard the patches this call replaces: all of them in near mode
+   * (stale geometry would report contacts with surfaces no longer there), the
+   * requested B bodies otherwise. */
   if (near)
   {
     for (int e = 0; e < halo->num_objects; ++e)
@@ -1342,17 +1167,8 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
     }
   }
 
-  /* ── 2. Publish, non-blocking ────────────────────────────────────────────
-   *
-   * NON-BLOCKING because there is exactly one piece of real work that does not
-   * depend on the answer, and it is proportional to the mesh rather than to the
-   * neighbour count: building each body's per-triangle intervals. Nothing after
-   * that can start early -- a triangle cannot be classified before the extents
-   * arrive, packed before it is classified, or sent before it is packed.
-   *
-   * Two collectives rather than one, and for the same reason the per-body
-   * reduction takes two: only the holder of a body knows it holds it, so the
-   * lengths cannot be predicted from the id space. */
+  /* ── 2. Publish the records: count allgather, then a non-blocking allgatherv
+   * overlapped with step 4 (the only work independent of the answer). */
   int *const rcount = (int *) MFTLCallocOrDie((size_t) MFTL_MAX(nn, 1), sizeof(int), "spatial halo record counts");
   int *const rdispl = (int *) MFTLCallocOrDie((size_t) MFTL_MAX(nn, 1), sizeof(int), "spatial halo record displacements");
   double *nb_rec = MFTL_NULL;
@@ -1378,11 +1194,8 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
     MPI_Ineighbor_allgatherv(my_rec, scount, MPI_DOUBLE, nb_rec, rcount, rdispl, MPI_DOUBLE, domain->comm_graph, &rec_req);
   }
 
-  /* ── 3. Which of my bodies can travel, and how far a margin each needs ────
-   *
-   * Indexed by LOCAL SLOT. A request naming a body this rank does not hold is
-   * silently dropped: there is nothing here to send, and the rank that does hold
-   * it is making the same decision from its own list. */
+  /* ── 3. Which held bodies may travel, and their margins (by local slot). A
+   * request naming a body not held here is ignored. */
   int *const req_off = (int *) MFTLCallocOrDie((size_t) nb + 1, sizeof(int), "spatial halo partner offsets");
   int *req_list = MFTL_NULL;
   double *const margin_of = (double *) MFTLCallocOrDie((size_t) MFTL_MAX(nb, 1), sizeof(double), "spatial halo margins");
@@ -1400,9 +1213,8 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
       if (ob == MFTL_ERROR) continue;
       is_b[ob] = MFTL_TRUE;
       req_off[ob + 1]++;
-      /* One body can be B in several pairs with different margins. The LARGEST
-       * wins: a triangle wanted by any partner must be sent, and using the
-       * smallest would silently drop contacts for the pair that asked for more. */
+      /* Several requests for one B: the LARGEST margin wins (never drop a
+       * triangle some partner wants). */
       if (requests[r].margin > margin_of[ob]) margin_of[ob] = requests[r].margin;
     }
     for (int o = 0; o < nb; ++o) req_off[o + 1] += req_off[o];
@@ -1419,14 +1231,9 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
     free(cursor);
   }
 
-  /* ── 4. Per-triangle intervals, WHILE the records fly ────────────────────
-   *
-   * Built ONCE per body and reused for every neighbour and every partner, and
-   * only for the bodies that can actually travel. The margin is NOT folded in
-   * here, because in the near-bodies form it is not known until the partners
-   * are: it is folded into each PARTNER's half-width instead, once per
-   * (body, neighbour, partner), so the inner test is still a bare distance
-   * compare. */
+  /* ── 4. Per-triangle extents of every sendable body, once, while the records
+   * fly. The margin is folded into the PARTNER's half-width later, so the inner
+   * test stays a bare distance compare. */
   int *const box_off = (int *) MFTLCallocOrDie((size_t) nb + 1, sizeof(int), "spatial halo box offsets");
   for (int o = 0; o < nb; ++o) box_off[o + 1] = box_off[o] + (is_b[o] ? ens->local_objects[o]->tris.n_local : 0);
 
@@ -1456,20 +1263,14 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
     MPI_Wait(&rec_req, MPI_STATUS_IGNORE);
   }
 
-  /* ── 5. Classify and pack ────────────────────────────────────────────────
-   *
-   * `margin_of[o]` is the widest envelope any matched partner asked for, and it
-   * is what the triangle boxes are compared with. Taking the maximum rather than
-   * the exact per-pair value can only send MORE, which is the safe direction:
-   * the pre-filter a triangle test stands in for must never be stricter than the
-   * test itself. */
+  /* ── 5. Classify and pack, against the WIDEST envelope any matched partner
+   * needs (erring towards sending more is the safe direction). */
   MFTL_SendBuffer *const send_t = (MFTL_SendBuffer *) MFTLCallocOrDie((size_t) nproc, sizeof(MFTL_SendBuffer), "spatial halo triangle buffers");
   MFTL_SendBuffer *const send_v = (MFTL_SendBuffer *) MFTLCallocOrDie((size_t) nproc, sizeof(MFTL_SendBuffer), "spatial halo vertex buffers");
 
   if (exchanging)
   {
-    /* Which neighbour block each arriving record came from, so a match knows
-     * where to send. One int per record, filled once. */
+    /* Source neighbour of each arriving record. */
     int *const rec_src = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_nb_rec, 1) * sizeof(int), "spatial halo record sources");
     for (int i = 0; i < nn; ++i)
     {
@@ -1478,9 +1279,8 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
       for (int r = first; r < last; ++r) rec_src[r] = i;
     }
 
-    /* The grid over the arriving records. Its cell has to cover the widest body
-     * on either side plus the widest envelope, or "within one cell" would stop
-     * being a superset of "within reach". */
+    /* Grid over the arriving records; the reach covers the widest body on
+     * either side plus the widest envelope. */
     body_grid grid;
     {
       double reach[3] = {0.0, 0.0, 0.0};
@@ -1503,8 +1303,7 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
       grid_build(&grid, domain, (n_nb_rec > 0) ? nb_rec + 1 : MFTL_NULL, MFTL_HALO_REC, n_nb_rec, reach);
     }
 
-    /* Matches for one body, grouped by neighbour: `(record index)` runs with
-     * `mat_off[nidx]`. Reused across bodies rather than reallocated. */
+    /* Per-body matches grouped by neighbour; reused across bodies. */
     mftl_int_buffer cand;
     ib_init(&cand, 64);
     int *const mat_cnt = (int *) MFTLCallocOrDie((size_t) MFTL_MAX(nn, 1), sizeof(int), "spatial halo match counts");
@@ -1519,10 +1318,8 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
     unsigned *const vstamp = (unsigned *) MFTLCallocOrDie((size_t) MFTL_MAX(max_nv, 1), sizeof(unsigned), "spatial halo vertex stamps");
     unsigned vepoch = 0u;
 
-    /* One partner extent per match on ONE neighbour. Near mode bounds that by
-     * that neighbour's record count; the request form bounds it by how many
-     * times the caller named this body as B, and a caller is allowed to name the
-     * same pair twice. */
+    /* Partner extents of one neighbour (bounded by its record count or by the
+     * request count, since a caller may name a pair twice). */
     double *const ph =
         (double *) MFTLMallocOrDie(6 * (size_t) MFTL_MAX(MFTL_MAX(n_nb_rec, n_requests), 1) * sizeof(double), "spatial halo partner extents");
 
@@ -1540,16 +1337,10 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
       owned_interval(obj, domain, my_c, my_h);
       if (interval_is_empty(my_h)) continue;
 
-      /* ── Find the partners ──────────────────────────────────────────────
-       *
-       * NEAR: every arriving record for a SMALLER body id whose extent is within
-       * the pair's envelope. The id order is the "reported once" rule -- the
-       * holder of the smaller id is the rank that reports the pair, so it is the
-       * rank that needs the copy, and sending both ways would report every
-       * cross-rank contact twice.
-       *
-       * REQUEST: the A bodies the caller named, looked up in each neighbour's
-       * sorted run. */
+      /* Partners. NEAR: arriving records of SMALLER ids (or the same id with
+       * self_pairs) within the envelope -- the holder of the smaller id reports,
+       * so only it needs the copy. REQUEST: the named A bodies, binary-searched
+       * in each neighbour's sorted block. */
       ib_reset(&matched);
       for (int i = 0; i < nn; ++i) mat_cnt[i] = 0;
 
@@ -1565,9 +1356,7 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
           const int r = cand.data[ci];
           const double *const rc = &nb_rec[(size_t) r * MFTL_HALO_REC];
           const int ga = (int) rc[0];
-          /* Only the larger id travels -- or the SAME id, when self-proximity
-           * was asked for: then a neighbour's share of body B is near this
-           * rank's share of body B, and the pair (B, B) needs it here. */
+
           if (ga > gb || (ga == gb && !halo->self_pairs)) continue;
           if (domain->neighbors[rec_src[r]] == domain->rank) continue;  // a thin periodic grid can name this rank
 
@@ -1597,8 +1386,7 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
           {
             const int ga = req_list[pi];
 
-            /* Binary search the neighbour's run, which is ascending by body id
-             * because every rank publishes its local directory in order. */
+
             int lo = 0, hi = nrec - 1, found = MFTL_ERROR;
             while (lo <= hi)
             {
@@ -1627,9 +1415,7 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
 
       if (matched.size == 0) continue;
 
-      /* Group the matches by neighbour so that each destination packs each
-       * triangle at most once -- a triangle wanted by two partners on the same
-       * rank must not be sent twice, or the contact is reported twice. */
+      /* Group by neighbour so each destination gets each triangle at most once. */
       mat_off[0] = 0;
       for (int i = 0; i < nn; ++i) mat_off[i + 1] = mat_off[i] + mat_cnt[i];
 
@@ -1652,8 +1438,7 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
 
         const int dest = domain->neighbors[i];
 
-        /* One partner extent per match, with the margin folded into the
-         * HALF-WIDTH so the triangle loop below is a bare distance compare. */
+        /* Partner extents with the margin folded into the half-width. */
         for (int j = 0; j < np; ++j)
         {
           const double *const rc = &nb_rec[(size_t) grouped.data[mat_off[i] + j] * MFTL_HALO_REC];
@@ -1704,8 +1489,7 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
           for (int k = 0; k < 3; ++k)
           {
             const MFTL_HalfEdge *const he = &obj->tris.he[3 * t + k];
-            /* The TARGET vertex of half-edge 3t+k -- not tris.verts[3t+k], which
-             * is its ORIGIN. The two differ by a rotation. */
+            /* The TARGET of half-edge 3t+k (not tris.verts[3t+k], its origin). */
             pt->vertex_gid[k] = obj->verts.rec[he->vertex_idx].global_id;
             pt->he_flags[k] = he->flags;
           }
@@ -1790,24 +1574,20 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
     const MFTL_PackedVertex *const av = (const MFTL_PackedVertex *) x[0].recv_buf;
     const MFTL_PackedTriangleComplex *const at = (const MFTL_PackedTriangleComplex *) x[1].recv_buf;
 
-    /* Which bodies arrived, as a sorted unique list. It is short -- a rank is
-     * near a handful of partners -- so the arrivals are bucketed by a position
-     * in THAT list rather than by body id, which is the whole reason the
-     * grouping pass no longer costs an array per body in the ensemble. */
+    /* The arrived bodies as a short sorted list; arrivals are bucketed by
+     * position in it. */
     int *blist = MFTL_NULL;
     int n_blist = 0, cap_blist = 0;
     for (int i = 0; i < x[1].recv_count; ++i) (void) sorted_insert(&blist, &n_blist, &cap_blist, at[i].body_gid);
     for (int i = 0; i < x[0].recv_count; ++i) (void) sorted_insert(&blist, &n_blist, &cap_blist, av[i].body_gid);
 
-    /* Every entry is created BEFORE any slot is looked up: halo_entry() is an
-     * ordered insert, so it moves the slots of everything after it. */
+    /* Create all entries before looking up slots (inserts move slots). */
     for (int i = 0; i < n_blist; ++i) (void) halo_entry(halo, blist[i]);
 
     int *const entry_of = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_blist, 1) * sizeof(int), "spatial halo arrival entries");
     for (int i = 0; i < n_blist; ++i) entry_of[i] = MFTLSpatialHaloFindBody(halo, blist[i]);
 
-    /* Counting sort by body: the stream arrives grouped by SENDER, and a patch
-     * has to see every contribution to its body at once. */
+    /* Counting sort by body (the stream is grouped by sender). */
     int *const v_off = (int *) MFTLCallocOrDie((size_t) n_blist + 1, sizeof(int), "spatial halo vertex grouping");
     int *const t_off = (int *) MFTLCallocOrDie((size_t) n_blist + 1, sizeof(int), "spatial halo triangle grouping");
 
@@ -1848,9 +1628,7 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
       rebuild_patch(halo, entry_of[i], &sv[v_off[i]], v_off[i + 1] - v_off[i], &st[t_off[i]], t_off[i + 1] - t_off[i], &tbl, &scratch);
     }
 
-    /* A patch is this rank's only handle on a body it holds nothing of, so the
-     * radius it needs for its envelope has to come off the wire. The sender
-     * published it in the same record that made the pair a candidate. */
+    /* Radii of bodies known only through patches come from the records. */
     for (int r = 0; r < n_nb_rec; ++r)
     {
       const double *const rc = &nb_rec[(size_t) r * MFTL_HALO_REC];
@@ -1884,11 +1662,7 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
   free(rcount);
   free(my_rec);
 
-  /* Both forms, not just the near one: the directory picks up an entry for every
-   * body a neighbour published a radius for, and over a run of a droplet
-   * ensemble those would accumulate every body that ever drifted past. Pruning
-   * to "held here, or a patch arrived" is what keeps the directory proportional
-   * to what is actually nearby. */
+  /* Keep only bodies held here or with a patch. */
   halo_prune(halo, ens);
   return MFTL_SUCCESS;
 }

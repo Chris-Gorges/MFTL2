@@ -5,25 +5,14 @@
  * @ingroup mftl_geometry
  *
  * @brief Bounded rasterisation of a triangle mesh's signed distance onto a
- *        lattice window, with the sign from angle-weighted pseudo-normals.
+ *        lattice window, signed by angle-weighted pseudo-normals.
  *
- * ## SCATTER OVER TRIANGLES, BOUNDED BY A CUTOFF
- *
- * The same argument vertex_geometry.c makes for normals applies here with more
- * force. The GATHER form -- for each node, find the nearest triangle -- needs a
- * spatial search per node. The SCATTER form visits each triangle once, walks
- * only the nodes inside its box dilated by the cutoff, and keeps the smallest
- * magnitude per node. Cost is `O(T * (h + 2 r)^3 / dx^3)` with h the triangle
- * size and r the cutoff: a few hundred nodes per triangle at the resolutions
- * the topology change uses, independent of how far the rest of the mesh is.
- *
- * ## THE SIGN
- *
- * A node's distance is decided by the nearest triangle, but its sign cannot be:
- * nearest to a shared edge or vertex, the face normal of whichever triangle was
- * visited first is simply the wrong question on a folded surface. The
- * pseudo-normal of the FEATURE the closest point lies on is the right one --
- * see MFTLRasterizeSignedDistance() in mftl_geometry.h.
+ * A SCATTER over triangles: each triangle visits only the nodes inside its box
+ * dilated by the cutoff and keeps, per node, the contribution of smallest
+ * magnitude (MFTLSdfMerge()). Cost \f$O(T\,(h+2r)^3/\Delta x^3)\f$ for triangle
+ * size h and cutoff r, independent of the rest of the mesh. The sign comes from
+ * the pseudo-normal of the closest FEATURE (face, edge or vertex) -- see
+ * MFTLRasterizeSignedDistance().
  */
 
 #include "mftl_geometry.h"
@@ -75,9 +64,8 @@ void MFTLSdfGridFree(MFTL_SdfGrid *grid)
 /**
  * @brief Unit normal of a triangle from its corners, or zero if it has no area.
  *
- * Recomputed from the current corners rather than read from `tris.normal`,
- * which nothing guarantees is current -- redistribution leaves it unspecified by
- * design.
+ * Recomputed rather than read from `tris.normal`, which a redistribution leaves
+ * unspecified.
  *
  * @param      c The three corners, as MFTLGetTriangleCorners() returns them.
  * @param[out] n The unit normal.
@@ -127,13 +115,9 @@ long MFTLRasterizeSignedDistance(MFTL_SdfGrid *grid, const MFTL_Object *obj, int
     }
     if (empty) continue;
 
-    /* ── The three pseudo-normals this triangle can need ────────────────────
-     *
-     * Computed lazily per triangle, once: most triangles never produce an edge
-     * or vertex closest point on any node, but the face normal is always used.
-     * The corner indices come from `tris.verts`, whose slot k is the ORIGIN of
-     * half-edge 3t+k -- the same convention MFTLClosestPointOnTriangle's edge
-     * numbering follows. */
+    /* Pseudo-normals: the face normal always; each edge's lazily. Edge k of
+     * MFTLClosestPointOnTriangle() is half-edge 3t+k, and corner k is
+     * tris.verts[3t+k]. */
     double n_face[3];
     face_normal(T, n_face);
     double n_edge[3][3];
@@ -164,8 +148,7 @@ long MFTLRasterizeSignedDistance(MFTL_SdfGrid *grid, const MFTL_Object *obj, int
 
           double *const node = &grid->phi[((size_t) lz * ny + ly) * nx + lx];
           const double d = sqrt(d_sq);
-          /* A node that already holds something strictly nearer cannot change,
-           * whatever the sign here would be -- skip the pseudo-normal. */
+          /* A node already holding something strictly nearer cannot change. */
           if (d > fabs(*node)) continue;
 
           const double *n = n_face;

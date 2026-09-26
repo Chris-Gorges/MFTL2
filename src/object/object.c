@@ -4,36 +4,14 @@
  * @date 2026-08-14
  * @ingroup mftl_object
  *
- * @brief Object lifecycle and the ONE allocation authority for both pools.
+ * @brief Object lifecycle and the single allocation authority for both pools.
  *
- * ## WHY THIS FILE IS THE ONLY PLACE THAT MAY TOUCH A POOL POINTER
- *
- * A pool is one allocation. `vertex_layout_compute` decides where each
- * sub-array starts inside it, `*_pool_bind` publishes those addresses into the
- * struct, and `*_pool_resize` is the only function that ever calls either --
- * `*_pool_reserve` is its grow-only wrapper, `MFTLObjectReleasePools` is it at
- * zero capacity, and `MFTLObjectShrinkToFit` is the only way down. The
- * consequence is the property the whole rewrite is organised around:
- *
- *     THE AoS RECORDS AND EVERY SoA ARRAY OF A POOL HAVE THE SAME CAPACITY,
- *     ALWAYS, BECAUSE THEY ARE THE SAME malloc.
- *
- * The arrangement this replaces is three capacity fields (`capacity_*`,
- * `geom_cap_*`, `flat_cap_*`), three reserve functions and a rule written in a
- * comment: "every site that raises capacity_triangles must call
- * MFTLObjectReserveTriangleGeometry, and a site that forgets does not produce a
- * wrong number -- it produces a heap overflow the next time the geometry pass
- * runs". That is an accurate description of any design that depends on everyone
- * remembering something. Here there is nothing to remember: growing the block
- * grows all of it, and a caller cannot reach the individual arrays' sizes
- * because there are none.
- *
- * Two secondary benefits worth naming, since they were not the goal:
- *
- *   - Destroying an object is two free() calls, not fifteen.
- *   - Every sub-array starts on a cache line (MFTLLayoutAdd), so a kernel
- *     writing `tris.area` cannot false-share with one reading `tris.normal`,
- *     and no streaming loop needs a vectoriser peel prologue.
+ * `*_layout_compute` decides where each sub-array starts inside a pool's one
+ * block, `*_pool_bind` publishes those addresses, and `*_pool_resize` is the
+ * only function that allocates, copies or frees a block (`*_pool_reserve` is
+ * its grow-only wrapper, MFTLObjectReleasePools() is a resize to zero, and
+ * MFTLObjectShrinkToFit() is the only way down). Hence the AoS records and every
+ * SoA array of a pool always share one capacity: they are the same `malloc`.
  */
 
 #include "mftl_object.h"
@@ -59,17 +37,13 @@ typedef struct
 } vertex_layout;
 
 /**
- * @brief Lays out a vertex block for @p cap vertices.
+ * @brief Lays out a vertex block for @p cap vertices: `rec`, `pos`, `normal`.
  *
- * Field order is not arbitrary: `rec` and `pos` come first because they are the
- * two arrays every pass touches, so they share the front of the block and the
- * TLB entries that go with it. `normal` is written by the vertex-normal pass and
- * read by whoever wants it.
- *
- * @return Total block size in bytes.
+ * `rec` and `pos`, which every pass touches, come first.
  *
  * @param[out] l   Receives one byte offset per field.
  * @param      cap Vertices the block must hold.
+ * @return Total block size in bytes.
  */
 static size_t vertex_layout_compute(vertex_layout *l, int cap)
 {
@@ -96,31 +70,16 @@ static void vertex_pool_bind(MFTL_VertexPool *p, unsigned char *blk, const verte
 }
 
 /**
- * @brief Resizes the vertex pool to exactly @p capacity entities, either way.
+ * @brief Resizes the vertex pool to exactly @p capacity vertices, up or down.
  *
- * The one function that allocates, frees or rebinds a vertex block. Growing and
- * shrinking are the SAME operation -- lay out a block for the requested
- * capacity, copy the live prefix in, free the old one -- so there is no second
- * code path for a shrink to get subtly wrong, and no second place that can
- * disagree with vertex_layout_compute() about where an array starts.
+ * Lays out a new block, zeroes it (so flags and never-written slots start
+ * defined), copies the live prefix of every array and frees the old block --
+ * one code path for growth and shrink. Capacity 0 releases the block and zeroes
+ * the struct (NULL pointers, not a dangling allocation of nothing).
  *
- * Contents are preserved: the live prefix of every array is copied into the new
- * block. Discarding the geometry on resize -- on the argument that the caller is
- * about to recompute it -- is true of the callers that exist and false in
- * general, and its failure mode is a silent 0.0 rather than a crash. A memcpy at
- * memory bandwidth, O(log n) times over the mesh's life, is not worth that class
- * of bug.
- *
- * @p capacity must be at least `p->n`. This function moves STORAGE; it does not
- * decide what to discard, exactly as MFTLObjectReleasePools() does not. A caller
- * that wants fewer entities lowers the count first, through
- * MFTLObjectSetCounts(). Clamping the copy to `MFTL_MIN(p->n, capacity)` instead
- * would not prevent that mistake -- it would convert an immediate heap overflow
- * into `n > capacity`, which is the corrupt state MFTLObjectPoolsAreConsistent()
- * exists to detect, surfacing later and somewhere else.
- *
- * @param p        The pool. Its `block` is replaced and the old one freed.
- * @param capacity Vertices the pool must hold afterwards. 0 releases the block.
+ * @param p        The pool.
+ * @param capacity Vertices it must hold afterwards; at least `p->n` (asserted:
+ *                 this moves storage and never discards entities).
  */
 static void vertex_pool_resize(MFTL_VertexPool *p, int capacity)
 {
@@ -128,12 +87,8 @@ static void vertex_pool_resize(MFTL_VertexPool *p, int capacity)
 
   if (capacity == p->capacity) return;
 
-  /* Zero capacity is a RELEASE, not an allocation of nothing.
-   * MFTLAlignedAllocOrDie() treats a request of 0 bytes as 1 and returns a real
-   * pointer, which would leave `capacity == 0 && block != MFTL_NULL` -- exactly
-   * the state MFTLObjectPoolsAreConsistent() rejects. Zeroing the whole struct
-   * also re-NULLs every sub-array pointer, which matters for the same reason:
-   * a dangling pointer here passes every count-based check. */
+  /* Zero capacity is a release: free, and zero the struct so every pointer is
+   * NULL (the state MFTLObjectPoolsAreConsistent() expects of an empty pool). */
   if (capacity == 0)
   {
     free(p->block);
@@ -145,10 +100,7 @@ static void vertex_pool_resize(MFTL_VertexPool *p, int capacity)
   const size_t bytes = vertex_layout_compute(&l, capacity);
   unsigned char *blk = (unsigned char *) MFTLAlignedAllocOrDie(bytes, "MFTL vertex pool");
 
-  /* Zeroed rather than left dirty: fields no explicit pass writes (flags in
-   * particular, which carries MFTL_FLAG_BOUNDARY) must start at a defined
-   * value, and a slot read before it is written yields 0.0 instead of whatever
-   * the allocator last had there. */
+  /* Zeroed so never-written fields (flags in particular) start defined. */
   memset(blk, 0, bytes);
 
   const size_t n = (size_t) p->n;
@@ -166,13 +118,8 @@ static void vertex_pool_resize(MFTL_VertexPool *p, int capacity)
 }
 
 /**
- * @brief Grows the vertex pool to @p capacity entities. Never shrinks.
- *
- * The grow-only half of vertex_pool_resize(). It stays its own function because
- * "a request at or below the current capacity is a no-op" is a contract
- * MFTLObjectReserve() publishes and MFTLObjectSetCounts() depends on -- see
- * include/mftl_object.h. Shrinking is reachable only through
- * MFTLObjectShrinkToFit(), which is explicit, gated, and never on a hot path.
+ * @brief Grows the vertex pool to @p capacity vertices; a no-op if it already
+ *        holds that many (the ratchet MFTLObjectReserve() publishes).
  *
  * @param p        The pool.
  * @param capacity Vertices the pool must hold afterwards.
@@ -200,18 +147,15 @@ typedef struct
 } triangle_layout;
 
 /**
- * @brief Lays out a triangle block for @p cap triangles and 3*@p cap half-edges.
+ * @brief Lays out a triangle block for @p cap triangles and 3 @p cap half-edges:
+ *        `rec`, `he`, `area`, `normal`, `center`, `verts`, `neighbors`.
  *
- * The half-edge array being here, rather than in a pool of its own, is what
- * removes the third independent capacity a separate half-edge pool would need.
- * It is not a packaging choice: a triangle has exactly three half-edges at 3t..3t+2
- * (mftl_topology.h), so a half-edge capacity that could differ from 3x the
- * triangle capacity would describe a mesh that cannot exist.
- *
- * @return Total block size in bytes.
+ * The half-edges live in this block because a triangle has exactly three, at
+ * 3t..3t+2; a separate half-edge capacity would describe an impossible mesh.
  *
  * @param[out] l   Receives one byte offset per field.
- * @param      cap Triangles the block must hold. Half-edges get 3x that.
+ * @param      cap Triangles the block must hold.
+ * @return Total block size in bytes.
  */
 static size_t triangle_layout_compute(triangle_layout *l, int cap)
 {
@@ -246,18 +190,11 @@ static void triangle_pool_bind(MFTL_TrianglePool *p, unsigned char *blk, const t
 }
 
 /**
- * @brief Resizes the triangle pool to exactly @p capacity triangles, either way.
+ * @brief Resizes the triangle pool (and its half-edges) to exactly @p capacity
+ *        triangles, up or down. Same contract as vertex_pool_resize().
  *
- * The triangle-side mirror of vertex_pool_resize(), and everything said there
- * applies: one code path for both directions, contents preserved, @p capacity at
- * least `p->n`, and 0 meaning release rather than an allocation of nothing.
- *
- * Half-edges come along automatically -- they are in this block at 3x this
- * capacity (triangle_layout_compute), so a shrink cannot leave them behind at
- * the old size any more than a growth can.
- *
- * @param p        The pool. Its `block` is replaced and the old one freed.
- * @param capacity Triangles the pool must hold afterwards. 0 releases the block.
+ * @param p        The pool.
+ * @param capacity Triangles it must hold afterwards; at least `p->n`.
  */
 static void triangle_pool_resize(MFTL_TrianglePool *p, int capacity)
 {
@@ -296,10 +233,7 @@ static void triangle_pool_resize(MFTL_TrianglePool *p, int capacity)
 }
 
 /**
- * @brief Grows the triangle pool to @p capacity triangles. Never shrinks.
- *
- * The grow-only half of triangle_pool_resize(); see vertex_pool_reserve() for
- * why the two halves are separate functions.
+ * @brief Grows the triangle pool to @p capacity triangles; never shrinks.
  *
  * @param p        The pool.
  * @param capacity Triangles the pool must hold afterwards.
@@ -328,9 +262,8 @@ MFTL_Object *MFTLObjectCreate(int global_id)
   object->global_id = global_id;
   object->domain = MFTL_NULL;  // set by MFTLEnsembleAddObject
   object->derived = 0u;
-  /* A mesh that has never been partitioned cannot have a partition that is still
-   * current, so the conservative value is the one that forces the first
-   * redistribution to do the work. */
+  /* Never partitioned, so no current partition: the first redistribution must
+   * rebuild it. */
   object->partition_dirty = MFTL_TRUE;
 
   return object;
@@ -390,11 +323,8 @@ void MFTLObjectSetCounts(MFTL_Object *obj, int n_vertices, int n_local_vertices,
    * ago, so whatever they hold is no longer a description of this mesh. */
   obj->derived = 0u;
 
-  /* And neither does the partition. This is THE choke point for entity creation
-   * and destruction, which is what makes the redistribution's per-body skip
-   * independent of an unenforceable convention: a caller that splits an edge or
-   * collapses one cannot get here without stamping, whatever it forgot to do.
-   * See MFTLObjectMarkPartitionDirty() for the whole list. */
+  /* Nor does the partition. Every entity creation or destruction passes through
+   * here, so the redistribution's skip of unchanged bodies cannot miss one. */
   obj->partition_dirty = MFTL_TRUE;
 }
 
@@ -422,10 +352,7 @@ size_t MFTLObjectPoolBytes(const MFTL_Object *obj)
 {
   MFTL_ASSERT(obj != MFTL_NULL);
 
-  /* Re-derived from the layout functions rather than from a per-entity constant,
-   * so it cannot drift when an array is added to either pool. That is also why
-   * it lives here: they are file-static, and this file is the only one that
-   * knows how big a block actually is. */
+  /* Re-derived from the layout functions, so it cannot drift from them. */
   size_t bytes = 0;
 
   if (obj->verts.capacity > 0)
@@ -449,23 +376,15 @@ bool MFTLObjectShrinkToFit(MFTL_Object *obj, double slack)
 
   bool moved = MFTL_FALSE;
 
-  /* The target is where an incrementally grown pool would have landed, so a
-   * shrink puts the capacity back ON the growth ladder rather than beside it.
-   * At n == 0 MFTLGrowCapacity() returns 0 -- the `needed <= current` early
-   * return -- so "give the block back entirely" is not a special case here, it
-   * is the same arithmetic reaching *_pool_resize(p, 0). */
+  /* Target: back on the growth ladder. At n == 0 MFTLGrowCapacity() returns 0,
+   * so a full release is the same arithmetic reaching *_pool_resize(p, 0). */
   const int v_target = MFTLGrowCapacity(0, obj->verts.n);
   const int t_target = MFTLGrowCapacity(0, obj->tris.n);
 
-  /* Two conditions, and they are not the same condition twice.
-   *
-   * The GATE is the policy: is this block wasteful enough to be worth a
-   * reallocation. The GUARD is correctness of repetition: for any count at or
-   * below MFTL_INIT_CAPACITY the target is a flat 128, so the gate stays true
-   * forever while there is nothing left to do -- a pool at capacity 128 with
-   * n == 4 satisfies `128 > 4 * 4` on every call, and without the guard would
-   * reallocate to the same size every timestep. Idempotence comes from the
-   * guard. */
+  /* GATE (policy): wasteful enough to reallocate? GUARD (idempotence): would
+   * the target actually be smaller? For n <= 128 the target is a flat 128, so
+   * without the guard a capacity-128 pool with n = 4 would "shrink" to itself
+   * on every call. */
   if ((double) obj->verts.capacity > slack * (double) obj->verts.n && v_target < obj->verts.capacity)
   {
     vertex_pool_resize(&obj->verts, v_target);
@@ -478,9 +397,7 @@ bool MFTLObjectShrinkToFit(MFTL_Object *obj, double slack)
     moved = MFTL_TRUE;
   }
 
-  /* Deliberately NOT stamped: see the header. This function moved storage; the
-   * counts, the contents, the derived arrays and the partition are all exactly
-   * what they were. */
+  /* Deliberately not stamped partition-dirty: only storage moved. */
   return moved;
 }
 
@@ -489,13 +406,8 @@ void MFTLObjectReleasePools(MFTL_Object *obj)
   MFTL_ASSERT(obj != MFTL_NULL);
   MFTL_ASSERT(obj->verts.n == 0 && obj->tris.n == 0 && "MFTLObjectReleasePools: the object still holds entities");
 
-  /* A release IS a resize to zero capacity, and routing it through the same two
-   * functions is what keeps "one place lays a block out, one place frees it"
-   * true rather than nearly true. The resize re-zeroes the struct, so a released
-   * object is indistinguishable from a freshly created one and the next
-   * MFTLObjectReserve() simply allocates. Rebinding the sub-array pointers to
-   * NULL matters: MFTLObjectPoolsAreConsistent derives them from `block`, and a
-   * dangling pointer here would pass every count-based check. */
+  /* A release is a resize to capacity 0, which also re-NULLs every sub-array
+   * pointer, so the object is indistinguishable from a fresh one. */
   vertex_pool_resize(&obj->verts, 0);
   triangle_pool_resize(&obj->tris, 0);
 }
@@ -520,10 +432,8 @@ bool MFTLObjectPoolsAreConsistent(const MFTL_Object *obj)
   }
   else
   {
-    /* Every pointer must be exactly where the layout for this capacity puts it.
-     * That is the strongest available statement of "the AoS and the SoA arrays
-     * were sized by the same call": if any of them had been grown separately, it
-     * would not be inside this block at this offset. */
+    /* Every pointer must sit exactly where the layout for this capacity puts
+     * it -- the strongest form of "all arrays were sized by the same call". */
     vertex_layout l;
     (void) vertex_layout_compute(&l, vp->capacity);
     const unsigned char *blk = (const unsigned char *) vp->block;

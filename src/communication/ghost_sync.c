@@ -4,40 +4,17 @@
  * @date 2026-08-14
  * @ingroup mftl_communication
  *
- * @brief Per-timestep ghost synchronisation: one per-vertex vector, unchanged
- *        topology.
+ * @brief Ghost synchronisation of one per-vertex 3-vector (position or normal)
+ *        with the topology unchanged.
  *
- * Redistribution is the expensive operation and it is only needed when OWNERSHIP
- * can have changed. Between two redistributions the partition is fixed and all a
- * ghost needs is fresh values, which is what this file moves -- 32 bytes per
- * ghost vertex per field, three neighbourhood collectives, nothing that scales
- * with nproc.
+ * A request/reply exchange, because only the HOLDER of a ghost knows it holds
+ * it; no owner-to-holder state is kept between calls. Per ghost vertex 8 B of
+ * request and 32 B of reply; three neighbourhood collectives (counts, requests,
+ * replies). One field per exchange: bundling recomputable fields with the
+ * position would ship bytes the receiver computes more cheaply.
  *
- * ### One field per exchange, and why that is not a missed fusion
- *
- * The whole exchange -- who asks whom for which vertex, and where each reply
- * lands -- is independent of the payload. The implementation is parameterised
- * by which per-vertex 3-vector is being moved, and both callers share it:
- *
- *   MFTLUpdateGhostPositions      verts.pos     -- authoritative, cannot be
- *                                                 recomputed anywhere else
- *   MFTLUpdateGhostVertexNormals  verts.normal  -- recomputable for OWNED
- *                                                 vertices, not for ghosts
- *
- * Shipping position, normal, both curvatures and the area in one 80-byte message
- * looks like a saving (one exchange instead of two) and is not: four fifths of
- * that payload is a function of the positions and the topology, so it would be
- * sent to save a receiver-side pass that costs less than the bytes do. Each field
- * costs exactly one exchange here, and a caller
- * that does not need the normals does not send them -- which is the common case,
- * because MFTLComputeVertexNormals is exact for owned vertices with no
- * communication at all (mftl_geometry.h).
- *
- * ### Why a request/reply and not a push
- *
- * Only the HOLDER of a ghost knows that it holds it; the owner has no record of
- * who copied its vertex. The request phase supplies exactly that information on
- * every call. No persistent owner-to-holder state is stored.
+ * Per call it builds one `[nproc]` rank-to-neighbour lookup (O(nproc) memory
+ * and time), the only term here that grows with the process count.
  */
 
 #include "mftl_communication.h"
@@ -53,13 +30,7 @@
 #include "mftl_object.h"
 #include "mftl_topology.h"
 
-/**
- * @brief Which per-vertex 3-vector an exchange moves.
- *
- * An enum rather than a pointer-to-member or an array offset, because the two
- * cases share the exchange code and differ only in which array is packed. Resolved
- * once per call, outside every loop.
- */
+/** @brief Which per-vertex 3-vector an exchange moves. */
 typedef enum
 {
   GHOST_FIELD_POSITION = 0,  ///< `verts.pos`.
@@ -91,31 +62,19 @@ static double *ghost_field_write(MFTL_Object *obj, ghost_field f)
 /**
  * @brief Answers the requests addressed to one object.
  *
- * The owner has to turn a global id into a pool slot, which is the one place
- * this module would have wanted a hash map. It does not need one: global ids are
- * dense per entity class, so a scatter of the OWNED vertices into an epoch-
- * stamped array (gt_* in comm_internal.h) answers every request for that object
- * with a single indexed read.
- *
- * The scatter is O(owned vertices) and the requests are O(halo), so it is only
- * worth doing per object that actually received a request -- which is why the
- * caller groups the requests by object first. In the many-body case that skips
- * the scatter for every body this rank does not hold, and the table for a body it
- * does hold is a few kilobytes and stays in cache.
- *
- * A request the owner cannot serve is a broken invariant (the requester believes
- * this rank owns a vertex it does not have). Rather than dereferencing garbage,
- * the reply is marked with MFTL_ERROR so the requester can skip it -- one
- * predictable compare on the apply side, and a diagnosable failure.
+ * The owner turns a vertex global id into a pool slot through the epoch-stamped
+ * id table (comm_internal.h), filled with this object's OWNED vertices only for
+ * objects that actually received requests. An unanswerable request (the
+ * requester believes this rank owns a vertex it does not) is answered with
+ * `global_id == MFTL_ERROR`, asserted in Debug and skipped by the requester.
  *
  * @param      obj        The mesh whose OWNED vertices answer the requests.
  * @param      field      Which per-vertex 3-vector is being synchronised.
- * @param      flat_recv  The received request ids, all senders concatenated.
+ * @param      flat_recv  The received requests (local slot, vertex id), all senders.
  * @param      order      Request indices belonging to this object.
  * @param      first      First slot of @p order to serve.
  * @param      last       One past the last slot to serve.
- * @param[out] replies    One payload per request. An unanswerable request gets
- *                        `global_id == MFTL_ERROR`.
+ * @param[out] replies    One payload per request.
  * @param      tbl        Epoch-stamped id-to-slot table, reused across objects.
  * @param[out] n_unserved Incremented once per request this rank could not answer.
  */
@@ -127,11 +86,7 @@ static void answer_object_requests(const MFTL_Object *obj, ghost_field field, co
   const int n_local = obj->verts.n_local;
 
   CS_BEGIN(ts_tbl);
-  /* Entry count and id range: the owned vertices go in, and their ids are drawn
-   * from the body's whole range. gt_begin() takes the direct-address path while
-   * this rank holds a reasonable share of the body and switches to a sparse table
-   * when it does not, which is what stops the table growing with the process
-   * count at a fixed problem size. See comm_internal.h. */
+  /* Owned vertices go in; the mode follows the share of the body held here. */
   gt_begin(tbl, n_local, MFTL_MAX(obj->next_vertex_gid, 1));
   for (int v = 0; v < n_local; ++v) gt_put(tbl, vr[v].global_id, v);
   CS_END(ts_tbl, g_t_table);
@@ -178,26 +133,18 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
   const int nproc = domain->nproc;
   const int nn = domain->num_neighbors;
 
-  /* The body-count guard is GLOBAL: three neighbourhood collectives follow, so a
-   * rank holding nothing must still enter them and exchange zero bytes. `nn` and
-   * `nproc` are safe to test locally -- a rank with no graph neighbours has no
-   * ghosts to sync and nobody is expecting a message from it, and nproc == 1 is
-   * the same number everywhere. */
+  /* Guards on GLOBAL state (or on a rank with no graph neighbours, which nobody
+   * expects a message from): a rank holding nothing must still enter the
+   * neighbourhood collectives. */
   if (ens->n_bodies_global == 0 || nn == 0 || nproc == 1) return MFTL_SUCCESS;
 
   CS_BEGIN(ts_total);
   MFTLCommStats.g_n_calls++;
   CS_BEGIN(ts_collect);
 
-  /* ── 1. Collect every ghost we hold, grouped by its owner ────────────────
-   *
-   * Two lists per neighbour, filled in lockstep: the REQUEST (object index,
-   * vertex gid) that goes on the wire, and the TARGET (object index, local vertex
-   * slot) that stays here. Recording the target now is what lets the apply phase
-   * be a direct indexed write. Re-deriving it instead costs a hash lookup per
-   * ghost, every timestep.
-   *
-   * Ghosts are an array SUFFIX, so the loop bound is the ownership filter. */
+  /* ── 1. Collect every ghost (the pool suffix), grouped by owner: a REQUEST
+   * (body id, vertex id) for the wire and a TARGET (local slot, vertex slot)
+   * kept here, so replies are applied by direct index. */
   mftl_int_buffer *const requests = (mftl_int_buffer *) MFTLMallocOrDie((size_t) nn * sizeof(mftl_int_buffer), "ghost request lists");
   mftl_int_buffer *const targets = (mftl_int_buffer *) MFTLMallocOrDie((size_t) nn * sizeof(mftl_int_buffer), "ghost target lists");
   for (int i = 0; i < nn; ++i)
@@ -222,30 +169,17 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
       const int n_idx = (owner >= 0 && owner < nproc) ? rank_to_neigh[owner] : MFTL_ERROR;
       if (n_idx == MFTL_ERROR)
       {
-        /* The owner is not in our 26-neighbourhood, so no message will reach it.
-         * Skipping keeps every rank inside the collectives below; aborting here
-         * would deadlock the ranks that are still fine.
-         *
-         * ASSERTED, because the consequence is silent and downstream: the ghost
-         * keeps a STALE POSITION, so this rank and the owner compute different
-         * centres for the same triangle, disagree about its destination in the
-         * next redistribution, and someone's owned triangle quietly loses an edge
-         * neighbour. The stderr line below is the Release symptom and it is easy
-         * to miss in a job log; in Debug this must stop the run at the cause.
-         *
-         * MFTLRemeshSyncGhostIds has the same structure and answers it with a
-         * global-communicator fallback. The same fix belongs here, and is not
-         * done: this function runs once per TIMESTEP rather than once per remesh,
-         * so it may not grow an O(nproc) path without a measurement first. */
+        /* Owner outside the 26-neighbourhood: unreachable. Skipped (aborting
+         * would deadlock the others) but asserted, because the stale position
+         * later makes two ranks route a triangle differently. There is no global
+         * fallback (unlike MFTLRemeshSyncGhostIds()); a partition whose halo
+         * leaves the neighbourhood must not outlive the call that created it. */
         MFTL_ASSERT(0 && "ghost sync: ghost vertex whose owner is not a graph neighbour -- its position will not be updated");
         orphaned++;
         continue;
       }
 
-      /* The REQUEST names the body by its global id -- the owner has its own
-       * slot for it and no reason for it to be the same one. The TARGET never
-       * leaves this rank, so it keeps the local slot and the apply phase stays a
-       * direct indexed write. */
+      /* Body by global id on the wire; local slot in the target. */
       ib_add2(&requests[n_idx], obj->global_id, vr[v].global_id);
       ib_add2(&targets[n_idx], o, v);
       MFTLCommStats.g_n_ghosts_requested++;
@@ -261,13 +195,8 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
 
   CS_END(ts_collect, g_t_collect);
 
-  /* ── 2. Exchange request counts ──────────────────────────────────────────
-   *
-   * Non-blocking, and this is the ONE place in this function where it buys
-   * anything: assembling the flat request image below is real work that does not
-   * depend on the counts. Everything after it is a strict dependency chain --
-   * the replies cannot be computed before the requests arrive and cannot be
-   * applied before they come back -- so the two alltoallv calls are blocking. */
+  /* ── 2. Request counts, non-blocking and overlapped with flattening the
+   * requests; everything after is a strict dependency chain. */
   int *const n_send = (int *) MFTLMallocOrDie((size_t) nn * sizeof(int), "ghost send counts");
   int *const n_recv = (int *) MFTLMallocOrDie((size_t) nn * sizeof(int), "ghost recv counts");
   for (int i = 0; i < nn; ++i) n_send[i] = requests[i].size;
@@ -312,14 +241,9 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
 
   CS_BEGIN(ts_answer);
 
-  /* ── 4. Answer them ──────────────────────────────────────────────────────
-   *
-   * The incoming stream is grouped by sender and, within a sender, by object.
-   * Answering it in arrival order would rebuild the id table once per (sender,
-   * object) pair, so the requests are first grouped by OBJECT with a counting
-   * sort -- O(requests + objects), no comparisons -- and each object's id table
-   * is then built exactly once. The replies are written back at the request's
-   * ORIGINAL position, because the requester matches them positionally. */
+  /* ── 4. Answer: group the requests by object (counting sort) so each object's
+   * id table is built once; replies go back at the request's ORIGINAL position,
+   * since the requester matches them positionally. */
   const int n_replies = total_recv / 2;
   MFTL_GhostUpdatePayload *const replies =
       (MFTL_GhostUpdatePayload *) MFTLMallocOrDie((size_t) MFTL_MAX(n_replies, 1) * sizeof(MFTL_GhostUpdatePayload), "ghost replies");
@@ -329,14 +253,8 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
   int unserved = 0;
 
   {
-    /* Resolve each request's body id to THIS rank's slot for it, ONCE, in place.
-     * Everything downstream then buckets by local slot, so the counting sort and
-     * its cursors stay sized by what this rank holds rather than by the
-     * ensemble. `flat_recv[2k+1]` -- the vertex id -- is left alone.
-     *
-     * A request for a body this rank has nothing of is a routing error, not a
-     * partition this rank is simply not part of: the requester named this rank
-     * as the vertex's OWNER, so it must hold the body. */
+    /* Resolve each body id to this rank's slot once, in place. A body not held
+     * here is a routing error: the requester named this rank as the owner. */
     int dropped = 0;
     for (int k = 0; k < n_replies; ++k)
     {
@@ -369,10 +287,7 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
   }
 
   {
-    /* The ensemble's, not a local: this table is sized by a body's id range, and
-     * building and releasing one per TIMESTEP was the last per-step allocation on
-     * either path. It is retired by an epoch bump inside answer_object_requests,
-     * which is what the epoch was always for. */
+    /* The ensemble's persistent table, retired per object by an epoch bump. */
     mftl_gid_table *const tbl = MFTLCommWorkspaceGhostTable(ens);
     for (int o = 0; o < num_objects; ++o)
     {
@@ -388,9 +303,7 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
 
   CS_BEGIN(ts_rep);
 
-  /* ── 5. Send the replies back ─────────────────────────────────────────────
-   * No extra count exchange: the reply counts are exactly the request counts
-   * halved, and both sides already know both. */
+  /* ── 5. Replies: counts are the request counts halved, known to both sides. */
   int *const n_send_rep = n_recv;  // what we were asked for, we now answer
   int *const n_recv_rep = n_send;  // what we asked for, we now receive
   for (int i = 0; i < nn; ++i)
@@ -413,9 +326,7 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
   MFTLCommStats.g_n_bytes_recv += (long) (total_send / 2) * (long) sizeof(MFTL_GhostUpdatePayload);
   CS_BEGIN(ts_apply);
 
-  /* ── 6. Apply ─────────────────────────────────────────────────────────────
-   * The replies come back in exactly the order the requests went out, so the
-   * targets list resolves each one directly. No hashing, no object search. */
+  /* ── 6. Apply in request order through the target list. */
   int p = 0;
   for (int i = 0; i < nn; ++i)
   {
@@ -456,9 +367,7 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
 
   CS_END(ts_total, g_t_total);
 
-  /* An orphaned ghost kept a STALE value, so the sync did not do its job even
-   * though every collective completed: report it, rather than returning success
-   * over ghosts that two ranks now see differently. */
+  /* An orphaned or unserved ghost kept a stale value: report it. */
   return (unserved == 0 && orphaned == 0) ? MFTL_SUCCESS : MFTL_ERROR;
 }
 

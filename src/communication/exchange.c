@@ -42,13 +42,9 @@ _Static_assert(sizeof(MFTL_PackedTriangleComplex) == 10 * sizeof(int), "MFTL_Pac
 _Static_assert(offsetof(MFTL_GhostUpdatePayload, global_id) == 3 * sizeof(double), "MFTL_GhostUpdatePayload: the doubles are not one run");
 
 /**
- * @brief Builds a struct datatype whose extent is pinned to the C sizeof.
- *
- * MPI_Type_create_struct derives the extent from the members it was told about.
- * That happens to match sizeof() for the structs here, but only because of how
- * the trailing padding falls -- and an array of a type whose extent disagrees
- * with the C stride reads shifted garbage, silently. MPI_Type_create_resized
- * states the stride instead of hoping for it.
+ * @brief Builds a struct datatype whose extent is pinned to the C `sizeof`
+ *        (`MPI_Type_create_resized`), so an array of it has the C stride
+ *        regardless of how trailing padding falls.
  *
  * @param n_blocks     Number of member blocks.
  * @param blocklengths Element count of each block.
@@ -79,8 +75,7 @@ void MFTLRegisterMpiTypes(void)
   }
 
   {
-    /* Ten ints and nothing else: dropping the geometry turned what used to be a
-     * three-block struct type into a plain contiguous run. */
+    /* Ten ints: a plain contiguous run. */
     MPI_Type_contiguous(10, MPI_INT, &MFTL_MPI_PackedTriangleComplex);
     MPI_Type_commit(&MFTL_MPI_PackedTriangleComplex);
   }
@@ -137,12 +132,8 @@ void MFTLExchangeStart(const MFTL_Domain *domain, MFTL_Exchange *x, int n_payloa
   int *const s_dsp = ctx->counts + 2 * block;
   int *const r_dsp = ctx->counts + 3 * block;
 
-  /* ── 1. ONE count exchange for every payload ─────────────────────────────
-   *
-   * MPI_Alltoall groups by target, so the counts are staged as [target][payload]
-   * and de-interleaved afterwards. A 1-int all-to-all is pure latency and does
-   * not get cheaper with fewer bytes -- paying it once instead of once per
-   * payload is what makes this scale. */
+  /* ── 1. ONE count exchange for all payloads (latency, not volume, is its
+   * cost), staged [target][payload] and de-interleaved. */
   CS_BEGIN(ts_counts);
   int *stage = (int *) MFTLMallocOrDie(2 * block * sizeof(int), "MFTLExchangeStart staging");
   int *stage_recv = stage + block;
@@ -205,13 +196,8 @@ void MFTLExchangeStart(const MFTL_Domain *domain, MFTL_Exchange *x, int n_payloa
     }
   }
 
-  /* ── 3. Post every payload back to back ──────────────────────────────────
-   *
-   * Independent messages, so there is no reason to serialise them behind each
-   * other's completion: the network pipelines them, and the caller can consume
-   * payload 0 while payload 1 is still in flight (MFTLExchangeWait). The posting
-   * order is fixed by the code, never by the data, which is what non-blocking
-   * collectives require of every rank. */
+  /* ── 3. Post every payload back to back; the caller may consume one while the
+   * others are in flight. The posting order is fixed by the code. */
   for (int p = 0; p < np; ++p)
   {
     int *const sc = s_cnt + (size_t) p * stride;
@@ -268,9 +254,7 @@ double *MFTLNeighborAllgatherDoubles(const MFTL_Domain *domain, const double *se
     total += (size_t) rcount[i];
   }
 
-  /* MPI counts and displacements are ints. Reaching this needs of the order of
-   * 10^7 doubles arriving from 26 neighbours at once, i.e. millions of bodies
-   * held on ONE rank -- far past where the per-body payload is the problem. */
+  /* MPI counts are ints (reached only with millions of bodies on one rank). */
   MFTL_ASSERT(total <= (size_t) 0x7fffffff && "MFTLNeighborAllgatherDoubles: neighbour payload exceeds an MPI int count");
 
   double *const recv = (double *) MFTLMallocOrDie(MFTL_MAX(total, (size_t) 1) * sizeof(double), "MFTLNeighborAllgatherDoubles");
