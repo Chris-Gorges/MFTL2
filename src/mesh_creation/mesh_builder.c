@@ -23,15 +23,40 @@
 #include "mftl_object.h"
 #include "mftl_topology.h"
 
-int MFTLBuildTopologyFromIndexList(MFTL_Object *object, const int *tri_verts, int n_triangles)
+/**
+ * @brief Is @p tri_verts a usable index list: every index in range and no
+ *        triangle with a repeated corner?
+ *
+ * Checked in Release, BEFORE anything is written, so a rejected call leaves the
+ * object exactly as it was. A repeated corner is a self-edge that can twin with
+ * itself, and nothing downstream distinguishes the result from a valid mesh.
+ *
+ * @param tri_verts   [3 * n_triangles] vertex indices.
+ * @param n_triangles Number of triangles.
+ * @param n_vertices  Size of the vertex pool the indices refer to.
+ * @return `true` if every triangle has three distinct, in-range corners.
+ */
+static bool index_list_is_valid(const int *tri_verts, int n_triangles, int n_vertices)
 {
-  MFTL_ASSERT(object != MFTL_NULL);
-  MFTL_ASSERT(tri_verts != MFTL_NULL);
-  MFTL_ASSERT(object->verts.n >= 3 && "MFTLBuildTopologyFromIndexList: the vertex pool must be filled first");
+  for (int t = 0; t < n_triangles; ++t)
+  {
+    const int a = tri_verts[3 * t + 0], b = tri_verts[3 * t + 1], c = tri_verts[3 * t + 2];
+    if (a < 0 || a >= n_vertices || b < 0 || b >= n_vertices || c < 0 || c >= n_vertices) return MFTL_FALSE;
+    if (a == b || b == c || c == a) return MFTL_FALSE;
+  }
+  return MFTL_TRUE;
+}
 
-  if (object == MFTL_NULL || tri_verts == MFTL_NULL) return MFTL_ERROR;
-  if (n_triangles < 1 || object->verts.n < 3) return MFTL_ERROR;
-
+/**
+ * @brief Builds triangles, half-edges, twins, the boundary flag and the derived
+ *        arrays from a VALIDATED index list.
+ *
+ * @param object      Object with a filled vertex pool.
+ * @param tri_verts   [3 * n_triangles] vertex indices, validated by the caller.
+ * @param n_triangles Number of triangles, >= 1.
+ */
+static void build_topology(MFTL_Object *object, const int *tri_verts, int n_triangles)
+{
   const int n_vertices = object->verts.n;
   const int rank = (object->domain != MFTL_NULL) ? object->domain->rank : 0;
 
@@ -68,10 +93,6 @@ int MFTLBuildTopologyFromIndexList(MFTL_Object *object, const int *tri_verts, in
       const int origin = tri_verts[3 * t + k];
       const int target = tri_verts[3 * t + (k + 1) % 3];
 
-      MFTL_ASSERT(origin >= 0 && origin < n_vertices && target >= 0 && target < n_vertices && "MFTLBuildTopologyFromIndexList: vertex index out of range");
-      MFTL_ASSERT(origin != target && "MFTLBuildTopologyFromIndexList: degenerate triangle (repeated vertex)");
-      if (origin < 0 || origin >= n_vertices || target < 0 || target >= n_vertices) return MFTL_ERROR;
-
       const int h = 3 * t + k;  // implicit indexing: no he_idx, next_idx or triangle_idx to write
       he[h].global_id = h;
       he[h].vertex_idx = target;  // half-edges store their TARGET
@@ -93,7 +114,19 @@ int MFTLBuildTopologyFromIndexList(MFTL_Object *object, const int *tri_verts, in
   MFTLMarkMeshBoundary(object);
 
   MFTLObjectBuildDerived(object);
+}
 
+int MFTLBuildTopologyFromIndexList(MFTL_Object *object, const int *tri_verts, int n_triangles)
+{
+  MFTL_ASSERT(object != MFTL_NULL);
+  MFTL_ASSERT(tri_verts != MFTL_NULL);
+  MFTL_ASSERT(object->verts.n >= 3 && "MFTLBuildTopologyFromIndexList: the vertex pool must be filled first");
+
+  if (object == MFTL_NULL || tri_verts == MFTL_NULL) return MFTL_ERROR;
+  if (n_triangles < 1 || object->verts.n < 3) return MFTL_ERROR;
+  if (!index_list_is_valid(tri_verts, n_triangles, object->verts.n)) return MFTL_ERROR;
+
+  build_topology(object, tri_verts, n_triangles);
   return MFTL_SUCCESS;
 }
 
@@ -104,6 +137,7 @@ int MFTLBuildIndexedMesh(MFTL_Object *object, const double *positions, int n_ver
 
   if (object == MFTL_NULL || positions == MFTL_NULL || tri_verts == MFTL_NULL) return MFTL_ERROR;
   if (n_vertices < 3 || n_triangles < 1) return MFTL_ERROR;
+  if (!index_list_is_valid(tri_verts, n_triangles, n_vertices)) return MFTL_ERROR;
 
   const int rank = (object->domain != MFTL_NULL) ? object->domain->rank : 0;
 
@@ -124,5 +158,6 @@ int MFTLBuildIndexedMesh(MFTL_Object *object, const double *positions, int n_ver
   }
   object->next_vertex_gid = n_vertices;
 
-  return MFTLBuildTopologyFromIndexList(object, tri_verts, n_triangles);
+  build_topology(object, tri_verts, n_triangles);
+  return MFTL_SUCCESS;
 }

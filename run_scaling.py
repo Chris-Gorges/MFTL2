@@ -28,7 +28,7 @@ Two properties of the accumulation are deliberate:
     failed sweep; editing plots in place is none of those.
 
   * Repeats are taken ROUND ROBIN over the rank counts, not in blocks.
-    docs/performance-analysis.md sec 7 records the same binary measuring 9.4 ms and
+    docs/analysis.md sec 10 records the same binary measuring 9.4 ms and
     6.1 ms in two sessions purely from machine state, and states the rule the whole
     document follows: interleave the variants, report minima, never quote a run
     taken in a block. A scaling curve measured in blocks is exactly the shape that

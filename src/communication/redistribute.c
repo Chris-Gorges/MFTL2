@@ -7,8 +7,7 @@
  * @brief Redistribution: re-partitioning a distributed mesh over the process grid.
  *
  * Both public entry points run the SAME implementation (redistribute_core below);
- * MFTLRedistributeObject is the n == 1 case, which differs only in that it skips
- * the per-body count payload and the run bookkeeping.
+ * MFTLRedistribute is MFTLRedistributeWithOwners with the geometric owner rule.
  *
  * ## THE ONE IDEA THIS FILE EXISTS TO EXPRESS
  *
@@ -55,9 +54,7 @@
 
 #include "mftl_communication.h"
 
-#include <math.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -109,13 +106,7 @@ static void sb_reserve(MFTL_SendBuffer *sb, int needed, size_t elem)
   int cap = (sb->capacity == 0) ? MFTL_MAX(needed, 256) : sb->capacity;
   while (cap < sb->count + needed) cap *= 2;
 
-  void *p = realloc(sb->buffer, (size_t) cap * elem);
-  if (!p)
-  {
-    fprintf(stderr, "FATAL ERROR: MFTL redistribution send buffer allocation failed for %lu bytes.\n", (unsigned long) ((size_t) cap * elem));
-    exit(EXIT_FAILURE);
-  }
-  sb->buffer = p;
+  sb->buffer = MFTLReallocOrDie(sb->buffer, (size_t) cap * elem, "MFTL redistribution send buffer");
   sb->capacity = cap;
 }
 
@@ -155,41 +146,6 @@ static void ensure_bytes(void **p, size_t *cap, size_t need)
 /* ═══════════════════════════════════════════════════════════════════════════
  * 2. Phase 1 -- ownership and destinations
  * ═══════════════════════════════════════════════════════════════════════════ */
-
-#ifndef NDEBUG
-/**
- * @brief Debug check: every triangle's cached centre still matches its vertices.
- *
- * Redistribution routes by the cached centre, for GHOST triangles as well -- that
- * is how a rank knows where its neighbour's triangle is going, and therefore
- * which of its own triangles that rank will need as a ghost. Nothing communicates
- * ghost triangle geometry, so a caller that refreshed only its owned triangles
- * (MFTLEnsembleUpdate rather than MFTLComputeTriangleGeometry(obj, obj->tris.n))
- * leaves those centres one step behind.
- *
- * The consequence is not a crash: two ranks disagree about a ghost triangle's
- * destination, and someone's locally owned triangle silently ends up without one
- * of its edge neighbours. Failing here instead is worth a Debug-only pass.
- *
- * @param obj The mesh.
- * @return `true` if every triangle's `tris.center` matches the centroid its
- *         three vertices imply, to within a loose tolerance.
- */
-static bool centres_are_current(const MFTL_Object *obj)
-{
-  for (int t = 0; t < obj->tris.n; ++t)
-  {
-    double fresh[3];
-    MFTLGetTriangleProperties(obj, t, MFTL_NULL, MFTL_NULL, fresh);
-
-    /* Both are wrapped positions, so compare through the seam, not across it. */
-    double d[3];
-    MFTLGetMinimumImageVector(obj->domain, d, &obj->tris.center[3 * t], fresh);
-    if (fabs(d[0]) > 1e-9 || fabs(d[1]) > 1e-9 || fabs(d[2]) > 1e-9) return MFTL_FALSE;
-  }
-  return MFTL_TRUE;
-}
-#endif
 
 /**
  * @brief Records one ownership classification pass into the diagnostics.
@@ -311,7 +267,7 @@ static int compute_owners(MFTL_Object *obj, const MFTL_OwnerMap *map, int *restr
     return (changed_v | changed_t) != 0;
   }
 
-  MFTL_ASSERT(centres_are_current(obj) &&
+  MFTL_ASSERT(MFTLTriangleCentresAreCurrent(obj) &&
               "redistribute: stale triangle centres -- call MFTLComputeTriangleGeometry(obj, obj->tris.n) (ghosts included) first");
 
   long changed_v = 0, changed_t = 0;
@@ -681,11 +637,10 @@ typedef struct
   int n_kept_t_owned;  ///< Kept triangles this rank OWNS.
   int n_kept_t;  ///< Kept triangles in total.
 
-  /* Arrival slices. `*_idx == MFTL_NULL` means the identity [0, n_recv_*), which
-   * is the single-body case where no grouping is needed at all. */
-  const int *recv_v_idx;  ///< Arriving vertex slots, or MFTL_NULL for the identity.
+  /* Arrival slices: indices into the flat receive buffers, grouped by body. */
+  const int *recv_v_idx;  ///< [n_recv_v] arriving vertex slots.
   int n_recv_v;  ///< Vertices arriving for this body.
-  const int *recv_t_idx;  ///< Arriving triangle slots, or MFTL_NULL for the identity.
+  const int *recv_t_idx;  ///< [n_recv_t] arriving triangle slots.
   int n_recv_t;  ///< Triangles arriving for this body.
 } body_state;
 
@@ -910,7 +865,7 @@ static inline int slot_of_body(MFTL_Object *const *work, int n_sorted, int n_wor
  *   - the whole of `rebuild_scratch`, fourteen arrays and two id tables.
  *
  * Measured on the unmodified code at four ranks: 66 to 99 allocations and 20 to
- * 39 MB requested PER TIMESTEP. docs/performance-analysis.md section 7 identifies
+ * 39 MB requested PER TIMESTEP. docs/analysis.md §2.1 identifies
  * that churn as the reason a first benchmark run is slower than every repeat of
  * it -- the pages are handed back and re-faulted each time.
  *
@@ -1014,6 +969,31 @@ typedef struct
   mftl_gid_table ghost_tbl;
 } comm_workspace;
 
+/**
+ * @brief Releases the arrays indexed by destination rank, including the heap each
+ *        per-destination buffer owns.
+ * @param ws The workspace. Its `[nproc]` arrays are freed; `nproc` is left as is.
+ */
+static void ws_free_rank_arrays(comm_workspace *ws)
+{
+  for (int r = 0; r < ws->nproc; ++r)
+  {
+    ib_free(&ws->tri_ids[r]);
+    ib_free(&ws->vert_ids[r]);
+    free(ws->send_tris[r].buffer);
+    free(ws->send_verts[r].buffer);
+    free(ws->send_counts[r].buffer);
+  }
+  free(ws->is_neighbor);
+  free(ws->tri_ids);
+  free(ws->vert_ids);
+  free(ws->send_tris);
+  free(ws->send_verts);
+  free(ws->send_counts);
+  free(ws->touched);
+  free(ws->rank_bit);
+}
+
 /** @brief Grows a byte array, discarding its contents. */
 static void ws_bytes(void **p, int *cap, int need, size_t elem, const char *what)
 {
@@ -1090,24 +1070,8 @@ static void ws_reserve(comm_workspace *ws, int nproc, int num_objects, int sum_v
 {
   if (ws->nproc != nproc)
   {
-    /* Only on the first call for this ensemble. The per-destination buffers own
-     * heap of their own, so they are released element by element first. */
-    for (int r = 0; r < ws->nproc; ++r)
-    {
-      ib_free(&ws->tri_ids[r]);
-      ib_free(&ws->vert_ids[r]);
-      free(ws->send_tris[r].buffer);
-      free(ws->send_verts[r].buffer);
-      if (ws->send_counts != MFTL_NULL) free(ws->send_counts[r].buffer);
-    }
-    free(ws->is_neighbor);
-    free(ws->tri_ids);
-    free(ws->vert_ids);
-    free(ws->send_tris);
-    free(ws->send_verts);
-    free(ws->send_counts);
-    free(ws->touched);
-    free(ws->rank_bit);
+    /* Only on the first call for this ensemble, when nothing is allocated yet. */
+    ws_free_rank_arrays(ws);
 
     ws->is_neighbor = (char *) MFTLCallocOrDie((size_t) nproc, 1, "redistribution neighbour map");
     ws->tri_ids = (mftl_int_buffer *) MFTLMallocOrDie((size_t) nproc * sizeof(mftl_int_buffer), "redistribution id lists");
@@ -1187,10 +1151,10 @@ static void ws_reserve(comm_workspace *ws, int nproc, int num_objects, int sum_v
    * this is what the rank currently holds rather than what it has ever asked
    * for -- a footprint, not churn. cs_alloc() already counts the churn.
    *
-   * The split is the measurement a weak-scaling sweep needs: per-entity is
-   * supposed to stay flat as P rises because the work per rank does, and
-   * per-body and per-rank are supposed to stay flat but do not, which is exactly
-   * what makes them the interesting two. See MFTL_RedistributeStats::ws_bytes_per_body.
+   * The split is the measurement a weak-scaling sweep needs: per-entity and
+   * per-body are supposed to stay flat as P rises because the work and the
+   * bodies per rank do, and per-rank is the one that does not. See
+   * MFTL_RedistributeStats::ws_bytes_per_body.
    *
    * The per-destination payload buffers are deliberately NOT counted as
    * per-rank: they are sized by the traffic that actually flowed, are only
@@ -1215,22 +1179,7 @@ static void ws_reserve(comm_workspace *ws, int nproc, int num_objects, int sum_v
 /** @brief Releases everything the workspace holds. */
 static void ws_free(comm_workspace *ws)
 {
-  for (int r = 0; r < ws->nproc; ++r)
-  {
-    ib_free(&ws->tri_ids[r]);
-    ib_free(&ws->vert_ids[r]);
-    free(ws->send_tris[r].buffer);
-    free(ws->send_verts[r].buffer);
-    if (ws->send_counts != MFTL_NULL) free(ws->send_counts[r].buffer);
-  }
-  free(ws->is_neighbor);
-  free(ws->tri_ids);
-  free(ws->vert_ids);
-  free(ws->send_tris);
-  free(ws->send_verts);
-  free(ws->send_counts);
-  free(ws->touched);
-  free(ws->rank_bit);
+  ws_free_rank_arrays(ws);
   free(ws->work);
   free(ws->states);
   free(ws->grp_off_v);
@@ -1373,14 +1322,11 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
   const int n_kept_v = bs->n_kept_v;
   const int n_kept_t = bs->n_kept_t;
 
-  /* ── 0. Bodies this rank has no part of ──────────────────────────────────
+  /* ── 0. Bodies this rank no longer has any part of ───────────────────────
    *
-   * Every rank holds the SAME object list (mftl_types.h), so a thousand-droplet
-   * ensemble on eight ranks runs this function eight thousand times per timestep
-   * to reach the few hundred bodies that are actually here. Measured on the
-   * unmodified code: 71 % of the calls at np = 4 and 84 % at np = 8 had nothing
-   * to do, and each still paid two id-table epoch bumps, a
-   * MFTLObjectSetCounts(0,0,0,0) and a full MFTLObjectBuildDerived().
+   * A body whose entities have all left: nothing kept, nothing arriving. It is
+   * emptied here and destroyed at the end of the call (phase 6), so it pays no
+   * id-table epoch bump and no rebuild.
    *
    * The early return is placed before the timeline opens rather than after it,
    * because a body with no work is exactly where the instrumentation's own ten
@@ -1478,12 +1424,12 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
    * see comm_internal.h, where the measurement behind the ratio is recorded. */
   for (int i = 0; i < bs->n_recv_v; ++i)
   {
-    const int g = recv_v[bs->recv_v_idx ? bs->recv_v_idx[i] : i].global_id;
+    const int g = recv_v[bs->recv_v_idx[i]].global_id;
     if (g >= v_range) v_range = g + 1;
   }
   for (int i = 0; i < bs->n_recv_t; ++i)
   {
-    const int g = recv_t[bs->recv_t_idx ? bs->recv_t_idx[i] : i].global_id;
+    const int g = recv_t[bs->recv_t_idx[i]].global_id;
     if (g >= t_range) t_range = g + 1;
   }
 
@@ -1502,7 +1448,7 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
   int n_new_v = 0, n_new_v_owned = 0;
   for (int i = 0; i < bs->n_recv_v; ++i)
   {
-    const MFTL_PackedVertex *const p = &recv_v[bs->recv_v_idx ? bs->recv_v_idx[i] : i];
+    const MFTL_PackedVertex *const p = &recv_v[bs->recv_v_idx[i]];
     if (gt_has(&s->v_tbl, p->global_id))
     {
       s->recv_v_logical[i] = MFTL_ERROR;
@@ -1522,7 +1468,7 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
   int n_new_t = 0, n_new_t_owned = 0;
   for (int i = 0; i < bs->n_recv_t; ++i)
   {
-    const MFTL_PackedTriangleComplex *const p = &recv_t[bs->recv_t_idx ? bs->recv_t_idx[i] : i];
+    const MFTL_PackedTriangleComplex *const p = &recv_t[bs->recv_t_idx[i]];
     if (gt_has(&s->t_tbl, p->global_id))
     {
       MFTL_ASSERT(0 && "redistribute: the same triangle arrived twice -- two ranks believe they own it");
@@ -1553,7 +1499,7 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
     {
       const int L = s->recv_v_logical[i];
       if (L == MFTL_ERROR) continue;
-      const MFTL_PackedVertex *const p = &recv_v[bs->recv_v_idx ? bs->recv_v_idx[i] : i];
+      const MFTL_PackedVertex *const p = &recv_v[bs->recv_v_idx[i]];
       s->v_final_of_logical[L] = (p->owner_proc == my_rank) ? o++ : g++;
     }
     MFTL_ASSERT(o == bs->n_kept_v_owned + n_new_v_owned && "rebuild_object: owned vertex block overrun");
@@ -1570,7 +1516,7 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
     {
       const int L = s->recv_t_logical[i];
       if (L == MFTL_ERROR) continue;
-      const MFTL_PackedTriangleComplex *const p = &recv_t[bs->recv_t_idx ? bs->recv_t_idx[i] : i];
+      const MFTL_PackedTriangleComplex *const p = &recv_t[bs->recv_t_idx[i]];
       s->t_final_of_logical[L] = (p->owner_proc == my_rank) ? o++ : g++;
     }
     MFTL_ASSERT(o == bs->n_kept_t_owned + n_new_t_owned && "rebuild_object: owned triangle block overrun");
@@ -1589,7 +1535,7 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
    * every timestep -- and MFTLObjectSetCounts inherits that. Under advection the
    * counts jitter by a few entities every step, so the exact rule reallocates a
    * whole pool block for a one-entity rise and copies EVERY sub-array forward:
-   * 88 B per vertex and 212 B per triangle, almost all of it overwritten before
+   * 64 B per vertex and 140 B per triangle, almost all of it overwritten before
    * it is read. Asking for a doubled capacity first turns the reserve inside
    * SetCounts into an early return and makes the reallocation O(log n) over the
    * run instead of once per jitter.
@@ -1761,7 +1707,7 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
     const int L = s->recv_v_logical[i];
     if (L == MFTL_ERROR) continue;
 
-    const MFTL_PackedVertex *const p = &recv_v[bs->recv_v_idx ? bs->recv_v_idx[i] : i];
+    const MFTL_PackedVertex *const p = &recv_v[bs->recv_v_idx[i]];
     const int slot = s->v_final_of_logical[L];
 
     obj->verts.pos[3 * slot + 0] = p->pos[0];
@@ -1780,7 +1726,7 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
     const int L = s->recv_t_logical[i];
     if (L == MFTL_ERROR) continue;
 
-    const MFTL_PackedTriangleComplex *const p = &recv_t[bs->recv_t_idx ? bs->recv_t_idx[i] : i];
+    const MFTL_PackedTriangleComplex *const p = &recv_t[bs->recv_t_idx[i]];
     const int slot = s->t_final_of_logical[L];
 
     MFTL_Triangle *const rec = &obj->tris.rec[slot];
@@ -1948,8 +1894,8 @@ static int group_runs_by_object(const body_run *runs, int n_runs, int num_object
  * changes nothing about who holds what.
  *
  * So if neither input changed, the whole of section 5 is a very expensive way of
- * reproducing the pool that is already there. The review in
- * docs/redistribution_optimizations_review.md prices what a skip removes at 68 %
+ * reproducing the pool that is already there. The estimate in
+ * docs/analysis.md §2.4 prices what a skip removes at 68 %
  * of the phase: kept gather, destination analysis, relink, topology arrays,
  * arrivals, pool growth, place-back and twin repair. What survives is the
  * ownership scan (which is how the decision is made) and the collectives.
@@ -1981,7 +1927,7 @@ static int group_runs_by_object(const body_run *runs, int n_runs, int num_object
  * and the second clause is `obj->partition_dirty` (MFTLObjectMarkPartitionDirty,
  * mftl_object.h), stamped at the choke point every entity creation and
  * destruction already passes through plus the two renumbering sites and the one
- * flag-writing site. Full derivation in docs/redistribution_skip_correctness.md.
+ * flag-writing site. Full derivation in docs/analysis.md §2.4.
  *
  * ── WHY IT TAKES TWO PASSES AND ONE COLLECTIVE ─────────────────────────────
  *
@@ -1992,11 +1938,12 @@ static int group_runs_by_object(const body_run *runs, int n_runs, int num_object
  *
  * Agreeing per body inside the object loop would be num_objects collectives per
  * timestep, which at a thousand droplets costs more than the phase it is saving.
- * One MPI_BOR over a bitset is the alternative, and it forces the loop in two:
+ * ONE per-body reduction over the bodies' holders (MFTLEnsembleReduceBodies(),
+ * one MAX per body) is the alternative, and it forces the loop in two:
  *
  *   pass 1  classify ownership for EVERY body, and do the full analysis and
  *           packing immediately for every body THIS rank saw change;
- *   vote    one Allreduce;
+ *   vote    one per-body reduction;
  *   pass 2  the bodies that were clean here and dirty somewhere else.
  *
  * Pass 2 does not need pass 1's owner arrays kept alive, which is the thing that
@@ -2045,9 +1992,9 @@ static int group_runs_by_object(const body_run *runs, int n_runs, int num_object
  * merely harmless.
  *
  * "D before" is the only state redistribution carries between calls, and it
- * lives in the workspace. MFTLRedistributeObject() builds a workspace for the
- * duration of its one call, so it starts with everything unsettled and skips
- * nothing -- which is correct, and is also all a single call could ever do.
+ * lives on the object (MFTL_Object::partition_settled) rather than in the
+ * workspace: a body created on arrival starts unsettled, which is the
+ * conservative verdict, without un-settling any other body.
  * ════════════════════════════════════════════════════════════════════════════ */
 
 /** @brief Whether unchanged bodies may be left alone. See MFTLRedistributeSetSkipUnchangedBodies(). */
@@ -2083,13 +2030,12 @@ double MFTLRedistributeGetShrinkSlack(void) { return g_shrink_slack; }
  *                          on the wire -- the caller's slot for it is not
  *                          transmitted and is not needed here.
  * @param      my_rank      This rank.
- * @param      group_bodies `true` when the per-body count payload is being built.
  * @param      dd           Per-destination vertex de-duplication state.
  * @param[out] bs           This body's kept lists and counts.
  * @return 1 if any destination fell outside the 26-neighbourhood, which forces
  *         the exchange onto the global communicator.
  */
-static int analyze_and_pack_body(comm_workspace *ws, MFTL_Object *obj, int my_rank, bool group_bodies, vertex_dedup *dd, body_state *bs)
+static int analyze_and_pack_body(comm_workspace *ws, MFTL_Object *obj, int my_rank, vertex_dedup *dd, body_state *bs)
 {
   CS_TIMELINE(tm);
 
@@ -2119,19 +2065,16 @@ static int analyze_and_pack_body(comm_workspace *ws, MFTL_Object *obj, int my_ra
     append_destination(obj, obj->global_id, ws->vert_gid, &ws->tri_ids[r], &ws->vert_ids[r], &ws->send_tris[r], &ws->send_verts[r],
                        dd->rank_bit[r] == MFTL_DEDUP_NO_BIT);
 
-    if (group_bodies)
-    {
-      sb_reserve(&ws->send_counts[r], MFTL_BODY_COUNT_INTS, sizeof(int));
-      int *const c = (int *) ws->send_counts[r].buffer + ws->send_counts[r].count;
-      c[MFTL_BODY_HDR_GID] = obj->global_id;  // the body GID, not this rank's slot for it
-      c[MFTL_BODY_HDR_N_TRIS] = ws->send_tris[r].count - tri_before;
-      c[MFTL_BODY_HDR_N_VERTS] = ws->send_verts[r].count - vert_before;
-      c[MFTL_BODY_HDR_NEXT_VGID] = obj->next_vertex_gid;
-      c[MFTL_BODY_HDR_NEXT_TGID] = obj->next_triangle_gid;
-      c[MFTL_BODY_HDR_GLOBAL_V] = obj->global_n_vertices;
-      c[MFTL_BODY_HDR_GLOBAL_T] = obj->global_n_triangles;
-      ws->send_counts[r].count += MFTL_BODY_COUNT_INTS;
-    }
+    sb_reserve(&ws->send_counts[r], MFTL_BODY_COUNT_INTS, sizeof(int));
+    int *const c = (int *) ws->send_counts[r].buffer + ws->send_counts[r].count;
+    c[MFTL_BODY_HDR_GID] = obj->global_id;  // the body GID, not this rank's slot for it
+    c[MFTL_BODY_HDR_N_TRIS] = ws->send_tris[r].count - tri_before;
+    c[MFTL_BODY_HDR_N_VERTS] = ws->send_verts[r].count - vert_before;
+    c[MFTL_BODY_HDR_NEXT_VGID] = obj->next_vertex_gid;
+    c[MFTL_BODY_HDR_NEXT_TGID] = obj->next_triangle_gid;
+    c[MFTL_BODY_HDR_GLOBAL_V] = obj->global_n_vertices;
+    c[MFTL_BODY_HDR_GLOBAL_T] = obj->global_n_triangles;
+    ws->send_counts[r].count += MFTL_BODY_COUNT_INTS;
 
     ib_reset(&ws->tri_ids[r]);
     ib_reset(&ws->vert_ids[r]);
@@ -2195,20 +2138,24 @@ static void check_object_lists_agree(const MFTL_Domain *dom, int n_bodies_global
 /**
  * @brief The one redistribution implementation; both public entry points call it.
  *
- * @param ens         The ensemble, for its persistent workspace, or #MFTL_NULL
- *                    when the caller has no ensemble -- MFTLRedistributeObject()
- *                    is the only such path, and it uses a workspace of its own
- *                    for the one call.
- * @param domain      The MPI/physical world.
- * @param objects     Objects to repartition, all in one communication round.
- * @param num_objects Number of objects.
- * @param maps        `[num_objects]` explicit owner maps in @p objects order, or NULL for the
- *                    geometric rule.
+ * Every local object is repartitioned in ONE communication round: the packed
+ * streams of all bodies are interleaved into one pair of messages and separated
+ * again at the receiver from a third payload of per-body headers, so the message
+ * COUNT is independent of the number of bodies.
+ *
+ * @param ens  The ensemble: its domain, its local object list and its persistent
+ *             workspace.
+ * @param maps `[ens->n_local_objects]` explicit owner maps in local-slot order,
+ *             or NULL for the geometric rule.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR if the exchange failed.
  */
-static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Object **objects, int num_objects, const MFTL_OwnerMap *maps)
+static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
 {
   MFTL_ASSERT(MFTL_MPI_PackedVertex != MPI_DATATYPE_NULL && "MFTLRedistribute: call MFTLRegisterMpiTypes() first");
+
+  MFTL_Domain *const domain = &ens->domain;
+  MFTL_Object **const objects = ens->local_objects;
+  const int num_objects = ens->n_local_objects;
 
   CS_BEGIN(ts_total);
   MFTLCommStats.n_calls++;
@@ -2218,8 +2165,7 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
   const int my_rank = domain->rank;
 
 #ifndef NDEBUG
-  /* No ensemble means MFTLRedistributeObject(), whose one body IS the id space. */
-  check_object_lists_agree(domain, (ens != MFTL_NULL) ? ens->n_bodies_global : num_objects);
+  check_object_lists_agree(domain, ens->n_bodies_global);
 #endif
 
   if (nproc < 2)
@@ -2243,17 +2189,14 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
      * is the shape of difference that only ever surfaces in someone's serial
      * reproduction of a parallel bug. Walked backwards so an erase does not move
      * a slot this loop has yet to reach. */
-    if (ens != MFTL_NULL)
+    for (int o = num_objects - 1; o >= 0; --o)
     {
-      for (int o = num_objects - 1; o >= 0; --o)
-      {
-        MFTL_Object *gone = objects[o];
-        if (gone->tris.n > 0 || gone->verts.n > 0) continue;
+      MFTL_Object *gone = objects[o];
+      if (gone->tris.n > 0 || gone->verts.n > 0) continue;
 
-        MFTLEnsembleEraseLocalSlot(ens, MFTLEnsembleFindLocalSlot(ens, gone->global_id));
-        MFTLObjectDestroy(&gone);
-        MFTLCommStats.n_objects_destroyed++;
-      }
+      MFTLEnsembleEraseLocalSlot(ens, MFTLEnsembleFindLocalSlot(ens, gone->global_id));
+      MFTLObjectDestroy(&gone);
+      MFTLCommStats.n_objects_destroyed++;
     }
 
     CS_END(ts_total, t_total);
@@ -2279,40 +2222,18 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
   int tri_hint, vert_hint;
   calc_buffer_hints(global_tris, global_verts, nproc, &tri_hint, &vert_hint);
 
-  /* ── Whether the per-body count payload travels, and why it is not a count ──
+  /* The per-body header payload ALWAYS travels, even for a single-body
+   * ensemble. A rank that holds nothing of a body it is about to receive has no
+   * object to put the arrivals in, and the header is what lets an arrival name
+   * its body -- which is what makes creation on arrival possible at all. It also
+   * keeps the payload count a constant, and the payload count is collective
+   * state: two ranks posting a different number of Alltoallv calls deadlock with
+   * no diagnostic.
    *
-   * This decides how many payloads the exchange carries, so it is a COLLECTIVE
-   * decision: two ranks disagreeing about it post a different number of
-   * Alltoallv calls and the job deadlocks with no diagnostic. It used to read
-   * `num_objects > 1`, which was the same number on every rank only because
-   * every rank held every body.
-   *
-   * It is now "does this call have an ensemble" rather than "are there several
-   * bodies", and the single-body ensemble deliberately pays the three extra ints
-   * per destination. The direct path's precondition is that every arrival belongs
-   * to the one body THIS RANK ALREADY HAS -- and a rank that holds nothing of a
-   * body it is about to receive has no such body. Keeping the payload is what
-   * lets the arrival name itself, which is what makes creation on arrival
-   * possible at all. MFTLRedistributeObject() is the one caller that genuinely
-   * cannot receive an unknown body: it was handed the object. */
-  const bool group_bodies = (ens != MFTL_NULL);
-
-  /* The workspace is the ensemble's, so a steady loop reaches its high-water
-   * marks in the first few timesteps and then allocates nothing here at all. The
-   * one caller without an ensemble gets a workspace for the duration of the call,
-   * which is exactly the behaviour every caller had before. */
-  comm_workspace local_ws;
-  comm_workspace *ws;
-  if (ens != MFTL_NULL)
-  {
-    if (ens->comm_workspace == MFTL_NULL) ens->comm_workspace = MFTLCallocOrDie(1, sizeof(comm_workspace), "MFTL communication workspace");
-    ws = (comm_workspace *) ens->comm_workspace;
-  }
-  else
-  {
-    memset(&local_ws, 0, sizeof local_ws);
-    ws = &local_ws;
-  }
+   * The workspace is the ensemble's, so a steady loop reaches its high-water
+   * marks in the first few timesteps and then allocates nothing here at all. */
+  if (ens->comm_workspace == MFTL_NULL) ens->comm_workspace = MFTLCallocOrDie(1, sizeof(comm_workspace), "MFTL communication workspace");
+  comm_workspace *const ws = (comm_workspace *) ens->comm_workspace;
 
   /* ── Two different body indexes, and the difference is the whole design ──
    *
@@ -2321,13 +2242,10 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
    * workspace is one of these, the skip votes included -- they were the last
    * that was not.
    *
-   * A BODY ID indexes anything that is a MESSAGE -- the count triples on the
-   * wire, an explicit owner map, one record of a per-body reduction. Two ranks
-   * holding different bodies agree about nothing else.
-   *
-   * MFTLRedistributeObject() has no ensemble and therefore no id space: it is one
-   * body, whose `global_id` is whatever the caller chose, so its single vote sits
-   * in slot 0. */
+   * A BODY ID indexes anything that is a MESSAGE -- the body headers on the
+   * wire, one record of a per-body reduction. Two ranks holding different bodies
+   * agree about nothing else. (An explicit owner map is indexed by local slot:
+   * it never crosses a rank, see MFTLRedistributeWithOwners().) */
 
   /* ── Whether the skip vote can stay on the neighbour graph ───────────────
    *
@@ -2340,10 +2258,10 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
    * plausible answer to the wrong question -- and one that is wrong only when
    * something moved far, i.e. exactly when the vote matters.
    *
-   * The verdict is agreed at phase 1b, where a collective is already being
-   * taken, and handed to the reduction so it does not re-derive it from the
-   * rewritten records. */
-  const int holders_ok_local = (ens != MFTL_NULL && MFTLEnsembleBodyHoldersFitTheGraph(ens)) ? 1 : 0;
+   * The verdict is handed to the reduction at phase 1b, which agrees it together
+   * with the certificate it takes after its exchange -- that one reads only the
+   * exchanged records, so the rewritten pools cannot mislead it. */
+  const bool holders_fit = MFTLEnsembleBodyHoldersFitTheGraph(ens);
 
   /* At least one slot even with nothing held: the arrival path grows the arrays
    * from here, and a NULL base pointer is not a valid thing to grow from. */
@@ -2355,7 +2273,7 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
 
   MFTL_SendBuffer *const send_tris = ws->send_tris;
   MFTL_SendBuffer *const send_verts = ws->send_verts;
-  MFTL_SendBuffer *const send_counts = group_bodies ? ws->send_counts : MFTL_NULL;
+  MFTL_SendBuffer *const send_counts = ws->send_counts;
   int *const kept_arena_v = ws->kept_arena_v;
   int *const kept_arena_t = ws->kept_arena_t;
   int *const tri_owner = ws->tri_owner;
@@ -2375,7 +2293,7 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
   {
     send_tris[r].count = 0;
     send_verts[r].count = 0;
-    if (group_bodies) send_counts[r].count = 0;
+    send_counts[r].count = 0;
   }
   memset(ws->states, 0, (size_t) n_pre * sizeof(body_state));
 
@@ -2426,7 +2344,7 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
     if (!dirty) continue;
 
     dirty_local[o] = 1.0;
-    requires_global |= analyze_and_pack_body(ws, obj, my_rank, group_bodies, &dd, bs);
+    requires_global |= analyze_and_pack_body(ws, obj, my_rank, &dd, bs);
   }
 
   /* ── Phase 1b: agree, per body, over each body's HOLDERS ─────────────────
@@ -2443,10 +2361,9 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
    * per-holder reduction and MFTLEnsembleReduceBodies() is where that decision
    * lives. On the neighbour route the payload is two doubles per body HELD.
    *
-   * The route was established before the classification (see the note where
-   * `holders_ok_local` is taken) and is agreed here, on the collective this
-   * phase was already paying for: one int alongside, so the extra cost is a
-   * message that was going to be sent anyway.
+   * The pre-exchange half of the route test was taken before the classification
+   * (see the note where `holders_fit` is taken); the reduction agrees it with
+   * its own certificate in the one int it costs anyway.
    *
    * Not in place: pass 2 needs to know which bodies THIS rank already did, which
    * is exactly the information a reduction in place would destroy -- so the
@@ -2458,21 +2375,10 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
    * that follows then finds everyone already synchronised and costs pure
    * latency. t_skip_vote against t_route is the measurement. */
   CS_BEGIN(ts_vote);
-  if (ens != MFTL_NULL)
   {
-    int holders_ok = 0;
-    MPI_Allreduce(&holders_ok_local, &holders_ok, 1, MPI_INT, MPI_LAND, domain->comm_cart);
-
     static const MFTL_BodyReduceOp vote_op = MFTL_BODY_REDUCE_MAX;
     memcpy(dirty_global, dirty_local, (size_t) n_pre * sizeof(double));
-    MFTLEnsembleReduceBodies(ens, dirty_global, 1, &vote_op, holders_ok ? MFTL_BODY_REDUCE_SCOPE_HOLDERS : MFTL_BODY_REDUCE_SCOPE_GLOBAL);
-  }
-  else
-  {
-    /* MFTLRedistributeObject(): one body, no ensemble, no id space. The vote is
-     * a single value and every rank holds it, so the holder set IS the
-     * communicator. */
-    MPI_Allreduce(dirty_local, dirty_global, 1, MPI_DOUBLE, MPI_MAX, domain->comm_cart);
+    MFTLEnsembleReduceBodiesPrescanned(ens, dirty_global, 1, &vote_op, holders_fit);
   }
   CS_END(ts_vote, t_skip_vote);
 
@@ -2497,7 +2403,7 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
     (void) compute_owners(obj, maps ? &maps[o] : MFTL_NULL, tri_owner, vert_owner, vert_gid, MFTL_FALSE);
     CS_LAP(tm, t_owners);
 
-    requires_global |= analyze_and_pack_body(ws, obj, my_rank, group_bodies, &dd, &ws->states[o]);
+    requires_global |= analyze_and_pack_body(ws, obj, my_rank, &dd, &ws->states[o]);
     MFTLCommStats.n_objects_reclassified++;
     if (dirty_global[o] == 0.0) MFTLCommStats.n_objects_settled++;
   }
@@ -2531,17 +2437,14 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
   xfer[1].send_bufs = send_tris;
   xfer[1].type = MFTL_MPI_PackedTriangleComplex;
   xfer[1].type_size = sizeof(MFTL_PackedTriangleComplex);
-  if (group_bodies)
-  {
-    xfer[2].send_bufs = send_counts;
-    xfer[2].type = MPI_INT;
-    xfer[2].type_size = sizeof(int);
-  }
+  xfer[2].send_bufs = send_counts;
+  xfer[2].type = MPI_INT;
+  xfer[2].type_size = sizeof(int);
 
   for (int r = 0; r < nproc; ++r)
   {
     const long bytes = (long) send_verts[r].count * (long) sizeof(MFTL_PackedVertex) + (long) send_tris[r].count * (long) sizeof(MFTL_PackedTriangleComplex) +
-                       (group_bodies ? (long) send_counts[r].count * (long) sizeof(int) : 0);
+                       (long) send_counts[r].count * (long) sizeof(int);
     if (bytes > 0)
     {
       MFTLCommStats.n_bytes_sent += bytes;
@@ -2550,7 +2453,7 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
   }
 
   MFTL_ExchangeCtx ctx;
-  MFTLExchangeStart(domain, xfer, group_bodies ? 3 : 2, global_decision != 0, &ctx);
+  MFTLExchangeStart(domain, xfer, 3, global_decision != 0, &ctx);
 
   /* MFTLExchangeStart has already copied everything into its own storage, so the
    * per-destination buffers are dead -- but they are the right size for the next
@@ -2559,140 +2462,115 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
    * top of the next call. */
 
   /* ── Phase 4: reconstruct the per-body arrival slices ───────────────────── */
-  int *grp_idx_v = MFTL_NULL, *grp_idx_t = MFTL_NULL;
+  CS_BEGIN(ts_w2);
+  MFTLExchangeWait(&ctx, 2);
+  CS_END(ts_w2, t_wait);
 
-  if (group_bodies)
+  CS_BEGIN(ts_g2);
+  const int *const rc = (const int *) xfer[2].recv_buf;
+  const int n_runs = xfer[2].recv_count / MFTL_BODY_COUNT_INTS;
+
+  ws_bytes((void **) &ws->runs, &ws->cap_runs, MFTL_MAX(n_runs, 1), sizeof(body_run), "redistribution body runs");
+  body_run *const runs = ws->runs;
+
+  int t_off = 0, v_off = 0;
+  for (int k = 0; k < n_runs; ++k)
   {
-    CS_BEGIN(ts_w2);
-    MFTLExchangeWait(&ctx, 2);
-    CS_END(ts_w2, t_wait);
+    const int *const tp = &rc[MFTL_BODY_COUNT_INTS * k];
+    const int gid = tp[MFTL_BODY_HDR_GID];
 
-    CS_BEGIN(ts_g2);
-    const int *const rc = (const int *) xfer[2].recv_buf;
-    const int n_runs = xfer[2].recv_count / MFTL_BODY_COUNT_INTS;
-
-    ws_bytes((void **) &ws->runs, &ws->cap_runs, MFTL_MAX(n_runs, 1), sizeof(body_run), "redistribution body runs");
-    body_run *const runs = ws->runs;
-
-    int t_off = 0, v_off = 0;
-    for (int k = 0; k < n_runs; ++k)
+    int slot = slot_of_body(ws->work, n_pre, n_work, gid);
+    if (slot == MFTL_ERROR)
     {
-      const int *const tp = &rc[MFTL_BODY_COUNT_INTS * k];
-      const int gid = tp[MFTL_BODY_HDR_GID];
+      /* ── A body arriving where this rank held nothing of it ─────────────
+       *
+       * The body is created here and appended to the WORK list -- not inserted
+       * into the sorted directory, because an ordered insert shifts every slot
+       * above it and phase 5 is about to index by slot. The merge happens once,
+       * at the end, when nothing is indexing any more.
+       *
+       * It starts unsettled (MFTLObjectCreate zeroes `partition_settled`),
+       * which is the conservative verdict and exactly what the "clean twice"
+       * rule wants for a body this rank has never rebuilt. */
+      MFTL_ASSERT(gid >= 0 && gid < ens->n_bodies_global && "redistribute: received a body gid outside the id space");
 
-      int slot = slot_of_body(ws->work, n_pre, n_work, gid);
-      if (slot == MFTL_ERROR)
-      {
-        /* ── A body arriving where this rank held nothing of it ─────────────
-         *
-         * This is the case a replicated object list made impossible: every rank
-         * had a shell for every body, so an arrival always found one. Now the
-         * body is created here and appended to the WORK list -- not inserted into
-         * the sorted directory, because an ordered insert shifts every slot above
-         * it and phase 5 is about to index by slot. The merge happens once, at
-         * the end, when nothing is indexing any more.
-         *
-         * It starts unsettled (MFTLObjectCreate zeroes `partition_settled`),
-         * which is the conservative verdict and exactly what the "clean twice"
-         * rule wants for a body this rank has never rebuilt.
-         *
-         * Without an ensemble there is nothing to create INTO, and there is also
-         * nothing to create: MFTLRedistributeObject() hands over one body and
-         * every arrival names it. */
-        MFTL_ASSERT(ens != MFTL_NULL && "redistribute: received a body gid this rank does not hold");
-        MFTL_ASSERT(gid >= 0 && gid < ens->n_bodies_global && "redistribute: received a body gid outside the id space");
+      ws_bodies_reserve(ws, n_work + 1);
+      MFTL_Object *const arrived = MFTLObjectCreate(gid);
+      arrived->domain = domain;
+      arrived->derived = MFTL_DERIVED_TOPOLOGY;  // an empty mesh is trivially described
 
-        ws_bodies_reserve(ws, n_work + 1);
-        MFTL_Object *const arrived = MFTLObjectCreate(gid);
-        arrived->domain = domain;
-        arrived->derived = MFTL_DERIVED_TOPOLOGY;  // an empty mesh is trivially described
+      /* Clear the slot. The workspace is persistent and only ever grows, so a
+       * slot past this call's `n_pre` still holds whatever the PREVIOUS call
+       * put there -- a kept-list pointer into the arena and a non-zero kept
+       * count, which rebuild_object() would then read against a body that has
+       * no pool at all. The setup memset covers [0, n_pre) only, because that
+       * is all this call knew about at the time. */
+      memset(&ws->states[n_work], 0, sizeof(body_state));
 
-        /* Clear the slot. The workspace is persistent and only ever grows, so a
-         * slot past this call's `n_pre` still holds whatever the PREVIOUS call
-         * put there -- a kept-list pointer into the arena and a non-zero kept
-         * count, which rebuild_object() would then read against a body that has
-         * no pool at all. The setup memset covers [0, n_pre) only, because that
-         * is all this call knew about at the time. */
-        memset(&ws->states[n_work], 0, sizeof(body_state));
-
-        ws->work[n_work] = arrived;
-        slot = n_work++;
-        MFTLCommStats.n_objects_created++;
-      }
-
-      /* The four global fields. A body this rank already had must agree with the
-       * sender about every one of them -- they are properties of the whole mesh,
-       * not of a partition -- so applying them unconditionally is correct, and
-       * checking them first is free evidence that it is. */
-      MFTL_Object *const target = ws->work[slot];
-      MFTL_ASSERT((target->verts.n == 0 && target->tris.n == 0)
-                  || (target->next_vertex_gid == tp[MFTL_BODY_HDR_NEXT_VGID] && target->next_triangle_gid == tp[MFTL_BODY_HDR_NEXT_TGID]
-                      && target->global_n_vertices == tp[MFTL_BODY_HDR_GLOBAL_V] && target->global_n_triangles == tp[MFTL_BODY_HDR_GLOBAL_T])
-                  && "redistribute: two ranks disagree about a body's global counters");
-
-      target->next_vertex_gid = tp[MFTL_BODY_HDR_NEXT_VGID];
-      target->next_triangle_gid = tp[MFTL_BODY_HDR_NEXT_TGID];
-      target->next_halfedge_gid = 3 * target->next_triangle_gid;
-      target->global_n_vertices = tp[MFTL_BODY_HDR_GLOBAL_V];
-      target->global_n_triangles = tp[MFTL_BODY_HDR_GLOBAL_T];
-
-      runs[k].obj_idx = slot;
-      runs[k].tri_start = t_off;
-      runs[k].tri_len = tp[MFTL_BODY_HDR_N_TRIS];
-      runs[k].vert_start = v_off;
-      runs[k].vert_len = tp[MFTL_BODY_HDR_N_VERTS];
-
-      t_off += tp[MFTL_BODY_HDR_N_TRIS];
-      v_off += tp[MFTL_BODY_HDR_N_VERTS];
+      ws->work[n_work] = arrived;
+      slot = n_work++;
+      MFTLCommStats.n_objects_created++;
     }
 
-    CS_END(ts_g2, t_group);
+    /* The four global fields. A body this rank already had must agree with the
+     * sender about every one of them -- they are properties of the whole mesh,
+     * not of a partition -- so applying them unconditionally is correct, and
+     * checking them first is free evidence that it is. */
+    MFTL_Object *const target = ws->work[slot];
+    MFTL_ASSERT((target->verts.n == 0 && target->tris.n == 0)
+                || (target->next_vertex_gid == tp[MFTL_BODY_HDR_NEXT_VGID] && target->next_triangle_gid == tp[MFTL_BODY_HDR_NEXT_TGID]
+                    && target->global_n_vertices == tp[MFTL_BODY_HDR_GLOBAL_V] && target->global_n_triangles == tp[MFTL_BODY_HDR_GLOBAL_T])
+                && "redistribute: two ranks disagree about a body's global counters");
 
-    CS_BEGIN(ts_w01);
-    MFTLExchangeWait(&ctx, 0);
-    MFTLExchangeWait(&ctx, 1);
-    CS_END(ts_w01, t_wait);
+    target->next_vertex_gid = tp[MFTL_BODY_HDR_NEXT_VGID];
+    target->next_triangle_gid = tp[MFTL_BODY_HDR_NEXT_TGID];
+    target->next_halfedge_gid = 3 * target->next_triangle_gid;
+    target->global_n_vertices = tp[MFTL_BODY_HDR_GLOBAL_V];
+    target->global_n_triangles = tp[MFTL_BODY_HDR_GLOBAL_T];
 
-    CS_BEGIN(ts_g01);
-    MFTL_ASSERT(t_off == xfer[1].recv_count && "redistribute: body triangle counts do not add up to the arrival count");
-    MFTL_ASSERT(v_off == xfer[0].recv_count && "redistribute: body vertex counts do not add up to the arrival count");
+    runs[k].obj_idx = slot;
+    runs[k].tri_start = t_off;
+    runs[k].tri_len = tp[MFTL_BODY_HDR_N_TRIS];
+    runs[k].vert_start = v_off;
+    runs[k].vert_len = tp[MFTL_BODY_HDR_N_VERTS];
 
-    ws_bytes((void **) &ws->grp_idx_v, &ws->cap_gidx_v, MFTL_MAX(xfer[0].recv_count, 1), sizeof(int), "redistribution group indices");
-    ws_bytes((void **) &ws->grp_idx_t, &ws->cap_gidx_t, MFTL_MAX(xfer[1].recv_count, 1), sizeof(int), "redistribution group indices");
-    int *const grp_off_v = ws->grp_off_v;
-    int *const grp_off_t = ws->grp_off_t;
-    grp_idx_v = ws->grp_idx_v;
-    grp_idx_t = ws->grp_idx_t;
-
-    group_runs_by_object(runs, n_runs, n_work, MFTL_FALSE, grp_off_v, grp_idx_v, ws->cursor);
-    group_runs_by_object(runs, n_runs, n_work, MFTL_TRUE, grp_off_t, grp_idx_t, ws->cursor);
-
-    for (int o = 0; o < n_work; ++o)
-    {
-      ws->states[o].recv_v_idx = grp_idx_v + grp_off_v[o];
-      ws->states[o].n_recv_v = grp_off_v[o + 1] - grp_off_v[o];
-      ws->states[o].recv_t_idx = grp_idx_t + grp_off_t[o];
-      ws->states[o].n_recv_t = grp_off_t[o + 1] - grp_off_t[o];
-    }
-
-    CS_END(ts_g01, t_group);
+    t_off += tp[MFTL_BODY_HDR_N_TRIS];
+    v_off += tp[MFTL_BODY_HDR_N_VERTS];
   }
-  else
+
+  CS_END(ts_g2, t_group);
+
+  CS_BEGIN(ts_w01);
+  MFTLExchangeWait(&ctx, 0);
+  MFTLExchangeWait(&ctx, 1);
+  CS_END(ts_w01, t_wait);
+
+  CS_BEGIN(ts_g01);
+  MFTL_ASSERT(t_off == xfer[1].recv_count && "redistribute: body triangle counts do not add up to the arrival count");
+  MFTL_ASSERT(v_off == xfer[0].recv_count && "redistribute: body vertex counts do not add up to the arrival count");
+
+  ws_bytes((void **) &ws->grp_idx_v, &ws->cap_gidx_v, MFTL_MAX(xfer[0].recv_count, 1), sizeof(int), "redistribution group indices");
+  ws_bytes((void **) &ws->grp_idx_t, &ws->cap_gidx_t, MFTL_MAX(xfer[1].recv_count, 1), sizeof(int), "redistribution group indices");
+  int *const grp_off_v = ws->grp_off_v;
+  int *const grp_off_t = ws->grp_off_t;
+  int *const grp_idx_v = ws->grp_idx_v;
+  int *const grp_idx_t = ws->grp_idx_t;
+
+  group_runs_by_object(runs, n_runs, n_work, MFTL_FALSE, grp_off_v, grp_idx_v, ws->cursor);
+  group_runs_by_object(runs, n_runs, n_work, MFTL_TRUE, grp_off_t, grp_idx_t, ws->cursor);
+
+  for (int o = 0; o < n_work; ++o)
   {
-    CS_BEGIN(ts_w);
-    MFTLExchangeWait(&ctx, 0);
-    MFTLExchangeWait(&ctx, 1);
-    CS_END(ts_w, t_wait);
-
-    ws->states[0].recv_v_idx = MFTL_NULL;  // identity
-    ws->states[0].n_recv_v = xfer[0].recv_count;
-    ws->states[0].recv_t_idx = MFTL_NULL;
-    ws->states[0].n_recv_t = xfer[1].recv_count;
+    ws->states[o].recv_v_idx = grp_idx_v + grp_off_v[o];
+    ws->states[o].n_recv_v = grp_off_v[o + 1] - grp_off_v[o];
+    ws->states[o].recv_t_idx = grp_idx_t + grp_off_t[o];
+    ws->states[o].n_recv_t = grp_off_t[o + 1] - grp_off_t[o];
   }
+
+  CS_END(ts_g01, t_group);
 
   MFTLCommStats.n_bytes_recv += (long) xfer[0].recv_count * (long) sizeof(MFTL_PackedVertex) +
-                                  (long) xfer[1].recv_count * (long) sizeof(MFTL_PackedTriangleComplex) +
-                                  (group_bodies ? (long) xfer[2].recv_count * (long) sizeof(int) : 0);
+                                  (long) xfer[1].recv_count * (long) sizeof(MFTL_PackedTriangleComplex) + (long) xfer[2].recv_count * (long) sizeof(int);
 
   /* ── Phase 5: rebuild ──────────────────────────────────────────────────── */
   rebuild_scratch *const scratch = &ws->scratch;
@@ -2787,42 +2665,36 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
    *
    * Its skip state goes with it. If the body comes back, it is created unsettled
    * and gets its settling rebuild -- which is correct rather than merely safe:
-   * a rank that has just received a body has never rebuilt it here.
-   *
-   * MFTLRedistributeObject() has no directory and does not own its object, so it
-   * neither inserts nor destroys. */
-  if (ens != MFTL_NULL)
+   * a rank that has just received a body has never rebuilt it here. */
+  for (int o = n_pre; o < n_work; ++o)
   {
-    for (int o = n_pre; o < n_work; ++o)
+    MFTL_Object *arrived = ws->work[o];
+    if (arrived->tris.n > 0 || arrived->verts.n > 0)
     {
-      MFTL_Object *arrived = ws->work[o];
-      if (arrived->tris.n > 0 || arrived->verts.n > 0)
-      {
-        MFTLEnsembleInsertLocalObject(ens, arrived);
-      }
-      else
-      {
-        /* Addressed to this rank and yet empty: every entity of the run was a
-         * duplicate this rank kept. Nothing to hold, so nothing to keep. */
-        MFTLObjectDestroy(&arrived);
-        MFTLCommStats.n_objects_destroyed++;
-      }
-      ws->work[o] = MFTL_NULL;
+      MFTLEnsembleInsertLocalObject(ens, arrived);
     }
-
-    for (int o = 0; o < n_pre; ++o)
+    else
     {
-      MFTL_Object *gone = ws->work[o];
-      if (gone->tris.n > 0 || gone->verts.n > 0) continue;
-
-      /* By GID, not by `o`: the insertions above have already shifted the slots. */
-      const int slot = MFTLEnsembleFindLocalSlot(ens, gone->global_id);
-      MFTL_ASSERT(slot != MFTL_ERROR && "redistribute: a body in the work list is not in the directory");
-      MFTLEnsembleEraseLocalSlot(ens, slot);
-      MFTLObjectDestroy(&gone);
+      /* Addressed to this rank and yet empty: every entity of the run was a
+       * duplicate this rank kept. Nothing to hold, so nothing to keep. */
+      MFTLObjectDestroy(&arrived);
       MFTLCommStats.n_objects_destroyed++;
-      ws->work[o] = MFTL_NULL;
     }
+    ws->work[o] = MFTL_NULL;
+  }
+
+  for (int o = 0; o < n_pre; ++o)
+  {
+    MFTL_Object *gone = ws->work[o];
+    if (gone->tris.n > 0 || gone->verts.n > 0) continue;
+
+    /* By GID, not by `o`: the insertions above have already shifted the slots. */
+    const int slot = MFTLEnsembleFindLocalSlot(ens, gone->global_id);
+    MFTL_ASSERT(slot != MFTL_ERROR && "redistribute: a body in the work list is not in the directory");
+    MFTLEnsembleEraseLocalSlot(ens, slot);
+    MFTLObjectDestroy(&gone);
+    MFTLCommStats.n_objects_destroyed++;
+    ws->work[o] = MFTL_NULL;
   }
 
   /* Only what the exchange layer allocated for this call. Everything else --
@@ -2834,49 +2706,26 @@ static int redistribute_core(MFTL_Ensemble *ens, MFTL_Domain *domain, MFTL_Objec
   CS_BEGIN(ts_free3);
   free(xfer[0].recv_buf);
   free(xfer[1].recv_buf);
-  if (group_bodies) free(xfer[2].recv_buf);
+  free(xfer[2].recv_buf);
 
   MFTLExchangeFree(&ctx);
-  MFTLCommStats.n_frees += group_bodies ? 3 : 2;
+  MFTLCommStats.n_frees += 3;
   CS_END(ts_free3, t_teardown);
-
-  if (ens == MFTL_NULL) ws_free(ws);
 
   CS_END(ts_total, t_total);
   return MFTL_SUCCESS;
-}
-
-int MFTLRedistributeObject(MFTL_Object *object)
-{
-  if (object == MFTL_NULL || object->domain == MFTL_NULL) return MFTL_ERROR;
-  return redistribute_core(MFTL_NULL, object->domain, &object, 1, MFTL_NULL);
-}
-
-int MFTLRedistributeListOfObjects(MFTL_Ensemble *ensemble)
-{
-  if (ensemble == MFTL_NULL || ensemble->local_objects == MFTL_NULL) return MFTL_ERROR;
-
-  /* An ensemble with no BODIES AT ALL is a no-op, not an error -- the same
-   * contract as MFTLRedistribute() and MFTLRedistributeWithOwners(). It used to
-   * return MFTL_ERROR here, so the three public entry points disagreed about the
-   * one case a caller is most likely to hit by accident.
-   *
-   * The test is global. A rank that holds no bodies still has to enter the
-   * exchange: another rank may be sending it one. */
-  if (ensemble->n_bodies_global == 0) return MFTL_SUCCESS;
-
-  return redistribute_core(ensemble, &ensemble->domain, ensemble->local_objects, ensemble->n_local_objects, MFTL_NULL);
 }
 
 int MFTLRedistributeWithOwners(MFTL_Ensemble *ensemble, const MFTL_OwnerMap *maps)
 {
   if (ensemble == MFTL_NULL || ensemble->local_objects == MFTL_NULL) return MFTL_ERROR;
 
-  /* GLOBAL: a rank holding no bodies must still enter the exchange. */
+  /* An ensemble with no bodies at all is a no-op, not an error. The test is
+   * GLOBAL: a rank that holds no bodies still has to enter the exchange, because
+   * another rank may be sending it one. */
   if (ensemble->n_bodies_global == 0) return MFTL_SUCCESS;
 
-  /* No dispatch of its own: redistribute_core already takes the direct path --
-   * no per-body count payload, no run bookkeeping -- when the ensemble holds one
-   * body, which is the whole of what MFTLRedistribute's dispatch buys. */
-  return redistribute_core(ensemble, &ensemble->domain, ensemble->local_objects, ensemble->n_local_objects, maps);
+  return redistribute_core(ensemble, maps);
 }
+
+int MFTLRedistribute(MFTL_Ensemble *ensemble) { return MFTLRedistributeWithOwners(ensemble, MFTL_NULL); }

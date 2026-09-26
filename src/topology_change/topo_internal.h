@@ -29,10 +29,20 @@
 #ifndef MFTL_TOPO_INTERNAL_H
 #define MFTL_TOPO_INTERNAL_H
 
+#include "mftl_ensemble.h"
 #include "mftl_geometry.h"
 #include "mftl_meshgen.h"
 #include "mftl_topology_change.h"
 #include "mftl_types.h"
+
+/**
+ * @brief Whether @p r is this rank or one of its graph neighbours, i.e. whether
+ *        a record for it can travel on `comm_graph`.
+ * @param dom The MPI/physical world.
+ * @param r   A rank.
+ * @return `true` if the neighbourhood exchange reaches @p r.
+ */
+static inline bool MFTLTopoIsNeighbour(const MFTL_Domain *dom, int r) { return r == dom->rank || MFTLDomainNeighborIndex(dom, r) != MFTL_ERROR; }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 1. The lattice and the clusters
@@ -345,8 +355,15 @@ double *MFTLTopoCommExchange(const MFTL_Domain *dom, const double *records, cons
  * @brief Sends @p reply (one record of @p stride doubles per received request,
  *        in receive order) back to the requesters. The inverse of
  *        MFTLTopoCommExchange() with the counts swapped.
+ *
+ * @param dom         The domain.
+ * @param reply       One record per received request, in receive order.
+ * @param src_counts  `[nproc]` requests received from each rank, as
+ *                    MFTLTopoCommExchange() reported them.
+ * @param stride      Doubles per record.
+ * @param global_path Whether the request exchange went global; agreed inside.
  * @return The replies, in the order the requests were packed.
  */
-double *MFTLTopoCommReply(const MFTL_Domain *dom, const double *reply, const int *src_counts, const int *dest_counts, int stride, bool global_path);
+double *MFTLTopoCommReply(const MFTL_Domain *dom, const double *reply, const int *src_counts, int stride, bool global_path);
 
 #endif  // MFTL_TOPO_INTERNAL_H

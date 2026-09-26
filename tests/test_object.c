@@ -46,9 +46,6 @@ static void touch_every_array_at_capacity(MFTL_Object *obj)
     obj->verts.rec[vc - 1].global_id = 1;
     obj->verts.pos[3 * vc - 1] = 1.0;
     obj->verts.normal[3 * vc - 1] = 1.0;
-    obj->verts.area[vc - 1] = 1.0;
-    obj->verts.mean_curv[vc - 1] = 1.0;
-    obj->verts.gauss_curv[vc - 1] = 1.0;
   }
 
   if (tc > 0)
@@ -80,9 +77,6 @@ static void fill_pattern(MFTL_Object *obj, int seed)
       obj->verts.pos[3 * v + k] = (double) (seed + 3 * v + k);
       obj->verts.normal[3 * v + k] = (double) (seed - 3 * v - k);
     }
-    obj->verts.area[v] = (double) (seed * 2 + v);
-    obj->verts.mean_curv[v] = (double) (seed * 3 + v);
-    obj->verts.gauss_curv[v] = (double) (seed * 4 + v);
   }
 
   for (int t = 0; t < obj->tris.n; ++t)
@@ -120,9 +114,6 @@ static int check_pattern(const MFTL_Object *obj, int seed, int nv, int nt)
       if (obj->verts.pos[3 * v + k] != (double) (seed + 3 * v + k)) return 0;
       if (obj->verts.normal[3 * v + k] != (double) (seed - 3 * v - k)) return 0;
     }
-    if (obj->verts.area[v] != (double) (seed * 2 + v)) return 0;
-    if (obj->verts.mean_curv[v] != (double) (seed * 3 + v)) return 0;
-    if (obj->verts.gauss_curv[v] != (double) (seed * 4 + v)) return 0;
   }
 
   for (int t = 0; t < nt; ++t)
@@ -715,14 +706,14 @@ static int test_zeroed_on_first_allocation(void)
  * Global statistics (collective)
  * ─────────────────────────────────────────────────────────────────────────── */
 
-static int test_update_global_stats_counts_the_owned_prefix(void)
+static int test_update_global_counts_counts_the_owned_prefix(void)
 {
   MFTL_Object *obj = MFTLObjectCreate(1);
   MFTLEnsembleAddObject(g_ens, obj);
 
   // 10 vertices of which 6 are owned; 8 triangles of which 5 are owned.
   MFTLObjectSetCounts(obj, 10, 6, 8, 5);
-  MFTLObjectUpdateGlobalStats(obj);
+  MFTLEnsembleUpdateGlobalCounts(g_ens);
 
   const int nproc = g_ens->domain.nproc;
   TEST_ASSERT_EQUAL_INT(6 * nproc, obj->global_n_vertices);
@@ -765,7 +756,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_shrink_to_fit_zeroes_the_new_tail);
   RUN_TEST(test_shrink_to_fit_leaves_the_bookkeeping_alone);
   RUN_TEST(test_zeroed_on_first_allocation);
-  RUN_TEST(test_update_global_stats_counts_the_owned_prefix);
+  RUN_TEST(test_update_global_counts_counts_the_owned_prefix);
 
   TEST_REPORT();
 

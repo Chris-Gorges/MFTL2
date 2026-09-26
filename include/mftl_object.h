@@ -155,11 +155,11 @@ void MFTLObjectClear(MFTL_Object *obj);
  * form, for a body that is merely smaller than it was.
  *
  * Both are needed. On the generation path bodies are built whole on rank 0 --
- * `3680 * 4^refine + 176` bytes each -- and the opening redistribution then
+ * `3440 * 4^refine + 128` bytes each -- and the opening redistribution then
  * leaves rank 0 with a SLIVER of the ones it still overlaps and NOTHING of the
  * rest. This function is what src/communication/redistribute.c calls for the
  * second group; the shrink is what handles the first. See
- * docs/scaling-analysis.md for what each is worth.
+ * docs/analysis.md §6.1 for what each is worth.
  *
  * @param obj The mesh. Must already hold no entities -- this frees storage, it
  *            does not decide what to discard. Afterwards the object is exactly as
@@ -197,8 +197,8 @@ void MFTLObjectReleasePools(MFTL_Object *obj);
  * this function moves STORAGE and does not decide what to drop. Lower the counts
  * first, through MFTLObjectSetCounts(), if that is what you meant.
  *
- * **Nothing observable changes.** `n`, `n_local`, every array's live prefix, both
- * MFTL_DERIVED_* bits and the partition-dirty stamp are exactly as they were --
+ * **Nothing observable changes.** `n`, `n_local`, every array's live prefix, the
+ * #MFTL_DERIVED_TOPOLOGY bit and the partition-dirty stamp are exactly as they were --
  * this is a memory operation, not a mesh operation. In particular it must not be
  * spelled through MFTLObjectSetCounts(), which stamps the body dirty and would
  * silently defeat MFTLRedistributeSetSkipUnchangedBodies().
@@ -247,8 +247,6 @@ size_t MFTLObjectPoolBytes(const MFTL_Object *obj);
  * when the capacity is non-zero, and each pointer inside its own block. Used by
  * the tests and by assertions; not a mesh validity check (that is
  * MFTLCheckMeshIntegrity).
- *
- * @return MFTL_TRUE if the pools are structurally sound.
  *
  * @param obj The mesh.
  * @return `true` if every count, capacity and pointer agrees. Intended for
@@ -302,8 +300,8 @@ static inline void MFTLObjectInvalidateDerived(MFTL_Object *obj) { obj->derived 
  * MFTLObjectSetCounts() owes this call. It is CONSERVATIVE by design: a spurious
  * stamp costs one body's rebuild, a missing one is silent corruption.
  *
- * @param obj The mesh. Only `partition_dirty` is written; the derived bits are
- *            a separate question and are not touched.
+ * @param obj The mesh. Only `partition_dirty` is written; the derived bit is
+ *            a separate question and is not touched.
  *
  * @rank_local It is a local statement about a local pool. Redistribution reduces
  *             the per-body votes of every rank before acting on any of them.
@@ -415,27 +413,8 @@ static inline uint64_t MFTLMorton3D(uint64_t x, uint64_t y, uint64_t z)
  */
 void MFTLObjectReorderMorton(MFTL_Object *obj);
 
-// -----------------------------------------------------------------------------
-// 5. GLOBAL STATISTICS
-// -----------------------------------------------------------------------------
-
-/**
- * @brief Sums the owned entity counts of ONE object across all ranks.
- *
- * Useful when only one object has been modified (e.g. during generation) and a
- * full ensemble reduction is not warranted. With ownership as a prefix this is
- * one Allreduce of two integers and no per-entity work at all -- the previous
- * version scanned every entity testing an `is_ghost` flag first.
- *
- * @note Collective on the object's domain communicator.
- *
- * @param object The mesh. `global_n_vertices` and `global_n_triangles` are
- *               overwritten on every rank.
- */
-void MFTLObjectUpdateGlobalStats(MFTL_Object *object);
-
 /* ═══════════════════════════════════════════════════════════════════════════
- * 6. HOT-LOOP ITERATORS
+ * 5. HOT-LOOP ITERATORS
  *
  * Macros, not functions, and deliberately so. C has no lambdas, so a function
  * taking the loop body would have to take a function POINTER -- which the

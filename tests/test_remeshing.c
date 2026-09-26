@@ -1339,6 +1339,96 @@ static int test_compaction_removes_orphans(void)
   return 0;
 }
 
+/**
+ * @brief Remeshing commutes with a change of units, to the bit.
+ *
+ * A front-tracking run in SI units meshes a millimetre droplet with edges near
+ * 1e-4, so every test the remesher makes has to be DIMENSIONLESS -- a ratio, or a
+ * comparison against zero. The fold test used to compare a squared area vector
+ * (dimension L^4) against 1e-15; below an edge length of about 1.8e-4 every
+ * triangle then counted as degenerate, and every collapse and every flip was
+ * refused while nothing reported it.
+ *
+ * Scaling by a power of two is exact in floating point -- every sum, product,
+ * quotient and square root of scaled operands is the scaled result with the same
+ * rounding -- so a remesher with no length scale of its own must produce the
+ * SAME mesh times 2^-20, bit for bit, in the same pool order. Any absolute
+ * threshold anywhere in the pass breaks that, which is why the comparison is
+ * exact and not approximate. Non-vacuity: the pass must split, collapse AND flip.
+ */
+static int test_remeshing_is_independent_of_the_length_unit(void)
+{
+  const double s = ldexp(1.0, -20);
+
+  /* The unit mesh: a scrambled sphere, so that all three operators have work. */
+  MFTL_Object *unit = make_sphere(3);
+  unsigned seed = 24681357u;
+  for (int v = 0; v < unit->verts.n; ++v)
+  {
+    double *q = MFTLVertexPosMut(unit, v);
+    for (int k = 0; k < 3; ++k)
+    {
+      seed = seed * 1103515245u + 12345u;
+      q[k] += 0.22 * ((double) ((seed >> 16) & 0x7fff) / 32767.0 - 0.5);
+    }
+    const double r = sqrt(q[0] * q[0] + q[1] * q[1] + q[2] * q[2]);
+    for (int k = 0; k < 3; ++k) q[k] /= r;
+  }
+  MFTLComputeTriangleGeometry(unit, unit->tris.n);
+
+  /* The same mesh in a box 2^20 times smaller: same generator, so the same
+   * topology and pool order, then every position scaled exactly. */
+  int cuts[3] = {1, 1, 1};
+  double lo[3] = {-4.0 * s, -4.0 * s, -4.0 * s};
+  double hi[3] = {4.0 * s, 4.0 * s, 4.0 * s};
+  bool periodic[3] = {MFTL_FALSE, MFTL_FALSE, MFTL_FALSE};
+  MFTL_Ensemble *small_ens = MFTLEnsembleCreate(MPI_COMM_SELF, cuts, lo, hi, periodic, 1);
+  TEST_ASSERT(small_ens != MFTL_NULL);
+
+  MFTL_Object *small = MFTLObjectCreate(0);
+  MFTLEnsembleAddObject(small_ens, small);
+  double centre[3] = {0.0, 0.0, 0.0};
+  MFTLGenerateSphere(small, centre, s, 3);
+  TEST_ASSERT_EQUAL_INT(unit->verts.n, small->verts.n);
+  for (int i = 0; i < 3 * unit->verts.n; ++i) small->verts.pos[i] = unit->verts.pos[i] * s;
+  MFTLComputeTriangleGeometry(small, small->tris.n);
+
+  const double target = MFTLMeanEdgeLength(unit);
+  MFTL_RemeshParameters pu;
+  MFTL_RemeshParameters ps;
+  MFTLInitRemeshParams(&pu, MFTL_REMESH_ISOTROPIC, target, 15, MFTL_SMOOTH_TRIANGLE_BASED, 180.0);
+  MFTLInitRemeshParams(&ps, MFTL_REMESH_ISOTROPIC, target * s, 15, MFTL_SMOOTH_TRIANGLE_BASED, 180.0);
+  pu.smooth_iterations = ps.smooth_iterations = 3;
+
+  MFTL_RemeshStats su;
+  MFTL_RemeshStats ss;
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLRemeshObject(unit, &pu, &su));
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLRemeshObject(small, &ps, &ss));
+
+  printf("\n    unit: %d split / %d collapse / %d flip -> %d tris;  x2^-20: %d / %d / %d -> %d tris ", su.n_split, su.n_collapse, su.n_flip, unit->tris.n,
+         ss.n_split, ss.n_collapse, ss.n_flip, small->tris.n);
+
+  TEST_ASSERT(su.n_split > 0 && su.n_collapse > 0 && su.n_flip > 0);
+  TEST_ASSERT_EQUAL_INT(su.n_split, ss.n_split);
+  TEST_ASSERT_EQUAL_INT(su.n_collapse, ss.n_collapse);
+  TEST_ASSERT_EQUAL_INT(su.n_flip, ss.n_flip);
+  TEST_ASSERT_EQUAL_INT(unit->verts.n, small->verts.n);
+  TEST_ASSERT_EQUAL_INT(unit->tris.n, small->tris.n);
+
+  int same = 1;
+  for (int i = 0; i < 3 * unit->verts.n; ++i) same &= (small->verts.pos[i] == unit->verts.pos[i] * s);
+  for (int t = 0; t < unit->tris.n; ++t)
+    for (int k = 0; k < 3; ++k) same &= (small->tris.verts[3 * t + k] == unit->tris.verts[3 * t + k]);
+  TEST_ASSERT(same);
+
+  TEST_ASSERT(inv_mesh_is_sound(small, 0));
+  TEST_ASSERT(inv_mesh_is_closed(small));
+
+  MFTLEnsembleDestroy(&small_ens);
+  fixture_free(unit);
+  return 0;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════ */
 
 int main(int argc, char **argv)
@@ -1391,6 +1481,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_remesh_converges_and_then_does_nothing);
   RUN_TEST(test_remesh_preserves_a_cube);
   RUN_TEST(test_remesh_of_an_open_patch_keeps_its_rim);
+  RUN_TEST(test_remeshing_is_independent_of_the_length_unit);
   RUN_TEST(test_compaction_removes_orphans);
 
   TEST_REPORT();

@@ -44,7 +44,7 @@
  * operator again -- it equalises edge lengths and does nothing about area -- so a
  * caller selecting "triangle based" for its isotropy would get a slightly more
  * expensive MFTL_SMOOTH_VERTEX_BASED instead. Measured in
- * docs/remeshing-quality-analysis.md, where dropping the weight costs volume
+ * docs/analysis.md §4, where dropping the weight costs volume
  * conservation (6.0 % against 3.5 %) rather than triangle quality.
  *
  * ## WHY THE NORMAL IS NOT COMPUTED HERE
@@ -293,7 +293,7 @@ int MFTLDetectFeatures(MFTL_Object *obj, double angle_degrees, double corner_ang
       const double l1 = d1[0] * d1[0] + d1[1] * d1[1] + d1[2] * d1[2];
       const double l2 = d2[0] * d2[0] + d2[1] * d2[1] + d2[2] * d2[2];
 
-      if (l1 > MFTL_VERYVERYSMALL && l2 > MFTL_VERYVERYSMALL)
+      if (l1 > 0.0 && l2 > 0.0)
       {
         const double dot = (d1[0] * d2[0] + d1[1] * d2[1] + d1[2] * d2[2]) / MFTL_SQRT(l1 * l2);
         is_ridge = (dot <= straight_dot);
@@ -388,7 +388,9 @@ static bool ridge_displacement(const MFTL_Object *obj, int v, const int *fan, in
    * it is the one that erodes ridges. */
   const double tau[3] = {d2[0] - d1[0], d2[1] - d1[1], d2[2] - d1[2]};
   const double tau_len_sq = tau[0] * tau[0] + tau[1] * tau[1] + tau[2] * tau[2];
-  if (tau_len_sq < MFTL_VERYVERYSMALL) return MFTL_FALSE;
+  /* Relative to the two edges, not to 1: the test has to mean "the neighbours
+   * coincide" at a millimetre as much as at a metre. */
+  if (!(tau_len_sq > MFTL_VERYVERYSMALL * (l1 + l2))) return MFTL_FALSE;
 
   const double delta[3] = {0.5 * (d1[0] + d2[0]), 0.5 * (d1[1] + d2[1]), 0.5 * (d1[2] + d2[2])};
   const double s = (delta[0] * tau[0] + delta[1] * tau[1] + delta[2] * tau[2]) / tau_len_sq;
@@ -488,7 +490,10 @@ static bool free_displacement(const MFTL_Object *obj, int v, const int *fan, int
     }
   }
 
-  if (weight_sum < MFTL_VERYVERYSMALL) return MFTL_FALSE;
+  /* Zero only when every fan triangle is exactly degenerate. A small but
+   * non-zero sum is still a well-defined weighted mean -- numerator and
+   * denominator carry the same areas -- so no length scale belongs here. */
+  if (!(weight_sum > 0.0)) return MFTL_FALSE;
 
   const double inv = 1.0 / weight_sum;
   double delta[3] = {target[0] * inv, target[1] * inv, target[2] * inv};
@@ -574,7 +579,7 @@ void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params,
       const double disp_sq = disp[0] * disp[0] + disp[1] * disp[1] + disp[2] * disp[2];
       const double limit_sq = step_frac * step_frac * min_edge_sq;
 
-      if (disp_sq * relax * relax > limit_sq && disp_sq > MFTL_VERYVERYSMALL) scale = MFTL_SQRT(limit_sq / disp_sq);
+      if (disp_sq * relax * relax > limit_sq && disp_sq > 0.0) scale = MFTL_SQRT(limit_sq / disp_sq);
 
       double p[3] = {obj->verts.pos[3 * v + 0] + scale * disp[0], obj->verts.pos[3 * v + 1] + scale * disp[1], obj->verts.pos[3 * v + 2] + scale * disp[2]};
       MFTLApplyPeriodicity(obj->domain, p);

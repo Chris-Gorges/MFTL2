@@ -275,7 +275,7 @@ static inline void MFTLGetTriangleProperties(const MFTL_Object *obj, int t, doub
    *   - the mean-ratio quality q = 4*sqrt(3)*A / (a^2+b^2+c^2) becomes UNBOUNDED
    *     ABOVE for small triangles, for a measure whose maximum is 1 at the
    *     equilateral triangle. An average q of 1.023 was measured on a degenerate
-   *     mesh (docs/remeshing-quality-analysis.md);
+   *     mesh (docs/analysis.md §4);
    *   - and the NORMAL of any triangle smaller than that floor came out
    *     under-normalised rather than unit, because it was divided by the clamp
    *     instead of by its own length.
@@ -298,7 +298,7 @@ static inline void MFTLGetTriangleProperties(const MFTL_Object *obj, int t, doub
    * It costs one instruction per triangle: `fcmp`+`fcsel` against `fmax`.
    * The retired frame-backed ensemble benchmark measured this guard at +1.1%
    * on the fused geometry+quality pass. That historical result is recorded in
-   * docs/performance-analysis.md; the exactness argument remains independent of
+   * docs/analysis.md §1.7; the exactness argument remains independent of
    * the triangle input layout. */
   double cr[3];
   cr[0] = e1[1] * e2[2] - e1[2] * e2[1];
@@ -445,6 +445,37 @@ static inline void MFTLGetTriangleNormal(const MFTL_Object *obj, int t, double o
  * @param[out] out The centroid, wrapped back into the domain box.
  */
 static inline void MFTLGetTriangleCenter(const MFTL_Object *obj, int t, double out[3]) { MFTLGetTriangleProperties(obj, t, MFTL_NULL, MFTL_NULL, out); }
+
+/**
+ * @brief Does every triangle's cached `tris.center` still match its vertices?
+ *
+ * The precondition check behind every migration that routes by centre --
+ * MFTLRedistribute() and the remesher's shifted placements. It covers GHOSTS as
+ * well as owned triangles, and that is the point: a rank routes its ghosts to
+ * work out which of its OWN triangles the ghost's owner is about to need, so a
+ * caller that refreshed only the owned centres leaves two ranks disagreeing about
+ * a destination, and someone's owned triangle silently loses an edge neighbour.
+ *
+ * A full geometry pass, so it belongs inside `MFTL_ASSERT` and nowhere else.
+ *
+ * @param obj The mesh.
+ * @return `true` if every centre is within 1e-9 per axis of the one its three
+ *         vertices imply, compared through the periodic seam.
+ */
+static inline bool MFTLTriangleCentresAreCurrent(const MFTL_Object *obj)
+{
+  for (int t = 0; t < obj->tris.n; ++t)
+  {
+    double fresh[3];
+    MFTLGetTriangleCenter(obj, t, fresh);
+
+    /* Both are wrapped positions, so compare THROUGH the seam, not across it. */
+    double d[3];
+    MFTLGetMinimumImageVector(obj->domain, d, &obj->tris.center[3 * t], fresh);
+    if (fabs(d[0]) > 1e-9 || fabs(d[1]) > 1e-9 || fabs(d[2]) > 1e-9) return MFTL_FALSE;
+  }
+  return MFTL_TRUE;
+}
 
 // -----------------------------------------------------------------------------
 // 5. POINT QUERIES

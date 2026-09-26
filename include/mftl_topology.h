@@ -690,12 +690,11 @@ void MFTLRebuildTwins(MFTL_Object *obj);
  * missing twin also means "the neighbour is on another rank", and marking those
  * would turn the halo rim into a fake surface boundary.
  *
- * @return The number of boundary half-edges found; 0 means the mesh is closed.
  * @note Local (serial) operation -- no MPI, and it asserts in Debug that the
  *       object holds no ghosts.
  *
  * @param obj The mesh. Must be COMPLETE -- see the note above.
- * @return #MFTL_SUCCESS, or #MFTL_ERROR on a NULL object.
+ * @return The number of boundary half-edges found; 0 means the mesh is closed.
  */
 int MFTLMarkMeshBoundary(MFTL_Object *obj);
 
@@ -715,8 +714,6 @@ int MFTLMarkMeshBoundary(MFTL_Object *obj);
  * A half-edge without a twin is accepted -- an open surface is a legitimate
  * mesh -- and the count is reported instead, which is the cheapest way to notice
  * that a mesh expected to be closed is not.
- *
- * @return MFTL_SUCCESS if the mesh is valid, MFTL_ERROR otherwise.
  *
  * @param obj The mesh.
  * @return #MFTL_SUCCESS if every structural check passes, else #MFTL_ERROR.

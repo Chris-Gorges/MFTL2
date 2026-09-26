@@ -92,6 +92,50 @@ static int g_tests_failed = 0;
 
 #define TEST_ASSERT_TRUE(cond) TEST_ASSERT(cond)
 
+/**
+ * @brief The process grid the multi-rank tests run on at @p nproc ranks.
+ *
+ * 2x2x1 at 4, 3x2x1 at 6, 2x2x2 at 8, 3x3x3 at 27, and a slab (nproc x 1 x 1)
+ * at any other count.
+ *
+ * 3x3x3 is worth a run of its own. At cuts[k] == 2 a periodic axis has both of a
+ * cell's neighbours be the SAME rank, so "one cell towards -x" and "one cell
+ * towards +x" are indistinguishable and a direction error cannot show up; three
+ * is the smallest count at which they are different ranks, and the smallest grid
+ * with an interior cell whose 26 neighbours are 26 distinct ranks.
+ *
+ * @param      nproc Ranks in the job.
+ * @param[out] cuts  The grid; its product is @p nproc.
+ */
+static inline void test_grid_for(int nproc, int cuts[3])
+{
+  cuts[0] = nproc;
+  cuts[1] = 1;
+  cuts[2] = 1;
+  if (nproc == 4)
+  {
+    cuts[0] = 2;
+    cuts[1] = 2;
+  }
+  else if (nproc == 6)
+  {
+    cuts[0] = 3;
+    cuts[1] = 2;
+  }
+  else if (nproc == 8)
+  {
+    cuts[0] = 2;
+    cuts[1] = 2;
+    cuts[2] = 2;
+  }
+  else if (nproc == 27)
+  {
+    cuts[0] = 3;
+    cuts[1] = 3;
+    cuts[2] = 3;
+  }
+}
+
 #define TEST_FAIL()                                                                                            \
   do                                                                                                           \
   {                                                                                                            \

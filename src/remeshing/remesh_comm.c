@@ -131,42 +131,6 @@ static void migrator_reserve(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens)
   }
 }
 
-#ifndef NDEBUG
-/**
- * @brief Debug check: every triangle's cached centre still matches its vertices.
- *
- * The same check `compute_owners` makes for the geometric rule, repeated here
- * because an owner map turns that one off -- a map is not obliged to route by
- * geometry at all, and the dispersed rule does not. The shifted rule DOES, so it
- * owes the check itself.
- *
- * It covers GHOSTS as well as owned triangles, and that is the whole point. A
- * rank routes its ghosts in order to work out which of its OWN triangles the
- * ghost's owner is about to need; if only the owned centres were refreshed, two
- * ranks would disagree about a ghost's destination and someone's owned triangle
- * would silently end up without one of its edge neighbours. Nothing crashes.
- *
- * @param obj The mesh.
- * @return `true` if every triangle's cached centre still matches its vertices.
- *         Debug only -- a migration routes ghosts by that centre, so a stale one
- *         makes two ranks disagree about a destination.
- */
-static bool centres_are_current(const MFTL_Object *obj)
-{
-  for (int t = 0; t < obj->tris.n; ++t)
-  {
-    double fresh[3];
-    MFTLGetTriangleProperties(obj, t, MFTL_NULL, MFTL_NULL, fresh);
-
-    /* Both are wrapped positions, so compare THROUGH the seam, not across it. */
-    double d[3];
-    MFTLGetMinimumImageVector(obj->domain, d, &obj->tris.center[3 * t], fresh);
-    if (fabs(d[0]) > 1e-9 || fabs(d[1]) > 1e-9 || fabs(d[2]) > 1e-9) return MFTL_FALSE;
-  }
-  return MFTL_TRUE;
-}
-#endif
-
 int MFTLRemeshMigrateShifted(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const int group[3], const double shift[3], MFTL_RemeshMigrationReport *report)
 {
   MFTL_ASSERT(m != MFTL_NULL && ens != MFTL_NULL && group != MFTL_NULL && shift != MFTL_NULL);
@@ -189,7 +153,10 @@ int MFTLRemeshMigrateShifted(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const i
   {
     const MFTL_Object *const obj = ens->local_objects[o];
 
-    MFTL_ASSERT(centres_are_current(obj) &&
+    /* The check `compute_owners` makes for the geometric rule, repeated here
+     * because an owner map turns that one off: a map need not route by geometry
+     * at all (the dispersed rule does not), but the shifted rule does. */
+    MFTL_ASSERT(MFTLTriangleCentresAreCurrent(obj) &&
                 "MFTLRemeshMigrateShifted: stale triangle centres -- call MFTLComputeTriangleGeometry(obj, obj->tris.n) "
                 "(ghosts included) first. Triangles are routed by their centre here, exactly as in the production rule.");
 
@@ -330,6 +297,24 @@ void MFTLRemeshAgreeDoubleMax(const MFTL_Domain *domain, double *values, int n)
   MPI_Allreduce(MPI_IN_PLACE, values, n, MPI_DOUBLE, MPI_MAX, domain->comm_world);
 }
 
+void MFTLRemeshAgreeProfile(const MFTL_Domain *domain, MFTL_RemeshStats *st, double *extra, int n_extra)
+{
+  MFTL_ASSERT(n_extra >= 0 && n_extra <= 2 && "MFTLRemeshAgreeProfile: at most two extra values");
+
+  double prof[8] = {st->t_total, st->t_migrate, st->t_geometry, st->t_freeze, st->t_sweep, st->t_reduce, 0.0, 0.0};
+  for (int i = 0; i < n_extra; ++i) prof[6 + i] = extra[i];
+
+  MFTLRemeshAgreeDoubleMax(domain, prof, 6 + n_extra);
+
+  st->t_total = prof[0];
+  st->t_migrate = prof[1];
+  st->t_geometry = prof[2];
+  st->t_freeze = prof[3];
+  st->t_sweep = prof[4];
+  st->t_reduce = prof[5];
+  for (int i = 0; i < n_extra; ++i) extra[i] = prof[6 + i];
+}
+
 double MFTLRemeshWallTime(void) { return MPI_Wtime(); }
 
 bool MFTLRemeshParamsAgree(const MFTL_Domain *domain, const MFTL_RemeshParameters *params)
@@ -383,32 +368,17 @@ void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radiu
 
   const int b = ens->n_local_objects;
 
-  /* Layout per body: [w, s0, c0, s1, c1, s2, c2, ntri]. A periodic axis uses the
-   * (sin, cos) pair, a non-periodic one puts its plain weighted sum in the `s`
-   * slot and leaves `c` zero.
+  /* Layout per body: [w, s0, c0, s1, c1, s2, c2, ntri, lowest holder]. A
+   * periodic axis uses the (sin, cos) pair, a non-periodic one puts its plain
+   * weighted sum in the `s` slot and leaves `c` zero. The owned TRIANGLE COUNT
+   * rides along because the dispersed balancer needs it -- the alternative is
+   * not a shorter message, it is a SECOND reduction over the same bodies.
    *
-   * EIGHT, and the eighth is not padding. It was, once: the stride was seven
-   * because an eighth slot bought a power-of-two address calculation that no
-   * reduction cares about, at 12.5 % of the message. The slot now carries the
-   * body's owned TRIANGLE COUNT, which the dispersed balancer needs, and that
-   * changes the trade completely -- the alternative is not a shorter message,
-   * it is a SECOND reduction over the same bodies.
-   *
-   * ── AND IT IS INDEXED BY LOCAL SLOT ───────────────────────────────────────
-   *
-   * This used to stage `8 * n_bodies_global` doubles into an `MPI_Allreduce` on
-   * `comm_world`, and then `n_bodies_global` more for the radius: 72 bytes per
-   * body on every rank, whether or not it held a triangle of it. The measurement
-   * is a per-body reduction like any other, so it goes through the one place that
-   * chooses a communicator, and the caller's buffers describe what this rank
-   * holds.
-   *
-   * What that costs is stated rather than hidden: the dispersed balancer needs a
-   * REPLICATED assignment and therefore replicated inputs, so it re-broadcasts
-   * these results over `comm_world` itself -- see replicate_for_balancer() in
-   * remesh_dispersed.c. Everything else here -- the strategy ratio, the
-   * admission test, the destination of a body this rank holds -- is answered
-   * from the local rows and one scalar.
+   * INDEXED BY LOCAL SLOT: the measurement is a per-body reduction like any
+   * other, so it goes through the one place that chooses a communicator, and the
+   * caller's buffers describe what this rank holds. The strategy ratio, the
+   * admission test and the destination of a body this rank holds are all
+   * answered from the local rows and one scalar (`r_max`).
    */
   enum
   {
@@ -590,34 +560,7 @@ void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radiu
 
 double *MFTLRemeshNeighborGather(const MFTL_Domain *domain, const double *send, int n_send, int *rcount, int *rdispl, int *n_recv)
 {
-  const int d = domain->num_neighbors;
-
-  *n_recv = 0;
-  if (domain->nproc < 2 || d < 1)
-  {
-    return (double *) MFTLMallocOrDie(sizeof(double), "remesh neighbour gather (empty)");
-  }
-
-  MPI_Neighbor_allgather(&n_send, 1, MPI_INT, rcount, 1, MPI_INT, domain->comm_graph);
-
-  size_t total = 0;
-  for (int i = 0; i < d; ++i)
-  {
-    rdispl[i] = (int) total;
-    total += (size_t) rcount[i];
-  }
-
-  /* Reaching this needs of the order of 10^7 doubles arriving from 26 neighbours
-   * at once. The records here are three doubles per body a rank DECIDES, so it
-   * is millions of bodies on one rank -- far past where the payload is the
-   * problem. Same bound and same reasoning as holder_gather(). */
-  MFTL_ASSERT(total <= (size_t) 0x7fffffff && "MFTLRemeshNeighborGather: neighbour payload exceeds an MPI int count");
-
-  double *const recv = (double *) MFTLMallocOrDie(MFTL_MAX(total, (size_t) 1) * sizeof(double), "remesh neighbour gather");
-  MPI_Neighbor_allgatherv(send, n_send, MPI_DOUBLE, recv, rcount, rdispl, MPI_DOUBLE, domain->comm_graph);
-
-  *n_recv = (int) total;
-  return recv;
+  return MFTLNeighborAllgatherDoubles(domain, send, n_send, rcount, rdispl, n_recv);
 }
 
 void MFTLRemeshNeighborAllgather(const MFTL_Domain *domain, const double *send, int n, double *recv)

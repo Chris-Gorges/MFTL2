@@ -24,7 +24,7 @@
  *
  * The historical frame-backed comparison was measured on the same mesh in the
  * same binary and checked to agree to rounding (the retired benchmark and its
- * results are documented in docs/performance-analysis.md):
+ * results are documented in docs/analysis.md §1.5):
  *
  *     scatter over triangles       5.2 - 5.5 ns per vertex, flat in mesh size
  *     gather by fan walk          17.8 - 21.6 ns per vertex, i.e. 3.4x slower
@@ -74,7 +74,7 @@
 #include "mftl_types.h"
 
 /**
- * @brief Zeroes the accumulator and scatters every face normal into it.
+ * @brief Scatters every face's area-weighted normal into its three vertices.
  *
  * The inner k-loop is written out rather than left as a loop so that the three
  * read-modify-write chains are visibly independent: they touch three different
@@ -90,14 +90,7 @@
 static void scatter_face_normals(MFTL_Object *obj)
 {
   const int n_tris = obj->tris.n;
-  const int n_verts = obj->verts.n;
-
   double *restrict vn = obj->verts.normal;
-
-  /* Every vertex is written by this pass, so the whole live prefix is cleared
-   * rather than only the owned part -- a ghost that kept last step's value would
-   * be a stale number that looks like a fresh one. */
-  memset(vn, 0, 3 * (size_t) n_verts * sizeof(double));
 
   MFTL_FOREACH_TRIANGLE_GEOMETRY(
       obj, n_tris,
@@ -140,29 +133,45 @@ static void scatter_face_normals(MFTL_Object *obj)
  * A face with zero area has no unit normal. It is skipped rather than given the
  * zero vector's angle sum, which is the same answer and avoids three `atan2`.
  *
- * @param obj The mesh. `verts.normal` is accumulated into after being zeroed.
+ * @param obj The mesh. `verts.normal` is accumulated into, having been zeroed
+ *            by the caller.
  */
 static void scatter_angle_weighted_normals(MFTL_Object *obj)
 {
   const int n_tris = obj->tris.n;
-  const int n_verts = obj->verts.n;
-
   double *restrict vn = obj->verts.normal;
-  memset(vn, 0, 3 * (size_t) n_verts * sizeof(double));
 
-  MFTL_FOREACH_TRIANGLE_GEOMETRY(obj, n_tris, const double nx = e1y * e2z - e1z * e2y; const double ny = e1z * e2x - e1x * e2z;
-                                 const double nz = e1x * e2y - e1y * e2x; const double mag = MFTL_SQRT(nx * nx + ny * ny + nz * nz); if (!(mag > 0.0)) continue;
-                                 const double inv = 1.0 / mag; const double ux = nx * inv, uy = ny * inv, uz = nz * inv;
+  // clang-format off
+  MFTL_FOREACH_TRIANGLE_GEOMETRY(
+      obj, n_tris,
+    const double nx = e1y * e2z - e1z * e2y;
+    const double ny = e1z * e2x - e1x * e2z;
+    const double nz = e1x * e2y - e1y * e2x;
+    const double mag = MFTL_SQRT(nx * nx + ny * ny + nz * nz);
+    if (!(mag > 0.0)) continue;
 
-                                 const double d12 = e1x * e2x + e1y * e2y + e1z * e2z; const double d11 = e1x * e1x + e1y * e1y + e1z * e1z;
-                                 const double d22 = e2x * e2x + e2y * e2y + e2z * e2z; const double a0 = atan2(mag, d12);
-                                 const double a1 = atan2(mag, d11 - d12); const double a2 = atan2(mag, d22 - d12);
+    const double inv = 1.0 / mag;
+    const double ux = nx * inv, uy = ny * inv, uz = nz * inv;
 
-                                 vn[3 * v0 + 0] += a0 * ux; vn[3 * v0 + 1] += a0 * uy; vn[3 * v0 + 2] += a0 * uz;
+    const double d12 = e1x * e2x + e1y * e2y + e1z * e2z;
+    const double d11 = e1x * e1x + e1y * e1y + e1z * e1z;
+    const double d22 = e2x * e2x + e2y * e2y + e2z * e2z;
+    const double a0 = atan2(mag, d12);
+    const double a1 = atan2(mag, d11 - d12);
+    const double a2 = atan2(mag, d22 - d12);
 
-                                 vn[3 * v1 + 0] += a1 * ux; vn[3 * v1 + 1] += a1 * uy; vn[3 * v1 + 2] += a1 * uz;
+    vn[3 * v0 + 0] += a0 * ux;
+    vn[3 * v0 + 1] += a0 * uy;
+    vn[3 * v0 + 2] += a0 * uz;
 
-                                 vn[3 * v2 + 0] += a2 * ux; vn[3 * v2 + 1] += a2 * uy; vn[3 * v2 + 2] += a2 * uz;);
+    vn[3 * v1 + 0] += a1 * ux;
+    vn[3 * v1 + 1] += a1 * uy;
+    vn[3 * v1 + 2] += a1 * uz;
+
+    vn[3 * v2 + 0] += a2 * ux;
+    vn[3 * v2 + 1] += a2 * uy;
+    vn[3 * v2 + 2] += a2 * uz;);
+  // clang-format on
 }
 
 /**
@@ -213,6 +222,11 @@ void MFTLComputeVertexNormals(MFTL_Object *obj, MFTL_NormalWeighting weighting)
   MFTL_ASSERT((obj->derived & MFTL_DERIVED_TOPOLOGY) != 0u && "MFTLComputeVertexNormals: tris.verts is stale -- MFTLObjectBuildDerived first");
 
   if (obj->verts.n == 0) return;
+
+  /* Every vertex is written by this pass, so the whole live prefix is cleared
+   * rather than only the owned part -- a ghost that kept last step's value would
+   * be a stale number that looks like a fresh one. */
+  memset(obj->verts.normal, 0, 3 * (size_t) obj->verts.n * sizeof(double));
 
   if (weighting == MFTL_NORMAL_WEIGHT_ANGLE)
     scatter_angle_weighted_normals(obj);

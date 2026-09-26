@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "mftl_arrayfunctions.h"
 #include "mftl_communication.h"
 #include "mftl_constants.h"
 #include "mftl_ensemble.h"
@@ -44,19 +45,11 @@ MFTL_TopologyOptions MFTLTopologyDefaultOptions(void)
 /** @brief Record layout of an event on the wire. */
 #define EVENT_STRIDE 7
 
-static bool is_neighbour(const MFTL_Domain *dom, int r)
-{
-  if (r == dom->rank) return MFTL_TRUE;
-  for (int i = 0; i < dom->num_neighbors; ++i)
-    if (dom->neighbors[i] == r) return MFTL_TRUE;
-  return MFTL_FALSE;
-}
-
 /** @brief Whether any destination with a non-zero count is outside the neighbourhood. */
 static bool any_far(const MFTL_Domain *dom, const int *counts)
 {
   for (int r = 0; r < dom->nproc; ++r)
-    if (counts[r] > 0 && !is_neighbour(dom, r)) return MFTL_TRUE;
+    if (counts[r] > 0 && !MFTLTopoIsNeighbour(dom, r)) return MFTL_TRUE;
   return MFTL_FALSE;
 }
 
@@ -145,27 +138,6 @@ int MFTLTopologyDetectEvents(MFTL_Ensemble *ens, const MFTL_TopologyOptions *opt
 /* ═══════════════════════════════════════════════════════════════════════════
  * 2. Reconstruction
  * ═══════════════════════════════════════════════════════════════════════════ */
-
-static int cmp_int_asc(const void *a, const void *b)
-{
-  const int x = *(const int *) a, y = *(const int *) b;
-  return (x > y) - (x < y);
-}
-
-static int created_index(const int *created, int n, int gid)
-{
-  int lo = 0, hi = n - 1;
-  while (lo <= hi)
-  {
-    const int mid = (lo + hi) / 2;
-    if (created[mid] == gid) return mid;
-    if (created[mid] < gid)
-      lo = mid + 1;
-    else
-      hi = mid - 1;
-  }
-  return -1;
-}
 
 /** @brief The cluster a body id came out of, or -1 if it is not a new body. */
 static int came_from(const MFTL_TopoComponent *comps, int n, int gid)
@@ -271,17 +243,6 @@ static double displacement_field(MFTL_Object *obj)
   return dvdd;
 }
 
-/** @brief Geometry and derived arrays current for every local object: what redistribution needs. */
-static void refresh_all(MFTL_Ensemble *ens)
-{
-  for (int o = 0; o < ens->n_local_objects; ++o)
-  {
-    MFTL_Object *const obj = ens->local_objects[o];
-    if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
-    MFTLComputeTriangleGeometry(obj, obj->tris.n);
-  }
-}
-
 int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int n_bodies_in, const MFTL_TopologyEvent *events, int n_events,
                                   const MFTL_TopologyOptions *opts, MFTL_TopologyStats *stats)
 {
@@ -316,10 +277,8 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
   /* The sorted body list and the global size of each body. */
   int *const bodies = (int *) MFTLMallocOrDie((size_t) n_bodies_in * sizeof(int), "topology body list");
   memcpy(bodies, bodies_in, (size_t) n_bodies_in * sizeof(int));
-  qsort(bodies, (size_t) n_bodies_in, sizeof(int), cmp_int_asc);
-  int nb = 0;
-  for (int i = 0; i < n_bodies_in; ++i)
-    if (nb == 0 || bodies[nb - 1] != bodies[i]) bodies[nb++] = bodies[i];
+  MFTLSortIds(bodies, n_bodies_in);
+  const int nb = MFTLUniqueIntArray(bodies, n_bodies_in);
 
   /* One message for two questions: per body its triangle count (SUM), per
    * cluster whether some body has a rim off the walls (SUM of flags). */
@@ -460,7 +419,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
     double *const got = MFTLTopoCommExchange(dom, req, dest, 3, far, &n_req, src);
     double *const answer = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(n_req, 1) * sizeof(double), "topology label answers");
     if (MFTLTopoServeLabelRequests(pieces, n_cl, got, n_req, answer)) changed = MFTL_TRUE;
-    double *const back = MFTLTopoCommReply(dom, answer, src, dest, 1, far);
+    double *const back = MFTLTopoCommReply(dom, answer, src, 1, far);
     if (MFTLTopoApplyLabelReplies(pieces, n_cl, dom->nproc, back)) changed = MFTL_TRUE;
     free(back);
     free(answer);
@@ -502,7 +461,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
     for (int o = 0; o < nl; ++o)
     {
       const MFTL_Object *const obj = ens->local_objects[o];
-      if (created_index(created, n_created, obj->global_id) < 0) continue;
+      if (MFTLSortedIndexOf(created, n_created, obj->global_id) < 0) continue;
       val[2 * o] = obj->verts.n_local;
       val[2 * o + 1] = obj->tris.n_local;
     }
@@ -511,7 +470,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
     for (int o = 0; o < nl; ++o)
     {
       MFTL_Object *const obj = ens->local_objects[o];
-      if (created_index(created, n_created, obj->global_id) < 0) continue;
+      if (MFTLSortedIndexOf(created, n_created, obj->global_id) < 0) continue;
       const int vb = (int) val[2 * o], tb = (int) val[2 * o + 1];
       for (int v = 0; v < obj->verts.n_local; ++v) obj->verts.rec[v].global_id = vb + v;
       for (int t = 0; t < obj->tris.n_local; ++t) obj->tris.rec[t].global_id = tb + t;
@@ -532,7 +491,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
     double *const got = MFTLTopoCommExchange(dom, req, dest, 3, far, &n_req, src);
     double *const answer = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(n_req, 1) * sizeof(double), "topology id answers");
     MFTLTopoServeIdRequests(ens, created, n_created, vkeys, tkeys, got, n_req, answer);
-    double *const back = MFTLTopoCommReply(dom, answer, src, dest, 1, far);
+    double *const back = MFTLTopoCommReply(dom, answer, src, 1, far);
     MFTLTopoApplyIdReplies(ens, created, n_created, dom->nproc, back);
     free(back);
     free(answer);
@@ -554,9 +513,9 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
   const double t_sep = MFTLTopoCommTime();
 
   /* ── Back to the canonical partition ───────────────────────────────────── */
-  refresh_all(ens);
+  MFTLEnsembleComputeTriangleGeometry(ens);
   int status = MFTLRedistribute(ens);
-  refresh_all(ens);
+  MFTLEnsembleComputeTriangleGeometry(ens);
   MFTLEnsembleUpdateGlobalCounts(ens);
   const double t_red = MFTLTopoCommTime();
 
@@ -631,7 +590,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
       MFTLUpdateGhostPositions(ens);
     }
     free(va);
-    refresh_all(ens);
+    MFTLEnsembleComputeTriangleGeometry(ens);
   }
   free(comps);
   MFTLTopoFreeClusters(cl, n_cl);

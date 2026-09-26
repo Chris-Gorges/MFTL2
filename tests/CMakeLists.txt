@@ -261,6 +261,9 @@ mftl_add_mpi_test_at(test_redistribution_np8 test_redistribution 8)
 mftl_add_mpi_test(test_io 1)
 mftl_add_mpi_test_at(test_io_np2 test_io 2)
 mftl_add_mpi_test_at(test_io_np4 test_io 4)
+# The three share fixed output file prefixes, so under `ctest -j` they would
+# write and delete each other's files.
+set_tests_properties(test_io test_io_np2 test_io_np4 PROPERTIES RESOURCE_LOCK mftl_test_io_files)
 
 # MFTLComputeVertexNormals is a LOCAL operation, so a second rank count is not
 # about communication -- it is about the empty-object path. MFTLGenerateSphere

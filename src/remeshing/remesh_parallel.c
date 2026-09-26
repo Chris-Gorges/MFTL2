@@ -555,7 +555,7 @@ static void gid_scratch_free(gid_scratch *g)
  *
  * Pinning this to #MFTL_BODY_REDUCE_SCOPE_GLOBAL is a scaling regression THAT NO
  * TEST OF THE MESH CAN SEE. The two routes agree to the bit by construction, so
- * every digest in docs/parallel-remeshing-analysis.md reproduces either way; the
+ * every digest in docs/analysis.md §5.3 reproduces either way; the
  * cost is `3 * n_bodies_global * 2` doubles of staging and two `comm_world`
  * collectives over a third of that, ONCE PER PHASE, on a rank that may hold a
  * hundred of a million bodies. `test_a_droplet_remesh_takes_no_global_reduction`
@@ -956,25 +956,6 @@ static double frozen_band_width(const MFTL_RemeshParameters *params)
   return (MFTL_REMESH_BAND_EDGES + (double) MFTL_MAX(params->freeze_dilation_rings, 0)) * params->max_edge_length;
 }
 
-int MFTLRemeshCoarseningFactor(const MFTL_Domain *domain, const MFTL_RemeshParameters *params)
-{
-  MFTL_ASSERT(domain != MFTL_NULL && params != MFTL_NULL);
-
-  const double h_min = MFTLDomainGetHMin(domain);
-  if (h_min <= 0.0) return 1;  // nproc == 1: no interior plane, no band
-
-  const double ratio = 4.0 * frozen_band_width(params) / h_min;
-  if (ratio <= 1.0) return 1;
-
-  /* A perfect cube, so that grouping keeps the boxes roughly cubic -- the
-   * constraint is on ONE axis, and merging G ranks along a single axis would
-   * make the boxes G times longer there and no wider anywhere else, which fixes
-   * the precondition for that axis and leaves the other two exactly as they
-   * were. */
-  const int g = (int) ceil(ratio);
-  return g * g * g;
-}
-
 void MFTLRemeshCoarseningFactors(const MFTL_Domain *domain, const MFTL_RemeshParameters *params, double band, int out_group[3])
 {
   MFTL_ASSERT(domain != MFTL_NULL && params != MFTL_NULL && out_group != MFTL_NULL);
@@ -1051,10 +1032,9 @@ static void check_band_fits(const MFTL_Domain *dom, const MFTL_RemeshParameters 
   if (warned || dom->rank != 0) return;
 
   /* The factor quoted is the one the driver would ACTUALLY use -- per axis, from
-   * the measured band. MFTLRemeshCoarseningFactor's cube of the estimate is the
-   * same answer computed conservatively twice over and comes out about nine
-   * times larger, which in a message that says "group this many ranks" is not a
-   * safety margin, it is a wrong instruction. */
+   * the measured band. A single factor cubed from the estimate comes out about
+   * nine times larger, which in a message that says "group this many ranks" is
+   * not a safety margin, it is a wrong instruction. */
   int group[3];
   MFTLRemeshCoarseningFactors(dom, params, band_measured, group);
 
@@ -1219,54 +1199,6 @@ static bool watermarks_agree(MFTL_Ensemble *ens)
  * 5. The driver
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/**
- * @brief Accumulates one object's stats into the ensemble total.
- *
- * @param[out] dst The caller's statistics block.
- * @param      src One object's statistics from this phase.
- */
-static void accumulate_stats(MFTL_RemeshStats *dst, const MFTL_RemeshStats *src)
-{
-  dst->n_split += src->n_split;
-  dst->n_collapse += src->n_collapse;
-  dst->n_flip += src->n_flip;
-  dst->n_collapse_rejected_link += src->n_collapse_rejected_link;
-  dst->n_collapse_rejected_fold += src->n_collapse_rejected_fold;
-  dst->n_collapse_rejected_feature += src->n_collapse_rejected_feature;
-  dst->n_flip_rejected_fold += src->n_flip_rejected_fold;
-  dst->n_feature_edges += src->n_feature_edges;
-  dst->n_corner_vertices += src->n_corner_vertices;
-  dst->n_ridge_vertices += src->n_ridge_vertices;
-  dst->n_free_vertices += src->n_free_vertices;
-  dst->n_vertices_removed += src->n_vertices_removed;
-  dst->n_orphans_removed += src->n_orphans_removed;
-  dst->iterations = MFTL_MAX(dst->iterations, src->iterations);
-}
-
-/**
- * @brief Refreshes the centres of ALL triangles and repairs the derived arrays.
- *
- * Both are preconditions of MFTLRedistribute and both are easy to owe by
- * accident. The centres must cover GHOSTS as well as owned triangles -- the
- * redistribution routes a ghost by its cached centre to work out which of THIS
- * rank's triangles the ghost's owner will need, so a rank that refreshed only
- * its own would disagree with its neighbour about a destination and someone's
- * owned triangle would silently lose an edge neighbour.
- *
- * @param ens The ensemble. Rebuilds the derived arrays and refreshes the
- *            triangle centres over the FULL count including ghosts, which is
- *            what a migration routes by.
- */
-static void prepare_for_migration(MFTL_Ensemble *ens)
-{
-  for (int o = 0; o < ens->n_local_objects; ++o)
-  {
-    MFTL_Object *const obj = ens->local_objects[o];
-    if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
-    MFTLComputeTriangleGeometry(obj, obj->tris.n);
-  }
-}
-
 int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats)
 {
   MFTL_ASSERT(ens != MFTL_NULL && params != MFTL_NULL);
@@ -1328,7 +1260,7 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
   int group[3] = {1, 1, 1};
   if ((params->parallel_coarsen != 0 || params->serial_gather_max_triangles > 0) && dom->nproc > 1)
   {
-    prepare_for_migration(ens);
+    MFTLEnsembleComputeTriangleGeometry(ens);
 
     double probe[2] = {0.0, 0.0};
     double counts[2] = {0.0, 0.0};
@@ -1522,7 +1454,7 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
     MFTLRemeshPhaseShift(dom, group, MFTL_REMESH_PHASES[distinct[p % n_distinct]], shift);
 
     t_mark = MFTLRemeshWallTime();
-    prepare_for_migration(ens);
+    MFTLEnsembleComputeTriangleGeometry(ens);
     st->t_geometry += MFTLRemeshWallTime() - t_mark;
 
     t_mark = MFTLRemeshWallTime();
@@ -1594,7 +1526,7 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
       memset(&one, 0, sizeof(one));
 
       local_ops += MFTLRemeshIterate(ens->local_objects[o], params, &one, params->iterations);
-      accumulate_stats(st, &one);
+      remesh_stats_accumulate(st, &one);
     }
     st->t_sweep += MFTLRemeshWallTime() - t_mark;
     extra[MFTL_REMESH_EXTRA_OPS] = local_ops;
@@ -1699,7 +1631,7 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
   st->t_reduce += MFTLRemeshWallTime() - t_mark;
 
   t_mark = MFTLRemeshWallTime();
-  prepare_for_migration(ens);
+  MFTLEnsembleComputeTriangleGeometry(ens);
   st->t_geometry += MFTLRemeshWallTime() - t_mark;
 
   /* The canonical placement is the PRODUCTION rule, so the closing migration
@@ -1720,12 +1652,7 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
    * triangle geometry, so this one promises the same thing rather than making
    * the parallel entry point a different contract. */
   t_mark = MFTLRemeshWallTime();
-  for (int o = 0; o < ens->n_local_objects; ++o)
-  {
-    MFTL_Object *const obj = ens->local_objects[o];
-    if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
-    MFTLComputeTriangleGeometry(obj, obj->tris.n);
-  }
+  MFTLEnsembleComputeTriangleGeometry(ens);
   st->t_geometry += MFTLRemeshWallTime() - t_mark;
 
   /* ── 7. Publish the profile ───────────────────────────────────────────────
@@ -1741,22 +1668,10 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
    * rank. Gating a collective on a caller's argument is a deadlock waiting for
    * the one caller who passes NULL. */
   st->t_total = MFTLRemeshWallTime() - t0_call;
+  MFTLRemeshAgreeProfile(dom, st, band_probe, 2);
 
-  /* Gathered into a local array rather than reduced through `&st->t_total`:
-   * that spelling would silently depend on the six fields staying adjacent and
-   * in this order, and a struct member added between them is exactly the kind of
-   * edit nobody re-reads a reduction for. */
-  double prof[8] = {st->t_total, st->t_migrate, st->t_geometry, st->t_freeze, st->t_sweep, st->t_reduce, band_probe[0], band_probe[1]};
-  MFTLRemeshAgreeDoubleMax(dom, prof, 8);
-  st->t_total = prof[0];
-  st->t_migrate = prof[1];
-  st->t_geometry = prof[2];
-  st->t_freeze = prof[3];
-  st->t_sweep = prof[4];
-  st->t_reduce = prof[5];
-
-  st->band_measured = prof[6];
-  st->band_bound = (MFTL_REMESH_BAND_EDGES + (double) MFTL_MAX(params->freeze_dilation_rings, 0)) * prof[7];
+  st->band_measured = band_probe[0];
+  st->band_bound = (MFTL_REMESH_BAND_EDGES + (double) MFTL_MAX(params->freeze_dilation_rings, 0)) * band_probe[1];
 
   /* Warned about AFTER the fact, and that is not a compromise. The band is a
    * property of the mesh as the pass actually saw it, so the accurate number

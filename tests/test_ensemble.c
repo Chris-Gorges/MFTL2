@@ -26,7 +26,6 @@ static int test_domain_bounds_are_precomputed_consistently(void)
   for (int k = 0; k < 3; ++k)
   {
     TEST_ASSERT_EQUAL_DOUBLE(d->global_max[k] - d->global_min[k], d->domain_size[k], 1e-15);
-    TEST_ASSERT_EQUAL_DOUBLE(0.5 * d->domain_size[k], d->domain_half_size[k], 1e-15);
     TEST_ASSERT_EQUAL_DOUBLE(1.0, d->domain_size[k] * d->inv_domain_size[k], 1e-15);
     TEST_ASSERT_EQUAL_DOUBLE((double) d->cuts[k] / d->domain_size[k], d->grid_factors[k], 1e-15);
   }

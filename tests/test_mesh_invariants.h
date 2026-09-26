@@ -516,4 +516,35 @@ static int anywhere(int local_observation, MPI_Comm comm)
   return global;
 }
 
+/**
+ * @brief Body @p gid as an object, or a shared EMPTY one if this rank holds none.
+ *
+ * A rank holds an MFTL_Object only for the bodies it has entities of, so a
+ * pointer cached before a redistribution -- which every remeshing pass ends with
+ * -- may be dangling after it, and a rank that holds nothing of a body has no
+ * object for it at all. Re-resolving through MFTLEnsembleFindLocalObject() and
+ * substituting an empty, derived-current stand-in lets a multi-rank test make the
+ * same calls on every rank (it must: they are usually collective) and read zero
+ * counts where this rank holds nothing.
+ *
+ * READ-ONLY: every absent body aliases the same static object, so a write
+ * through one lands on all of them.
+ *
+ * @param ens The ensemble.
+ * @param gid The body id.
+ * @return The local object, or the empty stand-in.
+ */
+static MFTL_Object *test_body(MFTL_Ensemble *ens, int gid)
+{
+  MFTL_Object *const obj = MFTLEnsembleFindLocalObject(ens, gid);
+  if (obj != MFTL_NULL) return obj;
+
+  static MFTL_Object empty; /* zero-initialised: no entities, no pools */
+  MFTL_ASSERT(empty.verts.n == 0 && empty.tris.n == 0 && "test_body: something wrote through the shared empty stand-in");
+  empty.global_id = MFTL_ERROR;
+  empty.domain = &ens->domain;
+  empty.derived = MFTL_DERIVED_TOPOLOGY; /* an empty mesh is trivially described */
+  return &empty;
+}
+
 #endif  // MFTL_TEST_MESH_INVARIANTS_H

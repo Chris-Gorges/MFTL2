@@ -782,7 +782,15 @@ bool MFTLFlipApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParameters
   tri_area_vector_substituted(obj, t1, MFTL_ERROR, MFTL_ERROR, MFTL_NULL, n1);
   tri_area_vector_substituted(obj, t2, MFTL_ERROR, MFTL_ERROR, MFTL_NULL, n2);
 
-  const double n_ref[3] = {n1[0] + n2[0], n1[1] + n2[1], n1[2] + n2[2]};
+  /* The pair's reference normal. It cancels only on a quad folded back onto
+   * itself, and then its direction is rounding noise -- zero it, relative to the
+   * two it is built from, so the fold test refuses rather than guesses. */
+  double n_ref[3] = {n1[0] + n2[0], n1[1] + n2[1], n1[2] + n2[2]};
+  {
+    const double ref_sq = n_ref[0] * n_ref[0] + n_ref[1] * n_ref[1] + n_ref[2] * n_ref[2];
+    const double parts_sq = (n1[0] * n1[0] + n1[1] * n1[1] + n1[2] * n1[2]) + (n2[0] * n2[0] + n2[1] * n2[1] + n2[2] * n2[2]);
+    if (!(ref_sq > MFTL_REMESH_DEGENERATE_SIN2 * parts_sq)) n_ref[0] = n_ref[1] = n_ref[2] = 0.0;
+  }
 
   const double *pa = MFTLVertexPos(obj, va);
   const double *pb = MFTLVertexPos(obj, vb);
@@ -799,8 +807,10 @@ bool MFTLFlipApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParameters
   MFTLGetMinimumImageVector(obj->domain, db, pd, pb);
   MFTLGetMinimumImageVector(obj->domain, dc, pd, pc);
 
-  const double m1[3] = {ad[1] * ac[2] - ad[2] * ac[1], ad[2] * ac[0] - ad[0] * ac[2], ad[0] * ac[1] - ad[1] * ac[0]};
-  const double m2[3] = {db[1] * dc[2] - db[2] * dc[1], db[2] * dc[0] - db[0] * dc[2], db[0] * dc[1] - db[1] * dc[0]};
+  double m1[3];
+  double m2[3];
+  fold_area_vector(ad, ac, m1);
+  fold_area_vector(db, dc, m2);
 
   if (area_vector_cos(n_ref, m1) < params->max_normal_deviation_cos || area_vector_cos(n_ref, m2) < params->max_normal_deviation_cos)
   {

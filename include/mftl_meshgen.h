@@ -56,7 +56,9 @@
  * @param tri_verts   [3 * n_triangles] vertex indices, counter-clockwise as seen
  *                    from the side the normal should point to.
  * @param n_triangles Number of triangles, >= 1.
- * @return MFTL_SUCCESS, or MFTL_ERROR on invalid arguments.
+ * @return MFTL_SUCCESS, or MFTL_ERROR on invalid arguments -- including an
+ *         index out of range or a triangle with a repeated corner, which are
+ *         checked in Release too, before the object is modified.
  *
  * @note Local (serial) operation -- no MPI. The collective bookkeeping belongs
  *       to the generator that calls it.
@@ -85,7 +87,9 @@ int MFTLBuildIndexedMesh(MFTL_Object *object, const double *positions, int n_ver
  * @param object      Object with a filled vertex pool and a valid domain link.
  * @param tri_verts   [3 * n_triangles] vertex indices, counter-clockwise.
  * @param n_triangles Number of triangles, >= 1.
- * @return MFTL_SUCCESS, or MFTL_ERROR on invalid arguments.
+ * @return MFTL_SUCCESS, or MFTL_ERROR on invalid arguments -- including an
+ *         index out of range or a triangle with a repeated corner, which are
+ *         checked in Release too, before the object is modified.
  *
  * @note Local (serial) operation -- no MPI.
  */
@@ -160,9 +164,10 @@ int MFTLGenerateSphereLocal(MFTL_Object *object, double center[3], double radius
  * `global_n_triangles`. Exactly what MFTLGenerateSphere() does for one body,
  * for the whole object list at once.
  *
- * @note Collective. Every rank must hold the same object list in the same order.
- *       An empty ensemble is a no-op, not an error, but every rank must still
- *       call: the two collectives happen regardless of what this rank holds.
+ * @note Collective. Call it after generation and BEFORE the first
+ *       redistribution, while every rank still holds an object for every body in
+ *       the same order (MFTLEnsembleAddObject() order). An empty ensemble is a
+ *       no-op, not an error, but every rank must still call.
  *
  * @param ens The ensemble. Every object's counters and `global_n_*` are settled.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR on a NULL ensemble.

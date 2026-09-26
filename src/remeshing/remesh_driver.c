@@ -333,11 +333,12 @@ int MFTLRemeshObject(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL
 
   if (params->renumber_global_ids) MFTLRemeshRenumberGlobalIds(obj);
 
-  /* Postcondition: the caller gets an object it can stream immediately. Both
-   * derived bits are already set (compaction, then the smoother's closing
-   * refresh); this fills `tris.area/normal/center`, which the operators leave
-   * stale by design because none of them read it. */
-  MFTLObjectBuildDerived(obj);
+  /* Postcondition: the caller gets an object it can stream immediately. The
+   * derived topology is already current -- compaction and the flip sweep rebuild
+   * it, and neither smoothing nor the id renumbering changes connectivity -- so
+   * only `tris.area/normal/center` are left to fill; the operators leave them
+   * stale by design because none of them read them. */
+  if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
   MFTLComputeTriangleGeometry(obj, obj->tris.n);
 
   return MFTL_SUCCESS;
@@ -415,20 +416,7 @@ int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, 
 
     if (!stats) continue;
 
-    stats->iterations = MFTL_MAX(stats->iterations, one.iterations);
-    stats->n_split += one.n_split;
-    stats->n_collapse += one.n_collapse;
-    stats->n_flip += one.n_flip;
-    stats->n_collapse_rejected_link += one.n_collapse_rejected_link;
-    stats->n_collapse_rejected_fold += one.n_collapse_rejected_fold;
-    stats->n_collapse_rejected_feature += one.n_collapse_rejected_feature;
-    stats->n_flip_rejected_fold += one.n_flip_rejected_fold;
-    stats->n_feature_edges += one.n_feature_edges;
-    stats->n_corner_vertices += one.n_corner_vertices;
-    stats->n_ridge_vertices += one.n_ridge_vertices;
-    stats->n_free_vertices += one.n_free_vertices;
-    stats->n_vertices_removed += one.n_vertices_removed;
-    stats->n_orphans_removed += one.n_orphans_removed;
+    remesh_stats_accumulate(stats, &one);
   }
 
   MFTLEnsembleUpdateGlobalCounts(ens);

@@ -65,7 +65,7 @@ submit()
 
 # Repeats go ROUND ROBIN over the points, not in blocks.
 #
-# docs/performance-analysis.md sec 7 records the same binary measuring 9.4 ms and
+# docs/analysis.md sec 10 records the same binary measuring 9.4 ms and
 # 6.1 ms in two sessions purely from machine state, and states the rule the whole
 # document follows: interleave the variants, report minima, never quote a run
 # taken in a block. Submitting all repeats of np=1, then all of np=2, invites the

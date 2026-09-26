@@ -251,13 +251,12 @@ hang instead of a clean failure.
 **The documentation build is NOT in this repository.** It lives in
 `MFTL_Documentation`, normally checked out beside this one, and reads this tree from wherever it is. What
 stays here is only what is read in place: the Doxygen comments in `include/` and `src/**`, the eleven
-`src/<module>/README.md` theory chapters (they render on GitHub next to the code they explain) and the four
-`docs/*-analysis.md` measurement documents (some thirty comments in `src/`, `include/`, `tests/` and
-`examples/` cite them by path).
-
-`docs/scalability-update-status.md` is a prose STATUS document rather than a measurement one: what the
-sparse-object-list work changed, what it measurably bought, and what is still missing. It is not in the
-manual's page list — read it in place. Its numbers all come from `docs/scaling-analysis.md`.
+`src/<module>/README.md` theory chapters (they render on GitHub next to the code they explain) and ONE
+measurement document, `docs/analysis.md` — what was measured, what was decided because of it, what was
+rejected, and what is still open. Some fifty comments in `src/`, `include/`, `tests/` and `examples/` cite it
+as `docs/analysis.md §N`, so keep its section numbers stable and add to it rather than beside it: a second
+document in `docs/` is how the eighteen plans, reviews and superseded recommendations it replaced
+accumulated.
 
 ```bash
 cd ../MFTL_Documentation
@@ -330,7 +329,7 @@ the vertex normals need an EXCHANGE (owned normals are already exact; the ghosts
 **One deliberate exception, and it is performance over tidiness.** `MFTLEnsembleUpdate`'s kernel is a file-static
 function in `src/ensemble/ensemble_update.c` rather than in `src/geometry/`, because it carries nine live
 reduction accumulators. Moving it across a translation-unit boundary would force them into an address-taken
-struct, which the performance doc §6 measures at 15 %. The kernel stays next to the reduction it feeds.
+struct, which `docs/analysis.md` §1.6 measures at 15 %. The kernel stays next to the reduction it feeds.
 
 ### Object model: Ensemble → Domain → Objects → pools
 
@@ -399,7 +398,7 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   `MFTLObjectMarkPartitionDirty` (`mftl_object.h`), stamped by `MFTLObjectSetCounts` (the choke point every
   entity creation and destruction already passes through), by both renumbering sites and by
   `MFTLRemeshMarkFrozen`. **Anything that edits a mesh without going through `MFTLObjectSetCounts` owes that
-  call.** Derivation in `docs/redistribution_skip_correctness.md`.
+  call.** Derivation in `docs/analysis.md` §2.4.
 
   Three consequences. The vote is per body through ONE `MPI_BOR` bitset, never per body per collective — that
   splits the object loop in two, and pass 2 re-runs the idempotent `compute_owners` rather than storing
@@ -451,10 +450,10 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   it made every remeshing migration allocate, clear and carry two pointers for every body in the JOB on a
   rank that might hold none of them — 16 B/body/rank, four to eight times per remesh. It is
   `[ens->n_local_objects]` in `ens->local_objects` order, and so is `MFTL_RemeshMigrator.maps`. The rule to
-  apply is "does this index have to mean the same thing on two ranks", not "is it about a body". `MFTLEnsembleAcquireDenseView` is kept for a CALLER that genuinely needs every body; it is
-  `O(bodies in the ensemble)`, it must not appear on a per-timestep path, and **the library itself no longer
-  uses it** — contact detection and the spatial halo, its last two consumers, were the premise that turned
-  out to be false (see the spatial-halo entry below).
+  apply is "does this index have to mean the same thing on two ranks", not "is it about a body". The dense
+  `[n_bodies_global]` view of the ensemble that contact detection and the spatial halo once read is deleted:
+  their premise that every rank needs every body turned out to be false (see the spatial-halo entry below),
+  and nothing else used it.
 
 - **HANDING OUT IDS IS A SCAN, NOT A REDUCTION, AND `MFTLEnsembleExscanBodies` IS ITS SIBLING.** Two ranks
   that both split an edge of one body each create a vertex, and the two need DIFFERENT global ids — so a
@@ -481,13 +480,18 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   (`MFTLEnsembleUpdate` allocated `22 × bodies` doubles per call — 176 B/body, i.e. 176 MB at a
   million bodies).
 
-  **The route is decided, not assumed, and the test is local, exact and uncached.** A rank checks that
-  every body it holds owns at least one entity here, that every other holder named by its ghosts'
-  `owner_proc` is a graph neighbour, and that those neighbours' cell offsets span at most one cell per
-  axis; `MPI_LAND` of that is exactly "the neighbourhood route is exact". It reads only the ghost suffix,
-  so a body held whole costs nothing. It is re-derived every call because a cached verdict is invalidated
-  by any holder-set change anywhere in the job and a stale one is a *silently wrong reduction*. Derivation
-  and its one assumption — a body is a CONNECTED surface — on `MFTLEnsembleReduceBodies`.
+  **The route is CERTIFIED AFTER THE EXCHANGE, never decided before it.** Before it, a rank can check that
+  every body it holds owns an entity here and that every ghost owner is a graph neighbour — which, on a
+  connected surface, makes the holders connected on the graph and nothing more. After it, every holder
+  checks that it and every neighbour that published a record for the body span at most one cell per axis,
+  which makes a connected holder set a clique; one `MPI_LAND` agrees all of it, and a refusal discards the
+  records and runs the exact `comm_world` route. **Checking the span on the halo-visible holders before the
+  exchange is NOT sufficient**: a tube bent around a grid corner passes it on every rank while its two ends,
+  two cells apart, never hear from each other — 386 of 484 triangles summed, overlapping id ranges handed
+  out (`test_a_bent_body_is_certified_after_the_exchange`, np = 27). The certificate is re-derived every
+  call because a cached verdict is invalidated by any holder-set change anywhere in the job and a stale one
+  is a *silently wrong reduction*. Derivation and its one assumption — a body is a CONNECTED surface — on
+  `MFTLEnsembleReduceBodies`.
 
   Four things about it are load-bearing and every one of them is silent when wrong. **An empty holder
   vetoes**: a rank owning nothing appears in no other holder's halo, so it can neither be discovered nor
@@ -498,9 +502,11 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   `{2,1,1}` and `{2,2,1}` have it, `{2,2,2}` and `{3,3,3}` do not, which is exactly the set of rank counts
   that failed. **Contributions are folded in ascending SOURCE-RANK order** with self spliced in at its
   own position, because two holders disagreeing in the last ulp about `quality` is two ranks entering
-  different collectives when a solver branches on it. And **redistribution takes the route test itself,
-  before `compute_owners` rewrites `owner_proc` with the destination ranks** — one line later it is a
-  plausible answer to the wrong question, wrong exactly when something moved far.
+  different collectives when a solver branches on it. And **redistribution takes the pre-exchange scan itself,
+  before `compute_owners` rewrites `owner_proc` with the destination ranks**, and hands the local verdict to
+  `MFTLEnsembleReduceBodiesPrescanned` — one line later the scan is a plausible answer to the wrong question,
+  wrong exactly when something moved far. The post-exchange certificate reads only the records, so it is
+  unaffected.
 
   **Bytes are WORSE below about 45 ranks and better above, and that trade is deliberate.** The
   neighbourhood route sends every held body to every neighbour, so its payload is `b_local × (1+d)`
@@ -508,7 +514,7 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   27/P, and 22× *less* at P = 1000. Per consumer the crossover is P ≈ 35 (quality), 96 (counts) and 4100
   (the vote, whose bitset is simply a very good encoding). The vote is kept on the same mechanism anyway:
   one payload encoding is one mechanism, and at the design point it wins on bytes too. Table in
-  `docs/scaling-analysis.md` §scaling_holder_reductions.
+  `docs/analysis.md` §6.5.
 
   **A PINNED SCOPE IS A SCALING REGRESSION THAT NO TEST OF THE ANSWER CAN SEE, so the routes are counted
   rather than trusted.** The two routes agree TO THE BIT by construction — that is the property every other
@@ -523,7 +529,7 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   thing on the path.
 - **Redistribution invalidates all cached geometry except the vertex positions.** It returns an object with valid
   topology, valid positions and both derived bits set; `tris.area/normal/center` and
-  `verts.normal/area/mean_curv/gauss_curv` hold unspecified values until something recomputes them. That is what
+  `verts.normal` hold unspecified values until something recomputes them. That is what
   buys the 3× smaller wire format — see `include/mftl_communication.h`. A solver that consumes triangle geometry
   AFTER the redistribution therefore owes one more pass — the price of not shipping the geometry on the wire. `parallel_advection_redistribute_list` runs it as step 5 and times it separately, because comparing the
   two versions' redistribute timings alone credits this one with a saving it has not finished paying for.
@@ -596,7 +602,7 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   (`h <= 4*delta`) is not negotiable — the alternative is an un-remeshed lattice. FROZEN
   (`coarsen_frozen_fraction`) and GATHER (`serial_gather_max_triangles`) are trades with cheaper
   alternatives the library cannot take on its own. Both ship DISABLED, and both defaults are measured
-  rather than assumed — see `docs/parallel-remeshing-analysis.md` §7.
+  rather than assumed — see `docs/analysis.md` §5.6.
 
 - **THE FROZEN SHARE IS THE SHARE OF EVERY MIGRATION THAT BUYS NOTHING, AND `h > 4*delta` PERMITS 87.5 % OF
   IT.** A frozen entity travels with the mesh and is then not touched, so `MFTL_RemeshStats.frozen_fraction`
@@ -787,6 +793,16 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
   `inv_vertex_normals_are_unit` in `tests/test_mesh_invariants.h` — which are deliberately NOT part of
   `inv_mesh_is_sound`, because redistribution leaves `tris.normal` unspecified by design. The expression must
   stay identical in the walk and stream kernels or `test_triangle_geometry_paths_are_bit_identical` fails.
+- **NO TEST MAY COMPARE A DIMENSIONAL QUANTITY AGAINST AN ABSOLUTE CONSTANT.** The same rule as the unit
+  normal, one level up: a front-tracking run in SI units meshes a millimetre droplet with edges near 1e-4.
+  The remesher's fold test used to compare a squared area vector — dimension L⁴ — against 1e-15, an
+  effective cutoff of sin θ ≈ 3.2e-8/ℓ², so below ℓ ≈ 1.8e-4 every triangle counted as degenerate and
+  every collapse and flip was refused while the mesh could still be refined; nothing reported it. Degeneracy
+  is now relative to the triangle's own edges (`fold_area_vector`, `MFTL_REMESH_DEGENERATE_SIN2`), guards on a
+  divisor test against zero, and Morton scaling needs only a finite scale. Scaling by a power of two is exact
+  in floating point, so `test_remeshing_is_independent_of_the_length_unit` requires a sphere remeshed at
+  2⁻²⁰ to be the unit result times 2⁻²⁰ BIT FOR BIT — any absolute threshold anywhere in the pass breaks it.
+  With the old test it made 0 collapses and 0 flips and ended at 2128 triangles against 842.
 - **Face normals point outward, everywhere.** The icosahedron face table in `src/mesh_creation/sphere_creation.c`
   is wound counter-clockwise as seen from outside, and the 1-to-4 subdivision emits every sub-triangle in its
   parent's rotational order. This is what makes the enclosed volume positive under the divergence theorem and fixes
@@ -983,10 +999,10 @@ struct, which the performance doc §6 measures at 15 %. The kernel stays next to
 
 ## Performance
 
-`docs/performance-analysis.md` holds the measured picture, `docs/remeshing-quality-analysis.md` the
-equivalent for the remesher, and `docs/parallel-remeshing-analysis.md` the distributed one — correctness
-against serial, bitwise determinism, phase counts and scaling, all from
-`examples/leveque_remeshing_parallel.c`. Read it before optimising anything, and re-run the
+`docs/analysis.md` holds the measured picture: single-rank kernels (§1), redistribution (§2), I/O (§3),
+the serial remesher (§4), the distributed one — correctness against serial, bitwise determinism, phase
+counts and scaling, all from `examples/leveque_remeshing_parallel.c` (§5) — and the scaling harness (§6).
+Read it before optimising anything, and re-run the
 benchmarks rather than trusting the tables — each answers one question:
 
 | benchmark | question |
@@ -1014,7 +1030,7 @@ comments:**
    even when a pragma forces it. 26 % of the pass is one `sqrt` plus one divide, which is irreducible.
 5. **The quality statistics are not nearly free.** "A few extra flops on data already in registers" predicts a
    few per cent; they cost **+90 %** (1.64 → 3.11 ns/triangle). The streaming geometry baseline is fast, and
-   `q = 4√3·A/(a²+b²+c²)` adds a *second* divide to a loop already limited by one (§4).
+   `q = 4√3·A/(a²+b²+c²)` adds a *second* divide to a loop already limited by one (`docs/analysis.md` §1.6).
    Fusing is still right (two passes cost 2.20 ns against 1.47 fused), but `MFTLEnsembleUpdate` is **slower than
    `MFTLComputeTriangleGeometry` on a non-periodic domain** while computing strictly more. Call it for the
    statistics, not as a free upgrade. On a periodic domain — what a real run has — it wins at 1.19×.
@@ -1025,7 +1041,7 @@ comments:**
    removed together with persistent frames.
    obvious next change. And the buckets that shrink least are the ones proportional to the HALO rather than to
    the mesh - twin repair 1.05x against 3.6-5.2x for everything per-entity - because the bodies a skip removes
-   are the interior ones with the least halo churn. Full table in `docs/performance-analysis.md` §7e.
+   are the interior ones with the least halo churn. Full table in `docs/analysis.md` §2.4.
 
 7. **MPI-IO did not make output faster; dropping ASCII did.** A shared collective file is 1.0× at one rank and
    0.45× at four against one file per rank on a laptop SSD, because there is nothing for two-phase buffering to
@@ -1042,7 +1058,7 @@ comments:**
    configuration but bounds a runaway once features are spurious (16 702 triangles against 101 048), and the
    MISSING AREA WEIGHTING in "triangle-based" smoothing costs volume conservation (3.5 % against 6.0 %) rather
    than triangle quality, which is a wash. Set `feature_angle_threshold` to 180 for any smooth closed
-   interface. Full measurement in `docs/remeshing-quality-analysis.md`.
+   interface. Full measurement in `docs/analysis.md` §4.
 
 9. **MOVING WORK OUT OF A STREAMING PASS INTO A DEPENDENCY-BOUND LOOP RECOVERS A THIRD OF IT, NOT ALL OF IT.**
    Redistribution used to close with `MFTLObjectBuildDerived`; `rebuild_object` now emits `tris.verts` /
@@ -1051,12 +1067,12 @@ comments:**
    0.369 of it comes straight back into `t_relink`**, so the trade is 0.22 ms/step, 2.3 %. What the model left
    out is WHICH loop the stores land in — `build_topology_arrays` is a pure stream the prefetcher handles
    perfectly, the relink already does two random gathers per half-edge. It is kept (one pass fewer over the
-   pool is a footprint statement too, and §7c says footprint is what has mattered), but the
+   pool is a footprint statement too, and `docs/analysis.md` §2.3 says footprint is what has mattered), but the
    destination-analysis items it was ranked ABOVE are the ones carrying the win: `build_kept_lists` reading
    the dense owner arrays in one two-cursor pass instead of the AoS records in four scans, plus a branch-free
    stencil test in `collect_destinations`, take **20 % off the destination analysis** in both regimes. All
    four together: 1.038–1.040x on the phase where the body skip cannot fire, 1.02x where it can.
-   `docs/performance-analysis.md` §7f closes out `docs/redistribution_optimizations_review.md`.
+   `docs/analysis.md` §2.5 has the measurement.
 
 ## Known deferred issues
 
@@ -1069,7 +1085,7 @@ comments:**
    `inv_implicit_indexing()` catches it in tests, and `MFTLCheckMeshIntegrity` does not. Consider asserting it in
    `MFTLObjectSetCounts` when remeshing lands.
 3. **`tris.verts` / `tris.neighbors` are redundant state whose benefit is argued, not measured.** The 4× traffic
-   figure is arithmetic. Given finding §3 in the performance doc, re-examine when a consumer that isolates them
+   figure is arithmetic. Given `docs/analysis.md` §1.4, re-examine when a consumer that isolates them
    exists (redistribution's halo analysis is the first).
 4. **The update kernel sits on the FP divide/sqrt unit and cannot be vectorised out of it.** 26 % of the pass is
    one `sqrt` plus one reciprocal per triangle, and the kernel needs both `|n|` and `n/|n|`, so neither is
@@ -1084,12 +1100,12 @@ comments:**
    keep its resolved slot list and every subsequent sync would be a single `MPI_Neighbor_alltoallv` of positions
    with no lookup at all. Not done, because the per-timestep loop this library is built around redistributes every
    step and there would be nothing to amortise over. Revisit if a solver appears that redistributes every N steps.
-   It is also the reason the ghost sync improved by less than its 2.5× payload reduction (performance doc §7).
+   It is also the reason the ghost sync improved by less than its 2.5× payload reduction (`docs/analysis.md` §2.1).
 
 6. **The per-destination send buffers are allocated and freed on every call.** At the density-derived hint they
    are ~128 KB each, so a redistribution mallocs and frees a few megabytes per timestep and pays the first-touch
    faults again each time. That churn is what makes a first benchmark run slower than every repeat of it
-   (performance doc §7). Keeping them as scratch on the domain would remove it; not
+   (`docs/analysis.md` §2.1). Keeping them as scratch on the domain would remove it; not
    done because it puts mutable per-call state on a struct that is otherwise read-only during a redistribution.
 
 7. **Step 5 of the per-timestep loop is bound by first touch, not only by arithmetic.** The geometry pass that restores
@@ -1109,7 +1125,7 @@ comments:**
    path, and the behaviour at P in the hundreds — is entirely unmeasured.
 
 11. **The phase count is now measured on a real deforming case, and the open question moved.**
-   `docs/parallel-remeshing-analysis.md` measures the LeVeque deformation with per-timestep distributed
+   `docs/analysis.md` §5 measures the LeVeque deformation with per-timestep distributed
    remeshing at np = 1, 2, 4, 8. At a fixed `parallel_phase_budget` of 4 the phase count **saturates**
    (3.83 → 3.96 from np = 2 to np = 8), overhead on a fixed problem grows 33 % for 4× the ranks, and the
    distributed mesh is *better* than the serial one on every quality measure at an adequate resolution.
@@ -1168,7 +1184,7 @@ comments:**
 
 14. **Nothing in `src/bvh/` has been profiled in TIME beyond `orient3d_predicate_profile.c`.** The
    explicit-stack traversal, the refit-only fast path and the batched leaf phase are all argued from
-   structure rather than measured; there is no BVH entry in `docs/performance-analysis.md`.
+   structure rather than measured; there is no BVH entry in `docs/analysis.md`.
    Build/refit/traverse timings are the first thing to measure before optimising any of it.
 
    What HAS been measured is the shape of the pipeline around it, and only in counted quantities: candidate
@@ -1211,11 +1227,12 @@ comments:**
    ensemble's whole footprint stayed resident on rank 0 for the run. That was two claims welded
    together, and measuring them apart is what this entry now records.
 
-   `MFTLGenerateSphere` builds every body whole on rank 0 — `3680 * 4^refine + 176` bytes each,
-   57.5 MiB for 256 bodies at refine 3, 460 MiB for 512 at refine 4. That constant is
-   `140 B/triangle + 88 B/vertex`, read off `triangle_layout_compute` / `vertex_layout_compute` in
-   `src/object/object.c`; it said 5120 until 2026-08-31, because the triangle block lost the
-   72 B/triangle persistent frames and nothing that quotes the formula was updated with it.
+   `MFTLGenerateSphere` builds every body whole on rank 0 — `3440 * 4^refine + 128` bytes each,
+   53.8 MiB for 256 bodies at refine 3, 430 MiB for 512 at refine 4. That constant is
+   `140 B/triangle + 64 B/vertex`, read off `triangle_layout_compute` / `vertex_layout_compute` in
+   `src/object/object.c`. It has moved twice — 5120 until the 72 B/triangle persistent frames went,
+   3680 until the 24 B/vertex of never-produced curvature and area arrays went — and nothing ties the
+   quoted formula to the layout, so every place that quotes it has to move with it.
    **That peak is real, it is serial, and nothing here touches it**: every body exists at full size before the opening
    `MFTLRedistribute` runs. `examples/parallel_advection_scaling.c` prints it and refuses above
    `--max-gen-mb`. Fixing it needs a generator that builds distributed, which does not exist.
@@ -1259,7 +1276,7 @@ comments:**
 
    Generation remains the benchmark's Amdahl ceiling: it is rank-0 serial, so in a WEAK scaling
    sweep setup time grows linearly with `nproc` while the timed loop does not, and it must never be
-   folded into a scaling total. Full reasoning in `docs/scaling-analysis.md`.
+   folded into a scaling total. Full reasoning in `docs/analysis.md` §6.1.
 
 21. **`compute_owners` IS NOW THE LARGEST NON-COLLECTIVE BUCKET, AND THE BODY SKIP CANNOT TOUCH IT BECAUSE
    IT IS THE DECISION.** With the skip on and the frames gone it is 1.4 of 4.7 ms/step at np = 4 on 1000
@@ -1321,7 +1338,7 @@ comments:**
 ### Settled, so nobody re-opens them
 
 - **The vertex→triangle CSR stays deleted.** `src/object/derived.c` asked for it to be reconsidered when a consumer
-  appeared. Vertex normals are that consumer, and §5 of the performance doc measures a CSR gather as a dead heat
+  appeared. Vertex normals are that consumer, and `docs/analysis.md` §1.5 measures a CSR gather as a dead heat
   with the triangle scatter while costing 16 B/triangle of permanent state and a rebuild per topology change.
 - **Quality statistics stay fused with area/normal/center.** Splitting them into two passes measures 25 % slower.
 - **`verts.pos`, `tris.normal` and `tris.center` stay xyz-interleaved**, and `pad4` (32 B/vertex) is rejected.

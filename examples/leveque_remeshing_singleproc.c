@@ -20,7 +20,7 @@
  *
  *   step  t  ntri  minQ  avgQ  folds  feat  corner  ridge  free  V/V0  A/A0
  *
- * which is what docs/remeshing-quality-analysis.md is built from. The columns
+ * which is what docs/analysis.md §4 is built from. The columns
  * that matter are `free` and `minQ`: a run whose free-vertex count falls while
  * the mesh grows is a run whose smoother is progressively switching itself off,
  * and minQ follows it down within one step of the first feature edge appearing.
@@ -148,7 +148,7 @@ static mesh_report measure(MFTL_Object *obj)
      * [0, 1]. That was not true before the degeneracy guard was moved off the
      * magnitude and onto the reciprocal's divisor -- with the area floored at
      * 5e-7 this example measured an AVERAGE q of 1.023 on a degenerate mesh. See
-     * docs/remeshing-quality-analysis.md. */
+     * docs/analysis.md §4. */
     double n[3];
     double area = 0.0;
     MFTLGetTriangleProperties(obj, t, &area, n, MFTL_NULL);

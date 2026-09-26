@@ -125,15 +125,6 @@ static int needing_cells(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, in
   return m;
 }
 
-/** @brief Whether @p r is this rank or one of its graph neighbours. */
-static bool is_neighbour(const MFTL_Domain *dom, int r)
-{
-  if (r == dom->rank) return MFTL_TRUE;
-  for (int i = 0; i < dom->num_neighbors; ++i)
-    if (dom->neighbors[i] == r) return MFTL_TRUE;
-  return MFTL_FALSE;
-}
-
 bool MFTLTopoPackNodeExchange(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, const MFTL_TopoCluster *cl, int n_cl, int *dest_counts, double **records)
 {
   const int np = dom->nproc;
@@ -188,7 +179,7 @@ bool MFTLTopoPackNodeExchange(const MFTL_Domain *dom, const MFTL_TopoLattice *la
                   if (pass == 0)
                   {
                     dest_counts[r]++;
-                    if (!is_neighbour(dom, r)) far = MFTL_TRUE;
+                    if (!MFTLTopoIsNeighbour(dom, r)) far = MFTL_TRUE;
                   }
                   else
                   {

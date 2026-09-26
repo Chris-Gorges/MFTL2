@@ -24,7 +24,7 @@
  *   (12-16 bytes) so one cache line carries four of them.
  *
  *   GEOMETRY -> Structure of Arrays.
- *   Positions, normals, areas, centroids and curvatures. These are read and written by kernels that touch ONE
+ *   Positions, normals, areas and centroids. These are read and written by kernels that touch ONE
  *   component of EVERY entity, every timestep. That is the access pattern AoS is
  *   worst at, and it is where all the time goes.
  *
@@ -37,7 +37,7 @@
  *
  * Here there is ONE capacity per entity class, because a pool is ONE allocation:
  *
- *     MFTL_VertexPool  = one block  -> rec[] pos[] normal[] area[] curvatures[]
+ *     MFTL_VertexPool  = one block  -> rec[] pos[] normal[]
  *     MFTL_TrianglePool= one block  -> rec[] he[] area[] normal[] center[]
  *                                      verts[] neighbors[]
  *
@@ -99,8 +99,8 @@ struct MFTL_Ensemble;
  * @struct MFTL_Vertex
  * @brief Identity and topology of one vertex. Its POSITION is not here.
  *
- * Everything geometric about a vertex -- position, normal, Voronoi area, the two
- * curvatures -- lives in the SoA arrays of MFTL_VertexPool at the same index.
+ * Everything geometric about a vertex -- its position and its normal -- lives in
+ * the SoA arrays of MFTL_VertexPool at the same index.
  * What stayed is what a remesher edits one entity at a time.
  *
  * 16 bytes exactly: four records per cache line, and no padding to explain.
@@ -179,9 +179,13 @@ typedef struct MFTL_HalfEdge
  * which must permute the former and may simply rebuild the latter:
  *
  *   authoritative : rec, pos
- *   cached        : normal, area, mean_curv, gauss_curv   (recomputed per step,
- *                   but permuted anyway -- a reorder must not silently discard
- *                   geometry the caller just computed)
+ *   cached        : normal   (recomputed per step, but permuted anyway -- a
+ *                   reorder must not silently discard geometry the caller just
+ *                   computed)
+ *
+ * A vertex-area or curvature array belongs here only together with the pass that
+ * computes it: an array nothing writes is 8 B per vertex copied by every resize,
+ * reorder and compaction for a value nobody can read.
  */
 typedef struct MFTL_VertexPool
 {
@@ -189,9 +193,6 @@ typedef struct MFTL_VertexPool
 
   double *pos;  ///< [3*capacity]    AUTHORITATIVE position, xyz interleaved.
   double *normal;  ///< [3*capacity]    vertex normal, xyz interleaved.
-  double *area;  ///< [capacity]      Voronoi area.
-  double *mean_curv;  ///< [capacity]      mean curvature.
-  double *gauss_curv;  ///< [capacity]      Gaussian curvature.
 
   int n;  ///< Active vertices (owned + ghost).
   int n_local;  ///< Owned vertices; they occupy [0, n_local).
@@ -417,7 +418,6 @@ typedef struct MFTL_Domain
   double global_min[3];  ///< Lower corner of the domain box, per axis.
   double global_max[3];  ///< Upper corner of the domain box, per axis.
   double domain_size[3];  ///< global_max - global_min.
-  double domain_half_size[3];  ///< Precomputed for periodicity checks.
   double inv_domain_size[3];  ///< 1 / domain_size, 0 on a zero-length axis. Minimum-image wrapping is a
   ///< multiply-and-round, so the reciprocal is precomputed once here.
 
@@ -440,13 +440,14 @@ typedef struct MFTL_Ensemble
   MFTL_Domain domain;  ///< By value: there is exactly one, and every object borrows a pointer to it.
 
   /**
-   * Owned; MFTLEnsembleDestroy() destroys each of them.
+   * The bodies THIS RANK holds entities of, sorted by ascending
+   * #MFTL_Object::global_id (see "The local object directory" in
+   * mftl_ensemble.h). Owned; MFTLEnsembleDestroy() destroys each of them.
    *
    * Bodies are identified ON THE WIRE by #MFTL_Object::global_id, which
-   * MFTLEnsembleAddObject() hands out densely in add order -- NOT by their
-   * position in this list. The distinction does not show yet, because every rank
-   * holds every body and the two numbers are equal; it is what lets a rank stop
-   * holding bodies it has nothing of.
+   * MFTLEnsembleAddObject() hands out densely in add order -- never by their
+   * position in this list, which differs between ranks and changes whenever a
+   * redistribution creates or destroys a local object.
    *
    * @warning Every rank must still add the same bodies in the same order, so that
    *          the same id names the same body everywhere. A Debug-only checksum
@@ -469,42 +470,17 @@ typedef struct MFTL_Ensemble
    *
    * It is identical on every rank because every rank adds the same bodies in the
    * same order, and it never decreases -- an id is retired with its body, not
-   * reused, so nothing that stored one can be silently pointed at another.
+   * reused, so nothing that stored one can be silently pointed at another. A
+   * topology change raises it for every body it creates, so it is the size of the
+   * id SPACE and may exceed the number of live bodies.
+   *
+   * Being the one body count every rank agrees about, it is the count a
+   * collective may be guarded by. `n_local_objects` is not: returning early on it
+   * is a rank-local decision about a collective call, i.e. a deadlock.
    */
   int n_bodies_global;
 
   int total_global_triangles;  ///< Sum over all objects of global_n_triangles.
-
-  /**
-   * @name The dense body view
-   *
-   * A `[n_bodies_global]` array of #MFTL_Object* in which slot `g` is the body
-   * with `global_id == g`, or a shared, permanently EMPTY object for a body this
-   * rank holds nothing of. Built on demand by MFTLEnsembleAcquireDenseView().
-   *
-   * It exists for a CALLER that genuinely has to enumerate every body in the
-   * ensemble, and **the library itself no longer has one**. Contact detection and
-   * the spatial halo were its two consumers, on the premise that their work list
-   * had to be identical on every rank so that the collectives it drove would
-   * match. The premise was false -- the halo's collectives are one neighbourhood
-   * allgatherv of body extents and one of payload, and neither's count depends on
-   * the request list -- so both now work from what this rank holds and what its
-   * neighbours published. See MFTLExtendSpatialHaloNearBodies().
-   *
-   * It is kept because it is the honest answer for a caller that does need every
-   * body, and because deleting a documented entry point is a separate decision
-   * from no longer needing it.
-   *
-   * READ-ONLY for its users, and that is what makes one shared empty object legal
-   * rather than a per-body one: every absent slot aliases the same struct, so a
-   * write to any of them would land on all of them. A Debug check on release
-   * asserts its counts are still zero.
-   * @{
-   */
-  MFTL_Object **dense_view;  ///< [dense_view_cap], MFTL_NULL until first acquired.
-  int dense_view_cap;  ///< Slots allocated in `dense_view`.
-  MFTL_Object *empty_body;  ///< The shared placeholder every absent slot points at.
-  /** @} */
 
   /**
    * Opaque scratch owned by the communication module, created on the first

@@ -9,6 +9,7 @@
 
 #include "mftl_ensemble.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -222,8 +223,10 @@ MFTL_Ensemble *MFTLEnsembleCreate(MPI_Comm comm, int cuts[3], double global_min[
   MPI_Comm_size(dom->comm_world, &dom->nproc);
   MPI_Comm_rank(dom->comm_world, &dom->rank);
 
-  // --- 2. Validate the process grid ---
-  if (cuts[0] < 1 || cuts[1] < 1 || cuts[2] < 1 || cuts[0] * cuts[1] * cuts[2] != dom->nproc)
+  // --- 2. Validate the process grid and the bounds ---
+  /* The product in 64 bits: three int cuts can overflow an int before the
+   * comparison, and an overflow that happens to equal nproc would be accepted. */
+  if (cuts[0] < 1 || cuts[1] < 1 || cuts[2] < 1 || (long long) cuts[0] * cuts[1] * cuts[2] != (long long) dom->nproc)
   {
     if (dom->rank == 0)
     {
@@ -233,6 +236,20 @@ MFTL_Ensemble *MFTLEnsembleCreate(MPI_Comm comm, int cuts[3], double global_min[
     return MFTL_NULL;
   }
 
+  /* A zero-length axis is legal (a flat decomposition), an inverted or non-finite
+   * one is not: it would silently produce negative sizes, a negative reciprocal
+   * and owner lookups that clamp everything into one cell. `!(a >= b)` also
+   * rejects NaN. */
+  for (int i = 0; i < 3; ++i)
+  {
+    if (!(global_max[i] >= global_min[i]) || !isfinite(global_min[i]) || !isfinite(global_max[i]))
+    {
+      if (dom->rank == 0) fprintf(stderr, "MFTL Error: invalid domain bounds on axis %d: [%g, %g].\n", i, global_min[i], global_max[i]);
+      MFTLEnsembleDestroy(&ens);
+      return MFTL_NULL;
+    }
+  }
+
   // --- 3. Copy bounds and flags ---
   for (int i = 0; i < 3; ++i)
   {
@@ -240,7 +257,6 @@ MFTL_Ensemble *MFTLEnsembleCreate(MPI_Comm comm, int cuts[3], double global_min[
     dom->global_min[i] = global_min[i];
     dom->global_max[i] = global_max[i];
     dom->domain_size[i] = global_max[i] - global_min[i];
-    dom->domain_half_size[i] = dom->domain_size[i] * 0.5;
     dom->inv_domain_size[i] = (dom->domain_size[i] > 0.0) ? 1.0 / dom->domain_size[i] : 0.0;
     dom->is_periodic[i] = is_periodic ? is_periodic[i] : MFTL_FALSE;
   }
@@ -269,11 +285,7 @@ void MFTLEnsembleDestroy(MFTL_Ensemble **p_ens)
   for (int i = 0; i < ens->n_local_objects; ++i) MFTLObjectDestroy(&ens->local_objects[i]);
   free(ens->local_objects);
 
-  // 1a. The dense view borrows those pointers; only its own two allocations go.
-  free(ens->dense_view);
-  MFTLObjectDestroy(&ens->empty_body);
-
-  // 1b. And the communication module's scratch, if a redistribution built one
+  // 1a. And the communication module's scratch, if a redistribution built one
   MFTLCommWorkspaceDestroy(&ens->comm_workspace);
 
   // 2. Release the domain resources
@@ -407,88 +419,6 @@ void MFTLEnsembleEraseLocalSlot(MFTL_Ensemble *ens, int slot)
     memmove(&ens->local_objects[slot], &ens->local_objects[slot + 1], (size_t) (ens->n_local_objects - slot - 1) * sizeof(MFTL_Object *));
   }
   ens->n_local_objects--;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * The dense body view
- *
- * A dense `[n_bodies_global]` view in which an absent body is a shared,
- * permanently empty object, so that a consumer written against "one object per
- * body in the ensemble" keeps every array, index and collective it had while the
- * object list itself becomes sparse.
- *
- * ── IT WAS A BRIDGE, AND NOTHING IN THE LIBRARY IS STILL ON IT ─────────────
- *
- * It was built for the two modules that appeared to need every body: contact
- * detection (MFTLEnsembleIntersectObjects built one BVH per body and enumerated
- * every body PAIR) and the spatial halo, "whose request list has to be identical
- * on every rank because it drives a sequence of collectives".
- *
- * That justification was wrong, and it is worth recording because it is the kind
- * of wrong that survives review: the halo's collectives are one neighbourhood
- * allgatherv of body extents and one of payload, and neither's COUNT depends on
- * the request list. A request only ever says what the SENDING rank is willing to
- * send. Both modules now work from what this rank holds plus what its neighbours
- * published, the pair list is derived from the extents rather than enumerated
- * (MFTLExtendSpatialHaloNearBodies), and the last O(bodies^2) term in the library
- * went with it.
- *
- * So this is kept for a CALLER that genuinely needs every body, and because
- * deleting a documented entry point is a separate decision from no longer needing
- * it. If nothing outside the tests uses it by the next review, it should go.
- *
- * ONE shared placeholder, not one per absent body, because the alternative is
- * O(bodies) object shells per rank -- precisely the memory this whole change
- * exists to remove. The price is that the view is READ-ONLY: every absent slot
- * aliases the same struct, so a write to one lands on all of them. That is
- * checked rather than trusted -- MFTLEnsembleReleaseDenseView() asserts in Debug
- * that the placeholder is still empty and still unowned.
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-MFTL_Object *const *MFTLEnsembleAcquireDenseView(MFTL_Ensemble *ens)
-{
-  MFTL_ASSERT(ens != MFTL_NULL);
-  if (ens == MFTL_NULL) return MFTL_NULL;
-
-  const int n = ens->n_bodies_global;
-
-  if (ens->empty_body == MFTL_NULL)
-  {
-    /* MFTL_ERROR as its id: it stands for whichever body a slot names, so any
-     * single id would be a lie about all the others. Nothing reads it -- the
-     * users of the view index by slot -- and a nonsense value shows up in a
-     * debugger rather than being mistaken for body 0. */
-    ens->empty_body = MFTLObjectCreate(MFTL_ERROR);
-    ens->empty_body->domain = &ens->domain;
-    MFTLObjectBuildDerived(ens->empty_body);  // vacuously current, so hot loops do not trip the staleness assert
-  }
-
-  /* A zero count, not `dense_view_cap`: the macro grows when count + needed
-   * exceeds capacity, so passing the capacity as the count would grow the array
-   * on every single call. Nothing in the view survives between acquisitions --
-   * it is rewritten below -- so "hold at least n slots" is the whole request. */
-  int zero = 0;
-  MFTL_ENSURE_CAPACITY(ens->dense_view, &zero, &ens->dense_view_cap, (n > 0) ? n : 1, MFTL_Object *);
-
-  for (int g = 0; g < n; ++g) ens->dense_view[g] = ens->empty_body;
-  for (int o = 0; o < ens->n_local_objects; ++o)
-  {
-    MFTL_Object *const obj = ens->local_objects[o];
-    MFTL_ASSERT(obj->global_id >= 0 && obj->global_id < n && "MFTLEnsembleAcquireDenseView: body id outside the id space");
-    ens->dense_view[obj->global_id] = obj;
-  }
-
-  return ens->dense_view;
-}
-
-void MFTLEnsembleReleaseDenseView(MFTL_Ensemble *ens)
-{
-  if (ens == MFTL_NULL || ens->empty_body == MFTL_NULL) return;
-
-  /* The whole contract in one line: if a user wrote through an absent slot, it
-   * wrote into every absent slot at once, and this is where that surfaces. */
-  MFTL_ASSERT(ens->empty_body->verts.n == 0 && ens->empty_body->tris.n == 0 &&
-              "MFTLEnsembleReleaseDenseView: the dense view is read-only -- something wrote through a placeholder slot");
 }
 
 void MFTLEnsembleUpdateGlobalCounts(MFTL_Ensemble *ensemble)

@@ -234,6 +234,44 @@ static inline int remesh_new_triangle(MFTL_Object *obj)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
+ * @brief Squared sine of a corner angle at or below which a fold test treats the
+ *        triangle as degenerate.
+ *
+ * DIMENSIONLESS, because the verdict has to be the same at every length scale:
+ * a front-tracking run in SI units meshes a millimetre droplet with edges near
+ * 1e-4. The test this replaces compared the squared area vector -- dimension
+ * L^4 -- against 1e-15, i.e. a cutoff of sin(theta) ~ 3.2e-8 / l^2 for edge
+ * length l: 1e-5 at l = 0.05, 3 % at l = 1e-3, and EVERY triangle below
+ * l ~ 1.8e-4, so that every collapse and every flip was refused and the mesh could
+ * only ever be refined. The same 1e-15 as a ratio is the precision floor the
+ * closest-point and BVH degeneracy tests already use: below it the cross product
+ * is rounding noise and its direction means nothing.
+ */
+#define MFTL_REMESH_DEGENERATE_SIN2 MFTL_VERYVERYSMALL
+
+/**
+ * @brief \f$\vect{e}_1 \times \vect{e}_2\f$, or the zero vector when the
+ *        triangle the two edges span is degenerate.
+ *
+ * The zero vector is the "not computable" sentinel area_vector_cos() rejects, so
+ * a degenerate triangle fails a fold test exactly as an inverted one does.
+ *
+ * @param      e1  First edge vector.
+ * @param      e2  Second edge vector, from the same corner.
+ * @param[out] out The cross product, or zero.
+ */
+static inline void fold_area_vector(const double e1[3], const double e2[3], double out[3])
+{
+  out[0] = e1[1] * e2[2] - e1[2] * e2[1];
+  out[1] = e1[2] * e2[0] - e1[0] * e2[2];
+  out[2] = e1[0] * e2[1] - e1[1] * e2[0];
+
+  const double cr_sq = out[0] * out[0] + out[1] * out[1] + out[2] * out[2];
+  const double ref = (e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]) * (e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]);
+  if (!(cr_sq > MFTL_REMESH_DEGENERATE_SIN2 * ref)) out[0] = out[1] = out[2] = 0.0;
+}
+
+/**
  * @brief Twice the area vector of triangle @p t, optionally with one or two of
  *        its corners moved to @p sub_pos.
  *
@@ -243,7 +281,8 @@ static inline int remesh_new_triangle(MFTL_Object *obj)
  * @param      sub_b   Second vertex index to substitute, or #MFTL_ERROR.
  * @param      sub_pos Position both substituted corners take.
  * @param[out] out     \f$\vect{e}_1 \times \vect{e}_2\f$, un-normalised, so its
- *                     magnitude is twice the area.
+ *                     magnitude is twice the area -- or zero when the
+ *                     triangle is degenerate (fold_area_vector()).
  *
  * The substitution is what makes a fold-over test possible without editing the
  * mesh first: an operator asks "what would this triangle's normal be afterwards"
@@ -251,8 +290,7 @@ static inline int remesh_new_triangle(MFTL_Object *obj)
  * current normal, from the same code path, so the comparison cannot be skewed by
  * two slightly different formulas.
  *
- * Un-normalised on purpose -- its magnitude is twice the area, which the callers
- * want anyway to reject degenerate results.
+ * Un-normalised on purpose: only its direction and whether it is zero are read.
  */
 static inline void tri_area_vector_substituted(const MFTL_Object *obj, int t, int sub_a, int sub_b, const double sub_pos[3], double out[3])
 {
@@ -269,29 +307,27 @@ static inline void tri_area_vector_substituted(const MFTL_Object *obj, int t, in
   double e2[3];
   MFTLGetMinimumImageVector(obj->domain, e1, p[0], p[1]);
   MFTLGetMinimumImageVector(obj->domain, e2, p[0], p[2]);
-
-  out[0] = e1[1] * e2[2] - e1[2] * e2[1];
-  out[1] = e1[2] * e2[0] - e1[0] * e2[2];
-  out[2] = e1[0] * e2[1] - e1[1] * e2[0];
+  fold_area_vector(e1, e2, out);
 }
 
 /**
- * @brief cos of the angle between two area vectors, 0 if either is degenerate.
+ * @brief cos of the angle between two area vectors, 0 if either is zero.
  *
  * Returning 0 rather than 1 for a degenerate input is what makes this usable as
  * a rejection test: an operation that produces a zero-area triangle should fail
- * the same threshold an inverting one fails, not pass it by accident.
+ * the same threshold an inverting one fails, not pass it by accident. WHAT counts
+ * as degenerate is decided where the vector is built, relative to its own edges
+ * (fold_area_vector()); here the test is against zero, which has no length scale.
  *
  * @param a First area vector.
  * @param b Second area vector.
- * @return \f$\cos\theta\f$ between them, or 0 if either is degenerate.
+ * @return \f$\cos\theta\f$ between them, or 0 if either is zero.
  */
 static inline double area_vector_cos(const double a[3], const double b[3])
 {
-  const double la = a[0] * a[0] + a[1] * a[1] + a[2] * a[2];
-  const double lb = b[0] * b[0] + b[1] * b[1] + b[2] * b[2];
-  if (la < MFTL_VERYVERYSMALL || lb < MFTL_VERYVERYSMALL) return 0.0;
-  return (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / MFTL_SQRT(la * lb);
+  const double den = MFTL_SQRT((a[0] * a[0] + a[1] * a[1] + a[2] * a[2]) * (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]));
+  if (!(den > 0.0)) return 0.0;
+  return (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / den;
 }
 
 /**
@@ -380,6 +416,36 @@ static inline bool freeze_blocks_collapse(const MFTL_Object *obj, int h)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
+ * @brief Adds one object's per-pass operation counts into a running total.
+ *
+ * The one place the per-object counters of #MFTL_RemeshStats are summed, used by
+ * all three drivers. The counters are sums; `iterations` is the maximum, because
+ * the objects of one pass iterate side by side rather than one after another.
+ * Fields that describe the PASS rather than an object (phases, migrations, the
+ * profile) are the driver's own and are not touched.
+ *
+ * @param[in,out] dst The running total.
+ * @param         src One object's statistics.
+ */
+static inline void remesh_stats_accumulate(MFTL_RemeshStats *dst, const MFTL_RemeshStats *src)
+{
+  dst->n_split += src->n_split;
+  dst->n_collapse += src->n_collapse;
+  dst->n_flip += src->n_flip;
+  dst->n_collapse_rejected_link += src->n_collapse_rejected_link;
+  dst->n_collapse_rejected_fold += src->n_collapse_rejected_fold;
+  dst->n_collapse_rejected_feature += src->n_collapse_rejected_feature;
+  dst->n_flip_rejected_fold += src->n_flip_rejected_fold;
+  dst->n_feature_edges += src->n_feature_edges;
+  dst->n_corner_vertices += src->n_corner_vertices;
+  dst->n_ridge_vertices += src->n_ridge_vertices;
+  dst->n_free_vertices += src->n_free_vertices;
+  dst->n_vertices_removed += src->n_vertices_removed;
+  dst->n_orphans_removed += src->n_orphans_removed;
+  dst->iterations = MFTL_MAX(dst->iterations, src->iterations);
+}
+
+/**
  * @brief The split/collapse/compact/flip/smooth loop, gated by MFTL_FLAG_FROZEN.
  *
  * The whole of MFTLRemeshObject() except its no-ghost assertion, its stats
@@ -449,7 +515,7 @@ typedef struct
 } MFTL_RemeshMeasurement;
 
 /**
- * @brief Allocates the three arrays for @p ens's current local list.
+ * @brief Allocates the four per-body arrays for @p ens's current local list.
  * @param m   Receives the arrays; release with MFTLRemeshMeasurementFree().
  * @param ens The ensemble.
  */

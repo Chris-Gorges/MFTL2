@@ -4,8 +4,7 @@
  *
  * @brief Strong, weak and granularity scaling of the distributed advection timestep.
  *
- * docs/performance-analysis.md sec 10 and docs/parallel-remeshing-analysis.md both
- * record the same hole in their own words: nothing in MFTL has been measured above
+ * docs/analysis.md sec 9 records the hole this closes: nothing in MFTL has been measured above
  * four ranks on real hardware, and there was no instrument that could do it. This
  * is that instrument. It runs the same five-step timestep as
  * examples/parallel_advection_redistribute_list.c -- that example is the reference
@@ -84,7 +83,7 @@
  *    generated leaves 33.5 MB of capacity on rank 0 at 256 bodies, refine 3,
  *    np = 4. --shrink-slack recovers the rest, and it is worth about 8 % of
  *    capacity for about 2 % of the redistribute phase, which is why it is off by
- *    default. See docs/scaling-analysis.md section 1 for the table.
+ *    default. See docs/analysis.md sec 6.1 for the table.
  *      In weak mode, where the body count grows with P, setup time grows
  *    LINEARLY WITH P on one rank while the timed loop does not -- it is the
  *    Amdahl ceiling of the harness, not of the library, and it must never be
@@ -1302,14 +1301,12 @@ int main(int argc, char **argv)
    * The two constants are the POOL BLOCK SIZES and must track object.c:
    *   triangle_layout_compute: 12 rec + 48 he(3x) + 8 area + 24 normal
    *                            + 24 center + 12 verts + 12 neighbors = 140
-   *   vertex_layout_compute:   16 rec + 24 pos + 24 normal + 8 area
-   *                            + 8 mean_curv + 8 gauss_curv           =  88
-   * so one body is 3680 * 4^refine + 176 bytes. This read 212 until the
-   * persistent triangle frames were deleted (commit 71199c6, -72 B/triangle) and
-   * nothing updated it, which overstated every generation figure by 1.391x.
-   * There is no compile-time link between these numbers and the layout -- if a
-   * pool array is added or removed, change them here too. */
-  const double gen_mb = (double) n_bodies * ((double) tri_per_body * 140.0 + (double) vert_per_body * 88.0) / (1024.0 * 1024.0);
+   *   vertex_layout_compute:   16 rec + 24 pos + 24 normal            =  64
+   * so one body is 3440 * 4^refine + 128 bytes. There is no compile-time link
+   * between these numbers and the layout -- if a pool array is added or removed,
+   * change them here too (they went stale twice: when the persistent triangle
+   * frames were deleted, and when the unused vertex area/curvature arrays were). */
+  const double gen_mb = (double) n_bodies * ((double) tri_per_body * 140.0 + (double) vert_per_body * 64.0) / (1024.0 * 1024.0);
   if (gen_mb > cfg.max_gen_mb)
   {
     if (rank == 0)

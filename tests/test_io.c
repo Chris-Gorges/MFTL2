@@ -53,29 +53,10 @@ static int g_nproc = 1;
  * 1. Fixtures
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static void grid_for(int nproc, int cuts[3])
-{
-  cuts[0] = nproc;
-  cuts[1] = 1;
-  cuts[2] = 1;
-  if (nproc == 4)
-  {
-    cuts[0] = 2;
-    cuts[1] = 2;
-    cuts[2] = 1;
-  }
-  else if (nproc == 8)
-  {
-    cuts[0] = 2;
-    cuts[1] = 2;
-    cuts[2] = 2;
-  }
-}
-
 static MFTL_Ensemble *make_ensemble(bool periodic, int capacity)
 {
   int cuts[3];
-  grid_for(g_nproc, cuts);
+  test_grid_for(g_nproc, cuts);
 
   double lo[3] = {-1.0, -1.0, -1.0};
   double hi[3] = {1.0, 1.0, 1.0};
@@ -206,10 +187,17 @@ static const char *vtu_find_tag(const vtu_file *f, const char *name)
 }
 
 /**
- * @brief Pointer to and byte count of an appended binary array.
- * @return NULL if the array is absent or not in appended form.
+ * @brief An aligned COPY of an appended binary array, and its byte count.
+ *
+ * A copy and not a pointer into the file: the blocks sit at arbitrary byte
+ * offsets -- `types` is one byte per cell -- so reading one in place as `double`
+ * or `int` is a misaligned load, undefined behaviour that UBSan reports and a
+ * strict-alignment CPU faults on. `malloc` returns storage aligned for any type.
+ *
+ * @return The copy, to be released with free(), or NULL if the array is absent or
+ *         not in appended form.
  */
-static const void *vtu_binary(const vtu_file *f, const char *name, unsigned long long *nbytes)
+static void *vtu_binary(const vtu_file *f, const char *name, unsigned long long *nbytes)
 {
   const char *tag = vtu_find_tag(f, name);
   if (!tag || f->appended == 0) return NULL;
@@ -226,8 +214,20 @@ static const void *vtu_binary(const vtu_file *f, const char *name, unsigned long
   memcpy(&len, f->raw + at, 8);
   if (at + 8u + (size_t) len > f->size) return NULL;
 
+  void *copy = malloc(len > 0 ? (size_t) len : 1u);
+  if (copy == NULL) return NULL;
+  memcpy(copy, f->raw + at + 8u, (size_t) len);
   *nbytes = len;
-  return f->raw + at + 8u;
+  return copy;
+}
+
+/** @brief Whether an appended binary array named @p name is present. */
+static int vtu_has_binary(const vtu_file *f, const char *name)
+{
+  unsigned long long nb = 0;
+  void *copy = vtu_binary(f, name, &nb);
+  free(copy);
+  return copy != NULL;
 }
 
 /**
@@ -273,19 +273,23 @@ static long vtu_ascii(const vtu_file *f, const char *name, double *out, long max
 static double vtu_area_binary(const vtu_file *f, int base)
 {
   unsigned long long np_bytes = 0, nc_bytes = 0;
-  const double *pts = (const double *) vtu_binary(f, "Points", &np_bytes);
-  const int *conn = (const int *) vtu_binary(f, "connectivity", &nc_bytes);
-  if (!pts || !conn) return -1.0;
-  if (np_bytes != (unsigned long long) f->n_points * 24u) return -1.0;
-  if (nc_bytes != (unsigned long long) f->n_cells * 12u) return -1.0;
+  double *pts = (double *) vtu_binary(f, "Points", &np_bytes);
+  int *conn = (int *) vtu_binary(f, "connectivity", &nc_bytes);
 
-  double area = 0.0;
+  double area = -1.0;
+  if (!pts || !conn || np_bytes != (unsigned long long) f->n_points * 24u || nc_bytes != (unsigned long long) f->n_cells * 12u) goto out;
+
+  area = 0.0;
   for (long long t = 0; t < f->n_cells; ++t)
   {
     const int i0 = conn[3 * t + 0] - base;
     const int i1 = conn[3 * t + 1] - base;
     const int i2 = conn[3 * t + 2] - base;
-    if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= f->n_points || i1 >= f->n_points || i2 >= f->n_points) return -2.0;
+    if (i0 < 0 || i1 < 0 || i2 < 0 || i0 >= f->n_points || i1 >= f->n_points || i2 >= f->n_points)
+    {
+      area = -2.0;
+      goto out;
+    }
 
     double e1[3], e2[3];
     for (int k = 0; k < 3; ++k)
@@ -298,6 +302,10 @@ static double vtu_area_binary(const vtu_file *f, int base)
     const double cz = e1[0] * e2[1] - e1[1] * e2[0];
     area += 0.5 * sqrt(cx * cx + cy * cy + cz * cz);
   }
+
+out:
+  free(conn);
+  free(pts);
   return area;
 }
 
@@ -306,21 +314,24 @@ static int vtu_structure_is_sound(const vtu_file *f)
 {
   unsigned long long nb = 0;
 
-  const int *off = (const int *) vtu_binary(f, "offsets", &nb);
-  if (!off || nb != (unsigned long long) f->n_cells * 4u) return 0;
+  int *off = (int *) vtu_binary(f, "offsets", &nb);
+  const int off_ok = off && nb == (unsigned long long) f->n_cells * 4u;
 
-  const unsigned char *ty = (const unsigned char *) vtu_binary(f, "types", &nb);
-  if (!ty || nb != (unsigned long long) f->n_cells) return 0;
+  unsigned char *ty = (unsigned char *) vtu_binary(f, "types", &nb);
+  int ok = off_ok && ty && nb == (unsigned long long) f->n_cells;
 
   /* The offsets are cumulative and the file may be one rank's slice of a shared
    * piece, so only the STEP is checkable without knowing the base. */
-  for (long long t = 0; t < f->n_cells; ++t)
+  for (long long t = 0; ok && t < f->n_cells; ++t)
   {
-    if (ty[t] != 5) return 0;
-    if (t > 0 && off[t] - off[t - 1] != 3) return 0;
+    if (ty[t] != 5) ok = 0;
+    if (t > 0 && off[t] - off[t - 1] != 3) ok = 0;
   }
-  if (f->n_cells > 0 && off[0] % 3 != 0) return 0;
-  return 1;
+  if (ok && f->n_cells > 0 && off[0] % 3 != 0) ok = 0;
+
+  free(ty);
+  free(off);
+  return ok;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -784,7 +795,7 @@ static int test_ascii_agrees_with_binary(void)
   if (ok && fb.n_points > 0)
   {
     unsigned long long nb = 0;
-    const double *bpts = (const double *) vtu_binary(&fb, "Points", &nb);
+    double *bpts = (double *) vtu_binary(&fb, "Points", &nb);
     double *apts = (double *) malloc((size_t) (3 * fa.n_points) * sizeof(double));
     const long n = vtu_ascii(&fa, "Points", apts, 3 * fa.n_points);
 
@@ -793,18 +804,20 @@ static int test_ascii_agrees_with_binary(void)
      * relative -- exactly, not approximately, the format's own precision. */
     for (long i = 0; ok && i < n; ++i) ok = (fabs(apts[i] - bpts[i]) <= 1e-9 * (fabs(bpts[i]) + 1.0));
     free(apts);
+    free(bpts);
   }
 
   if (ok && fb.n_cells > 0)
   {
     unsigned long long nb = 0;
-    const int *bconn = (const int *) vtu_binary(&fb, "connectivity", &nb);
+    int *bconn = (int *) vtu_binary(&fb, "connectivity", &nb);
     double *aconn = (double *) malloc((size_t) (3 * fa.n_cells) * sizeof(double));
     const long n = vtu_ascii(&fa, "connectivity", aconn, 3 * fa.n_cells);
 
     ok = bconn && (n == 3 * fa.n_cells);
     for (long i = 0; ok && i < n; ++i) ok = ((int) aconn[i] == bconn[i]);
     free(aconn);
+    free(bconn);
   }
 
   vtu_free(&fb);
@@ -842,7 +855,7 @@ static int test_body_id_partitions_the_cells(void)
   if (ok)
   {
     unsigned long long nb = 0;
-    const int *bid = (const int *) vtu_binary(&f, "BodyID", &nb);
+    int *bid = (int *) vtu_binary(&f, "BodyID", &nb);
     ok = bid && (nb == (unsigned long long) f.n_cells * 4u);
     for (long long t = 0; ok && t < f.n_cells; ++t)
     {
@@ -850,6 +863,7 @@ static int test_body_id_partitions_the_cells(void)
       ok = (b >= 0 && b < n_bodies);
       if (ok) per_body[b]++;
     }
+    free(bid);
   }
   vtu_free(&f);
   TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
@@ -892,12 +906,11 @@ static int test_optional_arrays_toggle(void)
   piece_path(path, sizeof path, prefix, g_rank);
 
   vtu_file f;
-  unsigned long long nb = 0;
   int ok = vtu_load(path, &f);
   if (ok)
   {
-    ok = (vtu_binary(&f, "VertexOwner", &nb) == NULL) && (vtu_binary(&f, "TriangleOwner", &nb) == NULL) && (vtu_binary(&f, "BodyID", &nb) == NULL) &&
-         (vtu_binary(&f, "VertexGID", &nb) != NULL) && (vtu_binary(&f, "TriangleGID", &nb) != NULL);
+    ok = !vtu_has_binary(&f, "VertexOwner") && !vtu_has_binary(&f, "TriangleOwner") && !vtu_has_binary(&f, "BodyID") && vtu_has_binary(&f, "VertexGID") &&
+         vtu_has_binary(&f, "TriangleGID");
   }
   vtu_free(&f);
   TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));

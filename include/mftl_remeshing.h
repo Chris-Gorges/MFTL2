@@ -304,7 +304,7 @@ typedef enum
    * pulling vertices out of densely triangulated regions towards sparse ones. An
    * unweighted mean of centroids is very nearly another umbrella operator, and a
    * remesher using it loses most of its isotropy -- measured in
-   * docs/remeshing-quality-analysis.md, where it costs volume conservation (6.0 %
+   * docs/analysis.md §4, where it costs volume conservation (6.0 %
    * against 3.5 %) rather than triangle quality.
    */
   MFTL_SMOOTH_TRIANGLE_BASED
@@ -351,7 +351,7 @@ typedef struct MFTL_RemeshParameters
    * production setting rather than a debug switch: on a closed smooth interface
    * -- a droplet, a bubble, the Leveque test sphere -- there are no features to
    * preserve, and every edge the detector flags is a false positive that locks a
-   * vertex the smoother needed to move. See docs/remeshing-quality-analysis.md.
+   * vertex the smoother needed to move. See docs/analysis.md §4.
    *
    * A mesh boundary is ALWAYS treated as a feature, threshold or not, because it
    * is a feature of the surface rather than of its curvature.
@@ -397,7 +397,7 @@ typedef struct MFTL_RemeshParameters
    * reads
    * that as a sharp edge, the smoother locks every vertex of it, and the
    * inversion becomes permanent. Measured in
-   * docs/remeshing-quality-analysis.md.
+   * docs/analysis.md §4.
    */
   double max_normal_deviation_cos;
 
@@ -644,7 +644,7 @@ typedef struct MFTL_RemeshParameters
    * looks like: at 18 300 triangles the distributed answer measures min q 0.85
    * against the serial 0.72. Gathering buys time and gives that back. The
    * default is 0 because the crossover has not been measured -- the np = 1 rows
-   * in docs/parallel-remeshing-analysis.md take a different code path and never
+   * in docs/analysis.md §5.4 take a different code path and never
    * pay for the gather, so they do not answer the question.
    */
   int serial_gather_max_triangles;
@@ -1008,7 +1008,7 @@ typedef struct
   // distributed pass is a RATIO of these -- is the pass bound by moving the mesh
   // or by remeshing it? -- and until they existed the question could only be
   // answered by timing the whole call, which is what
-  // docs/parallel-remeshing-analysis.md section 7 records as the reason the
+  // docs/analysis.md §5.4 records as the reason the
   // work-list decision could not be made. They are also the only way to see the
   // O(n) floor: `t_geometry` is a full triangle-geometry pass per phase over
   // owned AND ghost triangles, and it does not get cheaper when less is moved.
@@ -1498,14 +1498,17 @@ void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params,
  * cannot be collapsed without agreement, so a "serial" remesh of a partitioned
  * object would silently produce a different mesh on each rank.
  *
- * On return the object has valid topology, both derived bits set, and current
- * `tris.area/normal/center`. Vertex normals are current as a side effect of the
- * last smoothing sweep.
+ * On return the object has valid topology, derived connectivity current, and
+ * current `tris.area/normal/center`. `verts.normal` is NOT refreshed after the
+ * final position update: it holds the normals the last smoothing sweep moved
+ * against (and is untouched if no sweep ran), so a caller that reads vertex
+ * normals owes MFTLComputeVertexNormals(). No integrity check is run; call
+ * MFTLCheckMeshIntegrity() for one.
  *
  * @param      obj    The mesh, remeshed in place.
  * @param      params The parameter block. See MFTLInitRemeshParams().
  * @param[out] stats  May be #MFTL_NULL.
- * @return #MFTL_SUCCESS, or #MFTL_ERROR if the mesh failed its integrity check.
+ * @return #MFTL_SUCCESS.
  * @rank_local
  */
 int MFTLRemeshObject(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats);
@@ -1587,8 +1590,8 @@ int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, 
  * ── Preconditions ──────────────────────────────────────────────────────────
  *
  *   - MFTLRegisterMpiTypes() has been called (the driver migrates).
- *   - Every rank holds the same object list in the same order, and agrees on
- *     each object's next_*_gid. Both are checked in Debug.
+ *   - Every rank added the same bodies in the same order, and every holder of a
+ *     body agrees on its next_*_gid. Both are checked in Debug.
  *   - h_min > 4 * delta, delta ~ (3 + freeze_dilation_rings) * max_edge_length.
  *     Warned about once rather than enforced; see MFTL_RemeshStats.converged.
  *
@@ -1599,7 +1602,7 @@ int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, 
  *     IS MFTLRedistribute.
  *   - Global ids dense over the whole mesh again, and consistent between every
  *     ghost and its owner.
- *   - Valid topology, both derived bits, current `tris.area/normal/center`.
+ *   - Valid topology, current derived connectivity, current `tris.area/normal/center`.
  *     `verts.normal` is NOT current -- the closing migration discards it; call
  *     MFTLEnsembleUpdateVertexNormals if you need it.
  *   - MFTL_FLAG_FROZEN cleared everywhere.
@@ -1706,8 +1709,8 @@ MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategy(MFTL_Ensemble *ens, const M
  * @brief The GLOBAL centroid and radius of every body, in two collectives.
  *
  * What the strategy choice is made from, published because a caller has the same
- * question: the plan's ensemble-rebalancing scheme (§6) is exactly "measure the
- * bodies, then decide", and deciding is the caller's business.
+ * question: rebalancing an ensemble is exactly "measure the bodies, then
+ * decide", and deciding is the caller's business.
  *
  * Both are reduced over the body's HOLDERS and are therefore global answers about
  * each body, even though the buffers are local. A rank's own share of a body has
@@ -1778,7 +1781,7 @@ MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategy(MFTL_Ensemble *ens, const M
  *                      summing a per-body verdict over ranks counts a shared body
  *                      once per holder unless one of them is designated. Free --
  *                      it is a MIN slot on the reduction already being taken.
- * @note Collective: one per-body reduction of 8 values, then one of 1 value when
+ * @note Collective: one per-body reduction of 9 values, then one of 1 value when
  *       @p radius or @p r_max is asked for, plus one scalar `MPI_MAX` for
  *       @p r_max. Which of them are taken depends only on which POINTERS are
  *       null, so it must be the same on every rank -- it is a property of the
@@ -1788,64 +1791,22 @@ MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategy(MFTL_Ensemble *ens, const M
 void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radius, double *weight, double *r_max, double *lowest_holder);
 
 /**
- * @brief How many flow ranks would have to be grouped into one remeshing rank
- *        for the shift schedule's `h > 4*delta` precondition to hold.
- *
- * The plan's Regime C number (§4.4), and the actionable half of the warning the
- * driver prints when the precondition fails: "your boxes are too small" is not
- * useful on its own, "group 8 of them" is.
- *
- *   G > (4*delta / h_min)^3,  rounded up to a perfect cube
- *
- * A perfect cube so that grouped boxes stay roughly cubic; cubing because the
- * constraint is on ONE axis of a 3D grid, so the linear factor has to be applied
- * three times to keep the shape.
- *
- * ── What this is, now that acting on it is possible ────────────────────────
- *
- * A DIAGNOSTIC, and deliberately still one. The library CAN act on the answer --
- * set `MFTL_RemeshParameters.parallel_coarsen` and the driver merges rank boxes
- * itself -- but it acts on MFTLRemeshCoarseningFactors, not on this, and the
- * difference is a factor of nine in wasted parallelism:
- *
- *   this           one number, cubed, from the 3*max_edge_length ESTIMATE
- *   the driver     per axis, from the MEASURED band
- *
- * The estimate overstates the band by about three (MFTL_RemeshStats.band_bound
- * against band_measured), and cubing applies a one-axis constraint to all three.
- * Both are the safe direction and both cost ranks. This function is kept
- * unchanged because it is what the warning message quotes -- a single "group N
- * of them" is what a human reads at 3 a.m. -- and because changing a published
- * return value to mean something else is worse than having two functions.
- *
- * What the plan proposed and what was NOT built: MPI_Comm_split, a gather onto a
- * group master, remesh on the coarse grid, scatter back. It was not needed. A
- * coarsened decomposition is an OWNER FUNCTION, and redistribution has taken an
- * arbitrary owner map since the dispersed strategy landed, so the whole path is
- * one inline function (MFTLRemeshCoarseOwnerProc) rather than a second
- * communication subsystem.
- *
- * @param domain The MPI/physical world.
- * @param params Supplies the target length the band is derived from.
- * @rank_local Every rank computes the same value from replicated data.
- * @return 1 when the precondition already holds, else the smallest perfect cube
- *         that would satisfy it.
- */
-int MFTLRemeshCoarseningFactor(const MFTL_Domain *domain, const MFTL_RemeshParameters *params);
-
-/**
  * @brief The per-axis coarsening the shift schedule needs, from a MEASURED band.
  *
  * `g[k] = ceil(4*delta / h_k)` for every axis that is actually cut, and 1
- * everywhere else. The scalar MFTLRemeshCoarseningFactor is the product, kept
- * because it is what a diagnostic message quotes; THIS is what the driver acts
- * on, and the difference is not cosmetic. The precondition is per axis --
- * MFTLDomainGetHMin takes a minimum precisely because one thin axis is enough to
- * break it -- so cubing the worst axis' factor throws away parallelism on the
- * two axes that were fine. A domain thin in x only costs 2x, not 8x.
+ * everywhere else, clamped to `cuts[k]`. It is PER AXIS because the precondition
+ * is -- MFTLDomainGetHMin takes a minimum precisely because one thin axis is
+ * enough to break it -- so a single factor cubed would throw away parallelism on
+ * the two axes that were fine. A domain thin in x only costs 2x, not 8x.
+ *
+ * A coarsened decomposition is only an OWNER FUNCTION (MFTLRemeshCoarseOwnerProc),
+ * which redistribution accepts through #MFTL_OwnerMap -- no second communicator,
+ * no gather onto a group master. The driver caps the factors separately with
+ * `parallel_coarsen`; this function does not.
  *
  * @param      domain    The MPI/physical world.
- * @param      params    Supplies `parallel_coarsen`, which caps the result.
+ * @param      params    Supplies `max_edge_length` and `freeze_dilation_rings`
+ *                       for the estimate when @p band is 0.
  * @param      band      The frozen band half-width. Pass
  *                       `MFTL_RemeshStats::band_bound` from a previous pass for
  *                       a measured answer, or 0 to fall back to the

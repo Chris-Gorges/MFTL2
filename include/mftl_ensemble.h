@@ -33,7 +33,7 @@
  * src/ensemble/ensemble_update.c rather than in src/geometry/, because it
  * carries nine live reduction accumulators. Moving it across a translation-unit
  * boundary would force them into an address-taken struct, which
- * docs/performance-analysis.md §6 measures at 15 % -- so the kernel stays next
+ * docs/analysis.md §1.6 measures at 15 % -- so the kernel stays next
  * to the reduction it feeds. Tidiness lost to a number.
  */
 
@@ -116,27 +116,6 @@ void MFTLEnsembleDestroy(MFTL_Ensemble **p_ens);
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Bodies this rank holds entities of. NOT the size of the ensemble.
- * @param ens The ensemble.
- * @return #MFTL_Ensemble::n_local_objects.
- */
-static inline int MFTLEnsembleLocalBodyCount(const MFTL_Ensemble *ens) { return (ens != MFTL_NULL) ? ens->n_local_objects : 0; }
-
-/**
- * @brief The size of the body-id space: every id ever handed out.
- *
- * Equal to the number of bodies until a topology change retires one -- ids are
- * never reused, so after MFTLEnsembleReconstructBodies() some ids below it name
- * no body anywhere. The number every rank agrees about, and the one a collective
- * may be sized or guarded by. MFTLEnsembleLocalBodyCount() is not: returning early on it is a
- * rank-local decision about a collective call, which is a deadlock.
- *
- * @param ens The ensemble.
- * @return #MFTL_Ensemble::n_bodies_global.
- */
-static inline int MFTLEnsembleGlobalBodyCount(const MFTL_Ensemble *ens) { return (ens != MFTL_NULL) ? ens->n_bodies_global : 0; }
-
-/**
  * @brief Slot of body @p body_gid in the local list, by binary search.
  * @param ens      The ensemble.
  * @param body_gid The body id.
@@ -180,48 +159,6 @@ int MFTLEnsembleInsertLocalObject(MFTL_Ensemble *ens, MFTL_Object *object);
  */
 void MFTLEnsembleEraseLocalSlot(MFTL_Ensemble *ens, int slot);
 
-/**
- * @brief A `[n_bodies_global]` view in which slot `g` is body `g`, or a shared
- *        EMPTY object if this rank holds nothing of it.
- *
- * For a CALLER that genuinely has to enumerate every body in the ensemble. Do not
- * use it for anything on the per-timestep path: it is `O(bodies in the ensemble)`
- * per rank by definition, which is the cost the sparse local list exists to
- * avoid.
- *
- * @note **The library itself has no caller left.** Contact detection and the
- *       spatial halo were the two, on the premise that their work list had to be
- *       identical on every rank; the premise was false, and
- *       MFTLExtendSpatialHaloNearBodies() derives the work list from the body
- *       extents it already exchanges instead.
- *
- * @warning **READ-ONLY.** Every absent slot points at the SAME placeholder, so a
- *          write through one lands on all of them. MFTLEnsembleReleaseDenseView()
- *          asserts in Debug that the placeholder is untouched. A module that
- *          needs to write per body must iterate `local_objects` instead, or key
- *          its own array by `global_id`.
- *
- * @note The view is invalidated by anything that changes the local object list --
- *       a redistribution, in particular. Acquire it after, not across.
- *
- * @rank_local No MPI. The ensemble owns the storage and reuses it.
- *
- * @param ens The ensemble.
- * @return The view, or #MFTL_NULL on a NULL ensemble.
- */
-MFTL_Object *const *MFTLEnsembleAcquireDenseView(MFTL_Ensemble *ens);
-
-/**
- * @brief Ends a dense-view borrow and checks the placeholder was not written.
- *
- * Frees nothing -- the storage is reused. It exists so the read-only contract is
- * verified rather than trusted, which is why it should be called even though
- * skipping it leaks nothing.
- *
- * @param ens The ensemble.
- */
-void MFTLEnsembleReleaseDenseView(MFTL_Ensemble *ens);
-
 /* ═══════════════════════════════════════════════════════════════════════════
  * Per-body reductions over the HOLDERS of each body
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -247,57 +184,46 @@ typedef enum MFTL_BodyReduceOp
  *          per call rather than setting it as library state is what makes that
  *          checkable by reading the call site.
  *
+ * There is deliberately no value that forces the neighbourhood route. Whether it
+ * is exact is only known once the records have been exchanged, so it is always
+ * certified; a caller that had to take the pre-exchange scan early passes its
+ * verdict to MFTLEnsembleReduceBodiesPrescanned() instead.
+ *
  * @see MFTLEnsembleReduceBodies()
  */
 typedef enum MFTL_BodyReduceScope
 {
   /**
-   * Take the neighbourhood route when it is provably exact, the global one
+   * Take the neighbourhood route when it is certified exact, the global one
    * otherwise. The value to pass unless there is a reason not to.
    *
-   * It runs MFTLEnsembleBodyHoldersFitTheGraph() and agrees the answer with one
-   * `MPI_Allreduce` of a single int. The verdict is re-derived on every call and
-   * never cached: it is invalidated by any holder-set change anywhere in the
-   * job, and a stale one is a silently wrong reduction rather than a crash.
+   * The certificate is re-derived on every call and never cached: it is
+   * invalidated by any holder-set change anywhere in the job, and a stale one is
+   * a silently wrong reduction rather than a crash.
    */
   MFTL_BODY_REDUCE_SCOPE_AUTO = 0,
-
-  /**
-   * Take the neighbourhood route, unchecked.
-   *
-   * @warning NOT verified at run time, in Debug either. On an ensemble where
-   *          some body has a holder outside another holder's 26-neighbourhood
-   *          this computes a wrong per-body answer in silence -- that rank's
-   *          contribution is simply absent. Pass it only after establishing the
-   *          property, which is what MFTLEnsembleBodyHoldersFitTheGraph() is
-   *          for.
-   *
-   * It exists for the caller that cannot let #MFTL_BODY_REDUCE_SCOPE_AUTO run
-   * the test at call time. Redistribution is that caller: it rewrites every
-   * entity's `owner_proc` with the DESTINATION owner while classifying, so by
-   * the time its skip vote is reduced the pools describe the partition that is
-   * about to exist rather than the one the vote has to reach. It therefore takes
-   * the test before classifying, agrees it, and passes the answer here.
-   */
-  MFTL_BODY_REDUCE_SCOPE_HOLDERS = 1,
 
   /**
    * Take the `comm_world` reduction. Correct for any ensemble, and
    * `O(bodies in the ensemble)` per rank in both payload and staging memory.
    *
    * Worth passing on a knowingly spanning ensemble: #MFTL_BODY_REDUCE_SCOPE_AUTO
-   * would pay the ghost-suffix scan and the extra one-int collective every call
+   * would pay the neighbourhood exchange and the one-int agreement every call
    * only to arrive here anyway.
    */
-  MFTL_BODY_REDUCE_SCOPE_GLOBAL = 2
+  MFTL_BODY_REDUCE_SCOPE_GLOBAL = 1
 } MFTL_BodyReduceScope;
 
 /**
- * @brief Whether every body this rank holds has all its holders on the graph.
+ * @brief Whether this rank's pools rule the neighbourhood route out.
  *
- * The rank-local half of the #MFTL_BODY_REDUCE_SCOPE_AUTO test, and the whole of
- * it once every rank agrees -- the property is a conjunction over ranks, so an
- * `MPI_LAND` of this is exactly "the neighbourhood route is exact".
+ * The pre-exchange half of the #MFTL_BODY_REDUCE_SCOPE_AUTO test: statements 1
+ * and 2 of the derivation on MFTLEnsembleReduceBodies(), plus an early refusal of
+ * two visible holders two cells apart. NECESSARY, NOT SUFFICIENT -- a body whose
+ * holders form a chain around a corner passes it on every rank while its two
+ * ends never hear from each other. What it establishes, for a connected surface,
+ * is that each body's holders are connected on the graph; the certificate after
+ * the exchange does the rest.
  *
  * It reads only the GHOST SUFFIX of each pool: everything in `[0, n_local)` is
  * owned here by the ownership-prefix invariant, so the halo is what names the
@@ -306,13 +232,15 @@ typedef enum MFTL_BodyReduceScope
  *
  * @warning It describes the pools AS THEY ARE. A caller that is about to rewrite
  *          `owner_proc` -- redistribution, while it classifies -- must take the
- *          answer first; afterwards the pools describe a different partition.
+ *          answer first and hand it to MFTLEnsembleReduceBodiesPrescanned();
+ *          afterwards the pools describe a different partition.
  *
  * @param ens The ensemble.
- * @return #MFTL_TRUE if no body of this rank has a holder outside this rank's
- *         26-neighbourhood, or one two cells away from another of its holders.
+ * @return #MFTL_TRUE if every body of this rank owns an entity here and no ghost
+ *         of it is owned outside this rank's 26-neighbourhood or two cells from
+ *         another visible holder.
  *
- * @rank_local Each rank answers about its own bodies. Combine with `MPI_LAND`.
+ * @rank_local Each rank answers about its own bodies.
  */
 bool MFTLEnsembleBodyHoldersFitTheGraph(const MFTL_Ensemble *ens);
 
@@ -344,59 +272,63 @@ bool MFTLEnsembleBodyHoldersFitTheGraph(const MFTL_Ensemble *ens);
  * `MFTL_Domain::comm_graph`; each rank combines the records whose body it holds
  * into its own contribution. Cost `O(local bodies * degree)` -- constant in the
  * process count AND in the ensemble's body count. Exact if and only if every
- * holder of every body is inside every other holder's 26-neighbourhood.
+ * two holders of every body are graph neighbours.
  *
  * **Global.** The `comm_world` `MPI_Allreduce` over a body-id-indexed staging
  * buffer, one call per distinct operator (so at most three). Always exact,
  * `O(bodies in the ensemble)` per rank.
  *
+ * #MFTL_BODY_REDUCE_SCOPE_AUTO exchanges the records, certifies them, and agrees
+ * the verdict with ONE `MPI_Allreduce` of a single int; on refusal it discards
+ * them and takes the global route. A certified call therefore costs exactly the
+ * neighbourhood exchange plus one int, and a refused one pays the exchange on
+ * top of the global route -- the price of deciding where the decision is sound.
+ *
  * ## WHEN THE NEIGHBOURHOOD IS EXACT, AND HOW THAT IS ESTABLISHED
  *
- * A rank holds an entity of a body only if it OWNS one: redistribution sends a
- * triangle to the owner of each of its three corners and each of its three edge
- * neighbours, so a rank holding nothing but ghosts of a body cannot exist. The
- * holders of a body are therefore the cells its entities occupy, and the
- * question is whether that cell set fits inside one 26-neighbourhood, i.e. has
- * per-axis extent at most one cell.
- *
- * That is decided WITHOUT geometry and without a body-global measurement, from
- * three local statements about the set \f$V_R(X)\f$ of holders rank \f$R\f$ can
- * see for body \f$X\f$ -- itself, plus the `owner_proc` of every ghost of
- * \f$X\f$ in its pool:
+ * Write \f$H(X)\f$ for the holders of body \f$X\f$. Three local statements,
+ * each checked on every holder \f$R\f$:
  *
  *   1. \f$R\f$ owns at least one entity of \f$X\f$;
- *   2. every member of \f$V_R(X)\f$ is a graph neighbour of \f$R\f$;
- *   3. the per-axis span of their cell offsets from \f$R\f$ is at most 1.
+ *   2. every rank owning a ghost of \f$X\f$ in \f$R\f$'s pool is a graph
+ *      neighbour of \f$R\f$;
+ *   3. AFTER THE EXCHANGE: \f$R\f$ and every graph neighbour that published a
+ *      record for \f$X\f$ span at most one cell per axis.
  *
- * Statement 1 is what makes \f$V\f$ complete: a rank holding an EMPTY object
- * owns nothing, appears in no other holder's halo, and could therefore neither be
- * discovered nor served. It cannot be seen from outside, so such a rank vetoes.
+ * Statements 1 and 2 are MFTLEnsembleBodyHoldersFitTheGraph(); statement 3 needs
+ * the records, because a rank's halo names only the holders its own entities
+ * touch, while every holder publishes a record.
  *
- * Given it, all three hold everywhere iff every body's holder set has Chebyshev
- * diameter at most one. The forward direction is immediate. For the converse,
- * take holders \f$c, c'\f$ of \f$X\f$ two cells or more apart; the surface is
- * connected, so there is a chain of holders from \f$c\f$ to \f$c'\f$ in which
- * consecutive members share an entity and therefore see each other. If any step
- * of that chain is itself two cells or more, statement 2 fails at its start. If
- * every step is one cell, the chain covers a distance of at least two in unit
- * steps, so some member has chain neighbours on opposite sides of it along one
- * axis -- both in its own \f$V\f$, spanning two cells -- and statement 3 fails
- * there.
+ * **1 and 2 make \f$H(X)\f$ connected on the graph.** Redistribution sends a
+ * triangle to the owner of each of its corners and edge neighbours, so of two
+ * incident entities with different owners, each owner holds the other entity
+ * as a ghost and, by 2, is a graph neighbour of the other owner. The surface is
+ * connected, so its owners are; by 1 every holder is an owner.
  *
- * @warning The converse rests on ONE assumption, and it is the assumption the
+ * **3 makes a connected \f$H(X)\f$ a clique.** If it were not, two holders
+ * \f$a, c\f$ at graph distance exactly 2 would exist, with a common holder
+ * neighbour \f$m\f$. Both are in \f$m\f$'s record set, so by 3 their offsets from
+ * \f$m\f$ differ by at most one per axis, so \f$c\f$'s cell is in \f$a\f$'s
+ * 26-stencil and the two ARE neighbours. Contradiction. The converse is
+ * immediate: in a clique every holder's record set is all of \f$H(X)\f$, which
+ * spans at most one cell per axis whenever it fits one neighbourhood. The one
+ * conservative case is a periodic axis with `cuts[k] == 3`, where cells at
+ * offsets \f$-1\f$ and \f$+1\f$ are neighbours and a body occupying all three
+ * is refused -- it spans the domain, which is the regime the global route is
+ * for anyway.
+ *
+ * Statement 1 is also why an EMPTY holder vetoes: it owns nothing, so nothing
+ * connects it to the other holders. It is the state a generated ensemble is in
+ * before its first redistribution, and after one no empty object exists.
+ *
+ * @warning The argument rests on ONE assumption, and it is the assumption the
  *          whole library already makes about an #MFTL_Object: that a body is one
  *          CONNECTED surface. Two components of one body could sit on ranks that
  *          neither see each other nor have anything between them, and no local
  *          test could tell. Nothing in MFTL produces such a body -- generation
- *          emits a closed sphere, remeshing preserves connectivity, and the fan
- *          walks, the mean edge length and the halo rule all read one surface --
- *          but a caller that assembles one from an index list owes
- *          #MFTL_BODY_REDUCE_SCOPE_GLOBAL.
- *
- * The test is deliberately conservative in one case: three or more cells on a
- * periodic axis are all mutual neighbours when `cuts[k] == 3`, and offsets
- * \f$\{-1, 0, +1\}\f$ report a span of 2. A body occupying three of three cells
- * spans the domain, which is the regime the global route is for anyway.
+ *          emits closed spheres, remeshing preserves connectivity, and a topology
+ *          change gives every component its own id -- but a caller that assembles
+ *          one from an index list owes #MFTL_BODY_REDUCE_SCOPE_GLOBAL.
  *
  * ## THE ANSWER IS BITWISE IDENTICAL ON EVERY HOLDER, AND THAT IS NOT FREE
  *
@@ -423,13 +355,37 @@ bool MFTLEnsembleBodyHoldersFitTheGraph(const MFTL_Ensemble *ens);
  * @param ops `[n_per_body]` operators, one per slot. Mixing them costs nothing
  *            on the holder route -- it combines in local memory -- and at most
  *            one `MPI_Allreduce` per distinct operator on the global one.
- * @param scope Which route to take. Pass #MFTL_BODY_REDUCE_SCOPE_AUTO unless the
- *              route has already been established and agreed; it must be the
- *              same value on every rank.
- * @return #MFTL_SUCCESS, or #MFTL_ERROR on a NULL ensemble or a negative
- *         @p n_per_body.
+ * @param scope Which route to take; it must be the same value on every rank.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on a NULL ensemble, a negative
+ *         @p n_per_body or NULL @p ops.
  */
 int MFTLEnsembleReduceBodies(MFTL_Ensemble *ens, double *values, int n_per_body, const MFTL_BodyReduceOp *ops, MFTL_BodyReduceScope scope);
+
+/**
+ * @brief MFTLEnsembleReduceBodies() with #MFTL_BODY_REDUCE_SCOPE_AUTO, for a
+ *        caller that had to take the pre-exchange scan itself.
+ *
+ * Redistribution is that caller: it rewrites every entity's `owner_proc` with
+ * the DESTINATION owner while classifying, so by the time its skip vote is
+ * reduced the pools describe the partition that is about to exist rather than
+ * the one the vote has to reach. It takes MFTLEnsembleBodyHoldersFitTheGraph()
+ * before classifying and passes the verdict here. The certificate after the
+ * exchange reads only the records, not the pools, so it is still valid then;
+ * the verdict is agreed inside, in the same single int as always.
+ *
+ * @note Collective over `comm_world`, like MFTLEnsembleReduceBodies().
+ *
+ * @param ens The ensemble.
+ * @param[in,out] values As for MFTLEnsembleReduceBodies().
+ * @param n_per_body As for MFTLEnsembleReduceBodies().
+ * @param ops As for MFTLEnsembleReduceBodies().
+ * @param holders_fit This rank's MFTLEnsembleBodyHoldersFitTheGraph() verdict,
+ *                    taken while `owner_proc` still described the partition the
+ *                    reduction runs over. Local; it need not agree across ranks.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on a NULL ensemble, a negative
+ *         @p n_per_body or NULL @p ops.
+ */
+int MFTLEnsembleReduceBodiesPrescanned(MFTL_Ensemble *ens, double *values, int n_per_body, const MFTL_BodyReduceOp *ops, bool holders_fit);
 
 /**
  * @brief Per-body EXCLUSIVE prefix sum over the ranks that hold each body.
@@ -461,8 +417,9 @@ int MFTLEnsembleReduceBodies(MFTL_Ensemble *ens, double *values, int n_per_body,
  *             out of the same records, so asking for it costs no collective.
  * @param n_per_body Values per body. 0 makes the call a no-op that still enters
  *                   every collective.
- * @param scope Which route to take; see #MFTL_BodyReduceScope. The exactness
- *              argument is identical to MFTLEnsembleReduceBodies()'.
+ * @param scope Which route to take; see #MFTL_BodyReduceScope. The route is
+ *              certified exactly as for MFTLEnsembleReduceBodies(), on the same
+ *              records.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR on a NULL ensemble or a negative
  *         @p n_per_body.
  */
@@ -481,8 +438,9 @@ int MFTLEnsembleExscanBodies(MFTL_Ensemble *ens, double *values, double *total, 
  * distributed remesher dispatches on.
  *
  * `n_bytes` counts payload bytes on whichever route was taken, sent plus
- * received, so the two are directly comparable. The one-int route agreement is
- * not counted: it is latency, not volume.
+ * received, so the two are directly comparable -- including the neighbourhood
+ * exchange a refused certificate discarded, since those bytes were moved. The
+ * one-int route agreement is not counted: it is latency, not volume.
  */
 typedef struct MFTL_BodyReduceStats
 {
@@ -575,6 +533,26 @@ void MFTLEnsembleUpdateGlobalCounts(MFTL_Ensemble *ensemble);
 void MFTLEnsembleUpdate(MFTL_Ensemble *ensemble);
 
 /**
+ * @brief Brings every local object into the state a migration routes by:
+ *        derived connectivity current, and area/normal/centre for ALL triangles.
+ *
+ * For each object this rank holds: MFTLObjectBuildDerived() if the topology bit
+ * is clear, then MFTLComputeTriangleGeometry(obj, obj->tris.n). GHOSTS INCLUDED,
+ * because redistribution routes a ghost by its cached centre (step 3 of the
+ * per-timestep order in mftl_communication.h) -- and it is equally what restores
+ * the triangle geometry a redistribution leaves unspecified.
+ *
+ * The exception to the naming rule at the top of this header, stated so it is
+ * not mistaken for a collective: it is a loop over the object list with NO
+ * collective, because neither half of it needs one.
+ *
+ * @param ensemble The ensemble.
+ *
+ * @rank_local No MPI; each rank refreshes what it holds.
+ */
+void MFTLEnsembleComputeTriangleGeometry(MFTL_Ensemble *ensemble);
+
+/**
  * @brief The per-vertex counterpart: exact vertex normals everywhere, in one call.
  *
  * For every object it runs MFTLComputeVertexNormals(), then performs ONE ghost
@@ -637,5 +615,34 @@ int MFTLEnsembleUpdateVertexNormals(MFTL_Ensemble *ensemble, MFTL_NormalWeightin
  * @rank_local Every rank computes the same value from the same fields.
  */
 double MFTLDomainGetHMin(const MFTL_Domain *domain);
+
+/**
+ * @brief Slot of rank @p r in `domain->neighbors`, by linear scan.
+ *
+ * The one spelling of "is this rank on my graph, and where", shared by every
+ * module that has to ask it. At most 26 entries, so the scan is cheaper than an
+ * `[nproc]` inverse table and allocates nothing -- which is also why no module
+ * keeps one.
+ *
+ * On a grid with a single cut on a periodic axis `comm_graph` carries a
+ * SELF-LOOP (see MFTLEnsembleReduceBodies()), so `MFTLDomainNeighborIndex(dom,
+ * dom->rank)` is a legitimate question: it returns the self-loop's slot, or
+ * #MFTL_ERROR when the graph has none.
+ *
+ * @param domain The MPI/physical world.
+ * @param r      A rank.
+ * @return The first slot of `domain->neighbors` holding @p r, or #MFTL_ERROR if
+ *         @p r is not a graph neighbour.
+ *
+ * @rank_local Pure inspection of a list built at ensemble creation.
+ */
+static inline int MFTLDomainNeighborIndex(const MFTL_Domain *domain, int r)
+{
+  for (int i = 0; i < domain->num_neighbors; ++i)
+  {
+    if (domain->neighbors[i] == r) return i;
+  }
+  return MFTL_ERROR;
+}
 
 #endif  // MFTL_ENSEMBLE_H

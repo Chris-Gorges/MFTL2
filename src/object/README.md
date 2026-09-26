@@ -38,7 +38,7 @@ to free. **"The AoS grew but the SoA did not" is not a bug that can be made — 
 is not expressible.**
 
 ```
-vertex block    rec[cap]  pos[3cap]  normal[3cap]  area[cap]  mean_curv[cap]  gauss_curv[cap]
+vertex block    rec[cap]  pos[3cap]  normal[3cap]
 triangle block  rec[cap]  he[3cap]   area[cap]  normal[3cap]  center[3cap]
                 verts[3cap]  neighbors[3cap]
 ```
@@ -155,8 +155,8 @@ geometry iterator rather than stored as mutable mesh state.
 
 Two derived arrays are kept, and the ones that are not are listed in
 `derived.c` with the reason. The vertex→triangle **CSR** is the one worth naming:
-`derived.c` asked for it to be reconsidered when a consumer appeared. Vertex normals are that consumer, and §5 of
-`docs/performance-analysis.md` measures a CSR gather as a **dead heat** with the
+`derived.c` asked for it to be reconsidered when a consumer appeared. Vertex normals are that consumer, and §1.5 of
+`docs/analysis.md` measures a CSR gather as a **dead heat** with the
 triangle scatter while costing 16 B/triangle of permanent state and a rebuild per
 topology change. It stays deleted.
 

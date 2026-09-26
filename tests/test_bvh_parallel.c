@@ -145,15 +145,8 @@ static void make_pair(MFTL_Object **a, MFTL_Object **b, double sep, int refine)
   MFTLGenerateSphere(*b, cb, 1.0, refine);
 }
 
-/**
- * @brief Body @p gid as an object, or a shared EMPTY one if this rank holds none.
- *
- * A rank holds an MFTL_Object only for the bodies it has entities of, so a
- * pointer cached before a redistribution may be dangling after it. Contact
- * detection reads bodies through the ensemble's dense view for the same reason,
- * and so does this test.
- */
-static MFTL_Object *bodyv(int gid) { return MFTLEnsembleAcquireDenseView(g_ens)[gid]; }
+/** @brief Body @p gid of the fixture ensemble, re-resolved at the point of use; see test_body(). */
+static MFTL_Object *bodyv(int gid) { return test_body(g_ens, gid); }
 
 /** @brief The per-timestep preamble every consumer of triangle geometry owes. */
 static void refresh(MFTL_Ensemble *ens)
@@ -600,6 +593,50 @@ static int test_halo_does_not_touch_the_bodies(void)
   return 0;
 }
 
+/**
+ * @brief A contact between two sub-micron bodies neither overflows the broad
+ *        phase nor goes missing.
+ *
+ * The body-extent grid is sized as the domain over the contact reach, and a
+ * triangle 1e-7 across in a box of 10 asks for 1e8 cells per axis. That product
+ * used to overflow a long, after an out-of-range int conversion, before the
+ * item-based cap shrank the table -- a heap overflow under the Debug build's
+ * sanitizers with six vertices. Here it has to be exactly one contact, both on
+ * the unscattered ensemble and after the redistribution.
+ */
+static int test_a_micron_contact_does_not_overflow_the_broad_phase(void)
+{
+  for (int i = 0; i < 2; ++i)
+  {
+    MFTL_Object *obj = MFTLObjectCreate(i);
+    MFTLEnsembleAddObject(g_ens, obj);
+    if (g_rank == 0)
+    {
+      const double s = 1.0e-7;
+      const double pos[9] = {2.5, 2.5, 2.5, 2.5 + s, 2.5 + s, 2.5, 2.5, 2.5, 2.5 + s};
+      const int tri[3] = {0, 1, 2};
+      MFTLBuildIndexedMesh(obj, pos, 3, tri, 1);
+    }
+  }
+  MFTLPublishGeneratedBodies(g_ens);
+  MFTLEnsembleComputeTriangleGeometry(g_ens);
+
+  const MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  int mine = 0, before = 0, after = 0;
+  TEST_ASSERT(agreed(MFTLEnsembleIntersectObjects(g_ens, &p, count_only, &mine) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  MPI_Allreduce(&mine, &before, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+
+  TEST_ASSERT(agreed(MFTLRedistribute(g_ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  MFTLEnsembleComputeTriangleGeometry(g_ens);
+
+  mine = 0;
+  TEST_ASSERT(agreed(MFTLEnsembleIntersectObjects(g_ens, &p, count_only, &mine) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  MPI_Allreduce(&mine, &after, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+
+  TEST_ASSERT(agreed(before == 1 && after == 1, MPI_COMM_WORLD));
+  return 0;
+}
+
 /* ───────────────────────────────────────────────────────────────────────── */
 
 /** @brief A fresh ensemble per test: each one builds its own bodies. */
@@ -607,22 +644,8 @@ static void ensemble_reset(void)
 {
   if (g_ens != MFTL_NULL) MFTLEnsembleDestroy(&g_ens);
 
-  int cuts[3] = {1, 1, 1};
-  if (g_nproc == 2)
-  {
-    cuts[0] = 2;
-  }
-  else if (g_nproc == 4)
-  {
-    cuts[0] = 2;
-    cuts[1] = 2;
-  }
-  else if (g_nproc == 8)
-  {
-    cuts[0] = 2;
-    cuts[1] = 2;
-    cuts[2] = 2;
-  }
+  int cuts[3];
+  test_grid_for(g_nproc, cuts);
 
   double lo[3] = {0.0, 0.0, 0.0};
   double hi[3] = {10.0, 10.0, 10.0};
@@ -655,6 +678,9 @@ int main(int argc, char **argv)
 
   ensemble_reset();
   RUN_TEST(test_ensemble_pipeline_matches_the_explicit_one);
+
+  ensemble_reset();
+  RUN_TEST(test_a_micron_contact_does_not_overflow_the_broad_phase);
 
   if (g_rank == 0) TEST_REPORT();
 

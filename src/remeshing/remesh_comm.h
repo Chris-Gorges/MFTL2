@@ -441,8 +441,9 @@ int MFTLRemeshMigrateShifted(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const i
  * merely slow, when two ranks name different destinations for one entity. Both
  * of the dispersed driver's paths satisfy that: the unbalanced one applies
  * MFTLGetOwnerProc() to a centroid every holder received identically to the bit
- * from MFTLEnsembleReduceBodies(), and the balanced one runs a greedy over
- * replicated data. It is a 26-neighbour exchange exactly when each body fits
+ * from MFTLEnsembleReduceBodies(), and the balanced one decides each body on ONE
+ * rank and delivers the verdict to every holder one hop along `comm_graph`. It
+ * is a 26-neighbour exchange exactly when each body fits
  * inside a rank box; when it does not, redistribution notices by itself and
  * falls back to the global communicator, so the failure mode is a slower message
  * pattern and not a wrong answer.
@@ -557,6 +558,30 @@ void MFTLRemeshAgreeIntMax(const MFTL_Domain *domain, int *values, int n);
 void MFTLRemeshAgreeDoubleMax(const MFTL_Domain *domain, double *values, int n);
 
 /**
+ * @brief Replaces the six wall-clock fields of @p st, and up to two further
+ *        values, by their maxima over all ranks -- in ONE MPI_Allreduce.
+ *
+ * Both distributed drivers publish their profile this way at the end of a pass,
+ * and the spanning driver appends its band measurement to the same message. The
+ * fields are gathered into a local array rather than reduced through
+ * `&st->t_total`: that spelling would silently depend on the six fields staying
+ * adjacent and in this order, and a member added between them is exactly the
+ * kind of edit nobody re-reads a reduction for.
+ *
+ * UNCONDITIONAL in the drivers, even when the caller passed no stats struct: the
+ * collective must be entered by every rank.
+ *
+ * @param         domain  The MPI/physical world.
+ * @param[in,out] st      `t_total`, `t_migrate`, `t_geometry`, `t_freeze`,
+ *                        `t_sweep` and `t_reduce` are replaced by their maxima.
+ * @param[in,out] extra   `[n_extra]` further values, replaced likewise. May be
+ *                        #MFTL_NULL when @p n_extra is 0.
+ * @param         n_extra 0, 1 or 2.
+ * @collective
+ */
+void MFTLRemeshAgreeProfile(const MFTL_Domain *domain, MFTL_RemeshStats *st, double *extra, int n_extra);
+
+/**
  * @brief Seconds from an arbitrary fixed origin. MPI_Wtime, and nothing else.
  *
  * It looks like a pointless wrapper and it is not: `test_remeshing_mpi_is_confined`
@@ -627,32 +652,18 @@ int MFTLRemeshSyncGhostIds(MFTL_Ensemble *ens, const int *vertex_gid_base);
  * and `comm_graph` carries a SELF-LOOP -- shapes {2,1,1} and {2,2,1} have one,
  * {2,2,2} and {3,3,3} do not. A gather then delivers this rank's own block back
  * to it, and a caller that also folds in its own contribution locally counts it
- * twice. Every consumer here must skip MFTLRemeshSelfLoopSlot(), and the same
- * trap doubled every SUM in MFTLEnsembleReduceBodies() before it was found.
+ * twice. Every consumer here must skip the slot
+ * `MFTLDomainNeighborIndex(domain, domain->rank)` (mftl_ensemble.h) reports, and
+ * the same trap doubled every SUM in MFTLEnsembleReduceBodies() before it was
+ * found.
  */
-
-/**
- * @brief Index of this rank's own entry in `domain->neighbors`, if it has one.
- *
- * @param domain The MPI/physical world.
- * @return The slot, or #MFTL_ERROR when the graph carries no self-loop.
- * @rank_local Pure inspection of a list built at ensemble creation.
- */
-static inline int MFTLRemeshSelfLoopSlot(const MFTL_Domain *domain)
-{
-  for (int i = 0; i < domain->num_neighbors; ++i)
-  {
-    if (domain->neighbors[i] == domain->rank) return i;
-  }
-  return MFTL_ERROR;
-}
 
 /**
  * @brief Variable-length allgatherv of doubles over `comm_graph`.
  *
- * Two collectives and not one, for the reason every sparse exchange in this
- * library is: only the sender knows how much it is sending, so the lengths
- * cannot be predicted from anything replicated.
+ * MFTLNeighborAllgatherDoubles() (mftl_communication.h), routed through this
+ * file so that remesh_comm.c stays the complete inventory of the module's
+ * network use.
  *
  * @param      domain The MPI/physical world.
  * @param      send   `[n_send]` this rank's block, delivered to every neighbour.
@@ -697,7 +708,7 @@ void MFTLRemeshNeighborAllgather(const MFTL_Domain *domain, const double *send, 
 void MFTLRemeshNeighborAlltoall(const MFTL_Domain *domain, const double *send, int n, double *recv);
 
 /* MFTLRemeshMeasureBodies is declared in mftl_remeshing.h -- it is the one entry
- * point here a CALLER has a use for (the plan's section 6 rebalance is exactly
+ * point here a CALLER has a use for (any ensemble rebalancing is exactly
  * "measure the bodies, then decide"), so it is published rather than internal.
  * Its implementation is in remesh_comm.c with the rest of the module's MPI. */
 

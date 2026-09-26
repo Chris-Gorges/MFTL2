@@ -654,7 +654,7 @@ int main(int argc, char **argv)
 
   /* ── The A/B, interleaved in ONE process ────────────────────────────────
    *
-   * Not two invocations. docs/performance-analysis.md sections 7c-7d record five
+   * Not two invocations. docs/analysis.md §2.3 and §10 record five
    * obviously-correct fixes measuring as no change at all because the
    * process-to-process spread on this machine is larger than the effect; the
    * only readings that have ever resolved anything here are interleaved ones.

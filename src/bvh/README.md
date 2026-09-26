@@ -1095,7 +1095,7 @@ it removes is **silent**.
 @warning Every row of this table except the last two is **argued from structure,
          not measured**. Nothing in this directory has been profiled beyond
          `examples/orient3d_predicate_profile.c`, and there is no BVH entry in
-         `docs/performance-analysis.md`. Build / refit / traverse timings are the
+         `docs/analysis.md`. Build / refit / traverse timings are the
          first thing to measure before optimising any of it. See @ref
          bvh_deferred.
 

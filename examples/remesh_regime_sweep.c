@@ -15,10 +15,9 @@
  * either: a test can assert which strategy was chosen, but "chosen correctly"
  * means "chosen the cheaper one", and cheapness is a measurement.
  *
- * So this runs BOTH drivers on the same fixture, in each of the four regimes the
- * implementation plan names, and prints their costs side by side together with
- * what AUTO picked. A row where AUTO's choice is not the cheaper one is the
- * result worth having.
+ * So this runs BOTH drivers on the same fixture, in each of the four regimes
+ * below, and prints their costs side by side together with what AUTO picked.
+ * A row where AUTO's choice is not the cheaper one is the result worth having.
  *
  * ═══════════════════════════════════════════════════════════════════════════
  * THE FOUR REGIMES, AND WHY THEY ARE FOUR AND NOT TWO
@@ -64,7 +63,7 @@
  *   -budget N    parallel_phase_budget      (default 8)
  *   -dense N     bodies in regime A         (default 32)
  *   -only X      any subset of the section letters, e.g. -only fgl
- *                a b c d  the four regimes of the implementation plan
+ *                a b c d  the four regimes
  *                f        does the frozen-fraction trigger pay?
  *                g        where is the single-rank gather crossover?
  *                l        what does the dispersed load balancer buy?

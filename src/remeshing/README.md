@@ -360,7 +360,7 @@ $\mathbf{d} = \frac1{\lvert N(v)\rvert}\sum_{u \in N(v)} (\mathbf{p}_u - \mathbf
          equalises triangle SIZE, by pulling vertices out of densely triangulated
          regions towards sparse ones. An unweighted mean of the same centroids is
          very nearly the umbrella operator again — measured in
-         `docs/remeshing-quality-analysis.md`, where dropping it costs volume
+         `docs/analysis.md` §4, where dropping it costs volume
          conservation (6.0 % against 3.5 %) rather than triangle quality.
 
 **Ridge vertices.** With $\mathbf{d}_1, \mathbf{d}_2$ the offsets to the two
@@ -561,7 +561,7 @@ flowchart TD
   P -->|DISPERSED| DI["MFTLRemeshEnsembleDispersed"]
   P -->|AUTO| M["MFTLRemeshChooseStrategyMeasured — COLLECTIVE"]
 
-  M --> M1["prepare_for_migration: triangle geometry"]
+  M --> M1["MFTLEnsembleComputeTriangleGeometry: triangle geometry"]
   M1 --> M2["MFTLRemeshMeasureBodies — 2 per-body reductions plus one scalar MAX"]
   M2 --> M3["dispersed_box_min — the yardstick, local"]
   M3 --> R{"r_max greater than dispersed_radius_fraction times the box?"}
@@ -588,7 +588,7 @@ MFTLRemeshEnsemble(ens, params, stats)                          COLLECTIVE
      └─ MFTL_REMESH_PARALLEL_AUTO
           │
           ├─ MFTLRemeshChooseStrategyMeasured                     COLLECTIVE
-          │    ├─ prepare_for_migration        triangle geometry          local
+          │    ├─ MFTLEnsembleComputeTriangleGeometry                     local
           │    ├─ MFTLRemeshMeasureBodies      9 SUM/MIN values per LOCAL body
           │    │                               Allreduce(MAX)   N_b doubles
           │    │                               ▸ centroid[3N] radius[N] weight[N]
@@ -650,7 +650,7 @@ flowchart TD
 
   DP --> PL["PHASE LOOP  p = 0 .. parallel_phase_budget-1"]
   PL --> SH["MFTLRemeshPhaseShift — shift is half the COARSE box on each active axis"]
-  SH --> PM["prepare_for_migration"]
+  SH --> PM["MFTLEnsembleComputeTriangleGeometry"]
   PM --> MQ{"did ANY rank move anything? 1 Allreduce LOR"}
   MQ -->|no| SK["SKIP the migration, n_migrations_skipped++"]
   MQ -->|yes| RD["MFTLRedistributeWithOwners — MFTLRemeshCoarseOwnerProc per entity"]
@@ -695,7 +695,7 @@ MFTLRemeshEnsembleParallel(ens, params, stats)                   COLLECTIVE
 │
 ├─ 1 ── COARSENING PRE-PASS ───── only if (parallel_coarsen != 0 ||
 │   │                                      serial_gather_max_triangles > 0) && P > 1
-│   ├─ prepare_for_migration                                          local
+│   ├─ MFTLEnsembleComputeTriangleGeometry                            local
 │   ├─ for each object:  MFTLRemeshMarkFrozen                         local
 │   │                    MFTLDilateFrozenBand(freeze_dilation_rings)  local
 │   │                    local_band_probe   ▸ {delta, longest edge}   local
@@ -728,7 +728,7 @@ MFTLRemeshEnsembleParallel(ens, params, stats)                   COLLECTIVE
 │   ├─ MFTLRemeshPhaseShift(dom, group, PHASES[distinct[p % n_distinct]], shift)
 │   │     shift[k] = phase[k] * 0.5 * group[k]*h_k     (0 on an inactive axis)
 │   │
-│   ├─ prepare_for_migration                                       t_geometry
+│   ├─ MFTLEnsembleComputeTriangleGeometry                         t_geometry
 │   ├─ MFTLRemeshMigrateShifted(&mig, ens, group, shift, &report)  t_migrate
 │   │    ├─ per entity: MFTLRemeshCoarseOwnerProc ▸ MFTL_OwnerMap    local
 │   │    ├─◆ did ANY rank move anything ?          1 Allreduce(LOR)
@@ -763,7 +763,7 @@ MFTLRemeshEnsembleParallel(ens, params, stats)                   COLLECTIVE
     │    2. MFTLRemeshSyncGhostIds        request/reply over comm_graph
     │       ▲ keyed on the OLD id, so it must run BEFORE the overwrite
     │    3. overwrite by SLOT:  gid = base + slot,  he_gid = 3*tri_gid + k
-    ├─ prepare_for_migration                                       t_geometry
+    ├─ MFTLEnsembleComputeTriangleGeometry                         t_geometry
     ├─ MFTLRedistribute(ens)   canonical planes, the PRODUCTION rule  t_migrate
     │    ▲ after the renumbering: it is what replaces the stale ghost triangle ids
     ├─ clear_frozen  +  MFTLEnsembleUpdateGlobalCounts
@@ -1289,7 +1289,7 @@ only form of the question that bounds that. In every row measured, **a gathered
 pass converges and hides nothing**, because there is no band for work to hide
 behind.
 
-Full tables in `docs/parallel-remeshing-analysis.md` §7.
+Full tables in `docs/analysis.md` §5.6–5.7.
 
 @note A coarse destination is $g_k$ cells away, hence outside the 26-neighbourhood,
       so both `MFTLRedistributeWithOwners` and `MFTLRemeshSyncGhostIds` fall back
@@ -1315,7 +1315,7 @@ Control flow first; the call tree with the per-step cost follows it.
 
 ```mermaid
 flowchart TD
-  A["MFTLRemeshEnsembleDispersed — the PUBLIC entry, owes its own measurement"] --> A1["prepare_for_migration, MFTLRemeshMeasureBodies — 2 per-body reductions"]
+  A["MFTLRemeshEnsembleDispersed — the PUBLIC entry, owes its own measurement"] --> A1["MFTLEnsembleComputeTriangleGeometry, MFTLRemeshMeasureBodies — 2 per-body reductions"]
   A1 --> B["MFTLRemeshEnsembleDispersedMeasured(centroid, radius, weight)"]
   X["MFTLRemeshEnsemble on AUTO — already measured, hands it on"] --> B
   B --> G["GUARDS: the edge-length band, MFTLRemeshParamsAgree"]
@@ -1342,7 +1342,7 @@ flowchart TD
   MG1 --> SW["per object with tris.n greater than 0: MFTLRemeshObject — the untouched SERIAL entry point"]
   SW --> SW1["MFTLRemeshRenumberGlobalIds — UNCONDITIONAL"]
   SW1 --> RE["MFTLEnsembleReduceBodies MAX over 2 counters per LOCAL body, plus 1 scalar"]
-  RE --> CL["prepare_for_migration, MFTLRedistribute back to the geometric partition"]
+  RE --> CL["MFTLEnsembleComputeTriangleGeometry, MFTLRedistribute back to the geometric partition"]
   CL --> CL1["MFTLEnsembleUpdateGlobalCounts, MFTLComputeTriangleGeometry, 1 Allreduce MAX for the profile"]
 ```
 
@@ -1360,7 +1360,7 @@ flowchart TD
 MFTLRemeshEnsembleDispersed(ens, params, stats)                  COLLECTIVE
 │   the PUBLIC entry point owes its own measurement; MFTLRemeshEnsemble does not
 │   come through here — it measured once for the strategy choice and hands it on
-│   ├─ prepare_for_migration
+│   ├─ MFTLEnsembleComputeTriangleGeometry
 │   └─ MFTLRemeshMeasureBodies                  2 per-body reductions
 │   ▼
 MFTLRemeshEnsembleDispersedMeasured(ens, params, stats, centroid, radius, weight)
@@ -1416,7 +1416,7 @@ MFTLRemeshEnsembleDispersedMeasured(ens, params, stats, centroid, radius, weight
 │        ▸ stats.converged = true, n_phases = 1, n_edges_hidden = 0
 │        ▸ stats.n_ops_busiest_rank  (MAX, not SUM — one rank per body)
 │
-└─ 6 ── prepare_for_migration                                       t_geometry
+└─ 6 ── MFTLEnsembleComputeTriangleGeometry                         t_geometry
     ├─ MFTLRedistribute(ens)   back to the geometric partition       t_migrate
     ├─ MFTLEnsembleUpdateGlobalCounts
     ├─ MFTLComputeTriangleGeometry(obj, obj->tris.n)   the postcondition

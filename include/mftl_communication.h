@@ -22,7 +22,7 @@
  *
  * ONLY TOPOLOGY AND IDENTITY TRAVEL. Everything geometric except the vertex
  * position is left behind and recomputed at the receiver, because recomputing it
- * is a streaming pass over contiguous arrays (docs/performance-analysis.md) while
+ * is a streaming pass over contiguous arrays (docs/analysis.md §2.1) while
  * shipping it is bytes on a wire, per entity, per timestep:
  *
  *                            geometry on the wire   here
@@ -31,8 +31,8 @@
  *
  * A vertex POSITION is the one geometric quantity that is authoritative
  * (mftl_types.h, invariant 3) -- nothing can recompute it -- so it travels. The
- * vertex normal, area and curvatures, and the triangle area/normal/centre, are
- * all functions of the positions and of the topology, so they do not.
+ * vertex normal and the triangle area/normal/centre are all functions of the
+ * positions and of the topology, so they do not.
  *
  * Three fields a general half-edge wire format would carry are not sent, because
  * implicit indexing already determines them:
@@ -50,8 +50,8 @@
  * ### Postcondition, and the loop order that follows from it
  *
  * A redistributed object comes back with valid topology, valid POSITIONS, and
- * both derived-array bits set (MFTLObjectBuildDerived has run). Its
- * `tris.area/normal/center` and `verts.normal/area/mean_curv/gauss_curv` hold
+ * the derived-array bit set (MFTLObjectBuildDerived has run). Its
+ * `tris.area/normal/center` and `verts.normal` hold
  * UNSPECIFIED values and must be recomputed before they are read. The
  * per-timestep loop that satisfies this with exactly one geometry pass is:
  *
@@ -81,7 +81,7 @@
  * the forces belong to -- owes one more pass, which is the price of not packing
  * the geometry onto the wire. That pass is 13-15 % of a timestep;
  * examples/parallel_advection_redistribute_list.c runs it as step 5 and times it
- * separately, and docs/performance-analysis.md §7 quotes the comparison both
+ * separately, and docs/analysis.md §2.1 quotes the comparison both
  * ways because both are honest answers to different questions.
  *
  * ## ENTITIES THAT STAY NEVER LEAVE THE POOL
@@ -111,10 +111,11 @@
  *
  *   - MFTLRegisterMpiTypes() has been called on every rank.
  *   - `tris.center` is current for ALL triangles, ghosts included (see above).
- *   - Every rank holds the SAME object list in the SAME order. Bodies are
- *     identified on the wire by their INDEX in that list, which is what removes
- *     the need for a body-id hash map. A Debug-only checksum reduction
- *     inside the redistribution reports a violation instead of corrupting.
+ *   - Every rank added the SAME bodies in the SAME order, so that a body id
+ *     (#MFTL_Object::global_id, which is how bodies are named on the wire) means
+ *     the same body everywhere. Which bodies a rank HOLDS differs between ranks
+ *     by design. A Debug-only checksum reduction inside the redistribution
+ *     reports a disagreement about the id space instead of corrupting.
  */
 
 #ifndef MFTL_COMMUNICATION_H
@@ -123,6 +124,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "mftl_arrayfunctions.h"
 #include "mftl_constants.h"
 #include "mftl_types.h"
 
@@ -140,17 +142,10 @@
  *
  * ## WHY `body_gid` AND NOT A LIST POSITION
  *
- * A body used to be named on the wire by its INDEX in `MFTL_Ensemble::objects`,
- * which required every rank to hold the same list in the same order -- and
- * therefore to hold an #MFTL_Object for every body in the ensemble, including
- * every body it holds nothing of. That is the assumption that stops scaling once
- * the body count grows with the rank count.
- *
- * #MFTL_Object::global_id is dense (MFTLEnsembleAddObject() hands it out), so it
- * indexes an array just as cheaply as a list position did, and it stays valid
- * when a rank holds only some of the bodies. While every rank does still hold the
- * whole list the two are numerically equal, which is exactly what makes the
- * change safe to land on its own.
+ * A rank holds an #MFTL_Object only for the bodies it has entities of, so a
+ * position in `MFTL_Ensemble::local_objects` means a different body on every
+ * rank. #MFTL_Object::global_id is the one body name every rank agrees about,
+ * and it is dense (MFTLEnsembleAddObject() hands it out).
  */
 typedef struct
 {
@@ -329,6 +324,34 @@ void MFTLExchangeWait(MFTL_ExchangeCtx *ctx, int payload);
  */
 void MFTLExchangeFree(MFTL_ExchangeCtx *ctx);
 
+/**
+ * @brief Variable-length allgather of doubles over `comm_graph`: this rank's
+ *        block, delivered to every graph neighbour.
+ *
+ * The shape every sparse, per-body publication in the library has -- the holder
+ * route of MFTLEnsembleReduceBodies(), the spatial halo's radius publish, the
+ * dispersed balancer's verdicts -- so it is spelled once. Two collectives and not
+ * one: only the sender knows how much it is sending, so the lengths cannot be
+ * predicted from anything replicated. The payload is `O(what this rank holds *
+ * degree)`, never sized by the body-id space or by `nproc`.
+ *
+ * The graph may carry a SELF-LOOP (see MFTLDomainNeighborIndex()), in which case
+ * this rank's own block comes back once; a caller that also folds its own
+ * contribution in locally must skip that slot.
+ *
+ * @param      domain The MPI/physical world.
+ * @param      send   `[n_send]` this rank's block.
+ * @param      n_send Doubles in @p send. May be zero.
+ * @param[out] rcount `[num_neighbors]` doubles received from each neighbour.
+ * @param[out] rdispl `[num_neighbors]` offset of each neighbour's block.
+ * @param[out] n_recv Total doubles received.
+ * @return A newly allocated buffer of @p n_recv doubles in neighbour order; the
+ *         caller frees it. Never #MFTL_NULL, so an empty result frees cleanly.
+ *
+ * @collective Over `comm_graph`; a serial run makes no MPI call.
+ */
+double *MFTLNeighborAllgatherDoubles(const MFTL_Domain *domain, const double *send, int n_send, int *rcount, int *rdispl, int *n_recv);
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * 4. Redistribution
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -364,22 +387,13 @@ void MFTLExchangeFree(MFTL_ExchangeCtx *ctx);
  * any entities -- therefore ends up held by nobody. Its id stays allocated in the
  * space; nothing else of it remains.
  *
- * Anything that must enumerate every body regardless of what this rank holds
- * takes MFTLEnsembleAcquireDenseView() instead. That is
- * `O(bodies in the ensemble)` per rank by definition and does not belong on a
- * per-timestep path.
- *
- * **Nothing in the library does.** Contact detection and the spatial halo were
- * the two consumers, on the premise that their work list had to be identical on
- * every rank; the premise was false -- see MFTLExtendSpatialHaloNearBodies(), and
- * §6 of `docs/scalability-update-status.md` for the whole story.
+ * Nothing in the library enumerates every body of the ensemble on a rank; work
+ * lists are derived from what a rank holds and what its neighbours published
+ * (see MFTLExtendSpatialHaloNearBodies()).
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Redistributes a SINGLE object across the process grid.
- *
- * @note This entry point has no ensemble, so it neither creates nor destroys:
- *       the caller owns the object and keeps it whatever the partition does.
+ * @brief Redistributes every local object of an ensemble in ONE communication round.
  *
  * Phases:
  *   1. ANALYSIS  Every OWNED triangle is assigned to the rank owning its centre,
@@ -388,79 +402,31 @@ void MFTLExchangeFree(MFTL_ExchangeCtx *ctx);
  *      free -- no separate ghost exchange is needed afterwards, and it is exactly
  *      the halo MFTLComputeVertexNormals needs to be communication-free. Ghost
  *      triangles are never forwarded: their owner sends the authoritative copy.
+ *      A body for which nothing changed is left alone entirely (see
+ *      MFTLRedistributeSetSkipUnchangedBodies()).
  *   2. DECISION  One MPI_Allreduce(LOR) agrees on whether any destination lies
  *      outside the 26-neighbourhood. If none does, the exchange runs on the graph
  *      communicator; otherwise it falls back to the global one.
- *   3. EXCHANGE  Vertices and triangles go out as two payloads of a single
- *      non-blocking exchange (see MFTLExchangeStart).
+ *   3. EXCHANGE  Vertices, triangles and one small header per (body,
+ *      destination) go out as three payloads of a single non-blocking exchange
+ *      (see MFTLExchangeStart). The streams of all bodies are interleaved, so the
+ *      message COUNT is independent of the number of bodies.
  *   4. REBUILD   Kept entities are compacted in place; arrivals are de-duplicated
- *      against them through a dense global-id table and appended. Twins are
- *      repaired incrementally, `out_he_idx` is re-derived, and the derived arrays
- *      are rebuilt.
+ *      against them through a global-id table and appended. Twins are repaired
+ *      incrementally, `out_he_idx` and the derived arrays are emitted inline. A
+ *      body arriving where this rank held nothing is created; a body this rank
+ *      no longer holds anything of is destroyed.
  *
- * @note Collective over the object's domain. Every rank must call it for the same
- *       object.
- * @note Invalidates every local index and all cached geometry except the vertex
- *       positions; see the postcondition at the top of this header.
- *
- * @return MFTL_SUCCESS, or MFTL_ERROR on a NULL/domain-less object.
- *
- * @param object The mesh. Must already be attached to an ensemble, since the
- *               domain supplies the process grid.
- */
-int MFTLRedistributeObject(MFTL_Object *object);
-
-/**
- * @brief Redistributes every object of an ensemble in ONE communication round.
- *
- * Same algorithm as MFTLRedistributeObject, with the packed streams of all bodies
- * interleaved into a single pair of messages and separated again at the receiver
- * from a third payload of per-body counts. That keeps the message COUNT
- * independent of the number of bodies, which is what matters once an emulsion has
- * thousands of droplets and each individual body contributes only a handful of
- * triangles per rank pair.
- *
- * @note Collective. Every rank must hold the same object list in the same order.
- *       An empty ensemble is a no-op, not an error -- the same contract as
- *       MFTLRedistribute() and MFTLRedistributeWithOwners().
- * @return MFTL_SUCCESS, or MFTL_ERROR on an invalid ensemble.
- *
- * @param ensemble The ensemble. Every object is repartitioned in one round.
- */
-int MFTLRedistributeListOfObjects(MFTL_Ensemble *ensemble);
-
-/**
- * @brief Redistributes an ensemble, picking the cheaper of the two paths.
- *
- * A single body skips the per-body count payload and the run bookkeeping that
- * only exist to keep several bodies apart, so it is routed to
- * MFTLRedistributeObject().
- *
- * @param ens The ensemble. Every object is repartitioned in place.
+ * @param ens The ensemble. Every local object is repartitioned in place.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR on a NULL ensemble.
  *
- * @collective An empty ensemble is a no-op, not an error.
+ * @collective Every rank must call it, including one holding no bodies. An
+ *             ensemble with no bodies at all is a no-op, not an error.
+ * @note Invalidates every local index, every #MFTL_Object pointer (see above) and
+ *       all cached geometry except the vertex positions; see the postcondition at
+ *       the top of this header.
  */
-static inline int MFTLRedistribute(MFTL_Ensemble *ens)
-{
-  MFTL_ASSERT(ens != MFTL_NULL && "MFTLRedistribute: NULL ensemble");
-  if (ens == MFTL_NULL) return MFTL_ERROR;
-
-  /* GLOBAL: a rank holding no bodies must still enter the exchange, because
-   * another rank may be about to send it one. */
-  if (ens->n_bodies_global == 0 || ens->local_objects == MFTL_NULL) return MFTL_SUCCESS;
-
-  /* One body goes through the ensemble entry point too, NOT through
-   * MFTLRedistributeObject(). The single-body fast path it used to take still
-   * exists -- redistribute_core drops the per-body count payload and the run
-   * bookkeeping whenever num_objects is 1, which was all that dispatch ever
-   * bought -- but MFTLRedistributeObject() takes an object rather than an
-   * ensemble and so cannot reach the persistent workspace. Routing a
-   * single-body ensemble through it meant re-allocating every scratch array,
-   * including the arrival id tables, on every timestep: measured at 28 MB per
-   * rank per step on one 327 680-triangle body. */
-  return MFTLRedistributeListOfObjects(ens);
-}
+int MFTLRedistribute(MFTL_Ensemble *ens);
 
 /**
  * @struct MFTL_OwnerMap
@@ -516,7 +482,7 @@ typedef struct MFTL_OwnerMap
  * Identical to MFTLRedistribute in every other respect, including the
  * postcondition. @p maps is indexed by **local slot** --
  * `[ens->n_local_objects]`, entry `o` describing `ens->local_objects[o]` -- or
- * MFTL_NULL for the geometric rule (in which case this IS MFTLRedistribute).
+ * MFTL_NULL for the geometric rule (MFTLRedistribute() is exactly that call).
  *
  * ── WHY A SLOT HERE, WHEN THE WIRE INSISTS ON A GID ────────────────────────
  *
@@ -558,8 +524,8 @@ int MFTLRedistributeWithOwners(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps);
  * topology and the owner map, so a body for which neither input changed already
  * holds the answer: the ownership prefix, the halo, the twins and the derived
  * topology are all reproductions of what is in the pool. With this on, the
- * per-object loop tests both inputs, agrees on the verdict with every other rank
- * in one MPI_BOR over a per-body bitset, and skips the destination analysis, the
+ * per-object loop tests both inputs, agrees on the verdict with the body's other
+ * holders in one per-body reduction, and skips the destination analysis, the
  * kept gather, the relink, the arrival classification, the twin repair and the
  * topology rebuild for every body that did not move. Vertex motion requires no
  * derived work.
@@ -614,7 +580,7 @@ bool MFTLRedistributeGetSkipUnchangedBodies(void);
  * at its high-water mark for the rest of the run. That is not a corner case:
  * MFTLGenerateSphere() builds every body whole on rank 0, and after the opening
  * redistribution rank 0 holds a sliver of each in a block sized for all of it --
- * `3680 * 4^refine + 176` bytes per body, 460 MiB for 512 bodies at refine 4.
+ * `3440 * 4^refine + 128` bytes per body, 430 MiB for 512 bodies at refine 4.
  * With this armed, the redistribution offers every body it touched back to
  * MFTLObjectShrinkToFit() once the rebuild is complete.
  *
@@ -677,13 +643,15 @@ void MFTLCommWorkspaceDestroy(void **p_ws);
  * redistribution: call it after advection or smoothing, and redistribute only
  * when ownership can actually have changed.
  *
- * Requests carry the OBJECT INDEX rather than the object's global id, which is
- * what lets the reply phase be an array index instead of a hash lookup. It
- * therefore requires the same "same object list, same order on
- * every rank" precondition as redistribution.
+ * A request names the body by its global id and the vertex by its global id;
+ * the owner resolves the body through its sorted local directory and the vertex
+ * through an epoch-stamped id table, and the reply comes back in request order,
+ * so the requester applies it with a direct indexed write.
  *
  * @param ens The ensemble. All ranks must call collectively.
- * @return MFTL_SUCCESS, or MFTL_ERROR on an invalid ensemble.
+ * @return MFTL_SUCCESS, or MFTL_ERROR on an invalid ensemble or when some ghost
+ *         could not be served (its owner is not a graph neighbour, or does not
+ *         hold it) and therefore kept a STALE value. The verdict is this rank's.
  */
 int MFTLUpdateGhostPositions(MFTL_Ensemble *ens);
 
@@ -712,7 +680,7 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble *ens);
  * @note Requires MFTLComputeVertexNormals() to have run on every object first;
  *       it synchronises `verts.normal`, it does not compute it.
  * @param ens The ensemble. All ranks must call collectively.
- * @return MFTL_SUCCESS, or MFTL_ERROR on an invalid ensemble.
+ * @return MFTL_SUCCESS, or MFTL_ERROR as for MFTLUpdateGhostPositions().
  */
 int MFTLUpdateGhostVertexNormals(MFTL_Ensemble *ens);
 
@@ -885,8 +853,8 @@ typedef struct MFTL_SpatialHalo
  */
 typedef struct MFTL_SpatialHaloRequest
 {
-  int body_a;  ///< Index in the ensemble's object list. Only its EXTENT is used.
-  int body_b;  ///< Index of the body whose triangles travel.
+  int body_a;  ///< Body id (#MFTL_Object::global_id). Only its EXTENT is used.
+  int body_b;  ///< Body id of the body whose triangles travel.
   double margin;  ///< Absolute distance, in domain length units.
 } MFTL_SpatialHaloRequest;
 
@@ -913,20 +881,7 @@ MFTL_SpatialHalo *MFTLSpatialHaloCreate(MFTL_Ensemble *ens);
  */
 static inline int MFTLSpatialHaloFindBody(const MFTL_SpatialHalo *halo, int body_gid)
 {
-  if (halo == MFTL_NULL) return MFTL_ERROR;
-
-  int lo = 0, hi = halo->num_objects - 1;
-  while (lo <= hi)
-  {
-    const int mid = lo + ((hi - lo) >> 1);
-    const int g = halo->body_gid[mid];
-    if (g == body_gid) return mid;
-    if (g < body_gid)
-      lo = mid + 1;
-    else
-      hi = mid - 1;
-  }
-  return MFTL_ERROR;
+  return (halo == MFTL_NULL) ? MFTL_ERROR : MFTLSortedIndexOf(halo->body_gid, halo->num_objects, body_gid);
 }
 
 /**
@@ -1172,7 +1127,7 @@ static inline int MFTLSpatialHaloCount(const MFTL_SpatialHalo *halo, int body_gi
  * It exists because this module had no instrumentation at all: `git grep
  * MPI_Wtime -- src/` returned exactly one hit, in `remesh_comm.c`. The
  * redistribution is the largest phase of the per-timestep loop
- * (docs/performance-analysis.md section 7), and every published statement about
+ * (docs/analysis.md §2), and every published statement about
  * WHICH PART of it is expensive was inference from the source rather than a
  * measurement. Architectural decisions about this module were being made on that
  * inference. These counters replace it.
@@ -1241,9 +1196,10 @@ typedef struct
   double t_route;
 
   /**
-   * The per-body skip vote: one MPI_BOR over a bitset of one bit per body.
+   * The per-body skip vote: one MFTLEnsembleReduceBodies() over each body's
+   * holders, one value per body held.
    *
-   * Pure latency by payload -- 1.25 kB at ten thousand bodies -- but it is the
+   * Small by payload, but it is the
    * FIRST collective after the object loop, so it takes over t_route's other job
    * of absorbing the spread between ranks. Read the two together: if this bucket
    * is large and `t_route` has collapsed, the imbalance simply moved and the
@@ -1274,7 +1230,7 @@ typedef struct
    * worth about 0.22 ms/step -- roughly a THIRD of what the traffic arithmetic
    * predicts, because a streaming pass the prefetcher handles perfectly is being
    * traded for scattered stores in a loop that is already dependency-bound.
-   * docs/performance-analysis.md section 7f has the measurement.
+   * docs/analysis.md §2.5 has the measurement.
    */
   double t_relink;
   double t_arrivals;  ///< Classifying and writing what arrived, derived entries included.
@@ -1285,7 +1241,7 @@ typedef struct
    * the per-destination id lists and the send and receive buffers.
    *
    * `t_setup + t_teardown` is what a persistent workspace would remove, and
-   * docs/performance-analysis.md section 7 identifies that churn as the reason a
+   * docs/analysis.md §2.1 identifies that churn as the reason a
    * first benchmark run is slower than every repeat of it. The counters
    * `n_allocs` / `n_bytes_allocated` say how much of it there is; these two say
    * what it costs.
@@ -1312,12 +1268,11 @@ typedef struct
   long n_objects_visited;  ///< Bodies iterated, summed over calls.
 
   /**
-   * Bodies this rank held NOTHING of, and still paid for.
+   * Bodies that reached the rebuild with nothing kept and nothing arriving.
    *
-   * The per-object rebuild runs unconditionally today: an id-table epoch bump, a
-   * MFTLObjectSetCounts(0,0,0,0) and a full MFTLObjectBuildDerived(), for every
-   * body in a replicated object list. This counter is what makes that cost
-   * visible rather than argued.
+   * These are bodies whose entities have all left this rank: the rebuild gives
+   * their pool blocks back (and the object is destroyed at the end of the call),
+   * so the counter measures departure churn rather than wasted work.
    */
   long n_objects_empty_local;
 
@@ -1400,12 +1355,10 @@ typedef struct
    * these three say which of them can be expected to STAY CONSTANT as a job
    * grows, and that is the only form of the question weak scaling cares about:
    *
-   *   ws_bytes_per_body    proportional to the number of bodies in the ensemble.
-   *                        Every rank pays it for every body, held or not,
-   *                        because bodies are identified by their position in a
-   *                        replicated list. In a weak-scaling sweep the body
-   *                        count grows with the rank count, so this one grows
-   *                        LINEARLY WITH P for a fixed amount of work per rank.
+   *   ws_bytes_per_body    proportional to the number of bodies THIS RANK
+   *                        holds. It used to be sized by the whole ensemble; a
+   *                        figure that grows with P in a weak-scaling sweep is
+   *                        now a regression.
    *   ws_bytes_per_rank    proportional to nproc. Bounded-degree neighbour
    *                        traffic does not need it; the global Alltoallv
    *                        fallback does.

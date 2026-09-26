@@ -48,35 +48,10 @@ static int g_nproc = 1;
  * Fixtures
  * ─────────────────────────────────────────────────────────────────────────── */
 
-static void grid_for(int nproc, int cuts[3])
-{
-  cuts[0] = nproc;
-  cuts[1] = 1;
-  cuts[2] = 1;
-  if (nproc == 4)
-  {
-    cuts[0] = 2;
-    cuts[1] = 2;
-    cuts[2] = 1;
-  }
-  else if (nproc == 6)
-  {
-    cuts[0] = 3;
-    cuts[1] = 2;
-    cuts[2] = 1;
-  }
-  else if (nproc == 8)
-  {
-    cuts[0] = 2;
-    cuts[1] = 2;
-    cuts[2] = 2;
-  }
-}
-
 static MFTL_Ensemble *make_ensemble(bool periodic, int capacity)
 {
   int cuts[3];
-  grid_for(g_nproc, cuts);
+  test_grid_for(g_nproc, cuts);
 
   double lo[3] = {-1.0, -1.0, -1.0};
   double hi[3] = {1.0, 1.0, 1.0};
@@ -1646,15 +1621,9 @@ static int test_empty_ensemble_is_a_no_op(void)
  */
 static int test_invalid_arguments(void)
 {
-  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLRedistributeObject(MFTL_NULL));
-  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLRedistributeListOfObjects(MFTL_NULL));
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLRedistribute(MFTL_NULL));
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLRedistributeWithOwners(MFTL_NULL, MFTL_NULL));
   TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLUpdateGhostPositions(MFTL_NULL));
-
-  /* An object that was never added to an ensemble has no domain. */
-  MFTL_Object *orphan = MFTLObjectCreate(0);
-  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLRedistributeObject(orphan));
-  MFTLObjectDestroy(&orphan);
-
   return 0;
 }
 

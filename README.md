@@ -13,8 +13,7 @@ MFTL_Object
 ├── MFTL_VertexPool          ── ONE malloc, ONE capacity ──
 │   ├── rec[]                AoS   16 B   out_he_idx, global_id, owner_proc, flags
 │   ├── pos[]                SoA   3×     authoritative position
-│   ├── normal[] area[]      SoA          derived per-vertex geometry
-│   └── mean_curv[] gauss_curv[]
+│   └── normal[]             SoA          derived per-vertex geometry
 │
 └── MFTL_TrianglePool        ── ONE malloc, ONE capacity ──
     ├── rec[]                AoS   12 B   global_id, owner_proc, flags
@@ -171,8 +170,8 @@ dataset contains every triangle exactly once and an integral computed over it in
 
 Raw binary is 23–32× faster to write than ASCII and about half the size. The shared file is **not** faster on a
 laptop — it exists because P+1 files per dump is what stops working first on a parallel filesystem. See
-`docs/performance-analysis.md` §8, and re-measure on the target machine before choosing.
+`docs/analysis.md` §3, and re-measure on the target machine before choosing.
 
-See `CLAUDE.md` for the architecture in detail and `docs/performance-analysis.md` for what has actually been
+See `CLAUDE.md` for the architecture in detail and `docs/analysis.md` for what has actually been
 measured — including six results that did not come out the way the design predicted, and the seven measurement
 mistakes made while getting them.

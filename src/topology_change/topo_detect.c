@@ -20,7 +20,7 @@
  *      signs are a fold seen edge-on, not a thin feature, and are not events;
  *   4. their distance is within the threshold of THAT kind.
  *
- * Condition 3 is what the plan's detection criteria leave implicit, and it is
+ * Condition 3 is what the original design's detection criteria left implicit, and it is
  * the one that makes the same machinery serve both directions of a topology
  * change: the RT cap rolling onto its own stem and a jet's neck thinning are
  * both "two opposing triangles within delta", and only the side the gap is on

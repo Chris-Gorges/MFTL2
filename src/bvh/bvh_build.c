@@ -447,7 +447,10 @@ void MFTLBVHBuildFromPrims(MFTL_BVH *bvh)
   double range = hi[0] - lo[0];
   if (hi[1] - lo[1] > range) range = hi[1] - lo[1];
   if (hi[2] - lo[2] > range) range = hi[2] - lo[2];
-  const double inv_range = (range > MFTL_VERYSMALL) ? MFTL_MORTON_MAX / range : 0.0;
+  /* The only condition is that the scale be FINITE. An absolute floor here (it
+   * was 1e-12) collapses every key of a small but perfectly valid object onto
+   * one value, and ordering then silently stops meaning anything. */
+  const double inv_range = (range > MFTL_MORTON_MAX / MFTL_DBL_MAX) ? MFTL_MORTON_MAX / range : 0.0;
 
   uint64_t *const keys = (uint64_t *) MFTLMallocOrDie((size_t) n * sizeof(uint64_t), "BVH Morton keys");
 

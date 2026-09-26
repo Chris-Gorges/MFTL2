@@ -9,14 +9,14 @@
  * THE QUESTION THIS EXISTS TO ANSWER
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * docs/parallel-remeshing-analysis.md section 7 records one thing as deliberately
+ * docs/analysis.md §5.4 records one thing as deliberately
  * not attempted and names its prerequisite:
  *
  *     "A profile that separates sweep time from migration time inside
  *      MFTLRemeshEnsembleParallel is the prerequisite, and it does not exist yet."
  *
  * This is that profile. It is the measurement that decides whether the work-list
- * architecture of the implementation plan's section 7 is worth building -- a work
+ * architecture (docs/analysis.md §5.4) is worth building -- a work
  * list shortens each SWEEP, and if the pass is bound by MIGRATION instead then it
  * buys nothing.
  *

@@ -4,11 +4,11 @@
  * @date 2026-08-14
  * @ingroup mftl_communication
  *
- * @brief The MPI datatypes and the generic variable-length exchange.
+ * @brief The MPI datatypes, the generic variable-length exchange, and the
+ *        neighbourhood allgather.
  *
- * Both are shared by the redistribution and the ghost synchronisation, and
- * neither knows anything about meshes -- which is why they live in their own
- * translation unit.
+ * All three are shared by several modules and none knows anything about meshes
+ * -- which is why they live in their own translation unit.
  */
 
 #include "mftl_communication.h"
@@ -246,4 +246,36 @@ void MFTLExchangeFree(MFTL_ExchangeCtx *ctx)
   ctx->counts = MFTL_NULL;
   ctx->n_payloads = 0;
   ctx->n_targets = 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 3. Neighbourhood allgather
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+double *MFTLNeighborAllgatherDoubles(const MFTL_Domain *domain, const double *send, int n_send, int *rcount, int *rdispl, int *n_recv)
+{
+  const int d = domain->num_neighbors;
+
+  *n_recv = 0;
+  if (domain->nproc < 2 || d < 1) return (double *) MFTLMallocOrDie(sizeof(double), "MFTLNeighborAllgatherDoubles (empty)");
+
+  MPI_Neighbor_allgather(&n_send, 1, MPI_INT, rcount, 1, MPI_INT, domain->comm_graph);
+
+  size_t total = 0;
+  for (int i = 0; i < d; ++i)
+  {
+    rdispl[i] = (int) total;
+    total += (size_t) rcount[i];
+  }
+
+  /* MPI counts and displacements are ints. Reaching this needs of the order of
+   * 10^7 doubles arriving from 26 neighbours at once, i.e. millions of bodies
+   * held on ONE rank -- far past where the per-body payload is the problem. */
+  MFTL_ASSERT(total <= (size_t) 0x7fffffff && "MFTLNeighborAllgatherDoubles: neighbour payload exceeds an MPI int count");
+
+  double *const recv = (double *) MFTLMallocOrDie(MFTL_MAX(total, (size_t) 1) * sizeof(double), "MFTLNeighborAllgatherDoubles");
+  MPI_Neighbor_allgatherv(send, n_send, MPI_DOUBLE, recv, rcount, rdispl, MPI_DOUBLE, domain->comm_graph);
+
+  *n_recv = (int) total;
+  return recv;
 }

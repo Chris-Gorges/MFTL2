@@ -148,9 +148,13 @@ static void update_kernel(MFTL_Object *obj, int n_tris, update_accumulators *acc
       const double b_sq = e2x * e2x + e2y * e2y + e2z * e2z;
       const double c_sq = e3x * e3x + e3y * e3y + e3z * e3z;
 
-      /* Mean-ratio quality: 1 for an equilateral triangle, 0 for a degenerate one. */
+      /* Mean-ratio quality: 1 for an equilateral triangle, 0 for a degenerate one.
+       * It is DIMENSIONLESS, so the only degeneracy test that means the same thing
+       * at every length scale is against zero: an absolute floor on the squared
+       * edge sum (which scales as L^2) reported q = 0 for a perfect equilateral
+       * triangle with 1e-7 edges. */
       const double denom = a_sq + b_sq + c_sq;
-      const double q = (denom > MFTL_VERYSMALL) ? MFTL_FOUR_SQRT3 * area / denom : 0.0;
+      const double q = (denom > 0.0) ? MFTL_FOUR_SQRT3 * area / denom : 0.0;
 
       min_area = fmin(min_area, area); max_area = fmax(max_area, area); sum_area += area;
       min_q = fmin(min_q, q); max_q = fmax(max_q, q); sum_q += q;
@@ -331,6 +335,18 @@ void MFTLEnsembleUpdate(MFTL_Ensemble *ensemble)
   free(rows);
 }
 
+void MFTLEnsembleComputeTriangleGeometry(MFTL_Ensemble *ensemble)
+{
+  MFTL_ASSERT(ensemble != MFTL_NULL);
+
+  for (int o = 0; o < ensemble->n_local_objects; ++o)
+  {
+    MFTL_Object *const obj = ensemble->local_objects[o];
+    if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
+    MFTLComputeTriangleGeometry(obj, obj->tris.n);
+  }
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * The per-vertex counterpart
  *
@@ -381,7 +397,7 @@ int MFTLEnsembleUpdateVertexNormals(MFTL_Ensemble *ensemble, MFTL_NormalWeightin
  * update-kernel benchmark, which rebuilt the frame-backed kernel eleven ways on
  * one mesh in one binary and checked identical results. It explains retained
  * arithmetic choices, but is not a current frame-vs-gather measurement. Current
- * end-to-end measurements live in docs/redistribution_optimizations_review.md.
+ * end-to-end measurements live in docs/analysis.md §1.2.
  *
  * ── 1. Does the loop vectorise?  No, and not for the reason believed ───────
  *

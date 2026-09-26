@@ -457,7 +457,9 @@ int main(int argc, char *argv[])
 
   const double h_min = MFTLDomainGetHMin(&ens->domain);
   const double delta = 3.0 * params.max_edge_length;
-  const int coarsen_g = MFTLRemeshCoarseningFactor(&ens->domain, &params);
+  int coarsen_group[3];
+  MFTLRemeshCoarseningFactors(&ens->domain, &params, 0.0, coarsen_group);
+  const int coarsen_g = coarsen_group[0] * coarsen_group[1] * coarsen_group[2];
 
   if (rank == 0 && !quiet)
   {
@@ -472,7 +474,9 @@ int main(int argc, char *argv[])
            feature_angle, (feature_angle >= 180.0) ? " (detection DISABLED)" : "");
     printf("#   band precondition: h_min=%.4f %s 4*delta=%.4f%s\n", h_min, (h_min > 4.0 * delta) ? ">" : "<=", 4.0 * delta,
            (coarsen_g > 1) ? "   *** VIOLATED ***" : "");
-    if (coarsen_g > 1) printf("#   MFTLRemeshCoarseningFactor says %d ranks would have to be grouped\n", coarsen_g);
+    if (coarsen_g > 1)
+      printf("#   MFTLRemeshCoarseningFactors says %dx%dx%d = %d ranks would have to be grouped\n", coarsen_group[0], coarsen_group[1], coarsen_group[2],
+             coarsen_g);
     printf("#   V0 = %.8e   A0 = %.8e\n#\n", r0.volume, r0.area);
     printf("# %5s %7s %9s %8s %8s %5s %6s %5s %5s %10s %8s %8s %9s\n", "step", "t", "ntri", "minQ", "avgQ", "inv", "oob", "ph", "mig", "V/V0", "A/A0",
            "t_rem", "str");

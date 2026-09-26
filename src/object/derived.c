@@ -134,7 +134,7 @@ void MFTLObjectBuildDerived(MFTL_Object *obj)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 3. Morton renumbering of the pools
+ * 2. Morton renumbering of the pools
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /*
@@ -217,32 +217,6 @@ static void permute_he_triples(MFTL_HalfEdge *field, MFTL_HalfEdge *scratch, con
 }
 
 /**
- * @brief Sorts one contiguous segment of Morton keys, carrying the old indices.
- *
- * @param keys   The Morton keys of the segment, sorted ascending in place.
- * @param values On entry the old indices of the segment, on exit permuted so
- *               that `values[i]` is the old index that belongs at new position
- *               `i`.
- * @param count  Elements in the segment.
- */
-static void sort_segment64(uint64_t *keys, int *values, int count)
-{
-  if (count > 1) MFTLSortPairs64(keys, values, count);
-}
-
-/**
- * @brief The 32-bit counterpart, for the triangle keys.
- *
- * @param keys   The 32-bit spatial keys, sorted in place.
- * @param values Old indices, permuted alongside the keys.
- * @param count  Elements in the segment.
- */
-static void sort_segment32(int *keys, int *values, int count)
-{
-  if (count > 1) MFTLSortPairs32(keys, values, count);
-}
-
-/**
  * @brief Orders the vertices along a Morton curve and remaps every reference.
  * @return true if a permutation was applied.
  *
@@ -281,7 +255,10 @@ static bool reorder_vertices(MFTL_Object *obj, int *old_of_new, int *new_of_old,
   double range = hi[0] - lo[0];
   if (hi[1] - lo[1] > range) range = hi[1] - lo[1];
   if (hi[2] - lo[2] > range) range = hi[2] - lo[2];
-  const double inv_range = (range > MFTL_VERYSMALL) ? MFTL_MORTON_MAX / range : 0.0;
+  /* The only condition is that the scale be FINITE. An absolute floor here (it
+   * was 1e-12) collapses every key of a small but perfectly valid object onto
+   * one value, and ordering then silently stops meaning anything. */
+  const double inv_range = (range > MFTL_MORTON_MAX / MFTL_DBL_MAX) ? MFTL_MORTON_MAX / range : 0.0;
 
   uint64_t *keys = (uint64_t *) MFTLMallocOrDie((size_t) nv * sizeof(uint64_t), "MFTLObjectReorderMorton vertex keys");
 
@@ -299,22 +276,19 @@ static bool reorder_vertices(MFTL_Object *obj, int *old_of_new, int *new_of_old,
    * would interleave them and destroy the prefix invariant that every ownership
    * test in the library relies on. */
   const int n_local = obj->verts.n_local;
-  sort_segment64(keys, old_of_new, n_local);
-  sort_segment64(keys + n_local, old_of_new + n_local, nv - n_local);
+  MFTLSortPairs64(keys, old_of_new, n_local);
+  MFTLSortPairs64(keys + n_local, old_of_new + n_local, nv - n_local);
 
   free(keys);
 
   for (int i = 0; i < nv; ++i) new_of_old[old_of_new[i]] = i;
 
-  /* Records first, then the SoA arrays. `pos` is authoritative and the rest is
-   * cached geometry, but all of it is permuted: a reorder must not silently
-   * discard values the caller computed one line earlier. */
+  /* Records first, then the SoA arrays. `pos` is authoritative and `normal` is
+   * cached geometry, but both are permuted: a reorder must not silently discard
+   * values the caller computed one line earlier. */
   permute_vertex_recs(obj->verts.rec, (MFTL_Vertex *) scratch, old_of_new, nv);
   permute_doubles(obj->verts.pos, (double *) scratch, old_of_new, nv, 3);
   permute_doubles(obj->verts.normal, (double *) scratch, old_of_new, nv, 3);
-  permute_doubles(obj->verts.area, (double *) scratch, old_of_new, nv, 1);
-  permute_doubles(obj->verts.mean_curv, (double *) scratch, old_of_new, nv, 1);
-  permute_doubles(obj->verts.gauss_curv, (double *) scratch, old_of_new, nv, 1);
 
   /* Every reference INTO the vertex pool. `out_he_idx` is a half-edge index and
    * travelled with its record, so it needs nothing here. */
@@ -363,8 +337,8 @@ static bool reorder_triangles(MFTL_Object *obj, int *old_of_new, int *new_of_old
   }
 
   const int n_local = obj->tris.n_local;
-  sort_segment32(keys, old_of_new, n_local);
-  sort_segment32(keys + n_local, old_of_new + n_local, nt - n_local);
+  MFTLSortPairs32(keys, old_of_new, n_local);
+  MFTLSortPairs32(keys + n_local, old_of_new + n_local, nt - n_local);
 
   free(keys);
 
@@ -412,10 +386,9 @@ void MFTLObjectReorderMorton(MFTL_Object *obj)
   const int n_max = (nv > nt) ? nv : nt;
 
   /* One scratch block for every permutation. Sized for the widest element any
-   * permute_* call moves: 6 doubles per triangle (`edge`) and 3 half-edge
-   * records per triangle both come to 48 bytes, against 24 for a vertex
-   * position. Allocating it once keeps the reorder at two mallocs plus the two
-   * the sorts make internally. */
+   * permute_* call moves: the 3 half-edge records of a triangle, 48 bytes,
+   * against 24 for a position, normal or centroid. Allocating it once keeps the
+   * reorder at two mallocs plus the two the sorts make internally. */
   const size_t widest = 48;
   void *scratch = MFTLMallocOrDie((size_t) n_max * widest, "MFTLObjectReorderMorton scratch");
 

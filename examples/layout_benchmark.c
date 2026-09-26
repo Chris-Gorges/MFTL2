@@ -398,7 +398,7 @@ static void p4_split(layout_ctx *c)
  * @brief Best of TRIALS timed runs, in nanoseconds per element.
  *
  * The MINIMUM rather than the mean, for the reason recorded in
- * docs/performance-analysis.md: a single descheduled run should not decide a
+ * docs/analysis.md §10: a single descheduled run should not decide a
  * layout question, and taking a mean lets it.
  */
 static double best_ns(void (*fn)(layout_ctx *), layout_ctx *c, double elements)
@@ -660,7 +660,7 @@ int main(int argc, char *argv[])
   printf("  layout question is close to a wash on time and is therefore decided on\n");
   printf("  the API instead. Interleaved keeps MFTLVertexPos() returning a plain\n");
   printf("  const double[3], which is what every geometry routine in the library\n");
-  printf("  takes. See docs/performance-analysis.md.\n");
+  printf("  takes. See docs/analysis.md sec 1.4.\n");
 
   MFTLEnsembleDestroy(&ens);
   MPI_Finalize();

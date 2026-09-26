@@ -108,7 +108,7 @@ static int test_minimum_image_is_antisymmetric_and_bounded(void)
       // Never longer than half a period on a periodic axis. That is the whole
       // definition, and it is what stops a seam-crossing edge from inflating an
       // area by a factor of the domain size.
-      TEST_ASSERT(fabs(ab[k]) <= dom->domain_half_size[k] + 1e-12);
+      TEST_ASSERT(fabs(ab[k]) <= 0.5 * dom->domain_size[k] + 1e-12);
     }
   }
   return 0;
@@ -298,6 +298,35 @@ static int test_a_very_small_triangle_is_measured_exactly(void)
   MFTLComputeTriangleGeometry(obj, 1);
   TEST_ASSERT_EQUAL_DOUBLE(0.5 * s * s, obj->tris.area[0], 1e-25);
   TEST_ASSERT_EQUAL_DOUBLE(1.0, obj->tris.normal[2], 1e-12);
+  return 0;
+}
+
+/**
+ * @brief The mean-ratio quality MFTLEnsembleUpdate reports is scale invariant.
+ *
+ * q is dimensionless, so an equilateral triangle has q = 1 whatever its size. An
+ * absolute floor on the squared edge sum -- which scales as L^2 -- used to report
+ * q = 0 for a perfect equilateral triangle with 1e-7 edges.
+ */
+static int test_quality_statistics_are_scale_invariant(void)
+{
+  for (int e = -8; e <= 4; ++e)
+  {
+    const double s = pow(10.0, (double) e);
+
+    MFTL_Object *obj = MFTLObjectCreate(70 + e);
+    MFTLEnsembleAddObject(g_open, obj);
+
+    const double pos[9] = {0.0, 0.0, 0.0, s, 0.0, 0.0, 0.5 * s, 0.5 * sqrt(3.0) * s, 0.0};
+    const int tv[3] = {0, 1, 2};
+    TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLBuildIndexedMesh(obj, pos, 3, tv, 1));
+
+    MFTLEnsembleUpdate(g_open);
+
+    TEST_ASSERT_EQUAL_DOUBLE(1.0, obj->quality.min_aspect_ratio, 1e-12);
+    TEST_ASSERT_EQUAL_DOUBLE(1.0, obj->quality.max_aspect_ratio, 1e-12);
+    TEST_ASSERT_EQUAL_DOUBLE(0.25 * sqrt(3.0) * s * s, obj->quality.min_triangle_area, 1e-12 * s * s);
+  }
   return 0;
 }
 
@@ -817,6 +846,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_triangle_properties_of_a_known_triangle);
   RUN_TEST(test_degenerate_triangle_does_not_produce_nan);
   RUN_TEST(test_a_very_small_triangle_is_measured_exactly);
+  RUN_TEST(test_quality_statistics_are_scale_invariant);
   RUN_TEST(test_triangle_normals_are_unit_at_every_scale);
   RUN_TEST(test_normals_of_a_whole_mesh_are_unit);
   RUN_TEST(test_edge_lengths_are_periodic_aware);

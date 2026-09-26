@@ -73,20 +73,17 @@ void MFTLSdfGridFree(MFTL_SdfGrid *grid)
 }
 
 /**
- * @brief Unit normal of triangle @p t from its current corners, or zero if it
- *        has no area.
+ * @brief Unit normal of a triangle from its corners, or zero if it has no area.
  *
- * Recomputed rather than read from `tris.normal`, which nothing guarantees is
- * current -- redistribution leaves it unspecified by design.
+ * Recomputed from the current corners rather than read from `tris.normal`,
+ * which nothing guarantees is current -- redistribution leaves it unspecified by
+ * design.
  *
- * @param      obj The mesh.
- * @param      t   Triangle index.
- * @param[out] n   The unit normal.
+ * @param      c The three corners, as MFTLGetTriangleCorners() returns them.
+ * @param[out] n The unit normal.
  */
-static void face_normal(const MFTL_Object *obj, int t, double n[3])
+static void face_normal(const double c[3][3], double n[3])
 {
-  double c[3][3];
-  MFTLGetTriangleCorners(obj, t, c);
   const double e1[3] = {c[1][0] - c[0][0], c[1][1] - c[0][1], c[1][2] - c[0][2]};
   const double e2[3] = {c[2][0] - c[0][0], c[2][1] - c[0][1], c[2][2] - c[0][2]};
   n[0] = e1[1] * e2[2] - e1[2] * e2[1];
@@ -138,7 +135,7 @@ long MFTLRasterizeSignedDistance(MFTL_SdfGrid *grid, const MFTL_Object *obj, int
      * half-edge 3t+k -- the same convention MFTLClosestPointOnTriangle's edge
      * numbering follows. */
     double n_face[3];
-    face_normal(obj, t, n_face);
+    face_normal(T, n_face);
     double n_edge[3][3];
     bool have_edge[3] = {MFTL_FALSE, MFTL_FALSE, MFTL_FALSE};
 
@@ -179,7 +176,12 @@ long MFTLRasterizeSignedDistance(MFTL_SdfGrid *grid, const MFTL_Object *obj, int
             {
               const int tw = obj->tris.he[3 * t + e].twin_idx;
               double nt[3] = {0.0, 0.0, 0.0};
-              if (tw != MFTL_ERROR) face_normal(obj, MFTLHeTriIdx(tw), nt);
+              if (tw != MFTL_ERROR)
+              {
+                double Tw[3][3];
+                MFTLGetTriangleCorners(obj, MFTLHeTriIdx(tw), Tw);
+                face_normal(Tw, nt);
+              }
               for (int k = 0; k < 3; ++k) n_edge[e][k] = n_face[k] + nt[k];
               have_edge[e] = MFTL_TRUE;
             }

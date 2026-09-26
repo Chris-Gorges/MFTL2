@@ -85,12 +85,12 @@ static int test_global_stats_see_the_whole_mesh_from_every_rank(void)
   MFTL_Object *obj = make_sphere(3);
 
   /* The counts are global, so a rank holding nothing still knows how big the
-   * object is. Generation runs MFTLObjectUpdateGlobalStats itself, so this must
-   * already hold on return. */
+   * object is. Generation publishes them itself, so this must already hold on
+   * return. */
   int ok = (obj->global_n_vertices == 642) && (obj->global_n_triangles == 1280);
 
-  // Calling it again must not double-count.
-  MFTLObjectUpdateGlobalStats(obj);
+  // Recounting must not double-count.
+  MFTLEnsembleUpdateGlobalCounts(g_ens);
   ok = ok && (obj->global_n_vertices == 642) && (obj->global_n_triangles == 1280);
 
   TEST_ASSERT(agreed(ok, g_ens->domain.comm_world));
@@ -137,7 +137,7 @@ static int test_reorder_is_a_local_operation(void)
   }
 
   // The global counts are unchanged by a renumbering.
-  MFTLObjectUpdateGlobalStats(obj);
+  MFTLEnsembleUpdateGlobalCounts(g_ens);
   ok = ok && (obj->global_n_vertices == 162) && (obj->global_n_triangles == 320);
 
   TEST_ASSERT(agreed(ok, g_ens->domain.comm_world));

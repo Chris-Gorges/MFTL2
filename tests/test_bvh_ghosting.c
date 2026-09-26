@@ -412,7 +412,7 @@ static MFTL_Object *add_patch(int gid, const double origin[3], const double u[3]
   o->next_triangle_gid = gids[1];
   o->next_halfedge_gid = gids[2];
 
-  MFTLObjectUpdateGlobalStats(o);
+  MFTLEnsembleUpdateGlobalCounts(g_ens);
   return o;
 }
 
@@ -543,16 +543,8 @@ typedef struct
   int self_pairs;
 } run_info;
 
-/**
- * @brief Body @p gid as an object, or a shared EMPTY one if this rank holds none.
- *
- * A rank holds an MFTL_Object only for the bodies it has entities of, so
- * `local_objects[b]` is body `b` only before the first redistribution. Contact
- * detection needs every body anyway -- its request list drives collectives and
- * must be identical on every rank -- so it reads them through the ensemble's
- * dense view, and so does this test.
- */
-static MFTL_Object *bodyv(int gid) { return MFTLEnsembleAcquireDenseView(g_ens)[gid]; }
+/** @brief Body @p gid of the fixture ensemble, re-resolved at the point of use; see test_body(). */
+static MFTL_Object *bodyv(int gid) { return test_body(g_ens, gid); }
 
 /**
  * @brief MFTL_FOREACH_OWNED_VERTEX over body @p gid, re-resolved at the point of use.
@@ -662,8 +654,8 @@ static void run_pipeline(int ia, int ib, const MFTL_BVHBuildParams *p, keyset *l
  */
 static int *owner_table(const MFTL_Object *obj)
 {
-  /* The LENGTH has to be agreed before the reduction is posted. `obj` may be the
-   * dense view's shared empty object on a rank that holds none of this body, and
+  /* The LENGTH has to be agreed before the reduction is posted. `obj` may be
+   * test_body()'s shared empty object on a rank that holds none of this body, and
    * that one reports a global triangle count of zero -- so sizing the buffer from
    * it locally gives two ranks two different message lengths, which MPI reports
    * as a truncation rather than as the disagreement it is. */
@@ -1653,8 +1645,8 @@ static int test_degenerate_partitions_build_and_traverse(void)
     o->next_vertex_gid = gids[0];
     o->next_triangle_gid = gids[1];
     o->next_halfedge_gid = gids[2];
-    MFTLObjectUpdateGlobalStats(o);
   }
+  MFTLEnsembleUpdateGlobalCounts(g_ens);
   refresh();
 
   /* Before redistribution: rank 0 has 1 and 2 primitives, every other rank has

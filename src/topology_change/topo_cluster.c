@@ -23,7 +23,7 @@
  *
  * No rank stores the lattice. It stores a WINDOW per cluster: its own box, plus
  * a pad wide enough that every owned triangle's rasterisation footprint fits,
- * intersected with the cluster's extent. That is the plan's "component grid"
+ * intersected with the cluster's extent. That is the original design's "component grid"
  * per interacting cluster, cut into per-rank pieces -- memory follows the part
  * of the cluster near this rank, never the domain.
  */
@@ -34,6 +34,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "mftl_arrayfunctions.h"
 #include "mftl_constants.h"
 #include "mftl_geometry.h"
 #include "mftl_memory.h"
@@ -85,38 +86,14 @@ static int uf_find(int *parent, int i)
   return i;
 }
 
-static int cmp_int(const void *a, const void *b)
-{
-  const int x = *(const int *) a, y = *(const int *) b;
-  return (x > y) - (x < y);
-}
-
-/** @brief Position of body @p gid in the sorted list @p b, or -1. */
-static int find_sorted(const int *b, int n, int gid)
-{
-  int lo = 0, hi = n - 1;
-  while (lo <= hi)
-  {
-    const int mid = (lo + hi) / 2;
-    if (b[mid] == gid) return mid;
-    if (b[mid] < gid)
-      lo = mid + 1;
-    else
-      hi = mid - 1;
-  }
-  return -1;
-}
-
 int MFTLTopoBuildClusters(const int *bodies_in, int n_in, const MFTL_TopologyEvent *events, int n_events, MFTL_TopoCluster **out)
 {
   /* Sorted, unique body list: the cluster order must not depend on the order
    * the caller listed them in. */
   int *const b = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_in, 1) * sizeof(int), "topology bodies");
   memcpy(b, bodies_in, (size_t) n_in * sizeof(int));
-  qsort(b, (size_t) n_in, sizeof(int), cmp_int);
-  int nb = 0;
-  for (int i = 0; i < n_in; ++i)
-    if (nb == 0 || b[nb - 1] != b[i]) b[nb++] = b[i];
+  MFTLSortIds(b, n_in);
+  const int nb = MFTLUniqueIntArray(b, n_in);
 
   int *const parent = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(nb, 1) * sizeof(int), "topology union-find");
   for (int i = 0; i < nb; ++i) parent[i] = i;
@@ -130,7 +107,7 @@ int MFTLTopoBuildClusters(const int *bodies_in, int n_in, const MFTL_TopologyEve
   for (int e = 0; e < n_events; ++e)
   {
     if (events[e].body_a == events[e].body_b) continue;
-    const int ia = find_sorted(b, nb, events[e].body_a), ib = find_sorted(b, nb, events[e].body_b);
+    const int ia = MFTLSortedIndexOf(b, nb, events[e].body_a), ib = MFTLSortedIndexOf(b, nb, events[e].body_b);
     if (ia < 0 || ib < 0) continue;
     const int ra = uf_find(parent, ia), rb = uf_find(parent, ib);
     if (ra < rb)
@@ -158,7 +135,7 @@ int MFTLTopoBuildClusters(const int *bodies_in, int n_in, const MFTL_TopologyEve
   int *const ev_cl = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_events, 1) * sizeof(int), "topology event clusters");
   for (int e = 0; e < n_events; ++e)
   {
-    const int ia = find_sorted(b, nb, events[e].body_a);
+    const int ia = MFTLSortedIndexOf(b, nb, events[e].body_a);
     ev_cl[e] = (ia >= 0) ? cl_of[ia] : -1;
     if (ev_cl[e] >= 0) cl[ev_cl[e]].n_events++;
   }
@@ -194,7 +171,7 @@ void MFTLTopoFreeClusters(MFTL_TopoCluster *cl, int n)
 int MFTLTopoClusterOf(const MFTL_TopoCluster *cl, int n, int gid)
 {
   for (int c = 0; c < n; ++c)
-    if (find_sorted(cl[c].bodies, cl[c].n_bodies, gid) >= 0) return c;
+    if (MFTLSortedIndexOf(cl[c].bodies, cl[c].n_bodies, gid) >= 0) return c;
   return -1;
 }
 

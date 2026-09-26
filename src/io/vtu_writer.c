@@ -1016,13 +1016,19 @@ static int write_pvtu(const char *prefix, int nproc, const io_block *blocks)
 static void scan_placement(MPI_Comm comm, long long my_points, long long my_cells, long long base[2], long long total[2])
 {
   long long mine[2] = {my_points, my_cells};
-  base[0] = base[1] = 0;  /* MPI_Exscan leaves rank 0's receive buffer untouched. */
   total[0] = total[1] = 0;
 
   MPI_Request req[2];
   MPI_Iexscan(mine, base, 2, MPI_LONG_LONG, MPI_SUM, comm, &req[0]);
   MPI_Iallreduce(mine, total, 2, MPI_LONG_LONG, MPI_SUM, comm, &req[1]);
   MPI_Waitall(2, req, MPI_STATUSES_IGNORE);
+
+  /* MPI leaves rank 0's exclusive-scan receive buffer UNDEFINED -- zeroing it
+   * before the call is no guarantee. These are file offsets, so garbage here
+   * writes rank 0's slice over another rank's. Its prefix is zero by definition. */
+  int rank = 0;
+  MPI_Comm_rank(comm, &rank);
+  if (rank == 0) base[0] = base[1] = 0;
 }
 
 /**
@@ -1037,9 +1043,13 @@ static void scan_placement(MPI_Comm comm, long long my_points, long long my_cell
  */
 static int write_shared_file(MPI_Comm comm, int rank, const char *prefix, io_block *blocks, const long long base[2], const long long total[2])
 {
-  if (total[0] > 2147483647LL)
+  /* Both limits are on the GLOBAL totals, which every rank holds identically, so
+   * the early return is a collective decision. The cell offsets are
+   * `3 * cumulative cells`, which leaves the Int32 range at 715 827 883 triangles
+   * -- long before the point ids do on a closed surface, where V ~ T/2. */
+  if (total[0] > 2147483647LL || 3 * total[1] > 2147483647LL)
   {
-    if (rank == 0) fprintf(stderr, "MFTLWriteVtu: %lld points exceeds the Int32 connectivity limit.\n", total[0]);
+    if (rank == 0) fprintf(stderr, "MFTLWriteVtu: %lld points / %lld cells exceed the Int32 connectivity and offset limits.\n", total[0], total[1]);
     return MFTL_ERROR;
   }
 
@@ -1047,6 +1057,7 @@ static int write_shared_file(MPI_Comm comm, int rank, const char *prefix, io_blo
    * only arithmetic the scan result feeds. */
   unsigned long long rel[BLK_COUNT];
   unsigned long long acc = 0;
+  int local_bad = 0;
   for (int i = 0; i < BLK_COUNT; ++i)
   {
     rel[i] = acc;
@@ -1060,23 +1071,27 @@ static int write_shared_file(MPI_Comm comm, int rank, const char *prefix, io_blo
     if (blocks[i].bytes > 2147483647u)
     {
       fprintf(stderr, "[Rank %d] MFTLWriteVtu: block '%s' is %llu bytes, above the MPI count limit.\n", rank, blocks[i].name, (unsigned long long) blocks[i].bytes);
-      return MFTL_ERROR;
+      local_bad = 1;
     }
   }
+
+  char path[1024];
+  const int np = snprintf(path, sizeof path, "%s.vtu", prefix);
+  if (np < 0 || (size_t) np >= sizeof path) local_bad = 1;
+
+  /* Every check above is LOCAL -- block sizes differ by rank -- and the next call
+   * is the collective MPI_File_open. A rank returning alone here would leave the
+   * others blocked inside it, so the verdict is agreed first and every rank
+   * returns together. */
+  int any_bad = 0;
+  MPI_Allreduce(&local_bad, &any_bad, 1, MPI_INT, MPI_MAX, comm);
+  if (any_bad) return MFTL_ERROR;
 
   sbuf h;
   sb_init(&h);
   build_header(&h, blocks, rel, total[0], total[1], true);
   const MPI_Offset header_len = (MPI_Offset) h.len;
   const MPI_Offset footer_at = header_len + (MPI_Offset) acc;
-
-  char path[1024];
-  const int np = snprintf(path, sizeof path, "%s.vtu", prefix);
-  if (np < 0 || (size_t) np >= sizeof path)
-  {
-    sb_free(&h);
-    return MFTL_ERROR;
-  }
 
   MPI_File fh;
   /* File error handlers default to MPI_ERRORS_RETURN, so the return codes are

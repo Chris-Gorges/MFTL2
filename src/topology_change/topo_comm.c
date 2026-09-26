@@ -202,10 +202,8 @@ double *MFTLTopoCommExchange(const MFTL_Domain *dom, const double *records, cons
   return alltoallv_doubles(dom, records, dest_counts, stride, global_path, src_counts, n_recv);
 }
 
-double *MFTLTopoCommReply(const MFTL_Domain *dom, const double *reply, const int *src_counts, const int *dest_counts, int stride, bool global_path)
+double *MFTLTopoCommReply(const MFTL_Domain *dom, const double *reply, const int *src_counts, int stride, bool global_path)
 {
   int n = 0;
-  double *const back = alltoallv_doubles(dom, reply, src_counts, stride, global_path, MFTL_NULL, &n);
-  (void) dest_counts;
-  return back;
+  return alltoallv_doubles(dom, reply, src_counts, stride, global_path, MFTL_NULL, &n);
 }

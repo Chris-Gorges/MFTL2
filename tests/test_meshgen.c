@@ -84,6 +84,13 @@ static int test_indexed_mesh_rejects_bad_input(void)
   TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLBuildIndexedMesh(obj, pos, 2, tv, 1));  // fewer than 3 vertices
   TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLBuildIndexedMesh(obj, pos, 3, tv, 0));  // no triangles
 
+  /* Rejected in Release as well as Debug: a repeated corner is a self-edge that
+   * can twin with itself, and an out-of-range index reads past the pool. */
+  const int repeated[3] = {0, 1, 1};
+  const int out_of_range[3] = {0, 1, 3};
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLBuildIndexedMesh(obj, pos, 3, repeated, 1));
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLBuildIndexedMesh(obj, pos, 3, out_of_range, 1));
+
   // The object must be untouched by a rejected call.
   TEST_ASSERT_EQUAL_INT(0, obj->verts.n);
   TEST_ASSERT_EQUAL_INT(0, obj->tris.n);

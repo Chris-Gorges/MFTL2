@@ -336,7 +336,7 @@ collective.
 
 ## Where this departs from the draft {#topo_departures}
 
-`docs/topology_change_implementation_plan.md` was the starting point. Each departure
+The implementation plan this module was built from (an SDF + marching-cubes draft, since retired) was the starting point. Each departure
 below was either agreed before implementation or forced by a measurement.
 
 | Draft | Here | Why |

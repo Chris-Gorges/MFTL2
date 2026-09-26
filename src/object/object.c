@@ -56,9 +56,6 @@ typedef struct
   size_t rec;  ///< [capacity]   MFTL_Vertex records.
   size_t pos;  ///< [3*capacity] AUTHORITATIVE positions, xyz interleaved.
   size_t normal;  ///< [3*capacity] vertex normals, xyz interleaved.
-  size_t area;  ///< [capacity]   Voronoi areas.
-  size_t mean_curv;  ///< [capacity]   mean curvatures.
-  size_t gauss_curv;  ///< [capacity]   Gaussian curvatures.
 } vertex_layout;
 
 /**
@@ -66,8 +63,8 @@ typedef struct
  *
  * Field order is not arbitrary: `rec` and `pos` come first because they are the
  * two arrays every pass touches, so they share the front of the block and the
- * TLB entries that go with it. Everything after them is written once per
- * timestep by a geometry pass and read by whoever wants curvature.
+ * TLB entries that go with it. `normal` is written by the vertex-normal pass and
+ * read by whoever wants it.
  *
  * @return Total block size in bytes.
  *
@@ -81,9 +78,6 @@ static size_t vertex_layout_compute(vertex_layout *l, int cap)
   l->rec = MFTLLayoutAdd(&cursor, n, sizeof(MFTL_Vertex));
   l->pos = MFTLLayoutAdd(&cursor, 3 * n, sizeof(double));
   l->normal = MFTLLayoutAdd(&cursor, 3 * n, sizeof(double));
-  l->area = MFTLLayoutAdd(&cursor, n, sizeof(double));
-  l->mean_curv = MFTLLayoutAdd(&cursor, n, sizeof(double));
-  l->gauss_curv = MFTLLayoutAdd(&cursor, n, sizeof(double));
   return cursor;
 }
 
@@ -99,9 +93,6 @@ static void vertex_pool_bind(MFTL_VertexPool *p, unsigned char *blk, const verte
   p->rec = (MFTL_Vertex *) (void *) (blk + l->rec);
   p->pos = (double *) (void *) (blk + l->pos);
   p->normal = (double *) (void *) (blk + l->normal);
-  p->area = (double *) (void *) (blk + l->area);
-  p->mean_curv = (double *) (void *) (blk + l->mean_curv);
-  p->gauss_curv = (double *) (void *) (blk + l->gauss_curv);
 }
 
 /**
@@ -166,9 +157,6 @@ static void vertex_pool_resize(MFTL_VertexPool *p, int capacity)
     memcpy(blk + l.rec, p->rec, n * sizeof(MFTL_Vertex));
     memcpy(blk + l.pos, p->pos, 3 * n * sizeof(double));
     memcpy(blk + l.normal, p->normal, 3 * n * sizeof(double));
-    memcpy(blk + l.area, p->area, n * sizeof(double));
-    memcpy(blk + l.mean_curv, p->mean_curv, n * sizeof(double));
-    memcpy(blk + l.gauss_curv, p->gauss_curv, n * sizeof(double));
   }
 
   free(p->block);
@@ -543,9 +531,6 @@ bool MFTLObjectPoolsAreConsistent(const MFTL_Object *obj)
     if ((const unsigned char *) vp->rec != blk + l.rec) return MFTL_FALSE;
     if ((const unsigned char *) vp->pos != blk + l.pos) return MFTL_FALSE;
     if ((const unsigned char *) vp->normal != blk + l.normal) return MFTL_FALSE;
-    if ((const unsigned char *) vp->area != blk + l.area) return MFTL_FALSE;
-    if ((const unsigned char *) vp->mean_curv != blk + l.mean_curv) return MFTL_FALSE;
-    if ((const unsigned char *) vp->gauss_curv != blk + l.gauss_curv) return MFTL_FALSE;
   }
 
   if (tp->capacity == 0)
@@ -568,26 +553,4 @@ bool MFTLObjectPoolsAreConsistent(const MFTL_Object *obj)
   }
 
   return MFTL_TRUE;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Public: global statistics
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-void MFTLObjectUpdateGlobalStats(MFTL_Object *object)
-{
-  MFTL_ASSERT(object != MFTL_NULL);
-  MFTL_ASSERT(object->domain != MFTL_NULL && "MFTLObjectUpdateGlobalStats: object has no domain -- add it to an ensemble first");
-
-  /* Ownership is a prefix, so the local counts ARE the answer -- no scan over
-   * the entities testing a flag, which is what an `is_ghost` field would need.
-   *
-   * Blocking rather than non-blocking: two integers, latency-bound, and the
-   * caller wants the result immediately. There is nothing to overlap it with. */
-  const int local_counts[2] = {object->tris.n_local, object->verts.n_local};
-  int global_counts[2] = {0, 0};
-  MPI_Allreduce(local_counts, global_counts, 2, MPI_INT, MPI_SUM, object->domain->comm_world);
-
-  object->global_n_triangles = global_counts[0];
-  object->global_n_vertices = global_counts[1];
 }

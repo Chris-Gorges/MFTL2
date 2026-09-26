@@ -26,12 +26,14 @@
 
 #include "mftl_communication.h"
 
+#include <limits.h>
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "comm_internal.h"
+#include "mftl_arrayfunctions.h"
 #include "mftl_constants.h"
 #include "mftl_ensemble.h"
 #include "mftl_geometry.h"
@@ -610,19 +612,9 @@ int MFTLSpatialHaloResolveRadii(MFTL_Ensemble *ens, MFTL_SpatialHalo *halo)
   int *const rcount = (int *) MFTLMallocOrDie((size_t) nn * sizeof(int), "spatial halo radius counts");
   int *const rdispl = (int *) MFTLMallocOrDie((size_t) nn * sizeof(int), "spatial halo radius displacements");
 
-  const int scount = 2 * b;
-  MPI_Neighbor_allgather(&scount, 1, MPI_INT, rcount, 1, MPI_INT, dom->comm_graph);
-
-  size_t total = 0;
-  for (int i = 0; i < nn; ++i)
-  {
-    rdispl[i] = (int) total;
-    total += (size_t) rcount[i];
-  }
-  MFTL_ASSERT(total <= (size_t) 0x7fffffff && "MFTLSpatialHaloResolveRadii: neighbour radius payload exceeds an MPI int count");
-
-  double *const recv = (double *) MFTLMallocOrDie(MFTL_MAX(total, (size_t) 1) * sizeof(double), "spatial halo radius receive");
-  MPI_Neighbor_allgatherv(send, scount, MPI_DOUBLE, recv, rcount, rdispl, MPI_DOUBLE, dom->comm_graph);
+  int n_recv = 0;
+  double *const recv = MFTLNeighborAllgatherDoubles(dom, send, 2 * b, rcount, rdispl, &n_recv);
+  const size_t total = (size_t) n_recv;
 
   /* MAX, not assignment: a body held here already has the exact answer from the
    * reduction, and a holder's published copy is the same number to the bit --
@@ -894,6 +886,26 @@ typedef struct
 } body_grid;
 
 /**
+ * @brief The cell holding coordinate @p x along axis @p k, clamped into the grid.
+ *
+ * Clamped in floating point BEFORE the cast, because a centre far outside the
+ * box -- or a NaN -- would otherwise reach an int conversion that is undefined
+ * out of range. Inside it this is the plain truncation, so no cell changes.
+ *
+ * @param g The grid.
+ * @param k Axis.
+ * @param x Coordinate.
+ * @return A cell index in `[0, g->n[k])`.
+ */
+static inline int grid_axis_cell(const body_grid *g, int k, double x)
+{
+  const double f = (x - g->origin[k]) * g->inv_w[k];
+  if (!(f >= 1.0)) return 0;
+  if (f >= (double) g->n[k]) return g->n[k] - 1;
+  return (int) f;
+}
+
+/**
  * @brief Builds a grid over @p n_items centres, resolving the cell size first.
  *
  * @param g        Receives the grid. Release with grid_free().
@@ -908,27 +920,36 @@ static void grid_build(body_grid *g, const MFTL_Domain *dom, const double *centr
 {
   g->n_items = n_items;
 
-  long cells = 1;
   for (int k = 0; k < 3; ++k)
   {
     const double size = dom->domain_size[k];
     double want = reach[k];
     if (!(want > 0.0)) want = MFTL_DBL_MAX;
 
+    /* Clamped before the cast: a reach far below the domain size -- a
+     * degenerate body -- would otherwise be an out-of-range int conversion. */
     int nk = 1;
-    if (size > 0.0 && want < size) nk = (int) (size / want);
+    if (size > 0.0 && want < size)
+    {
+      const double q = size / want;
+      nk = (q < (double) INT_MAX) ? (int) q : INT_MAX;
+    }
     if (nk < 1) nk = 1;
 
     g->n[k] = nk;
     g->origin[k] = dom->global_min[k];
-    cells *= nk;
   }
 
   /* A domain a thousand droplet radii wide would otherwise ask for a cell table
    * proportional to the DOMAIN rather than to the data. Halve the longest axis
-   * until the table is proportional to what goes in it. */
-  const long cap = 4L * (long) MFTL_MAX(n_items, 1) + 64L;
-  while (cells > cap)
+   * until the table is proportional to what goes in it.
+   *
+   * The table size is carried in DOUBLE because three int axes overflow a long:
+   * exact below 2^53, and anything above that is far past the cap, so every
+   * comparison comes out as integer arithmetic would have. The cap is also held
+   * to INT_MAX, which is what lets a cell index stay an int. */
+  const long cap = MFTL_MIN(4L * (long) MFTL_MAX(n_items, 1) + 64L, (long) INT_MAX);
+  while ((double) g->n[0] * (double) g->n[1] * (double) g->n[2] > (double) cap)
   {
     int worst = 0;
     for (int k = 1; k < 3; ++k)
@@ -936,10 +957,9 @@ static void grid_build(body_grid *g, const MFTL_Domain *dom, const double *centr
       if (g->n[k] > g->n[worst]) worst = k;
     }
     if (g->n[worst] <= 1) break;
-    cells /= g->n[worst];
     g->n[worst] /= 2;
-    cells *= g->n[worst];
   }
+  const long cells = (long) g->n[0] * (long) g->n[1] * (long) g->n[2];
 
   for (int k = 0; k < 3; ++k)
   {
@@ -954,15 +974,7 @@ static void grid_build(body_grid *g, const MFTL_Domain *dom, const double *centr
   for (int i = 0; i < n_items; ++i)
   {
     const double *const c = &centre[(size_t) i * stride];
-    int idx = 0, mul = 1;
-    for (int k = 0; k < 3; ++k)
-    {
-      int ck = (int) ((c[k] - g->origin[k]) * g->inv_w[k]);
-      if (ck < 0) ck = 0;
-      if (ck >= g->n[k]) ck = g->n[k] - 1;
-      idx += ck * mul;
-      mul *= g->n[k];
-    }
+    const int idx = grid_axis_cell(g, 0, c[0]) + g->n[0] * (grid_axis_cell(g, 1, c[1]) + g->n[1] * grid_axis_cell(g, 2, c[2]));
     g->next[i] = g->head[idx];
     g->head[idx] = i;
   }
@@ -1036,13 +1048,7 @@ static int grid_axis_cells(const body_grid *g, const MFTL_Domain *dom, int k, in
 static void grid_collect(const body_grid *g, const MFTL_Domain *dom, const double *c, mftl_int_buffer *out)
 {
   int base[3];
-  for (int k = 0; k < 3; ++k)
-  {
-    int ck = (int) ((c[k] - g->origin[k]) * g->inv_w[k]);
-    if (ck < 0) ck = 0;
-    if (ck >= g->n[k]) ck = g->n[k] - 1;
-    base[k] = ck;
-  }
+  for (int k = 0; k < 3; ++k) base[k] = grid_axis_cell(g, k, c[k]);
 
   int cx[3], cy[3], cz[3];
   const int nx = grid_axis_cells(g, dom, 0, base[0], cx);
@@ -1097,28 +1103,6 @@ static int sorted_insert(int **list, int *n, int *cap, int gid)
   (*list)[lo] = gid;
   (*n)++;
   return lo;
-}
-
-/**
- * @brief Slot of @p gid in a sorted list, or #MFTL_ERROR.
- * @param list Sorted list.
- * @param n    Entries.
- * @param gid  The value.
- * @return The slot, or #MFTL_ERROR.
- */
-static int sorted_find(const int *list, int n, int gid)
-{
-  int lo = 0, hi = n - 1;
-  while (lo <= hi)
-  {
-    const int mid = lo + ((hi - lo) >> 1);
-    if (list[mid] == gid) return mid;
-    if (list[mid] < gid)
-      lo = mid + 1;
-    else
-      hi = mid - 1;
-  }
-  return MFTL_ERROR;
 }
 
 /**
@@ -1827,8 +1811,8 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
     int *const v_off = (int *) MFTLCallocOrDie((size_t) n_blist + 1, sizeof(int), "spatial halo vertex grouping");
     int *const t_off = (int *) MFTLCallocOrDie((size_t) n_blist + 1, sizeof(int), "spatial halo triangle grouping");
 
-    for (int i = 0; i < x[0].recv_count; ++i) v_off[sorted_find(blist, n_blist, av[i].body_gid) + 1]++;
-    for (int i = 0; i < x[1].recv_count; ++i) t_off[sorted_find(blist, n_blist, at[i].body_gid) + 1]++;
+    for (int i = 0; i < x[0].recv_count; ++i) v_off[MFTLSortedIndexOf(blist, n_blist, av[i].body_gid) + 1]++;
+    for (int i = 0; i < x[1].recv_count; ++i) t_off[MFTLSortedIndexOf(blist, n_blist, at[i].body_gid) + 1]++;
     for (int i = 0; i < n_blist; ++i)
     {
       v_off[i + 1] += v_off[i];
@@ -1848,8 +1832,8 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
         cv[i] = v_off[i];
         ct[i] = t_off[i];
       }
-      for (int i = 0; i < x[0].recv_count; ++i) sv[cv[sorted_find(blist, n_blist, av[i].body_gid)]++] = av[i];
-      for (int i = 0; i < x[1].recv_count; ++i) st[ct[sorted_find(blist, n_blist, at[i].body_gid)]++] = at[i];
+      for (int i = 0; i < x[0].recv_count; ++i) sv[cv[MFTLSortedIndexOf(blist, n_blist, av[i].body_gid)]++] = av[i];
+      for (int i = 0; i < x[1].recv_count; ++i) st[ct[MFTLSortedIndexOf(blist, n_blist, at[i].body_gid)]++] = at[i];
       free(cv);
       free(ct);
     }

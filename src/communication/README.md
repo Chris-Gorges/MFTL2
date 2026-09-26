@@ -181,7 +181,7 @@ everything in "Entities that stay never leave the pool" above is a very expensiv
 way of reproducing it. `MFTLRedistributeSetSkipUnchangedBodies` (default **on**)
 leaves such a body alone: no destination analysis, no kept gather, no relink, no
 arrival classification, no twin repair, no topology rebuild. The measured share
-of a redistribution that removes is in `docs/performance-analysis.md`.
+of a redistribution that removes is in `docs/analysis.md` §2.4.
 
 **The precondition is NOT "did topology change".** Under the remesher's freeze
 discipline a topology change is invisible to the halo rule — an unfrozen entity
@@ -199,7 +199,7 @@ and the second clause is `MFTLObjectMarkPartitionDirty` (@ref mftl_object.h),
 stamped by `MFTLObjectSetCounts` — the choke point every entity creation and
 destruction already passes through — plus the two renumbering sites and
 `MFTLRemeshMarkFrozen`. Full derivation in
-`docs/redistribution_skip_correctness.md`.
+`docs/analysis.md` §2.4.
 
 **Two passes and one collective.** The decision cannot be local: a rank with zero
 local changes is still the receiver of a change made elsewhere. Agreeing per body
@@ -220,14 +220,14 @@ and only they will rebuild it, so the vote is exactly a per-holder reduction.
 @ref MFTLEnsembleReduceBodies "MFTLEnsembleReduceBodies" is where that decision
 lives; the workspace slices are now indexed by local slot.
 
-@warning The route test reads each body's ghost `owner_proc`, and
-         `compute_owners` **overwrites** `owner_proc` with the DESTINATION rank
-         while classifying. Asking one line later gives a plausible answer to the
-         wrong question — the partition that is about to exist, not the one the
-         vote has to reach — and it is wrong only when something moved far, i.e.
-         exactly when the vote matters. So it is taken before pass 1a, agreed on
-         the collective phase 1b was already paying for, and handed to the
-         reduction.
+@warning The pre-exchange half of the route test reads each body's ghost
+         `owner_proc`, and `compute_owners` **overwrites** `owner_proc` with the
+         DESTINATION rank while classifying. Asking one line later gives a
+         plausible answer to the wrong question — the partition that is about to
+         exist, not the one the vote has to reach — and it is wrong only when
+         something moved far, i.e. exactly when the vote matters. So it is taken
+         before pass 1a and handed to `MFTLEnsembleReduceBodiesPrescanned`, which
+         agrees it together with the post-exchange certificate in one int.
 
 An **arrival** has no vote slot and needs none: it is here because an entity of it
 crossed into this rank's cell, so some rank saw it change, and `MFTLObjectCreate`
@@ -263,13 +263,13 @@ than merely harmless.
 
 @warning A redistributed object comes back with valid topology, valid **positions**
          and #MFTL_DERIVED_TOPOLOGY set. Its `tris.area/normal/center` and
-         `verts.normal/area/mean_curv/gauss_curv` hold **unspecified** values.
+         `verts.normal` hold **unspecified** values.
 
 `tris.verts` and `tris.neighbors` are not rebuilt by a closing pass; the relink
 loop, the arrival loop and `repair_twins` emit them as they go, because every
 input is already in a register there. Two thirds of what that saves comes back as
 store traffic in a loop that is dependency-bound rather than streaming, which is
-the measurement in `docs/performance-analysis.md` §7f and the reason the
+the measurement in `docs/analysis.md` §2.5 and the reason the
 `derived: topology` bucket no longer exists.
 
 That is what buys the 3× smaller wire format. The loop that satisfies it with

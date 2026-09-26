@@ -49,18 +49,6 @@
 #include "test_mesh_invariants.h"
 #include "test_utils.h"
 
-/**
- * @brief Body @p gid as an object, or a shared EMPTY one if this rank holds none.
- *
- * A rank holds an MFTL_Object only for the bodies it has entities of, so a
- * pointer cached before a redistribution -- which every remeshing pass ends with
- * -- may be dangling after it. Re-resolving through the ensemble's dense view
- * gives back either the body or a permanently empty stand-in, which is exactly
- * what a rank holding none of it used to have and so leaves every read below
- * meaning what it did.
- */
-static MFTL_Object *body(MFTL_Ensemble *e, int gid) { return MFTLEnsembleAcquireDenseView(e)[gid]; }
-
 static int g_rank = 0;
 static int g_nproc = 1;
 
@@ -68,30 +56,11 @@ static int g_nproc = 1;
  * Fixtures
  * ─────────────────────────────────────────────────────────────────────────── */
 
-static void grid_for(int nproc, int cuts[3])
-{
-  cuts[0] = nproc;
-  cuts[1] = 1;
-  cuts[2] = 1;
-  if (nproc == 4)
-  {
-    cuts[0] = 2;
-    cuts[1] = 2;
-    cuts[2] = 1;
-  }
-  else if (nproc == 8)
-  {
-    cuts[0] = 2;
-    cuts[1] = 2;
-    cuts[2] = 2;
-  }
-}
-
 /** @brief [-1,1]^3, so every grid above has h_min = 1.0 and the arithmetic is legible. */
 static MFTL_Ensemble *make_ensemble(bool periodic)
 {
   int cuts[3];
-  grid_for(g_nproc, cuts);
+  test_grid_for(g_nproc, cuts);
 
   double lo[3] = {-1.0, -1.0, -1.0};
   double hi[3] = {1.0, 1.0, 1.0};
@@ -138,7 +107,7 @@ static void standard_params(MFTL_RemeshParameters *p, double target)
 {
   /* Feature detection OFF: a sphere has no features, so every flagged edge is a
    * false positive that locks a vertex the smoother needed. See
-   * docs/remeshing-quality-analysis.md. */
+   * docs/analysis.md §4. */
   MFTLInitRemeshParams(p, MFTL_REMESH_ISOTROPIC, target, 4, MFTL_SMOOTH_TRIANGLE_BASED, 180.0);
   p->smooth_iterations = 3;
   p->smooth_relaxation = 0.5;
@@ -275,20 +244,11 @@ static int ensemble_is_sound(const MFTL_Ensemble *ens)
  * arrival tables from `next_*_gid`, so a pass that leaves holes grows those
  * tables without bound over a run of constant mesh size.
  */
-/**
- * @brief Body @p gid as an object, or a shared EMPTY one if this rank holds none.
- *
- * A rank holds an MFTL_Object only for the bodies it has entities of, and a
- * remeshing pass ends in a redistribution -- so `local_objects[b]` is body `b`
- * only before the first one, and a pointer cached across one may be dangling.
- */
-static MFTL_Object *bodyv(MFTL_Ensemble *e, int gid) { return MFTLEnsembleAcquireDenseView(e)[gid]; }
-
 static int global_ids_are_dense(const MFTL_Object *obj)
 {
   /* Two things this has to get right now that a rank may hold none of the body.
    *
-   * The LENGTH is agreed first: `obj` may be the dense view's shared empty, whose
+   * The LENGTH is agreed first: `obj` may be test_body()'s shared empty, whose
    * counters are zero, and a locally-sized reduction would then truncate rather
    * than report the disagreement.
    *
@@ -425,7 +385,7 @@ static int test_a_seam_straddling_droplet_is_not_measured_as_domain_sized(void)
   TEST_ASSERT(agreed(MFTLRemeshEnsembleDispersed(ens, &params, &stats) == MFTL_SUCCESS, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
   TEST_ASSERT(agreed(stats.n_bodies_not_centred == 0, MPI_COMM_WORLD));
-  TEST_ASSERT(agreed(global_ids_are_dense(bodyv(ens, 0)), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(global_ids_are_dense(test_body(ens, 0)), MPI_COMM_WORLD));
 
   MFTLEnsembleDestroy(&ens);
   return 0;
@@ -510,7 +470,7 @@ static int test_four_split_droplets_are_centred_and_remeshed(void)
    * every rank has to run it for the same bodies in the same order. */
   for (int b = 0; b < ens->n_bodies_global; ++b)
   {
-    TEST_ASSERT(agreed(global_ids_are_dense(bodyv(ens, b)), MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(global_ids_are_dense(test_body(ens, b)), MPI_COMM_WORLD));
   }
 
   mesh_measure after;
@@ -667,8 +627,8 @@ static int test_a_spanning_body_forced_dispersed_falls_back_cleanly(void)
 
   /* And the answer is right anyway. That is the whole point of the fallback. */
   TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
-  TEST_ASSERT(agreed(MFTLCheckMeshIntegrity(bodyv(ens, 0)) == MFTL_SUCCESS, MPI_COMM_WORLD));
-  TEST_ASSERT(agreed(global_ids_are_dense(bodyv(ens, 0)), MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLCheckMeshIntegrity(test_body(ens, 0)) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(global_ids_are_dense(test_body(ens, 0)), MPI_COMM_WORLD));
   TEST_ASSERT(agreed(stats.converged, MPI_COMM_WORLD));
 
   mesh_measure after;

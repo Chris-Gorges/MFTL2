@@ -46,7 +46,7 @@
  *    per-rank layout usually wins, because there is no aggregation to be had and
  *    a shared file only adds contention. On a Lustre/GPFS system with P in the
  *    thousands the single file wins by a margin that grows with P, and the
- *    per-rank layout eventually stops working at all. docs/performance-analysis.md
+ *    per-rank layout eventually stops working at all. docs/analysis.md §3
  *    carries the measurement on the development machine; RE-RUN IT on the target.
  *
  * 3. ONLY OWNED ENTITIES ARE WRITTEN.

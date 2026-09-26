@@ -205,6 +205,34 @@ static inline int MFTLGetUniqueIntegers(const int *input_array, int input_count,
 }
 
 /**
+ * @brief Binary search for @p key in an ascending int array.
+ *
+ * The library keeps its sparse, id-keyed directories as SORTED arrays so that
+ * `id -> slot` is a binary search rather than a hash map; this is that search,
+ * spelled once.
+ *
+ * @param sorted Ascending array.
+ * @param n      Number of elements.
+ * @param key    The value.
+ * @return An index `i` with `sorted[i] == key`, or -1 (#MFTL_ERROR) if absent.
+ *         With duplicate keys it is one of their indices.
+ */
+static inline int MFTLSortedIndexOf(const int *sorted, int n, int key)
+{
+  int lo = 0, hi = n - 1;
+  while (lo <= hi)
+  {
+    const int mid = lo + ((hi - lo) >> 1);
+    if (sorted[mid] == key) return mid;
+    if (sorted[mid] < key)
+      lo = mid + 1;
+    else
+      hi = mid - 1;
+  }
+  return -1;
+}
+
+/**
  * @brief Removes adjacent duplicates from a SORTED int array, in place.
  *
  * Only compares neighbours, so the array must be sorted first (typically by

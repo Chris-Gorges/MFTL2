@@ -455,7 +455,11 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
   CS_END(ts_free, g_t_teardown);
 
   CS_END(ts_total, g_t_total);
-  return (unserved == 0) ? MFTL_SUCCESS : MFTL_ERROR;
+
+  /* An orphaned ghost kept a STALE value, so the sync did not do its job even
+   * though every collective completed: report it, rather than returning success
+   * over ghosts that two ranks now see differently. */
+  return (unserved == 0 && orphaned == 0) ? MFTL_SUCCESS : MFTL_ERROR;
 }
 
 int MFTLUpdateGhostPositions(MFTL_Ensemble *ens) { return ghost_sync_vec3(ens, GHOST_FIELD_POSITION); }

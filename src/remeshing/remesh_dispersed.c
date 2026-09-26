@@ -81,9 +81,6 @@
  * 1. Strategy selection
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/** @brief Defined below; the measurement needs current triangle geometry. */
-static void prepare_for_migration(MFTL_Ensemble *ens);
-
 /**
  * @brief The box width a body's radius is judged against: the rank box, or the
  *        COARSENED box when the fallback is armed and the fine one is too small.
@@ -243,7 +240,7 @@ MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategyMeasured(MFTL_Ensemble *ens,
    * because the caller may be MFTLRemeshEnsemble, which owns the buffers and
    * would otherwise have to know whether they were filled. Filling them
    * unconditionally is one collective on a path that is about to run a dozen. */
-  prepare_for_migration(ens);
+  MFTLEnsembleComputeTriangleGeometry(ens);
   MFTLRemeshMeasureBodies(ens, m->centroid, m->radius, m->weight, &m->r_max, m->lowest_holder);
 
   if (MFTLDomainGetHMin(&ens->domain) <= 0.0) return MFTL_REMESH_PARALLEL_SPANNING;
@@ -294,7 +291,7 @@ MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategy(MFTL_Ensemble *ens, const M
  *               whatever `nproc` is.
  *
  * The second is what is below. It was the last `O(bodies in the ensemble)` term
- * in the library (docs/scalability-update-status.md §6).
+ * in the library (docs/analysis.md §6.4).
  *
  * ── THE ONE PRECONDITION, AND IT IS A LOCAL TEST RATHER THAN AN ARGUMENT ───
  *
@@ -493,25 +490,16 @@ typedef struct
 } nbhood;
 
 /**
- * @brief Resolves @p pos to a slot in `domain->neighbors`, or "that is me".
+ * @brief Resolves rank @p r to a slot in `domain->neighbors`, or "that is me".
  *
  * @param dom The MPI/physical world.
  * @param r   A rank.
- * @return The slot, #MFTL_SUCCESS's absence notwithstanding: `-1` (#MFTL_ERROR)
- *         when @p r is neither this rank nor a graph neighbour, and `d` when it
- *         IS this rank. A linear scan over at most 26 entries, which is cheaper
- *         than the `[nproc]` inverse table it replaces and is the reason nothing
- *         here allocates per rank.
+ * @return `num_neighbors` when @p r IS this rank, its slot when it is a graph
+ *         neighbour, and #MFTL_ERROR otherwise. A linear scan over at most 26
+ *         entries (MFTLDomainNeighborIndex()), which is why nothing here
+ *         allocates per rank.
  */
-static int neighbor_slot(const MFTL_Domain *dom, int r)
-{
-  if (r == dom->rank) return dom->num_neighbors;
-  for (int i = 0; i < dom->num_neighbors; ++i)
-  {
-    if (dom->neighbors[i] == r) return i;
-  }
-  return MFTL_ERROR;
-}
+static int neighbor_slot(const MFTL_Domain *dom, int r) { return (r == dom->rank) ? dom->num_neighbors : MFTLDomainNeighborIndex(dom, r); }
 
 /**
  * @brief Is neighbour slot @p a preferred to slot @p b at equal usefulness?
@@ -701,7 +689,7 @@ static void assign_destinations(MFTL_Ensemble *ens, const MFTL_RemeshParameters 
 
   nbhood nh;
   nh.d = dom->num_neighbors;
-  nh.self = MFTLRemeshSelfLoopSlot(dom);
+  nh.self = MFTLDomainNeighborIndex(dom, dom->rank);
 
   /* The unbalanced answer, and the one every body keeps unless its home rank
    * says otherwise. Every holder computes it from its own reduced centroid, so
@@ -1063,52 +1051,6 @@ static void assign_destinations(MFTL_Ensemble *ens, const MFTL_RemeshParameters 
  * 2. The driver
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/**
- * @brief Accumulates one object's stats into the ensemble total.
- *
- * @param[out] dst The caller's statistics block.
- * @param      src One object's statistics from this pass.
- */
-static void accumulate_stats(MFTL_RemeshStats *dst, const MFTL_RemeshStats *src)
-{
-  dst->n_split += src->n_split;
-  dst->n_collapse += src->n_collapse;
-  dst->n_flip += src->n_flip;
-  dst->n_collapse_rejected_link += src->n_collapse_rejected_link;
-  dst->n_collapse_rejected_fold += src->n_collapse_rejected_fold;
-  dst->n_collapse_rejected_feature += src->n_collapse_rejected_feature;
-  dst->n_flip_rejected_fold += src->n_flip_rejected_fold;
-  dst->n_feature_edges += src->n_feature_edges;
-  dst->n_corner_vertices += src->n_corner_vertices;
-  dst->n_ridge_vertices += src->n_ridge_vertices;
-  dst->n_free_vertices += src->n_free_vertices;
-  dst->n_vertices_removed += src->n_vertices_removed;
-  dst->n_orphans_removed += src->n_orphans_removed;
-  dst->iterations = MFTL_MAX(dst->iterations, src->iterations);
-}
-
-/**
- * @brief Refreshes centres over the FULL triangle count and repairs the derived
- *        arrays -- the two preconditions of any migration.
- *
- * The centres must cover ghosts as well as owned triangles even here, where the
- * destination does not depend on them: `MFTL_OwnerMap` bypasses the geometric
- * rule, but the redistribution still uses the centres for its own bookkeeping in
- * Debug, and the migration BACK at the end is the geometric one.
- *
- * @param ens The ensemble. Rebuilds the derived arrays and refreshes the
- *            triangle centres over the FULL count including ghosts.
- */
-static void prepare_for_migration(MFTL_Ensemble *ens)
-{
-  for (int o = 0; o < ens->n_local_objects; ++o)
-  {
-    MFTL_Object *const obj = ens->local_objects[o];
-    if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
-    MFTLComputeTriangleGeometry(obj, obj->tris.n);
-  }
-}
-
 int MFTLRemeshEnsembleDispersed(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats)
 {
   MFTL_ASSERT(ens != MFTL_NULL && params != MFTL_NULL);
@@ -1121,7 +1063,7 @@ int MFTLRemeshEnsembleDispersed(MFTL_Ensemble *ens, const MFTL_RemeshParameters 
 
   if (ens->n_bodies_global >= 1)
   {
-    prepare_for_migration(ens);
+    MFTLEnsembleComputeTriangleGeometry(ens);
     MFTLRemeshMeasureBodies(ens, m.centroid, m.radius, m.weight, &m.r_max, m.lowest_holder);
   }
 
@@ -1356,7 +1298,7 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
     memset(&one, 0, sizeof(one));
 
     if (MFTLRemeshObject(obj, params, &one) != MFTL_SUCCESS) status = MFTL_ERROR;
-    accumulate_stats(st, &one);
+    remesh_stats_accumulate(st, &one);
     local_ops += one.n_split + one.n_collapse + one.n_flip;
 
     /* Unconditionally, whatever `renumber_global_ids` says. In serial that flag
@@ -1439,7 +1381,7 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
 
   /* ── 6. Back to the decomposition the flow solver expects ────────────────── */
   t_mark = MFTLRemeshWallTime();
-  prepare_for_migration(ens);
+  MFTLEnsembleComputeTriangleGeometry(ens);
   st->t_geometry += MFTLRemeshWallTime() - t_mark;
 
   t_mark = MFTLRemeshWallTime();
@@ -1453,12 +1395,7 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
    * MFTLRemeshObject promises its caller current triangle geometry. This entry
    * point promises the same thing rather than being a different contract. */
   t_mark = MFTLRemeshWallTime();
-  for (int o = 0; o < ens->n_local_objects; ++o)
-  {
-    MFTL_Object *const obj = ens->local_objects[o];
-    if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
-    MFTLComputeTriangleGeometry(obj, obj->tris.n);
-  }
+  MFTLEnsembleComputeTriangleGeometry(ens);
   st->t_geometry += MFTLRemeshWallTime() - t_mark;
 
   /* The maximum over ranks, and unconditional -- see the same block at the end
@@ -1466,15 +1403,7 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
    * this strategy sends every body to one rank, so at N_bodies < nproc most
    * ranks contribute a `t_sweep` of zero and the max is one rank's whole cost. */
   st->t_total = MFTLRemeshWallTime() - t0_call;
-
-  double prof[6] = {st->t_total, st->t_migrate, st->t_geometry, st->t_freeze, st->t_sweep, st->t_reduce};
-  MFTLRemeshAgreeDoubleMax(dom, prof, 6);
-  st->t_total = prof[0];
-  st->t_migrate = prof[1];
-  st->t_geometry = prof[2];
-  st->t_freeze = prof[3];
-  st->t_sweep = prof[4];
-  st->t_reduce = prof[5];
+  MFTLRemeshAgreeProfile(dom, st, MFTL_NULL, 0);
 
   return status;
 }

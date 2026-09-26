@@ -172,39 +172,49 @@ shrinks and the per-rank memory does not.
 
 ### When the neighbourhood is enough
 
-A rank holds an entity of a body only if it **owns** one: redistribution sends a
-triangle to the owner of each of its three corners and each of its three edge
-neighbours, so a rank holding nothing but ghosts cannot exist. The holders of a
-body are therefore the cells its entities occupy, and the question is whether
-that set fits inside one 26-neighbourhood.
-
-Three local statements decide it, with no geometry and no body-global
-measurement. Let $V_R(X)$ be the holders rank $R$ can see for body $X$ — itself,
-plus the `owner_proc` of every ghost of $X$ in its pool:
+The holder route is exact if and only if every two holders of a body are graph
+neighbours: each holder then hears from all the others. That is decided with no
+geometry and no body-global measurement, from three statements every holder $R$
+of body $X$ checks locally:
 
 1. $R$ owns at least one entity of $X$;
-2. every member of $V_R(X)$ is a graph neighbour of $R$;
-3. their cell offsets span at most one cell per axis.
+2. every rank owning a ghost of $X$ in $R$'s pool is a graph neighbour of $R$;
+3. **after the exchange**, $R$ and every graph neighbour that published a record
+   for $X$ span at most one cell per axis.
 
-`MPI_LAND` of that is exactly "the neighbourhood route is exact", and it reads
-only the **ghost suffix** — a body held whole costs nothing at all.
+Statements 1 and 2 are `MFTLEnsembleBodyHoldersFitTheGraph`, read off the ghost
+suffix alone — a body held whole costs nothing. Statement 3 needs the records,
+because a rank's halo names only the holders its own entities touch, while every
+holder publishes a record. All three are agreed in the one `MPI_LAND` the route
+decision always cost; on a refusal the records are discarded and the exact
+`comm_world` route runs instead.
 
-Statement 1 is what makes $V$ complete. A rank holding an **empty** object owns
-nothing, appears in no other holder's halo, and can therefore neither be
-discovered nor served; it cannot be seen from outside, so it vetoes. That is not
-a corner case — it is the state a generated ensemble is in before its first
-redistribution, and it is what `test_ensemble_update_tolerates_empty_ranks`
-caught at $P = 4$.
+**1 and 2 make the holders connected on the graph.** Redistribution sends a
+triangle to the owner of each of its corners and edge neighbours, so of two
+incident entities with different owners, each owner holds the other entity as a
+ghost and, by 2, is a graph neighbour of the other owner. The surface is
+connected, so its owners are; by 1 every holder is an owner. A rank holding an
+**empty** object owns nothing, so nothing connects it to the others — it vetoes.
+That is the state a generated ensemble is in before its first redistribution,
+and it is what `test_ensemble_update_tolerates_empty_ranks` caught at $P = 4$.
 
-Given it, the converse holds. Take holders $c, c'$ two cells or more apart; the
-surface is connected, so there is a chain of holders from $c$ to $c'$ whose
-consecutive members share an entity and therefore see each other. If any step of
-that chain is two cells or more, statement 2 fails at its start. If every step is
-one cell, the chain covers at least two cells in unit steps, so some member has
-chain neighbours on **opposite sides** of it along one axis — both in its own $V$
-— and statement 3 fails there.
+**3 makes a connected holder set a clique.** Otherwise there are holders $a, c$
+at graph distance exactly two with a common holder neighbour $m$; both are in
+$m$'s record set, so their offsets from $m$ differ by at most one per axis, so
+$c$'s cell is in $a$'s stencil and they *are* neighbours.
 
-@warning The converse rests on one assumption: a body is a **connected** surface.
+**The first version checked 1, 2 and statement 3 on the visible holders only,
+before the exchange, and that is not sufficient.** Its argument claimed that a
+chain of one-cell steps covering two cells must have a member with neighbours on
+opposite sides along one axis. It need not: a tube bent around a corner — cells
+(0,0) → (1,0) → (1,1) → (2,1) — passes the local test on every rank while its
+ends, two cells apart in $x$, never hear from each other. Measured on a 3×2×1
+grid: 386 of 484 triangles, and exclusive prefixes that handed two ranks
+overlapping id ranges. `test_a_bent_body_is_certified_after_the_exchange` runs
+that tube at $P = 27$, where the pre-exchange test passes everywhere and the
+certificate must refuse.
+
+@warning The argument rests on one assumption: a body is a **connected** surface.
          Two components on ranks that neither see each other nor have anything
          between them would pass every local test. Nothing in MFTL produces such
          a body, but a caller that assembles one from an index list owes
@@ -214,14 +224,15 @@ The verdict is re-derived on every call and never cached: it is invalidated by
 any holder-set change anywhere in the job, and a stale one is a silently wrong
 reduction rather than a crash.
 
-### Redistribution takes the test itself, and has to
+### Redistribution takes the pre-exchange test itself, and has to
 
 `MFTLEnsembleBodyHoldersFitTheGraph` describes the pools **as they are**.
 `compute_owners` overwrites every entity's `owner_proc` with its *destination*
 rank while classifying, so after the object loop the pools describe the partition
 that is about to exist while the skip vote has to reach the ranks holding the
-body now. Redistribution therefore takes the answer before classifying, agrees
-it, and passes `MFTL_BODY_REDUCE_SCOPE_HOLDERS` or `..._GLOBAL` explicitly.
+body now. Redistribution therefore takes statements 1 and 2 before classifying
+and hands the local verdict to `MFTLEnsembleReduceBodiesPrescanned`; statement 3
+reads only the exchanged records, so it is still valid after the rewrite.
 
 ### The answer is bitwise identical on every holder
 
@@ -275,7 +286,7 @@ This is the library's one deliberate exception to the "arithmetic belongs to
 
 The kernel carries nine live reduction accumulators. Moving it across a
 translation-unit boundary would force them into an address-taken struct, which
-`docs/performance-analysis.md` §6 measures at **15 %**. The kernel stays next to
+`docs/analysis.md` §1.6 measures at **15 %**. The kernel stays next to
 the reduction it feeds.
 
 ### The statistics are not nearly free

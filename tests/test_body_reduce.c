@@ -41,8 +41,11 @@
  *   8    2x2x2: every one of the 26 offsets is a distinct rank pair, and a body
  *        on a corner has seven other holders
  *   27   3x3x3: the first grid with an interior rank whose 26 neighbours are 26
- *        DISTINCT ranks, and the first where three cells on an axis make the
- *        offset span test reject a body that is in fact well placed
+ *        DISTINCT ranks, the first where three cells on an axis make the
+ *        offset span test reject a body that is in fact well placed, and the
+ *        only one where a body's holders can be connected on the graph without
+ *        being mutual neighbours -- the case the certificate after the exchange
+ *        exists for (test_a_bent_body_is_certified_after_the_exchange)
  */
 
 #include <math.h>
@@ -70,20 +73,10 @@ static const MFTL_BodyReduceOp g_ops[N_SLOTS] = {MFTL_BODY_REDUCE_MIN, MFTL_BODY
  * Fixtures
  * ─────────────────────────────────────────────────────────────────────────── */
 
-static void grid_for(int nproc, int cuts[3])
-{
-  cuts[0] = nproc;
-  cuts[1] = 1;
-  cuts[2] = 1;
-  if (nproc == 4) { cuts[0] = 2; cuts[1] = 2; cuts[2] = 1; }
-  else if (nproc == 8) { cuts[0] = 2; cuts[1] = 2; cuts[2] = 2; }
-  else if (nproc == 27) { cuts[0] = 3; cuts[1] = 3; cuts[2] = 3; }
-}
-
 static MFTL_Ensemble *make_ensemble(void)
 {
   int cuts[3];
-  grid_for(g_nproc, cuts);
+  test_grid_for(g_nproc, cuts);
 
   double lo[3] = {-1.0, -1.0, -1.0};
   double hi[3] = {1.0, 1.0, 1.0};
@@ -221,22 +214,24 @@ static int test_both_routes_match_the_reference(void)
   const size_t bytes = (size_t) MFTL_MAX(n * N_SLOTS, 1) * sizeof(double);
 
   double *ref = (double *) malloc(bytes);
-  double *via_holders = (double *) malloc(bytes);
   double *via_global = (double *) malloc(bytes);
   double *via_auto = (double *) malloc(bytes);
 
   fill_contribution(ens, ref);
-  memcpy(via_holders, ref, bytes);
   memcpy(via_global, ref, bytes);
   memcpy(via_auto, ref, bytes);
 
   reference_reduce(ens, ref);
-  MFTLEnsembleReduceBodies(ens, via_holders, N_SLOTS, g_ops, MFTL_BODY_REDUCE_SCOPE_HOLDERS);
   MFTLEnsembleReduceBodies(ens, via_global, N_SLOTS, g_ops, MFTL_BODY_REDUCE_SCOPE_GLOBAL);
-  MFTLEnsembleReduceBodies(ens, via_auto, N_SLOTS, g_ops, MFTL_BODY_REDUCE_SCOPE_AUTO);
 
-  int ok = (memcmp(ref, via_holders, (size_t) n * N_SLOTS * sizeof(double)) == 0);
-  ok = ok && (memcmp(ref, via_global, (size_t) n * N_SLOTS * sizeof(double)) == 0);
+  /* AUTO must actually take the holder route here, or this compares the global
+   * route with itself: droplets are the regime the certificate is for. */
+  MFTLEnsembleResetBodyReduceStats();
+  MFTLEnsembleReduceBodies(ens, via_auto, N_SLOTS, g_ops, MFTL_BODY_REDUCE_SCOPE_AUTO);
+  long split[2];
+  route_split(split);
+
+  int ok = (memcmp(ref, via_global, (size_t) n * N_SLOTS * sizeof(double)) == 0);
   ok = ok && (memcmp(ref, via_auto, (size_t) n * N_SLOTS * sizeof(double)) == 0);
 
   /* NON-VACUITY: the holder count in slot 3. Bodies with only one holder would
@@ -260,10 +255,10 @@ static int test_both_routes_match_the_reference(void)
 
   TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
   TEST_ASSERT(g_nproc == 1 ? (holders_max == 1) : (holders_max > 1));
+  TEST_ASSERT(agreed(g_nproc == 1 ? (split[0] + split[1] == 0) : (split[0] == 1 && split[1] == 0), MPI_COMM_WORLD));
 
   free(via_auto);
   free(via_global);
-  free(via_holders);
   free(ref);
   MFTLEnsembleDestroy(&ens);
   return 0;
@@ -597,7 +592,7 @@ static int test_a_droplet_timestep_takes_no_global_reduction(void)
  * FAILURE IT GUARDS. The spanning driver hands out per-phase global id blocks
  * with MFTLEnsembleExscanBodies, and that call site spent a while pinned to
  * #MFTL_BODY_REDUCE_SCOPE_GLOBAL. Every mesh digest in
- * docs/parallel-remeshing-analysis.md reproduced bit for bit while it was, and
+ * docs/analysis.md §5.3 reproduced bit for bit while it was, and
  * every remeshing test passed -- BECAUSE THE TWO ROUTES COMPUTE THE SAME
  * ANSWER. That is the whole point of them, so no test of the ANSWER can ever
  * distinguish them; the only observable is which communicator was used, and
@@ -815,7 +810,8 @@ static int test_the_scan_tiles_every_body_exactly_once(void)
 }
 
 /**
- * @brief The two routes give the scan the same answer, to the bit.
+ * @brief The two routes give the scan the same answer, to the bit, and AUTO
+ *        really takes the holder route on droplets.
  *
  * Same argument as for the reduction: the holder route folds in ascending source
  * rank and the global route is an `MPI_Exscan`, so the two are independent
@@ -835,7 +831,10 @@ static int test_both_scan_routes_agree(void)
   fill_scan_contribution(ens, mine);
 
   memcpy(a_pre, mine, (size_t) n * sizeof(double));
-  MFTLEnsembleExscanBodies(ens, a_pre, a_tot, 1, MFTL_BODY_REDUCE_SCOPE_HOLDERS);
+  MFTLEnsembleResetBodyReduceStats();
+  MFTLEnsembleExscanBodies(ens, a_pre, a_tot, 1, MFTL_BODY_REDUCE_SCOPE_AUTO);
+  long split[2];
+  route_split(split);
 
   memcpy(b_pre, mine, (size_t) n * sizeof(double));
   MFTLEnsembleExscanBodies(ens, b_pre, b_tot, 1, MFTL_BODY_REDUCE_SCOPE_GLOBAL);
@@ -843,12 +842,201 @@ static int test_both_scan_routes_agree(void)
   const int bytes = n * (int) sizeof(double);
   TEST_ASSERT(agreed(n == 0 || memcmp(a_pre, b_pre, (size_t) bytes) == 0, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(n == 0 || memcmp(a_tot, b_tot, (size_t) bytes) == 0, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(g_nproc == 1 ? (split[0] + split[1] == 0) : (split[0] == 1 && split[1] == 0), MPI_COMM_WORLD));
 
   free(b_tot);
   free(b_pre);
   free(a_tot);
   free(a_pre);
   free(mine);
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/**
+ * @brief A thin closed tube bent twice in one layer of cells of a [0,3]^3 box.
+ *
+ * Its centre line runs +x from (0.2, 0.2), +y at x = 1.5, then +x again at
+ * y = 1.5, all at z = 0.5. On the 3x3x3 grid of unit cells that is the holder
+ * chain (0,0,0) - (1,0,0) - (1,1,0) - (2,1,0): every link one cell, no holder
+ * with chain neighbours on opposite sides along one axis, and yet the two ends
+ * two cells apart in x. Non-periodic, so they really are not neighbours.
+ *
+ * Built on rank 0 from an index list and published, so every other rank starts
+ * with an empty object -- MFTLRedistribute() then spreads it.
+ */
+static MFTL_Ensemble *make_bent_tube(void)
+{
+  int cuts[3];
+  test_grid_for(g_nproc, cuts);
+  double lo[3] = {0.0, 0.0, 0.0};
+  double hi[3] = {3.0, 3.0, 3.0};
+  bool per[3] = {MFTL_FALSE, MFTL_FALSE, MFTL_FALSE};
+  MFTL_Ensemble *ens = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, lo, hi, per, 1);
+
+  MFTL_Object *obj = MFTLObjectCreate(0);
+  MFTLEnsembleAddObject(ens, obj);
+
+  /* S segments per leg, a square cross-section of four vertices per ring, and
+   * two triangles closing each end. */
+  enum { S = 20, N = 3 * S + 1, NV = 4 * N, NT = 8 * (N - 1) + 4 };
+
+  if (g_rank == 0)
+  {
+    double c[N][2];
+    for (int j = 0; j < N; ++j)
+    {
+      if (j <= S)
+      {
+        c[j][0] = 0.2 + 1.3 * j / S;
+        c[j][1] = 0.2;
+      }
+      else if (j <= 2 * S)
+      {
+        c[j][0] = 1.5;
+        c[j][1] = 0.2 + 1.3 * (j - S) / S;
+      }
+      else
+      {
+        c[j][0] = 1.5 + 1.3 * (j - 2 * S) / S;
+        c[j][1] = 1.5;
+      }
+    }
+
+    double *pos = (double *) malloc(3 * NV * sizeof(double));
+    int *tri = (int *) malloc(3 * NT * sizeof(int));
+
+    for (int j = 0; j < N; ++j)
+    {
+      const int a = (j > 0) ? j - 1 : j, b = (j + 1 < N) ? j + 1 : j;
+      const double dx = c[b][0] - c[a][0], dy = c[b][1] - c[a][1];
+      const double len = hypot(dx, dy);
+      for (int k = 0; k < 4; ++k)
+      {
+        const double w = (k == 0 || k == 3) ? 0.01 : -0.01;
+        pos[3 * (4 * j + k) + 0] = c[j][0] - w * dy / len;
+        pos[3 * (4 * j + k) + 1] = c[j][1] + w * dx / len;
+        pos[3 * (4 * j + k) + 2] = 0.5 + ((k < 2) ? 0.01 : -0.01);
+      }
+    }
+
+    int t = 0;
+    for (int j = 0; j < N - 1; ++j)
+    {
+      for (int k = 0; k < 4; ++k)
+      {
+        const int a = 4 * j + k, b = 4 * (j + 1) + k;
+        const int c0 = 4 * j + (k + 1) % 4, d = 4 * (j + 1) + (k + 1) % 4;
+        tri[t++] = a;
+        tri[t++] = b;
+        tri[t++] = c0;
+        tri[t++] = c0;
+        tri[t++] = b;
+        tri[t++] = d;
+      }
+    }
+    const int e = 4 * (N - 1);
+    const int caps[12] = {0, 1, 2, 0, 2, 3, e, e + 2, e + 1, e, e + 3, e + 2};
+    for (int i = 0; i < 12; ++i) tri[t++] = caps[i];
+
+    MFTLBuildIndexedMesh(obj, pos, NV, tri, NT);
+    free(tri);
+    free(pos);
+  }
+
+  MFTLPublishGeneratedBodies(ens);
+  MFTLEnsembleComputeTriangleGeometry(ens);
+  MFTLRedistribute(ens);
+  return ens;
+}
+
+/**
+ * @brief A body whose halo passes every local test and whose holders are not
+ *        neighbours is refused AFTER the exchange, and stays exact.
+ *
+ * The pre-exchange scan -- ghost owners are neighbours, visible holders span one
+ * cell -- once decided the route on its own. It is necessary and not sufficient:
+ * on the bent tube it passes on every rank, the two ends of the chain never hear
+ * from each other, and the neighbourhood route handed rank (0,0,0) a triangle
+ * count of 386 of 484 and rank (2,1,0) an id range that overlapped its
+ * predecessors'. What closes it is statement 3 on MFTLEnsembleReduceBodies():
+ * the corner holder (1,0,0) receives records from BOTH ends and sees them two
+ * cells apart.
+ *
+ * Checked on the reduction AND the scan, because the scan hands out global ids
+ * and a missing predecessor there is two entities sharing one.
+ *
+ * NON-VACUITY at np = 27: the pre-scan must pass everywhere (or the old test
+ * alone would already have refused, and nothing new is exercised) and the route
+ * must still come out global. Below 27 every grid has at most two cells per axis,
+ * all holders are mutual neighbours, and the holder route must be taken.
+ */
+static int test_a_bent_body_is_certified_after_the_exchange(void)
+{
+  MFTL_Ensemble *ens = make_bent_tube();
+  const int n = ens->n_local_objects;
+  const size_t bytes = (size_t) MFTL_MAX(n * N_SLOTS, 1) * sizeof(double);
+
+  const int fits_local = MFTLEnsembleBodyHoldersFitTheGraph(ens) ? 1 : 0;
+  int fits = 0;
+  MPI_Allreduce(&fits_local, &fits, 1, MPI_INT, MPI_LAND, MPI_COMM_WORLD);
+
+  /* The reduction, against the reference. */
+  double *ref = (double *) malloc(bytes);
+  double *got = (double *) malloc(bytes);
+  fill_contribution(ens, ref);
+  memcpy(got, ref, bytes);
+  reference_reduce(ens, ref);
+
+  MFTLEnsembleResetBodyReduceStats();
+  MFTLEnsembleReduceBodies(ens, got, N_SLOTS, g_ops, MFTL_BODY_REDUCE_SCOPE_AUTO);
+  long split[2];
+  route_split(split);
+
+  const int ok_reduce = (memcmp(ref, got, (size_t) n * N_SLOTS * sizeof(double)) == 0);
+  const int holders = (n > 0) ? (int) ref[3] : 0;
+  int holders_max = 0;
+  MPI_Allreduce(&holders, &holders_max, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+
+  /* The scan of owned triangles, against MPI_Exscan in rank order: a non-holder
+   * contributes 0, so over comm_world it IS the prefix over the holders. */
+  const MFTL_Object *obj = MFTLEnsembleFindLocalObject(ens, 0);
+  const double mine = (obj != MFTL_NULL) ? (double) obj->tris.n_local : 0.0;
+  double expected = 0.0, all = 0.0;
+  MPI_Exscan(&mine, &expected, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+  if (g_rank == 0) expected = 0.0;
+  MPI_Allreduce(&mine, &all, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+
+  double pre = mine, tot = 0.0;
+  MFTLEnsembleResetBodyReduceStats();
+  MFTLEnsembleExscanBodies(ens, (obj != MFTL_NULL) ? &pre : MFTL_NULL, (obj != MFTL_NULL) ? &tot : MFTL_NULL, 1, MFTL_BODY_REDUCE_SCOPE_AUTO);
+  long scan_split[2];
+  route_split(scan_split);
+
+  const int ok_scan = (obj == MFTL_NULL) || (pre == expected && tot == all);
+
+  if (g_rank == 0)
+  {
+    printf("\n    np=%d: bent tube -> %d holders, pre-scan %s, route %s, %.0f triangles\n", g_nproc, holders_max, fits ? "passes" : "refuses",
+           split[1] > 0 ? "global" : "holders", all);
+  }
+
+  TEST_ASSERT(agreed(ok_reduce, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ok_scan, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(all == 8.0 * (3 * 20) + 4.0, MPI_COMM_WORLD));
+
+  if (g_nproc == 27)
+  {
+    TEST_ASSERT(agreed(fits && holders_max >= 4, MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(split[1] == 1 && scan_split[1] == 1, MPI_COMM_WORLD));
+  }
+  else if (g_nproc > 1)
+  {
+    TEST_ASSERT(agreed(split[0] == 1 && scan_split[0] == 1, MPI_COMM_WORLD));
+  }
+
+  free(got);
+  free(ref);
   MFTLEnsembleDestroy(&ens);
   return 0;
 }
@@ -866,6 +1054,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_every_holder_gets_the_same_bits);
   RUN_TEST(test_an_empty_holder_forces_the_global_route);
   RUN_TEST(test_a_spanning_body_falls_back_and_stays_exact);
+  RUN_TEST(test_a_bent_body_is_certified_after_the_exchange);
   RUN_TEST(test_a_rank_with_no_bodies_still_participates);
   RUN_TEST(test_the_library_consumers_still_see_the_whole_body);
   RUN_TEST(test_a_droplet_timestep_takes_no_global_reduction);

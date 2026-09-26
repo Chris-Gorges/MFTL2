@@ -149,12 +149,8 @@
 #define MFTL_SQ(x) ((x) * (x))
 /** @brief Square root of @p x. */
 #define MFTL_SQRT(x) sqrt(x)
-/** @brief Absolute value of @p x. @p x is evaluated twice. */
-#define MFTL_ABS(x) (((x) < 0) ? -(x) : (x))
 /** @brief Cosine of @p x, in radians. */
 #define MFTL_COS(x) cos(x)
-/** @brief Sine of @p x, in radians. */
-#define MFTL_SIN(x) sin(x)
 /** @brief Largest finite `double`. Used as the identity of a running minimum. */
 #define MFTL_DBL_MAX DBL_MAX
 /** @brief Smallest positive normalised `double`. */
