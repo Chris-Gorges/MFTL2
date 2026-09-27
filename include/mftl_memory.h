@@ -1,6 +1,8 @@
 /*
- * @Author: Christian Gorges
- * @Date: 2025-10-27
+ * MFTL2 core — growth of the flat entity arrays (MFTL_ENSURE_CAPACITY / MFTL_RESERVE_ADDITIONAL).
+ *
+ * Grown regions are zero-filled, and an allocation failure terminates the program (recovery
+ * from out-of-memory is impractical in an MPI job).
  */
 
 #ifndef MFTL_MEMORY_H
@@ -12,11 +14,7 @@
 #include "mftl_constants.h"
 
 /**
- * @brief Ensures an array has enough capacity to hold 'needed' additional items.
- *
- * This macro implements a geometric growth strategy (x2) to amortize allocation costs.
- * It strictly handles allocation failures by printing an error and exiting,
- * which is standard practice for HPC applications where recovery from OOM is impractical.
+ * @brief Grows *capacity to target_cap (no-op when it is already large enough).
  *
  * The newly grown region is always zeroed, so slots handed out from fresh
  * capacity never inherit garbage from realloc'd memory (in particular stray
@@ -33,7 +31,7 @@
   do                                                                                                                   \
   {                                                                                                                    \
     int _req_cap = (target_cap);                                                                                       \
-    /* Safety: Only realloc if we actually need more space */                                                          \
+                                                                                                                       \
     if (_req_cap > (*(capacity)))                                                                                      \
     {                                                                                                                  \
       int _old_cap = (*(capacity));                                                                                    \
@@ -54,8 +52,8 @@
   } while (0)
 
 /**
- * @brief Default Geometric Growth (x2).
- * Use this for incremental additions (e.g., inside a loop).
+ * @brief Geometric growth (x2, starting at MFTL_INIT_CAPACITY) so that `needed` more items fit;
+ * for incremental additions.
  */
 #define MFTL_ENSURE_CAPACITY(ptr, count, capacity, needed, type)              \
   do                                                                          \
@@ -63,7 +61,7 @@
     if ((*(count)) + (needed) > (*(capacity)))                                \
     {                                                                         \
       int _new_cap = (*(capacity) == 0) ? MFTL_INIT_CAPACITY : (*(capacity)); \
-      /* Geometric doubling until we fit the need */                          \
+                                                                              \
       while (_new_cap < (*(count)) + (needed))                                \
       {                                                                       \
         _new_cap *= 2;                                                        \
@@ -73,9 +71,7 @@
   } while (0)
 
 /**
- * @brief Exact Growth.
- * Use this when you know exactly how many items you are about to add (Bulk Loading).
- * This saves memory by avoiding the "x2" overhead.
+ * @brief Exact growth to count + needed; for bulk loading when the number of items is known.
  */
 #define MFTL_RESERVE_ADDITIONAL(ptr, count, capacity, needed, type) \
   do                                                                \

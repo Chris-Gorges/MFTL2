@@ -1,8 +1,13 @@
 /*
- * @Author: Christian Gorges
- * @Date: 2025-08-09 14:35:27
- * @Last Modified by: Christian Gorges
- * @Last Modified time: 2025-09-22 19:52:21
+ * MFTL2 core — half-edge topology: array accessors, navigation (next/prev/twin/origin/target),
+ * the twin-state predicates, one-ring traversal, flattened connectivity, builders (triples,
+ * distributed soups, staged copies), and the topology invariant API of plans/16 (declared class,
+ * rings, validation, ghost completion, boundary loops).
+ *
+ * Twin states (plans/16 §2.1): every live half-edge of a quiescent mesh is LOCAL (twin stored
+ * here), REMOTE (twin on another rank: an MPI rim) or BOUNDARY (a tagged physical boundary).
+ * twin_gid is read only through the predicates below. A NULL from MFTLHeTwin means "no stored
+ * twin" — either a physical boundary or an MPI rim — and must not be taken as a boundary.
  */
 
 #ifndef MFTL_TOPOLOGY_H
@@ -40,27 +45,27 @@ static inline MFTL_Triangle *MFTLGetTriangle(const MFTL_Object *obj, int idx)
 }
 
 // -----------------------------------------------------------------------------
-// 2. VERTEX NAVIGATION
+// VERTEX NAVIGATION
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Get the outgoing half-edge starting from this vertex.
- * @return Pointer to the half-edge, or NULL if isolated.
+ * @brief The stored outgoing half-edge of a vertex (the outgoing BOUNDARY half-edge on a
+ * boundary vertex, plans/16 §2.6).
+ * @return Pointer to the half-edge, or NULL if the vertex has none (out_he_idx == -1).
  */
 static inline MFTL_HalfEdge *MFTLVOutHe(const MFTL_Object *obj, const MFTL_Vertex *v) { return MFTLGetHalfedge(obj, v->out_he_idx); }
 
 // -----------------------------------------------------------------------------
-// 3. TRIANGLE NAVIGATION
+// TRIANGLE NAVIGATION
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Get the first half-edge associated with this triangle.
+ * @brief The half-edge the triangle stores (he_idx; the "first" half-edge of the triangle).
  */
 static inline MFTL_HalfEdge *MFTLTHe(const MFTL_Object *obj, const MFTL_Triangle *t) { return MFTLGetHalfedge(obj, t->he_idx); }
 
 /**
- * @brief Get the three half-edges of a triangle in CCW order.
- * @param[out] out_he Array of 3 pointers to store the results.
+ * @brief The three half-edges of a triangle in winding order, starting at he_idx.
  */
 static inline void MFTLGetTriangleHalfedges(const MFTL_Object *obj, const MFTL_Triangle *tri, MFTL_HalfEdge *out_he[3])
 {
@@ -70,54 +75,50 @@ static inline void MFTLGetTriangleHalfedges(const MFTL_Object *obj, const MFTL_T
 }
 
 /**
- * @brief Get the three vertices of a triangle in CCW order.
- * @param[out] out_verts Array of 3 pointers to store the results.
+ * @brief The three vertices of a triangle in winding order: origin of he0, then the targets
+ * of he0 and he1. (v1 - v0) x (v2 - v0) is the triangle normal.
  */
 static inline void MFTLGetTriangleVertices(const MFTL_Object *obj, const MFTL_Triangle *tri, MFTL_Vertex *out_verts[3])
 {
   MFTL_HalfEdge *out_he[3];
   MFTLGetTriangleHalfedges(obj, tri, out_he);
 
-  // Assign Vertices
-  // Note order: The "first" vertex of the triangle is the Origin of HE0.
-  // Origin of HE0 == Target of HE2.
+  // origin of he0 == target of he2
   out_verts[0] = (MFTL_Vertex *) &obj->vertices[out_he[2]->vertex_idx];
   out_verts[1] = (MFTL_Vertex *) &obj->vertices[out_he[0]->vertex_idx];
   out_verts[2] = (MFTL_Vertex *) &obj->vertices[out_he[1]->vertex_idx];
 }
 
 // -----------------------------------------------------------------------------
-// 4. HALFEDGE NAVIGATION (The Core Topology)
+// HALF-EDGE NAVIGATION
 // -----------------------------------------------------------------------------
 
 /**
- * @brief Get the vertex at the END (Target) of this half-edge.
+ * @brief The vertex at the END (target) of a half-edge.
  */
 static inline MFTL_Vertex *MFTLHeTarget(const MFTL_Object *obj, const MFTL_HalfEdge *he) { return MFTLGetVertex(obj, he->vertex_idx); }
 
 /**
- * @brief Get the vertex at the START (Origin) of this half-edge.
- * * @note Uses the "Next->Next" traversal strategy. This is safer than 
- * using twin->vertex because it works on boundary edges where twin is NULL.
+ * @brief The vertex at the START (origin) of a half-edge: the target of the previous
+ * half-edge of the same triangle (next->next), so it needs no twin.
  */
 static inline MFTL_Vertex *MFTLHeOrigin(const MFTL_Object *obj, const MFTL_HalfEdge *he)
 {
-  // Jump forward twice in the triangle loop to find the "previous" edge
   const MFTL_HalfEdge *next = &obj->half_edges[he->next_idx];
   const MFTL_HalfEdge *prev = &obj->half_edges[next->next_idx];
-
-  // The target of the "previous" edge is the origin of the "current" edge
   return MFTLGetVertex(obj, prev->vertex_idx);
 }
 
 /**
- * @brief Get the TWIN (Opposite) half-edge.
- * @return Pointer to twin, or NULL if this is a boundary edge.
+ * @brief The stored twin (LOCAL state).
+ * @return Pointer to the twin, or NULL when the twin is not stored on this rank: a physical
+ * boundary (BOUNDARY) OR an MPI rim (REMOTE) — use the predicates to tell them apart.
  */
 static inline MFTL_HalfEdge *MFTLHeTwin(const MFTL_Object *obj, const MFTL_HalfEdge *he) { return MFTLGetHalfedge(obj, he->twin_idx); }
 
-/* ---- Stage 16A twin-state predicates (plans/16 §2.1). The ONLY sanctioned readers of
-   twin_idx-as-state and twin_gid; see MFTL_TWIN_* in mftl_constants.h. ---- */
+/* ---- Twin-state predicates (plans/16 §2.1). The ONLY sanctioned readers of twin_idx-as-state
+   and twin_gid (enforced by tools/check_twin_gid_readers.sh); see MFTL_TWIN_* in
+   mftl_constants.h. ---- */
 static inline bool MFTLHeIsLocal(const MFTL_HalfEdge *he) { return he->twin_idx >= 0; }
 static inline bool MFTLHeIsRemote(const MFTL_HalfEdge *he) { return he->twin_idx < 0 && he->twin_gid >= 0; }
 static inline bool MFTLHeIsBoundary(const MFTL_HalfEdge *he) { return he->twin_idx < 0 && he->twin_gid <= MFTL_TWIN_NONE; }
@@ -146,7 +147,7 @@ static inline void MFTLHeSetRemote(MFTL_HalfEdge *he, int partner_gid)
 
 /* Global id of the opposite half-edge for LOCAL (the stored twin's id) and REMOTE (the
    retained rim id); MFTL_ERROR for BOUNDARY (and for the transient UNKNOWN state), so a
-   boundary code is never mistaken for a gid. Stage 15 (L3) / Stage 16A. */
+   boundary code is never mistaken for a gid. */
 static inline int MFTLHeTwinGid(const MFTL_Object *obj, const MFTL_HalfEdge *he)
 {
   if (he->twin_idx >= 0) return obj->half_edges[he->twin_idx].global_id;
@@ -168,13 +169,12 @@ static inline int MFTLHeEdgeId(const MFTL_Object *obj, const MFTL_HalfEdge *he)
 }
 
 /**
- * @brief Get the NEXT half-edge in the triangle loop (CCW).
+ * @brief The next half-edge of the same triangle (winding order).
  */
 static inline MFTL_HalfEdge *MFTLHeNext(const MFTL_Object *obj, const MFTL_HalfEdge *he) { return MFTLGetHalfedge(obj, he->next_idx); }
 
 /**
- * @brief Get the PREVIOUS half-edge in the triangle loop (CCW).
- * @note Implicitly calculates Next->Next.
+ * @brief The previous half-edge of the same triangle (next->next).
  */
 static inline MFTL_HalfEdge *MFTLHePrev(const MFTL_Object *obj, const MFTL_HalfEdge *he)
 {
@@ -183,14 +183,12 @@ static inline MFTL_HalfEdge *MFTLHePrev(const MFTL_Object *obj, const MFTL_HalfE
 }
 
 /**
- * @brief Get the TRIANGLE this half-edge belongs to.
- * @return Pointer to triangle, or NULL if this is a boundary half-edge.
+ * @brief The triangle this half-edge belongs to (every half-edge has one).
  */
 static inline MFTL_Triangle *MFTLHeTriangle(const MFTL_Object *obj, const MFTL_HalfEdge *he) { return MFTLGetTriangle(obj, he->triangle_idx); }
 
 /**
- * @brief Get the ADJACENT TRIANGLE this half-edge's twin belongs to.
- * @return Pointer to triangle, or NULL if this is a boundary half-edge.
+ * @brief The triangle across the edge; requires a stored twin (LOCAL; asserted).
  */
 static inline MFTL_Triangle *MFTLHeAdjacentTriangle(const MFTL_Object *obj, const MFTL_HalfEdge *he)
 {
@@ -199,32 +197,31 @@ static inline MFTL_Triangle *MFTLHeAdjacentTriangle(const MFTL_Object *obj, cons
   return MFTLGetTriangle(obj, twin->triangle_idx);
 }
 
-/* VERTEX ONE-RING TRAVERSAL FUNCTIONS */
+/* VERTEX ONE-RING TRAVERSAL
+   The fan of a vertex is walked through its outgoing half-edges (out -> twin -> next). Seen
+   from the side into which the triangle normals point (outside an outward-wound body),
+   next(twin(h)) turns CLOCKWISE around the vertex and twin(prev(h)) counter-clockwise. The
+   walk stops at an outgoing half-edge without a stored twin (physical boundary OR MPI rim).
+   Unless is_inner is set, the walk first rewinds counter-clockwise to such a stop, so an open
+   or rim-cut fan is returned from one end to the other. MFTLVertexRing classifies a fan as
+   closed / open-complete / incomplete. */
 
 /**
- * @brief Retrieves the 1-ring of triangles surrounding a vertex.
- * * @param obj The mesh object.
- * @param v The vertex to query.
- * @param[out] out_tris User-allocated buffer for triangle pointers.
- * @param max_tris Safety limit for the buffer.
- * @param is_inner Set to MFTL_TRUE if you are CERTAIN the vertex is an inner vertex and has a full one ring neighborhood.
- * This skips the boundary search (Rewind step) for performance.
- * @return The number of triangles found.
+ * @brief The triangles of the stored fan of v (see above); max_tris bounds out_tris.
+ * is_inner = MFTL_TRUE skips the rewind (only valid for a closed fan).
+ * @return The number of triangles.
  */
 static inline int MFTLGetVertexOneRing(const MFTL_Object *obj, const MFTL_Vertex *v, MFTL_Triangle **out_tris, int max_tris, bool is_inner)
 {
   int count = 0;
 
-  // 1. Start at the vertex's primary outgoing half-edge
   MFTL_HalfEdge *start_he = MFTL_NULL;
   start_he = MFTLVOutHe(obj, v);
   assert(start_he);
 
   MFTL_HalfEdge *curr = start_he;
 
-  // 2. Rewind (Only if NOT inner)
-  // If we know it's an inner vertex, we are already inside a closed loop,
-  // so any starting edge is valid and we don't need to find a "start" point.
+  // rewind counter-clockwise to the first outgoing half-edge of an open / cut fan
   if (is_inner == MFTL_FALSE)
   {
     while (true)
@@ -232,32 +229,26 @@ static inline int MFTLGetVertexOneRing(const MFTL_Object *obj, const MFTL_Vertex
       MFTL_HalfEdge *incoming = MFTLHePrev(obj, curr);
       MFTL_HalfEdge *cw_neighbor = MFTLHeTwin(obj, incoming);
 
-      // Stop if we hit a boundary
-      if (!cw_neighbor) break;
+      if (!cw_neighbor) break;  // no stored twin: boundary or rim
 
-      // Stop if we wrapped around (closed 1-ring)
-      if (cw_neighbor == start_he) break;
+      if (cw_neighbor == start_he) break;  // closed fan
 
       curr = cw_neighbor;
     }
-    // Update start_he so the CCW loop knows when it has completed the circle
     start_he = curr;
   }
 
-  // 3. Replay: Move Counter-Clockwise (CCW) to collect triangles.
+  // clockwise walk (next(twin)) collecting the triangles
   do
   {
-    // Buffer safety check
     assert(count < max_tris && "Buffer overflow in MFTLGetVertexOneRing");
 
-    // Add the triangle belonging to the current half-edge
     out_tris[count++] = MFTLGetTriangle(obj, curr->triangle_idx);
 
-    // Move to the next outgoing half-edge in CCW order
     MFTL_HalfEdge *twin = MFTL_NULL;
     twin = MFTLHeTwin(obj, curr);
 
-    // Boundary check (Required even for inner loops to detect the end of the loop logic in case of boundary edges)
+    // end of an open / cut fan (also checked with is_inner)
     if (twin == MFTL_NULL) break;
 
     curr = MFTLHeNext(obj, twin);
@@ -268,14 +259,10 @@ static inline int MFTLGetVertexOneRing(const MFTL_Object *obj, const MFTL_Vertex
 }
 
 /**
- * @brief Retrieves the 1-ring of neighbor vertices.
- *
- * @param obj The mesh object.
- * @param v The central vertex.
- * @param[out] out_verts User-allocated array for vertex pointers.
- * @param max_verts Safety limit for the buffer.
- * @param is_inner Optimization flag. Set to TRUE to skip boundary rewind.
- * @return The number of neighbors found.
+ * @brief The neighbour vertices of v: the targets of the outgoing half-edges of its stored
+ * fan (for an open fan the last neighbour across the final edge is not included).
+ * is_inner as in MFTLGetVertexOneRing.
+ * @return The number of neighbours.
  */
 static inline int MFTLGetVertexOneRingVertices(const MFTL_Object *obj, const MFTL_Vertex *v, MFTL_Vertex **out_verts, int max_verts, bool is_inner)
 {
@@ -287,7 +274,6 @@ static inline int MFTLGetVertexOneRingVertices(const MFTL_Object *obj, const MFT
 
   MFTL_HalfEdge *curr = start_he;
 
-  // 2. Rewind (Optional)
   if (is_inner == MFTL_FALSE)
   {
     while (true)
@@ -301,15 +287,12 @@ static inline int MFTLGetVertexOneRingVertices(const MFTL_Object *obj, const MFT
     start_he = curr;
   }
 
-  // 3. Replay (CCW)
   do
   {
     assert(count < max_verts && "Buffer overflow in MFTLGetVertexOneRingVertices");
 
-    // Add Neighbor (Target of outgoing HE)
     out_verts[count++] = MFTLHeTarget(obj, curr);
 
-    // Advance
     MFTL_HalfEdge *twin = MFTL_NULL;
     twin = MFTLHeTwin(obj, curr);
     if (!twin) break;
@@ -322,53 +305,40 @@ static inline int MFTLGetVertexOneRingVertices(const MFTL_Object *obj, const MFT
 }
 
 /**
- * @brief Retrieves the indices of the 1-ring of outgoing half-edges for a vertex.
- * This is the "Edge-based" variant of the one-ring search.
- *
- * @param obj The mesh object.
- * @param v The central vertex.
- * @param[out] out_he_indices User-allocated array for half-edge INDICES.
- * @param max_he Safety limit for the buffer (usually 64 is plenty).
- * @param is_inner Optimization flag. Set to true if you are certain the vertex is not on the boundary.
- * @return The number of edges found.
+ * @brief The local indices of the outgoing half-edges of the stored fan of v (0 when v has no
+ * outgoing half-edge). is_inner as in MFTLGetVertexOneRing.
+ * @return The number of half-edges.
  */
 static inline int MFTLGetVertexOneRingHalfedges(const MFTL_Object *obj, const MFTL_Vertex *v, int *out_he_indices, int max_he, bool is_inner)
 {
   int count = 0;
 
-  // 1. Get Start
   MFTL_HalfEdge *start_he = MFTLVOutHe(obj, v);
-  if (!start_he) return 0;  // Isolated vertex
+  if (!start_he) return 0;
 
   MFTL_HalfEdge *curr = start_he;
 
-  // 2. Rewind (Find the "first" edge in the fan if on boundary)
   if (is_inner == false)
   {
     while (true)
     {
-      MFTL_HalfEdge *incoming = MFTLHePrev(obj, curr);  // Uses Next->Next
+      MFTL_HalfEdge *incoming = MFTLHePrev(obj, curr);
       MFTL_HalfEdge *cw_neighbor = MFTLHeTwin(obj, incoming);
 
-      // Stop if boundary hit or loop closed
       if (!cw_neighbor || cw_neighbor == start_he) break;
       curr = cw_neighbor;
     }
     start_he = curr;
   }
 
-  // 3. Replay (Collect Indices)
   do
   {
     assert(count < max_he && "Buffer overflow in MFTLGetVertexOneRingHalfedges");
 
-    // CALCULATE INDEX: Pointer Arithmetic (Safe within this function scope)
-    // This converts the pointer 'curr' back to its integer index in the pool.
     out_he_indices[count++] = (int) (curr - obj->half_edges);
 
-    // Advance
     MFTL_HalfEdge *twin = MFTLHeTwin(obj, curr);
-    if (!twin) break;  // Boundary stop
+    if (!twin) break;
 
     curr = MFTLHeNext(obj, twin);
 
@@ -378,63 +348,66 @@ static inline int MFTLGetVertexOneRingHalfedges(const MFTL_Object *obj, const MF
 }
 
 /**
- * @brief Retrieves the three neighboring triangles of a given triangle.
- * * The neighbors are ordered corresponding to the triangle's half-edges (CCW).
- * * @param obj The mesh object.
- * @param tri The triangle to query.
- * @param[out] out_neighbors An array of 3 MFTL_Triangle* pointers. 
- * Entries will be NULL if the edge is a boundary.
+ * @brief The triangles across the three edges of tri, in half-edge order; NULL where the edge
+ * has no stored twin (physical boundary or MPI rim).
  */
 static inline void MFTLGetTriangleNeighbors(MFTL_Object *obj, MFTL_Triangle *tri, MFTL_Triangle *out_neighbors[3])
 {
-  // 1. Get the three half-edges of the triangle in CCW order
   MFTL_HalfEdge *edges[3];
   MFTLGetTriangleHalfedges(obj, tri, edges);
 
-  // 2. Iterate over the edges to find the adjacent triangles
   for (int i = 0; i < 3; i++)
   {
-    // The neighbor is located across the Twin half-edge
     MFTL_HalfEdge *twin = MFTL_NULL;
     twin = MFTLHeTwin(obj, edges[i]);
 
     if (twin)
     {
-      // Found a neighbor
       out_neighbors[i] = MFTLHeTriangle(obj, twin);
     }
     else
     {
-      // This edge is a boundary (no neighbor)
       out_neighbors[i] = MFTL_NULL;
     }
   }
 }
 
 /**
- * @brief Rebuilds the twin indices for all half-edges.
+ * @brief Re-pairs the stored half-edges (rank-local): a half-edge u->v becomes LOCAL with the
+ * stored v->u; an unpaired half-edge keeps its state code (REMOTE gid / BOUNDARY code / UNKNOWN).
+ * Needs local vertex indices; refreshes the boundary cache and the boundary-vertex
+ * out-half-edge convention (MFTLRefreshBoundaryCache).
  */
 void MFTLRebuildTwins(MFTL_Object *obj);
 
 /**
- * @brief Converts global ids to local indices based on the hash maps.
+ * @brief After unpacking: converts vertex_idx and out_he_idx from global ids to local indices
+ * through the id maps (a vertex whose packed out half-edge is not stored gets the next
+ * half-edge of an incoming one). Twins are left to MFTLRebuildTwins. A half-edge whose target
+ * vertex is missing is fatal.
  */
 void MFTLConvertGlobalToLocalIndices(MFTL_Object *obj);
 
 /**
- * @brief Builds internal cache-friendly integer arrays for mesh connectivity.
- * Populates: flat_tri_verts, flat_tri_neighbors, vert_offsets, vert_tris.
- * 1. Triangle Maps (flat_tri_*): Direct lookup of vertices and neighbors for a triangle.
- * 2. Vertex Maps (vert_*): Compressed Sparse Row (CSR) structure for lookup of incident triangles for a vertex.
+ * @brief Builds the flattened connectivity arrays (rank-local):
+ *  - flat_tri_verts[3t + j]: target vertex of the j-th half-edge of triangle t (a cyclic
+ *    rotation of MFTLGetTriangleVertices' order, same orientation);
+ *  - flat_tri_neighbors[3t + j]: triangle across that half-edge, -1 if its twin is not stored;
+ *  - vert_offsets / vert_tris: CSR vertex -> incident stored triangles.
+ * Rebuild after every topology change.
  */
 void MFTLFlattenConnectivity(MFTL_Object *obj);
 
+/**
+ * @brief Rank-local structural check: index bounds, triangle half-edge cycles, twin symmetry
+ * and vertex consistency, no unresolved twin state, BOUNDARY only on declared-open bodies.
+ * Silent on success; prints every violation. Returns MFTL_SUCCESS / MFTL_ERROR.
+ */
 int MFTLCheckMeshIntegrity(MFTL_Object *object);
 
 /**
  * @struct MFTL_Neighborhood
- * @brief Container for the results of a neighborhood search.
- * Includes dynamic arrays for vertices and triangles found during traversal.
+ * @brief Result of MFTLGetNeighborhood: gathered vertex and triangle local indices.
  */
 typedef struct MFTL_Neighborhood
 {
@@ -448,7 +421,7 @@ typedef struct MFTL_Neighborhood
 } MFTL_Neighborhood;
 
 /**
- * @brief Helper to free the neighborhood result arrays.
+ * @brief Frees the arrays of a neighbourhood result.
  */
 static inline void MFTLFreeNeighborhood(MFTL_Neighborhood *nb)
 {
@@ -459,35 +432,14 @@ static inline void MFTLFreeNeighborhood(MFTL_Neighborhood *nb)
 }
 
 /**
- * @brief Gather the neighborhood of a set of seeds by traversing the mesh topology.
+ * @brief Breadth-first gathering on the vertex/triangle incidence graph (rank-local, stored
+ * entities only). Each step alternates the expansion: vertices -> incident triangles (CSR
+ * arrays), triangles -> their corners (flat_tri_verts). One step from a vertex gives its
+ * triangles; two steps also their vertices (the full one-ring).
  *
- * @details This function performs a Breadth-First Search (BFS) starting from the provided
- * seed indices (vertices or triangles). It treats the mesh as a bipartite graph
- * where vertices connect to triangles, and triangles connect to vertices.
- * * It alternates expansion types at each step:
- * - If currently holding **Vertices**: It gathers all incident **Triangles**.
- * - If currently holding **Triangles**: It gathers all incident **Vertices**.
- * * This approach is more robust than purely edge-based traversal as it naturally 
- * captures the full "star" of a vertex or the full set of corners of a triangle.
- *
- * ### Optimization
- * The function uses the flattened connectivity arrays (`vert_offsets` / `vert_tris` for V->T 
- * and `flat_tri_verts` for T->V) to ensure maximum cache coherency and avoid pointer chasing.
- * It uses a double-buffered queue system to minimize memory allocation overhead during the loop.
- *
- * @note    The meaning of `steps` is topological hops, not geometric distance:
- * - **1 Step** from a Vertex gathers its incident Triangles (the "Umbrella").
- * - **2 Steps** from a Vertex gathers incident Triangles AND their other Vertices (the full "1-Ring").
- *
- * @param[in]  obj               The mesh object containing the topology.
- * @param[in]  seed_indices      Array of local indices serving as the starting front.
- * @param[in]  n_seeds           Number of indices in `seed_indices`.
- * @param[in]  use_vertex_seeds  Set to `true` if seeds are Vertex indices, `false` for Triangle indices.
- * @param[in]  steps             Number of bipartite hops to expand. 
- * (e.g., 2 steps = V->T->V).
- * @param[out] out_result        Pointer to a user-allocated `MFTL_Neighborhood` struct 
- * where the results will be stored. Arrays are allocated internally 
- * and must be freed by the user (or `MFTLFreeNeighborhood`).
+ * seed_indices are vertex (use_vertex_seeds) or triangle local indices; the seeds themselves
+ * are part of the result. The result arrays are allocated here (free with
+ * MFTLFreeNeighborhood). MFTL_FLAG_VISITED is used internally and cleared again.
  */
 void MFTLGetNeighborhood(MFTL_Object *restrict obj, int *restrict seed_indices, int n_seeds, bool use_vertex_seeds, int steps,
                          MFTL_Neighborhood *restrict out_result);
@@ -496,18 +448,19 @@ void MFTLGetNeighborhood(MFTL_Object *restrict obj, int *restrict seed_indices, 
  * @brief Builds complete half-edge topology from a vertex list and a list of
  *        triangle index triples (generators and mesh I/O share this path).
  *
- * Wiring convention (matches generate_icosahedron/generators): for a triangle
- * triple (a, b, c), the three half-edges target the NEXT vertex (b, c, a) and
- * cycle within the triangle. The caller is responsible for consistent
- * (e.g. outward) winding of the triples — see MFTLObjectVolume's sign.
+ * Wiring convention (matches the generators): for a triangle triple (a, b, c), the three
+ * half-edges target the NEXT vertex (b, c, a) and cycle within the triangle. The caller is
+ * responsible for consistent (e.g. outward) winding of the triples — see MFTLObjectVolume's
+ * sign.
  *
  * Fills vertices/triangles/half_edges, assigns sequential global ids and sets
  * the next_*_gid counters, links one outgoing half-edge per vertex, then runs
- * MFTLRebuildTwins + MFTLFlattenConnectivity. Positions are stored verbatim
- * (NO periodic wrapping — callers apply MFTLApplyPeriodicity beforehand if
- * desired). The object must be empty.
+ * MFTLRebuildTwins + MFTLFlattenConnectivity. Positions are stored verbatim with img = 0 (a
+ * caller with continuous input wraps them first, e.g. MFTLWrapContinuous, and sets the
+ * counters); the wrap flags are invalid until the next collective canonicalisation. The object
+ * must be empty.
  *
- * Stage 16A: rank-local. A half-edge without a partner becomes BOUNDARY only when the object
+ * Rank-local. A half-edge without a partner becomes BOUNDARY only when the object
  * is declared open (MFTLObjectDeclareOpen; tags = boundary-loop index ordered by the
  * smallest vertex gid of the loop); on a closed object it is an error. Duplicate directed
  * half-edges (non-manifold edge / inconsistent orientation / Mobius) and bow-tie vertices
@@ -516,7 +469,8 @@ void MFTLGetNeighborhood(MFTL_Object *restrict obj, int *restrict seed_indices, 
 int MFTLBuildTopologyFromTriples(MFTL_Object* obj, int nV, const double positions[][3], int nF, const int triples[][3]);
 
 /**
- * @brief Stage 15: builds an EMPTY object from a distributed triangle soup with global ids.
+ * @brief Builds an EMPTY object from a distributed triangle soup with global ids (closed body;
+ * see MFTLBuildFromSoupEx for open bodies).
  *
  * Vertex i has global id vgid[i], position pos[i] and owner vowner[i] (NULL: this rank);
  * triangle t has global id tgid[t], vertex global ids tvg[t][0..2] (the order defines the
@@ -531,8 +485,8 @@ int MFTLBuildTopologyFromTriples(MFTL_Object* obj, int nV, const double position
 int MFTLBuildFromSoup(MFTL_Object *obj, int nV, const int *vgid, const double (*pos)[3], const int *vowner, int nT, const int *tgid, const int (*tvg)[3],
                       const int *towner);
 
-/* Stage 16A boundary declaration of a soup (plans/16 §2.2). Honoured only for a body declared
-   open (MFTLObjectDeclareOpen, before the build). */
+/* Boundary declaration of a soup (plans/16 §2.2). Honoured only for a body declared open
+   (MFTLObjectDeclareOpen, before the build). */
 typedef struct MFTL_BoundaryEdgeDecl
 {
   int vgid_a, vgid_b;  ///< undirected edge (vertex global ids)
@@ -549,7 +503,7 @@ typedef struct MFTL_BoundaryDecl
 } MFTL_BoundaryDecl;
 
 /**
- * @brief Stage 16A: MFTLBuildFromSoup with an explicit boundary declaration.
+ * @brief MFTLBuildFromSoup with an explicit boundary declaration.
  *
  * Twins are paired locally, then every unpaired half-edge is resolved in GLOBAL discovery
  * mode (all ranks, before ownership): a partner anywhere -> REMOTE. An edge unmatched
@@ -561,24 +515,24 @@ typedef struct MFTL_BoundaryDecl
 int MFTLBuildFromSoupEx(MFTL_Object *obj, int nV, const int *vgid, const double (*pos)[3], const int *vowner, int nT, const int *tgid,
                         const int (*tvg)[3], const int *towner, const MFTL_BoundaryDecl *decl);
 
-/** @brief Stage 16B: as MFTLBuildFromSoupEx, with the WRAPPED positions and explicit image
+/** @brief As MFTLBuildFromSoupEx, with the WRAPPED positions and explicit image
  *  counters of every vertex (native restart, §3.2); canonicalised afterwards like every build. */
 int MFTLBuildFromSoupImg(MFTL_Object *obj, int nV, const int *vgid, const double (*pos)[3], const int (*vimg)[3], const int *vowner, int nT,
                          const int *tgid, const int (*tvg)[3], const int *towner, const MFTL_BoundaryDecl *decl);
 
 /**
- * @brief Stage 15: copies triangle tri_idx of src (with its half-edges and missing vertices,
+ * @brief Copies triangle tri_idx of src (with its half-edges and missing vertices,
  * payload and surface scalar) into dst unless dst already stores that triangle id. Twins
  * are linked through the retained twin gids. Returns the triangle's index in dst. Rank-local.
  *
- * Stage 16A: the copy is STAGED — a half-edge whose twin is not in dst keeps the source's
+ * The copy is STAGED — a half-edge whose twin is not in dst keeps the source's
  * state code (REMOTE gid / BOUNDARY code) and dst is not quiescent until the batch is closed
  * by MFTLObjectCommitCopy (collective).
  */
 int MFTLObjectAppendTriangleCopy(MFTL_Object *dst, const MFTL_Object *src, int tri_idx);
 
 /**
- * @brief Stage 16A: closes a batch of staged copies (collective, GLOBAL discovery mode).
+ * @brief Closes a batch of staged copies (collective, GLOBAL discovery mode).
  *
  * Every non-LOCAL, non-BOUNDARY half-edge of dst is resolved against the live authoritative
  * (non-ghost) half-edges of dst on all ranks. mode MFTL_COMMIT_ASSEMBLE: an unresolved one is a
@@ -590,8 +544,8 @@ int MFTLObjectAppendTriangleCopy(MFTL_Object *dst, const MFTL_Object *src, int t
 int MFTLObjectCommitCopy(MFTL_Object *dst, int mode);
 
 /* ---------------------------------------------------------------------------------------
- * Stage 16A: twin states, declared class, validation, ghost completion, rings and loops
- * (plans/16 §2). All "collective" functions use obj->domain->comm_cart.
+ * Twin states, declared class, validation, ghost completion, rings and loops (plans/16 §2).
+ * All "collective" functions use obj->domain->comm_cart.
  * --------------------------------------------------------------------------------------- */
 
 /** @brief Declare the body open (1) or closed (0, default). Must be identical on all ranks. */
@@ -601,9 +555,9 @@ void MFTLObjectDeclareOpen(MFTL_Object *obj, int open);
  * @brief Classifies the fan of vertex v_idx: MFTL_RING_CLOSED, MFTL_RING_OPEN_COMPLETE (the fan
  * runs from an incoming BOUNDARY to an outgoing BOUNDARY half-edge) or MFTL_RING_INCOMPLETE (the
  * walk reaches a REMOTE / unresolved half-edge, or the fan is malformed). When out_he != NULL the
- * outgoing half-edges are stored in CCW order (for an open fan: starting after the incoming
- * boundary, ending with the outgoing BOUNDARY half-edge), at most max_he; *n_out receives the
- * count (may be NULL). Rank-local.
+ * outgoing half-edges are stored in walk order, h -> next(twin(h)) (clockwise seen from the
+ * normal side; for an open fan: starting after the incoming boundary, ending with the outgoing
+ * BOUNDARY half-edge), at most max_he; *n_out receives the count (may be NULL). Rank-local.
  */
 int MFTLVertexRing(const MFTL_Object *obj, int v_idx, int *out_he, int max_he, int *n_out);
 
@@ -661,7 +615,7 @@ typedef struct MFTL_BoundaryLoop
   int tag;  ///< tag of the loop (the smallest tag when mixed)
   int mixed_tags;  ///< 1 when the loop carries more than one tag
   double length;  ///< sum of the (minimum-image) edge lengths
-  int winding[3];  ///< Stage 16B: sum of the edge lattice shifts around the loop (§2.6/§3.3)
+  int winding[3];  ///< sum of the edge lattice shifts around the loop (plans/16 §2.6/§3.3)
 } MFTL_BoundaryLoop;
 
 typedef struct MFTL_BoundaryLoopSet
@@ -683,7 +637,7 @@ void MFTLFreeBoundaryLoops(MFTL_BoundaryLoopSet *set);
    every vertex with an outgoing BOUNDARY half-edge at it (plans/16 §2.6). */
 void MFTLRefreshBoundaryCache(MFTL_Object *obj);
 
-/** @brief Stage 15: removes every entity (and payload) from an object; rank-local. */
+/** @brief Removes every entity (and payload) from an object; rank-local. */
 void MFTLObjectClear(MFTL_Object *obj);
 
 #endif  // MFTL_TOPOLOGY_H

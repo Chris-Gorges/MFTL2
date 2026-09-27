@@ -1,5 +1,5 @@
 /*
- * Vertex fitting for remeshing (Stage 08): paraboloid least-squares fit
+ * MFTL2 remeshing — vertex fitting: paraboloid least-squares fit
  * (MFTL1 vertexfitting.c:ParaboloidFit, LAPACK dgelsy) and the barycentric
  * butterfly stencil (MFTL1 BarycentricInterp), used to place new split
  * midpoints and collapse survivors back onto the surface.
@@ -25,6 +25,10 @@
  *    only x[2] (its x/y stores are commented out — treated here as a bug).
  *  - Feature edges are never fitted (the caller/driver keeps midpoints
  *    there); fitting is skipped when the required neighbourhood is missing.
+ *  - Positions are replaced by the displacement rule (image counters follow the short move,
+ *    plans/16 §3.2). The split / collapse wrappers also remap the conserved surface scalar
+ *    mass-conservingly (MFTL1 parity). Generalized bodies place boundary vertices on their
+ *    boundary curve and reject fits that invert a fan triangle.
  */
 
 #include <math.h>
@@ -95,7 +99,7 @@ static int mftlRingNormal(MFTL_Object* obj, int vi, double n[3])
 // Frame normal for the fit: normalized sum of the FRESH one-ring normals of
 // the neighbour set (MFTL1 averages the neighbourhood vertex normals; stored
 // normals go stale within a remesh pass, so they are recomputed here).
-// mftl1 (Stage 15, MFTL_RemeshParameters.mftl1_criteria): MFTL1's ParaboloidFit sums the
+// mftl1 (MFTL_RemeshParameters.mftl1_criteria): MFTL1's ParaboloidFit sums the
 // sin(alpha)/(l0*l1)-weighted one-ring vertex normals (MFTL_OneRingVertexNormal, the L5
 // kernel MFTLComputeVertexNormalAt, which also stores them as MFTL1 did); otherwise the
 // unweighted average of the ring's triangle normals.
@@ -394,7 +398,7 @@ static int mftlParaboloidFitPoint(MFTL_Object* obj, const double c_in[3], const 
 #endif
 }
 
-// Stage 16B displacement rule: a fitted (wrapped) position replaces the vertex position; the move
+// Displacement rule: a fitted (wrapped) position replaces the vertex position; the move
 // is short, so the image counters follow the minimum-image displacement (plans/16 §3.2).
 static inline void mftlSetPosFollow(MFTL_Object* obj, int v_idx, const double p[3])
 {
@@ -414,7 +418,7 @@ static int mftlParaboloidFitAt(MFTL_Object* obj, int v_idx, const int* nbr, int 
   return MFTL_SUCCESS;
 }
 
-/* Stage 16C: generalized bodies never take the MFTL1-parity fit branches */
+/* generalized bodies never take the MFTL1-parity fit branches */
 #define MFTL_GENERALIZED_PARAMS(obj, params, copy)                                         \
   do                                                                                       \
   {                                                                                        \
@@ -474,7 +478,7 @@ void MFTLFitVertex(MFTL_Object* obj, int v_idx, int he_idx, MFTL_RemeshParameter
 }
 
 /* ------------------------------------------------------------------------- */
-/* Stage 15 (L7): conserved surface scalar through the edge operators          */
+/* Conserved surface scalar through the edge operators                       */
 /*                                                                           */
 /* MFTL1 (FRONTTRACKING build) parity, operator by operator:                  */
 /*  - split   : each parent's mass c*A (A from the current positions) is      */
@@ -499,12 +503,12 @@ int MFTLSplitEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParameters*
 {
   MFTL_RemeshParameters gp;
   MFTL_GENERALIZED_PARAMS(obj, params, gp);
-  // Stage 16C (plans/16 §4.4.2): a boundary edge of a generalized body splits onto its boundary
+  // A boundary edge of a generalized body (plans/16 §4.4.2) splits onto its boundary
   // curve (no paraboloid fit across the boundary)
   double btarget[3];
   const int boundary_split = params && MFTLObjectRemeshGeneralized(obj) && MFTLHeIsBoundary(&obj->half_edges[he_ab_idx]) &&
                              MFTLGeneralizedSplitTarget(obj, he_ab_idx, MFTLBoundaryCornerAngle(params), btarget) == MFTL_SUCCESS;
-  // Stage 15 (L7): parent triangles and their masses before the split.
+  // surface scalar: parent triangles and their masses before the split
   const int ss_t1 = obj->half_edges[he_ab_idx].triangle_idx;
   const int ss_he_ba = obj->half_edges[he_ab_idx].twin_idx;
   const int ss_t3 = (ss_he_ba != MFTL_ERROR) ? obj->half_edges[ss_he_ba].triangle_idx : MFTL_ERROR;
@@ -539,10 +543,10 @@ int MFTLSplitEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParameters*
   const int ss_nt_before = obj->n_triangles;
   int v_new = MFTLSplitEdge(obj, he_ab_idx);
   if (v_new == MFTL_ERROR || v_new < 0) return v_new;
-  double split_mid[3];  // Stage 16C: the new vertex at the edge midpoint (never inverts)
+  double split_mid[3];  // the new vertex at the edge midpoint (never inverts)
   memcpy(split_mid, obj->vertices[v_new].pos, sizeof(split_mid));
 
-  // Stage 15 (L7): pre-fit apportioning. MFTLSplitEdge keeps the parent index for the
+  // Surface scalar, pre-fit apportioning. MFTLSplitEdge keeps the parent index for the
   // child containing A (T1 = A-M-C, T3 = B-M-D) and appends T2 = M-B-C, then T4 = M-A-D.
   // As in MFTL1, the child sharing vertex A takes the area-proportional share and its
   // sibling the remainder.
@@ -573,7 +577,7 @@ int MFTLSplitEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParameters*
   {
     MFTLFitVertex(obj, v_new, he_ab_idx, params);
   }
-  // Stage 16C: for generalized bodies a fitted interior vertex that inverts one of its triangles
+  // for generalized bodies a fitted interior vertex that inverts one of its triangles
   // falls back to the midpoint
   if (!boundary_split && params && MFTLObjectRemeshGeneralized(obj))
   {
@@ -590,7 +594,7 @@ int MFTLSplitEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParameters*
     }
   }
 
-  // Stage 15 (L7): post-fit concentrations c = mass / area (cached areas refreshed).
+  // surface scalar: post-fit concentrations c = mass / area (cached areas refreshed)
   const int ss_tris[4] = {ss_t1, ss_t2, ss_t3, ss_t4};
   const double ss_mass[4] = {ss_m1, ss_m2, ss_m3, ss_m4};
   for (int k = 0; k < 4; ++k)
@@ -609,8 +613,8 @@ void MFTLCollapseEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParamet
   MFTL_GENERALIZED_PARAMS(obj, params, gp);
   int feature = params ? mftlEdgeIsFeatureEx(obj, he_ab_idx, params->feature_angle_threshold) : mftlEdgeIsFeature(obj, he_ab_idx);
   int v_b = obj->half_edges[he_ab_idx].vertex_idx;  // survivor (he target)
-  // Stage 16C (plans/16 §4.4.1): generalized survivor placement — on the boundary curve for a
-  // boundary edge, kept in place for an interior edge with a boundary survivor (16A S-A5)
+  // generalized survivor placement (plans/16 §4.4.1) — on the boundary curve for a boundary
+  // edge, kept in place for an interior edge with a boundary survivor (S-A5)
   double gtarget[3];
   int gkind = 0;
   if (params && MFTLObjectRemeshGeneralized(obj) &&
@@ -618,7 +622,7 @@ void MFTLCollapseEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParamet
     gkind = 0;
   if (gkind != 0) feature = 1;  // no fit: the position is prescribed
 
-  // Stage 15 (L7): union of the two endpoint one-rings and its surface-scalar mass.
+  // surface scalar: union of the two endpoint one-rings and its mass
   int ss_ring[2 * MFTL_FIT_MAX_NBR];
   int ss_n = 0;
   double ss_mass_start = 0.0;
@@ -648,7 +652,7 @@ void MFTLCollapseEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParamet
   }
 
   // Fit BEFORE the collapse using the intact edge stencil: the collapse
-  // moves the survivor to the raw midpoint, which we then overwrite with the
+  // moves the survivor to the raw midpoint, which is then overwritten with the
   // fitted position (volume conservation, MFTL1 parity).
   double fitted[3] = {0, 0, 0};
   int have_fit = 0;
@@ -660,7 +664,7 @@ void MFTLCollapseEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParamet
     }
     else if (params->mftl1_criteria)
     {
-      // Stage 15, MFTL1 edgecollapse.c: a separate mid vertex is fitted with both endpoints
+      // MFTL1 edgecollapse.c: a separate mid vertex is fitted with both endpoints
       // (and hence the stencil and its vertex normals) at their ORIGINAL positions.
       const MFTL_HalfEdge* he = &obj->half_edges[he_ab_idx];
       int va = obj->half_edges[obj->half_edges[he->next_idx].next_idx].vertex_idx;
@@ -682,7 +686,7 @@ void MFTLCollapseEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParamet
       int he_prev = obj->half_edges[he_next].next_idx;
       int va = obj->half_edges[he_prev].vertex_idx;
       double saved[3];
-      int saved_img[3];  // Stage 16B: the temporary midpoint / fit moves must not leak into img
+      int saved_img[3];  // the temporary midpoint / fit moves must not leak into img
       memcpy(saved, obj->vertices[v_b].pos, 3 * sizeof(double));
       memcpy(saved_img, obj->vertices[v_b].img, 3 * sizeof(int));
       // seam-safe midpoint (raw average when non-periodic, bit-identical)
@@ -717,7 +721,7 @@ void MFTLCollapseEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParamet
     }
   }
 
-  // Stage 16C: the orientation gate of the generalized approval checked the midpoint; a fitted
+  // The orientation gate of the generalized approval checked the midpoint; a fitted
   // position must not invert a surviving fan triangle either, else the midpoint is kept
   if (have_fit && params && MFTLObjectRemeshGeneralized(obj))
   {
@@ -730,7 +734,7 @@ void MFTLCollapseEdgeWithFit(MFTL_Object* obj, int he_ab_idx, MFTL_RemeshParamet
   if (have_fit) mftlSetPosFollow(obj, v_b, fitted);
   if (gkind != 0 && (obj->half_edges[he_ab_idx].flags & MFTL_FLAG_DEAD)) MFTLSetVertexPosFromFrame(obj, v_b, gtarget);
 
-  // Stage 15 (L7): redistribute the ring mass over the survivors by their new areas
+  // surface scalar: redistribute the ring mass over the survivors by their new areas
   // (nothing to do when MFTLCollapseEdge refused the collapse).
   if (!(obj->half_edges[he_ab_idx].flags & MFTL_FLAG_DEAD)) return;
   double ss_area_new = 0.0;

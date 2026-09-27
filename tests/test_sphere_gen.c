@@ -1,3 +1,6 @@
+/*
+ * MFTLGenerateSphere on one rank: global triangle count and mesh integrity.
+ */
 #include "test_utils.h"
 #include "mftl_core.h"
 #include "mftl_topology.h"

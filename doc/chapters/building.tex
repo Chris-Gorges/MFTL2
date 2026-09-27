@@ -1,0 +1,134 @@
+\chapter{Building, linking and testing}
+\label{ch:building}
+
+\section{Requirements}
+
+\begin{itemize}
+  \item a C99 compiler (GCC or Clang are tested);
+  \item CMake 3.13 or newer;
+  \item an MPI implementation with its C bindings (the tests use MPICH's \texttt{mpirun});
+  \item optionally LAPACK and BLAS, for the least-squares paraboloid fit of the remesher. Without
+    LAPACK the fit falls back to a barycentric (butterfly) fit; the library is complete either
+    way.
+  \item optionally a \LaTeX{} installation (\texttt{pdflatex}, TikZ, \texttt{listings}) to build
+    this manual. The library build never needs \LaTeX.
+\end{itemize}
+
+\section{Configuring and building}
+
+\mftl{} is a CMake project that builds one static library, \texttt{libMFTL2.a}, from all
+sources under \texttt{src/} (collected with \texttt{GLOB\_RECURSE}, so adding a source file
+needs only a re-configure). A typical release build:
+\begin{lstlisting}[language=bash,numbers=none]
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release -DMFTL_USE_LAPACK=ON
+cmake --build build-release -j
+\end{lstlisting}
+The options are listed in Table~\ref{tab:cmake}. When \mftl{} is configured as the top-level
+project, the tests, the examples and (in Debug builds) the sanitizers are enabled by default;
+when it is consumed through \texttt{add\_subdirectory} they are off.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabularx}{\textwidth}{@{}llX@{}}
+\toprule
+Option & Default & Meaning \\
+\midrule
+\texttt{CMAKE\_BUILD\_TYPE} & --- & \texttt{Release} (\texttt{-O3}, link-time optimisation) or \texttt{Debug} \\
+\texttt{MFTL\_USE\_LAPACK} & OFF & link LAPACK/BLAS and define \texttt{MFTL\_HAVE\_LAPACK} (paraboloid fit with \texttt{dgelsy}) \\
+\texttt{ENABLE\_SANITIZERS} & ON (top level) & in Debug builds with GCC/Clang: instrument library, tests and examples with ASan and UBSan; the archive then carries the sanitizer link flag to its consumers \\
+\texttt{MFTL\_BUILD\_TESTS} & ON (top level) & build the test suite and register it with CTest \\
+\texttt{BUILD\_EXAMPLES} & ON (top level) & build the programs in \texttt{examples/} \\
+\texttt{MFTL\_ENABLE\_IPO} & ON & link-time optimisation of the Release library (GCC, fat LTO objects so non-LTO consumers still link) \\
+\texttt{MFTL\_NATIVE\_ARCH} & OFF & \texttt{-march=native} for the Release library (not portable) \\
+\texttt{MFTL\_BUILD\_MANUAL} & OFF & add the \texttt{manual} target that builds this manual \\
+\bottomrule
+\end{tabularx}
+\caption{CMake options of \mftl.}
+\label{tab:cmake}
+\end{table}
+
+The script \texttt{build\_all.py} wraps the common configurations: no argument builds a Release
+tree in \texttt{build/}, \texttt{--debug} a Debug tree with sanitizers, \texttt{--valgrind} a
+Debug tree without sanitizers, and \texttt{--lib-only} skips the examples.
+\texttt{run\_local\_tests.py} builds and runs the test suite.
+
+\section{Using MFTL2 from another project}
+
+The library exports the CMake package \texttt{MFTL2} with the imported target
+\texttt{MFTL2::MFTL2}. Its usage interface carries the public include directories (the headers
+in \texttt{include/} and \texttt{khash.h}, which the public structures use), MPI, \texttt{libm}
+and --- when the library was built with it --- LAPACK and the definition
+\texttt{MFTL\_HAVE\_LAPACK}. A consumer names nothing but the target:
+\begin{lstlisting}[language=bash,numbers=none]
+# install MFTL2 (or point CMAKE_PREFIX_PATH at a build tree, which also exports the package)
+cmake --install build-release --prefix $HOME/opt/mftl2
+\end{lstlisting}
+\begin{lstlisting}[numbers=none,language={}]
+find_package(MFTL2 CONFIG REQUIRED)
+target_link_libraries(my_solver PRIVATE MFTL2::MFTL2)
+\end{lstlisting}
+The directory \texttt{external\_link\_test/} is such a consumer; it is used to check an
+installation. \multi{} consumes \mftl{} in exactly this way (its CMake variable
+\texttt{MFTL2\_ROOT} is the search prefix).
+
+A program includes the public headers it needs; Table~\ref{tab:headers} lists them.
+
+\begin{table}[ht]
+\centering\small
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+Header & Contents \\
+\midrule
+\texttt{mftl\_core.h} & data structures, object and ensemble lifecycle, per-triangle payload, sphere generator \\
+\texttt{mftl\_constants.h} & return codes, tolerances, flags, enumerations, twin-state codes \\
+\texttt{mftl\_topology.h} & half-edge navigation, twin-state predicates, one-ring traversal, builders, validation, ghost completion, boundary loops \\
+\texttt{mftl\_communication.h} & ownership, redistribution, ghost refresh and ghost layers, MPI record types \\
+\texttt{mftl\_geometry.h} & periodic primitives, triangle properties, integrals, local-frame kernels, transforms, generators, curvature, point queries \\
+\texttt{mftl\_images.h} & image counters, canonicalisation, wrap flags, body reference point \\
+\texttt{mftl\_phase\_set.h} & phase-boundary sets \\
+\texttt{mftl\_io.h} & VTK/VTU output, GTS, native restart meshes \\
+\texttt{mftl\_bvh.h} & LBVH, triangle intersection, spatial ghosts \\
+\texttt{mftl\_overlap.h} & overlap volumes, 2-D convex hull and polygon helpers \\
+\texttt{mftl\_remeshing.h} & remesh parameters, operators, smoothing, volume conservation, serial and parallel drivers, load balancing \\
+\texttt{mftl\_memory.h}, \texttt{mftl\_vectoroperations.h}, \texttt{mftl\_arrayfunctions.h} & small helpers (growable arrays, vector algebra, integer sorting) \\
+\bottomrule
+\end{tabularx}
+\caption{Public headers.}
+\label{tab:headers}
+\end{table}
+
+\section{Source layout}
+\label{sec:layout}
+
+\input{chapters/source_layout}
+
+\section{Running the tests}
+
+The test suite (129 CTest entries) covers every subsystem on 1, 2, 4 and 8 ranks, including
+the Stage-16 acceptance tests (\texttt{Stage16A}--\texttt{Stage16F}) and the manual's example
+programs (\texttt{Manual-<program>-np<N>}).
+\begin{lstlisting}[language=bash,numbers=none]
+cd build-release && ctest -j6 --output-on-failure
+\end{lstlisting}
+Notes:
+\begin{itemize}
+  \item The tests start \texttt{mpirun -np N} themselves. With MPICH, running more ranks than
+    cores needs no flag (MPICH does not accept Open~MPI's \texttt{--oversubscribe}).
+  \item In sanitizer builds, LeakSanitizer reports small allocations inside MPICH; the tests run
+    with the suppression file \texttt{tests/lsan.supp}.
+  \item Setting the environment variable \texttt{MFTL\_VALIDATE} to a non-zero value (\eg
+    \texttt{MFTL\_VALIDATE=1}) makes Release builds run the
+    full collective twin-state validation at every quiescent point (Debug builds always do,
+    \S\ref{sec:validation}).
+\end{itemize}
+
+\section{Building this manual}
+
+The manual lives in \texttt{doc/}: \texttt{MFTL2.tex}, the chapters in \texttt{doc/chapters/}
+and the TikZ figures inline. Build it with
+\begin{lstlisting}[language=bash,numbers=none]
+make -C doc          # doc/MFTL2.pdf (pdflatex, three passes)
+\end{lstlisting}
+or configure with \texttt{-DMFTL\_BUILD\_MANUAL=ON} and build the target \texttt{manual}. The
+listings are read from \texttt{examples/}, so the manual always shows the programs that the
+tests compile and run.

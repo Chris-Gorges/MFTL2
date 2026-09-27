@@ -329,3 +329,18 @@ foreach(NP 1 2 8)
     add_test(NAME Stage16B-restart-read-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage16b> read ${CMAKE_BINARY_DIR}/stage16b_restart)
     set_tests_properties(Stage16B-restart-read-np${NP} PROPERTIES FIXTURES_REQUIRED s16b_restart ENVIRONMENT "${MFTL_LSAN_ENV}")
 endforeach()
+
+# --- Manual example programs (examples/manual_*.c, listed in doc/MFTL2.tex) ---
+# Built by the top-level BUILD_EXAMPLES glob; every program runs on 1, 2, 4 and 8 ranks and
+# returns non-zero when one of its checks fails.
+set(MFTL_MANUAL_EXAMPLES manual_basic_workflow manual_curvature manual_queries manual_triangle_data
+    manual_remeshing manual_periodic manual_open_surface manual_phase_set)
+foreach(ex ${MFTL_MANUAL_EXAMPLES})
+    if(TARGET ${ex})
+        foreach(NP 1 2 4 8)
+            add_test(NAME Manual-${ex}-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:${ex}>
+                     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+            set_tests_properties(Manual-${ex}-np${NP} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+        endforeach()
+    endif()
+endforeach()

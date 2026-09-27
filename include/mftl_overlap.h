@@ -1,5 +1,6 @@
 /*
- * Stage 11 — object–object overlap-volume quantification (MFTL1 parity).
+ * MFTL2 intersection — object–object overlap-volume quantification (MFTL1 parity, plans/11)
+ * and 2-D convex-hull / polygon helpers.
  *
  * Reimplements MFTL1's overlap.c pipeline per triangle pair:
  *   orthonormal frame from the A->B separation (GS_OrthoNormalise) ->
@@ -12,8 +13,8 @@
  *   AverageSurfaceNorm = 0.5*(N_A - N_B) with OUTWARD normals (project
  *   invariant), EffectiveRadiusOfCurvature = the blended osculating radius.
  *
- * Deviations from MFTL1 (both required by the Stage-11 acceptance tests,
- * recorded in plans/11):
+ * Deviations from MFTL1 (required by the overlap acceptance tests, recorded
+ * in plans/11):
  *   1. Fan-triangulation integrates clip polygons with ANY corner count
  *      (MFTL1's `if (3 >= dis_corners)` gate silently dropped the generic
  *      4-6-corner triangle intersection regions).
@@ -74,23 +75,25 @@ typedef struct MFTL_Overlap
 int MFTLCalculateOverlap(MFTL_Object* objA, int triA, MFTL_Object* objB, int triB, const double vecAB[3], MFTL_Overlap* out);
 
 /**
- * @brief Ensemble-level overlap driver: for each object pair (i<j for
+ * @brief Ensemble-level overlap driver (collective): for each object pair (i<j for
  * ensB==NULL, all i,j otherwise), gather the candidate triangles of both
  * bodies to every rank (MFTL1 MFTL_BodyOverlap cross-proc exchange: owned
  * triangles whose AABB meets the other body's big box) and compute the
  * per-pair overlap records, each exactly once globally (on the rank owning
  * the body-A candidate).
  *
- * The brute-force candidate gather (accepted by the Stage-11 plan) is used
+ * The brute-force candidate gather (accepted in plans/11) is used
  * instead of the proximity BVH because the volume prism spans triangle pairs
  * whose sheets are far apart in 3D but overlap in the projection plane —
  * MFTL_IntersectObjects only sees genuinely touching pairs (slivers).
  *
  * For periodic domains the packed candidate positions are expressed in a
  * common unwrapped frame (each body unwrapped about its own surface centre,
- * body B additionally shifted by the minimum image of cmB - cmA); the mesh
- * itself is never mutated, so ownership/ghost state stays consistent on any
- * rank count. Bodies must be smaller than the period (MFTL1 restriction).
+ * body B additionally shifted by the minimum image of cmB - cmA); positions
+ * are replaced only temporarily and restored, so ownership/ghost state stays
+ * consistent on any rank count. Every body must be compact (a wrapping body is
+ * rejected with MFTL_ERROR) and lie within half a period of its surface centre
+ * along each periodic axis (an overlap-specific restriction, as in MFTL1).
  *
  * Records are Allgatherv'd so every rank returns the full, identical,
  * deterministically ordered list.
@@ -104,7 +107,7 @@ int MFTLCalculateOverlap(MFTL_Object* objA, int triA, MFTL_Object* objB, int tri
  */
 int MFTLEnsembleCalculateOverlap(MFTL_Ensemble* ensA, MFTL_Ensemble* ensB, MFTL_Overlap** out_records, int* out_count);
 
-/* ── 2D convex hull helpers (Graham scan; public per the Stage-11 plan) ── */
+/* ── 2D convex hull helpers (Graham scan; public, plans/11) ── */
 
 typedef struct
 {

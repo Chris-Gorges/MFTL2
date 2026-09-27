@@ -1,6 +1,7 @@
 /*
- * Stage 16C — library-internal helpers of the generalized (boundary-aware) remesher
- * (src/remeshing/boundary_remesh.c; plans/16 §4.3, §4.4). Not part of the public API.
+ * MFTL2 remeshing (internal) — helpers of the generalized (boundary-aware) remesher
+ * (src/remeshing/boundary_remesh.c; plans/16 §4.3, §4.4). Not part of the public API; it stays in
+ * include/ (and is installed) because the test suite uses it (tests/test_stage16c.c).
  */
 #ifndef MFTL_BOUNDARY_INTERNAL_H
 #define MFTL_BOUNDARY_INTERNAL_H
@@ -35,9 +36,9 @@ int MFTLGeneralizedSplitValenceOk(const MFTL_Object *obj, int he_idx);
 /* one Jacobi sweep of boundary-vertex smoothing along the boundary curve; returns moves */
 int MFTLSmoothBoundaryVertices(MFTL_Object *obj, double relaxation, double corner_angle_deg);
 
-/* Stage 16C (plans/16 §4.4.4): class-guarded volume recovery of the remesh drivers. kind 0: no
+/* Class-guarded volume recovery of the remesh drivers (plans/16 §4.4.4). kind 0: no
    recovery (phase set not DEFINED, or skipped), 1: the body's own volume (closed and compact; the
-   Stage-15 path, unchanged), 2: set-level recovery of the singleton phase set (e.g. a closed body
+   closed-surface path, unchanged), 2: set-level recovery of the singleton phase set (e.g. a closed body
    that wraps a periodic direction). */
 typedef struct
 {

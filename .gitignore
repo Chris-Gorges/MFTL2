@@ -29,3 +29,10 @@ info
 poltergeist.config.json
 run_mpi.sh
 build*/
+
+# manual build products (make -C doc)
+doc/*.aux
+doc/*.log
+doc/*.toc
+doc/*.out
+doc/MFTL2.pdf

@@ -1,10 +1,10 @@
 /*
- * mftl1_criteria.c — Stage 15: MFTL1 edge criteria for the remesh drivers
+ * MFTL2 remeshing — MFTL1 edge criteria and sweep order for the remesh drivers
  * (MFTL_RemeshParameters.mftl1_criteria = 1).
  *
  * multiflow's front tracking must keep its MFTL1 remeshing behaviour. MFTL1 decides splits,
  * collapses and flips with the tests of edgesplit.c, edgecollapse.c and edgeflip.c; MFTL2's
- * own criteria (Stage 08) are simpler (e.g. JIAO split = "longer than max", JIAO collapse =
+ * own criteria (remeshing_core.c) are simpler (e.g. JIAO split = "longer than max", JIAO collapse =
  * "shorter than min") and coarsen a front very differently. The functions below reproduce
  * the MFTL1 tests on the half-edge structure:
  *

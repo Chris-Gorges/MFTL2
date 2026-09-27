@@ -1,5 +1,6 @@
 /*
- * Stage 16B — phase-boundary sets (plans/16 §3.6, revision 3.2, frozen).
+ * MFTL2 phase sets — closed-phase quantities of periodic, open and wall-closed surfaces
+ * (plans/16 §3.6, revision 3.2, frozen).
  *
  * A phase-boundary set S is a list of (body, orientation sign σ = ±1) entries plus optional wall
  * closures on ONE non-periodic axis. Every closed-phase query returns one of three statuses:
@@ -77,7 +78,7 @@ MFTL_PhaseStatus MFTLPhaseSetCentre(MFTL_PhaseSet *S, double C[3], MFTL_PhaseSta
  *  MFTL_PHASE_OUTSIDE / INSIDE / ON_BOUNDARY when DEFINED. */
 MFTL_PhaseStatus MFTLPhaseSetInside(MFTL_PhaseSet *S, const double Q[3], int *where);
 
-/** @brief Stage 16C (plans/16 §4.4.4): set-level volume recovery (collective). Every member moves
+/** @brief Set-level volume recovery (collective; plans/16 §4.4.4). Every member moves
  *  by a uniform displacement delta along its phase-outward vertex normal (sigma * stored normal;
  *  boundary vertices on wall closures stay fixed), delta = (V_target - V) / A(S), iterated (at
  *  most 8 steps) until |V - V_target| <= 1e-12 V_cell. `ens` holds the members (ghost refresh).

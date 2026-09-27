@@ -1,11 +1,7 @@
 /*
- * @Author: MFTL
- * @Date: 2026-03-01
- *
- * This program checks the intersection of two spheres in parallel.
- * It strictly tests the new LBVH approach and robust SAT triangles intersections.
- * The spheres start at opposite ends of the domain and move towards each other,
- * crossing processor boundaries to rigorously test dynamic spatial ghosting.
+ * Example: parallel intersection detection of two spheres (LBVH pair traversal with the
+ * Guigue-Devillers triangle test and pairwise spatial ghosting). The spheres start at opposite
+ * ends of the domain and move towards each other across rank boundaries.
  */
 
 #include "mftl_core.h"

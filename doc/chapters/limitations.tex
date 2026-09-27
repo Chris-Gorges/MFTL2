@@ -1,0 +1,73 @@
+\chapter{Limitations and known compromises}
+\label{ch:limitations}
+
+\section{Intentionally unsupported}
+
+The following are outside the scope of \mftl{} after Stage~16 and are rejected explicitly
+rather than approximated:
+\begin{itemize}
+  \item contact-line dynamics (the loops of a wall-closed open surface must be pinned), and
+    pinned supports that move with an IBM or DEM body;
+  \item free liquid-interface edges, surface viscosity and integral surface tension on open
+    surfaces, and mass properties derived from open surfaces;
+  \item phase-set quantities whose status is UNDEFINED or UNSUPPORTED (Chapter~\ref{ch:phasesets});
+  \item non-manifold, non-orientable and self-intersecting meshes (embeddedness is assumed, not
+    checked);
+  \item the \mftlone{} criteria (\texttt{mftl1\_criteria}) on open bodies.
+\end{itemize}
+
+\section{Performance compromises}
+
+These are correct but not optimal; they are candidates for a later performance stage:
+\begin{itemize}
+  \item load balancing for parallel remeshing is one-dimensional (x-only slabs); on other
+    decompositions a temporary x-only layout is used;
+  \item the boundary cleanup of the parallel remesher, the centering algorithm and the serial
+    bracket gather data on rank 0;
+  \item canonicalisation gathers the edge graph of a body on rank 0; boundary loops and
+    phase-set evaluations gather their records on every rank; the overlap driver all-gathers its
+    candidates;
+  \item \fn{MFTLPointInsideObject} builds an LBVH per call (use the caller-held query for many
+    points); on periodic domains the caller-held query falls back to single-point calls;
+  \item every triangle's payload is a separate heap block;
+  \item \fn{MFTLUpdateGhostPositions} and \fn{MFTLScatterTriangleData} look up bodies linearly
+    unless the caller passes a body-id map;
+  \item spatial search over wrapping bodies uses conservative, stretched boxes for triangles that
+    cross a seam.
+\end{itemize}
+
+\section{Behavioural limitations}
+
+\begin{itemize}
+  \item \fn{MFTLEnsembleCreateSpatialGhosts} compares boxes on the stored positions and is not
+    periodic-aware (\fn{MFTL\_CreateSpatialGhosts}, used by the intersection driver, is).
+  \item \fn{MFTLPointTriangleDistance} uses the stored positions without minimum image.
+  \item The LBVH box inflation ($10^{-4}$) and the intersection proximity tolerance ($10^{-6}$)
+    are absolute, not scaled with the mesh; exactly coplanar triangle pairs are reported as
+    intersecting.
+  \item \texttt{n\_local\_*} are maintained only by multi-rank redistributions, the builders,
+    \fn{MFTLObjectAppendTriangleCopy} and \fn{MFTLObjectClear} (Chapter~\ref{ch:datamodel}).
+  \item \fn{MFTLSwapEdge} is declared but not implemented; use \fn{MFTLFlipEdge}.
+  \item The closed-surface parity collapse test checks the vertex part of the link condition
+    only. For closed manifold meshes this cannot cause an illegal collapse (the only violating
+    configuration is a tetrahedral component whose valence-3 vertices the \mftlone{} valence
+    test already rejects); open bodies never use this path.
+\end{itemize}
+
+\section{Known defects}
+\label{sec:known-defects}
+
+Two defects were found during Stage~17. Fixing them changes behaviour, which Stage~17 (a
+behaviour-preserving cleanup) does not do; they are recorded here for a later stage.
+\begin{enumerate}
+  \item \textbf{\fn{MFTLPointQueryInsideMany} / \fn{MFTLPointQueryInside} can deadlock.} On a
+    non-periodic domain, a rank that stores no triangle of the body has no LBVH and takes the
+    single-point fallback, while the other ranks run the batched loop; their collectives do not
+    match. Work-around: use the caller-held query only when every rank stores at least one triangle
+    of the body, or use \fn{MFTLPointInsideObject}. (\multi's adapter uses the caller-held query.)
+  \item \textbf{Error path of \fn{MFTLEnsembleCreate}.} When the cuts do not match the number of
+    ranks, or the communicators cannot be built, the partly initialised ensemble is destroyed
+    with \fn{MFTLEnsembleDestroy}, which frees communicator handles that were never created and
+    decrements the ensemble count that was never incremented (which can free the MPI datatypes
+    while another ensemble is alive). Only the failure path is affected.
+\end{enumerate}

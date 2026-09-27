@@ -1,7 +1,6 @@
 /*
- * @Author: Christian Gorges
- * @Date: 2026-01-25
- * @Brief: Minimal assertion macros for MFTL unit testing.
+ * Minimal test harness of the MFTL2 suite: RUN_TEST, TEST_ASSERT*, TEST_REPORT; a test binary
+ * returns non-zero when any test failed.
  */
 
 #ifndef MFTL_TEST_UTILS_H

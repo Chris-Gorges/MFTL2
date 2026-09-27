@@ -1,9 +1,9 @@
 /*
- * Stage 16C — generalized (boundary-aware) remeshing support (plans/16 §4.3, §4.4).
+ * MFTL2 remeshing — generalized (boundary-aware) remeshing support (plans/16 §4.3, §4.4).
  *
  *  - remesh-mode selection per body (§4.4.4): open bodies always use the generalized remesher,
  *    closed bodies only by explicit opt-in (MFTL_REMESH_MODE_GENERALIZED); closed bodies in the
- *    default mode keep the Stage-15 path bit-identically;
+ *    default mode keep the closed-surface path bit-identically;
  *  - boundary-curve model per boundary tag (§4.3): REPRESENTED (interpolating Catmull-Rom spline
  *    through the loop's current vertices; corners are spline breakpoints) or CONSTRAINED
  *    (application projector); corners (turning angle > boundary_corner_angle, default 30 deg, or

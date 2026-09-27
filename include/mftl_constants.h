@@ -1,8 +1,10 @@
 /*
- * @Author: Christian Gorges 
- * @Date: 2025-08-09 14:35:27 
- * @Last Modified by: Christian Gorges
- * @Last Modified time: 2025-09-22 19:52:21
+ * MFTL2 core — return codes, numerical constants, entity flag bits and the enumerations shared
+ * by every header (twin states, ring classes, commit modes, remesh and boundary-curve modes).
+ *
+ * Tolerances: MFTL_VERYSMALL / MFTL_VERYVERYSMALL are fixed absolute guards (denominators,
+ * degenerate-geometry tests); scale-dependent decisions use mesh-relative tolerances in the
+ * modules that make them.
  */
 #ifndef MFTL_CONSTANTS_H
 #define MFTL_CONSTANTS_H
@@ -19,19 +21,17 @@
 
 #define MFTL_NULL (NULL)
 
-// Boolean aliases if <stdbool.h> is not enough or for preference
 #define MFTL_TRUE (true)
 #define MFTL_FALSE (false)
 
 #define MFTL_PI 3.14159265358979323846
 #define MFTL_TWO_PI 6.28318530717958647692
 
-// Tolerance for geometric checks
+// absolute tolerances
 #define MFTL_EPSILON 1e-9
 #define MFTL_VERYSMALL 1e-12
 #define MFTL_VERYVERYSMALL 1e-15
 
-// Math Macros
 #define MFTL_MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define MFTL_MAX(a, b) (((a) > (b)) ? (a) : (b))
 #define MFTL_SQ(x) ((x) * (x))
@@ -47,7 +47,7 @@
 
 #define MFTL_MAX_VALENCE 32
 
-// Memory Management
+// first capacity of a growing entity array (MFTL_ENSURE_CAPACITY)
 #define MFTL_INIT_CAPACITY 128
 
 // =============================================================================
@@ -64,36 +64,36 @@ typedef enum
 
 typedef enum
 {
-  MFTL_ALGO_CENTERING = 0, /* object-center migration + serial kern  */
-  MFTL_ALGO_SHIFT_SCHEME = 1 /* spatial shift / freeze / migrate loop  */
+  MFTL_ALGO_CENTERING = 0, /* gather each body to one rank + serial kernel */
+  MFTL_ALGO_SHIFT_SCHEME = 1 /* distributed two-pass shift scheme          */
 } MFTL_RemeshAlgorithm;
 
 // =============================================================================
-// MESH FLAGS (Bitmask values - must be powers of 2)
+// ENTITY FLAGS (bitmask; the flags travel with the entity through MPI packing)
 // =============================================================================
-#define MFTL_FLAG_NONE 0  // 0000 0000
-#define MFTL_FLAG_DEAD (1 << 0)  // 0000 0001 - Element is deleted/scheduled for garbage collection
-#define MFTL_FLAG_MODIFIED (1 << 1)  // 0000 0010 - Element was touched (for next pass/incremental updates)
-#define MFTL_FLAG_BOUNDARY (1 << 2)  // 0000 0100 - Element is on a geometric boundary
-#define MFTL_FLAG_VISITED (1 << 3)  // 0000 1000 - Element evaluated in current remeshing pass
-#define MFTL_FLAG_FEATURE (1 << 4)  // 0001 0000 - Element is a sharp feature (do not smooth across)
+#define MFTL_FLAG_NONE 0
+#define MFTL_FLAG_DEAD (1 << 0)  // deleted inside a remesh pass, compacted away at finalisation
+#define MFTL_FLAG_MODIFIED (1 << 1)  // touched in the current pass (incremental updates)
+#define MFTL_FLAG_BOUNDARY (1 << 2)  // reserved; the physical boundary is the BOUNDARY twin state
+#define MFTL_FLAG_VISITED (1 << 3)  // evaluated in the current remeshing pass / traversal
+#define MFTL_FLAG_FEATURE (1 << 4)  // sharp feature (not smoothed across, not collapsed)
 
-// Stage 16C (plans/16 §4.2/§4.3): vertex flag bits (packed with the vertex flags)
+// vertex flag bits (plans/16 §4.2/§4.3)
 #define MFTL_VFLAG_CURV_UNDEFINED (1 << 8)  // curvature not computed: open (boundary) or incomplete fan
 #define MFTL_VFLAG_CURV_EXTRAPOLATED (1 << 9)  // curv_extrap holds an open-stencil paraboloid estimate
 #define MFTL_VFLAG_CORNER (1 << 10)  // boundary corner (input/application tag): never moved/merged/collapsed
 
-// Stage 16C (plans/16 §4.4.4): per-body remesh mode
-#define MFTL_REMESH_MODE_DEFAULT 0  // closed: Stage-15 path (parity when mftl1_criteria); open: generalized
+// per-body remesh mode (plans/16 §4.4.4)
+#define MFTL_REMESH_MODE_DEFAULT 0  // closed: the closed-surface remesher (MFTL1 parity with mftl1_criteria); open: generalized
 #define MFTL_REMESH_MODE_GENERALIZED 1  // explicit opt-in of a closed body into the generalized remesher
 
-// Stage 16C (plans/16 §4.3): boundary-curve modes per boundary tag
+// boundary-curve modes per boundary tag (plans/16 §4.3)
 #define MFTL_BCURVE_REPRESENTED 0  // interpolating Catmull-Rom spline through the loop's vertices (default)
 #define MFTL_BCURVE_CONSTRAINED 1  // application projector: new/moved boundary vertices are projected
 #define MFTL_BOUNDARY_CORNER_ANGLE_DEFAULT 30.0  // degrees (plans/16 §4.3)
 
 // =============================================================================
-// Stage 16A: half-edge twin states (plans/16 §2.1)
+// Half-edge twin states (plans/16 §2.1)
 // =============================================================================
 // Every live half-edge of a QUIESCENT mesh is exactly one of
 //   LOCAL    : twin_idx >= 0, twin_gid == half_edges[twin_idx].global_id

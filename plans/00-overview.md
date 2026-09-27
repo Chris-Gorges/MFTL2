@@ -1,6 +1,6 @@
 # 00 — Overview: reimplementing MFTL1 functionality in MFTL2
 
-Status: IN PROGRESS — Stages 01–13 accepted; 14 IMPLEMENTED (awaiting independent acceptance); 15 ACCEPTED (independent review 2026-09-23); 16 (generalized surfaces) **ACCEPTED / COMPLETE (2026-09-25)** — 16A–16E ACCEPTED (independent reviews 2026-09-24/25), 16F final validation ACCEPTED (2026-09-25, `plans/16` §28); 17 (cleanup + manual) planned; 18 (performance) to be planned
+Status: IN PROGRESS — Stages 01–13 accepted; 14 IMPLEMENTED (awaiting independent acceptance); 15 ACCEPTED (independent review 2026-09-23); 16 (generalized surfaces) **ACCEPTED / COMPLETE (2026-09-25)** — 16A–16E ACCEPTED (independent reviews 2026-09-24/25), 16F final validation ACCEPTED (2026-09-25, `plans/16` §28); 17 (cleanup + manual) **ACCEPTED / COMPLETE (2026-09-27)**; 18 (performance) to be planned
 Depends on: —
 Implemented by:
 Reviewed by:
@@ -414,7 +414,22 @@ bit-identical to Stage 15 at every gate):
   classified (§28.13, §28.14). **Stage-16 summary: §28.15.**
 
 **Stage 17 (code-quality/documentation cleanup + MFTL2 manual; formerly Stage 16, renumbered
-2026-09-23) — PLANNED, NOT STARTED.** Runs **only after Stage 16 is complete and accepted**,
+2026-09-23) — ACCEPTED / COMPLETE (2026-09-27)** (baseline MFTL2 `511fe23`, multiflow
+`4a61244`; the final working tree passed the complete cold-review gate; per-substage evidence:
+separately preserved, individually gated patch snapshots, the substages not being committed by
+explicit instruction). (`plans/17` "Implementation record": every substage gated
+behaviour-identical — token streams,
+disassembly, full ctest outputs vs the Stage-16 baseline in Release/LAPACK/Debug/ASan, 1 000-step
+fuzz, multiflow closed-surface A/B bit-identical, Stage-16D/16E suites; manual `doc/MFTL2.tex`).
+*Deferred from Stage 17 (behaviour changes, category 4), follow-up correctness work:* D1
+`MFTLPointQueryInsideMany` deadlock when a non-periodic distributed body has a rank with zero
+local triangles; D2 `MFTLEnsembleCreate` error cleanup freeing communicator / MPI-datatype state it
+does not own; the
+redistribution receive-side de-duplication and the unwrap-helper merge (not provably
+bit-identical); splits of `bvh.c`/`overlap.c`/`phase_set.c`/`twin_states.c`/`io.c`; the
+`plans/15` §R6–R7 should-fix items; scale-dependent absolute thresholds; multiflow's zero-mass
+surface-scalar result in the FT configuration; repository-wide formatting (not run).
+Original plan summary: Runs **only after Stage 16 is complete and accepted**,
 when the code, public API (incl. the generalized surface model) and multiflow coupling are
 stable. Purpose: a repository-wide, **behaviour-preserving** cleanup —
 (17A) comments/file-header standardization and terminology, (17B) internal naming on

@@ -1,13 +1,9 @@
 /*
- * @Author: Christian Gorges
- * @Date: 2026-06-17 11:03:52
- * @Last Modified by: Christian Gorges
- * @Last Modified time: 2026-06-17 11:03:52
+ * MFTL2 remeshing — parallel remeshing and x-only load balancing (MFTL1 parity, plans/10), the
+ * generalized-remesher gates in parallel (plans/16 §4.4.3) and the serial bracket.
  */
 
-// Stage 10 — parallel remeshing + load balancing (MFTL1 parity).
-//
-// Design (approved in plans/10-parallel-remeshing-load-balancing.md):
+// Design (plans/10-parallel-remeshing-load-balancing.md):
 //
 //   * Single-owner rule (MFTL1 Boundary_Check): every edge operator acts
 //     ONLY on parallel-interior edges — both endpoints owned by this rank
@@ -36,9 +32,13 @@
 //     maximum). Counters are re-synchronized (Allreduce MAX) after every
 //     redistribution.
 //
-//   * Stage-09 follow-up: the serial edge-local smoothers fail loudly on
-//     distributed meshes; the parallel driver uses the *Parallel variants,
-//     which gate every edge to the parallel-interior rule above.
+//   * The serial edge-local smoothers fail loudly on distributed meshes; the
+//     parallel driver uses the *Parallel variants, which gate every edge to the
+//     parallel-interior rule above.
+//
+//   * Generalized bodies (open, or closed opted in) use the same drivers with
+//     their own gates: an edge qualifies when its complete (augmented)
+//     neighbourhood is owned by this rank (plans/16 §4.4.3).
 
 #include <stdlib.h>
 #include <string.h>
@@ -242,11 +242,11 @@ static int mftlFanInterior(MFTL_Object *obj, int he_idx)
   return 1;
 }
 
-/* Stage 16C (plans/16 §4.4.3): gates of the GENERALIZED remesher (open bodies, closed bodies opted
-   in). The same test functions as in serial are applied to edges whose complete (augmented)
-   neighbourhood is local: a LOCAL or BOUNDARY edge (never REMOTE) whose triangle(s) are owned with
-   owned corners (split), resp. whose endpoint fans are completely owned (collapse). Closed bodies
-   in the default mode keep the Stage-15 gates above bit-identically. */
+/* Gates of the GENERALIZED remesher (plans/16 §4.4.3; open bodies, closed bodies opted in). The
+   same test functions as in serial are applied to edges whose complete (augmented) neighbourhood
+   is local: a LOCAL or BOUNDARY edge (never REMOTE) whose triangle(s) are owned with owned
+   corners (split), resp. whose endpoint fans are completely owned (collapse). Closed bodies in
+   the default mode keep the gates above bit-identically. */
 static int mftlEdgeInteriorGen(MFTL_Object *obj, int he_idx)
 {
   MFTL_HalfEdge *he = &obj->half_edges[he_idx];
@@ -296,9 +296,9 @@ static inline int mftlCollapseGate(MFTL_Object *obj, int j) { return MFTLObjectR
  *
  * A split consumes 1 vertex, 2 triangle and 6 half-edge GIDs, so the
  * candidate count bounds consumption exactly. The apply pass splits only
- * the candidates recorded by the counting pass (Stage 15: criteria that read
- * the neighbourhood could otherwise approve more edges after neighbouring
- * splits than were counted).
+ * the candidates recorded by the counting pass (criteria that read the
+ * neighbourhood could otherwise approve more edges after neighbouring splits
+ * than were counted).
  * ══════════════════════════════════════════════════════════════════════ */
 static long mftlParallelSplitPhase(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
 {
@@ -370,7 +370,7 @@ static long mftlParallelSplitPhase(MFTL_Ensemble *ens, MFTL_RemeshParameters *pa
       // a twin approved in the same pass, or an edge touched by an earlier split, is skipped
       if (obj->half_edges[j].flags & (MFTL_FLAG_DEAD | MFTL_FLAG_VISITED)) continue;
       if (!mftlSplitGate(obj, j)) continue;
-      // 16C review: earlier splits of this pass may have raised an opposite vertex's valence;
+      // earlier splits of this pass may have raised an opposite vertex's valence;
       // skipping only lowers the consumption below the reserved block
       if (MFTLObjectRemeshGeneralized(obj) && !MFTLGeneralizedSplitValenceOk(obj, j)) continue;
       MFTLSplitEdgeWithFit(obj, j, params);
@@ -396,7 +396,7 @@ static long mftlParallelSplitPhase(MFTL_Ensemble *ens, MFTL_RemeshParameters *pa
  * split (GID blocks) -> collapse -> flip -> tangential smoothing ->
  * VISITED cleanup -> finalize (compaction; also drops dead entities before
  * the next redistribution, which would otherwise ship them). Then the
- * Stage-09 parallel-safe smoothers and a per-pass global VolumeRecovery
+ * parallel-safe volume-conserving smoothers and a per-pass volume recovery
  * against the pre-remesh volume, and a ghost position refresh.
  *
  * Returns the LOCAL operation count (caller reduces globally).
@@ -439,7 +439,7 @@ static long mftlParallelRemeshPass(MFTL_Ensemble *ens, MFTL_RemeshParameters *pa
   // 2. SPLIT (collective block scheduling inside).
   ops += mftlParallelSplitPhase(ens, params);
 
-  // 3. COLLAPSE (parallel-interior fan gate + Stage-08 approval).
+  // 3. COLLAPSE (parallel-interior fan gate + collapse approval).
   for (int o = 0; o < nobj && !params->skip_collapse; ++o)
   {
     MFTL_Object *obj = ens->objects[o];
@@ -454,7 +454,7 @@ static long mftlParallelRemeshPass(MFTL_Ensemble *ens, MFTL_RemeshParameters *pa
     }
   }
 
-  // 4. FLIP (parallel-interior gate + Stage-08 gate stack).
+  // 4. FLIP (parallel-interior gate + flip gate stack).
   for (int o = 0; o < nobj && !params->skip_flip; ++o)
   {
     MFTL_Object *obj = ens->objects[o];
@@ -473,7 +473,7 @@ static long mftlParallelRemeshPass(MFTL_Ensemble *ens, MFTL_RemeshParameters *pa
     }
   }
 
-  // 5. Tangential smoothing (ghost-safe since Stage 10; mirrors the serial
+  // 5. Tangential smoothing (ghost-safe: ghosts are never moved; mirrors the serial
   //    driver, which runs it after the edge operators).
   for (int o = 0; o < nobj && !params->skip_tangential_smoothing; ++o)
   {
@@ -495,7 +495,7 @@ static long mftlParallelRemeshPass(MFTL_Ensemble *ens, MFTL_RemeshParameters *pa
     MFTLFinalizeRemeshing(obj, snap_v[o], snap_t[o], snap_h[o], collapses_occurred[o]);
   }
 
-  // 7. Stage-09 volume-conserving stages (parallel-safe variants). No
+  // 7. Volume-conserving smoothing stages (parallel-safe variants). No
   //    emptiness guard: MFTLComputeRoughness (inside the roughness driver)
   //    is collective and must be reached by every rank.
   for (int o = 0; o < nobj; ++o)
@@ -565,7 +565,7 @@ static void mftlEnsembleOwnedBBox(MFTL_Ensemble *ens, double out_min[3], double 
  *
  * MFTL1 MFTLRedistributeObjectLoadBalanced, ensemble-wide (MFTL2 has one
  * shared domain ownership function, so all objects balance together —
- * see the Stage-10 review notes). Computes the x-only slab decomposition
+ * plans/10). Computes the x-only slab decomposition
  * (domain->lb_*), activates it, redistributes, and synchronizes the GID
  * counters. Returns the number of active slabs (0 = nothing to balance).
  *
@@ -805,21 +805,22 @@ int MFTLShiftOwnershipRanges(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
  *
  *   per iteration:
  *     pass 1: x-only load-balanced slabs -> redistribute -> extend ghosts
- *             -> split/collapse/flip (parallel-interior gates) -> Stage-09
- *             smoothers -> VolumeRecovery -> ghost refresh
+ *             -> split/collapse/flip (parallel-interior gates) -> volume-
+ *             conserving smoothers -> volume recovery -> ghost refresh
  *     pass 2: shift the slab cuts -> same pipeline (boundary coverage)
- *   convergence: global op count < 10 (serial semantics), failsafe 15
- *   iterations for run-to-convergence mode
+ *   convergence: global op count < 10 (serial semantics), at most 16 passes
+ *   in run-to-convergence mode
  *
- * Afterwards: restore the native decomposition, final redistribution, GID
- * counter sync, and the MFTL1 end-of-remesh domain clamp (non-periodic
- * axes).
+ * Afterwards: optional boundary cleanup (gather to rank 0), split cleanup,
+ * restore the native decomposition, final redistribution, GID counter sync,
+ * and the MFTL1 end-of-remesh domain clamp (non-periodic axes).
  *
- * On a non-x-only decomposition the shift scheme is unavailable (slab
- * owners would not be comm_graph neighbours); the driver then remeshes on
- * the native decomposition with parallel-interior gates only — correct,
- * but triangles touching a partition boundary are not remeshed (the MFTL1
- * LoadBalance = NO behaviour).
+ * On a non-x-only decomposition with load balancing enabled, the two-pass
+ * scheme runs on a TEMPORARY x-only slab layout (slab i = rank i) and the
+ * native decomposition is restored at the end. Without load balancing (or if
+ * the temporary layout cannot be created) the driver remeshes on the native
+ * decomposition with parallel-interior gates only — correct, but triangles
+ * touching a partition boundary are not remeshed (MFTL1 LoadBalance = NO).
  * ══════════════════════════════════════════════════════════════════════ */
 int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
 {
@@ -829,9 +830,9 @@ int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *par
 
   // Snapshot pre-remesh volumes (collective per object).
   MFTL_RecoveryTarget *start_volume = (MFTL_RecoveryTarget *) malloc((size_t) nobj * sizeof(MFTL_RecoveryTarget));
-  for (int o = 0; o < nobj; ++o) MFTLRemeshRecoveryTarget(ens->objects[o], params, &start_volume[o]);  // Stage 16B/16C class guard
+  for (int o = 0; o < nobj; ++o) MFTLRemeshRecoveryTarget(ens->objects[o], params, &start_volume[o]);  // class-guarded target
 
-  // Stage 15: on a non-x-only decomposition the load-balanced two-pass scheme runs on a
+  // On a non-x-only decomposition the load-balanced two-pass scheme runs on a
   // TEMPORARY x-only slab layout (slab i = rank i, MFTL1's LoadBalance ownership model:
   // adjacent slabs are graph neighbours there), and the native decomposition is restored
   // before the final redistribution below.
@@ -971,7 +972,7 @@ int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *par
   if (!params->skip_split_cleanup)
   {
     MFTL_SPLIT_CLEANUP();
-    // Stage 15: the cleanup splits run after the redistribution above, so the ghost copies
+    // The cleanup splits run after the redistribution above, so the ghost copies
     // of split triangles on neighbouring ranks are topologically stale; re-derive them.
     MFTLRedistributeListOfObjects(ens);
     MFTLSyncEnsembleGidCounters(ens);
@@ -1016,7 +1017,7 @@ int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *par
     for (int o = 0; o < nobj; ++o)
     {
       MFTL_Object *obj = ens->objects[o];
-      MFTLRemeshRecover(ens, obj, &start_volume[o]);  // Stage 16C class guard
+      MFTLRemeshRecover(ens, obj, &start_volume[o]);  // class-guarded recovery
       MFTLComputeTriangleProperties(obj);
     }
   }
@@ -1026,7 +1027,7 @@ int MFTLRemeshEnsembleShiftScheme(MFTL_Ensemble *ens, MFTL_RemeshParameters *par
 }
 
 /* ══════════════════════════════════════════════════════════════════════
- * Stage 15: serial bracket (gather an ensemble to rank 0 and back)
+ * Serial bracket (gather an ensemble to rank 0 and back)
  *
  * MFTLEnsembleBeginSerial swaps a single-partition domain (everything owned by rank 0,
  * no ghosts) into the ensemble and redistributes every object onto rank 0, then syncs the

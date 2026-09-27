@@ -124,7 +124,9 @@ int test_roundtrip()
   TEST_ASSERT(ens != NULL);
 
   const char* src = GTS_PATH("meshes/disco.gts");
-  const char* tmp = "io_roundtrip.gts";
+  // per rank count: the MeshIO-np* tests run concurrently in one directory
+  char tmp[64];
+  snprintf(tmp, sizeof(tmp), "io_roundtrip_np%d.gts", g_nproc);
 
   int rc = MFTLReadGTS(obj, src);
   TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, rc);
@@ -263,7 +265,8 @@ int test_pvtu()
   MFTLComputeTriangleProperties(obj);
   MFTLRedistributeListOfObjects(ens);
 
-  const char* stem = "io_smoke";
+  char stem[64];  // per rank count (concurrent MeshIO-np* tests)
+  snprintf(stem, sizeof(stem), "io_smoke_np%d", g_nproc);
   MFTLWritePvtu(ens, stem);
   MPI_Barrier(MPI_COMM_WORLD);
 
@@ -328,7 +331,8 @@ int test_write_rejects_distributed_surface()
   MFTLGenerateSphere(obj, origin, 1.0, 3);
   MFTLComputeTriangleProperties(obj);
 
-  const char* tmp = "io_partial_reject.gts";
+  char tmp[64];  // per rank count (concurrent MeshIO-np* tests)
+  snprintf(tmp, sizeof(tmp), "io_partial_reject_np%d.gts", g_nproc);
   int fail = 0;
 
   // Sanity: the serial (pre-redistribution) write succeeds.

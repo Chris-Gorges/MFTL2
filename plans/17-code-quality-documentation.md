@@ -1,10 +1,13 @@
 # 17 — Repository-wide code-quality cleanup + MFTL2 manual
 
-Status: NOT STARTED
+Status: ACCEPTED / COMPLETE (2026-09-27) — 17A–17E implemented and individually gated; all
+acceptance criteria met (see "Implementation record" and "Acceptance" at the end). The substages
+were not committed (explicit instruction); their separately preserved, individually gated patch
+snapshots are the per-substage evidence.
 Depends on: 15 (accepted) and 16 (generalized surfaces — must be COMPLETE and ACCEPTED before Stage 17 begins)
-Implemented by:
-Reviewed by:
-Acceptance: NOT PASSED
+Implemented by: Claude Code (2026-09-26)
+Reviewed by: independent cold review (Claude Code subagent, 2026-09-26; findings resolved, see record)
+Acceptance: PASSED (2026-09-27)
 
 ## Objective
 A repository-wide cleanup of MFTL2 — comments, naming, file organization, and a new user/
@@ -422,9 +425,12 @@ production logic edits** beyond mechanical de-duplication proven identical.
   introduced here).
 - **Full ASan/UBSan/LSan suite passes.**
 - **MPI tests pass on 1/2/4/8 ranks.**
-- **Each 17C sub-step gated individually** — 17C1, 17C2, 17C3, 17C4 each compiled and passed
-  the full gate before the next began (visible as separate commits); in particular the
-  redistribution de-duplication is not in the `communication.c` move/split commits.
+- **Each 17C sub-step gated individually** — 17C1, 17C2, 17C3, 17C4 must each be independently
+  reviewable and must compile and pass the complete gate before the next begins. Normally this
+  is visible as separate commits; when the implementer is explicitly prohibited from committing,
+  separately preserved and individually gated patch snapshots are equivalent evidence. In
+  particular the redistribution de-duplication is never in the `communication.c` move/split
+  step.
 - **Documentation agrees with the final implementation** — every signature, convention, and
   invariant in the manual is verified against the post-Stage-16 source (17E); every code
   listing in the manual compiles against the shipped library; `MFTL2.pdf` builds via the
@@ -446,3 +452,138 @@ production logic edits** beyond mechanical de-duplication proven identical.
 | 17C4 | Public/private header cleanup (visibility-verified) | 2 (safe structural) |
 | 17D | MFTL2 LaTeX manual `doc/MFTL2.tex` (post-Stage-16 model), PDF build, compilable examples, README fixes | 1 (doc) |
 | 17E | Consistency + full behaviour-preservation regression gate; optional isolated repo-wide formatting commit | verification (+ 1) |
+
+## Implementation record (2026-09-26)
+
+Baseline: MFTL2 `511fe23` (Stage 16 accepted), multiflow `4a61244` (branch `berend-mftl`, not
+modified by Stage 17). Every substage was gated on a snapshot of the tree before the next one
+began: the comment-stripped token streams (`gcc -fpreprocessed -E -P`) and the per-function
+disassembly of a Release/no-LTO library build were compared with the previous state, and the full
+ctest suite was run in Release (LAPACK off) and Debug+ASan/UBSan/LSan (plus Release+LAPACK and
+Debug for 17C3 and the final tree). Every test's complete output was compared with the baseline
+run (all printed quantities, order-insensitive because ranks interleave): identical in every
+gate. Nothing was committed; the per-substage patch series and the snapshots are kept with the
+implementation notes.
+
+### 17A — comments and file headers (category 1)
+- A descriptive header (purpose, subsystem, contract) on every `.c`/`.h` (library, tests,
+  examples); `@Author/@Date/@Last Modified` boilerplate removed; narration and restating comments
+  removed; rationale comments kept and sharpened.
+- Stale comments corrected against the Stage-16 code, among them: `MFTLObjectCreate/Destroy`,
+  integral anchors (no extent restriction), `MFTLCheckMinimumImageConstraint` (edge criterion
+  only), transforms (translate does not wrap), curvature (Gaussian `2/R^2`, boundary flags, G2),
+  redistribution contract (the CACHED triangle centre decides the owner; cached geometry travels
+  with the triangle), `n_local_*` (only maintained by multi-rank redistribution, the builders,
+  `MFTLObjectAppendTriangleCopy` and `MFTLObjectClear`), spatial ghosts (not periodic-aware),
+  radix sort (unsigned order), `MFTLVolumeRecovery` (cap 10; no-op for open/wrapping bodies),
+  shift scheme (temporary x-only layout), `MFTLSwapEdge` (declared, not implemented), BVH
+  (coplanar pairs reported, absolute tolerances), one-ring traversal directions.
+- TODOs resolved or converted (linear body search → documented deferred optimisation).
+- Gate: token streams identical (0 code differences in 76 files), disassembly identical.
+
+### 17B — internal renames (category 2)
+- 36 internal helpers renamed to `mftlLowerCamel` (32 static; 4 non-static but undeclared in any
+  header: `buffer_init`, `glue_wings`, `CountFeatureEdges`, `FlipApproved`). No consumer
+  (multiflow, tests, examples, external) references any of them. Two diagnostic string literals
+  keep the old names so the object code stays byte-identical.
+- Kept by decision: the `ps*`/`mftl1*` file prefixes, the upstream-derived radix-sort helpers,
+  public-in-practice `MFTL_*` exported functions, all public API; no local-variable sweep; no
+  formatting.
+- Gate: token streams identical modulo the rename map; disassembly identical after mapping names.
+
+### 17C1 — directory moves (category 2)
+- `src/general/` split into `src/core/`, `src/parallel/`, `src/periodic/`, `src/geometry/`,
+  `src/intersection/`, `src/io/`, `src/generators/` (`git mv`); `mftl_bvh.c` → `bvh.c`. Only path
+  comments, the `CMakeLists.txt` comment and the allowlist of `tools/check_twin_gid_readers.sh`
+  changed. Gate: token streams and disassembly identical.
+
+### 17C2 — file splits (category 2)
+- `communication.c` → `comm_types.c` (MPI record types), `redistribute.c` (packing, exchange,
+  both redistribution paths), `ghost_refresh.c`, `ghost_layers.c`, with the private header
+  `src/parallel/comm_internal.h`; `remeshing_core.c` → `remeshing_core.c` (operators and gates),
+  `remesh_smoothing.c`, `remesh_driver.c`, with `src/remeshing/remeshing_internal.h`.
+- Every top-level definition is token-identical; the only linkage change is
+  `mftlMpiExchangeBuffers` (static → internal extern). Disassembly differs only by cross-file
+  inlining/register allocation. Gate outputs identical.
+- Not split (deferred, category 4): `bvh.c`, `overlap.c`, `phase_set.c`, `twin_states.c`, `io.c` —
+  cohesive single algorithms whose split would require de-staticising several helpers.
+
+### 17C3 — de-duplication (category 2)
+- The two collective anchor helpers are one (`mftlObjectUnwrapAnchor`, declared in
+  `src/geometry/geometry_internal.h`): identical collectives in identical order, identical
+  outputs, no arithmetic. Gate (all four configurations) identical.
+- A pre-existing test race was fixed (test-only): the concurrently running `MeshIO-np*` tests
+  shared output file names (reproduced on the baseline build).
+- Deferred (category 4): the redistribution receive-side reconstruction (the two paths differ in
+  payload offsets and completion placement; not provably bit-identical); merging
+  `MFTLUnwrapToAnchor` with the integer-image unwrap of the integrals (different formulas);
+  routing ad-hoc vector arithmetic through `mftl_vectoroperations.h` (operation order).
+
+### 17C4 — header visibility (category 2)
+- `mftl_twin_internal.h` (self-declared non-public, consumed by no consumer) moved to the private
+  include directory `src/internal/`; no longer installed. `mftl_boundary_internal.h` stays public
+  (the test suite uses it). Unconsumed declarations in the public headers were kept (removing
+  them would change the installed API).
+- Install to a prefix, `external_link_test` through `find_package(MFTL2)`, every installed header
+  compiles on its own, multiflow builds against the install. Gate identical.
+
+### 17D — manual
+- `doc/MFTL2.tex` + `doc/chapters/` (TikZ figures inline), `doc/Makefile`, `doc/README.md`,
+  CMake option `MFTL_BUILD_MANUAL` (target `manual`, off by default). 8 example programs
+  `examples/manual_*.c` are included with `\lstinputlisting` and run by 32 new tests
+  (`Manual-<program>-np<N>`, 1/2/4/8 ranks). README corrected (LAPACK optional; AABB/LBVH, not
+  OBB). The PDF builds from a clean tree without warnings about undefined references.
+
+### 17E — final review and regression
+- Independent cold review (token/disassembly classification of every change, public API and
+  exported-symbol audit, source and manual audit, examples on 1/2/4/8 ranks): behaviour
+  preservation confirmed; one doc mismatch (one-ring figure/direction) and several comment/doc
+  items fixed (comment/doc only, re-verified token- and disassembly-identical).
+- MFTL2 on the final tree: Release (LAPACK off/on), Debug, ASan/UBSan/LSan — 129/129 each, the
+  original 97 tests' outputs identical to the baseline; 1 000-step Stage-16 invariant fuzz on
+  1/2/4/8 ranks: 10 002 checks each, 0 failed, logs identical to the baseline.
+- multiflow (unchanged, rebuilt against an installed final MFTL2 with LAPACK; every comparison
+  against the same runs with the installed baseline MFTL2):
+  - adapter unit tests (`tools/mftladapter_tests`, 1–4 ranks): 1 541 checks, 0 failed, output
+    identical to the baseline;
+  - closed-surface legacy A/B (`FT_Stage16D/closed_ab`: FT, FT_Sharp_CSF, FT_Sharp_Integral,
+    IBM-MFTL A/B, Laplace, marching cubes; 12 runs): all 58 HDF5 files bit-identical (h5diff);
+    open IBM mesh rejected;
+  - FT_Stage16D quick (D5 seam/corner advection, D6 pinch-off, P_* seam family, restarts on
+    1/2/8 ranks, open patch, wrapping tube, rejections): 57 checks, 0 failed; all 39 per-step
+    `front_log.txt` byte-identical to the baseline;
+  - FT_Stage16E quick (open-surface scalar Neumann/Dirichlet, pinned surface tension with support
+    reaction, wall closures, CSF, rejections): 89 checks, 0 failed; all 51 per-step
+    `f16e_log.txt` byte-identical to the baseline.
+- Formatting: no repository-wide formatting run (skipped by decision; it would be an isolated
+  final commit).
+
+### Defects found and deferred (behaviour changes; not fixed in Stage 17)
+- D1: `MFTLPointQueryInsideMany`/`MFTLPointQueryInside` deadlock on a non-periodic domain when
+  some rank stores no triangle of the body (that rank takes the per-point fallback). multiflow's
+  adapter uses the caller-held query. Documented in the header and the manual.
+- D2: the error path of `MFTLEnsembleCreate` destroys communicators that were never created and
+  decrements the ensemble count that was never incremented.
+- Carried over, still open: the `plans/15` §R6–R7 should-fix items, the remaining scale-dependent
+  absolute thresholds (BVH inflation 1e-4, proximity 1e-6) and multiflow's zero-mass surface-scalar
+  result in the FT configuration (all behaviour changes).
+
+### Acceptance (2026-09-27)
+- **ACCEPTED / COMPLETE.** Baseline: MFTL2 `511fe2354cac4a5e8eac2616dca1da15570815ff` (Stage 16
+  accepted) and multiflow `4a612445dba8afe1222a4ddae21636c90b14ebf4` (branch `berend-mftl`). The
+  final Stage-17 working tree passed the complete cold-review gate (17E) after its findings were
+  resolved.
+- Per-substage evidence: the gated snapshots and patch series base → 17A → 17B → 17C1 → 17C2 →
+  17C3 → 17C4 → 17D → 17E, each passing its complete gate before the next began (the substages
+  were not committed by explicit instruction; see the amended criterion above).
+- Acceptance evidence (unchanged, recorded above): the manual `doc/MFTL2.tex` (PDF builds from a
+  clean tree) and its 8 example programs (32 tests on 1/2/4/8 ranks); the installed-package
+  consumer (`external_link_test` via `find_package(MFTL2)`, standalone installed headers,
+  multiflow built against the install); the MFTL2 suite on 1/2/4/8 ranks in Release (LAPACK
+  off/on), Debug and ASan/UBSan/LSan; the 1 000-step invariant fuzz; the multiflow adapter tests,
+  closed-surface A/B (bit-identical HDF5) and FT_Stage16D/16E suites (byte-identical logs).
+- Deferred follow-up correctness work (behaviour changes, not part of Stage 17):
+  - D1: `MFTLPointQueryInsideMany` / `MFTLPointQueryInside` deadlock when a non-periodic
+    distributed body has a rank with zero local triangles.
+  - D2: `MFTLEnsembleCreate` error cleanup frees communicator and MPI-datatype state it does not
+    own (communicators never created; ensemble count never incremented).

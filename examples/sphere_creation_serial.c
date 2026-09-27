@@ -1,11 +1,6 @@
 /*
- * @Author: Christian Gorges
- * @Date: 2025-08-12 12:44:56
- * @Last Modified by: Christian Gorges
- * @Last Modified time: 2025-08-14 12:54:56
- *
- * This program initializes a mesh, generates a sphere (icosahedron),
- * writes it to a VTK file for visualization, and then cleans up all resources.
+ * Example: create an ensemble on one rank, generate an icosphere, write it as legacy VTK and
+ * clean up.
  */
 
 #include "mftl_core.h"
@@ -92,13 +87,13 @@ int main(int argc, char *argv[])
 
   // --- 6. Destroy the Ensemble ---
   // This frees the Ensemble, the Domain, AND all added Objects (including 'object').
-  // You do NOT need to call MFTLObjectDestroy(&object) manually.
+  // MFTLObjectDestroy(&object) must not be called separately.
   MFTLEnsembleDestroy(&ensemble);
 
   if (rank == 0) printf("Rank %d: Ensemble and objects destroyed.\n", rank);
 
   // --- MPI Finalization ---
-  // Note: Your Reference Counting in EnsembleDestroy will handle MFTL_Free_mpi_types() automatically here.
+  // The last MFTLEnsembleDestroy has already freed the MPI datatypes (MFTLFreeMpiTypes).
   MPI_Finalize();
   return 0;
 }

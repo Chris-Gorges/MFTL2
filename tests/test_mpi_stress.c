@@ -1,3 +1,8 @@
+/*
+ * Redistribution stress test (8 ranks, fully periodic box): several spheres are advected with
+ * random velocities and redistributed repeatedly on every valid Cartesian decomposition of the
+ * rank count; the owned volume (seam-safe) and the triangle count are conserved.
+ */
 #include "test_utils.h"
 #include "mftl_core.h"
 #include "mftl_communication.h"

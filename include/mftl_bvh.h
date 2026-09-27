@@ -1,25 +1,23 @@
-/**
- * @file mftl_bvh.h
- * @brief Linear Bounding Volume Hierarchy (LBVH) implementation.
+/*
+ * MFTL2 intersection — linear bounding volume hierarchy (LBVH) and triangle-triangle
+ * intersection / proximity between objects.
  *
- * This module provides a highly optimized, state-of-the-art implementation of a 
- * Bounding Volume Hierarchy specifically designed for parallel surface meshing.
+ *  - LBVH: triangle centroids -> 30-bit Morton codes (Z-order) -> radix sort -> top-down split
+ *    at the highest differing bit of the (code, index) keys; leaves hold <= 4 triangles; node
+ *    boxes are float and inflated by a fixed 1e-4. Nodes are 32 bytes (two float triples and a
+ *    packed 64-bit payload).
+ *  - Pair queries: simultaneous traversal of two LBVHs; leaf pairs are tested with a
+ *    Guigue-Devillers orientation-predicate triangle test, extended to a proximity test (9
+ *    edge-edge and 6 vertex-face distances) with tolerance 1e-6.
+ *  - Periodicity: node boxes are built from the stored (wrapped) positions, so a seam-crossing
+ *    triangle has a stretched, conservative box; the box tests shift by one period on periodic
+ *    axes, and each tested triangle pair is first placed in one common frame (minimum image).
+ *  - Spatial ghosts (MFTL_CreateSpatialGhosts): owned triangles of one object whose box meets
+ *    the other object's box on a neighbour rank are shipped there as ghosts.
  *
- * ### Key Algorithmic Features:
- * 1. **Data Oriented Design (DOD)**: The `MFTL_BVHNode` architecture is strictly compressed 
- *    to 32-bytes, matching exact cache-line boundaries for maximum pre-fetching efficiency.
- * 2. **Radix Tree Spatial Partitioning**: The topology is built utilizing a deterministically 
- *    stable binary split based on 30-bit Morton Codes (Z-Order curves). It leverages 
- *    `__builtin_clz` for hyper-fast highest differing bit analysis, slicing nodes exactly at their radix point.
- * 3. **MPI Spatial Ghosting**: Utilizes `MPI_Neighbor_alltoall[v]` for boundary-aware triangle packing.
- *    Nodes overlapping distributed bounds are sequentially transmitted, unpacked, and organically 
- *    fused into the mesh `flat_tri_verts` for cohesive cross-boundary resolution.
- * 4. **Guigue-Devillers Robust Intersection**: Abandons conventional SAT arrays for rigorous 
- *    3D Orientation determinants. Automatically resolves exact interval overlapping intervals on planes 
- *    while avoiding heavy two-dimensional geometric projections or topological linkage tracking.
- *
- * @author Christian Gorges
- * @date 2026-03-01
+ * Known limitations: exactly coplanar triangle pairs are reported as intersecting (no 2-D
+ * overlap test); the box inflation and proximity tolerance are absolute (not scaled with the
+ * mesh).
  */
 
 #ifndef MFTL_BVH_H
@@ -30,9 +28,7 @@
 
 /**
  * @struct MFTL_BVHNode
- * @brief Node for the Linear Bounding Volume Hierarchy (LBVH).
- *
- * Designed to fit precisely into 32 bytes to ensure perfect cache-line alignment.
+ * @brief LBVH node (32 bytes: two nodes per 64-byte cache line).
  *
  * For a Leaf Node:
  *   payload encodes: first_prim_index and prim_count
@@ -57,7 +53,6 @@ typedef struct MFTL_BVHNode
 
 } MFTL_BVHNode;
 
-// Static assert to ensure 32-byte struct size
 _Static_assert(sizeof(MFTL_BVHNode) == 32, "MFTL_BVHNode must be exactly 32 bytes for cache alignment!");
 
 /**
@@ -67,7 +62,7 @@ _Static_assert(sizeof(MFTL_BVHNode) == 32, "MFTL_BVHNode must be exactly 32 byte
 typedef struct MFTL_BVH
 {
   MFTL_BVHNode* nodes;  ///< Array of all BVH nodes
-  int* prim_indices;  ///< Reordered triangle indices from radix sort
+  int* prim_indices;  ///< Triangle local indices in Morton order (leaves index into this)
 
   int nodes_used;  ///< Number of currently active nodes
   int nodes_capacity;  ///< Total allocated capacity for nodes array
@@ -76,71 +71,47 @@ typedef struct MFTL_BVH
 } MFTL_BVH;
 
 /**
- * @brief Callback for processing overlapping primitive pairs.
- * @param objA Pointer to the first object.
- * @param triA_id Index of the intersected triangle in objA.
- * @param objB Pointer to the second object.
- * @param triB_id Index of the intersected triangle in objB.
- * @param user_data Pointer to an optional user-provided data structure.
+ * @brief Called for every intersecting / proximate triangle pair (local triangle indices of
+ * objA and objB) found by a pair traversal.
  */
 typedef void (*IntersectionCallback)(MFTL_Object* objA, int triA_id, MFTL_Object* objB, int triB_id, void* user_data);
 
 /**
- * @brief Exchangers bounding box and intersecting triangles across MPI domains.
- * 
- * @param objA The first object.
- * @param objB The second object.
- * @return MFTL_SUCCESS on success.
+ * @brief Pairwise spatial ghosting (collective): every rank sends its owned-triangle bounding
+ * boxes of objA and objB to its graph neighbours; owned triangles of one object whose box meets
+ * the neighbour's box of the other object are shipped there and appended as ghosts (with their
+ * vertices and payload; flat_tri_verts is extended, twins are not re-paired). Box tests are
+ * periodic-aware. MFTL_ERROR (all ranks) on a payload-size mismatch.
  */
 int MFTL_CreateSpatialGhosts(MFTL_Object* objA, MFTL_Object* objB);
 
 /**
- * @brief Generates a Linear Bounding Volume Hierarchy (LBVH) for a given object.
- * 
- * Extracts normalized centroids, generates Morton Codes, and builds the tree
- * using a top-down split over the sorted codes. Finally refits the AABBs.
- * 
- * @param obj The mesh object (must have flat_tri_verts built).
- * @return A new BVH, or NULL on failure.
+ * @brief Builds an LBVH over all stored triangles of obj (rank-local; needs flat_tri_verts).
+ * @return A new BVH (free with MFTL_DestroyBVH), or NULL for an empty object.
  */
 MFTL_BVH* MFTL_GenerateLBVH(MFTL_Object* obj);
 
-/**
- * @brief Destroys a BVH and frees its resources.
- * @param bvh The BVH to destroy.
- */
+/** @brief Frees a BVH. */
 void MFTL_DestroyBVH(MFTL_BVH* bvh);
 
 /**
- * @brief Simultaneously traverses two BVH trees to find intersecting Object primitives.
- * 
- * @param objA The first mesh object.
- * @param bvhA The first object's BVH.
- * @param objB The second mesh object.
- * @param bvhB The second object's BVH.
- * @param callback The function to call when a Triangle-Triangle intersection is found.
- * @param user_data User data to pass to the callback.
+ * @brief Simultaneous traversal of two LBVHs (rank-local): calls callback for every triangle
+ * pair that intersects or lies within the 1e-6 proximity tolerance.
  */
 void MFTL_IntersectObjects(MFTL_Object* objA, MFTL_BVH* bvhA, MFTL_Object* objB, MFTL_BVH* bvhB, IntersectionCallback callback, void* user_data);
 
 /**
- * @brief Performs a robust exact Triangle-Triangle intersection test.
- *
- * Standard Guigue-Devillers triangle intersection. Uses the `flat_tri_verts`
- * for geometric lookups directly.
- *
- * @param objA The first mesh object.
- * @param triA_id Index of the first triangle.
- * @param objB The second mesh object.
- * @param triB_id Index of the second triangle.
- * @return 1 if they intersect, 0 if disjoint (or coplanar, if non-overlapping).
+ * @brief Guigue-Devillers triangle-triangle intersection test (orientation predicates on the
+ * flat_tri_verts corners; periodic domains: both triangles in one common frame).
+ * @return 1 if they intersect, 0 if disjoint. Exactly coplanar pairs return 1 (conservative;
+ * no 2-D overlap test).
  */
 int MFTL_TriTriIntersect(MFTL_Object* objA, int triA_id, MFTL_Object* objB, int triB_id);
 
 /**
- * @brief Scalable intersection pipeline for full ensembles: spatial ghosts,
- * per-object LBVHs and pair traversal (self-intersection when ensB is NULL;
- * object pairs i < j, so no pair is tested twice).
+ * @brief Intersection of full ensembles (collective for the ghosting): pairwise spatial ghosts,
+ * per-object LBVHs and pair traversal (self-intersection when ensB is NULL; object pairs i < j,
+ * so no pair is tested twice). The callback runs rank-locally, on the stored triangles.
  */
 void MFTLEnsembleIntersectObjects(MFTL_Ensemble* ensA, MFTL_Ensemble* ensB, IntersectionCallback callback, void* user_data);
 

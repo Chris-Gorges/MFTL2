@@ -973,7 +973,7 @@ static void test_boundary_operators(void)
   CHECK(flipped);
   CHECK(MFTLCheckTwinStatesLocal(obj, 0, 1) == 0);
 
-  // collapse of an interior edge with one BOUNDARY wing (glue_wings: the LOCAL wing becomes
+  // collapse of an interior edge with one BOUNDARY wing (mftlGlueWings: the LOCAL wing becomes
   // BOUNDARY with that tag); the edge from a boundary vertex b to an interior vertex c
   int collapsed = 0;
   for (int i = 0; i < obj->n_half_edges && collapsed < 2; ++i)

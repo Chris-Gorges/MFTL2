@@ -1,5 +1,6 @@
 /*
- * Stage 16B — periodic image counters, winding and canonicalisation (plans/16 §3.1–§3.5).
+ * MFTL2 periodic — image counters, homological winding, canonicalisation, cached per-axis wrap
+ * flags and the body reference point (plans/16 §3.1–§3.5).
  *
  * Every vertex stores its wrapped position pos (in [min, max) on periodic axes) and integer
  * image counters img; X = pos + img ⊙ L is its continuous coordinate. Helpers for the

@@ -1,3 +1,7 @@
+/*
+ * Example (one rank): LeVeque single-vortex advection of a sphere with RK4 and periodic serial
+ * remeshing; VTU output of the deformed front.
+ */
 #include <stdlib.h>
 #include <time.h>
 #include "mftl_core.h"
@@ -119,7 +123,7 @@ int main(int argc, char* argv[])
     length_sum += len;
   }
 
-  // Calculate your average edge length
+  // average edge length
   double avg_len = length_sum / object->n_half_edges;
 
   // Setup parameters

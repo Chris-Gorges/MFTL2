@@ -1,0 +1,37 @@
+\chapter{Invariants and conventions}
+\label{ch:invariants}
+
+The table collects the invariants that hold at every quiescent point and the conventions the
+library maintains. The test suite checks each of them; the Stage-16 fuzz test additionally
+applies random jitter, remeshing and redistribution to a closed and an open body on 1, 2, 4 and 8
+ranks and checks the topological invariants (twin states and ghost completion, exactly-once
+ownership, boundary edges, loops and tags) after every step.
+
+\begin{center}\small
+\begin{longtable}{@{}p{0.27\textwidth}p{0.68\textwidth}@{}}
+\toprule
+Invariant & Statement \\
+\midrule
+\endhead
+Manifold, orientable & every edge has one or two triangles; every vertex has one fan; the winding is consistent; bow-ties, non-manifold edges and M\"obius strips are rejected by the builders and never created by the operators \\
+Declared class & only a body declared open has boundary half-edges; the class is identical on every rank \\
+Twin states & every live half-edge is LOCAL, REMOTE or BOUNDARY; LOCAL pairs are symmetric; every REMOTE id names a live authoritative half-edge that names it back; a boundary edge has the same tag on every rank \\
+Boundary / rim / seam & decided by topology, ownership and image counters only, never by coordinates (Table~\ref{tab:brs}) \\
+Exactly-once ownership & every entity has exactly one owner; the owner's copy is authoritative; vertices are owned by position, triangles by cached centre \\
+Ghost completion & G1: every edge of an owned triangle is LOCAL or BOUNDARY; G2: the fan of every owned vertex is stored \\
+Image counters & $\vect{X}=\texttt{pos}+\texttt{img}\odot\vect{L}$ is the continuous coordinate; \texttt{pos} is wrapped; every update follows the displacement rule; the counters travel with the vertex \\
+Edge restriction & every edge is shorter than half a period on every periodic axis \\
+Wrap flags & after canonicalisation, \texttt{wrap}$_k$ holds iff some cycle winds along $k$; cut edges along a compact axis do not exist \\
+Winding & closed bodies are wound outward: outward normals and $V>0$ \\
+Volume & $V=\frac16\sum\vect{x}_1\cdot(\vect{x}_2\times\vect{x}_3)$ over owned triangles, in continuous coordinates, for closed compact bodies; otherwise through a phase-boundary set \\
+Surface centre, inertia & area-weighted vertex sum over $3A$; lumped-tetrahedron moment of inertia (\mftlone{} parity) \\
+Curvature & mean curvature $2/R$ and Gaussian curvature $2/R^2$ on a sphere; boundary vertices flagged \texttt{CURV\_UNDEFINED} \\
+Closed-phase quantities & returned only with status \texttt{MFTL\_DEFINED}; UNDEFINED and UNSUPPORTED carry no value \\
+Boundary loops & identical on every rank, independent of the rank count and of seams; tags persist through remeshing \\
+Rank independence & collective results agree on all ranks and (to round-off) across rank counts \\
+Opaque data & flat plain data of \texttt{data\_size} bytes, identical size on all ranks, transported byte-exactly \\
+Surface scalar & its mass $\sum c_TA_T$ is conserved by transport and by the remesher \\
+Tolerances & fixed absolute guards \texttt{MFTL\_VERYSMALL} $=10^{-12}$ and \texttt{MFTL\_VERYVERYSMALL} $=10^{-15}$; scale-dependent decisions use mesh-relative tolerances in their modules; overlap uses \texttt{MFTL\_REL\_TOLERANCE} $=5\times10^{-7}$ \\
+\bottomrule
+\end{longtable}
+\end{center}

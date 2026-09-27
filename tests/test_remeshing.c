@@ -1,3 +1,8 @@
+/*
+ * Serial remeshing operators (1 rank): boundary and interior edge splits and collapses on small
+ * hand-built meshes, a full remesh pass, and a split/flip/collapse sequence with an opaque
+ * per-triangle payload attached (payload lifecycle and bytes).
+ */
 #include "test_utils.h"
 #include "mftl_core.h"
 #include "mftl_constants.h"
@@ -668,7 +673,7 @@ static int VerifyRemeshData(MFTL_Object* obj, const int* snap_gids, const Remesh
 int TestRemeshingTriangleData()
 {
   // np1: ensemble + generator path so obj->domain is valid (remeshing's
-  // new_triangle reads obj->domain->rank).
+  // mftlNewTriangle reads obj->domain->rank).
   int cuts[3] = {1, 1, 1};
   double xmin[3] = {-2, -2, -2};
   double xmax[3] = {2, 2, 2};
@@ -735,7 +740,7 @@ int TestRemeshingTriangleData()
     EdgeQuadVertices(obj, he, &v_a, &v_b, &v_c, &v_d);
     if (vtouched[v_a] || vtouched[v_b] || vtouched[v_c] || vtouched[v_d]) continue;
 
-    // Same safety gates as FlipApproved: valence must stay >= 3 post-flip and
+    // Same safety gates as mftlFlipApproved: valence must stay >= 3 post-flip and
     // C-D must not already be connected (non-manifold otherwise).
     MFTL_Vertex* ring[32];
     int val_a = MFTLGetVertexOneRingVertices(obj, &obj->vertices[v_a], ring, 32, MFTL_FALSE);

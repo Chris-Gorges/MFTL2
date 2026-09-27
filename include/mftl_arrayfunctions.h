@@ -1,19 +1,21 @@
+/*
+ * MFTL2 core — integer sorting (LSD radix sort, src/core/radixsort.c) and de-duplication
+ * helpers for id arrays.
+ */
 #ifndef MFTL_ARRAYFUNCTIONS_H
 #define MFTL_ARRAYFUNCTIONS_H
 
 #include <stdint.h>
-#include <stddef.h>  // For size_t
+#include <stddef.h>
 #include "mftl_core.h"
 
 /**
- * High-level wrapper. 
- * Allocates temporary memory internally and sorts the data in-place.
+ * Sorts count ints in place (allocates a temporary buffer internally).
  */
 void MFTLSortIds(int* data, int count);
 
 /**
- * Sorts keys and moves associated values in parallel.
- * Fastest possible approach (Structure of Arrays).
+ * Sorts keys in place and applies the same permutation to values (structure of arrays).
  * @param keys   Array of IDs to sort.
  * @param values Array of associated data (e.g. original indices) to move with keys.
  * @param count  Number of elements.
@@ -21,9 +23,7 @@ void MFTLSortIds(int* data, int count);
 void MFTLSortPairs(int* keys, int* values, int count);
 
 /**
- * Low-level core sort.
- * Use this if you want to manage the temporary memory buffer yourself
- * (e.g., re-using one buffer for many sorts to reduce malloc overhead).
+ * Core sort with a caller-provided temporary buffer (re-usable across many sorts).
  * @param keys_in   Input array to sort.
  * @param keys_temp Temporary buffer of same size as keys_in.
  * @param size      Number of elements.
@@ -31,12 +31,10 @@ void MFTLSortPairs(int* keys, int* values, int count);
 void MFTLRadixSort(int* keys_in, int* keys_temp, int size);
 
 /**
- * @brief Finds the unique integers in a given input array.
+ * @brief Copies the distinct integers of input_array to output_array in first-occurrence order.
  *
- * This function iterates through an array of integers and populates an output
- * array with only the unique elements. For small input sizes, this simple
- * O(N^2) approach is highly efficient as it avoids function call overhead.
- * For N > 64, consider sorting the array first and then using unique_int_array.
+ * O(N^2): intended for short lists (e.g. neighbour ranks). For long arrays sort first and use
+ * MFTLUniqueIntArray. output_capacity is not checked; output_array must hold input_count items.
  *
  * @param input_array     A pointer to the const input array of integers.
  * @param input_count     The number of elements in the input array.
@@ -51,8 +49,6 @@ static inline int MFTLGetUniqueIntegers(const int* input_array, int input_count,
   {
     int d = input_array[j];
     int found = 0;
-
-    // Check if we've already added this integer to our output list.
     for (int k = 0; k < num_unique; ++k)
     {
       if (output_array[k] == d)
@@ -62,7 +58,6 @@ static inline int MFTLGetUniqueIntegers(const int* input_array, int input_count,
       }
     }
 
-    // If it wasn't found, add it to the list.
     if (!found)
     {
       output_array[num_unique++] = d;
@@ -72,13 +67,7 @@ static inline int MFTLGetUniqueIntegers(const int* input_array, int input_count,
 }
 
 /**
- * @brief Removes duplicate integers from a sorted array in-place.
- *
- * This function iterates through a sorted array and compacts it by removing 
- * consecutive duplicates. It operates in O(N) linear time and is extremely 
- * cache-efficient as it reads and writes sequentially.
- * * @warning The input array MUST be sorted (e.g. via qsort or radix sort) for this function 
- * to work correctly.
+ * @brief Removes consecutive duplicates from a SORTED array in place, O(N).
  *
  * @param arr  A pointer to the integer array to be deduplicated. 
  * The array is modified in-place.
@@ -102,15 +91,8 @@ static inline int MFTLUniqueIntArray(int* arr, int n)
 }
 
 /**
- * @brief Removes duplicate entries from sorted parallel arrays (SoA) in-place.
- *
- * This function iterates through the sorted `keys` array. When it finds a
- * unique key, it keeps both that key AND the corresponding value from the
- * `values` array. It effectively compacts both arrays in sync.
- *
- * @warning The `keys` array MUST be sorted for this function to work.
- * @note If multiple entries have the same key, the first one encountered 
- * is kept, and subsequent duplicates are discarded.
+ * @brief Removes duplicate keys from a SORTED key array in place and compacts the parallel
+ * value array in step; for equal keys the first entry is kept.
  *
  * @param keys   Pointer to the sorted array of keys (IDs).
  * @param values Pointer to the array of associated values.
@@ -124,12 +106,11 @@ static inline int MFTLUniquePairs(int* keys, int* values, int n)
   int dest = 0;
   for (int src = 1; src < n; ++src)
   {
-    // Check for unique key
     if (keys[src] != keys[dest])
     {
       dest++;
-      keys[dest] = keys[src];  // Compact Key
-      values[dest] = values[src];  // Compact Value (carry payload)
+      keys[dest] = keys[src];
+      values[dest] = values[src];
     }
   }
   return dest + 1;

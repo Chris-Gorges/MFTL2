@@ -1,8 +1,11 @@
 /*
- * @Author: Christian Gorges 
- * @Date: 2025-09-06 15:29:50 
- * @Last Modified by: Christian Gorges
- * @Last Modified time: 2025-09-22 20:18:43
+ * MFTL2 parallel — ownership, redistribution and ghost communication: the packed wire records
+ * and their MPI datatypes, the owner-of-a-position rule (MFTLGetOwnerProc), redistribution,
+ * ghost refresh and the ghosting extensions.
+ *
+ * Wire format: the Packed* records below are transported as committed MPI struct types; their
+ * field sets and order are part of the MPI wire format (and of the restart-independent
+ * exchange between ranks) and must not change.
  */
 #ifndef MFTL_COMMUNICATIONS_H
 #define MFTL_COMMUNICATIONS_H
@@ -10,18 +13,17 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stddef.h>  // Required for offsetof
-#include <stdint.h>  // For int64_t
+#include <stddef.h>
+#include <stdint.h>
 #include <assert.h>
 #include <stdbool.h>
 #include "mftl_core.h"
 #include "mftl_constants.h"
 #include "khash.h"
 
-// --- Data structures for MPI communication ---
 /**
  * @struct PackedVertex
- * @brief A pointer-free, serializable representation of an MFTL_Vertex.
+ * @brief Pointer-free wire record of an MFTL_Vertex; references are global ids.
  */
 typedef struct
 {
@@ -35,25 +37,24 @@ typedef struct
   double meancurvature;
   double gaussiancurvature;
   double area;
-  double roughness_mean;  // Stage 10: roughness data must cross ranks with the vertex
+  double roughness_mean;  // roughness data crosses ranks with the vertex
   double roughness_variance;
 
   // --- State Information ---
-  bool is_ghost;
+  bool is_ghost;  // the SENDER's status: false = ownership-authoritative copy
   int flags;
 
-  // --- Pointer Information ---
-  int id_he_out;
+  int id_he_out;  // gid of the outgoing half-edge
 
-  int body_id;
+  int body_id;  // object id
 
-  int img[3];  // Stage 16B: periodic image counters (travel with pos)
+  int img[3];  // periodic image counters (travel with pos)
 
 } PackedVertex;
 
 /**
  * @struct PackedTriangle
- * @brief A pointer-free, serializable representation of an MFTL_Triangle.
+ * @brief Pointer-free wire record of an MFTL_Triangle (the payload travels separately).
  */
 typedef struct
 {
@@ -61,8 +62,7 @@ typedef struct
   int global_id;
   int owner_proc;
 
-  // --- Relational Data ---
-  int he_id;  // id of one halfedge belonging to this triangle
+  int he_id;  // gid of one half-edge of this triangle
 
   // --- Geometric Properties ---
   double normal[3];
@@ -73,15 +73,16 @@ typedef struct
   bool is_ghost;
   int flags;
 
-  int body_id;
+  int body_id;  // object id
 
-  // --- Conserved surface scalar (Stage 15, see MFTL_Triangle.surface_scalar) ---
-  double surface_scalar;
+  double surface_scalar;  // conserved surface scalar (MFTL_Triangle.surface_scalar)
 } PackedTriangle;
 
 /**
  * @struct PackedHalfEdge
- * @brief A pointer-free, serializable representation of an MFTL_HalfEdge.
+ * @brief Pointer-free wire record of an MFTL_HalfEdge. twin_gid carries the twin STATE code
+ * (twin gid, or MFTL_TWIN_NONE - tag for a BOUNDARY half-edge); twin_idx and the boundary
+ * cache are re-derived at the destination. owner_proc is not part of the MPI datatype.
  */
 typedef struct
 {
@@ -89,11 +90,10 @@ typedef struct
   int global_id;
   int owner_proc;
 
-  // --- Relational Data (was pointers) ---
-  int vertex_gid;  // ID of the vertex at the end of this edge
-  int twin_gid;  // ID of the opposite half-edge
-  int next_gid;  // ID of the next half-edge around the face
-  int triangle_gid;  // ID of the triangle this edge belongs to
+  int vertex_gid;  // gid of the target vertex
+  int twin_gid;  // twin state code (see above)
+  int next_gid;  // gid of the next half-edge of the triangle
+  int triangle_gid;  // gid of the triangle
 
   // --- State Information ---
   bool boundary;
@@ -101,11 +101,9 @@ typedef struct
 } PackedHalfEdge;
 
 /**
- * @struct MFTL_PackedTriangleComplex
- * @brief A "super object" for sending a triangle and its full neighborhood.
- *
- * This struct groups a triangle, its three vertices, and its three interior
- * half-edges into a single object for efficient MPI transfer.
+ * @struct PackedTriangleComplex
+ * @brief A triangle with its three half-edges, the unit of triangle transport (its vertices
+ * travel as PackedVertex records in a separate stream).
  */
 typedef struct
 {
@@ -113,19 +111,19 @@ typedef struct
   PackedHalfEdge half_edges[3];
 } PackedTriangleComplex;
 
-// Define a struct to hold buffer info for the packing pass
+// per-destination send buffer of a packing pass
 typedef struct
 {
-  int count;  // Will be used as the current packing index
+  int count;  // elements packed so far (bytes for a payload stream)
   int capacity;
   void* buffer;
 } MFTL_SendBuffer;
 
-// A lightweight struct to send just the necessary data.
+// Reply record of MFTLUpdateGhostPositions: the owner's current vertex data.
 typedef struct
 {
   int global_id;
-  int found;  // Stage 10: 0 when the owner no longer holds this entity (legitimately
+  int found;  // 0 when the owner no longer holds this entity (legitimately
   // killed by a remesh op since the last sync); the requester keeps its
   // stale copy, which the next redistribution drops. Never fabricate data.
   double pos[3];
@@ -133,13 +131,12 @@ typedef struct
   double meancurvature;
   double gaussiancurvature;
   double area;
-  double roughness_mean;  // Stage 10: ghost payload carries roughness data
+  double roughness_mean;
   double roughness_variance;
-  int img[3];  // Stage 16B: ghost copies carry the owner's image counters
+  int img[3];  // ghost copies carry the owner's image counters
 } GhostUpdatePayload;
 
-// A map from a neighbor rank (int) to a list of GIDs (int64_t*).
-// We'll also need to store the count/capacity of that list.
+// growable list of gids
 typedef struct
 {
   int count;
@@ -147,9 +144,8 @@ typedef struct
   int* gids;
 } MFTL_GidList;
 
-// --- Global MPI Datatype Handles ---
-// Use 'extern' to make these available to any file that includes this header.
-// They are defined and created in communication.c.
+// Committed MPI datatypes of the records above (defined in src/parallel/comm_types.c; valid while at
+// least one ensemble exists).
 extern MPI_Datatype MPI_PackedVertex;
 extern MPI_Datatype MPI_PackedTriangle;
 extern MPI_Datatype MPI_PackedHalfEdge;
@@ -157,31 +153,17 @@ extern MPI_Datatype MPI_PackedTriangleComplex;
 extern MPI_Datatype MPI_GhostUpdatePayload;
 
 /**
- * @brief Creates and commits the custom MPI datatypes.
- *
- * This function should be called once by every process after MPI_Init().
+ * @brief Creates and commits the MFTL2 MPI datatypes. Called by MFTLEnsembleCreate* for the
+ * first live ensemble (reference counted); applications do not call it directly.
  */
 void MFTLRegisterMpiTypes();
 
 /**
- * @brief Frees the custom MPI datatypes.
- *
- * This function should be called once by every process before MPI_Finalize().
+ * @brief Frees the MFTL2 MPI datatypes; called by MFTLEnsembleDestroy with the last live
+ * ensemble.
  */
 void MFTLFreeMpiTypes();
 
-/**
- * @brief Determines which process owns a given 3D coordinate.
- * @details This function implements a deterministic ownership rule for points on
- * processor domain boundaries. A point on a shared boundary is assigned
- * to the processor with the lowest rank that contains it. This prevents
- * ambiguity and ensures each point has a unique owner.
- * The primary rule is [min, max) for all dimensions. If a point is not
- * found, it must lie on a max boundary, so a second pass checks for
- * containment in the closed interval [min, max].
- *
- * MPI works with 32 bit int, so its safer to stay with int here.
- */
 // Slab of coordinate x in a sorted cut array c[0..n] (n slabs): the largest s in [0, n-1]
 // with c[s] <= x; positions outside [c[0], c[n]] clamp to the end slabs.
 static inline int MFTLSlabIndex(const double* c, int n, double x)
@@ -203,13 +185,18 @@ static inline int MFTLSlabIndex(const double* c, int n, double x)
   return s;
 }
 
+/**
+ * @brief Owner rank of a position: the rank of the slab containing it (half-open slabs
+ * [lo, hi) per axis; uniform, rectilinear, or the x-only load-balancing override).
+ *
+ * Deterministic and identical on every rank, so every rank derives the same owner from the
+ * same position. Positions outside the global box (possible transiently, e.g. a front vertex
+ * advected through a wall) clamp to the boundary slabs.
+ */
 static inline int MFTLGetOwnerProc(const MFTL_Domain* domain, const double pos[3])
 {
-  // Positions outside the global box (possible transiently, e.g. a front vertex advected
-  // through a wall) clamp to the boundary slabs (Stage 15: was an assertion).
-
-  // Stage 10: x-only load-balanced ownership override (MFTL1 ownership
-  // ranges). Slab index == owning rank; cuts are arbitrary x positions.
+  // x-only load-balanced ownership override (MFTL1 ownership ranges). Slab index == owning
+  // rank; cuts are arbitrary x positions.
   // Out-of-window positions clamp to the end slabs (positions may drift by
   // sub-edge amounts during remeshing; the window covers bbox +/- refLength).
   if (domain->lb_nprocs > 0)
@@ -235,14 +222,11 @@ static inline int MFTLGetOwnerProc(const MFTL_Domain* domain, const double pos[3
     return s;
   }
 
-  // 1. Math Optimization:
-  // Use pre-calculated factors (multiplication is faster than division).
-  // Use (int) cast instead of floor() (faster, safe because assertions ensure pos >= min).
-
+  // uniform slabs: truncation of (pos - min) * cuts / L, clamped to [0, cuts - 1]
   int ijk[3];
   for (int d = 0; d < 3; ++d)
   {
-    if (domain->axis_cuts[d])  // Stage 15 (L1): rectilinear slabs
+    if (domain->axis_cuts[d])  // rectilinear slabs
     {
       ijk[d] = MFTLSlabIndex(domain->axis_cuts[d], domain->cuts[d], pos[d]);
     }
@@ -250,66 +234,39 @@ static inline int MFTLGetOwnerProc(const MFTL_Domain* domain, const double pos[3
     {
       double f = (pos[d] - domain->global_min[d]) * domain->grid_factors[d];
       int c = (f > 0.0) ? (int) f : 0;
-      // 2. Clamp Indices (the max boundary, and positions beyond it)
       ijk[d] = (c >= domain->cuts[d]) ? domain->cuts[d] - 1 : c;
     }
   }
   int i = ijk[0], j = ijk[1], k = ijk[2];
 
-  // 3. Lookup Optimization
-  // Direct array access instead of MPI_Cart_rank
   int linear_idx = i + (j * domain->cuts[0]) + (k * domain->cuts[0] * domain->cuts[1]);
-
-  // No assert needed for owner_rank if initialization logic is correct
   return domain->rank_map[linear_idx];
 }
 
 /**
- * @brief Intelligently redistributes the mesh using the fastest available communication pattern.
+ * @brief Redistribution (collective): recomputes ownership (MFTLGetOwnerProc; vertices by pos,
+ * triangles by their CACHED centre tri->center) and moves every entity to its owner, with one
+ * ghost layer (each triangle also goes to the owners of its vertices and of its edge-neighbour
+ * triangles). Call MFTLComputeTriangleProperties before it after any change of positions: the
+ * cached centre decides ownership, and the cached area/normal/centre travel with the triangle
+ * (ghost triangles keep them until the next redistribution).
  *
- * @details This function implements a robust, multi-phase redistribution algorithm.
+ * On return (a quiescent point, plans/16 §2.3) every rank stores its owned entities first and
+ * its ghosts after them; ownership is exactly-once; every edge of an owned triangle is LOCAL or
+ * BOUNDARY and the fan of every owned vertex is complete (ghost completion G1/G2, §2.5); the
+ * twin states have been validated. Array indices change; global ids, image counters, flags,
+ * the surface scalar and the opaque payload travel unchanged.
  *
- * 1.  SETUP & ANALYSIS: It begins by querying the MPI graph communicator to get a
- * list of direct neighbors. It then iterates through all local triangles,
- * determines their correct owner, and checks if the owner is a direct neighbor.
- *
- * 2.  DECISION: Based on the analysis, a global consensus is reached using
- * MPI_Allreduce. If all data movement is between direct neighbors, the function
- * selects a highly-optimized "fast path". Otherwise, it falls back to a
- * robust "global path".
- *
- * 3.  COMMUNICATION:
- * - Fast Path: Uses MPI_Neighbor_alltoallv for efficient, localized data exchange.
- * - Global Path: Uses MPI_Alltoallv to handle arbitrary data exchange between any
- * two processes in the simulation.
- *
- * 4.  REBUILDING: Each rank unpacks the received data, combines it with the
- * triangles it kept, de-duplicates vertices by their unique global IDs,
- * and reconstructs its new local portion of the mesh.
- *
- * @param ensemble The MFTL ensemble containing the objects and MPI info.
- * @param base The geometric basis for determining ownership (VERTEX_BASED or CENTER_BASED).
- * @return 0 on success, -1 on failure.
+ * MFTLRedistributeObject handles one object; MFTLRedistributeListOfObjects all objects of an
+ * ensemble in one round. Returns MFTL_ERROR on a payload-size mismatch or a failed
+ * completion/validation; no-op on a single rank.
  */
 int MFTLRedistributeObject(MFTL_Object* object);
 int MFTLRedistributeListOfObjects(MFTL_Ensemble* ensemble);
 
 /**
- * @brief Intelligently redistributes mesh data, choosing the optimal
- *        communication pattern based on the ensemble's object count.
- *
- * @details
- *  - 0 objects : Early exit, no communication.
- *  - 1 object  : Routes to MFTLRedistributeObject(), which avoids all
- *                master-buffer management, hierarchical radix sorting,
- *                body-ID tagging, and per-object grouping passes that
- *                are only needed when multiple bodies coexist.
- *  - N objects : Routes to MFTLRedistributeListOfObjects(), which handles
- *                interleaved packing and hierarchical deduplication across
- *                all bodies in a single communication round.
- *
- * @param ens The ensemble to redistribute. All ranks must call collectively.
- * @return MFTL_SUCCESS on success, MFTL_ERROR on failure.
+ * @brief Redistributes an ensemble (collective): MFTLRedistributeObject for a single object,
+ * MFTLRedistributeListOfObjects otherwise. MFTL_ERROR for an ensemble without objects.
  */
 static inline int MFTLRedistribute(MFTL_Ensemble* ens)
 {
@@ -322,6 +279,8 @@ static inline int MFTLRedistribute(MFTL_Ensemble* ens)
   return MFTLRedistributeListOfObjects(ens);
 }
 
+// Packing / ghost-append building blocks of the transport paths (references are global ids
+// in the records and remain global ids in appended ghosts until they are remapped).
 void MFTLPackSingleVertex(MFTL_Object* obj, int vert_idx, PackedVertex* dst, bool is_ghost);
 void MFTLPackSingleTriangle(MFTL_Object* obj, int tri_idx, PackedTriangleComplex* dst, bool is_ghost);
 
@@ -329,7 +288,7 @@ void MFTLAppendGhostVertex(MFTL_Object* obj, PackedVertex* pv);
 void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc, const void* data);
 
 /**
- * @brief Stage 12: collective contract check — obj->data_size must be identical
+ * @brief Collective contract check — obj->data_size must be identical
  * on every rank before any triangle-payload transport. Prints a loud diagnostic
  * and returns MFTL_ERROR on mismatch; MFTL_SUCCESS when all ranks agree.
  * Called at the entry of every triangle-data transport path.
@@ -337,10 +296,11 @@ void MFTLAppendGhostTriangle(MFTL_Object* obj, PackedTriangleComplex* ptc, const
 int MFTLCheckTriangleDataSizeConsistency(MFTL_Object* obj);
 
 /**
- * @brief Synchronizes ghost vertex positions for a list of objects.
- * @param ensemble The ensemble containing the objects.
- * @param object_lookup Optional hash map (BodyID -> Index). Pass MFTL_NULL to use linear search fallback.
- * @return MFTL_SUCCESS on success.
+ * @brief Refreshes the ghost vertices of all objects from their owners (collective): position
+ * and image counters, normal, curvatures, area and roughness. The ghost set is unchanged;
+ * ghosts whose owner is not a graph neighbour or no longer holds them stay stale until the
+ * next redistribution. Call it after moving owned vertices.
+ * @param object_lookup Optional hash map (body id -> object index); MFTL_NULL = linear search.
  */
 int MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lookup);
 
@@ -364,23 +324,21 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble* ens, khash_t(object_map) * object_lo
 int MFTLScatterTriangleData(MFTL_Ensemble* ens, khash_t(object_map) * object_lookup);
 
 /**
- * @brief Extends the ghost layer by a specified number of topological steps.
- * @param ens The ensemble.
- * @param steps Number of steps to extend (e.g. 1 step = V->T->V).
- * @return MFTL_SUCCESS on success.
+ * @brief Adds `steps` further ghost layers (collective): each step appends the one-ring
+ * triangles of the current ghost vertices and their vertices (V -> T -> V), obtained from the
+ * owners over the graph neighbours.
  */
 int MFTLExtendGhostLayer(MFTL_Ensemble* ens, int steps);
 
 /**
- * @brief Bulk spatial ghosting using pure Domain-Boundary overlap and deduplication.
- * @param ens The MFTL ensemble.
- * @param proximity_tolerance Expansion envelope for near-field interaction tracking.
- * @return MFTL_SUCCESS on completion.
+ * @brief Spatial ghosting (collective): owned triangles whose bounding box, inflated by
+ * proximity_tolerance, overlaps a graph-neighbour rank's box become ghosts there. The box test
+ * uses the stored positions (not periodic-aware).
  */
 int MFTLEnsembleCreateSpatialGhosts(MFTL_Ensemble* ens, double proximity_tolerance);
 
 /**
- * @brief Stage 15 (L6): makes every locally OWNED triangle of obj (with its vertices and
+ * @brief Makes every locally OWNED triangle of obj (with its vertices and
  * payload) available as a ghost on EVERY rank whose box lies within `distance` of the
  * triangle's bounding box (MFTL1 MFTLSendLocalTrisToAllProcs parity; global exchange, not
  * limited to the 26 graph neighbours, rectilinear boxes honoured). Already stored entities

@@ -1,3 +1,7 @@
+/*
+ * Example / timing benchmark: as parallel_advection_redistribute_list.c, but every object is
+ * redistributed separately (MFTLRedistributeObject per object).
+ */
 #include <stdlib.h>
 #include <time.h>
 #include "mftl_core.h"

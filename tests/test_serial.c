@@ -1,6 +1,6 @@
 /*
- * @Author: Christian Gorges
- * @Date: 2026-01-25
+ * Serial topology/geometry basics on a hand-built single triangle: area, and the integrity
+ * check on a valid and a corrupted half-edge cycle.
  */
 
 #include "test_utils.h"

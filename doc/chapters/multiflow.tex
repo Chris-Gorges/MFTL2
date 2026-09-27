@@ -1,0 +1,123 @@
+\chapter{Interaction with multiflow}
+\label{ch:multiflow}
+
+\multi{} uses \mftl{} for its front-tracking interfaces and immersed-boundary bodies. This
+chapter describes the interface between the two as it stands after Stage~16; the details live in
+\multi{} (\texttt{src/general/mftlwrapper/}, \texttt{src/include/mftl\_adapter*.h} and
+\texttt{src/interfacial/fronttracking/}).
+
+\section{The adapter}
+
+\multi{} never calls \mftl{} directly from its physics code. An adapter layer
+(\texttt{mftl\_adapter.h}, implemented in \texttt{mftl\_adapter\_mftl2.c}) offers the operations
+the solver needs --- body lists, iteration over triangles and vertices, positions, geometry in
+local frames, redistribution, remeshing, I/O --- and maps them onto \mftl:
+\begin{itemize}
+  \item the decomposition of \multi's front-tracking overlap mesh (its particle-box grid)
+    becomes the domain of an ensemble created with \fn{MFTLEnsembleCreateRectilinear}, with the
+    per-axis cuts and the rank map of that grid. It is aligned with, but not identical to, the
+    fluid partition; \multi's \texttt{sendnonlocal*} exchanges reconcile the two;
+  \item per-body operations that \mftl{} implements for ensembles (remeshing, serial brackets)
+    run on a one-object view of the body's ensemble;
+  \item every redistribution first refreshes the cached centres of the owned triangles (the
+    ownership rule of \S\ref{sec:triprops});
+  \item physics code reads positions only through adapter accessors that return local-frame or
+    continuous coordinates (\texttt{MFAdapterTriVertexPositions}, \texttt{MFAdapterVertContinuous},
+    \texttt{MFAdapterVertDelta}, \texttt{MFAdapterEdgeVector}), so no physics routine subtracts
+    wrapped positions itself; after advection \texttt{MFAdapterBodyWrapVertices} applies the
+    displacement rule;
+  \item checked queries (volume, centre, inside/outside) return
+    \texttt{MFADAPTER\_DEFINED}, \texttt{\_UNDEFINED} or \texttt{\_UNSUPPORTED}, mirroring the
+    phase-set statuses.
+\end{itemize}
+\multi{} finds \mftl{} with \texttt{find\_package(MFTL2)} (its CMake variable \texttt{MFTL2\_ROOT})
+and needs a LAPACK-enabled build for its default vertex fit.
+
+\section{Declaring periodic and open fronts}
+
+The front-tracking options that concern \mftl{} (all in the \texttt{FRONTTRACKING} section of the
+options file) are explicit declarations; nothing is inferred from the geometry:
+\begin{center}\small
+\begin{tabularx}{\textwidth}{@{}lX@{}}
+\toprule
+Option & Meaning \\
+\midrule
+\texttt{PeriodicFronts XZ} & the fronts are periodic along the listed axes (each must be periodic in the fluid) \\
+\texttt{BodyMesh <body> <file.gts>} & read the body from a GTS file instead of generating a sphere \\
+\texttt{OpenSurface <body> BoundaryFromMesh} & the body is open; every unmatched edge of its mesh is a boundary, tagged per loop \\
+\texttt{RemeshMode <body> GENERALIZED|DEFAULT} & opt a closed body into the generalized remesher \\
+\texttt{SurfaceScalarBC <body> <tag|ALL> NEUMANN q} & scalar flux $q$ per unit length (positive outward along $\vect{\nu}$) at the loops with that tag \\
+\texttt{SurfaceScalarBC <body> <tag|ALL> DIRICHLET c} & prescribed concentration at the loops \\
+\texttt{SurfaceTensionBoundary <body> <tag|ALL> PINNED STATIC} & the loops are pinned to a static support \\
+\texttt{SurfaceTensionBoundary <body> <tag|ALL> REJECT} & (default) refuse surface tension on this open body \\
+\texttt{PhaseSetMember <body> <+1|-1>} & the open body is a member of the dispersed-phase set with this sign \\
+\texttt{WallClosure <X|Y|Z> <MIN|MAX>} & the dispersed-phase set is closed at this (non-periodic) fluid wall \\
+\bottomrule
+\end{tabularx}
+\end{center}
+\texttt{ROBIN} (scalar) and \texttt{CONTACT\_LINE} and IBM/DEM supports (surface tension) are
+reserved and rejected.
+
+\section{The capability check}
+
+At initialisation --- and again after every class transition --- \multi{} classifies every front
+body as \emph{closed} (non-periodic fronts), \emph{closed periodic compact}, \emph{closed periodic
+wrapping} or \emph{open}, and checks it against every enabled module. A conflict stops the run with
+a message that names the module and the body. The rules:
+\begin{itemize}
+  \item surface-only modules (Frenet-element surface tension, surface scalar transport) run on
+    every closed class;
+  \item modules that need an enclosed phase (indicator function, CSF, integral surface tension,
+    marching cubes with breakup and coalescence, volume recovery, force computation, generic
+    acceleration, normal-corrected advection, IRL reconstruction) need a closed non-periodic
+    front, or a periodic front whose dispersed-phase set is \texttt{MFTL\_DEFINED};
+  \item on periodic fronts some modules are not yet implemented (CSF, integral surface tension,
+    surface viscosity, normal-corrected advection, generic acceleration, force computation,
+    divergence-free interpolation, IRL reconstruction); the phase modules also reject wrapping
+    fronts;
+  \item an open body runs a module only with the declarations the module needs: scalar
+    transport needs a scalar boundary condition for every boundary tag (zero flux is never
+    assumed); Frenet surface tension needs \texttt{PINNED STATIC} on every tag; the indicator
+    and volume recovery need membership in a wall-closed, \texttt{DEFINED} dispersed-phase set whose
+    loops are all pinned; CSF and IRL additionally need a non-periodic front and a two-ring
+    fit stencil; integral surface tension, marching cubes and surface viscosity are rejected.
+\end{itemize}
+
+\section{Boundary conditions on open bodies}
+\label{sec:mf-bcs}
+
+\mftl{} supplies only geometry for boundary edges: tag, length $L_e$, tangent $\vect{t}$, conormal
+$\vect{\nu}$, midpoint and the triangle height $h_T=2A_T/L_e$
+(\fn{MFTLBoundaryEdgeGeometry}, \fn{MFTLBoundaryEdgeCentroidDistance}). \multi{} builds its
+boundary conditions from them.
+
+\paragraph{Surface scalar.} The scalar lives at triangle centroids; the distance from the centroid
+to a boundary edge along $\vect{\nu}$ is $\delta_e=h_T/3$.
+\begin{itemize}
+  \item \texttt{NEUMANN q}: the face value in the gradient reconstruction is
+    $c_f=c_T-q\,\delta_e/D$, the diffusion right-hand side gets $-qL_e$, and the mass changes by
+    $-\sum qL_e\Delta t$ (zero for $q=0$);
+  \item \texttt{DIRICHLET c}: the face value is $c_D$, and the two-point flux
+    $D L_e(c_D-c_T)/\delta_{\text{eff}}$ uses $\delta_{\text{eff}}=\max(\delta_e,0.1L_e)$ (a floor
+    that bounds the coefficient on slivers; every use is counted).
+\end{itemize}
+The advective flux across a boundary edge is zero (a material boundary).
+
+\paragraph{Pinned surface tension.} For constant $\sigma$ the element force of a triangle is
+$\sum_{\text{edges}}\sigma L\vect{\nu}_e$; summed over an open surface the interior edges cancel,
+leaving the line force at the boundary. With \texttt{PINNED STATIC} the boundary vertices are held
+on their support (their loop is a frozen, constrained boundary curve), the element forces are
+spread to the fluid unchanged, and the line force
+\begin{equation}
+  \vect{R} = -\sum_{\text{loop}} \sigma L_e\,\vect{\nu}_e
+\end{equation}
+is the reaction on the support, reported per step: the fluid force plus $\vect{R}$ is zero to
+round-off. A free boundary line force is never applied implicitly.
+
+\section{Periodic fronts}
+
+With \texttt{PeriodicFronts} the \mftl{} domain is periodic on the declared axes with the fluid
+period. Peskin spreading and interpolation use wrapped cell ranges, VTU output draws seam
+triangles per image, logs report continuous centroids on compact axes (and ``undefined''
+otherwise), and restarts use native mesh version~2. Closed bodies keep the \mftlone-parity remesher
+whether periodic or not; open bodies always use the generalized remesher.

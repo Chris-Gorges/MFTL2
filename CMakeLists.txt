@@ -19,6 +19,7 @@ option(MFTL_USE_LAPACK "Build with LAPACK/BLAS support (consumed by Stage 08 rem
 # toolchain on any node of the same ISA. -march=native is a local-development opt-in.
 option(MFTL_NATIVE_ARCH "Compile the Release library with -march=native (NOT portable across CPUs; development/benchmarking only)" OFF)
 option(MFTL_ENABLE_IPO "Link-time optimisation of the Release library (GCC: fat LTO objects, so non-LTO consumers still link)" ON)
+option(MFTL_BUILD_MANUAL "Add the target `manual` that builds doc/MFTL2.pdf (needs pdflatex; never part of the library build)" OFF)
 
 # --- Dependencies ---
 find_package(MPI REQUIRED COMPONENTS C)
@@ -82,13 +83,15 @@ add_library(MFTL2 STATIC ${MFTL_SOURCES})
 # Public include interface. `external/` holds khash.h, which mftl_core.h exposes
 # in the public MFTL_Object struct and in public function signatures, so it is
 # part of the public interface and must travel with the target. Internal source
-# subdirectories (src/general, src/remeshing, …) are NOT exposed: consumers only
+# subdirectories (src/core, src/parallel, src/geometry, src/remeshing, …) are NOT exposed: consumers only
 # ever include the flat public headers in include/.
 target_include_directories(MFTL2 PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/external>
     $<INSTALL_INTERFACE:include>
 )
+# Private declarations shared across the source subdirectories (never installed or exported).
+target_include_directories(MFTL2 PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/internal)
 target_link_libraries(MFTL2 PUBLIC MPI::MPI_C)
 # libm is part of the link interface (sqrt, pow, ... are used throughout)
 if(UNIX AND NOT APPLE)
@@ -151,6 +154,20 @@ if(BUILD_EXAMPLES)
         target_include_directories(${TARGET_NAME} PRIVATE ${MFTL_INCLUDE_DIR})
         mftl2_dev_target_options(${TARGET_NAME})
     endforeach()
+endif()
+
+# --- Manual (optional; LaTeX is never needed for the library) ---
+if(MFTL_BUILD_MANUAL)
+    find_program(MFTL2_PDFLATEX pdflatex)
+    find_program(MFTL2_MAKE make)
+    if(MFTL2_PDFLATEX AND MFTL2_MAKE)
+        add_custom_target(manual
+            COMMAND ${MFTL2_MAKE} -C ${CMAKE_CURRENT_SOURCE_DIR}/doc OUT=${CMAKE_CURRENT_BINARY_DIR}/doc PDFLATEX=${MFTL2_PDFLATEX}
+            COMMENT "Building the MFTL2 manual (${CMAKE_CURRENT_BINARY_DIR}/doc/MFTL2.pdf)"
+            VERBATIM)
+    else()
+        message(WARNING "MFTL_BUILD_MANUAL=ON but pdflatex or make was not found; no `manual` target")
+    endif()
 endif()
 
 # --- Install / export (so external projects can `find_package(MFTL2)`) ---------

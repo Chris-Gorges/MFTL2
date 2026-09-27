@@ -1,0 +1,55 @@
+\chapter{Public API index}
+\label{app:api}
+\raggedright
+
+The functions declared in the public headers, by header. Each name is declared in
+\texttt{include/}; the documentation comment above the declaration states whether the function is
+collective and what it requires. This list is generated from the headers.
+
+\section*{\texttt{mftl\_core.h}}
+\textit{Types:} \texttt{MFTL\_BoundaryCurve}, \texttt{MFTL\_Domain}, \texttt{MFTL\_Ensemble}, \texttt{MFTL\_HalfEdge}, \texttt{MFTL\_Object}, \texttt{MFTL\_Triangle}, \texttt{MFTL\_Vertex}\par
+\textit{Functions:} \texttt{MFTLObjectCreate}, \texttt{MFTLGetTriangleData}, \texttt{MFTLSetTriangleData}, \texttt{MFTLInitializeObjectData}, \texttt{MFTLObjectDestroy}, \texttt{MFTLEnsembleUpdateGlobalCounts}, \texttt{MFTLObjectUpdateGlobalStats}, \texttt{MFTLEnsembleCreate}, \texttt{MFTLEnsembleCreateRectilinear}, \texttt{MFTLEnsembleSetDecomposition}, \texttt{MFTLEnsembleRemoveObject}, \texttt{MFTLDomainCreateTemporary}, \texttt{MFTLDomainFreeTemporary}, \texttt{MFTLEnsembleTransferObject}, \texttt{MFTLEnsembleAddObject}, \texttt{MFTLEnsembleDestroy}, \texttt{MFTLGenerateSphere}\par
+
+\section*{\texttt{mftl\_constants.h}}
+\textit{Types:} \texttt{MFTL\_EnsembleType}, \texttt{MFTL\_RemeshAlgorithm}\par
+
+\section*{\texttt{mftl\_topology.h}}
+\textit{Types:} \texttt{MFTL\_BoundaryDecl}, \texttt{MFTL\_BoundaryEdgeDecl}, \texttt{MFTL\_BoundaryLoop}, \texttt{MFTL\_BoundaryLoopSet}, \texttt{MFTL\_DiscoveryStats}, \texttt{MFTL\_Neighborhood}\par
+\textit{Functions:} \texttt{MFTLGetVertex}, \texttt{MFTLGetHalfedge}, \texttt{MFTLGetTriangle}, \texttt{MFTLVOutHe}, \texttt{MFTLTHe}, \texttt{MFTLGetTriangleHalfedges}, \texttt{MFTLGetTriangleVertices}, \texttt{MFTLHeTarget}, \texttt{MFTLHeOrigin}, \texttt{MFTLHeTwin}, \texttt{MFTLHeIsLocal}, \texttt{MFTLHeIsRemote}, \texttt{MFTLHeIsBoundary}, \texttt{MFTLHeIsUnresolved}, \texttt{MFTLBoundaryCode}, \texttt{MFTLHeBoundaryTag}, \texttt{MFTLHeSetBoundary}, \texttt{MFTLHeSetRemote}, \texttt{MFTLHeTwinGid}, \texttt{MFTLHeTwinCode}, \texttt{MFTLHeEdgeId}, \texttt{MFTLHeNext}, \texttt{MFTLHePrev}, \texttt{MFTLHeTriangle}, \texttt{MFTLHeAdjacentTriangle}, \texttt{MFTLGetVertexOneRing}, \texttt{MFTLGetVertexOneRingVertices}, \texttt{MFTLGetVertexOneRingHalfedges}, \texttt{MFTLGetTriangleNeighbors}, \texttt{MFTLRebuildTwins}, \texttt{MFTLConvertGlobalToLocalIndices}, \texttt{MFTLFlattenConnectivity}, \texttt{MFTLCheckMeshIntegrity}, \texttt{MFTLFreeNeighborhood}, \texttt{MFTLGetNeighborhood}, \texttt{MFTLBuildTopologyFromTriples}, \texttt{MFTLBuildFromSoup}, \texttt{MFTLBuildFromSoupEx}, \texttt{MFTLBuildFromSoupImg}, \texttt{MFTLObjectAppendTriangleCopy}, \texttt{MFTLObjectCommitCopy}, \texttt{MFTLObjectDeclareOpen}, \texttt{MFTLVertexRing}, \texttt{MFTLCheckTwinStatesLocal}, \texttt{MFTLValidateTwinStatesEx}, \texttt{MFTLValidateTwinStates}, \texttt{MFTLCompleteGhosts}, \texttt{MFTLDiscoverySetForceFallback}, \texttt{MFTLGetLastDiscoveryStats}, \texttt{MFTLBoundaryLoops}, \texttt{MFTLFreeBoundaryLoops}, \texttt{MFTLRefreshBoundaryCache}, \texttt{MFTLObjectClear}\par
+
+\section*{\texttt{mftl\_communication.h}}
+\textit{Types:} \texttt{MFTL\_GidList}, \texttt{MFTL\_SendBuffer}\par
+\textit{Functions:} \texttt{MFTLRegisterMpiTypes}, \texttt{MFTLFreeMpiTypes}, \texttt{MFTLSlabIndex}, \texttt{MFTLGetOwnerProc}, \texttt{MFTLRedistributeObject}, \texttt{MFTLRedistributeListOfObjects}, \texttt{MFTLRedistribute}, \texttt{MFTLPackSingleVertex}, \texttt{MFTLPackSingleTriangle}, \texttt{MFTLAppendGhostVertex}, \texttt{MFTLAppendGhostTriangle}, \texttt{MFTLCheckTriangleDataSizeConsistency}, \texttt{MFTLUpdateGhostPositions}, \texttt{MFTLScatterTriangleData}, \texttt{MFTLExtendGhostLayer}, \texttt{MFTLEnsembleCreateSpatialGhosts}, \texttt{MFTLObjectSendLocalTrianglesToAll}\par
+
+\section*{\texttt{mftl\_geometry.h}}
+\textit{Types:} \texttt{MFTL\_PointQuery}\par
+\textit{Functions:} \texttt{MFTLGetMinimumImageVector}, \texttt{MFTLApplyPeriodicity}, \texttt{MFTLWrapPosImg}, \texttt{MFTLImgFollow}, \texttt{MFTLVertexRelative}, \texttt{MFTLEdgeShift}, \texttt{MFTLWrapContinuous}, \texttt{MFTLDomainAnyPeriodic}, \texttt{MFTLUnwrapToAnchor}, \texttt{MFTLGetEdgeLength}, \texttt{MFTL\_SQRT}, \texttt{MFTLGetEdgeLengthSquared}, \texttt{MFTLGetTriangleProperties}, \texttt{MFTLGetTriangleArea}, \texttt{MFTLGetTriangleNormal}, \texttt{MFTLGetTriangleCenter}, \texttt{MFTLComputeTriangleProperties}, \texttt{MFTLObjectVolume}, \texttt{MFTLSurfaceCenter}, \texttt{MFTLMomentOfInertia}, \texttt{MFTLCheckMinimumImageConstraint}, \texttt{MFTLVertexDelta}, \texttt{MFTLEdgeVector}, \texttt{MFTLVertexContinuous}, \texttt{MFTLTriangleUnwrapped}, \texttt{MFTLBoundaryEdgeGeometry}, \texttt{MFTLBoundaryEdgeCentroidDistance}, \texttt{MFTLVertexAngleSum}, \texttt{MFTLVertexTurningAngle}, \texttt{MFTLBoundaryNeighbours}, \texttt{MFTLFindThinRegionPairs}, \texttt{MFTLFindProximityPairs}, \texttt{MFTLScaleObject}, \texttt{MFTLTranslateObject}, \texttt{MFTLRotateObject}, \texttt{MFTLWrapObjectIntoDomain}, \texttt{MFTLGenerateCylinder}, \texttt{MFTLGenerateBox}, \texttt{MFTLGenerateCube}, \texttt{MFTLGenerateFace}, \texttt{MFTLComputeVertexNormals}, \texttt{MFTLComputeVertexCurvatures}, \texttt{MFTLComputeExtrapolatedCurvatures}, \texttt{MFTLComputeVertexNormalAt}, \texttt{MFTLComputeVertexCurvatureAt}, \texttt{MFTLComputeRoughness}, \texttt{MFTLPointTriangleDistance}, \texttt{MFTLPointInsideObject}, \texttt{MFTLPointQueryCreate}, \texttt{MFTLPointQueryDestroy}, \texttt{MFTLPointQueryInside}, \texttt{MFTLPointQueryInsideMany}, \texttt{MFTLPointInsideAABB}, \texttt{MFTLObjectAABB}, \texttt{MFTLDebugPointQueryBVHBuilds}, \texttt{MFTLDebugPointQueryLastIterations}\par
+
+\section*{\texttt{mftl\_images.h}}
+\textit{Functions:} \texttt{MFTLCanonicaliseImages}, \texttt{MFTLObjectRegaugeImages}, \texttt{MFTLObjectEnsureWinding}, \texttt{MFTLObjectWrapFlags}, \texttt{MFTLObjectIsCompact}, \texttt{MFTLObjectHasVolume}, \texttt{MFTLCheckWrapFlags}, \texttt{MFTLCountCutEdges}, \texttt{MFTLObjectReference}\par
+
+\section*{\texttt{mftl\_phase\_set.h}}
+\textit{Types:} \texttt{MFTL\_PhaseSet}, \texttt{MFTL\_PhaseSetInfo}, \texttt{MFTL\_PhaseSetTolerances}, \texttt{MFTL\_PhaseStatus}\par
+\textit{Functions:} \texttt{MFTLPhaseSetCreate}, \texttt{MFTLPhaseSetDestroy}, \texttt{MFTLPhaseSetAddMember}, \texttt{MFTLPhaseSetAddWallClosure}, \texttt{MFTLPhaseSetClassify}, \texttt{MFTLPhaseSetVolume}, \texttt{MFTLPhaseSetCentre}, \texttt{MFTLPhaseSetInside}, \texttt{MFTLPhaseSetVolumeRecovery}, \texttt{MFTLPhaseSetGetTolerances}, \texttt{MFTLPhaseSetSetTolerances}\par
+
+\section*{\texttt{mftl\_io.h}}
+\textit{Functions:} \texttt{MFTLWriteVtk}, \texttt{MFTLWriteVtu}, \texttt{MFTLReadGTS}, \texttt{MFTLWriteGTS}, \texttt{MFTLWritePvtu}, \texttt{MFTLWriteNativeMesh}, \texttt{MFTLWriteNativeMeshV2}, \texttt{MFTLReadNativeMesh}\par
+
+\section*{\texttt{mftl\_bvh.h}}
+\textit{Types:} \texttt{MFTL\_BVH}, \texttt{MFTL\_BVHNode}\par
+\textit{Functions:} \texttt{MFTL\_CreateSpatialGhosts}, \texttt{MFTL\_GenerateLBVH}, \texttt{MFTL\_DestroyBVH}, \texttt{MFTL\_IntersectObjects}, \texttt{MFTL\_TriTriIntersect}, \texttt{MFTLEnsembleIntersectObjects}\par
+
+\section*{\texttt{mftl\_overlap.h}}
+\textit{Types:} \texttt{MFTL\_Overlap}, \texttt{MFTL\_Point2D}\par
+\textit{Functions:} \texttt{MFTLCalculateOverlap}, \texttt{MFTLEnsembleCalculateOverlap}, \texttt{MFTLConvexHull2D}, \texttt{MFTLPolygonArea2D}, \texttt{MFTLPolygonCentroid2D}\par
+
+\section*{\texttt{mftl\_remeshing.h}}
+\textit{Types:} \texttt{MFTL\_RemeshCriterion}, \texttt{MFTL\_RemeshOpType}, \texttt{MFTL\_RemeshParameters}, \texttt{MFTL\_RemeshType}, \texttt{MFTL\_SerialBracket}, \texttt{MFTL\_SmoothMode}, \texttt{MFTL\_VCSmoothMode}, \texttt{MFTL\_VertexFitMode}\par
+\textit{Functions:} \texttt{MFTLInitRemeshParams}, \texttt{MFTLSplitEdge}, \texttt{MFTLCollapseEdge}, \texttt{MFTLSwapEdge}, \texttt{MFTLFlipEdge}, \texttt{FlipApprovedWithParams}, \texttt{MFTLFinalizeRemeshing}, \texttt{MFTL\_TriangleQuality}, \texttt{MFTLBotschKobbeltCurvatureThreshold}, \texttt{MFTLFitVertex}, \texttt{MFTLSplitEdgeWithFit}, \texttt{MFTLCollapseEdgeWithFit}, \texttt{MFTLSmoothTangentialWithParams}, \texttt{MFTLDetectFeatures}, \texttt{CollapseApproved}, \texttt{MFTLVolumeRecovery}, \texttt{MFTLEdgeVolumeConservingSmoothing}, \texttt{MFTLVolumeConservingSmoothing}, \texttt{MFTLEdgeTSUR}, \texttt{MFTLTSUR3D}, \texttt{MFTLRoughnessSmoothing}, \texttt{MFTLObjectSetRemeshMode}, \texttt{MFTLObjectRemeshGeneralized}, \texttt{MFTLObjectSetBoundaryCurve}, \texttt{MFTLObjectTakeClassTransition}, \texttt{MFTLRemeshEnsemble}, \texttt{MFTLSplitApproved}, \texttt{MFTL1SplitCriterion}, \texttt{MFTL1CollapseApproved}, \texttt{MFTL1FlipApproved}, \texttt{MFTL1Sweeps}, \texttt{MFTLRemeshEnsembleParallel}, \texttt{MFTLRemeshEnsembleShiftScheme}, \texttt{MFTLRemeshEnsembleDispersedCentering}, \texttt{MFTLEnsembleBeginSerial}, \texttt{MFTLEnsembleEndSerial}, \texttt{MFTLRedistributeEnsembleLoadBalanced}, \texttt{MFTLShiftOwnershipRanges}, \texttt{MFTLSyncEnsembleGidCounters}, \texttt{MFTLVolumeConservingSmoothingParallel}, \texttt{MFTLTSUR3DParallel}, \texttt{MFTLRoughnessSmoothingParallel}, \texttt{MFTLDomainGetHMin}\par
+
+\section*{\texttt{mftl\_vectoroperations.h}}
+\textit{Functions:} \texttt{MFTLNormalizeVector}, \texttt{MFTLVectorInProd}, \texttt{MFTLVectorCrossVector}\par
+
+\section*{\texttt{mftl\_arrayfunctions.h}}
+\textit{Functions:} \texttt{MFTLSortIds}, \texttt{MFTLSortPairs}, \texttt{MFTLRadixSort}, \texttt{MFTLGetUniqueIntegers}, \texttt{MFTLUniqueIntArray}, \texttt{MFTLUniquePairs}\par
+

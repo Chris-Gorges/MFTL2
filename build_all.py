@@ -20,7 +20,7 @@ Options:
     --valgrind     : Builds in Debug mode WITHOUT Sanitizers.
                      Use this if you intend to run the executable with Valgrind.
 
-    --lib-only     : Builds only the static library (libMFTL.a).
+    --lib-only     : Builds only the static library (libMFTL2.a).
                      Skips building the example executables in examples/.
 
 Examples:

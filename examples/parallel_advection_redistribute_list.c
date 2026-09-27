@@ -1,3 +1,8 @@
+/*
+ * Example / timing benchmark: spheres at random positions translated along x on a user-chosen
+ * decomposition and periodicity (command line), with ghost refresh and one
+ * MFTLRedistributeListOfObjects call per step for all objects.
+ */
 #include <stdlib.h>
 #include <time.h>
 #include "mftl_core.h"

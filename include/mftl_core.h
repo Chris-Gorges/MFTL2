@@ -1,19 +1,22 @@
 /*
- * @Author: Christian Gorges
- * @Date: 2025-08-09 14:35:27
- * @Last Modified by: Christian Gorges
- * @Last Modified time: 2025-09-22 19:52:21
+ * MFTL2 core — the public data model: vertices, triangles and half-edges in flat arrays per
+ * object (MFTL_Object), the decomposition (MFTL_Domain) and the ensemble handle (MFTL_Ensemble),
+ * plus object/ensemble lifecycle.
+ *
+ * Storage: an entity is OWNED when is_ghost == false (owner_proc == rank); the library
+ * identifies owned entities by this flag. A multi-rank redistribution stores the owned entities
+ * first and the ghost copies after them (see n_local_*). Entities are identified across ranks by
+ * global_id; array indices are rank-local and change with every redistribution/compaction.
+ * The khash maps translate global id -> local index.
  */
 
 #ifndef MFTL_CORE_H
 #define MFTL_CORE_H
 
-// #define DEBUG
-
-#include <mpi.h>  // For MPI types like MPI_Comm
-#include <stdbool.h>  // For bool type (C99)
-#include <stddef.h>  // For size_t
-#include <stdint.h>  // For int64_t
+#include <mpi.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
 #include <limits.h>
 #include "mftl_constants.h"
 #include "mftl_memory.h"
@@ -24,13 +27,6 @@ KHASH_MAP_INIT_INT(halfedge_map, int)
 KHASH_MAP_INIT_INT(triangle_map, int)
 KHASH_MAP_INIT_INT(object_map, int)
 
-//------------------------------------------------------------------------------
-// Forward Declarations
-//------------------------------------------------------------------------------
-// Forward declarations are necessary because the structs refer to each other
-// in a circular manner (e.g., a Vertex points to a HalfEdge, which points
-// back to a Vertex).
-
 struct MFTL_HalfEdge;
 struct MFTL_Vertex;
 struct MFTL_Triangle;
@@ -38,10 +34,10 @@ struct MFTL_Object;
 struct MFTL_Domain;
 struct MFTL_Ensemble;
 
-/* Stage 16C (plans/16 §4.3): boundary-curve projector of a CONSTRAINED boundary tag. X_in is a
-   point in the local frame of the operation (coordinates in the periodic image of the wrapped
-   position of the operation's first vertex); X_out receives its projection onto the curve.
-   Returns MFTL_SUCCESS, or MFTL_ERROR to refuse (the operation is then skipped). */
+/* Boundary-curve projector of a CONSTRAINED boundary tag (plans/16 §4.3). X_in is a point in
+   the local frame of the operation (coordinates in the periodic image of the wrapped position
+   of the operation's first vertex); X_out receives its projection onto the curve. Returns
+   MFTL_SUCCESS, or MFTL_ERROR to refuse (the operation is then skipped). */
 typedef int (*MFTL_BoundaryProjector)(int tag, const double X_in[3], double X_out[3], void *user);
 
 typedef struct MFTL_BoundaryCurve
@@ -59,105 +55,101 @@ typedef struct MFTL_BoundaryCurve
 
 /**
  * @struct MFTL_Vertex
- * @brief Represents a point in 3D space.
- *
- * A vertex stores its geometric position and properties. Crucially, it holds a
- * pointer to one of its outgoing half-edges, which allows for efficient
- * traversal of its local neighborhood (the "1-ring").
+ * @brief A mesh vertex: wrapped position, periodic image counters, derived geometry,
+ * ownership and one outgoing half-edge (entry point of the one-ring traversal).
  */
 typedef struct MFTL_Vertex
 {
   double pos[3];  ///< x, y, z coordinates of the vertex (WRAPPED into [min, max) on periodic axes).
-  /* Stage 16B (plans/16 §3.1): periodic image counters. The continuous coordinate of the vertex
-     is X = pos + img ⊙ L (img = 0 on non-periodic axes). Maintained by the displacement rule
+  /* Periodic image counters (plans/16 §3.1). The continuous coordinate of the vertex is
+     X = pos + img ⊙ L (img = 0 on non-periodic axes). Maintained by the displacement rule
      (§3.2) and re-gauged by MFTLCanonicaliseImages (§3.3). */
   int img[3];
 
   // --- Geometric Properties ---
-  double normal[3];  ///< Computed normal vector at the vertex.
-  double meancurvature;  ///< Computed mean curvature.
-  double gaussiancurvature;  ///< Computed Gaussian curvature.
-  double area;  ///< Voronoi area associated with the vertex.
+  double normal[3];  ///< Vertex normal (MFTLComputeVertexNormals).
+  double meancurvature;  ///< Mean curvature 2H (2/R on a sphere of radius R; MFTLComputeVertexCurvatures).
+  double gaussiancurvature;  ///< Gaussian curvature in the MFTL1 convention: 2 x angle deficit / mixed area (2/R^2 on a sphere).
+  double area;  ///< Mixed-Voronoi area associated with the vertex.
   double roughness_mean;  ///< Dihedral-angle roughness mean (owned vertices only).
   double roughness_variance;  ///< Dihedral-angle roughness sample variance (owned only).
 
   // --- Parallelism & Domain Information ---
-  int owner_proc;  ///< The MPI rank that has primary authority over this vertex.
-  bool is_ghost;  ///< True if this vertex is a ghost copy from another processor.
-  int global_id;  ///< A unique ID across all processors for tracking.
+  int owner_proc;  ///< Owner rank: the only rank whose copy is authoritative.
+  bool is_ghost;  ///< True for a read-only copy of a vertex owned by another rank.
+  int global_id;  ///< Global id, unique within the object across all ranks.
 
   // --- Topology ---
-  int out_he_idx;  ///< Index of the outgoing half-edge.
+  int out_he_idx;  ///< Local index of an outgoing half-edge (the outgoing BOUNDARY one on a boundary vertex).
 
   // --- Application-Specific Data ---
-  int flags;  ///< Bit flags for marking (e.g., for remeshing).
+  int flags;  ///< MFTL_FLAG_* / MFTL_VFLAG_* bits (remeshing marks, feature and curvature validity).
 
-  /* Stage 16C (plans/16 §4.2, §13): extrapolated curvature (2H, as meancurvature) of a boundary
-     vertex from an open-stencil paraboloid fit; valid iff MFTL_VFLAG_CURV_EXTRAPOLATED. Local,
-     not packed (recomputed on demand). */
+  /* Extrapolated curvature (2H, as meancurvature) of a boundary vertex from an open-stencil
+     paraboloid fit; valid iff MFTL_VFLAG_CURV_EXTRAPOLATED (plans/16 §4.2). Rank-local, not
+     packed (recomputed on demand). */
   double curv_extrap;
 
 } MFTL_Vertex;
 
 /**
  * @struct MFTL_Triangle
- * @brief Represents a triangular element in the mesh.
+ * @brief A mesh triangle: one of its three half-edges, derived geometry, ownership, the opaque
+ * user payload and the conserved surface scalar.
  *
- * A Triangle is defined by three vertices. It points to one of the half-edges
- * that form its boundary, allowing for traversal of its edges and vertices.
+ * A triangle is owned by the rank whose subdomain contains its centre (MFTLGetOwnerProc).
  */
 typedef struct MFTL_Triangle
 {
   // --- Topology ---
-  int he_idx;  ///< Index of one half-edge on the triangle's boundary.
+  int he_idx;  ///< Local index of one of the triangle's three half-edges.
 
-  // --- Geometric Properties ---
-  double normal[3];  ///< The geometric normal of the triangle.
-  double area;  ///< The area of the triangle.
-  double center[3];  ///< The geometric center (centroid) of the triangle.
+  // --- Geometric Properties (MFTLComputeTriangleProperties) ---
+  double normal[3];  ///< Unit normal; outward on a consistently (outward) wound closed body.
+  double area;  ///< Triangle area.
+  double center[3];  ///< Centroid (wrapped into the domain on periodic axes).
 
   // --- Parallelism & Domain Information ---
-  int owner_proc;  ///< The MPI rank that has primary authority over this triangle.
-  bool is_ghost;  ///< True if this triangle is a ghost copy from another processor.
-  int global_id;  ///< A unique ID across all processors.
+  int owner_proc;  ///< Owner rank (the rank whose subdomain contains the centre).
+  bool is_ghost;  ///< True for a read-only copy of a triangle owned by another rank.
+  int global_id;  ///< Global id, unique within the object across all ranks.
 
   // --- Application-Specific Data ---
-  void *data;  ///< Pointer to user-defined data associated with this triangle. TO-DO: put this into a hash define for better cache performance!?
-  int flags;  ///< Bit flags for marking (e.g., for remeshing).
+  void *data;  ///< Opaque payload of MFTL_Object.data_size bytes (NULL when data_size == 0).
+  int flags;  ///< MFTL_FLAG_* bits (remeshing marks).
 
-  /* Conserved surface scalar (Stage 15, MFTL1 `scalarconcentration` parity): a concentration
+  /* Conserved surface scalar (MFTL1 `scalarconcentration` parity, plans/15 item L7): a concentration
      per unit area whose MASS (surface_scalar * area) the library conserves. It travels with
      the triangle through every redistribution / ghost / pack operation, is remapped
      mass-conservingly by split / flip / collapse and rescaled (c *= A_old / A_new) by the
      TSUR3D / volume-conserving vertex moves, starts at 0 for generated / built triangles and
      is written/read by the native mesh I/O. Vertex moves made by the APPLICATION do not
-     rescale it. See plans/15 (item L7). */
+     rescale it. */
   double surface_scalar;
 } MFTL_Triangle;
 
 /**
  * @struct MFTL_HalfEdge
- * @brief The core of the half-edge data structure.
+ * @brief A directed edge of exactly one triangle.
  *
- * Represents a directed edge segment on the boundary of a single triangle. Each
- * topological edge in the mesh is composed of two opposite-facing half-edges.
- * This structure enables extremely fast and robust traversal of the mesh
- * topology.
+ * The three half-edges of a triangle form a cycle through next_idx in the triangle's winding
+ * order. An interior edge consists of two opposite half-edges (twins); a physical boundary
+ * edge has a single half-edge in the BOUNDARY state.
  */
 typedef struct MFTL_HalfEdge
 {
   // --- Topology ---
-  int vertex_idx;  ///< Index of the vertex at the END of this directed edge.
-  int twin_idx;  ///< Local index of the opposite half-edge; MFTL_ERROR when it is not stored here.
-  int next_idx;  ///< Index of the next half-edge in the counter-clockwise direction.
-  int triangle_idx;  ///< Index of the triangle this half-edge belongs to.
+  int vertex_idx;  ///< Local index of the vertex at the END of this directed edge.
+  int twin_idx;  ///< Local index of the opposite half-edge; MFTL_ERROR (-1) when it is not stored on this rank.
+  int next_idx;  ///< Local index of the next half-edge of the same triangle (winding order).
+  int triangle_idx;  ///< Local index of the triangle this half-edge belongs to.
 
   // --- Parallelism & Domain Information ---
-  int global_id;  ///< A unique ID across all processors.
-  /* Twin state code (Stage 16A, plans/16 §2.1; see MFTL_TWIN_* in mftl_constants.h):
+  int global_id;  ///< Global id, unique within the object across all ranks.
+  /* Twin state code (plans/16 §2.1; see MFTL_TWIN_* in mftl_constants.h):
      LOCAL     twin_idx >= 0 and twin_gid == half_edges[twin_idx].global_id;
      REMOTE    twin_idx == -1 and twin_gid >= 0: the gid of the live twin on another rank
-               (retained on the ghost-layer rim, Stage 15 item L3);
+               (an MPI rim of the ghost layer);
      BOUNDARY  twin_idx == -1 and twin_gid == MFTL_TWIN_NONE - tag: a genuine physical boundary.
      Read it only through the predicates of mftl_topology.h (MFTLHeIsLocal / IsRemote /
      IsBoundary / BoundaryTag / TwinGid / EdgeId). The undirected edge id is
@@ -165,8 +157,8 @@ typedef struct MFTL_HalfEdge
   int twin_gid;
 
   // --- Application-Specific Data ---
-  int flags;  ///< Bit flags for marking (e.g., for remeshing).
-  bool boundary;  ///< Cache of MFTLHeIsBoundary (BOUNDARY state); never a rim marker (Stage 16A).
+  int flags;  ///< MFTL_FLAG_* bits (remeshing marks).
+  bool boundary;  ///< Cache of MFTLHeIsBoundary (BOUNDARY state); never an MPI-rim marker.
 } MFTL_HalfEdge;
 
 //------------------------------------------------------------------------------
@@ -174,24 +166,27 @@ typedef struct MFTL_HalfEdge
 //------------------------------------------------------------------------------
 /**
  * @struct MFTL_Object
- * @brief The main container for the entire mesh object.
- *
- * This struct holds the arrays of vertices, faces, and half-edges.
+ * @brief One body (a triangulated surface, possibly several connected components): this
+ * rank's part of it — owned entities and ghost copies (owned first after a multi-rank
+ * redistribution) — plus id maps, the declared class and the periodic-winding cache.
  */
 typedef struct MFTL_Object
 {
   // --- Core Data Arrays (Pools) ---
-  MFTL_Vertex *vertices;  ///< Array of all vertices in this partition.
-  MFTL_Triangle *triangles;  ///< Array of all triangles in this partition.
-  MFTL_HalfEdge *half_edges;  ///< Array of all half-edges in this partition.
+  MFTL_Vertex *vertices;  ///< Vertices stored on this rank (owned, then ghosts).
+  MFTL_Triangle *triangles;  ///< Triangles stored on this rank (owned, then ghosts).
+  MFTL_HalfEdge *half_edges;  ///< Half-edges stored on this rank (those of owned triangles, then ghosts).
 
-  int n_vertices;  ///< Current number of active vertices (local + ghost).
-  int n_triangles;  ///< Current number of active triangles (local + ghost).
-  int n_half_edges;  ///< Current number of active half-edges (local + ghost).
+  int n_vertices;  ///< Number of stored vertices (owned + ghost).
+  int n_triangles;  ///< Number of stored triangles (owned + ghost).
+  int n_half_edges;  ///< Number of stored half-edges (owned + ghost).
 
-  /* These counts refer to the first n_local_* elements in the arrays.
-     Ghost entities are stored after the local entities. */
-  int n_local_triangles;  ///< Number of local (non-ghost) triangles.
+  /* Owned-prefix counts: the first n_local_* entries of each array are the owned entities.
+     Set only by a multi-rank redistribution, the builders (soups, MFTLBuildTopologyFromTriples),
+     MFTLObjectAppendTriangleCopy and MFTLObjectClear; the generators, remeshing and a single-rank
+     redistribution (a no-op) do not update them. Loop over the stored arrays and skip is_ghost
+     entries unless the object has just been redistributed on more than one rank. */
+  int n_local_triangles;  ///< Number of owned (non-ghost) triangles.
   int n_local_vertices;  ///< Same invariant for vertices[].
   int n_local_half_edges;  ///< Same invariant for half_edges[].
 
@@ -199,27 +194,27 @@ typedef struct MFTL_Object
   int capacity_triangles;  ///< Allocated capacity for the triangles array.
   int capacity_half_edges;  ///< Allocated capacity for the half_edges array.
 
-  // Global ID counters for new body creation or vertex insertion.
+  // next unused global ids (kept identical on all ranks; parallel remeshing uses disjoint
+  // per-rank blocks and re-synchronises them)
   int next_vertex_gid;
   int next_triangle_gid;
   int next_halfedge_gid;
 
-  int global_n_triangles;  // Total across all ranks (excluding ghosts)
-  int global_n_vertices;  // Total across all ranks (excluding ghosts)
+  int global_n_triangles;  // owned triangles summed over all ranks (MFTLObjectUpdateGlobalStats)
+  int global_n_vertices;  // owned vertices summed over all ranks
 
-  // --- Hash maps for fast lookup ---
+  // --- global id -> local index maps ---
   khash_t(vertex_map) * vertex_lookup;
   khash_t(triangle_map) * triangle_lookup;
   khash_t(halfedge_map) * halfedge_lookup;
 
-  // --- Acceleration Structures (Flattened Topology) ---
-  // These are allocated by MFTLFlattenConnectivity()
+  // --- Flattened connectivity (MFTLFlattenConnectivity; NULL until built) ---
   int *flat_tri_verts;  ///< Size: 3 * n_triangles. Vert indices for each tri.
   int *flat_tri_neighbors;  ///< Size: 3 * n_triangles. Neighbor tri indices.
   int *vert_offsets;  ///< Size: n_vertices + 1. CSR offsets for V2T map.
   int *vert_tris;  ///< Size: 3 * n_triangles. CSR values for V2T map.
 
-  int global_id;  ///< A unique ID across all processors for tracking.
+  int global_id;  ///< Object id (identical on all ranks).
 
   /* Size in bytes of the opaque per-triangle user payload (MFTL_Triangle.data).
    *
@@ -234,15 +229,15 @@ typedef struct MFTL_Object
    *   every triangle's data pointer stays NULL). */
   size_t data_size;
 
-  // Pointer to the domain this object lives in.
+  // domain of the ensemble the object belongs to (not owned; NULL when detached)
   struct MFTL_Domain *domain;
 
-  /* Stage 16A: the body is declared OPEN (MFTLObjectDeclareOpen, identical on every rank).
+  /* The body is declared OPEN (MFTLObjectDeclareOpen, identical on every rank).
      Only a declared-open body may carry BOUNDARY half-edges; a closed body with an
      unmatched edge is an error, never silently opened (plans/16 §0, §2.2). */
   int declared_open;
 
-  /* Stage 16B (plans/16 §3.3/§3.4): cached per-axis wrap flags, set by MFTLCanonicaliseImages:
+  /* Cached per-axis wrap flags (plans/16 §3.3/§3.4), set by MFTLCanonicaliseImages:
      wrap[k] = 1 iff some component of the body winds along k (a cycle with non-zero lattice
      residual). wrap_valid = 0 until the first canonicalisation. */
   int wrap[3];
@@ -250,14 +245,14 @@ typedef struct MFTL_Object
   /* winding lattice generators of the body (all components), from the last canonicalisation */
   int n_wind;
   int (*wind_gen)[3];
-  /* Stage 16C (plans/16 §4.4.4): set when a canonicalisation finds different wrap flags than the
+  /* Set when a canonicalisation finds different wrap flags than the
      previous valid state (a class transition); read and cleared by MFTLObjectTakeClassTransition. */
   int class_transition;
 
-  /* Stage 16C (plans/16 §4.4.4): MFTL_REMESH_MODE_DEFAULT / _GENERALIZED (identical on all ranks) */
+  /* MFTL_REMESH_MODE_DEFAULT / _GENERALIZED (plans/16 §4.4.4; identical on all ranks) */
   int remesh_mode;
-  /* Stage 16C (plans/16 §4.3): boundary-curve mode per boundary tag (identical on all ranks;
-     tags without an entry are REPRESENTED) */
+  /* boundary-curve mode per boundary tag (plans/16 §4.3; identical on all ranks; tags without an
+     entry are REPRESENTED) */
   int n_bcurve;
   struct MFTL_BoundaryCurve *bcurve;
 
@@ -268,48 +263,44 @@ typedef struct MFTL_Object
 //------------------------------------------------------------------------------
 /**
  * @struct MFTL_Domain
- * @brief Defines the computational environment, MPI topology, and physical bounds.
- * This struct is shared by all MFTL_Object instances in an MFTL_Ensemble. It decouples the "container"
- * from the "contents".
+ * @brief The decomposition shared by all objects of an ensemble: communicators, the
+ * slab -> rank map, neighbour ranks, the global box and its periodicity.
  */
 typedef struct MFTL_Domain
 {
   // --- MPI Topology ---
-  MPI_Comm comm_world;  ///< The main communicator.
-  MPI_Comm comm_cart;  ///< Cartesian topology for geometric domain decomposition.
-  MPI_Comm comm_graph;  ///< Graph topology for actual mesh adjacencies.
+  MPI_Comm comm_world;  ///< Duplicate of the communicator the ensemble was created on.
+  MPI_Comm comm_cart;  ///< Cartesian communicator of the slab grid (periodic axes wrap).
+  MPI_Comm comm_graph;  ///< Distributed-graph communicator over the neighbour ranks.
 
-  int rank;  ///< My rank.
-  int nproc;  ///< Total processes.
+  int rank;  ///< This rank in comm_world.
+  int nproc;  ///< Number of ranks.
 
-  // Neighbors (Dynamic array)
+  // de-duplicated ranks of the up to 26 neighbouring slabs (may include this rank on 1- or
+  // 2-slab periodic axes)
   int num_neighbors;
   int *neighbors;
 
-  // --- Domain Decomposition ---
-  int cuts[3];  ///< Processor cuts {x, y, z}.
+  int cuts[3];  ///< Number of slabs along x, y, z (product == nproc).
 
-  // --- Physical Bounds ---
-  double global_min[3];  ///< Global domain start.
-  double global_max[3];  ///< Global domain end.
-  double domain_size[3];  ///< Length of domain (max - min).
-  double domain_half_size[3];  ///< Pre-calculated for periodicity checks.
+  double global_min[3];  ///< Lower corner of the global box.
+  double global_max[3];  ///< Upper corner of the global box.
+  double domain_size[3];  ///< Box size L = max - min (the period on periodic axes).
+  double domain_half_size[3];  ///< L / 2 (minimum-image threshold).
 
-  // --- Boundary Conditions ---
-  bool is_periodic[3];  ///< x, y, z periodicity.
+  bool is_periodic[3];  ///< Periodicity per axis.
 
-  // --- Lookup table for ijk to rank mapping ---
-  int *rank_map;  // Linear array: rank_map[i + j*nx + k*nx*ny] = rank
-  double grid_factors[3];  // Pre-calculated: cuts[i] / domain_size[i]
+  int *rank_map;  // slab -> rank: rank_map[i + j*cuts[0] + k*cuts[0]*cuts[1]]
+  double grid_factors[3];  // cuts[d] / domain_size[d] (uniform slab lookup)
 
-  // --- Stage 15 (L1): rectilinear decomposition ---
+  // --- Rectilinear decomposition ---
   // When axis_cuts[d] != NULL, slab i along axis d is [axis_cuts[d][i], axis_cuts[d][i+1])
   // (cuts[d] + 1 ascending coordinates; axis_cuts[d][0] / [cuts[d]] are the global box
   // faces) instead of the uniform split. rank_map may then be any bijection slab -> rank
   // (e.g. the PETSc DMDA x-fastest layout). NULL axes keep the uniform split.
   double *axis_cuts[3];
 
-  // --- Parallel Remeshing (Stage 10): x-only load-balanced ownership ---
+  // --- Parallel remeshing: x-only load-balanced ownership ---
   // When lb_nprocs > 0, MFTLGetOwnerProc ignores the Cartesian rank_map and
   // maps a position to the x-slab (slab index == owning rank) selected by the
   // sorted cut array lb_xcuts[0..lb_nprocs]. This implements MFTL1's x-only
@@ -331,37 +322,30 @@ typedef struct MFTL_Domain
 //------------------------------------------------------------------------------
 /**
  * @struct MFTL_Ensemble
- * @brief The top-level handle for the meshing library state.
+ * @brief The library handle: one domain and the objects (bodies) living in it. Every rank
+ * holds the same object list in the same order.
  */
 typedef struct MFTL_Ensemble
 {
-  // The Environment (MPI + Physics)
   MFTL_Domain domain;
 
-  // The Data (List of Objects)
   MFTL_Object **objects;
   int num_objects;
-  int capacity_objects;  // If you add/remove objects dynamically
+  int capacity_objects;
 
-  // Global Statistics
-  int total_global_triangles;
+  int total_global_triangles;  // sum of the objects' global_n_triangles
 
-  // --- Parallel Remeshing ---
   MFTL_EnsembleType type;
   MFTL_RemeshAlgorithm last_algorithm;  // algorithm used in the last remesh
 
 } MFTL_Ensemble;
 
 /**
- * @brief Creates and performs basic initialization of a new MFTL_Object struct.
+ * @brief Allocates an empty object with object id global_id.
  *
- * This function allocates the main mesh struct and sets up the MPI
- * communicator. It does NOT allocate the main data arrays (pools) or define the
- * domain decomposition. That is handled by other functions.
- *
- * @param comm The MPI communicator the mesh will be part of. If MPI_COMM_NULL
- * is passed, the function will use MPI_COMM_WORLD.
- * @return A pointer to the newly allocated mesh, or NULL on failure.
+ * The object has no entities and no domain until it is filled (generator, reader, builder)
+ * and added to an ensemble (MFTLEnsembleAddObject).
+ * @return The new object, or NULL on allocation failure.
  */
 MFTL_Object *MFTLObjectCreate(int global_id);
 
@@ -400,47 +384,30 @@ static inline void MFTLSetTriangleData(MFTL_Object *obj, MFTL_Triangle *tri, con
 int MFTLInitializeObjectData(MFTL_Object *object, size_t data_size);
 
 /**
- * @brief Frees all memory associated with an MFTL_Object mesh.
- *
- * This function cleans up all allocated data pools, the domain decomposition
- * information, and the MPI communicator before freeing the mesh struct itself.
- *
- * @param p_mesh A pointer to the object pointer (MFTL_Object**). This allows
- * the function to set the original pointer to NULL after freeing.
+ * @brief Frees an object (entity arrays, payload blobs, maps, flattened connectivity) and sets
+ * *p_object to NULL. The domain is not owned by the object; remove the object from its
+ * ensemble first (MFTLEnsembleRemoveObject) unless the ensemble is being destroyed.
  */
 void MFTLObjectDestroy(MFTL_Object **p_object);
 
 /**
- * @brief Updates the global vertex and triangle counts for all objects in the ensemble.
- * * It sums up the locally owned (non-ghost) entities across all MPI ranks 
- * and stores the result in each object's global_n_* fields.
- * * @param ensemble The MFTL ensemble containing the domain and objects.
+ * @brief Sets global_n_triangles / global_n_vertices of every object of the ensemble (owned
+ * entities summed over all ranks). Collective.
  */
 void MFTLEnsembleUpdateGlobalCounts(MFTL_Ensemble *ensemble);
 
 /**
- * @brief Updates the global vertex and triangle counts for a SINGLE object.
- * * This is useful when you have modified only one object (e.g. during generation)
- * and don't want to pay the cost of reducing data for the entire ensemble.
- * * @param object The MFTL object to update. Must have a valid domain link.
+ * @brief Single-object variant of MFTLEnsembleUpdateGlobalCounts. Collective over the
+ * object's domain (the object must be linked to one).
  */
 void MFTLObjectUpdateGlobalStats(MFTL_Object *object);
 
 /**
- * @brief Creates a new MFTL Ensemble, initializing the global simulation domain and MPI topology.
+ * @brief Creates an ensemble on a uniform Cartesian decomposition of the global box.
  *
- * This function serves as the primary entry point for setting up the library's environment.
- * It performs the following key tasks:
- * 1. Allocates the MFTL_Ensemble structure.
- * 2. Initializes the MFTL_Domain, including:
- * - Duplicating the provided MPI communicator for internal safety.
- * - Validating that the process grid (cuts) matches the MPI size.
- * - Setting up global physical bounds and periodicity flags.
- * - Creating the complex 26-neighbor distributed graph topology for efficient communication.
- * 3. Registers custom MPI types if this is the first active ensemble.
- * 4. Allocates the initial capacity for the object list.
- *
- * @note This function must be called collectively by all ranks in the communicator.
+ * Duplicates comm, checks cuts[0]*cuts[1]*cuts[2] == number of ranks, stores the box and its
+ * periodicity, builds the Cartesian and 26-neighbour distributed-graph communicators, and
+ * registers the MFTL2 MPI datatypes with the first live ensemble. Collective over comm.
  *
  * @param comm The base MPI communicator (usually MPI_COMM_WORLD).
  * @param cuts An array of 3 integers specifying the domain decomposition grid (ranks in x, y, z).
@@ -456,7 +423,7 @@ void MFTLObjectUpdateGlobalStats(MFTL_Object *object);
 MFTL_Ensemble *MFTLEnsembleCreate(MPI_Comm comm, int cuts[3], double global_min[3], double global_max[3], bool is_periodic[3], int initial_object_capacity);
 
 /**
- * @brief Stage 15 (L1): creates an ensemble on a RECTILINEAR decomposition.
+ * @brief Creates an ensemble on a RECTILINEAR decomposition.
  *
  * Same as MFTLEnsembleCreate, but the slab boundaries along every axis are given explicitly
  * (axis_cuts[d] holds cuts[d] + 1 ascending coordinates; NULL = uniform split of
@@ -468,7 +435,7 @@ MFTL_Ensemble *MFTLEnsembleCreateRectilinear(MPI_Comm comm, const int cuts[3], c
                                              const double global_min[3], const double global_max[3], const bool is_periodic[3], int initial_object_capacity);
 
 /**
- * @brief Stage 15 (L1): replaces the decomposition of an existing ensemble (collective).
+ * @brief Replaces the decomposition of an existing ensemble (collective).
  *
  * Rebuilds the Cartesian/graph communicators, the neighbour list, the rank map and the
  * axis cuts; the global box and periodicity are replaced too. Objects are NOT moved: call
@@ -478,7 +445,7 @@ int MFTLEnsembleSetDecomposition(MFTL_Ensemble *ens, const int cuts[3], const do
                                  const double global_max[3], const bool is_periodic[3]);
 
 /**
- * @brief Stage 15 (L4): detaches an object from its ensemble WITHOUT destroying it.
+ * @brief Detaches an object from its ensemble WITHOUT destroying it.
  *
  * The object is removed from ens->objects (the order of the remaining objects is kept) and
  * its domain link is cleared. Returns MFTL_ERROR if the object is not in the ensemble.
@@ -486,7 +453,7 @@ int MFTLEnsembleSetDecomposition(MFTL_Ensemble *ens, const int cuts[3], const do
 int MFTLEnsembleRemoveObject(MFTL_Ensemble *ensemble, MFTL_Object *object);
 
 /**
- * @brief Stage 15: builds a temporary domain on base's communicator with a different
+ * @brief Builds a temporary domain on base's communicator with a different
  * (uniform) process grid — e.g. the x-only slab layout used by load-balanced remeshing on
  * a 3-D decomposition. Slab (i,j,k) maps to rank i + j*cuts[0] + k*cuts[0]*cuts[1].
  * Collective. Release with MFTLDomainFreeTemporary. The caller swaps it into
@@ -496,7 +463,7 @@ int MFTLDomainCreateTemporary(const MFTL_Domain *base, const int cuts[3], MFTL_D
 void MFTLDomainFreeTemporary(MFTL_Domain *tmp);
 
 /**
- * @brief Stage 15 (L4): moves an object from one ensemble to another (appended to dst).
+ * @brief Moves an object from one ensemble to another (appended to dst).
  *
  * Both ensembles must describe the same decomposition (the object keeps its entities and
  * ownership; only its domain link changes). Rank-local; call it identically on all ranks.
@@ -504,35 +471,20 @@ void MFTLDomainFreeTemporary(MFTL_Domain *tmp);
 int MFTLEnsembleTransferObject(MFTL_Ensemble *dst, MFTL_Ensemble *src, MFTL_Object *object);
 
 /**
- * @brief Adds an object to the ensemble and links the domain.
- * @param ensemble The ensemble to add to.
- * @param object The object to add.
- * @return MFTL_SUCCESS on success.
+ * @brief Appends an object to the ensemble and links it to the ensemble's domain. Rank-local;
+ * call it identically on all ranks (object lists must agree).
  */
 int MFTLEnsembleAddObject(MFTL_Ensemble *ensemble, MFTL_Object *object);
 
 /**
- * @brief Destroys an MFTL Ensemble and frees all associated resources.
- *
- * This function performs a comprehensive cleanup:
- * 1. Iterates through all MFTL_Object pointers in the ensemble and calls MFTLObjectDestroy() on them.
- * 2. Frees the MFTL_Domain resources, including:
- * - The distributed graph, Cartesian, and world communicators.
- * - The neighbor rank arrays.
- * 3. Frees the ensemble structure itself.
- * 4. If this is the last active ensemble, it deregisters custom MPI types (Reference Counting).
- *
- * @param p_ens A double pointer to the ensemble.
- * The underlying pointer is set to NULL to prevent dangling reference usage.
+ * @brief Destroys an ensemble: its objects, its communicators and decomposition arrays, and —
+ * with the last live ensemble — the MFTL2 MPI datatypes. Sets *p_ens to NULL. Collective.
  */
 void MFTLEnsembleDestroy(MFTL_Ensemble **p_ens);
 
 /**
- * @brief Public function to generate a sphere.
- * @param object The object to generate the sphere on.
- * @param center The center position of the sphere.
- * @param radius The radius of the sphere.
- * @param refinements The number of refinements for the sphere.
+ * @brief Generates an outward-wound icosphere (20 * 4^refinements triangles) of the given
+ * centre and radius into an empty object; see src/generators/sphere.c for the collective contract.
  */
 int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int refinements);
 

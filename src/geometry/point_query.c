@@ -1,0 +1,699 @@
+/*
+ * MFTL2 geometry — point queries: point-in-object (ray casting), point-triangle distance, the
+ * caller-held point query, and axis-aligned bounding-box containment (MFTL1 parity,
+ * plans/07).
+ *
+ *  - MFTLPointTriangleDistance: verbatim port of MFTL1's 6-region Voronoi
+ *    classification (serial/pointtriangledistance.c) — two rotations into a
+ *    canonical frame, mirror normalization, then zone tests giving the
+ *    vertex/edge/interior nearest feature.
+ *  - MFTLPointInsideObject: collective ray casting (generalfunctions/point.c):
+ *    one random direction broadcast from rank 0, candidate triangles gathered
+ *    by traversing an LBVH of the object (src/intersection/bvh.c) with a slab test
+ *    (node AABBs inflated to absorb their float precision), crossings counted
+ *    on owned triangles only, MPI_Allreduce(SUM) of the stab count and of the
+ *    degeneracy flag; odd => inside, even => outside, flag < 0 => on surface
+ *    (-1). Grazing vertex/edge hits (SameSide == 2) flag degeneracy and all
+ *    ranks retry together with a fresh direction (max 100, MFTL1).
+ *  - MFTLPointQueryCreate / Inside / InsideMany: the same classification against an LBVH
+ *    built once (non-periodic domains; periodic domains fall back to MFTLPointInsideObject).
+ *  - MFTLPointInsideAABB / MFTLObjectAABB: the ORTHOGONAL box multiflow's
+ *    moveIBM uses (MFTLPointInsideObjectBox parity) plus its construction.
+ *
+ * No oriented (covariance) bounding box is provided: the only consumer (multiflow moveIBM)
+ * uses an axis-aligned box, and candidate gathering uses the LBVH.
+ *
+ * Validity: the parity test needs a closed surface. On a periodic domain the body must be
+ * COMPACT (a wrapping body aborts; use MFTLPhaseSetInside). The local mesh is then temporarily
+ * replaced by continuous coordinates in the image of a collective anchor vertex (exact from the
+ * image counters, any body extent, plans/16 §3.5), every lattice image of the probe inside the
+ * body's continuous bounding box is tested, and the wrapped storage is restored before
+ * returning. MFTLPointTriangleDistance uses the stored positions as they are (no minimum image).
+ */
+
+#include <math.h>
+#include <mpi.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "mftl_core.h"
+#include "mftl_constants.h"
+#include "mftl_geometry.h"
+#include "mftl_images.h"
+#include "mftl_topology.h"
+#include "mftl_bvh.h"
+#include "geometry_internal.h"
+
+// MFTL1's MFTL_VERYSMALL is 1e-15 == MFTL2's MFTL_VERYVERYSMALL.
+#define MFTL_PQ_TOL MFTL_VERYVERYSMALL
+
+// MFTL1's MFTL_MultiplyTensorVector uses the COLUMN convention:
+// out[i] = sum_j R[j][i] * x[j]. Computed into temporaries first (callers
+// rotate in place).
+static inline void mftlTensorVector(double out[3], const double R[3][3], const double x[3])
+{
+  double t0 = R[0][0] * x[0] + R[1][0] * x[1] + R[2][0] * x[2];
+  double t1 = R[0][1] * x[0] + R[1][1] * x[1] + R[2][1] * x[2];
+  double t2 = R[0][2] * x[0] + R[1][2] * x[1] + R[2][2] * x[2];
+  out[0] = t0;
+  out[1] = t1;
+  out[2] = t2;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Point-triangle distance (verbatim port of the 6-region Voronoi method)    */
+/* ------------------------------------------------------------------------- */
+
+static inline double mftlPointPointDistance(const double a[3], const double b[3])
+{
+  double d0 = a[0] - b[0], d1 = a[1] - b[1], d2 = a[2] - b[2];
+  return sqrt(d0 * d0 + d1 * d1 + d2 * d2);
+}
+
+static inline double mftlPointLineDistance(const double a[3], const double b[3], const double p[3])
+{
+  double v1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+  double v2[3] = {p[0] - a[0], p[1] - a[1], p[2] - a[2]};
+  double c[3] = {v1[1] * v2[2] - v1[2] * v2[1], v1[2] * v2[0] - v1[0] * v2[2], v1[0] * v2[1] - v1[1] * v2[0]};
+  double lv1 = sqrt(v1[0] * v1[0] + v1[1] * v1[1] + v1[2] * v1[2]);
+  if (lv1 < MFTL_PQ_TOL) return mftlPointPointDistance(p, a);
+  return sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]) / lv1;
+}
+
+double MFTLPointTriangleDistance(const MFTL_Object* obj, int tri_idx, const double p[3])
+{
+  MFTL_ASSERT(obj != MFTL_NULL);
+  MFTL_ASSERT(tri_idx >= 0 && tri_idx < obj->n_triangles);
+
+  MFTL_Vertex* vv[3];
+  MFTLGetTriangleVertices(obj, &obj->triangles[tri_idx], vv);
+
+  double Point[3][3];
+  double P1[3];
+  double translate[3];
+
+  memcpy(translate, vv[0]->pos, 3 * sizeof(double));
+  for (int i = 0; i < 3; ++i)
+    for (int k = 0; k < 3; ++k) Point[i][k] = vv[i]->pos[k] - translate[k];
+  for (int k = 0; k < 3; ++k) P1[k] = p[k] - translate[k];
+
+  // Rotate the triangle so that V0V1 aligns with the z axis
+  double xy, xyz;
+  double R[3][3];
+  if (fabs(Point[1][0]) > MFTL_PQ_TOL || fabs(Point[1][1]) > MFTL_PQ_TOL)
+  {
+    xy = sqrt(Point[1][0] * Point[1][0] + Point[1][1] * Point[1][1]) + MFTL_PQ_TOL;
+    xyz = sqrt(Point[1][0] * Point[1][0] + Point[1][1] * Point[1][1] + Point[1][2] * Point[1][2]) + MFTL_PQ_TOL;
+    R[0][0] = Point[1][1] / xy;
+    R[1][0] = -Point[1][0] / xy;
+    R[2][0] = 0.0;
+    R[0][1] = Point[1][0] * Point[1][2] / (xy * xyz);
+    R[1][1] = Point[1][1] * Point[1][2] / (xy * xyz);
+    R[2][1] = -xy / xyz;
+    R[0][2] = Point[1][0] / xyz;
+    R[1][2] = Point[1][1] / xyz;
+    R[2][2] = Point[1][2] / xyz;
+    for (int i = 0; i < 3; ++i) mftlTensorVector(Point[i], R, Point[i]);
+    mftlTensorVector(P1, R, P1);
+  }
+
+  // Rotate so that V2 lies on the yz plane
+  if (fabs(Point[2][0]) > MFTL_PQ_TOL)
+  {
+    xy = sqrt(Point[2][0] * Point[2][0] + Point[2][1] * Point[2][1]) + MFTL_PQ_TOL;
+    R[0][0] = Point[2][1] / xy;
+    R[1][0] = -Point[2][0] / xy;
+    R[2][0] = 0.0;
+    R[0][1] = Point[2][0] / xy;
+    R[1][1] = Point[2][1] / xy;
+    R[2][1] = 0.0;
+    R[0][2] = 0.0;
+    R[1][2] = 0.0;
+    R[2][2] = 1.0;
+    for (int i = 0; i < 3; ++i) mftlTensorVector(Point[i], R, Point[i]);
+    mftlTensorVector(P1, R, P1);
+  }
+
+  // Mirror into the first quarter (P1.y>0 side convention of MFTL1)
+  if (Point[1][2] >= 0.0)
+  {
+    if (Point[2][1] < 0.0)
+    {
+      Point[2][1] *= -1.0;
+      P1[1] *= -1.0;
+    }
+  }
+  else
+  {
+    Point[1][2] *= -1.0;
+    Point[2][2] *= -1.0;
+    P1[2] *= -1.0;
+    if (Point[2][1] < 0.0)
+    {
+      Point[2][1] *= -1.0;
+      P1[1] *= -1.0;
+    }
+  }
+
+  // Six Voronoi zones (edge order V0V2, V1V2, V0V1)
+  double distance;
+  if (((P1[1] - Point[0][1]) * (Point[2][2] - Point[0][2]) - (P1[2] - Point[0][2]) * (Point[2][1] - Point[0][1])) > 0.0)
+  {
+    if ((-(P1[1] - Point[0][1]) * (Point[2][1] - Point[0][1]) - (P1[2] - Point[0][2]) * (Point[2][2] - Point[0][2])) >= 0.0)
+      distance = mftlPointPointDistance(P1, Point[0]);  // zone 1: closest to V0
+    else if ((-(P1[1] - Point[2][1]) * (Point[2][1] - Point[0][1]) - (P1[2] - Point[2][2]) * (Point[2][2] - Point[0][2])) <= 0.0)
+      distance = mftlPointPointDistance(P1, Point[2]);  // zone 3: closest to V2
+    else
+      distance = mftlPointLineDistance(Point[0], Point[2], P1);  // zone 2: edge V0V2
+  }
+  else if (((P1[1] - Point[1][1]) * (Point[2][2] - Point[1][2]) - (P1[2] - Point[1][2]) * (Point[2][1] - Point[1][1])) < 0.0)
+  {
+    if ((-(P1[1] - Point[2][1]) * (Point[2][1] - Point[1][1]) - (P1[2] - Point[2][2]) * (Point[2][2] - Point[1][2])) <= 0.0)
+      distance = mftlPointPointDistance(P1, Point[2]);  // zone 3: closest to V2
+    else if ((-(P1[1] - Point[1][1]) * (Point[2][1] - Point[1][1]) - (P1[2] - Point[1][2]) * (Point[2][2] - Point[1][2])) >= 0.0)
+      distance = mftlPointPointDistance(P1, Point[1]);  // zone 5: closest to V1
+    else
+      distance = mftlPointLineDistance(Point[1], Point[2], P1);  // zone 4: edge V1V2
+  }
+  else if (((P1[1] - Point[0][1]) * (Point[1][2] - Point[0][2]) - (P1[2] - Point[1][2]) * (Point[1][1] - Point[0][1])) < 0.0)
+  {
+    if ((-(P1[1] - Point[1][1]) * (Point[1][1] - Point[0][1]) - (P1[2] - Point[1][2]) * (Point[1][2] - Point[0][2])) <= 0.0)
+      distance = mftlPointPointDistance(P1, Point[1]);  // zone 3: closest to V1
+    else if ((-(P1[1] - Point[0][1]) * (Point[1][1] - Point[0][1]) - (P1[2] - Point[0][2]) * (Point[1][2] - Point[0][2])) >= 0.0)
+      distance = mftlPointPointDistance(P1, Point[0]);  // zone 1: closest to V0
+    else
+      distance = mftlPointLineDistance(Point[0], Point[1], P1);  // zone 6: edge V0V1
+  }
+  else
+    distance = fabs(P1[0]);  // interior: distance to the triangle plane
+
+  return distance + MFTL_PQ_TOL;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Ray casting (collective)                                                  */
+/* ------------------------------------------------------------------------- */
+
+// SameSide: 1 strictly same side, 2 on the edge/vertex, 0 opposite side.
+static int mftlSameSide(const double p1[3], const double p2[3], const double a[3], const double b[3])
+{
+  double v1[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
+  double v2[3] = {p1[0] - a[0], p1[1] - a[1], p1[2] - a[2]};
+  double cp1[3] = {v1[1] * v2[2] - v1[2] * v2[1], v1[2] * v2[0] - v1[0] * v2[2], v1[0] * v2[1] - v1[1] * v2[0]};
+  v2[0] = p2[0] - a[0];
+  v2[1] = p2[1] - a[1];
+  v2[2] = p2[2] - a[2];
+  double cp2[3] = {v1[1] * v2[2] - v1[2] * v2[1], v1[2] * v2[0] - v1[0] * v2[2], v1[0] * v2[1] - v1[1] * v2[0]};
+  double d = cp1[0] * cp2[0] + cp1[1] * cp2[1] + cp1[2] * cp2[2];
+  if (d > MFTL_PQ_TOL)
+    return 1;
+  else if (d >= -MFTL_PQ_TOL)
+    return 2;
+  else
+    return 0;
+}
+
+static int mftlPointInTriangle(const double p[3], const double a[3], const double b[3], const double c[3], int* degenerate)
+{
+  int s0 = mftlSameSide(p, a, b, c);
+  int s1 = mftlSameSide(p, b, a, c);
+  int s2 = mftlSameSide(p, c, a, b);
+  if (s0 && s1 && s2)
+  {
+    // grazing a vertex/edge: flag degeneracy unless an on-surface verdict
+    // (-999) has already been recorded
+    if ((s0 == 2 || s1 == 2 || s2 == 2) && *degenerate >= 0) *degenerate = 1;
+    return 1;
+  }
+  return 0;
+}
+
+// Returns 1 when the segment (p, rayEnd) crosses the triangle plane with
+// 0 < t < 1 (InterPoint filled), 2 when p lies on the plane, 0 otherwise.
+static int mftlRayPlaneIntersection(const double v0[3], const double normal[3], const double p[3], const double ray_end[3],
+                                    double inter[3])
+{
+  double D = v0[0] * normal[0] + v0[1] * normal[1] + v0[2] * normal[2];
+  double ray[3] = {ray_end[0] - p[0], ray_end[1] - p[1], ray_end[2] - p[2]};
+  double numerator = D - (p[0] * normal[0] + p[1] * normal[1] + p[2] * normal[2]);
+  double denumerator = ray[0] * normal[0] + ray[1] * normal[1] + ray[2] * normal[2];
+
+  if (fabs(denumerator) < MFTL_PQ_TOL)  // ray parallel to the triangle
+  {
+    if (fabs(numerator) < MFTL_PQ_TOL)  // p on the triangle plane
+      return 2;
+    return 0;
+  }
+
+  double t = numerator / denumerator;
+  for (int k = 0; k < 3; ++k) inter[k] = p[k] + t * ray[k];
+  if (t > 0.0 && t < 1.0)
+    return 1;  // proper crossing within the segment
+  if (fabs(numerator) < MFTL_PQ_TOL)
+    return 2;  // p lies on the triangle plane
+  return 0;
+}
+
+// Port of MFTL_StabbedTriangle: count a crossing of one owned triangle,
+// set degenerate to 1 on grazing hits and to -999 when p itself is on the
+// triangle (on-surface verdict).
+static int mftlStabbedTriangle(const MFTL_Object* obj, int tri_idx, const double p[3], int* degenerate, const double ray_end[3])
+{
+  const MFTL_Triangle* tri = &obj->triangles[tri_idx];
+  if (tri->is_ghost || tri->owner_proc != obj->domain->rank) return 0;
+
+  MFTL_Vertex* vv[3];
+  MFTLGetTriangleVertices(obj, tri, vv);
+  double inter[3];
+
+  int code = mftlRayPlaneIntersection(vv[0]->pos, tri->normal, p, ray_end, inter);
+  if (code == 2)
+  {
+    if (mftlPointInTriangle(p, vv[0]->pos, vv[1]->pos, vv[2]->pos, degenerate))
+    {
+      *degenerate = -999;  // p is on the surface
+      return 1;
+    }
+    return 0;
+  }
+  if (code == 1) return mftlPointInTriangle(inter, vv[0]->pos, vv[1]->pos, vv[2]->pos, degenerate);
+  return 0;
+}
+
+// Slab test of the segment (p, rayEnd) against an AABB, inflated by eps to
+// absorb the float precision of the LBVH node boxes.
+static int mftlSegmentHitsAABB(const float bmin[3], const float bmax[3], double eps, const double p[3], const double ray_end[3])
+{
+  double tmin = 0.0, tmax = 1.0;
+  for (int k = 0; k < 3; ++k)
+  {
+    double d = ray_end[k] - p[k];
+    double lo = (double) bmin[k] - eps;
+    double hi = (double) bmax[k] + eps;
+    if (fabs(d) < MFTL_PQ_TOL)
+    {
+      if (p[k] < lo || p[k] > hi) return 0;
+    }
+    else
+    {
+      double inv = 1.0 / d;
+      double t0 = (lo - p[k]) * inv;
+      double t1 = (hi - p[k]) * inv;
+      if (t0 > t1)
+      {
+        double tmp = t0;
+        t0 = t1;
+        t1 = tmp;
+      }
+      if (t0 > tmin) tmin = t0;
+      if (t1 < tmax) tmax = t1;
+      if (tmin > tmax) return 0;
+    }
+  }
+  return 1;
+}
+
+// Traverse the LBVH, counting crossings on owned triangles (MFTL1's
+// MFTL_StabbedTriangles with the OBB tree replaced by the LBVH).
+static int mftlStabbedTrianglesBVH(const MFTL_Object* obj, const MFTL_BVH* bvh, const double p[3], int* degenerate,
+                                   const double ray_end[3])
+{
+  int stabbed = 0;
+  if (!bvh || bvh->root_index < 0) return 0;
+
+  double eps = 1e-4;  // float-AABB inflation (domain-scale queries)
+  int* stack = malloc((size_t) bvh->nodes_used * sizeof(int));
+  int sp = 0;
+  stack[sp++] = bvh->root_index;
+  while (sp > 0)
+  {
+    int ni = stack[--sp];
+    const MFTL_BVHNode* node = &bvh->nodes[ni];
+    if (!mftlSegmentHitsAABB(node->aabb_min, node->aabb_max, eps, p, ray_end)) continue;
+
+    if (node->payload & 1ull)
+    {
+      // leaf
+      int prim_count = (int) ((node->payload >> 1) & 0x7FFFFFFFu);
+      khint64_t first = node->payload >> 32;
+      for (int q = 0; q < prim_count; ++q)
+      {
+        int tri_idx = bvh->prim_indices[(int) first + q];
+        stabbed += mftlStabbedTriangle(obj, tri_idx, p, degenerate, ray_end);
+      }
+    }
+    else
+    {
+      khint64_t left = node->payload >> 1;
+      stack[sp++] = (int) left;
+      stack[sp++] = (int) left + 1;
+    }
+  }
+  free(stack);
+  return stabbed;
+}
+
+// Deterministic non-zero components in [-1, 1) (rank 0 only; broadcast).
+static void mftlRandomRayLocal(int iteration, double dir[3])
+{
+  unsigned int s = 0x9E3779B9u + 0x85EBCA6Bu * (unsigned int) (iteration + 1);
+  for (int k = 0; k < 3; ++k)
+  {
+    do
+    {
+      s ^= s << 13;
+      s ^= s >> 17;
+      s ^= s << 5;
+    } while (s == 0u);
+    double r = 2.0 * ((double) s / 4294967296.0) - 1.0;
+    if (fabs(r) < MFTL_PQ_TOL) r = (r < 0.0) ? -0.5 : 0.5;
+    dir[k] = r;
+  }
+}
+
+// Test instrumentation: BVH builds performed by MFTLPointInsideObject / MFTLPointQueryCreate
+// (one per call, independent of retries) and the attempts of the last classification.
+static int g_mftl_pq_bvh_builds = 0;
+static int g_mftl_pq_last_iterations = 0;
+
+int MFTLDebugPointQueryBVHBuilds(void)
+{
+  return g_mftl_pq_bvh_builds;
+}
+
+int MFTLDebugPointQueryLastIterations(void)
+{
+  return g_mftl_pq_last_iterations;
+}
+
+int MFTLPointInsideObject(MFTL_Object* obj, const double p_in[3])
+{
+  MFTL_ASSERT(obj != MFTL_NULL);
+  MFTL_ASSERT(p_in != MFTL_NULL);
+  // Odd/even parity requires a closed surface.
+  MFTL_ASSERT(MFTLCheckMeshIntegrity(obj) == MFTL_SUCCESS);
+
+  MFTL_Domain* domain = obj->domain;
+  int rank = domain->rank;
+  int nproc = domain->nproc;
+
+  double p[3] = {p_in[0], p_in[1], p_in[2]};
+
+  // On a periodic domain the wrapped storage of a seam-straddling body is torn
+  // across the domain faces. Temporarily replace ALL local vertex positions (owned and ghost) by
+  // their continuous coordinates in the anchor's image (exact from the image counters, any body
+  // extent, plans/16 §3.5), ray-cast every lattice image of the probe that lies in the body's
+  // continuous bounding box (the lifts of a compact body are disjoint, so at most one image is
+  // inside), then restore the wrapped storage. Non-periodic domains keep the legacy path.
+  double* saved = NULL;
+  int n_img = 1;
+  double probes[27][3];
+  memcpy(probes[0], p, sizeof(p));
+  if (MFTLDomainAnyPeriodic(domain))
+  {
+    MFTLObjectEnsureWinding(obj);  // collective
+    if (!MFTLObjectIsCompact(obj))
+    {
+      if (rank == 0)
+        fprintf(stderr, "MFTLPointInsideObject: body %d wraps a periodic direction; use MFTLPhaseSetInside\n", obj->global_id);
+      MPI_Abort(domain->comm_world, 1);
+    }
+    double anchor[3];
+    int anchor_img[3] = {0, 0, 0};
+    if (mftlObjectUnwrapAnchor(obj, anchor, anchor_img))  // collective
+    {
+      saved = malloc((size_t) obj->n_vertices * 3 * sizeof(double));
+      MFTL_ASSERT(saved != MFTL_NULL || obj->n_vertices == 0);
+      double lo[3] = {MFTL_DBL_MAX, MFTL_DBL_MAX, MFTL_DBL_MAX}, hi[3] = {-MFTL_DBL_MAX, -MFTL_DBL_MAX, -MFTL_DBL_MAX};
+      for (int i = 0; i < obj->n_vertices; ++i)
+      {
+        MFTL_Vertex* v = &obj->vertices[i];
+        memcpy(saved + 3 * i, v->pos, 3 * sizeof(double));
+        for (int k = 0; k < 3; ++k)
+        {
+          if (!domain->is_periodic[k]) continue;
+          v->pos[k] = anchor[k] + ((double) (v->img[k] - anchor_img[k]) * domain->domain_size[k] + (saved[3 * i + k] - anchor[k]));
+        }
+        if (!v->is_ghost)
+          for (int k = 0; k < 3; ++k)
+          {
+            lo[k] = fmin(lo[k], v->pos[k]);
+            hi[k] = fmax(hi[k], v->pos[k]);
+          }
+      }
+      double glo[3], ghi[3];
+      MPI_Allreduce(lo, glo, 3, MPI_DOUBLE, MPI_MIN, domain->comm_cart);
+      MPI_Allreduce(hi, ghi, 3, MPI_DOUBLE, MPI_MAX, domain->comm_cart);
+      // probe images: p + n L inside [glo, ghi] (with a small margin) on every periodic axis
+      int nlo[3] = {0, 0, 0}, nhi[3] = {0, 0, 0};
+      for (int k = 0; k < 3; ++k)
+      {
+        if (!domain->is_periodic[k]) continue;
+        const double Lk = domain->domain_size[k], eps = 1e-12 * Lk;
+        nlo[k] = (int) ceil((glo[k] - eps - p[k]) / Lk);
+        nhi[k] = (int) floor((ghi[k] + eps - p[k]) / Lk);
+        if (nhi[k] < nlo[k]) nhi[k] = nlo[k] - 1;  // no image of p in the box on this axis
+      }
+      n_img = 0;
+      for (int a = nlo[0]; a <= nhi[0]; ++a)
+        for (int b = nlo[1]; b <= nhi[1]; ++b)
+          for (int c = nlo[2]; c <= nhi[2]; ++c)
+            if (n_img < 27)
+            {
+              const int n[3] = {a, b, c};
+              for (int k = 0; k < 3; ++k) probes[n_img][k] = p[k] + (domain->is_periodic[k] ? n[k] * domain->domain_size[k] : 0.0);
+              n_img++;
+            }
+    }
+  }
+  else
+  {
+    // Non-periodic: legacy re-image next to the object's AABB centre
+    // (a no-op without periodic axes; kept for collective-call parity).
+    double c[3], d[3];
+    MFTLObjectAABB(obj, c, d);
+    for (int k = 0; k < 3; ++k)
+    {
+      if (!domain->is_periodic[k]) continue;
+      double half = 0.5 * domain->domain_size[k];
+      while (p[k] - c[k] > half) p[k] -= domain->domain_size[k];
+      while (p[k] - c[k] < -half) p[k] += domain->domain_size[k];
+    }
+    memcpy(probes[0], p, sizeof(p));
+  }
+
+  // Ray length: 50x the domain diagonal (MFTL1) guarantees exit.
+  double domain_size[3] = {domain->domain_size[0], domain->domain_size[1], domain->domain_size[2]};
+  double ray_length = 50.0 * sqrt(domain_size[0] * domain_size[0] + domain_size[1] * domain_size[1] + domain_size[2] * domain_size[2]);
+
+  // the mesh is static during ray casting: one BVH serves every retry
+  MFTL_BVH* bvh = MFTL_GenerateLBVH(obj);
+  g_mftl_pq_bvh_builds++;
+
+  int result = 0;
+  int i = 0;
+  const int maxiter = 100;
+  for (int pi = 0; pi < n_img; ++pi)
+  {
+    const double* pp = probes[pi];
+    int flag = 0;
+    int stabbed_glob = 0;
+    i = 0;
+    while (i++ < maxiter)
+    {
+      int degenerate = 0;
+      double dir[3];
+
+      // One shared random direction: rank 0 draws, everyone receives.
+      if (rank == 0) mftlRandomRayLocal(i - 1, dir);
+      MPI_Bcast(dir, 3, MPI_DOUBLE, 0, domain->comm_cart);
+
+      double ray_end[3] = {pp[0] + dir[0] * ray_length, pp[1] + dir[1] * ray_length, pp[2] + dir[2] * ray_length};
+
+      int stabbed_loc = mftlStabbedTrianglesBVH(obj, bvh, pp, &degenerate, ray_end);
+
+      MPI_Allreduce(&stabbed_loc, &stabbed_glob, 1, MPI_INT, MPI_SUM, domain->comm_cart);
+      flag = 0;
+      MPI_Allreduce(&degenerate, &flag, 1, MPI_INT, MPI_SUM, domain->comm_cart);
+      if (flag == 0 || flag < 0) break;  // clean verdict, or on-surface everywhere
+    }
+    int r;
+    if (i > maxiter)
+      r = 1;  // MFTL1: after 100 retries assume inside
+    else if (flag < 0)
+      r = -1;  // on the surface
+    else
+      r = stabbed_glob % 2;  // odd => inside
+    if (r != 0)
+    {
+      result = r;
+      break;
+    }
+  }
+  g_mftl_pq_last_iterations = i;
+
+  MFTL_DestroyBVH(bvh);
+
+  // restore the wrapped storage
+  if (saved)
+  {
+    for (int i2 = 0; i2 < obj->n_vertices; ++i2) memcpy(obj->vertices[i2].pos, saved + 3 * i2, 3 * sizeof(double));
+    free(saved);
+  }
+  return result;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Caller-held point query (build once, query many)                          */
+/* ------------------------------------------------------------------------- */
+
+struct MFTL_PointQuery
+{
+  MFTL_Object* obj;
+  MFTL_BVH* bvh;  // NULL on periodic domains (per-point fallback)
+  double ray_length;
+};
+
+MFTL_PointQuery* MFTLPointQueryCreate(MFTL_Object* obj)
+{
+  MFTL_ASSERT(obj != MFTL_NULL);
+  MFTL_ASSERT(MFTLCheckMeshIntegrity(obj) == MFTL_SUCCESS);
+  MFTL_PointQuery* q = (MFTL_PointQuery*) calloc(1, sizeof(MFTL_PointQuery));
+  q->obj = obj;
+  const MFTL_Domain* domain = obj->domain;
+  const double* ds = domain->domain_size;
+  q->ray_length = 50.0 * sqrt(ds[0] * ds[0] + ds[1] * ds[1] + ds[2] * ds[2]);
+  if (!MFTLDomainAnyPeriodic(domain))
+  {
+    q->bvh = MFTL_GenerateLBVH(obj);
+    g_mftl_pq_bvh_builds++;
+  }
+  return q;
+}
+
+void MFTLPointQueryDestroy(MFTL_PointQuery** q)
+{
+  if (!q || !*q) return;
+  if ((*q)->bvh) MFTL_DestroyBVH((*q)->bvh);
+  free(*q);
+  *q = MFTL_NULL;
+}
+
+int MFTLPointQueryInsideMany(MFTL_PointQuery* q, int n, const double* xyz, int* result)
+{
+  MFTL_Object* obj = q->obj;
+  MFTL_Domain* domain = obj->domain;
+  if (!q->bvh)
+  {
+    for (int m = 0; m < n; ++m) result[m] = MFTLPointInsideObject(obj, &xyz[3 * m]);
+    return MFTL_SUCCESS;
+  }
+
+  // Per-point state; `pending` lists the points still being classified. Every iteration
+  // uses ONE shared direction (rank 0 draws, all receive), exactly the direction sequence
+  // MFTLPointInsideObject uses for every single point, so each point gets the verdict it
+  // would get from a sequence of single-point calls.
+  int* pending = (int*) malloc((size_t) (n > 0 ? n : 1) * sizeof(int));
+  int* loc = (int*) malloc((size_t) (2 * (n > 0 ? n : 1)) * sizeof(int));
+  int* glob = (int*) malloc((size_t) (2 * (n > 0 ? n : 1)) * sizeof(int));
+  int np = n;
+  for (int m = 0; m < n; ++m) pending[m] = m;
+
+  const int maxiter = 100;
+  int i = 0;
+  while (np > 0 && i++ < maxiter)
+  {
+    double dir[3];
+    if (domain->rank == 0) mftlRandomRayLocal(i - 1, dir);
+    MPI_Bcast(dir, 3, MPI_DOUBLE, 0, domain->comm_cart);
+
+    for (int k = 0; k < np; ++k)
+    {
+      const double* p = &xyz[3 * pending[k]];
+      int degenerate = 0;
+      double ray_end[3] = {p[0] + dir[0] * q->ray_length, p[1] + dir[1] * q->ray_length, p[2] + dir[2] * q->ray_length};
+      loc[2 * k] = mftlStabbedTrianglesBVH(obj, q->bvh, p, &degenerate, ray_end);
+      loc[2 * k + 1] = degenerate;
+    }
+    MPI_Allreduce(loc, glob, 2 * np, MPI_INT, MPI_SUM, domain->comm_cart);
+
+    int still = 0;
+    for (int k = 0; k < np; ++k)
+    {
+      const int stabbed = glob[2 * k], flag = glob[2 * k + 1];
+      if (flag == 0)
+        result[pending[k]] = stabbed % 2;  // odd => inside
+      else if (flag < 0)
+        result[pending[k]] = -1;  // on the surface
+      else
+        pending[still++] = pending[k];  // grazing hit somewhere: retry with a fresh direction
+    }
+    np = still;
+  }
+  for (int k = 0; k < np; ++k) result[pending[k]] = 1;  // MFTL1: after 100 retries assume inside
+  g_mftl_pq_last_iterations = i;
+
+  free(pending);
+  free(loc);
+  free(glob);
+  return MFTL_SUCCESS;
+}
+
+int MFTLPointQueryInside(MFTL_PointQuery* q, const double p[3])
+{
+  int r = 0;
+  MFTLPointQueryInsideMany(q, 1, p, &r);
+  return r;
+}
+
+/* ------------------------------------------------------------------------- */
+/* Axis-aligned bounding boxes (multiflow moveIBM's ortho box)               */
+/* ------------------------------------------------------------------------- */
+
+void MFTLObjectAABB(MFTL_Object* obj, double center[3], double dims[3])
+{
+  MFTL_ASSERT(obj != MFTL_NULL);
+  MFTL_Domain* domain = obj->domain;
+
+  double lmin[3] = {MFTL_DBL_MAX, MFTL_DBL_MAX, MFTL_DBL_MAX};
+  double lmax[3] = {-MFTL_DBL_MAX, -MFTL_DBL_MAX, -MFTL_DBL_MAX};
+  for (int i = 0; i < obj->n_vertices; ++i)
+  {
+    const MFTL_Vertex* v = &obj->vertices[i];
+    if (v->is_ghost || v->owner_proc != domain->rank) continue;
+    for (int k = 0; k < 3; ++k)
+    {
+      if (v->pos[k] < lmin[k]) lmin[k] = v->pos[k];
+      if (v->pos[k] > lmax[k]) lmax[k] = v->pos[k];
+    }
+  }
+
+  double gmin[3], gmax[3];
+  MPI_Allreduce(lmin, gmin, 3, MPI_DOUBLE, MPI_MIN, domain->comm_cart);
+  MPI_Allreduce(lmax, gmax, 3, MPI_DOUBLE, MPI_MAX, domain->comm_cart);
+
+  for (int k = 0; k < 3; ++k)
+  {
+    if (gmin[k] > gmax[k])
+    {
+      center[k] = 0.0;  // empty object
+      dims[k] = 0.0;
+    }
+    else
+    {
+      center[k] = 0.5 * (gmin[k] + gmax[k]);
+      dims[k] = 0.5 * (gmax[k] - gmin[k]);
+    }
+  }
+}
+
+int MFTLPointInsideAABB(const double center[3], const double dims[3], const double p[3])
+{
+  for (int k = 0; k < 3; ++k)
+  {
+    if (p[k] < center[k] - dims[k] - MFTL_VERYSMALL) return 0;
+    if (p[k] > center[k] + dims[k] + MFTL_VERYSMALL) return 0;
+  }
+  return 1;
+}
+

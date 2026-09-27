@@ -1,9 +1,10 @@
 /*
- * Volume-conserving smoothing (Stage 09), MFTL1 parity:
+ * MFTL2 remeshing — volume-conserving smoothing and volume recovery (MFTL1 parity, plans/09):
  *
  *   - MFTLVolumeRecovery (volumeconservation.c:VolumeRecovery): global
- *     uniform normal shift h = (V - target)/Area, iterated to a tight
- *     tolerance. Restores GLOBAL volume exactly (to first order per shift).
+ *     uniform normal shift h = (V - target)/Area with a secant-corrected slope,
+ *     iterated (at most 10 steps) to a relative error below 1e-12. Only for bodies
+ *     that enclose a volume by themselves (closed and compact); a no-op otherwise.
  *   - MFTLEdgeVolumeConservingSmoothing / MFTLVolumeConservingSmoothing
  *     (volumeconservation.c, Kuprat 2001 Algorithm 4): per-edge coupled
  *     umbrella targets x_s, under-relaxed moves dx, and a common normal
@@ -13,11 +14,11 @@
  *     endpoints to the common tangent plane n = n(n0+n1), then solve the
  *     volume-conserving height h = (V0+V1)/(V0/h0 + V1/h1).
  *   - MFTLRoughnessSmoothing (smoothing.c:Object_Roughness_Smoothing):
- *     per-edge trigger on dihedral roughness (Stage-06 roughness_mean) and
+ *     per-edge trigger on dihedral roughness (roughness_mean) and
  *     geometric-Laplacian magnitude, dispatch to Kuprat or TSUR.
  *
  * Conventions and guards:
- *   - Feature protection (Stage 08): edges flagged MFTL_FLAG_FEATURE or
+ *   - Feature protection: edges flagged MFTL_FLAG_FEATURE or
  *     geometrically sharp (dihedral > feature_angle_threshold) are never
  *     smoothed; vertices are only moved by edge steps on non-feature edges.
  *   - Dead/ghost entities are skipped; ring walks that cross them abort the
@@ -26,12 +27,12 @@
  *     inf), non-finite h -> step aborted with MFTL_ERROR.
  *   - Kuprat guard: |AA| near zero (flat/degenerate ring) -> step skipped.
  *
- * Parallel: PRECONDITION — a complete one-ring around every processed vertex
- * must be stored. The serial workflow (rank-0-local mesh, or ghosts via
- * MFTLExtendGhostLayer + MFTLUpdateGhostPositions) satisfies this; a fully
- * parallel edge-local version is Stage 10 work. Volume reductions are
- * collective (Stage 02 integrals over comm_cart). After smoothing owned
- * vertices, refresh ghost copies with MFTLUpdateGhostPositions.
+ * Parallel: the serial drivers need the whole mesh on one rank and fail loudly on a
+ * distributed mesh; the *Parallel drivers gate every edge to the parallel-interior rule
+ * (both endpoints owned, ghost-free fans) and are exact per edge. Volume reductions are
+ * collective (the integrals over comm_cart). After smoothing owned vertices, refresh ghost
+ * copies with MFTLUpdateGhostPositions. Moved vertices keep wrapped positions with their
+ * image counters updated (displacement rule).
  */
 
 #include <math.h>
@@ -48,13 +49,12 @@
 #define MFTL_VC_MAX_RING 64
 
 /* ------------------------------------------------------------------------- */
-/* Stage 10: serial-only precondition + parallel-safe drivers                */
+/* Serial-only precondition + parallel-safe drivers                          */
 /* ------------------------------------------------------------------------- */
 
 // The serial edge-local drivers below move BOTH endpoints of every edge they
 // visit and read their full one-rings. On a distributed mesh that would
-// silently move ghost vertices and read truncated rings — the Stage-09 review
-// carry-forward. Fail loudly (Debug AND Release) instead; distributed callers
+// silently move ghost vertices and read truncated rings. Fail loudly (Debug AND Release) instead; distributed callers
 // must use the parallel remesh driver (MFTLRemeshEnsembleParallel), which
 // gates every edge to the MFTL1 parallel-interior rule via the *Parallel
 // variants below.
@@ -114,7 +114,7 @@ static int mftlVcEdgeInteriorParallel(const MFTL_Object* obj, int he_idx)
   if (obj->vertices[obj->half_edges[tw_next].vertex_idx].is_ghost) return 0;
   if (obj->vertices[obj->half_edges[tw_prev].vertex_idx].is_ghost) return 0;
 
-  // Stage 15 (L7): the step moves both endpoints and rescales the surface scalar of every
+  // The step moves both endpoints and rescales the surface scalar of every
   // triangle in their one-rings; a ring triangle stored here only as a ghost would get its
   // rescale on the ghost copy while its owner keeps the old value (mass loss). Require the
   // full rings to be locally owned.
@@ -185,7 +185,7 @@ static int mftlVcRingTris(const MFTL_Object* obj, int vi, int* ring_tris)
   return count;
 }
 
-// Feature test: flagged or geometrically sharp (Stage 08 protection).
+// Feature test: flagged or geometrically sharp.
 static int mftlVcFeatureEdge(const MFTL_Object* obj, int he_idx, double angle_degrees)
 {
   const MFTL_HalfEdge* he = &obj->half_edges[he_idx];
@@ -199,7 +199,7 @@ static int mftlVcFeatureEdge(const MFTL_Object* obj, int he_idx, double angle_de
 }
 
 // A vertex incident to at least one sharp/feature edge is a feature vertex:
-// volume smoothers never move it (Stage 08 feature protection).
+// volume smoothers never move it (feature protection).
 static int mftlVcFeatureVertex(MFTL_Object* obj, int vi, double angle_degrees)
 {
   const MFTL_Vertex* v = &obj->vertices[vi];
@@ -245,7 +245,7 @@ static int mftlVcRingNormal(MFTL_Object* obj, int vi, double n[3])
   return MFTL_SUCCESS;
 }
 
-// Geometric-Laplacian magnitude (Stage-06 formula) of one vertex.
+// Geometric-Laplacian magnitude of one vertex (curvature.c formula).
 static double mftlVcLocalGL(MFTL_Object* obj, int vi)
 {
   const MFTL_Vertex* v = &obj->vertices[vi];
@@ -312,7 +312,7 @@ static double mftlVcDet3(const double m[3][3])
 
 double MFTLVolumeRecovery(MFTL_Object* obj, double target_volume)
 {
-  // Stage 16B class guard: open or wrapping bodies enclose no volume by themselves
+  // class guard: open or wrapping bodies enclose no volume by themselves
   MFTLObjectEnsureWinding(obj);  // collective
   if (!MFTLObjectHasVolume(obj)) return 0.0;
   MFTL_ASSERT(obj != MFTL_NULL);
@@ -408,7 +408,7 @@ double MFTLVolumeRecovery(MFTL_Object* obj, double target_volume)
       v->pos[1] -= n[1] * h;
       v->pos[2] -= n[2] * h;
       // storage invariant: positions stay wrapped inside the domain (no-op
-      // when no axis is periodic); Stage 16B: the wrap is counted into img
+      // when no axis is periodic); the wrap is counted into img
       MFTLWrapPosImg(obj->domain, v->pos, v->img);
     }
   }
@@ -506,7 +506,7 @@ static int mftlVcEndpointData(MFTL_Object* obj, int vi, int v_other, const doubl
   return MFTL_SUCCESS;
 }
 
-// Stage 15 (L7, MFTL1 tsur3d.c / volumeconservation.c parity): after the library moved the
+// Surface scalar (MFTL1 tsur3d.c / volumeconservation.c parity): after the library moved the
 // two edge endpoints, every triangle of their one-rings keeps its surface-scalar MASS:
 // c *= A_cached / A_new, and the cached area becomes A_new. A triangle in both rings is
 // visited twice; the second visit has ratio exactly 1.
@@ -594,7 +594,7 @@ void MFTLEdgeVolumeConservingSmoothing(MFTL_Object* obj, int he_idx, MFTL_Remesh
     MFTLWrapPosImg(obj->domain, obj->vertices[i == 0 ? v0 : v1].pos, obj->vertices[i == 0 ? v0 : v1].img);
   }
 
-  // Stage 15 (L7): conserve the surface-scalar mass of the moved rings.
+  // conserve the surface-scalar mass of the moved rings
   int ss_ring[MFTL_VC_MAX_RING];
   int ss_n = mftlVcRingTris(obj, v0, ss_ring);
   mftlSSRescaleRing(obj, ss_ring, ss_n);
@@ -816,14 +816,13 @@ int MFTLEdgeTSUR(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
   double h = (vol0 + vol1) / (vol0 / h0 + vol1 / h1);
   if (!isfinite(h)) return MFTL_ERROR;  // NaN guard (MFTL1 isnan path)
 
-  // 8. move + domain handling. Stage-13 resolution of the Stage-09
-  // carry-forward: on periodic axes the moved endpoint WRAPS back into the
+  // 8. move + domain handling: on periodic axes the moved endpoint WRAPS back into the
   // domain (clamping would pin the surface to the periodic face); on
   // non-periodic axes the original clamp is kept exactly.
   double nh[3] = {normal[0] * h, normal[1] * h, normal[2] * h};
   double* pos0 = obj->vertices[v0].pos;
   double* pos1 = obj->vertices[v1].pos;
-  double old0[3], old1[3];  // Stage 16B: displacement rule for the image counters
+  double old0[3], old1[3];  // displacement rule for the image counters
   memcpy(old0, pos0, sizeof(old0));
   memcpy(old1, pos1, sizeof(old1));
   for (int k = 0; k < 3; ++k)
@@ -844,7 +843,7 @@ int MFTLEdgeTSUR(MFTL_Object* obj, int he_idx, MFTL_RemeshParameters* params)
     pos1[k] = MFTL_MAX(lo, MFTL_MIN(pos1[k], hi));
   }
 
-  // Stage 15 (L7): conserve the surface-scalar mass of the moved rings.
+  // conserve the surface-scalar mass of the moved rings
   mftlSSRescaleRing(obj, ring0, n0);
   mftlSSRescaleRing(obj, ring1, n1);
   return MFTL_SUCCESS;
@@ -869,7 +868,7 @@ void MFTLRoughnessSmoothing(MFTL_Object* obj, MFTL_RemeshParameters* params)
 {
   mftlVcRequireCompleteMesh(obj, "MFTLRoughnessSmoothing");
   // Fill per-vertex dihedral roughness_mean (collective; also returns the
-  // global geometric Laplacian, which we recompute per endpoint below).
+  // global geometric Laplacian, which is recomputed per endpoint below).
   MFTLComputeRoughness(obj);
 
   for (int j = 0; j < obj->n_half_edges; ++j)
@@ -901,7 +900,7 @@ void MFTLRoughnessSmoothing(MFTL_Object* obj, MFTL_RemeshParameters* params)
 }
 
 /* ------------------------------------------------------------------------- */
-/* Stage 10: parallel-safe drivers                                           */
+/* Parallel-safe drivers                                                     */
 /*                                                                         */
 /* Same per-edge steps as the serial drivers, but every edge is gated to   */
 /* the MFTL1 parallel-interior rule (mftlVcEdgeInteriorParallel): both     */

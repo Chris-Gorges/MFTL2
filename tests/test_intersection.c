@@ -1,3 +1,7 @@
+/*
+ * Triangle-triangle intersection through the LBVH pair traversal on two hand-built
+ * single-triangle objects (exactly one hit, triangle 0 of each).
+ */
 #include "mftl_core.h"
 #include "mftl_bvh.h"
 #include <stdio.h>

@@ -1,3 +1,7 @@
+/*
+ * Unit tests of small internal helpers: radix sort, sorted-array de-duplication, the
+ * minimum-image vector, periodic wrapping and edge length.
+ */
 #include "test_utils.h"
 #include "mftl_core.h"
 #include "mftl_constants.h"

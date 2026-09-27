@@ -1,3 +1,8 @@
+/*
+ * MFTLExtendGhostLayer accuracy (4 ranks, 2x2x1 decomposition): after extending the ghost layer
+ * of a redistributed sphere, every stored ghost vertex lies on the sphere and its position
+ * matches its owner's copy.
+ */
 #include "test_utils.h"
 #include "mftl_core.h"
 #include "mftl_communication.h"
@@ -207,7 +212,7 @@ int test_ghost_extension_accuracy()
   }
 
   // MFTL has a "ghosts are only vertices" mode or "ghosts include triangles"?
-  // communication.c usually sends triangles (PackedTriangleComplex) implicitly when extending.
+  // ghost_layers.c usually sends triangles (PackedTriangleComplex) implicitly when extending.
   // So we expect triangles.
   if (ghost_count > 0) TEST_ASSERT(valid_ghost_structure);
 
