@@ -1382,9 +1382,6 @@ int main(int argc, char **argv)
      * 2N collectives for O(N) bytes. In WEAK mode N grows with the rank count,
      * so that alone would make setup grow linearly with P. */
     MFTLGenerateSphereLocal(obj, centre, radius, cfg.refinements);
-
-    /* Ownership is decided from the cached centre, and a fresh mesh has none. */
-    MFTLComputeTriangleGeometry(obj, obj->tris.n);
   }
 
   /* Two collectives for the whole ensemble, whatever the body count. */

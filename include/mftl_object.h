@@ -225,7 +225,8 @@ static inline void MFTLObjectMarkPartitionDirty(MFTL_Object *obj) { obj->partiti
 
 /**
  * @brief Rebuilds `tris.verts` and `tris.neighbors` from the half-edge records
- *        in one streaming pass and sets #MFTL_DERIVED_TOPOLOGY.
+ *        in one streaming pass and sets #MFTL_DERIVED_TOPOLOGY
+ *        (#MFTL_DERIVED_GEOMETRY is left as it was).
  *
  * `verts[3t+k]` is the ORIGIN of half-edge 3t+k and `neighbors[3t+k]` the
  * triangle across it (#MFTL_ERROR without a twin). Call after any topology

@@ -32,8 +32,9 @@
  *                               under coarsening).
  *   MFTLRemeshMeasureBodies     per-body holder reductions (9 values, then 1)
  *                               plus one scalar MPI_MAX; once per pass.
- *   MFTLRemeshAgree*            small fixed-size Allreduces (profile, band,
- *                               frozen counts, balancer scalars, Debug checks).
+ *   MFTLRemeshAgree*            small fixed-size Allreduces (the parameter block
+ *                               once per call, profile, frozen counts, balancer
+ *                               scalars, Debug checks).
  *   MFTLRemeshNeighbor*         the balancer's one-hop exchanges: O(local
  *                               bodies) or O(1) per neighbour, never sized by
  *                               n_bodies_global.
@@ -394,28 +395,36 @@ void MFTLRemeshSumInts(const MFTL_Domain *domain, int *values, int n);
 void MFTLRemeshAgreeDouble(const MFTL_Domain *domain, double *values, int n);
 
 /**
- * @brief Debug: do all ranks agree on the parameters that decide what to do?
+ * @brief Refuses, on EVERY rank, a parameter block that is invalid on any rank or
+ *        not identical on all of them.
  *
- * A remeshing pass is a set of independent local decisions taken against ONE
- * length band, and nothing in the algorithm communicates the band -- every rank
- * is simply assumed to have been handed the same one. When that assumption
- * breaks the failure is spectacular and its cause is invisible: a rank whose
- * `max_edge_length` is smaller splits everything it owns, every phase, and the
- * mesh grows without bound until the job is killed. There is no wrong answer to
- * find afterwards, only an enormous one.
+ * Nothing in a distributed pass communicates the parameters: every rank is
+ * assumed to hold the same block. Some fields decide the sequence of
+ * collectives (`parallel_strategy`, `parallel_phase_budget`, the coarsening
+ * controls), the rest decide what happens to shared entities. Two realistic
+ * violations, neither with a symptom of its own:
  *
- * The realistic way in is not a typo. It is deriving the target from the mesh --
- * `MFTLMeanEdgeLength(obj)`, which is LOCAL -- on a mesh that a collective
- * generator has already distributed, so that a rank holding nothing computes
- * zero. MFTLEnsembleMeanEdgeLength exists to remove that route; this check
- * catches every other one.
+ * - **A band that is invalid on some ranks only.** The usual cause is
+ *   MFTLMeanEdgeLength() (LOCAL) on a distributed mesh: 0 on a rank holding no
+ *   triangle of the body. A per-rank refusal returns on that rank and leaves the
+ *   others in the next collective, which is a hang in Release.
+ * - **Blocks that differ between ranks.** Different collective sequences hang;
+ *   different decisions on shared entities give an inconsistent mesh.
+ *
+ * One `MPI_Allreduce(MIN)` over every field, every negated field and the local
+ * band verdict gives each rank the extremes of every field and the worst
+ * verdict, so all ranks reach the same answer; a refusal is useful only if it
+ * is unanimous. The band is valid when
+ * \f$0 \le \ell_{\min} \le \ell_{\max}\f$ and \f$\ell_{\max} > 0\f$
+ * (NaN fails). Fields must agree bitwise. Rank 0 prints the reason on stderr.
  *
  * @param domain The MPI/physical world.
- * @param params The parameter block this rank was handed.
- * @return #MFTL_TRUE if every rank passed bitwise-identical bands.
- * @collective
+ * @param params This rank's parameter block.
+ * @param caller Name of the public entry point, for the diagnostic.
+ * @return #MFTL_SUCCESS on every rank, or #MFTL_ERROR on every rank.
+ * @collective One Allreduce of 49 doubles; at `nproc == 1` only the band test.
  */
-bool MFTLRemeshParamsAgree(const MFTL_Domain *domain, const MFTL_RemeshParameters *params);
+int MFTLRemeshAgreeParams(const MFTL_Domain *domain, const MFTL_RemeshParameters *params, const char *caller);
 
 /**
  * @brief In-place `MPI_Allreduce(MPI_MAX)` of @p n ints over the world.

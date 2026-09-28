@@ -59,6 +59,14 @@ $$
 (minimum-image edges $\mathbf{e}_i$), which may lie outside the box; all other
 triangles keep sharing their points. The mesh in memory is untouched.
 
+<!-- figure: vtu-unwrap
+Periodic unwrapping in `MFTLWriteVtu`. (a) Drawn with their stored corners,
+triangles straddling the seam span the whole domain. (b) Each straddler gets
+three private points $\mathbf{p}_0$, $\mathbf{p}_0+\mathbf{e}_1$,
+$\mathbf{p}_0+\mathbf{e}_2$ from minimum-image edges, which may lie outside
+the box; every other triangle keeps sharing its points.
+-->
+
 A triangle wraps iff some minimum-image edge differs from its raw difference, i.e.
 iff a periodic correction was applied: $d - L\,\mathrm{nearbyint}(d/L)$ returns
 $d$ bit-exactly when the rounding is 0 and differs by about $L$ otherwise. The test
@@ -103,6 +111,13 @@ many small non-contiguous slices into a few large stripe-aligned writes (two-pha
 collective buffering). The file is truncated to its exact size. Connectivity and
 offsets are Int32, which bounds a shared file at $2^{31}-1$ points and
 $(2^{31}-1)/3$ cells.
+
+<!-- figure: vtu-layout
+The shared file. Each array is one block: an 8-byte length, then every rank's
+slice in rank order. The XML header is built from global counts, so its length
+$H$ is the same on every rank, and one exclusive scan of each rank's
+(points, cells) places every slice of every block.
+-->
 
 ### Which layout is faster depends on the machine
 

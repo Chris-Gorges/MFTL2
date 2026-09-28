@@ -165,6 +165,13 @@ typedef enum
  * @struct MFTL_RemeshParameters
  * @brief Parameters of a remeshing pass; initialise with MFTLInitRemeshParams().
  *
+ * A distributed pass needs the same block, bit for bit, on every rank: some
+ * fields decide the sequence of collectives, the rest what happens to entities
+ * two ranks share. The distributed entry points check that with one Allreduce
+ * and refuse on every rank otherwise (see MFTLRemeshEnsemble()). A new field
+ * must be added to `MFTL_REMESH_AGREED_FIELDS` in src/remeshing/remesh_comm.c,
+ * or the ranks may disagree about it unchecked.
+ *
  * Tagged, so that mftl_topology_change.h can forward-declare it.
  */
 typedef struct MFTL_RemeshParameters
@@ -947,12 +954,22 @@ int MFTLRemeshObject(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL
  * MFTL_RemeshStats::strategy reports what ran. Call graphs: @ref rem_dispatch,
  * @ref rem_spanning_flow, @ref rem_dispersed_flow.
  *
+ * **Parameter check.** At `nproc > 1` every entry point agrees the whole
+ * parameter block with one `MPI_Allreduce`, taken at the path's first
+ * collective (after the local work before it, so it adds a latency, not a
+ * synchronisation point). A band that is invalid on ANY rank
+ * (\f$\ell_{\max} \le 0\f$, \f$\ell_{\min} < 0\f$ or
+ * \f$\ell_{\min} > \ell_{\max}\f$), or a field that differs between ranks,
+ * makes EVERY rank return #MFTL_ERROR with the mesh untouched; rank 0 names the
+ * cause. A per-rank refusal would leave the other ranks in the next collective.
+ * At `nproc == 1` only the band is tested.
+ *
  * @param      ens    The ensemble, remeshed in place.
- * @param      params The parameter block, identical on every rank (checked in
- *                    Debug).
+ * @param      params The parameter block, identical on every rank (checked).
  * @param[out] stats  May be #MFTL_NULL. Sums over the objects; see
  *                    #MFTL_RemeshStats for which fields are rank-local.
- * @return #MFTL_SUCCESS, or #MFTL_ERROR if any object or migration failed.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on every rank if the parameters were
+ *         refused, or if any object or migration failed.
  *
  * @collective For `nproc > 1`, including ranks holding nothing. The strategy
  *             is decided from reduced data only; two ranks in different
@@ -983,8 +1000,9 @@ int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, 
  * pool is frozen on its owner, so the copies are still exact after the sweeps.
  *
  * Preconditions: MFTLRegisterMpiTypes() called; the same bodies on every rank
- * in the same order with agreeing `next_*_gid` (checked in Debug); a positive
- * length band; \f$h > 4\delta\f$ (warned about once, see
+ * in the same order with agreeing `next_*_gid` (checked in Debug); the same
+ * parameter block on every rank with a valid band (checked, see
+ * MFTLRemeshEnsemble()); \f$h > 4\delta\f$ (warned about once, see
  * MFTL_RemeshStats::converged).
  *
  * Postconditions: the canonical partition (the closing migration IS
@@ -996,8 +1014,8 @@ int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, 
  * @param      ens    The ensemble, remeshed in place.
  * @param      params The parameter block.
  * @param[out] stats  May be #MFTL_NULL.
- * @return #MFTL_SUCCESS, or #MFTL_ERROR if the band is not positive or a
- *         migration or the id exchange failed.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on every rank if the parameters were
+ *         refused, or if a migration or the id exchange failed.
  * @collective
  */
 int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats);
@@ -1021,12 +1039,13 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
  * domain, and serialise it onto one rank): if any body is too large, the whole
  * ensemble goes to MFTLRemeshEnsembleParallel() untouched
  * (MFTL_RemeshStats::n_bodies_not_centred). Pre- and postconditions are those
- * of MFTLRemeshEnsembleParallel() without the band condition.
+ * of MFTLRemeshEnsembleParallel() without \f$h > 4\delta\f$.
  *
  * @param      ens    The ensemble, remeshed in place.
  * @param      params The parameter block.
  * @param[out] stats  May be #MFTL_NULL.
- * @return #MFTL_SUCCESS, or #MFTL_ERROR if a migration failed.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on every rank if the parameters were
+ *         refused, or if a migration failed.
  * @collective
  */
 int MFTLRemeshEnsembleDispersed(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats);
@@ -1146,8 +1165,9 @@ void MFTLDilateFrozenBand(MFTL_Object *obj, int rings);
  * RANK-LOCAL: on a partitioned object it covers this rank's owned and ghost
  * triangles only, and a rank holding nothing of the body gets 0 -- a length band
  * of [0, 0], under which the pass refines without bound. Use
- * MFTLEnsembleMeanEdgeLength() on distributed meshes; the drivers refuse a
- * non-positive band and check in Debug that all ranks received the same one.
+ * MFTLEnsembleMeanEdgeLength() on distributed meshes. The drivers refuse, on
+ * every rank, a band that is invalid on any rank or a parameter block that
+ * differs between ranks.
  *
  * @param obj The mesh.
  * @return The mean edge length, or 0 for an empty pool.

@@ -32,6 +32,7 @@
 #include "mftl_communication.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -139,6 +140,43 @@ static void stats_owner_scan(int nv, int nt, long changed_v, long changed_t)
   MFTLCommStats.n_tris_scanned += nt;
   MFTLCommStats.n_verts_owner_changed += changed_v;
   MFTLCommStats.n_tris_owner_changed += changed_t;
+}
+
+/**
+ * @brief Recomputes the triangle geometry of a body whose centres the library
+ *        knows to be out of date, before routing by them.
+ *
+ * Called when #MFTL_DERIVED_GEOMETRY is clear: no pass over every triangle
+ * since the last ghost sync, topology change or rebuild. That catches the
+ * inconsistent cases -- no pass at all, a pass over the owned triangles only
+ * (ghost centres stale), a pass before the ghost sync, a second redistribution
+ * without one (arrivals unspecified) -- in O(1) per body. It cannot catch owned
+ * vertices moved after a full pass: that leaves every holder with the same
+ * stale centres, so the partition lags one step but stays consistent.
+ *
+ * Local and deterministic: it computes what the caller should have, from the
+ * same positions, so it needs no agreement between ranks. Debug asserts if the
+ * centres were actually stale, so a test cannot pass by relying on it.
+ *
+ * @param obj The mesh; routed by the geometric rule.
+ */
+static void refresh_geometry_before_routing(MFTL_Object *obj)
+{
+  MFTL_ASSERT(MFTLTriangleCentresAreCurrent(obj) &&
+              "redistribute: stale triangle centres -- call MFTLComputeTriangleGeometry(obj, obj->tris.n) (ghosts included) first");
+
+  MFTLComputeTriangleGeometry(obj, obj->tris.n);
+  MFTLCommStats.n_objects_centres_recomputed++;
+
+  static bool warned = MFTL_FALSE;
+  if (!warned)
+  {
+    warned = MFTL_TRUE;
+    fprintf(stderr,
+            "[MFTL] MFTLRedistribute: body %d on rank %d had no geometry pass over all its triangles since the last ghost sync, "
+            "topology change or redistribution; recomputed it before routing. Call MFTLEnsembleComputeTriangleGeometry first.\n",
+            obj->global_id, obj->domain->rank);
+  }
 }
 
 /**
@@ -1833,6 +1871,7 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
     if (obj->tris.n < 1 || obj->verts.n < 1) continue;
 
     CS_TIMELINE(tm);
+    if (maps == MFTL_NULL && (obj->derived & MFTL_DERIVED_GEOMETRY) == 0u) refresh_geometry_before_routing(obj);
     int dirty = compute_owners(obj, maps ? &maps[o] : MFTL_NULL, tri_owner, vert_owner, vert_gid, MFTL_TRUE);
     CS_LAP(tm, t_owners);
 

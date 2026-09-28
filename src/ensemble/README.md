@@ -145,6 +145,16 @@ fails statement 1 and vetoes — the state of a generated ensemble before its fi
 redistribution. The certificate is re-derived on every call: any holder change
 anywhere invalidates it.
 
+<!-- figure: holder-certificate
+The holder certificate on a 3×3 slice of the process grid. (a) When a body's
+holders span at most one cell per axis they are pairwise graph neighbours:
+every holder hears every other, and the reduction folds locally. (b) A body
+bent around a grid corner. Each rank sees only neighbouring holders, so a check
+before the exchange passes, yet $a$ and $c$, two cells apart, never hear from
+each other. After the exchange $m$ holds records spanning three cells and
+vetoes; the global route runs.
+-->
+
 @warning The argument assumes each body is **one connected surface**. Nothing in
          MFTL produces a disconnected body (topology changes give every
          component its own id); a caller assembling one must pass

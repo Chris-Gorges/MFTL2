@@ -300,24 +300,76 @@ void MFTLRemeshAgreeProfile(const MFTL_Domain *domain, MFTL_RemeshStats *st, dou
 
 double MFTLRemeshWallTime(void) { return MPI_Wtime(); }
 
-bool MFTLRemeshParamsAgree(const MFTL_Domain *domain, const MFTL_RemeshParameters *params)
+/**
+ * @brief Every field of #MFTL_RemeshParameters, in declaration order. A field
+ *        missing here is a field the ranks may silently disagree about, so a new
+ *        field goes here too.
+ */
+#define MFTL_REMESH_AGREED_FIELDS(X)                                                                                                    \
+  X(type) X(smooth_mode) X(iterations) X(min_convergence_ops) X(target_length) X(min_edge_length) X(max_edge_length) X(min_edge_length_sq) \
+  X(max_edge_length_sq) X(feature_angle_threshold) X(feature_corner_angle) X(smooth_iterations) X(smooth_relaxation)                     \
+  X(smooth_max_step_fraction) X(max_normal_deviation_cos) X(renumber_global_ids) X(parallel_phase_budget) X(freeze_dilation_rings)       \
+  X(parallel_strategy) X(dispersed_radius_fraction) X(parallel_coarsen) X(coarsen_frozen_fraction) X(serial_gather_max_triangles)        \
+  X(dispersed_balance_slack)
+
+#define MFTL_REMESH_FIELD_NAME(f) #f,
+#define MFTL_REMESH_FIELD_VALUE(f) (double) params->f,
+
+int MFTLRemeshAgreeParams(const MFTL_Domain *domain, const MFTL_RemeshParameters *params, const char *caller)
 {
-  if (domain->nproc < 2) return MFTL_TRUE;
+  static const char *const names[] = {MFTL_REMESH_AGREED_FIELDS(MFTL_REMESH_FIELD_NAME)};
+  enum
+  {
+    N = (int) (sizeof(names) / sizeof(names[0]))
+  };
 
-  /* One MIN over the values AND their negations, rather than broadcasting rank
-   * 0's copy and testing equality: a minimum of -x is a maximum of x, so the two
-   * halves recover both extremes from a single reduction, and every rank learns
-   * that the ranks disagree. A broadcast-and-compare fires on one rank while the
-   * others walk into the next collective and hang. */
-  double v[4];
-  v[0] = params->min_edge_length;
-  v[1] = params->max_edge_length;
-  v[2] = -params->min_edge_length;
-  v[3] = -params->max_edge_length;
-  MPI_Allreduce(MPI_IN_PLACE, v, 4, MPI_DOUBLE, MPI_MIN, domain->comm_world);
+  /* NaN fails every comparison, so it fails the band test too. */
+  const bool band_ok = (params->max_edge_length > 0.0) && (params->min_edge_length >= 0.0) && (params->min_edge_length <= params->max_edge_length);
 
-  return (v[0] == -v[2]) && (v[1] == -v[3]);
+  /* [values | negated values | band verdict]. A MIN of -x is a MAX of x, so one
+   * reduction yields both extremes of every field, and equal extremes mean every
+   * rank passed the same value. Broadcasting rank 0's block and comparing would
+   * let the check fire on one rank only, which is the failure being fixed. */
+  const double local[N] = {MFTL_REMESH_AGREED_FIELDS(MFTL_REMESH_FIELD_VALUE)};
+  double v[2 * N + 1];
+  for (int i = 0; i < N; ++i)
+  {
+    v[i] = local[i];
+    v[N + i] = -local[i];
+  }
+  v[2 * N] = band_ok ? 1.0 : 0.0;
+
+  if (domain->nproc > 1) MPI_Allreduce(MPI_IN_PLACE, v, 2 * N + 1, MPI_DOUBLE, MPI_MIN, domain->comm_world);
+
+  int differs = -1;
+  for (int i = 0; i < N && differs < 0; ++i)
+  {
+    if (!(v[i] == -v[N + i])) differs = i;
+  }
+
+  if (v[2 * N] == 1.0 && differs < 0) return MFTL_SUCCESS;
+
+  if (domain->rank == 0)
+  {
+    if (v[2 * N] != 1.0)
+    {
+      fprintf(stderr,
+              "[MFTL] %s: refusing to remesh: the edge-length band is invalid on at least one rank (this rank: [%.6g, %.6g]; valid is "
+              "0 <= min <= max, max > 0). Use MFTLEnsembleMeanEdgeLength for a distributed mesh.\n",
+              caller, params->min_edge_length, params->max_edge_length);
+    }
+    else
+    {
+      fprintf(stderr, "[MFTL] %s: refusing to remesh: the ranks were handed different parameter blocks (%s ranges over [%.17g, %.17g]).\n",
+              caller, names[differs], v[differs], -v[N + differs]);
+    }
+  }
+  return MFTL_ERROR;
 }
+
+#undef MFTL_REMESH_FIELD_VALUE
+#undef MFTL_REMESH_FIELD_NAME
+#undef MFTL_REMESH_AGREED_FIELDS
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 3. Body extents

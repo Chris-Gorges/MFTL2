@@ -506,6 +506,9 @@ void MFTLRemeshMeasurementFree(MFTL_RemeshMeasurement *m);
 
 /**
  * @brief MFTLRemeshChooseStrategy() with the body measurement returned as well.
+ *
+ * Reads `tris.center`/`tris.area`: the caller computes the geometry first.
+ *
  * @param      ens    The ensemble.
  * @param      params May be #MFTL_NULL for the default radius fraction.
  * @param[out] m      Filled in by MFTLRemeshMeasureBodies(); must have been
@@ -516,9 +519,43 @@ void MFTLRemeshMeasurementFree(MFTL_RemeshMeasurement *m);
 MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategyMeasured(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshMeasurement *m);
 
 /**
- * @brief MFTLRemeshEnsembleDispersed() with the body measurement supplied.
+ * @brief MFTLRemeshEnsembleParallel(), with the parameter check optional.
+ *
+ * The check (MFTLRemeshAgreeParams()) is taken at the pass's first collective,
+ * after the local work before it, so it adds a latency rather than a
+ * synchronisation point. Callers that already agreed the parameters in this
+ * call -- MFTLRemeshEnsemble()'s AUTO path, the dispersed driver's fallback --
+ * pass #MFTL_NULL.
+ *
+ * @param      ens      The ensemble, remeshed in place.
+ * @param      params   The parameter block.
+ * @param[out] stats    May be #MFTL_NULL.
+ * @param      agree_as Entry-point name for the check's diagnostic, or
+ *                      #MFTL_NULL if the block is already agreed.
+ * @return As MFTLRemeshEnsembleParallel().
+ * @collective
+ */
+int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats, const char *agree_as);
+
+/**
+ * @brief MFTLRemeshEnsembleDispersed(), with the parameter check optional:
+ *        geometry, the check, the body measurement, then
+ *        MFTLRemeshEnsembleDispersedMeasured().
+ *
+ * @param      ens      The ensemble, remeshed in place.
+ * @param      params   The parameter block.
+ * @param[out] stats    May be #MFTL_NULL.
+ * @param      agree_as As for MFTLRemeshSpanningPass().
+ * @return As MFTLRemeshEnsembleDispersed().
+ * @collective
+ */
+int MFTLRemeshDispersedPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats, const char *agree_as);
+
+/**
+ * @brief MFTLRemeshEnsembleDispersed() with the body measurement supplied, and
+ *        without the parameter check.
  * @param      ens    The ensemble, remeshed in place.
- * @param      params The parameter block.
+ * @param      params An agreed parameter block (MFTLRemeshAgreeParams()).
  * @param[out] stats  May be #MFTL_NULL.
  * @param      m      From MFTLRemeshChooseStrategyMeasured(), describing the
  *                    local list as it stands now.

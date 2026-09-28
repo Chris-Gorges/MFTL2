@@ -491,6 +491,7 @@ void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params,
 
   const int n_v = obj->verts.n;
   if (n_v == 0 || obj->tris.n == 0 || iterations <= 0) return;
+  obj->derived &= ~MFTL_DERIVED_GEOMETRY;
 
   /* Jacobi, not Gauss-Seidel: every new position is computed from the OLD ones
    * and applied afterwards. Sweeping in place would make the result depend on the

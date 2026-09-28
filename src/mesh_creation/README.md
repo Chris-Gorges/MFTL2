@@ -26,7 +26,11 @@ established once:
 - global ids are $[0, n)$ per class, half-edge ids $3\,t_\mathrm{gid}+k$, and the
   `next_*_gid` counters end one past the last id;
 - twins are linked (`MFTLRebuildTwins`), the boundary is flagged while the mesh
-  is complete (`MFTLMarkMeshBoundary`), derived arrays are built.
+  is complete (`MFTLMarkMeshBoundary`), derived arrays are built;
+- `MFTLBuildIndexedMesh` and the generators also compute the triangle geometry
+  (area, normal, centre), so a new mesh can be redistributed at once — the first
+  redistribution routes by centres. `MFTLBuildTopologyFromIndexList` does not:
+  its caller still owns the positions (subdivision projects them afterwards).
 
 Index lists are validated in Release before anything is modified: an index out
 of range or a triangle with a repeated corner (a self-edge that could twin with
@@ -56,6 +60,15 @@ For a closed triangulation Euler's formula $V - E + F = 2$ with $3F = 2E$ gives
 $$
   F_r = 20 \cdot 4^{\,r}, \qquad E_r = 30 \cdot 4^{\,r}, \qquad V_r = 10 \cdot 4^{\,r} + 2 .
 $$
+
+<!-- figure: icosphere
+The icosphere. (a) One face refined 1-to-4. The midpoint $m_k$ lies on edge
+$v_k v_{k+1}$; the three corner children and the centre one are emitted in the
+parent's rotational order, so every child is counter-clockwise from outside.
+The neighbour across $v_0 v_1$ finds $m_0$ through the twin. (b) Refinement
+levels $r = 0 \ldots 3$, each subdivided flat and projected once onto the
+sphere.
+-->
 
 | $r$ | vertices | triangles | min $q$ | mean $q$ | max/min area | $1 - V_h/V$ |
 |---|---|---|---|---|---|---|
@@ -134,6 +147,17 @@ from the segments are wound with normals pointing from $\phi < 0$ to $\phi > 0$.
 A loop that visits one face twice is fanned from an apex with no diagonal to a
 crossing on a shared face, so no triangle lies inside a cell face; the tests
 assert that such an apex exists for every loop of all 256 cases.
+
+<!-- figure: marching-cubes
+Marching cubes from one face rule. (a) Walking a face counter-clockwise from
+outside, each crossing that enters the inside is joined to the next one that
+leaves it; on the ambiguous face each inside corner is cut off separately. The
+neighbouring cell walks the same face the other way and draws the same segments
+reversed, so nothing can crack. (b) Case `0b00000111` as the generated table
+builds it: five crossings chained into one loop, fanned from an apex with no
+in-face diagonal into three triangles whose normals point from $\phi<0$ to
+$\phi>0$.
+-->
 
 ### Lattice-keyed extraction
 

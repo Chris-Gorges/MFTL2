@@ -42,6 +42,13 @@ alignment keeps arrays written by different kernels on different lines.
 An icosphere of refinement $r$ ($F = 20\cdot4^r$, $V = 10\cdot4^r+2$) therefore
 occupies $140F + 64V = 3440\cdot4^r + 128$ bytes, padding aside.
 
+<!-- figure: pool-layout
+The two blocks of an object, to scale in bytes per entity: 64 B per vertex and
+140 B per triangle, every sub-array on its own 64 B cache line. (b) The access
+pattern each layout serves: an operator edits a few records and most of each; a
+geometry pass streams one component of every entity.
+-->
+
 ---
 
 ## The size API {#object_size_api}
@@ -84,6 +91,13 @@ changes no count, content, derived bit or partition stamp.
 | Bit | Arrays | Rebuilt by | Invalidated by |
 |---|---|---|---|
 | #MFTL_DERIVED_TOPOLOGY | `tris.verts`, `tris.neighbors` | `MFTLObjectBuildDerived` (and redistribution's rebuild) | any topology change |
+| #MFTL_DERIVED_GEOMETRY | `tris.area`, `tris.normal`, `tris.center` | `MFTLComputeTriangleGeometry(obj, tris.n)` | any topology change, a rebuild, `MFTLUpdateGhostPositions`, the remeshing operators |
+
+The geometry bit is a lower bound, not a certificate. Moving owned vertices
+through `verts.pos` does not clear it, because the library cannot see that; so a
+clear bit means "not current" and a set bit means "current unless the caller
+moved vertices since". `MFTLRedistribute` recomputes a body whose bit is clear
+before routing it by its centres.
 
 Both arrays are functions of the half-edge records:
 
@@ -121,6 +135,16 @@ $$
 Points in a common octree cell share a key prefix, so sorting by $Z$ places
 spatial neighbours close in memory. `MFTLMortonSpread3` performs the interleave
 with five shift-and-mask steps.
+
+<!-- figure: morton
+Morton order, in 2D for legibility (the library interleaves 21 bits of each of
+three axes). (a) Positions are quantised against the box with one common scale
+and ordered along the Z-curve; each vertex is coloured by its resulting pool
+index. (b) The key interleaves the coordinate bits, so points in one octree
+cell share a key prefix. (c) Every edge of the same mesh as an arc between the
+pool indices of its endpoints: for an arbitrary numbering, and after the
+renumbering.
+-->
 
 1. Key per vertex; stable radix sort of `[0, n_local)` and, separately,
    `[n_local, n)` — the ownership prefix survives.

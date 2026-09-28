@@ -17,7 +17,8 @@
 ## Ownership and the halo rule {#comm_redistribute}
 
 A vertex belongs to the rank whose Cartesian cell contains its position; a
-triangle to the rank whose cell contains its **cached centre**
+triangle to the rank whose cell contains its **cached centre** (a body whose
+#MFTL_DERIVED_GEOMETRY bit is clear is recomputed first)
 ($i_k = \lfloor (x_k-\min_k)\,\mathrm{cuts}_k/L_k\rfloor$). An owned triangle is
 *additionally* sent to the owner of each of its three **corners** and each of its
 three **edge neighbours**; that surplus is the ghost layer. Two properties
@@ -37,6 +38,17 @@ $$
   \exists\,\text{corner} \ge \texttt{verts.n\_local}\ \lor\ \exists\,\text{neighbour} \ge \texttt{tris.n\_local},
 $$
 which is the remesher's freeze test (@ref mftl_mod_remeshing).
+
+<!-- figure: halo-rule
+The halo rule on an open patch split between two ranks. (a) A vertex belongs to
+the rank whose cell holds it, a triangle to the rank holding its centre.
+(b) Rank 0's pool: its owned triangles plus every triangle it receives because
+it owns a corner (corner clause) or an edge neighbour (neighbour clause) of it.
+Every owned vertex has its complete fan (coral), so vertex normals need no
+communication. (c) Read backwards: an owned triangle is replicated, and so
+frozen for the remesher, exactly when one of its corners or neighbours is a
+ghost here.
+-->
 
 ### What the wire carries {#comm_wire}
 
@@ -242,6 +254,16 @@ not a mesh boundary.
    ascending and unique. Measured on six touching couples (6 of 66 pairs real):
    6/6/9/18/6 candidates at $P = 1, 2, 4, 8, 27$ against 66/132/264/528/1782 for
    all pairs (`test_the_broad_phase_finds_the_pairs_without_enumerating_them`).
+
+<!-- figure: halo-extents
+Why an extent is a centre and a half-width. One periodic axis, unrolled.
+(a) Two shares touching across the seam have disjoint $(\mathrm{lo},\mathrm{hi})$
+boxes, so the contact is missed before any triangle is compared. (b) A share
+straddling the seam has a box spanning the whole domain, so every neighbour
+ships it everything. Measured in the raw frame and in one shifted by half a
+period, keeping the tighter, the centre and half-width are right in both cases
+under the minimum image.
+-->
 
 `MFTLSpatialHaloResolveRadii` computes each body's radius — half the longest side
 of its **global** box (so envelopes do not depend on the process count; $R$ for a

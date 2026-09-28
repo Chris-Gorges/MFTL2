@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include "mftl_constants.h"
+#include "mftl_geometry.h"
 #include "mftl_memory.h"
 #include "mftl_object.h"
 #include "mftl_topology.h"
@@ -138,5 +139,9 @@ int MFTLBuildIndexedMesh(MFTL_Object *object, const double *positions, int n_ver
   object->next_vertex_gid = n_vertices;
 
   build_topology(object, tri_verts, n_triangles);
+
+  /* A new mesh leaves with current geometry, so the first MFTLRedistribute()
+   * routes by real centres. Without a domain nothing can route it yet. */
+  if (object->domain != MFTL_NULL) MFTLComputeTriangleGeometry(object, object->tris.n);
   return MFTL_SUCCESS;
 }

@@ -47,10 +47,17 @@
  *
  * **Preconditions.** MFTLRegisterMpiTypes() has been called; every rank added
  * the same bodies in the same order (body ids are the names on the wire); the
- * triangle centres of every local object are current, ghosts included
- * (MFTLEnsembleComputeTriangleGeometry()) -- including before the FIRST
- * redistribution of a freshly generated ensemble, whose centres are unset.
- * Stale centres route triangles to wrong owners without any error in Release.
+ * triangle centres of every local object are current, ghosts included. The
+ * generators leave them current, so a generated ensemble can be redistributed
+ * at once; after vertices move, step 3 restores them. A body whose
+ * #MFTL_DERIVED_GEOMETRY bit is clear -- no pass over every triangle since the
+ * last ghost sync, topology change or redistribution -- is recomputed before it
+ * is routed, counted in `MFTLCommStats.n_objects_centres_recomputed`, with one
+ * warning per process; this covers skipping step 3, running it over the owned
+ * triangles only, running it before step 2, and redistributing twice. Moving
+ * owned vertices after step 3 cannot be seen; every holder then routes by the
+ * same old centres, which is consistent but one step behind. Debug also checks
+ * every centre and asserts.
  *
  * Theory: src/communication/README.md.
  */
@@ -293,7 +300,9 @@ double *MFTLNeighborAllgatherDoubles(const MFTL_Domain *domain, const double *se
  *
  * @param ens The ensemble; every local object is repartitioned in place. Its
  *            triangle centres must be current, ghosts included
- *            (MFTLEnsembleComputeTriangleGeometry(); asserted in Debug).
+ *            (MFTLEnsembleComputeTriangleGeometry(); a body whose
+ *            #MFTL_DERIVED_GEOMETRY bit is clear is recomputed first, see the
+ *            file comment; asserted in Debug).
  * @return #MFTL_SUCCESS, or #MFTL_ERROR on a NULL ensemble.
  *
  * @collective Ranks holding no bodies must call it too; an ensemble without
@@ -433,6 +442,9 @@ void MFTLCommWorkspaceDestroy(void **p_ws);
  * A ghost whose owner is not a graph neighbour cannot be served, keeps a STALE
  * value and is reported (asserted in Debug); this happens only on a partition
  * whose halo reaches beyond the 26-neighbourhood.
+ *
+ * Clears #MFTL_DERIVED_GEOMETRY on every local object: triangle geometry
+ * computed before the sync is stale on the ghosts.
  *
  * @param ens The ensemble.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR if some ghost of THIS rank could not be
@@ -850,6 +862,14 @@ typedef struct
    */
   long n_objects_created;
   long n_objects_destroyed;  ///< See n_objects_created.
+
+  /**
+   * Bodies whose triangle geometry was recomputed before routing because their
+   * #MFTL_DERIVED_GEOMETRY bit was clear. Non-zero means the caller skipped, or
+   * misplaced, the geometry pass the precondition asks for (see
+   * MFTLRedistribute()).
+   */
+  long n_objects_centres_recomputed;
 
   long n_allocs;  ///< Allocation calls on the path.
   long n_frees;  ///< Matching frees.

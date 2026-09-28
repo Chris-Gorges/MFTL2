@@ -126,10 +126,16 @@ gives storage back through `MFTLObjectShrinkToFit` / `MFTLObjectReleasePools` �
 | bit | arrays | invalidated by |
 |---|---|---|
 | `MFTL_DERIVED_TOPOLOGY` | `verts`, `neighbors` | any topology change |
+| `MFTL_DERIVED_GEOMETRY` | `area`, `normal`, `center` | topology change, rebuild, `MFTLUpdateGhostPositions`, remeshing operators |
 
 `MFTLObjectBuildDerived` rebuilds both arrays. Geometric consumers gather the
 authoritative positions and construct seam-corrected edges in registers, so
-vertex motion invalidates no derived state.
+vertex motion invalidates no derived state. The geometry bit is set by
+`MFTLComputeTriangleGeometry(obj, tris.n)` and cannot see vertex motion: clear
+means stale, set means current unless the caller moved vertices since.
+`MFTLRedistribute` recomputes a body whose bit is clear before routing it (O(1)
+per body; a spot check that recomputed centres cost 1 % of the phase at 1000
+bodies and was rejected).
 
 `tris.verts` and `tris.neighbors` are *redundant* with the half-edge records (a rotation of `he.vertex_idx`, and
 `he.twin_idx / 3`). They are stored for traffic — 12 B/triangle instead of 48 — not for instructions. See
@@ -274,6 +280,13 @@ It locates this checkout through `mftl_paths.py`: `--source-dir`, `$MFTL_SOURCE_
 here without `@param`/`@return` fails `build_docs.py --strict` there**. Run it after touching any header —
 it is the one consequence of the split that a change in this repository can still trigger.
 
+**The theory chapters carry figures as `<!-- figure: name ... caption ... -->` comments.** GitHub shows
+nothing; both manuals expand each into a numbered figure of `MFTL_Documentation/images/name.svg`, drawn by
+`MFTL_Documentation/figures/` (grammar in its `images/README.md`). A figure is COMPUTED from the library's
+rules — the halo, the frozen band, the icosphere, the marching-cubes case, the LBVH — so a change to one of
+those rules owes a look at the figure that shows it. Keep a directive next to the paragraph it illustrates
+when editing a README, and do not delete one to tidy the GitHub view: it is invisible there already.
+
 `CMakeLists.txt` here has no `docs` target and never calls `find_package(Doxygen)`; the CMake route to the
 manual is `MFTL_Documentation`'s own `CMakeLists.txt` (`LANGUAGES NONE`, so it compiles nothing).
 
@@ -382,7 +395,10 @@ struct, which `docs/analysis.md` §1.6 measures at 15 %. The kernel stays next t
   the ghost sync must precede the geometry pass (a triangle's three vertices can belong to three ranks); the
   geometry pass must cover the GHOSTS too, because redistribution routes them by their cached centre and
   refreshing only the owned ones makes two ranks disagree about a ghost's destination. Geometry and quality
-  consumers go after redistribution when they need the new partition.
+  consumers go after redistribution when they need the new partition. Those two are no longer silent:
+  `MFTLRedistribute` recomputes a body whose `MFTL_DERIVED_GEOMETRY` bit is clear (skipped pass, owned-only
+  pass, pass before the sync) and warns once. Moving vertices AFTER the pass still is silent, but every holder
+  then routes by the same old centres, so the partition lags one step without becoming inconsistent.
 - **A BODY THAT DID NOT MOVE IS NOT TOUCHED, AND THE PRECONDITION IS NOT "DID TOPOLOGY CHANGE".** A rank's
   local state after a redistribution is a pure function of (global topology, owner map) — read the halo rule
   backwards and it defines the OUTPUT, not a procedure. Positions are not an input; they DECIDE the owner map,
@@ -528,7 +544,7 @@ struct, which `docs/analysis.md` §1.6 measures at 15 %. The kernel stays next t
   the only correct route — `AUTO` already falls back, and the one int it costs to find out is the cheapest
   thing on the path.
 - **Redistribution invalidates all cached geometry except the vertex positions.** It returns an object with valid
-  topology, valid positions and both derived bits set; `tris.area/normal/center` and
+  topology, valid positions and `MFTL_DERIVED_TOPOLOGY` set; `tris.area/normal/center` and
   `verts.normal` hold unspecified values until something recomputes them. That is what
   buys the 3× smaller wire format — see `include/mftl_communication.h`. A solver that consumes triangle geometry
   AFTER the redistribution therefore owes one more pass — the price of not shipping the geometry on the wire. `parallel_advection_redistribute_list` runs it as step 5 and times it separately, because comparing the
@@ -565,8 +581,8 @@ struct, which `docs/analysis.md` §1.6 measures at 15 %. The kernel stays next t
   renders identically; a false negative draws a triangle across the whole domain. Any slack added to suppress the
   first buys the second, so there is none. `test_wrap_detection_paths_agree` pins it against the gathering
   criterion used by the half-edge connectivity fallback.
-- **`MFTLWriteVtu` must never write `tris.area` or `tris.normal`.** Nothing on the object records whether they are
-  current — `derived` tracks connectivity, not geometry — and a redistribution leaves them
+- **`MFTLWriteVtu` must never write `tris.area` or `tris.normal`.** Nothing on the object can say they are
+  current — `MFTL_DERIVED_GEOMETRY` cannot see vertex motion — and a redistribution leaves them
   undefined by design, so a production file containing them would look right and be stale. `MFTLWriteVtk` writes
   them deliberately, because the raw dump's contract is to show what is actually in memory.
 

@@ -371,6 +371,12 @@ static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
   return (unserved == 0 && orphaned == 0) ? MFTL_SUCCESS : MFTL_ERROR;
 }
 
-int MFTLUpdateGhostPositions(MFTL_Ensemble *ens) { return ghost_sync_vec3(ens, GHOST_FIELD_POSITION); }
+int MFTLUpdateGhostPositions(MFTL_Ensemble *ens)
+{
+  /* New ghost positions: geometry computed before this is stale on the ghosts. */
+  if (ens != MFTL_NULL && ens->local_objects != MFTL_NULL)
+    for (int o = 0; o < ens->n_local_objects; ++o) ens->local_objects[o]->derived &= ~MFTL_DERIVED_GEOMETRY;
+  return ghost_sync_vec3(ens, GHOST_FIELD_POSITION);
+}
 
 int MFTLUpdateGhostVertexNormals(MFTL_Ensemble *ens) { return ghost_sync_vec3(ens, GHOST_FIELD_NORMAL); }

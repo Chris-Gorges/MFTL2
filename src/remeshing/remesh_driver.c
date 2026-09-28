@@ -330,6 +330,10 @@ int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, 
    * reproducible is worth the branch. */
   if (ens->domain.nproc > 1)
   {
+    /* The parameters are agreed ONCE per call, at the first collective of
+     * whichever path runs (MFTLRemeshAgreeParams()). Every path's first
+     * collective is that check, so two ranks that read different strategies
+     * still meet in it and both refuse. */
     /* AUTO resolves COLLECTIVELY -- MFTLRemeshChooseStrategy measures the bodies
      * with two Allreduces and every rank therefore reads the same ratio. That is
      * the load-bearing property of this branch, not the choice itself: two ranks
@@ -339,8 +343,8 @@ int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, 
 
     if (strategy != MFTL_REMESH_PARALLEL_AUTO)
     {
-      if (strategy == MFTL_REMESH_PARALLEL_DISPERSED) return MFTLRemeshEnsembleDispersed(ens, params, stats);
-      return MFTLRemeshEnsembleParallel(ens, params, stats);
+      if (strategy == MFTL_REMESH_PARALLEL_DISPERSED) return MFTLRemeshDispersedPass(ens, params, stats, "MFTLRemeshEnsemble");
+      return MFTLRemeshSpanningPass(ens, params, stats, "MFTLRemeshEnsemble");
     }
 
     /* AUTO measures the bodies to decide, and the dispersed driver needs exactly
@@ -351,17 +355,31 @@ int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, 
      *
      * GLOBAL body count for the guard: everything below is collective. The
      * measurement itself is indexed by LOCAL SLOT -- see MFTL_RemeshMeasurement. */
-    if (ens->n_bodies_global < 1) return MFTLRemeshEnsembleParallel(ens, params, stats);
+    if (ens->n_bodies_global < 1) return MFTLRemeshSpanningPass(ens, params, stats, MFTL_NULL);
 
     MFTL_RemeshMeasurement measure;
     MFTLRemeshMeasurementInit(&measure, ens);
 
+    MFTLEnsembleComputeTriangleGeometry(ens);
+    if (MFTLRemeshAgreeParams(&ens->domain, params, "MFTLRemeshEnsemble") != MFTL_SUCCESS)
+    {
+      MFTLRemeshMeasurementFree(&measure);
+      if (stats) memset(stats, 0, sizeof(*stats));
+      return MFTL_ERROR;
+    }
     strategy = MFTLRemeshChooseStrategyMeasured(ens, params, &measure);
 
     const int rc = (strategy == MFTL_REMESH_PARALLEL_DISPERSED) ? MFTLRemeshEnsembleDispersedMeasured(ens, params, stats, &measure)
-                                                                : MFTLRemeshEnsembleParallel(ens, params, stats);
+                                                                : MFTLRemeshSpanningPass(ens, params, stats, MFTL_NULL);
     MFTLRemeshMeasurementFree(&measure);
     return rc;
+  }
+
+  /* One rank: the band test alone, no MPI. */
+  if (ens->n_bodies_global > 0 && MFTLRemeshAgreeParams(&ens->domain, params, "MFTLRemeshEnsemble") != MFTL_SUCCESS)
+  {
+    if (stats) memset(stats, 0, sizeof(*stats));
+    return MFTL_ERROR;
   }
 
   if (stats)

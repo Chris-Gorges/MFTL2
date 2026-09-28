@@ -38,6 +38,15 @@ this way, so a triangle straddling a periodic face has correct edges although it
 corners are stored on opposite sides of the box. This requires every edge to be
 shorter than $L_k/2$, which any resolved surface satisfies.
 
+<!-- figure: minimum-image
+A triangle straddling a periodic seam. (a) Its corners are stored wrapped, so
+raw differences span the domain and the centroid of the stored corners lies in
+its middle. (b) Every edge is a minimum-image vector, so the triangle has its
+true shape across the seam; the centroid is built from those offsets and then
+wrapped, which makes it both the true centroid and a position
+`MFTLGetOwnerProc` accepts.
+-->
+
 `MFTLApplyPeriodicity` wraps a position into $[\min_k, \max_k)$ by at most one
 period — correct for positions wrapped every step. Its perfectly predicted
 compare-and-shift form beat a branchless variant by 1.34–1.37×.
@@ -112,6 +121,16 @@ and is the pseudo-normal of the signed-distance theorem below. The corner angles
 come from one cross product and three dot products via `atan2`, which is well
 conditioned where `acos` is not.
 
+<!-- figure: vertex-normals
+Normals. (a) One square root serves both $A = \tfrac12\lVert\mathbf{e}_1\times\mathbf{e}_2\rVert$
+and $\hat{\mathbf{n}}$; the corners are counter-clockwise from outside, so
+$\hat{\mathbf{n}}$ points out. (b, c) One uneven fan weighted by area (shade
+$\propto A_f$) and by corner angle (wedges $\alpha_f$): here the two vertex
+normals differ by 27°. The area weighting is the volume gradient; the angle
+weighting is invariant under re-triangulation of the fan and is the
+pseudo-normal the signed distance needs.
+-->
+
 The pass is a **scatter** over triangles (flat loop, compact connectivity) rather
 than a gather over fans (dependent loads, measured 3.4× slower); a
 vertex→triangle CSR gather was a dead heat and is not stored
@@ -158,6 +177,15 @@ changes are detected. Contributions are combined by `MFTLSdfMerge` (smaller
 magnitude wins, ties to the negative value): a total order, so the merged field
 is independent of triangle and rank order and a distributed rasterisation is
 bit-identical to a serial one.
+
+<!-- figure: closest-point
+The closest point on a triangle. (a) Perpendiculars through the corners cut the
+plane into seven regions: the face, three edges (edge $k$ is half-edge $3t+k$)
+and three corners. Six dot products select the region before any formula is
+evaluated. (b) A cross-section through a sharp edge. For $\mathbf{x}$ in the
+edge's region the face normal alone gives the wrong sign; the edge
+pseudo-normal $\hat{\mathbf{n}}_T+\hat{\mathbf{n}}_{T'}$ gives the right one.
+-->
 
 Nodes farther than the cutoff from every triangle stay `MFTL_SDF_UNKNOWN`. Every
 corner of a lattice cell crossed by the surface lies within one cell diagonal of

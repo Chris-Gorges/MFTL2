@@ -133,6 +133,15 @@ the children are $[f,\gamma]$ and $[\gamma+1,l]$.
 
 ### Fit and refit {#bvh_refit}
 
+<!-- figure: lbvh
+The LBVH over ten primitives, in 2D for legibility: Morton keys of 3 bits per
+axis, sorted stably. (a) Every node's box, coloured by depth. A split is taken
+at the highest differing key bit, so the children are separated by a dyadic
+plane of the Morton grid. (b) The radix tree over the sorted keys, each node
+labelled with the axis of its splitting bit. Two primitives share a key; the
+index in the extended key splits them, so every node splits.
+-->
+
 `MFTLBVHRefit` is three linear passes, shared by the build and by
 `MFTL_RefitLBVH` so they cannot disagree:
 
@@ -210,6 +219,16 @@ $$
 each gated by one root-box test (`test_contact_across_a_periodic_face`). The
 shift is added to the B side inside `flush_batch`, because it belongs to the
 image being traversed, not to the primitive.
+
+<!-- figure: periodic-images
+(a) Between bodies, periodicity is handled by traversing the pair once per
+image of $B$, each image gated by one root-box test; only the image adjacent to
+$A$ across the seam is traversed. (b) Each tree inflates its leaves by its own
+$\tau$, so the broad phase admits gaps up to $\tau_A+\tau_B$ while the narrow
+phase judges the pair at $\max(\tau_A,\tau_B)$. No contact the narrow phase
+accepts can be culled; the pair drawn is admitted by the boxes and rejected by
+the narrow phase.
+-->
 
 ---
 
@@ -341,6 +360,14 @@ $$
 At most **eight** predicates per pair, no division and no constructed point.
 Normalising only which vertex is isolated, and not B's orientation, gets the
 final test wrong on half the inputs.
+
+<!-- figure: guigue-devillers
+Guigue–Devillers. (a) The sign of `orient3d` for each corner against the other
+triangle's plane (coral) rejects most pairs at once. Otherwise the two planes
+meet in a line $L$ and each triangle cuts a closed interval from it. (b) The
+triangles intersect iff the intervals overlap, which two more orientation signs
+decide: no division, no constructed point.
+-->
 
 ### The coplanar case {#bvh_coplanar}
 

@@ -1444,6 +1444,88 @@ static int test_the_edge_length_band_is_a_collective_measurement(void)
 }
 
 /**
+ * @brief A band that is bad on ONE rank is refused on EVERY rank, by all three
+ *        entry points.
+ *
+ * The trap above produces exactly this: MFTLMeanEdgeLength() is 0 only on the
+ * ranks that hold nothing of the body. When the refusal was a per-rank test,
+ * those ranks returned MFTL_ERROR and the rest waited in the driver's next
+ * collective forever -- a hang in Release, which is what this test would do
+ * (and ctest's timeout would report) if the verdict stopped being agreed.
+ * At np = 1 the one rank is the bad rank, which is the plain refusal again.
+ */
+static int test_a_band_bad_on_one_rank_is_refused_on_every_rank(void)
+{
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE);
+  TEST_ASSERT(ens != MFTL_NULL);
+  add_sphere(ens, 0, 0.1, 0.0, -0.1, 0.5, 2);
+  TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+
+  MFTL_RemeshParameters p;
+  standard_params(&p, 0.06);
+  if (g_rank == g_nproc - 1)
+  {
+    p.min_edge_length = 0.0;
+    p.max_edge_length = 0.0;
+    MFTLRemeshParamsFinalise(&p);
+  }
+
+  MFTL_RemeshStats st;
+  TEST_ASSERT(agreed(MFTLRemeshEnsemble(ens, &p, &st) == MFTL_ERROR, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &p, &st) == MFTL_ERROR, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLRemeshEnsembleDispersed(ens, &p, &st) == MFTL_ERROR, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/**
+ * @brief Two ranks handed different parameter blocks are refused on every rank.
+ *
+ * Nothing in a pass communicates the parameters. A different phase budget
+ * changes how many collectives a rank makes (a hang); a different band changes
+ * what it does to entities other ranks also hold (an inconsistent mesh). Both
+ * blocks here are valid on their own, so only the agreement can catch them.
+ * Vacuous at np = 1.
+ */
+static int test_different_parameter_blocks_are_refused_on_every_rank(void)
+{
+  if (g_nproc < 2) return 0;
+
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE);
+  TEST_ASSERT(ens != MFTL_NULL);
+  add_sphere(ens, 0, 0.1, 0.0, -0.1, 0.5, 2);
+  TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+
+  MFTL_RemeshStats st;
+
+  MFTL_RemeshParameters budget;
+  standard_params(&budget, 0.06);
+  if (g_rank == g_nproc - 1) budget.parallel_phase_budget += 1;
+  TEST_ASSERT(agreed(MFTLRemeshEnsemble(ens, &budget, &st) == MFTL_ERROR, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &budget, &st) == MFTL_ERROR, MPI_COMM_WORLD));
+
+  MFTL_RemeshParameters band;
+  standard_params(&band, 0.06);
+  if (g_rank == 0)
+  {
+    band.max_edge_length *= 1.0 + 1e-15;
+    MFTLRemeshParamsFinalise(&band);
+  }
+  TEST_ASSERT(agreed(MFTLRemeshEnsembleDispersed(ens, &band, &st) == MFTL_ERROR, MPI_COMM_WORLD));
+
+  /* And an agreed block still goes through. */
+  MFTL_RemeshParameters same;
+  standard_params(&same, 0.06);
+  TEST_ASSERT(agreed(MFTLRemeshEnsemble(ens, &same, &st) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/**
  * @brief A repeated pass is idempotent enough to be run every timestep.
  *
  * The realistic usage is a remesh per N timesteps forever, so the interesting
@@ -2132,6 +2214,8 @@ int main(int argc, char **argv)
   RUN_TEST(test_a_dilated_band_reaches_the_same_mesh);
   RUN_TEST(test_the_edge_length_distribution_matches_the_serial_answer);
   RUN_TEST(test_the_edge_length_band_is_a_collective_measurement);
+  RUN_TEST(test_a_band_bad_on_one_rank_is_refused_on_every_rank);
+  RUN_TEST(test_different_parameter_blocks_are_refused_on_every_rank);
   RUN_TEST(test_a_second_pass_is_stable);
   RUN_TEST(test_only_the_distinct_placements_are_visited);
   RUN_TEST(test_the_budget_is_honoured_exactly);

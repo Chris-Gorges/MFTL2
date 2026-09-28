@@ -206,6 +206,10 @@ int MFTLGenerateSphereLocal(MFTL_Object *object, double center[3], double radius
       const int n_boundary = MFTLMarkMeshBoundary(object);
       MFTL_ASSERT(n_boundary == 0 && "MFTLGenerateSphereLocal: the generated sphere is not closed");
       (void) n_boundary;
+
+      /* After the projection, which moved every vertex: the first
+       * MFTLRedistribute() routes by these centres. */
+      MFTLComputeTriangleGeometry(object, object->tris.n);
     }
   }
   else

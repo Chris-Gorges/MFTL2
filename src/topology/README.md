@@ -36,6 +36,14 @@ $$
   \mathrm{origin}(h) = \mathrm{target}(\mathrm{prev}(h)).
 $$
 
+<!-- figure: halfedge-implicit
+Implicit indexing. (a) Half-edge $3t+k$ runs from corner $k$ of triangle $t$ to
+corner $k+1$, counter-clockwise seen from outside; the two half-edges on the
+shared edge (coral) are twins. (b) Per half-edge only the target vertex and the
+twin are stored. Face, next, prev and origin are arithmetic on the index, so a
+triangle's half-edges are always the triple $3t$, $3t+1$, $3t+2$.
+-->
+
 Consequences:
 
 1. A broken next-cycle or a half-edge that does not point back at its triangle
@@ -84,12 +92,20 @@ From then on it travels with the entity through redistribution and remeshing.
 Re-deriving it from `twin_idx` on a partitioned mesh would turn halo rims into
 fake boundaries.
 
+<!-- figure: halo-boundary
+What a missing twin means depends on the partition. Rank 0's pool of an open
+patch: owned triangles (blue) and its ghost layer (amber). Both the rim of the
+surface (solid) and the outer edge of the halo (dashed) have
+`twin_idx == MFTL_ERROR`; only the first carries `MFTL_FLAG_BOUNDARY`, written
+once while the mesh was still whole.
+-->
+
 ---
 
 ## Walking a fan {#topo_fan}
 
 From an outgoing half-edge $h$ of vertex $v$, the next outgoing half-edge
-counter-clockwise, and its inverse, are
+clockwise seen from outside, and its inverse, are
 
 $$
   h' = \mathrm{next}(\mathrm{twin}(h)), \qquad
@@ -97,8 +113,18 @@ $$
 $$
 
 On an interior vertex the rotation closes; on a boundary vertex it runs out of
-twins. `MFTLVertexFanStart` rewinds clockwise to the fan's first half-edge (on a
+twins. `MFTLVertexFanStart` rewinds counter-clockwise to the fan's first half-edge (on a
 closed fan this costs one full lap, which the walkers' `is_inner` flag skips).
+
+<!-- figure: vertex-fan
+Walking a fan, with triangles counter-clockwise from outside. (a) At an interior
+vertex $h' = \mathrm{next}(\mathrm{twin}(h))$ is the neighbouring outgoing
+half-edge clockwise and $h'' = \mathrm{twin}(\mathrm{prev}(h))$ the one
+counter-clockwise; the rotation closes after one lap. (b) At a boundary vertex
+the rotation runs out of twins at the rim (amber). Four triangles give four
+outgoing half-edges but five neighbours: the closing edge exists only as the
+incoming half-edge $u_4 \to v$ (coral).
+-->
 
 **A vertex on an open fan has one more neighbour than incident triangles**: the
 closing edge is reachable only as an incoming half-edge.

@@ -178,6 +178,7 @@ int MFTLSplitEdge(MFTL_Object *obj, int h)
   MFTL_ASSERT(obj != MFTL_NULL);
   if (h < 0 || h >= 3 * obj->tris.n) return MFTL_ERROR;
   if (tri_is_dead(obj, MFTLHeTriIdx(h))) return MFTL_ERROR;
+  obj->derived &= ~MFTL_DERIVED_GEOMETRY;
 
   /* ── 1. Read the patch ─────────────────────────────────────────────────────
    *
@@ -583,6 +584,7 @@ int MFTLCollapseEdge(MFTL_Object *obj, int h)
   MFTL_ASSERT(obj != MFTL_NULL);
   if (h < 0 || h >= 3 * obj->tris.n) return MFTL_ERROR;
   if (tri_is_dead(obj, MFTLHeTriIdx(h))) return MFTL_ERROR;
+  obj->derived &= ~MFTL_DERIVED_GEOMETRY;
 
   /* A collapse allocates nothing, so unlike the split this pointer stays valid
    * for the whole function. */
@@ -818,6 +820,7 @@ int MFTLFlipEdge(MFTL_Object *obj, int h)
 
   const int ht = he[h].twin_idx;
   if (ht == MFTL_ERROR) return MFTL_ERROR;
+  obj->derived &= ~MFTL_DERIVED_GEOMETRY;
 
   const int t1 = MFTLHeTriIdx(h);
   const int t2 = MFTLHeTriIdx(ht);

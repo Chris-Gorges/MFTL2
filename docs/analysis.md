@@ -236,6 +236,25 @@ returned only a third of its traffic estimate (0.588 ms saved, 0.369 of it back
 in `t_relink`) — **which loop the stores land in matters as much as how many
 there are.** Digests identical in 16 configurations.
 
+### 2.6 Stale centres: a bit, not a spot check
+
+Redistribution routes triangles by `tris.center`, and before this was guarded
+only a Debug assertion (a full geometry pass) checked it. The realistic failure
+was a freshly generated ensemble, whose centres were never computed: every
+triangle went to one rank, structurally valid. Generators now leave geometry
+current, and `MFTL_DERIVED_GEOMETRY` records "computed over every triangle since
+the library last changed its inputs" (cleared by a ghost sync, a topology change,
+a rebuild); `MFTLRedistribute` recomputes a body whose bit is clear.
+
+Rejected first: recomputing the centres of the last owned and last ghost
+triangle per body and comparing. It caught more in principle (vertices moved
+after the pass), but cost **+0.8 to +1.25 %** of the redistribution phase at
+1000 droplets, np = 4 (two gathers per body, mostly cache misses) — and the case
+only it catches is the benign one: all holders then route by the same old
+centres. The bit costs one test per body: paired-ratio median ×1.003 (IQR
+×0.995–1.009, 40 interleaved rounds), digests identical in 18 configurations,
+and the recompute never fires in any example or test that follows the loop.
+
 ---
 
 ## 3. Parallel I/O
@@ -339,8 +358,15 @@ dominates `t_sweep`, it buys nothing.
 `MFTLMeanEdgeLength` is local; a rank holding none of a body measures 0 and gets
 the band `[0, 0]`. Measured: a 105-triangle cap grew to **148 287 triangles in
 eight phases** with every invariant intact. Closed by
-`MFTLEnsembleMeanEdgeLength`, a refusal of a degenerate band in both drivers, and
-the Debug `MFTLRemeshParamsAgree` (`test_the_edge_length_band_is_a_collective_measurement`).
+`MFTLEnsembleMeanEdgeLength` and by `MFTLRemeshAgreeParams`, one Allreduce per
+call that refuses on every rank a band invalid on any rank or a parameter block
+that differs between ranks (`test_the_edge_length_band_is_a_collective_measurement`,
+`test_a_band_bad_on_one_rank_is_refused_on_every_rank`). A per-rank refusal
+would return on the bad rank and leave the others in the next collective. The
+check sits at each path's first collective, after the local work before it: at
+the top of the call it was a new synchronisation point and cost +0.8 % of a
+LeVeque step at np = 4 (load imbalance of that work, not the 0.7 µs
+reduction); placed there, a 40-round interleaved A/B gives ×0.997.
 
 ### 5.6 Coarsening, the gather, and the frozen share
 
@@ -557,24 +583,18 @@ Correctness, most severe first:
    repeated vertices, but an edge with three faces or a same-direction duplicate
    is paired partially and reported as an open boundary by
    `MFTLCheckMeshIntegrity`.
-3. **Collective control parameters are not agreed.** `MFTLRemeshParamsAgree`
-   checks only the length band and only in Debug; `parallel_strategy`, the phase
-   budget and the coarsening controls change the collective sequence. The
-   drivers' refusal of a non-positive band is also a per-rank decision: a band
-   that is bad on some ranks only (the §5.5 trap) returns `MFTL_ERROR` there and
-   leaves the other ranks in the next collective — a hang in Release.
-4. **A failed ghost-id sync during a spanning remesh** still renumbers owned ids
+3. **A failed ghost-id sync during a spanning remesh** still renumbers owned ids
    and proceeds into the closing redistribution; it should be an agreed
    fail-stop.
-5. **BVH float boxes are absolute**, so a unit triangle translated to 1e9 gets a
+4. **BVH float boxes are absolute**, so a unit triangle translated to 1e9 gets a
    256× looser fallback radius and a much wider broad phase (the ensemble radius
    hint repairs the tolerance, not the boxes).
-6. **Segment–segment distance mishandles zero-length segments** (squared distance
+5. **Segment–segment distance mishandles zero-length segments** (squared distance
    3 instead of 2 for a point-degenerate triangle).
-7. `MFTLUpdateGhostPositions` has no global fallback; it now *reports* orphaned
+6. `MFTLUpdateGhostPositions` has no global fallback; it now *reports* orphaned
    ghosts as an error, and is safe only because every coarsened partition is
    undone before the next timestep.
-8. VTU output is Int32: more than 2³¹ points or ~716 M triangles is refused
+7. VTU output is Int32: more than 2³¹ points or ~716 M triangles is refused
    collectively, not written.
 
 Scaling and engineering:

@@ -1127,6 +1127,11 @@ static bool watermarks_agree(MFTL_Ensemble *ens)
 
 int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats)
 {
+  return MFTLRemeshSpanningPass(ens, params, stats, "MFTLRemeshEnsembleParallel");
+}
+
+int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats, const char *agree_as)
+{
   MFTL_ASSERT(ens != MFTL_NULL && params != MFTL_NULL);
 
   MFTL_Domain *const dom = &ens->domain;
@@ -1139,30 +1144,51 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
   /* GLOBAL: everything below is collective. */
   if (ens->n_bodies_global == 0) return MFTL_SUCCESS;
 
-  MFTL_ASSERT(watermarks_agree(ens) &&
-              "MFTLRemeshEnsembleParallel: the ranks disagree about an object's next_*_gid. New ids are carved out "
-              "of it, so the blocks would overlap and two entities would end up sharing one global id.");
+  /* Free-running per-rank accumulation; reduced ONCE, on the way out. Timing
+   * every phase collectively would cost more than it measures and would add a
+   * barrier the algorithm does not otherwise have. */
+  const double t0_call = MFTLRemeshWallTime();
+  double t_mark = t0_call;
 
-  /* A zero or negative length band is a caller error that has no cheap symptom:
-   * every edge is longer than max_edge_length, so the pass refines without bound
-   * until the job is killed. Refusing here turns minutes of silent memory growth
-   * into an immediate diagnosable failure. The realistic cause is deriving the
-   * target with MFTLMeanEdgeLength on a distributed object -- see the warning on
-   * that function. */
-  if (!(params->max_edge_length > 0.0) || !(params->min_edge_length >= 0.0) || params->min_edge_length > params->max_edge_length)
+  /* Phase 0's geometry, taken here rather than at the top of the loop: the
+   * pre-pass needs it too, and nothing between here and the first migration
+   * moves a vertex, so one pass serves both. */
+  MFTLEnsembleComputeTriangleGeometry(ens);
+  st->t_geometry += MFTLRemeshWallTime() - t_mark;
+
+  /* The pre-pass's local half: see "Regime C" below. */
+  const bool prepass = (params->parallel_coarsen != 0 || params->serial_gather_max_triangles > 0) && dom->nproc > 1;
+  double probe[2] = {0.0, 0.0};
+  double counts[2] = {0.0, 0.0};
+  if (prepass)
   {
-    if (dom->rank == 0)
+    const double no_shift[3] = {0.0, 0.0, 0.0};
+    for (int o = 0; o < ens->n_local_objects; ++o)
     {
-      fprintf(stderr, "[MFTL] %s: refusing to remesh with an edge-length band of [%.6g, %.6g]. Use MFTLEnsembleMeanEdgeLength for a distributed mesh.\n",
-              "MFTLRemeshEnsembleParallel", params->min_edge_length, params->max_edge_length);
+      MFTLRemeshMarkFrozen(ens->local_objects[o]);
+      MFTLDilateFrozenBand(ens->local_objects[o], params->freeze_dilation_rings);
+      local_band_probe(ens->local_objects[o], dom, no_shift, probe);
+      local_frozen_count(ens->local_objects[o], counts);
     }
+  }
+
+  /* ── The parameter check, at the first collective ─────────────────────────
+   *
+   * Before anything that reads a parameter to decide a collective, and after
+   * the local work that precedes the first one. At the top of the call it would
+   * be a new synchronisation point in front of that work, and the ranks' load
+   * imbalance in it would be paid in full: +0.8 % of a LeVeque remesh step at
+   * np = 4, against 0.7 us for the reduction itself. Here it adds a latency.
+   * A refusal undoes the only state the pre-pass left behind. */
+  if (agree_as != MFTL_NULL && MFTLRemeshAgreeParams(dom, params, agree_as) != MFTL_SUCCESS)
+  {
+    clear_frozen(ens);
     return MFTL_ERROR;
   }
 
-  MFTL_ASSERT(MFTLRemeshParamsAgree(dom, params) &&
-              "MFTLRemeshEnsembleParallel: the ranks were handed different edge-length bands. Nothing communicates the band, so a rank "
-              "with a shorter one refines everything it owns, every phase, without bound. The usual cause is "
-              "MFTLMeanEdgeLength (LOCAL) on a mesh a collective generator already distributed.");
+  MFTL_ASSERT(watermarks_agree(ens) &&
+              "MFTLRemeshEnsembleParallel: the ranks disagree about an object's next_*_gid. New ids are carved out "
+              "of it, so the blocks would overlap and two entities would end up sharing one global id.");
 
   /* ── Regime C: do the rank boxes need merging before anything starts? ────
    *
@@ -1175,7 +1201,8 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
    * than the mesh actually requires.
    *
    * The group has to be a pure function of replicated data, and it is: `domain`
-   * and `params` are replicated by contract, and the band comes out of an
+   * is replicated by contract, `params` was checked identical on every rank by
+   * MFTLRemeshAgreeParams() on the way in, and the band comes out of an
    * Allreduce(MAX), which is order-independent and therefore bit-identical
    * everywhere. Two ranks computing different groups would partition against
    * different planes with nothing to detect it.
@@ -1184,20 +1211,8 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
    * edges -- the group is then slightly under-conservative. That is not silent:
    * it is exactly what `n_edges_hidden_long` and `converged` report. */
   int group[3] = {1, 1, 1};
-  if ((params->parallel_coarsen != 0 || params->serial_gather_max_triangles > 0) && dom->nproc > 1)
+  if (prepass)
   {
-    MFTLEnsembleComputeTriangleGeometry(ens);
-
-    double probe[2] = {0.0, 0.0};
-    double counts[2] = {0.0, 0.0};
-    const double no_shift[3] = {0.0, 0.0, 0.0};
-    for (int o = 0; o < ens->n_local_objects; ++o)
-    {
-      MFTLRemeshMarkFrozen(ens->local_objects[o]);
-      MFTLDilateFrozenBand(ens->local_objects[o], params->freeze_dilation_rings);
-      local_band_probe(ens->local_objects[o], dom, no_shift, probe);
-      local_frozen_count(ens->local_objects[o], counts);
-    }
     MFTLRemeshAgreeDoubleMax(dom, probe, 2);
 
     /* A SECOND reduction, and a different OPERATOR -- which is why it is a
@@ -1348,12 +1363,6 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
   int clean_streak = 0;
   int status = MFTL_SUCCESS;
 
-  /* Free-running per-rank accumulation; reduced ONCE, on the way out. Timing
-   * every phase collectively would cost more than it measures and would add a
-   * barrier the algorithm does not otherwise have. */
-  const double t0_call = MFTLRemeshWallTime();
-  double t_mark;
-
   /* {widest frozen band seen, longest owned edge seen}, local running maxima.
    * See local_band_probe. */
   double band_probe[2] = {0.0, 0.0};
@@ -1377,9 +1386,12 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
     double shift[3];
     MFTLRemeshPhaseShift(dom, group, MFTL_REMESH_PHASES[distinct[p % n_distinct]], shift);
 
-    t_mark = MFTLRemeshWallTime();
-    MFTLEnsembleComputeTriangleGeometry(ens);
-    st->t_geometry += MFTLRemeshWallTime() - t_mark;
+    if (p > 0)  // phase 0's was taken before the pre-pass
+    {
+      t_mark = MFTLRemeshWallTime();
+      MFTLEnsembleComputeTriangleGeometry(ens);
+      st->t_geometry += MFTLRemeshWallTime() - t_mark;
+    }
 
     t_mark = MFTLRemeshWallTime();
     MFTL_RemeshMigrationReport mig_report;

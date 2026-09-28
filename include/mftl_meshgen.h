@@ -10,7 +10,10 @@
  * MFTLBuildIndexedMesh() / MFTLBuildTopologyFromIndexList() are the single place
  * raw connectivity becomes an MFTL mesh. Every builder leaves the object with
  * twins linked, #MFTL_FLAG_BOUNDARY recorded (while the mesh is complete) and
- * derived connectivity built; triangle area/normal/centre are NOT computed.
+ * derived connectivity built. MFTLBuildIndexedMesh(), and every generator built
+ * on it, also computes the triangle geometry (area, normal, centre), so a new
+ * mesh can go straight into MFTLRedistribute(); MFTLBuildTopologyFromIndexList()
+ * does not, because its caller still owns the positions.
  *
  * Sphere generation builds the whole body on rank 0 (other ranks get an empty
  * object); MFTLRedistribute() spreads it. The collective form
@@ -35,6 +38,8 @@
  * one past the last id; every entity is owned by the calling rank. The caller
  * owns the winding: the normal \f$(\vect{p}_1-\vect{p}_0)\times(\vect{p}_2-\vect{p}_0)\f$
  * points to the side the triangles are counter-clockwise from.
+ *
+ * Triangle geometry is current on return (when the object has a domain).
  *
  * @param object      Target object; must be EMPTY and linked to a domain.
  * @param positions   [3 * n_vertices] interleaved xyz.
@@ -80,8 +85,9 @@ int MFTLBuildTopologyFromIndexList(MFTL_Object *object, const int *tri_verts, in
  * parent's rotation), which fixes the sign of the enclosed volume, of surface
  * tension and of the indicator function. Mean-ratio quality is at least 0.974
  * (mean 0.997) at every level; triangle areas vary by up to about a factor 2.
- * Positions are wrapped into a periodic domain. The result is in subdivision
- * order; MFTLObjectReorderMorton() gives spatial locality.
+ * Positions are wrapped into a periodic domain, and triangle geometry is current
+ * on return. The result is in subdivision order; MFTLObjectReorderMorton() gives
+ * spatial locality.
  *
  * @param object      The object to generate into; must already be in an ensemble.
  * @param center      Sphere centre.

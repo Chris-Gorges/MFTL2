@@ -92,6 +92,9 @@ void MFTLComputeTriangleGeometry(MFTL_Object *obj, int count)
     geometry_by_vertices(obj, count);
   else
     geometry_by_walk(obj, count);
+
+  /* Only a pass over every triangle makes the ghosts' geometry current too. */
+  if (count == obj->tris.n) obj->derived |= MFTL_DERIVED_GEOMETRY;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

@@ -79,8 +79,10 @@ void MFTLObjectBuildDerived(MFTL_Object *obj)
 
   if (obj->tris.n > 0) build_topology_arrays(obj);
 
-  /* An empty mesh is trivially described, so the bit is set. */
-  obj->derived = MFTL_DERIVED_TOPOLOGY;
+  /* An empty mesh is trivially described, so the bit is set. The geometry bit is
+   * left alone: rebuilding connectivity moves nothing, and every edit that does
+   * change a triangle's corners has already cleared it. */
+  obj->derived = MFTL_DERIVED_TOPOLOGY | (obj->derived & MFTL_DERIVED_GEOMETRY);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

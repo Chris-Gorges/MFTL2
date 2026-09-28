@@ -61,6 +61,14 @@ halves below $\ell_{\min}$ — and three mechanisms do:
    than $\ell_{\max}$ (the stretch clause);
 3. smoothing between sweeps pulls the length distribution into the band.
 
+<!-- figure: length-band
+The length band. A split halves an edge, and $\tfrac43L$ and $\tfrac23L$ are
+equally far from $L$, so a split never moves an edge away from the target.
+Edges in $(\tfrac43L, \tfrac85L)$ (hatched) split into halves below
+$\tfrac45L$, which is why the band alone does not rule out split/collapse
+ping-pong.
+-->
+
 `MFTL_REMESH_CUSTOM` lets the caller set any band (then `MFTLRemeshParamsFinalise`).
 
 ### The sweep order {#rem_order}
@@ -88,6 +96,14 @@ re-links the twins on the rim of its patch**:
 | FLIP | none | two triangles rewritten in place, four rim twins re-pointed |
 | SPLIT | one triangle per side (with its three half-edges) | midpoint vertex appended, 2–4 triangles written |
 | COLLAPSE | none, and nothing freed | one or two triangles and the origin vertex flagged `MFTL_FLAG_DEAD` for compaction |
+
+<!-- figure: remesh-operators
+The three operators, before (top) and after (bottom). A split appends the
+midpoint and one triangle per side. A collapse moves $b$ to $p_m$, rewrites
+$a$'s fan, and marks $a$ and the two triangles on the edge dead for compaction.
+A flip re-cuts a quad only if the valence energy strictly drops, here from 4
+to 0.
+-->
 
 Half-edge ids, $3\,t_\mathrm{gid}+k$, belong to the slot and stay valid. The
 flag word does not: when a triangle is rewritten a logical edge may move to
@@ -130,6 +146,15 @@ result is independent of the length unit:
 scale $2^{-20}$ to equal the unit result times $2^{-20}$ bit for bit. The
 fold-over guard also bounds a runaway once features are spurious (16 702
 triangles against 101 048).
+
+<!-- figure: collapse-predicate
+Four clauses of the collapse predicate, none of which fails loudly. (a) An
+allowed collapse: $a$ and $b$ share exactly the two wing vertices. (b) A third
+common neighbour $x$ violates the link condition; the collapse would weld two
+sheets. (c) A tetrahedron passes the link condition, but its wings have valence
+3 and it would dissolve. (d) $a$ and $b$ both lie on the rim but the edge
+between them does not: collapsing that chord pinches the rim inward.
+-->
 
 ### Valence optimisation
 
@@ -185,6 +210,16 @@ $\boldsymbol\Delta = \tfrac12(\mathbf d_1+\mathbf d_2)$. Moving it *to*
 $\boldsymbol\Delta$ instead cuts the chord: a regular 24-gon ridge shrinks to
 $\cos^{20}(\pi/24) = 0.842$ of its radius in 20 sweeps
 (`test_a_regular_ridge_is_a_fixed_point` asserts drift below $10^{-12}$).
+
+<!-- figure: smoothing
+Smoothing is a projection, and the feature class chooses the subspace. (a) A
+free vertex moves by the tangential part of $\mathbf{d}$ (drawn at 1.8×; the
+step is $\sigma\mathbf{d}$). (b) A ridge vertex moves along
+$\boldsymbol\tau$ only; the full $\boldsymbol\Delta$ would cut the chord.
+(c) A corner does not move. (d) Moving a regular 24-gon ridge to its midpoints
+shrinks it to $\cos^{20}(\pi/24) = 0.842$ of its radius in 20 sweeps; the
+projection leaves it fixed.
+-->
 
 The area weight is the mechanism that equalises triangle size; without it the
 operator is nearly the umbrella one (`docs/analysis.md` §4: 6.0 % volume loss
@@ -265,6 +300,14 @@ and convergence criteria), so `test_the_two_strategies_reach_the_same_mesh` chec
 the *answer*: within 4 % in triangle count and 1 % in volume (measured 0.4–2.5 %
 and 0.3 % at $P$ = 1, 2, 4, 8). The tolerance must not become equality: split and
 collapse are order-dependent.
+
+<!-- figure: remesh-regimes
+The two distributed strategies. (a) A body narrower than a rank box moves whole
+to the rank owning its centroid and is remeshed serially: nothing shared,
+nothing frozen. (b) A body wider than a rank box stays; the cut planes move by
+half a box instead. (c) Clustered bodies are spread one hop along `comm_graph`
+by a negotiation that never pushes a rank past its cap.
+-->
 
 ### Dispatch {#rem_dispatch}
 
@@ -350,6 +393,14 @@ $$
 Under this condition a point is near the planes of at most one placement per
 axis: for each axis there is at most one *bad* value $b_k$, and the point is
 interior in placement $s$ iff $s_k \ne b_k$ on every axis where $b_k$ is defined.
+
+<!-- figure: spanning-placements
+The frozen band follows the planes. An icosphere on a periodic 2×2×2 grid, with
+ownership, halo and frozen set computed by the rules of this chapter: (a) with
+the canonical planes, (b) with every plane shifted by $h/2$. (c) On one axis, a
+point within $\delta$ of a plane of one placement is at least $h/2-\delta$
+from every plane of the other, so it is interior there when $h > 4\delta$.
+-->
 
 ### The phase table {#rem_phase_table}
 
@@ -683,7 +734,7 @@ both directions on a $\{P,1,1\}$ grid.
 | `MFTLRemeshNeighborGather` / `Allgather` / `Alltoall` | `comm_graph` | 3 doubles per body a rank speaks for or moves; 1–2 doubles per neighbour per round |
 | `MFTLRemeshMeasureBodies` | 2 × `MFTLEnsembleReduceBodies` + scalar `MPI_MAX` | 9 + 1 doubles per local body |
 | `MFTLRemeshSyncGhostIds` | request/reply over `comm_graph` (global fallback) | 4 B per ghost vertex |
-| `MFTLRemeshParamsAgree` | Allreduce | Debug only |
+| `MFTLRemeshAgreeParams` | Allreduce(MIN) | 49 doubles, once per call, at the first collective |
 
 Nothing in `src/remeshing/` allocates or sends a quantity proportional to $B$;
 proportional to $P$ are only the `[nproc]` inverse neighbour table of
@@ -743,7 +794,8 @@ on a cluster.
 | idle ranks, DISPERSED | `n_ranks_idle`, `load_imbalance` | balanced but idle ⟹ $B < P$ (unfixable); imbalanced ⟹ check `n_bodies_unreachable`, slack |
 | DISPERSED became SPANNING | `n_bodies_not_centred`, `strategy` | a body outgrew the admission box (e.g. after coalescence) |
 | quality collapses at one step | `n_feature_edges` | features on a smooth surface: `feature_angle_threshold = 180` |
-| `MFTL_ERROR`: non-positive band | — | the band came from `MFTLMeanEdgeLength` on a distributed object on a rank holding nothing; use `MFTLEnsembleMeanEdgeLength` |
+| `MFTL_ERROR`, "band is invalid on at least one rank" | — | the band came from `MFTLMeanEdgeLength` on a distributed object on a rank holding nothing; use `MFTLEnsembleMeanEdgeLength` |
+| `MFTL_ERROR`, "different parameter blocks" | the field named on stderr | a parameter derived from rank-local data; every field must be bitwise identical on every rank |
 
 The timers are maxima over ranks (the slowest rank sets the wall clock of a
 synchronised loop) and are reduced unconditionally — a collective gated on the

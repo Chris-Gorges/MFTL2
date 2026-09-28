@@ -366,8 +366,37 @@ static inline void MFTLGetTriangleNormal(const MFTL_Object *obj, int t, double o
 static inline void MFTLGetTriangleCenter(const MFTL_Object *obj, int t, double out[3]) { MFTLGetTriangleProperties(obj, t, MFTL_NULL, MFTL_NULL, out); }
 
 /**
+ * @brief Whether triangle @p t's cached `tris.center` still matches its vertices.
+ *
+ * Stale means off by more than \f$10^{-12}(|c_k| + L_k)\f$ on some axis k,
+ * compared through the seam, with \f$c\f$ the recomputed centre and \f$L_k\f$
+ * the domain length. The tolerance is relative, never absolute: rounding
+ * differences between two evaluations are ulps of \f$|c_k|\f$, and a centre
+ * error below \f$10^{-12}L_k\f$ can change the owner only of a triangle that
+ * close to a cut plane. A NaN or garbage centre is stale.
+ *
+ * @param obj The mesh; needs a domain.
+ * @param t   Triangle index.
+ * @return `true` if the cached centre is current.
+ */
+static inline bool MFTLTriangleCentreIsCurrent(const MFTL_Object *obj, int t)
+{
+  double fresh[3];
+  MFTLGetTriangleCenter(obj, t, fresh);
+
+  /* Both are wrapped positions, so compare THROUGH the seam, not across it. */
+  double d[3];
+  MFTLGetMinimumImageVector(obj->domain, d, &obj->tris.center[3 * t], fresh);
+  for (int k = 0; k < 3; ++k)
+  {
+    if (!(fabs(d[k]) <= 1e-12 * (fabs(fresh[k]) + obj->domain->domain_size[k]))) return MFTL_FALSE;
+  }
+  return MFTL_TRUE;
+}
+
+/**
  * @brief Whether every triangle's cached `tris.center`, ghosts included, still
- *        matches its vertices.
+ *        matches its vertices (MFTLTriangleCentreIsCurrent()).
  *
  * The precondition of every migration that routes by centre (MFTLRedistribute(),
  * the remesher's shifted placements): a rank routes its ghosts too, and a stale
@@ -375,20 +404,13 @@ static inline void MFTLGetTriangleCenter(const MFTL_Object *obj, int t, double o
  * pass -- use it inside `MFTL_ASSERT` only.
  *
  * @param obj The mesh.
- * @return `true` if every centre is within an ABSOLUTE 1e-9 per axis (through
- *         the seam) of the one its vertices imply.
+ * @return `true` if every centre is current.
  */
 static inline bool MFTLTriangleCentresAreCurrent(const MFTL_Object *obj)
 {
   for (int t = 0; t < obj->tris.n; ++t)
   {
-    double fresh[3];
-    MFTLGetTriangleCenter(obj, t, fresh);
-
-    /* Both are wrapped positions, so compare THROUGH the seam, not across it. */
-    double d[3];
-    MFTLGetMinimumImageVector(obj->domain, d, &obj->tris.center[3 * t], fresh);
-    if (fabs(d[0]) > 1e-9 || fabs(d[1]) > 1e-9 || fabs(d[2]) > 1e-9) return MFTL_FALSE;
+    if (!MFTLTriangleCentreIsCurrent(obj, t)) return MFTL_FALSE;
   }
   return MFTL_TRUE;
 }
@@ -452,12 +474,13 @@ double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], dou
  *
  * @param obj   The mesh.
  * @param count `obj->tris.n_local` for owned triangles, `obj->tris.n` to include
- *              ghosts.
+ *              ghosts; only the latter sets #MFTL_DERIVED_GEOMETRY.
  *
  * @warning Before a redistribution the count must be `obj->tris.n`: ghosts are
  *          routed by their cached centre, and a stale ghost centre makes two
  *          ranks disagree about a destination (an owned triangle then silently
- *          loses an edge neighbour).
+ *          loses an edge neighbour). MFTLRedistribute() recomputes a body whose
+ *          bit is clear rather than trust it.
  *
  * @rank_local MFTLEnsembleUpdate() is the collective counterpart that also
  *             reduces quality statistics.

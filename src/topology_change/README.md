@@ -63,6 +63,17 @@ REMESH      optional; then the size floor a second time
 VOLUME      three Newton steps per cluster
 ```
 
+<!-- figure: topo-reconstruction
+The reconstruction, run in 2D on a pinching dumbbell. (a) The neck is thinner
+than $\delta_b$, and its opposing triangles are each behind the other.
+(b) The signed distance is rasterised only within $r_\mathrm{cut}$; beyond it,
+the bulb centres included, nodes stay unknown. (c) A bump of height
+$\varepsilon_b$ around the event lifts the neck above zero (dashed: the input
+surface). (d) The face rule extracts two closed loops. Every vertex lies on a
+lattice edge and is named by it, which is why neighbouring ranks need no
+stitching.
+-->
+
 `MFTLEnsembleApplyTopologyChanges` is `MFTLTopologyDetectEvents` followed by
 `MFTLEnsembleReconstructBodies` on every body an event touches. A call that
 detects nothing changes nothing: no redistribution, no remesh, no pool touched.
@@ -96,6 +107,15 @@ one body"; only the side the gap is on tells them apart, so "intra-body means
 breakup, inter-body means coalescence" is wrong in both directions — a film inside
 one body coalesces, and a liquid film between a drop and a bubble inside it is a
 breakup between two bodies.
+
+<!-- figure: topo-events
+An event is classified by the side its gap is on, not by how many bodies it
+touches. Opposing triangles each behind the other enclose liquid: a breakup.
+Each in front of the other, they enclose a film of the other phase: a
+coalescence. So (c) a cap rolled onto its own stem coalesces within one body,
+and (d) the liquid film between a drop and the bubble inside it breaks between
+two bodies.
+-->
 
 The pairs come from `MFTLEnsembleIntersectObjects` with `self_pairs` set — the
 existing distributed contact pipeline, with its halo, its broad phase and its
@@ -177,6 +197,14 @@ rather than `tris.neighbors` alone.
 union of all its bodies' surfaces, signed by the nearest one — not the minimum of
 per-body fields, which is wrong for nested bodies: inside a drop that contains a
 bubble, $\min(\phi_\text{drop},\phi_\text{bubble})$ is negative inside the bubble.
+
+<!-- figure: union-field
+Why a cluster is rasterised as a union. A 1D cut through a drop containing a
+bubble, whose surface faces into the bubble. The distance to the union of both
+surfaces, signed by the nearest one, is negative exactly in the liquid. The
+minimum of the per-body fields, each known within $r_\mathrm{cut}$ of its own
+surface, is negative inside the bubble, and next to the drop as well.
+-->
 
 **The merge is commutative and associative, so the field is partition-independent
 to the bit.** `MFTLSdfMerge` keeps the smaller $|\phi|$ and breaks a tie towards

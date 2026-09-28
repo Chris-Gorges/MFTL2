@@ -121,7 +121,8 @@ results as prominently as the positive ones.
 
 - **Read without building anything:** the pre-built manual in the `MFTL_Documentation` repository —
   `prebuilt/MFTL_Manual.pdf` (the whole manual in one PDF) and `prebuilt/html/index.html` (the web manual for
-  offline use, opened straight from disk).
+  offline use, opened straight from disk, with the Doxygen manual — call graphs, source browser — at
+  `prebuilt/html/doxygen/index.html`).
 - **In this tree:** the Doxygen comments in `include/` and `src/**`, the eleven `src/<module>/README.md` theory
   chapters (they render on GitHub next to the code) and one measurement document, `docs/analysis.md`.
 

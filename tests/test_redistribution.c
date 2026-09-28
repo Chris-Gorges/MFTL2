@@ -61,10 +61,8 @@ static MFTL_Ensemble *make_ensemble(bool periodic, int capacity)
 }
 
 /**
- * @brief Adds a generated sphere with its triangle geometry already computed.
- *
- * The centres must exist before the first redistribution: ownership is decided
- * from them, and a freshly generated mesh has none.
+ * @brief Adds a generated sphere. The generator leaves its triangle geometry
+ *        current, which is what the first redistribution routes by.
  */
 static MFTL_Object *add_sphere(MFTL_Ensemble *ens, int id, double cx, double cy, double cz, double r, int refine)
 {
@@ -73,7 +71,6 @@ static MFTL_Object *add_sphere(MFTL_Ensemble *ens, int id, double cx, double cy,
 
   double centre[3] = {cx, cy, cz};
   MFTLGenerateSphere(obj, centre, r, refine);
-  MFTLComputeTriangleGeometry(obj, obj->tris.n);
   return obj;
 }
 
@@ -1211,6 +1208,117 @@ static int test_skipping_reproduces_the_full_rebuild(void)
 }
 
 /**
+ * @brief Stale triangle centres are found and recomputed before routing, and the
+ *        partition comes out as if the caller had refreshed them.
+ *
+ * The two ways a caller realistically breaks the precondition, on alternate
+ * steps: no geometry pass at all after moving the vertices, and a pass over the
+ * OWNED triangles only (the ghosts stay stale). Against an ensemble that runs
+ * the documented loop, the partitions must agree to the bit, and the repair
+ * must have fired (summed over ranks, at np > 1). Release only: Debug asserts
+ * the precondition instead of repairing it.
+ */
+static int test_stale_centres_are_recomputed_before_routing(void)
+{
+#ifndef NDEBUG
+  return 0;
+#else
+  const int n_bodies = 6;
+  MFTL_Ensemble *ref = make_ensemble(MFTL_TRUE, n_bodies);
+  MFTL_Ensemble *lazy = make_ensemble(MFTL_TRUE, n_bodies);
+
+  for (int i = 0; i < n_bodies; ++i)
+  {
+    const double cx = -0.7 + 0.27 * (double) i;
+    const double cy = 0.5 - 0.19 * (double) ((i * 3) % 5);
+    const double cz = -0.4 + 0.15 * (double) ((i * 2) % 5);
+    add_sphere(ref, i, cx, cy, cz, 0.2, 2);
+    add_sphere(lazy, i, cx, cy, cz, 0.2, 2);
+  }
+  MFTLRedistribute(ref);
+  MFTLRedistribute(lazy);
+
+  const double velocity[3] = {0.041, -0.027, 0.033};
+  MFTLRedistributeStatsReset();
+  int ok = 1;
+
+  for (int step = 0; step < 12 && ok; ++step)
+  {
+    MFTL_Ensemble *both[2] = {ref, lazy};
+    for (int e = 0; e < 2; ++e)
+    {
+      for (int o = 0; o < both[e]->n_local_objects; ++o)
+      {
+        MFTL_Object *obj = both[e]->local_objects[o];
+        MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += velocity[0]; pos[1] += velocity[1]; pos[2] += velocity[2]; MFTLApplyPeriodicity(&both[e]->domain, pos););
+      }
+      MFTLUpdateGhostPositions(both[e]);
+    }
+
+    /* The documented step 3 on one side; nothing, or the owned half, on the other. */
+    for (int o = 0; o < ref->n_local_objects; ++o) MFTLComputeTriangleGeometry(ref->local_objects[o], ref->local_objects[o]->tris.n);
+    if (step % 2 == 1)
+    {
+      for (int o = 0; o < lazy->n_local_objects; ++o) MFTLComputeTriangleGeometry(lazy->local_objects[o], lazy->local_objects[o]->tris.n_local);
+    }
+
+    MFTLRedistribute(ref);
+    MFTLRedistribute(lazy);
+
+    uint64_t d_ref[2], d_lazy[2];
+    partition_digest(ref, d_ref);
+    partition_digest(lazy, d_lazy);
+    if (d_ref[0] != d_lazy[0] || d_ref[1] != d_lazy[1]) ok = 0;
+    if (!ensemble_is_sound(lazy)) ok = 0;
+  }
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+
+  MFTL_RedistributeStats st;
+  MFTLRedistributeGetStats(&st);
+  long repaired = 0;
+  MPI_Allreduce(&st.n_objects_centres_recomputed, &repaired, 1, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
+  if (g_nproc > 1) TEST_ASSERT(repaired > 0);
+
+  MFTLEnsembleDestroy(&ref);
+  MFTLEnsembleDestroy(&lazy);
+  return 0;
+#endif
+}
+
+/**
+ * @brief A generated mesh leaves the generator with current triangle geometry,
+ *        and with the bit that says so, so it can be redistributed at once.
+ *
+ * The first redistribution of a generated ensemble routes by `tris.center`; a
+ * generator that left it unset sent every triangle to one rank in Release,
+ * structurally valid and silently unbalanced. The bit is what redistribution
+ * trusts, and a ghost sync must clear it.
+ */
+static int test_a_generated_sphere_has_current_geometry(void)
+{
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 1);
+  MFTL_Object *obj = add_sphere(ens, 0, 0.3, -0.2, 0.1, 0.4, 2);
+
+  int ok = MFTLTriangleCentresAreCurrent(obj);
+  for (int t = 0; t < obj->tris.n && ok; ++t)
+  {
+    double area = 0.0, normal[3], centre[3];
+    MFTLGetTriangleProperties(obj, t, &area, normal, centre);
+    const double *const n = &obj->tris.normal[3 * t];
+    const double chord = sqrt((normal[0] - n[0]) * (normal[0] - n[0]) + (normal[1] - n[1]) * (normal[1] - n[1]) + (normal[2] - n[2]) * (normal[2] - n[2]));
+    ok = (fabs(area - obj->tris.area[t]) <= 1e-14 * area) && (chord <= 1e-14);
+  }
+  if (obj->tris.n > 0) ok = ok && (obj->derived & MFTL_DERIVED_GEOMETRY) != 0u;
+
+  MFTLUpdateGhostPositions(ens);
+  ok = ok && (obj->derived & MFTL_DERIVED_GEOMETRY) == 0u;
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/**
  * @brief A stamped body is rebuilt even when nothing about its ownership moved.
  *
  * The half of the precondition an owner-change test cannot see. The spanning
@@ -1658,6 +1766,8 @@ int main(int argc, char **argv)
   RUN_TEST(test_non_periodic_domain);
   RUN_TEST(test_skipping_reproduces_the_full_rebuild);
   RUN_TEST(test_a_stamped_body_is_never_skipped);
+  RUN_TEST(test_stale_centres_are_recomputed_before_routing);
+  RUN_TEST(test_a_generated_sphere_has_current_geometry);
   RUN_TEST(test_generation_capacity_does_not_stay_resident_on_rank_0);
   RUN_TEST(test_shrinking_does_not_change_the_mesh);
   RUN_TEST(test_a_body_arrives_leaves_and_returns);

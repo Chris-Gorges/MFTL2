@@ -620,10 +620,6 @@ int main(int argc, char **argv)
     /* The LOCAL half; the two collectives are hoisted out of the loop below so
      * setup costs 2 messages rather than 2 per body. */
     MFTLGenerateSphereLocal(obj, centre, radius, cfg.refinements);
-
-    /* Ownership is decided from the cached centre, and a freshly generated mesh
-     * has none. MFTLGenerateSphereLocal already wrapped the positions. */
-    MFTLComputeTriangleGeometry(obj, obj->tris.n);
   }
 
   MFTLPublishGeneratedBodies(ens);

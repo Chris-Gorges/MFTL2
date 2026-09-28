@@ -218,8 +218,8 @@ MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategyMeasured(MFTL_Ensemble *ens,
   /* The measurement is taken even when h_min says the answer is already SPANNING,
    * because the caller may be MFTLRemeshEnsemble, which owns the buffers and
    * would otherwise have to know whether they were filled. Filling them
-   * unconditionally is one collective on a path that is about to run a dozen. */
-  MFTLEnsembleComputeTriangleGeometry(ens);
+   * unconditionally is one collective on a path that is about to run a dozen.
+   * The caller has computed the geometry it reads. */
   MFTLRemeshMeasureBodies(ens, m->centroid, m->radius, m->weight, &m->r_max, m->lowest_holder);
 
   if (MFTLDomainGetHMin(&ens->domain) <= 0.0) return MFTL_REMESH_PARALLEL_SPANNING;
@@ -238,6 +238,7 @@ MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategy(MFTL_Ensemble *ens, const M
 
   MFTL_RemeshMeasurement m;
   MFTLRemeshMeasurementInit(&m, ens);
+  MFTLEnsembleComputeTriangleGeometry(ens);
   const MFTL_RemeshParallelStrategy strategy = MFTLRemeshChooseStrategyMeasured(ens, params, &m);
   MFTLRemeshMeasurementFree(&m);
   return strategy;
@@ -938,9 +939,14 @@ static void assign_destinations(MFTL_Ensemble *ens, const MFTL_RemeshParameters 
 
 int MFTLRemeshEnsembleDispersed(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats)
 {
+  return MFTLRemeshDispersedPass(ens, params, stats, "MFTLRemeshEnsembleDispersed");
+}
+
+int MFTLRemeshDispersedPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats, const char *agree_as)
+{
   MFTL_ASSERT(ens != MFTL_NULL && params != MFTL_NULL);
 
-  /* The public entry point owes its own measurement. MFTLRemeshEnsemble does not
+  /* This form owes its own measurement. MFTLRemeshEnsemble's AUTO path does not
    * come through here -- it measured once for the strategy choice and hands that
    * measurement straight to the Measured form below. */
   MFTL_RemeshMeasurement m;
@@ -949,6 +955,20 @@ int MFTLRemeshEnsembleDispersed(MFTL_Ensemble *ens, const MFTL_RemeshParameters 
   if (ens->n_bodies_global >= 1)
   {
     MFTLEnsembleComputeTriangleGeometry(ens);
+
+    /* The parameter check at the first collective, after the local work before
+     * it (see MFTLRemeshSpanningPass()). */
+    if (agree_as != MFTL_NULL && MFTLRemeshAgreeParams(&ens->domain, params, agree_as) != MFTL_SUCCESS)
+    {
+      MFTLRemeshMeasurementFree(&m);
+      if (stats)
+      {
+        memset(stats, 0, sizeof(*stats));
+        stats->strategy = MFTL_REMESH_PARALLEL_DISPERSED;
+        stats->n_coarse_groups = 1;
+      }
+      return MFTL_ERROR;
+    }
     MFTLRemeshMeasureBodies(ens, m.centroid, m.radius, m.weight, &m.r_max, m.lowest_holder);
   }
 
@@ -978,27 +998,6 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
   st->n_coarse_groups = 1;  // no bands, so nothing to coarsen; 1 rather than 0 so the field always reads as a group size
 
   if (n == 0) return MFTL_SUCCESS;
-
-  /* A zero or negative length band is a caller error that has no cheap symptom:
-   * every edge is longer than max_edge_length, so the pass refines without bound
-   * until the job is killed. Refusing here turns minutes of silent memory growth
-   * into an immediate diagnosable failure. The realistic cause is deriving the
-   * target with MFTLMeanEdgeLength on a distributed object -- see the warning on
-   * that function. */
-  if (!(params->max_edge_length > 0.0) || !(params->min_edge_length >= 0.0) || params->min_edge_length > params->max_edge_length)
-  {
-    if (dom->rank == 0)
-    {
-      fprintf(stderr, "[MFTL] %s: refusing to remesh with an edge-length band of [%.6g, %.6g]. Use MFTLEnsembleMeanEdgeLength for a distributed mesh.\n",
-              "MFTLRemeshEnsembleDispersed", params->min_edge_length, params->max_edge_length);
-    }
-    return MFTL_ERROR;
-  }
-
-  MFTL_ASSERT(MFTLRemeshParamsAgree(dom, params) &&
-              "MFTLRemeshEnsembleDispersed: the ranks were handed different edge-length bands. Nothing communicates the band, so a rank "
-              "with a shorter one refines everything it owns, every phase, without bound. The usual cause is "
-              "MFTLMeanEdgeLength (LOCAL) on a mesh a collective generator already distributed.");
 
   int status = MFTL_SUCCESS;
 
@@ -1107,7 +1106,7 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
     /* The spanning driver zeroes and refills the stats, so the one field that
      * describes THIS decision has to be carried across by hand. Nothing else
      * should survive: the pass being reported is the one that ran. */
-    const int rc = MFTLRemeshEnsembleParallel(ens, params, st);
+    const int rc = MFTLRemeshSpanningPass(ens, params, st, MFTL_NULL);
     st->n_bodies_not_centred = too_large;
     return rc;
   }

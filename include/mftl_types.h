@@ -157,7 +157,8 @@ typedef struct MFTL_VertexPool
  * connectivity-only loop then streams 12 B per triangle instead of 48 B.
  *
  * `area`, `normal` and `center` are written by MFTLComputeTriangleGeometry() /
- * MFTLEnsembleUpdate(); a redistribution leaves them unspecified.
+ * MFTLEnsembleUpdate(); a redistribution leaves them unspecified
+ * (#MFTL_DERIVED_GEOMETRY).
  */
 typedef struct MFTL_TrianglePool
 {
@@ -220,6 +221,22 @@ typedef struct MFTL_ObjectQualityStatistics
 
 /** @brief `derived` bit: tris.verts and tris.neighbors are current. */
 #define MFTL_DERIVED_TOPOLOGY 0x1u
+
+/**
+ * @brief `derived` bit: `tris.area/normal/center` were computed over EVERY
+ *        triangle, ghosts included, after the last change the library made to
+ *        their inputs.
+ *
+ * Set by MFTLComputeTriangleGeometry() over `tris.n` triangles. Cleared by any
+ * change of the entity set (MFTLObjectSetCounts() clears both bits), by the
+ * remeshing operators, by a redistribution's rebuild and by
+ * MFTLUpdateGhostPositions(); kept by MFTLObjectBuildDerived() and
+ * MFTLObjectReorderMorton(), which move no vertex. Moving owned vertices through `verts.pos` does NOT clear it: the
+ * library cannot see that. So a clear bit means "not current", and a set bit
+ * means "current unless the caller moved vertices since". MFTLRedistribute()
+ * recomputes the geometry of a body whose bit is clear before routing it.
+ */
+#define MFTL_DERIVED_GEOMETRY 0x2u
 
 /**
  * @struct MFTL_Object
