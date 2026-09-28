@@ -1,262 +1,417 @@
-/*
- * MFTL2 remeshing — the serial remesh driver MFTLRemeshEnsemble (split / collapse / flip /
- * smoothing passes, compaction, optional volume-conserving smoothing) and the class-guarded
- * volume recovery of the drivers (plans/16 §4.4.4).
+/**
+ * @file remesh_driver.c
+ * @author Christian Gorges
+ * @date 2026-08-15
+ * @ingroup mftl_remeshing
+ *
+ * @brief The remeshing pass: sweep order, convergence, and what is refreshed
+ *        when.
+ *
+ * ## The order of the sweeps
+ *
+ *   DETECT -> SPLIT -> COLLAPSE -> COMPACT -> FLIP -> DETECT -> SMOOTH
+ *
+ * - SPLIT before COLLAPSE: splitting cannot fail (no link condition, no fold
+ *   test), so the collapse sweep then sees edges that are genuinely short rather
+ *   than short relative to over-long neighbours.
+ * - COMPACT right after COLLAPSE: flip and smoothing never see a dead entity, so
+ *   the smoother can use MFTLComputeVertexNormals() over the whole pool without
+ *   accumulating dead triangles into live normals.
+ * - FLIP before SMOOTH: the valence criterion reads the connectivity the
+ *   previous sweeps produced; smoothing does not change it.
+ * - DETECT twice per iteration: splits and collapses change which edges exist,
+ *   and a vertex the smoother wrongly believes free (e.g. the midpoint of a
+ *   split rim edge) slides off its curve.
+ *
+ * Each sweep bounds its loop by the half-edge count taken BEFORE it: the halves
+ * of a split edge are not re-examined in the same sweep (a long edge would
+ * otherwise burst into many tiny ones), but in the next iteration, after
+ * smoothing.
  */
 
+#include "mftl_remeshing.h"
+
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <mpi.h>
-#include "mftl_arrayfunctions.h"
+
 #include "mftl_constants.h"
-#include "mftl_core.h"
-#include "mftl_communication.h"
-#include "mftl_remeshing.h"
-#include "mftl_images.h"
-#include "mftl_boundary_internal.h"
-#include "mftl_phase_set.h"
-#include "mftl_topology.h"
+#include "mftl_ensemble.h"
 #include "mftl_geometry.h"
 #include "mftl_memory.h"
+#include "mftl_object.h"
+#include "mftl_topology.h"
+#include "remesh_comm.h"
+#include "remesh_internal.h"
 
-/* ------------------------------------------------------------------------------------------
- * Class-guarded volume recovery of the remesh drivers (plans/16 §4.4.4): the body's own
- * volume for a closed compact body, the singleton phase set's volume when that is DEFINED,
- * otherwise no recovery (counted in stat_recovery_skipped).
- * ------------------------------------------------------------------------------------------ */
-void MFTLRemeshRecoveryTarget(MFTL_Object *obj, MFTL_RemeshParameters *params, MFTL_RecoveryTarget *t)
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Sweeps
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Splits every approved edge, once per undirected edge.
+ *
+ * The parallel freeze gate is tested first (two flag tests, against an
+ * approval's fan walk). Refusals are NOT counted as blocked work: a rank sees
+ * ghosts with incomplete one-rings, approves a collapse the owner would reject,
+ * and would report phantom blocked operations (3 on a converged np = 4 sphere).
+ * Convergence is instead certified by `count_hidden_edges` in remesh_parallel.c,
+ * which needs no fan walk.
+ *
+ * @param obj    The mesh.
+ * @param params Supplies `max_edge_length_sq`.
+ * @return Splits performed.
+ */
+
+static int sweep_split(MFTL_Object *obj, const MFTL_RemeshParameters *params)
 {
-  t->kind = 0;
-  t->target = 0.0;
-  MFTLObjectEnsureWinding(obj);  // collective; unknown winding never counts as compact
-  if (MFTLObjectHasVolume(obj))
+  const int n_he = 3 * obj->tris.n;  // snapshot: see the file header
+  int count = 0;
+
+  for (int h = 0; h < n_he; ++h)
   {
-    // closed and compact: the body's own volume (bit-identical to the closed-surface path)
-    t->kind = 1;
-    t->target = MFTLObjectVolume(obj);
-    return;
+    if (freeze_blocks_pair(obj, h)) continue;
+    if (!MFTLSplitApproved(obj, h, params)) continue;
+    if (MFTLSplitEdge(obj, h) != MFTL_ERROR) count++;
   }
-  if (params->skip_volume_recovery) return;
-  // open or wrapping: the singleton phase set decides (never MFTLObjectVolume)
-  MFTL_PhaseSet *S = MFTLPhaseSetCreate(obj->domain);
-  MFTLPhaseSetAddMember(S, obj, 1);
-  double V = 0.0;
-  if (MFTLPhaseSetVolume(S, &V) == MFTL_DEFINED)
-  {
-    t->kind = 2;
-    t->target = V;
-  }
-  else
-    params->stat_recovery_skipped++;
-  MFTLPhaseSetDestroy(&S);
+  return count;
 }
 
-void MFTLRemeshRecover(MFTL_Ensemble *ens, MFTL_Object *obj, const MFTL_RecoveryTarget *t)
+/**
+ * @brief Collapses every approved edge, once per undirected edge.
+ * @param      obj    The mesh.
+ * @param      params Supplies `min_edge_length_sq` and the safety thresholds.
+ * @param[out] stats  May be #MFTL_NULL. The rejection counters are accumulated here.
+ * @return Collapses performed.
+ */
+static int sweep_collapse(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats)
 {
-  if (t->kind == 1)
-    MFTLVolumeRecovery(obj, t->target);
-  else if (t->kind == 2)
+  const int n_he = 3 * obj->tris.n;
+  int count = 0;
+
+  for (int h = 0; h < n_he; ++h)
   {
-    MFTL_PhaseSet *S = MFTLPhaseSetCreate(obj->domain);
-    MFTLPhaseSetAddMember(S, obj, 1);
-    MFTLPhaseSetVolumeRecovery(S, ens, t->target, MFTL_NULL);
-    MFTLPhaseSetDestroy(&S);
+    if (freeze_blocks_collapse(obj, h)) continue;
+
+    int reason = MFTL_REMESH_REJECT_NONE;
+
+    if (MFTLCollapseApproved(obj, h, params, &reason))
+    {
+      if (MFTLCollapseEdge(obj, h) == MFTL_SUCCESS) count++;
+      continue;
+    }
+
+    if (!stats) continue;
+
+    switch (reason)
+    {
+      case MFTL_REMESH_REJECT_LINK: stats->n_collapse_rejected_link++; break;
+      case MFTL_REMESH_REJECT_FOLD: stats->n_collapse_rejected_fold++; break;
+      case MFTL_REMESH_REJECT_FEATURE: stats->n_collapse_rejected_feature++; break;
+      default: break;
+    }
   }
+  return count;
 }
 
-/* Serial remesh driver (rank-local kernel; the collective parts are the recovery target, the
-   convergence decision and the ghost refresh). Per iteration and object: triangle properties,
-   feature detection, normals / curvatures when needed, then splits (descending half-edge
-   index), collapses, flips and tangential smoothing — or MFTL1's sweeps for closed bodies with
-   mftl1_criteria. Stops after `iterations` passes, or (iterations == MFTL_ERROR) when fewer
-   than 10 operations happened, at most 16 passes. Then compaction, the optional
-   volume-conserving smoothing stages and the class-guarded volume recovery. */
-void MFTLRemeshEnsemble(MFTL_Ensemble *ens, MFTL_RemeshParameters *params)
+/**
+ * @brief Flips every edge whose flip strictly lowers the valence deviation.
+ * @param      obj    The mesh.
+ * @param      params Supplies `max_normal_deviation_cos`.
+ * @param[out] stats  May be #MFTL_NULL.
+ * @return Flips performed.
+ */
+static int sweep_flip(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats)
 {
-  int iter = 0;
+  const int n_he = 3 * obj->tris.n;
+  int count = 0;
 
-  bool collapses_occurred[ens->num_objects];
-  // entity counts before the pass (MFTLFinalizeRemeshing)
-  int start_n_vertices[ens->num_objects];
-  int start_n_triangles[ens->num_objects];
-  int start_n_halfedges[ens->num_objects];
-  MFTL_RecoveryTarget start_volume[ens->num_objects];
-
-  for (int i = 0; i < ens->num_objects; i++)
+  for (int h = 0; h < n_he; ++h)
   {
-    MFTL_Object *obj = ens->objects[i];
+    if (freeze_blocks_pair(obj, h)) continue;
 
-    collapses_occurred[i] = MFTL_FALSE;
-    start_n_vertices[i] = obj->n_vertices;
-    start_n_triangles[i] = obj->n_triangles;
-    start_n_halfedges[i] = obj->n_half_edges;
-    // recovery target (collective) with the class guard: the body's own volume only for closed
-    // compact bodies, a set-level target for DEFINED singleton phase sets, else none
-    MFTLRemeshRecoveryTarget(obj, params, &start_volume[i]);
+    int reason = MFTL_REMESH_REJECT_NONE;
+
+    if (MFTLFlipApproved(obj, h, params, &reason))
+    {
+      if (MFTLFlipEdge(obj, h) == MFTL_SUCCESS) count++;
+    }
+    else if (stats && reason == MFTL_REMESH_REJECT_FOLD)
+    {
+      stats->n_flip_rejected_fold++;
+    }
+  }
+  return count;
+}
+
+/**
+ * @brief Clears the per-sweep flags so the next iteration starts from scratch.
+ *
+ * @param obj The mesh. #MFTL_FLAG_VISITED is cleared on every entity, so the
+ *            next sweep starts from a clean slate.
+ */
+static void clear_visited(MFTL_Object *obj)
+{
+  const int n_he = 3 * obj->tris.n;
+  for (int h = 0; h < n_he; ++h) obj->tris.he[h].flags &= ~MFTL_FLAG_VISITED;
+  for (int v = 0; v < obj->verts.n; ++v) obj->verts.rec[v].flags &= ~MFTL_FLAG_VISITED;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Public
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+double MFTLMeanEdgeLength(const MFTL_Object *obj)
+{
+  MFTL_ASSERT(obj != MFTL_NULL);
+
+  const int n_he = 3 * obj->tris.n;
+  if (n_he == 0) return 0.0;
+
+  double sum = 0.0;
+  int count = 0;
+
+  /* Over UNDIRECTED edges. Averaging half-edges gives the same answer on a closed
+   * mesh and a wrong one on an open surface, where a boundary edge has one half
+   * and an interior edge has two -- so the boundary would be weighted half. */
+  for (int h = 0; h < n_he; ++h)
+  {
+    const int tw = obj->tris.he[h].twin_idx;
+    if (tw != MFTL_ERROR && h > tw) continue;
+
+    sum += MFTLGetEdgeLength(obj, h);
+    count++;
   }
 
-  // iterations == MFTL_ERROR: until convergence; otherwise a fixed maximum
-  while (params->iterations == MFTL_ERROR || iter < params->iterations)
+  return (count > 0) ? sum / (double) count : 0.0;
+}
+
+double MFTLEnsembleMeanEdgeLength(MFTL_Ensemble *ens)
+{
+  MFTL_ASSERT(ens != MFTL_NULL);
+
+  double acc[2] = {0.0, 0.0};
+
+  for (int o = 0; o < ens->n_local_objects; ++o)
   {
-    if (!params->quiet) printf("--- Iteration %d ---\n", iter + 1);
+    const MFTL_Object *const obj = ens->local_objects[o];
+    const int n_he = 3 * obj->tris.n;
 
-    int total_split = 0;
-    int total_collapse = 0;
-    int total_swap = 0;
-
-    for (int i = 0; i < ens->num_objects; i++)
+    for (int h = 0; h < n_he; ++h)
     {
-      MFTL_Object *obj = ens->objects[i];
+      const int t = MFTLHeTriIdx(h);
+      if (t >= obj->tris.n_local) continue;  // a ghost's owner counts it
 
-      int obj_split = 0;
-      int obj_collapse = 0;
-      int obj_swap = 0;
-
-      // Refresh geometry for the criteria, fitting and smoothing, and re-detect features EVERY
-      // iteration: the ops change the geometry and feature protection must track it without the
-      // caller pre-setting flags. Detection consumes triangle normals, so it runs after the
-      // property refresh.
-      MFTLComputeTriangleProperties(obj);
-      MFTLDetectFeatures(obj, params->feature_angle_threshold);
-      if (params->vertex_fit != MFTL_FIT_NONE || params->criterion == MFTL_CRITERION_BOTSCH_KOBBELT_CURVATURE ||
-          params->smooth_mode == MFTL_SMOOTH_CURVATURE_BASED)
+      const int tw = obj->tris.he[h].twin_idx;
+      if (tw != MFTL_ERROR)
       {
-        MFTLComputeVertexNormals(obj);
-        if (params->criterion == MFTL_CRITERION_BOTSCH_KOBBELT_CURVATURE || params->smooth_mode == MFTL_SMOOTH_CURVATURE_BASED)
-          MFTLComputeVertexCurvatures(obj);
-      }
+        const int to = MFTLHeTriIdx(tw);
 
-      // the MFTL1-parity path only for closed bodies in the default mode (plans/16 §4.4.4)
-      const int parity = params->mftl1_criteria && !MFTLObjectRemeshGeneralized(obj);
-      if (parity)
-      {
-        // MFTL1's sweeps (MFTL_Refining / MFTL_Coarsening / MFTL_Flipping)
-        MFTL1Sweeps(obj, params, &obj_split, &obj_collapse, &obj_swap);
-        if (obj_collapse > 0) collapses_occurred[i] = MFTL_TRUE;
-      }
-
-      // splits
-      for (int j = obj->n_half_edges - 1; j >= 0 && !params->skip_split && !parity; j--)
-      {
-        if (MFTLSplitApproved(obj, j, params))
+        /* Both mine: the smaller half-edge counts, as in the serial form. Split
+         * across ranks: the smaller triangle global id counts, which is a rule
+         * both sides evaluate to the same answer without asking each other. */
+        if (to < obj->tris.n_local)
         {
-          MFTLSplitEdgeWithFit(obj, j, params);
-          obj_split++;
+          if (h > tw) continue;
+        }
+        else if (obj->tris.rec[t].global_id > obj->tris.rec[to].global_id)
+        {
+          continue;
         }
       }
 
-      // collapses
-      for (int j = 0; j < obj->n_half_edges && !params->skip_collapse && !parity; ++j)
-      {
-        if (CollapseApproved(obj, j, params))
-        {
-          MFTLCollapseEdgeWithFit(obj, j, params);
-          collapses_occurred[i] = MFTL_TRUE;
-          obj_collapse++;
-        }
-      }
-
-      // flips (valence optimisation + quality/dihedral gates); interior, non-feature edges, each
-      // edge once
-      for (int j = 0; j < obj->n_half_edges && !params->skip_flip && !parity; ++j)
-      {
-        MFTL_HalfEdge *he = &obj->half_edges[j];
-
-        if (he->flags & MFTL_FLAG_DEAD) continue;
-        if (he->twin_idx == MFTL_ERROR) continue;
-        if (j > he->twin_idx) continue;
-        if (he->flags & MFTL_FLAG_FEATURE) continue;
-
-        if (FlipApprovedWithParams(obj, j, params))
-        {
-          MFTLFlipEdge(obj, j);
-          obj_swap++;
-        }
-      }
-
-      // tangential smoothing (mode / iterations from params)
-      if (!params->skip_tangential_smoothing) MFTLSmoothTangentialWithParams(obj, params);
-
-      for (int j = 0; j < obj->n_half_edges; ++j)
-      {
-        obj->half_edges[j].flags &= ~MFTL_FLAG_VISITED;
-      }
-
-      for (int j = 0; j < obj->n_vertices; ++j)
-      {
-        obj->vertices[j].flags &= ~MFTL_FLAG_VISITED;
-      }
-
-      params->stat_splits += obj_split;
-      params->stat_collapses += obj_collapse;
-      params->stat_flips += obj_swap;
-      total_split += obj_split;
-      total_collapse += obj_collapse;
-      total_swap += obj_swap;
+      acc[0] += MFTLGetEdgeLength(obj, h);
+      acc[1] += 1.0;
     }
-
-    if (!params->quiet) printf("Operations -> Split: %d | Collapsed: %d | Swapped: %d\n", total_split, total_collapse, total_swap);
-
-    // Convergence. On a single rank (or a ghost-complete mesh) the local op count is the
-    // whole story. When the serial kernel runs on a distributed ensemble
-    // (MFTLRemeshEnsembleDispersedCentering gathers to rank 0; other ranks
-    // hold empty objects), the decision must be collective — otherwise the
-    // empty ranks would exit the loop early and desynchronize the
-    // collectives in the smoothing / recovery stages below.
-    int converged = !params->fixed_iterations && (total_split + total_collapse + total_swap) < 10;
-    if (ens->domain.nproc > 1)
-    {
-      int converged_g = 0;
-      MPI_Allreduce(&converged, &converged_g, 1, MPI_INT, MPI_MIN, ens->domain.comm_cart);
-      converged = converged_g;
-    }
-    if (converged)
-    {
-      if (!params->quiet) printf("Remeshing converged successfully after %d iterations.\n", iter + 1);
-      break;
-    }
-
-    // run-to-convergence mode stops after 16 passes
-    if (iter >= 15 && params->iterations == MFTL_ERROR)
-    {
-      if (!params->quiet) printf("Warning: Remeshing reached failsafe limit (15 iterations). Exiting to prevent hang.\n");
-      break;
-    }
-
-    iter++;
   }
 
-  // compaction
-  for (int i = 0; i < ens->num_objects; i++)
+  MFTLRemeshAgreeDouble(&ens->domain, acc, 2);
+  return (acc[1] > 0.0) ? acc[0] / acc[1] : 0.0;
+}
+
+int MFTLRemeshIterate(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *st, int iterations)
+{
+  int total_ops = 0;
+
+  if (obj->tris.n == 0) return 0;
+
+  /* Every operator reads and writes the half-edge records; the derived arrays are
+   * rebuilt by the compaction that follows the collapse sweep. Building them here
+   * makes the object valid for the very first MFTLDetectFeatures. */
+  if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
+
+  for (int iter = 0; iter < iterations; ++iter)
   {
-    MFTL_Object *obj = ens->objects[i];
-    MFTLFinalizeRemeshing(obj, start_n_vertices[i], start_n_triangles[i], start_n_halfedges[i], collapses_occurred[i]);
+    st->iterations = iter + 1;
+
+    MFTLDetectFeatures(obj, params->feature_angle_threshold, params->feature_corner_angle, st);
+
+    const int n_split = sweep_split(obj, params);
+    const int n_collapse = sweep_collapse(obj, params, st);
+
+    /* Unconditional, not "if anything died": the split sweep left the derived
+     * arrays invalid too, and MFTLRemeshCompactObject rebuilds them on the way
+     * out whether or not it moved anything. */
+    MFTLRemeshCompactObject(obj, st);
+
+    const int n_flip = sweep_flip(obj, params, st);
+    if (n_flip > 0) MFTLObjectBuildDerived(obj);
+
+    clear_visited(obj);
+
+    /* Detected AGAIN, against the mesh that is about to be smoothed rather than
+     * the one the sweeps started from. The three sweeps in between create
+     * vertices that the first classification never saw: a split of a rim edge
+     * produces a midpoint that IS on the rim, and a vertex the smoother believes
+     * to be free gets the 2D tangent-plane treatment and slides straight off it.
+     * The surface then grows a serrated notch, which is invisible to every
+     * structural check -- the result is a perfectly valid manifold with a
+     * perfectly valid boundary, just not the boundary it started with.
+     *
+     * The cost is one geometry pass and two linear passes per iteration. Handing
+     * the classification forward from the first call instead would mean every
+     * operator maintaining it incrementally, which is the arrangement that leaves
+     * a smoother three sweeps out of date. */
+    MFTLDetectFeatures(obj, params->feature_angle_threshold, params->feature_corner_angle, st);
+
+    MFTLSmoothTangential(obj, params, params->smooth_iterations);
+
+    st->n_split += n_split;
+    st->n_collapse += n_collapse;
+    st->n_flip += n_flip;
+    total_ops += n_split + n_collapse + n_flip;
+
+    if (n_split + n_collapse + n_flip <= params->min_convergence_ops) break;
   }
 
-  // Volume-conserving post-remesh stages on the finalised mesh. The serial edge-local smoothers
-  // need every processed fan stored (a rank-local mesh); on a distributed mesh they fail loudly
-  // (the parallel driver uses the *Parallel variants).
-  for (int i = 0; i < ens->num_objects; i++)
+  return total_ops;
+}
+
+int MFTLRemeshObject(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats)
+{
+  MFTL_ASSERT(obj != MFTL_NULL && params != MFTL_NULL);
+  MFTL_ASSERT(obj->tris.n_local == obj->tris.n && obj->verts.n_local == obj->verts.n &&
+              "MFTLRemeshObject: object holds ghosts. Collapsing an edge whose far endpoint is owned elsewhere "
+              "needs agreement, so a 'serial' remesh of a partitioned object silently diverges between ranks. "
+              "The distributed entry point is MFTLRemeshEnsemble.");
+
+  /* The stats describe THIS call, so they are zeroed here rather than left to the
+   * caller. Accumulating into whatever the caller's struct happened to hold would
+   * make a second pass over the same mesh report the sum of both. */
+  MFTL_RemeshStats local;
+  MFTL_RemeshStats *const st = stats ? stats : &local;
+  memset(st, 0, sizeof(*st));
+
+  if (obj->tris.n == 0) return MFTL_SUCCESS;
+
+  MFTLRemeshIterate(obj, params, st, params->iterations);
+
+  if (params->renumber_global_ids) MFTLRemeshRenumberGlobalIds(obj);
+
+  /* Postcondition: the caller gets an object it can stream immediately. The
+   * derived topology is already current -- compaction and the flip sweep rebuild
+   * it, and neither smoothing nor the id renumbering changes connectivity -- so
+   * only `tris.area/normal/center` are left to fill; the operators leave them
+   * stale by design because none of them read them. */
+  if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
+  MFTLComputeTriangleGeometry(obj, obj->tris.n);
+
+  return MFTL_SUCCESS;
+}
+
+int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats)
+{
+  MFTL_ASSERT(ens != MFTL_NULL && params != MFTL_NULL);
+
+  /* One rank stays on the path below, and not merely as an optimisation: the
+   * phase schedule migrates, renumbers ids collectively and rebuilds the halo,
+   * all of which are identities at nproc == 1 but none of which are bit-level
+   * identities -- a redistribution permutes the pools. Keeping the serial answer
+   * reproducible is worth the branch. */
+  if (ens->domain.nproc > 1)
   {
-    MFTL_Object *obj = ens->objects[i];
-    MFTLComputeTriangleProperties(obj);
+    /* The parameters are agreed ONCE per call, at the first collective of
+     * whichever path runs (MFTLRemeshAgreeParams()). Every path's first
+     * collective is that check, so two ranks that read different strategies
+     * still meet in it and both refuse. */
+    /* AUTO resolves COLLECTIVELY -- MFTLRemeshChooseStrategy measures the bodies
+     * with two Allreduces and every rank therefore reads the same ratio. That is
+     * the load-bearing property of this branch, not the choice itself: two ranks
+     * entering different drivers is an immediate deadlock, and nothing further
+     * down would report it. */
+    MFTL_RemeshParallelStrategy strategy = params->parallel_strategy;
 
-    if (params->volume_conserving_smoothing == MFTL_VCSMOOTH_KUPRAT)
-      MFTLVolumeConservingSmoothing(obj, params);
-    else if (params->volume_conserving_smoothing == MFTL_VCSMOOTH_TSUR)
-      MFTLTSUR3D(obj, params);
+    if (strategy != MFTL_REMESH_PARALLEL_AUTO)
+    {
+      if (strategy == MFTL_REMESH_PARALLEL_DISPERSED) return MFTLRemeshDispersedPass(ens, params, stats, "MFTLRemeshEnsemble");
+      return MFTLRemeshSpanningPass(ens, params, stats, "MFTLRemeshEnsemble");
+    }
 
-    if (params->roughness_smoothing) MFTLRoughnessSmoothing(obj, params);
+    /* AUTO measures the bodies to decide, and the dispersed driver needs exactly
+     * the same measurement to route them -- so it is taken ONCE here and handed
+     * on. Doing it the obvious way (choose, then call the public driver) makes
+     * the pass pay four per-body reductions where two do, and the first caller
+     * then discards the centroids the second one recomputes.
+     *
+     * GLOBAL body count for the guard: everything below is collective. The
+     * measurement itself is indexed by LOCAL SLOT -- see MFTL_RemeshMeasurement. */
+    if (ens->n_bodies_global < 1) return MFTLRemeshSpanningPass(ens, params, stats, MFTL_NULL);
+
+    MFTL_RemeshMeasurement measure;
+    MFTLRemeshMeasurementInit(&measure, ens);
+
+    MFTLEnsembleComputeTriangleGeometry(ens);
+    if (MFTLRemeshAgreeParams(&ens->domain, params, "MFTLRemeshEnsemble") != MFTL_SUCCESS)
+    {
+      MFTLRemeshMeasurementFree(&measure);
+      if (stats) memset(stats, 0, sizeof(*stats));
+      return MFTL_ERROR;
+    }
+    strategy = MFTLRemeshChooseStrategyMeasured(ens, params, &measure);
+
+    const int rc = (strategy == MFTL_REMESH_PARALLEL_DISPERSED) ? MFTLRemeshEnsembleDispersedMeasured(ens, params, stats, &measure)
+                                                                : MFTLRemeshSpanningPass(ens, params, stats, MFTL_NULL);
+    MFTLRemeshMeasurementFree(&measure);
+    return rc;
   }
 
-  // ALWAYS finish a remesh cycle with global volume recovery against the
-  // pre-remesh volume: per-edge local conservation is first-order only and
-  // drift accumulates across the split/collapse/flip/smooth pipeline.
-  for (int i = 0; i < ens->num_objects; i++)
+  /* One rank: the band test alone, no MPI. */
+  if (ens->n_bodies_global > 0 && MFTLRemeshAgreeParams(&ens->domain, params, "MFTLRemeshEnsemble") != MFTL_SUCCESS)
   {
-    MFTL_Object *obj = ens->objects[i];
-    if (!params->skip_volume_recovery) MFTLRemeshRecover(ens, obj, &start_volume[i]);
-    MFTLComputeTriangleProperties(obj);
+    if (stats) memset(stats, 0, sizeof(*stats));
+    return MFTL_ERROR;
   }
-  MFTLUpdateGhostPositions(ens, NULL);
+
+  if (stats)
+  {
+    memset(stats, 0, sizeof(*stats));
+
+    /* A serial pass IS converged, by the only definition the field has: the mesh
+     * is as converged as the serial remesher would have made it, because it is
+     * what the serial remesher made. Leaving the flag false because "no phase
+     * driver ran" would make every nproc == 1 run report a convergence failure,
+     * which is what a solver logs and acts on. */
+    stats->converged = MFTL_TRUE;
+    stats->n_phases = 1;
+    stats->strategy = MFTL_REMESH_PARALLEL_SPANNING;
+    stats->n_coarse_groups = 1;
+    stats->n_distinct_placements = 1;  // one rank, one placement, and it is the canonical one
+  }
+
+  int status = MFTL_SUCCESS;
+
+  for (int i = 0; i < ens->n_local_objects; ++i)
+  {
+    MFTL_RemeshStats one;
+    memset(&one, 0, sizeof(one));
+
+    if (MFTLRemeshObject(ens->local_objects[i], params, &one) != MFTL_SUCCESS) status = MFTL_ERROR;
+
+    if (!stats) continue;
+
+    remesh_stats_accumulate(stats, &one);
+  }
+
+  MFTLEnsembleUpdateGlobalCounts(ens);
+  return status;
 }

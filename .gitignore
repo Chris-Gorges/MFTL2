@@ -28,11 +28,12 @@ lib/
 info
 poltergeist.config.json
 run_mpi.sh
-build*/
+.claude/
+/results/
+/scaling/
+/Testing/
+*vtk
 
-# manual build products (make -C doc)
-doc/*.aux
-doc/*.log
-doc/*.toc
-doc/*.out
-doc/MFTL2.pdf
+# The documentation toolchain lives in the separate MFTL_Documentation
+# repository and cannot appear here; only __pycache__ from the helper scripts.
+__pycache__/

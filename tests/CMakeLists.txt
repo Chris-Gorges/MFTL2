@@ -1,346 +1,378 @@
+# --- MFTL unit tests -----------------------------------------------------
+#
+# Two flavours:
+#   mftl_add_test        pure C, no MPI runtime needed
+#   mftl_add_mpi_test    needs MPI_Init, launched through mpirun with N ranks
+#
+# Every test binary returns non-zero when any assertion fails (see test_utils.h),
+# which is what CTest keys off.
 
-# Link the main library
-# We invoke the executable creation
+function(mftl_add_test name)
+  add_executable(${name} ${name}.c)
+  target_link_libraries(${name} PRIVATE MFTL m)
+  target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME ${name} COMMAND ${name})
+endfunction()
 
-# Serial Tests
-add_executable(unit_tests_serial test_serial.c)
-target_link_libraries(unit_tests_serial PRIVATE MFTL m)
-target_include_directories(unit_tests_serial PRIVATE ${CMAKE_SOURCE_DIR}/include)
+function(mftl_add_mpi_test name nranks)
+  add_executable(${name} ${name}.c)
+  target_link_libraries(${name} PRIVATE MFTL MPI::MPI_C m)
+  target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME ${name}
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${nranks}
+                   ${MPIEXEC_PREFLAGS} $<TARGET_FILE:${name}> ${MPIEXEC_POSTFLAGS})
+endfunction()
 
-add_test(NAME SerialMathTopology COMMAND unit_tests_serial)
+# Registers an ALREADY-DEFINED test target under a second name and rank count.
+# The rank count changes both the neighbour structure and which code path is
+# reachable, so the same binary at a different P is genuinely different coverage
+# -- and re-using the target avoids compiling the same source twice.
+function(mftl_add_mpi_test_at name target nranks)
+  add_test(NAME ${name}
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${nranks}
+                   ${MPIEXEC_PREFLAGS} $<TARGET_FILE:${target}> ${MPIEXEC_POSTFLAGS})
+endfunction()
 
-# MPI Tests
-add_executable(unit_tests_mpi test_mpi.c)
-target_link_libraries(unit_tests_mpi PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(unit_tests_mpi PRIVATE ${CMAKE_SOURCE_DIR}/include)
+# As above, but for rank counts that exceed the cores of a development machine.
+#
+# A 3x3x3 grid is the smallest one with an INTERIOR rank -- 26 neighbours that
+# are 26 distinct ranks -- and that property is worth having in CI even though
+# 27 processes on a laptop are heavily oversubscribed and slow. Open MPI refuses
+# to start more processes than slots without being told; MPICH and Intel MPI
+# oversubscribe silently and reject the flag, so it is only passed when the
+# launcher is recognised as Open MPI.
+function(mftl_add_mpi_test_oversub name target nranks)
+  set(_extra "")
+  execute_process(COMMAND ${MPIEXEC_EXECUTABLE} --version
+                  OUTPUT_VARIABLE _mpi_ver ERROR_VARIABLE _mpi_ver
+                  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_STRIP_TRAILING_WHITESPACE)
+  if(_mpi_ver MATCHES "Open MPI" OR _mpi_ver MATCHES "OpenRTE")
+    set(_extra "--oversubscribe")
+  endif()
+  add_test(NAME ${name}
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${nranks} ${_extra}
+                   ${MPIEXEC_PREFLAGS} $<TARGET_FILE:${target}> ${MPIEXEC_POSTFLAGS})
+endfunction()
 
-# Register MPI Test with 2 Ranks
-add_test(NAME MPIGhostSync COMMAND mpirun -np 2 $<TARGET_FILE:unit_tests_mpi>)
+# --- Layer 0: standalone utilities (no MPI) ---
+mftl_add_test(test_vectorops)
+mftl_add_test(test_memory)
+mftl_add_test(test_arrayfunctions)
 
-# --- Phase 1: Internals Test ---
-add_executable(test_internals test_internals.c)
-target_link_libraries(test_internals PRIVATE MFTL m)
-target_include_directories(test_internals PRIVATE ${CMAKE_SOURCE_DIR}/include)
-add_test(NAME UnitInternals COMMAND test_internals)
+# --- Layer 1-3: everything that needs a domain, hence MPI ---
+mftl_add_mpi_test(test_object 1)
+mftl_add_mpi_test(test_ensemble 1)
+mftl_add_mpi_test(test_geometry 1)
+mftl_add_mpi_test(test_topology 1)
+mftl_add_mpi_test(test_derived 1)
+mftl_add_mpi_test(test_meshgen 1)
+mftl_add_mpi_test(test_vertex_normals 1)
 
-# --- Phase 2: Sphere Generation Test (Serial) ---
-add_executable(test_sphere_gen test_sphere_gen.c)
-target_link_libraries(test_sphere_gen PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_sphere_gen PRIVATE ${CMAKE_SOURCE_DIR}/include)
-add_test(NAME UnitSphereGen COMMAND test_sphere_gen)
+# Marching cubes: the generated 256-case table, exhaustively (crack freedom over
+# every pair of cells that can share a face), and the extraction against
+# analytic shapes and adversarial random / checkerboard fields. Serial by
+# construction -- the lattice identity it tests is what the distributed
+# topology change relies on, and that is tested there.
+mftl_add_mpi_test(test_marching_cubes 1)
 
-# --- Phase 3: MPI Stress Test ---
-add_executable(test_mpi_stress test_mpi_stress.c)
-target_link_libraries(test_mpi_stress PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_mpi_stress PRIVATE ${CMAKE_SOURCE_DIR}/include)
+# The signed distance rasteriser, whose SIGN is checked against the generalised
+# winding number -- a reference that shares nothing with the closest-point and
+# pseudo-normal machinery -- on shapes built to break it.
+mftl_add_mpi_test(test_signed_distance 1)
 
-# Run with 8 ranks for stress testing (or 4 if 8 is too heavy for local CI)
-add_test(NAME MPIStressTest COMMAND mpirun -np 8 $<TARGET_FILE:test_mpi_stress>)
+# The BVH's serial half: predicates, build, refit, traversal, and both halves of
+# the periodic problem. Everything here is local by construction -- the module's
+# only collective is the spatial ghost exchange, which test_bvh_parallel covers.
+mftl_add_mpi_test(test_bvh 1)
 
-# --- Phase 4: Ghost Layer Integration Test ---
-add_executable(test_ghost_layers test_ghost_layers.c)
-target_link_libraries(test_ghost_layers PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_ghost_layers PRIVATE ${CMAKE_SOURCE_DIR}/include)
+# The BVH's only collective is the spatial ghost exchange, and it is registered
+# at three counts because each exercises a different part of it:
+#
+#   2   a thin 2x1x1 grid, so the contact region lies on the single cut and both
+#       bodies are split by it -- the case where every contact is cross-rank
+#   4   2x2x1: the first grid with a diagonal neighbour, so a triangle can be
+#       wanted by a rank that is not a face neighbour
+#   8   2x2x2: every one of the 26 offsets is populated, and ranks legitimately
+#       hold nothing of either body while still having to enter every collective
+mftl_add_mpi_test(test_bvh_parallel 2)
+mftl_add_mpi_test_at(test_bvh_parallel_np4 test_bvh_parallel 4)
+mftl_add_mpi_test_at(test_bvh_parallel_np8 test_bvh_parallel 8)
 
-# Requires exactly 4 ranks
-add_test(NAME MPIGhostLayers COMMAND mpirun -np 4 $<TARGET_FILE:test_ghost_layers>)
+# Where the LBVH meets the spatial halo. The table of placements inside is
+# resolved against the ACTUAL process grid, so each rank count is a different
+# geometry rather than the same test run wider:
+#
+#   1    no decomposition -- the reference path itself, and the guarantee that
+#        every collective is still entered when there is nothing to exchange
+#   2    2x1x1: every rank boundary is a FACE
+#   4    2x2x1: the first grid with an EDGE, where four ranks meet on a line
+#   8    2x2x2: the first grid with a CORNER, where eight meet at a point and a
+#        triangle near it is wanted by seven neighbours at once
+#   27   3x3x3: the first grid with an INTERIOR rank, whose 26 neighbours are 26
+#        DISTINCT ranks. Below this, periodic aliasing collapses several of the
+#        26 stencil offsets onto the same rank and the de-duplication is doing
+#        half the work by accident.
+mftl_add_mpi_test(test_bvh_ghosting 1)
+mftl_add_mpi_test_at(test_bvh_ghosting_np2 test_bvh_ghosting 2)
+mftl_add_mpi_test_at(test_bvh_ghosting_np4 test_bvh_ghosting 4)
+mftl_add_mpi_test_at(test_bvh_ghosting_np8 test_bvh_ghosting 8)
+mftl_add_mpi_test_oversub(test_bvh_ghosting_np27 test_bvh_ghosting 27)
 
-# --- Phase 5: Remeshing Unit Tests ---
-add_executable(test_remeshing test_remeshing.c)
-target_link_libraries(test_remeshing PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_remeshing PRIVATE ${CMAKE_SOURCE_DIR}/include)
-add_test(NAME UnitRemeshing COMMAND mpirun -np 1 $<TARGET_FILE:test_remeshing>)
+# SELF-proximity (params.self_pairs), the query a topology change is detected
+# by, tested as a multiset against an exhaustive sweep taken before
+# partitioning. Same rank counts and the same reasons as test_bvh_ghosting; the
+# fixtures sit where the cut planes meet and the cross-rank pairs are counted.
+mftl_add_mpi_test(test_bvh_self 1)
+mftl_add_mpi_test_at(test_bvh_self_np2 test_bvh_self 2)
+mftl_add_mpi_test_at(test_bvh_self_np4 test_bvh_self 4)
+mftl_add_mpi_test_at(test_bvh_self_np8 test_bvh_self 8)
+mftl_add_mpi_test_oversub(test_bvh_self_np27 test_bvh_self 27)
 
-# --- Phase 6: Intersection Test ---
-add_executable(unit_tests_intersection test_intersection.c)
-target_link_libraries(unit_tests_intersection PRIVATE MFTL m)
-target_include_directories(unit_tests_intersection PRIVATE ${CMAKE_SOURCE_DIR}/include)
-add_test(NAME UnitIntersection COMMAND unit_tests_intersection)
+# Topology changes. Every scenario is checked for what the result must BE and,
+# at np > 1, against a genuine np = 1 run of the same scenario on MPI_COMM_SELF
+# inside the same test: same bodies, same ids, same vertex positions. The rank
+# counts are the usual ones -- a face (2), an edge (4), a corner (8), an
+# interior rank (27) -- and every fixture sits where the cut planes meet.
+mftl_add_mpi_test(test_topology_change 1)
+mftl_add_mpi_test_at(test_topology_change_np2 test_topology_change 2)
+mftl_add_mpi_test_at(test_topology_change_np4 test_topology_change 4)
+mftl_add_mpi_test_at(test_topology_change_np8 test_topology_change 8)
+mftl_add_mpi_test_oversub(test_topology_change_np27 test_topology_change 27)
 
-# --- LeakSanitizer suppressions for MPI-linked tests ---
-# MPICH internals leak small bookkeeping allocations (see tests/lsan.supp);
-# MFTL's own allocations must remain leak-clean.
-set(MFTL_LSAN_ENV "LSAN_OPTIONS=suppressions=${CMAKE_CURRENT_SOURCE_DIR}/lsan.supp:print_suppressions=0")
-set_tests_properties(MPIGhostSync MPIStressTest MPIGhostLayers UnitRemeshing UnitSphereGen PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+# The remeshing OPERATORS are serial by construction -- MFTLRemeshObject asserts
+# the object holds no ghosts -- so one rank is not a reduced case here, it is the
+# whole domain of that file.
+mftl_add_mpi_test(test_remeshing 1)
 
-# --- Phase 7: Object Integrals (Stage 02) ---
-add_executable(test_object_integrals test_object_integrals.c)
-target_link_libraries(test_object_integrals PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_object_integrals PRIVATE ${CMAKE_SOURCE_DIR}/include)
+# The remeshing DRIVER is not. The shift/freeze schedule is registered at four
+# counts and each covers something the others cannot:
+#
+#   1   the phase driver with an EMPTY frozen set. Isolates driver bugs
+#       (migration, id renumbering, the closing sequence) from freeze bugs: a
+#       failure here cannot be about the partition.
+#   2   2x1x1. One interior plane per axis at most, and under periodicity the
+#       two cut planes of the x axis are the same pair of ranks seen twice --
+#       the case where a shift by h/2 maps a rank's band onto its own interior.
+#   4   2x2x1: the first grid where an entity can be near the planes of TWO axes
+#       at once, which is the TUBE conflict the even-parity phases exist for.
+#   8   2x2x2: CORNER conflicts, i.e. entities near all three axes' planes, which
+#       only the odd-parity phases resolve.
+mftl_add_mpi_test(test_remeshing_parallel 1)
+mftl_add_mpi_test_at(test_remeshing_parallel_np2 test_remeshing_parallel 2)
+mftl_add_mpi_test_at(test_remeshing_parallel_np4 test_remeshing_parallel 4)
+mftl_add_mpi_test_at(test_remeshing_parallel_np8 test_remeshing_parallel 8)
+#
+#   27  3x3x3. Two things only this grid can see, and they are different
+#       questions. First, at cuts[k] == 2 a periodic axis has the SAME rank on
+#       both sides of a cell, so the shifted ownership rule can confuse "one cell
+#       left" with "one cell right" and no test at np <= 8 notices; three is the
+#       smallest count where those are different ranks. Second, h falls to L/3,
+#       so the h > 4*delta precondition stops being comfortable and the band
+#       measurement is exercised against a real margin rather than a generous one.
+mftl_add_mpi_test_oversub(test_remeshing_parallel_np27 test_remeshing_parallel 27)
 
-# Rank-independence: the same binary is registered at 1/2/4/8 ranks
-# (each run also asserts pre/post-redistribution equality internally).
-foreach(NP 1 2 4 8)
-    add_test(NAME ObjectIntegrals-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_object_integrals>)
-endforeach()
-set_tests_properties(ObjectIntegrals-np1 ObjectIntegrals-np2 ObjectIntegrals-np4 ObjectIntegrals-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+# The OTHER distributed strategy: move the bodies instead of the planes. Same
+# rank counts, and for the same reasons -- the fixture puts one droplet on every
+# cut plane, so np = 2, 4 and 8 each split a different number of bodies. The
+# np = 1 run is not redundant: it is where the dispersed driver's fallback must
+# NOT fire, because one rank holds everything and every body is trivially local.
+mftl_add_mpi_test(test_remeshing_dispersed 1)
+mftl_add_mpi_test_at(test_remeshing_dispersed_np2 test_remeshing_dispersed 2)
+mftl_add_mpi_test_at(test_remeshing_dispersed_np4 test_remeshing_dispersed 4)
+mftl_add_mpi_test_at(test_remeshing_dispersed_np8 test_remeshing_dispersed 8)
 
-# --- Stage 03: Rigid-body transforms ---
-add_executable(test_transforms test_transforms.c)
-target_link_libraries(test_transforms PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_transforms PRIVATE ${CMAKE_SOURCE_DIR}/include)
-foreach(NP 1 2 4 8)
-    add_test(NAME Transforms-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_transforms>)
-endforeach()
-set_tests_properties(Transforms-np1 Transforms-np2 Transforms-np4 Transforms-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+# --- The remeshing module's MPI must stay in one file ----------------------
+#
+# A source-level test, because it is a source-level property and no runtime
+# check can see it: every MPI call the remesher makes lives in remesh_comm.c,
+# and the operators, the smoother, the compaction and both drivers contain none.
+#
+# That is what makes "the serial path is unaffected by the parallel work"
+# checkable rather than merely intended, and it is exactly the property that was
+# lost the first time round -- when the shift reached redistribution by growing
+# MFTLGetOwnerProc and the id exchange by growing the per-timestep ghost sync.
+# Both are cheap to reintroduce by accident and neither would fail a test.
+add_test(NAME test_remeshing_mpi_is_confined
+         COMMAND ${CMAKE_COMMAND}
+                 -DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../src/remeshing
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/check_mpi_confinement.cmake)
 
-# --- Stage 04: Object generators ---
-add_executable(test_generators test_generators.c)
-target_link_libraries(test_generators PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_generators PRIVATE ${CMAKE_SOURCE_DIR}/include)
-foreach(NP 1 2 4 8)
-    add_test(NAME Generators-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_generators>)
-endforeach()
-set_tests_properties(Generators-np1 Generators-np2 Generators-np4 Generators-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+# The same rule for topology changes: rasterisation, marching cubes, labelling
+# and the id decision are local computation, and every exchange they need goes
+# through topo_comm.c -- which is what lets the reconstruction be argued
+# partition-independent one file at a time.
+add_test(NAME test_topology_change_mpi_is_confined
+         COMMAND ${CMAKE_COMMAND}
+                 -DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../src/topology_change
+                 -DALLOWED=topo_comm.c
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/check_mpi_confinement.cmake)
 
-# --- Stage 05: Mesh I/O (GTS reader/writer + PVTU) ---
-# Fixture location of the MFTL1 tree (GTS test meshes); override with
-# -DMFTL1_ROOT=/path/to/mftl if checked out elsewhere.
-set(MFTL1_ROOT "/home/berend/git/Code/mftl" CACHE PATH "Root of the MFTL1 source tree (GTS fixtures)")
-add_executable(test_io test_io.c)
-target_link_libraries(test_io PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_io PRIVATE ${CMAKE_SOURCE_DIR}/include)
-target_compile_definitions(test_io PRIVATE MFTL_GTS_DIR="${MFTL1_ROOT}")
-foreach(NP 1 2 4 8)
-    add_test(NAME MeshIO-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_io>)
-endforeach()
-set_tests_properties(MeshIO-np1 MeshIO-np2 MeshIO-np4 MeshIO-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+# --- Genuine multi-rank coverage ------------------------------------------
+#
+# At nproc == 1 the collectives are called correctly but most cross-rank
+# behaviour (real neighbour discovery, periodic de-duplication on a thin
+# decomposition, SUM-reducing non-zero values from more than one rank, and mesh
+# generation's rank-0-only semantics) is either degenerate or entirely
+# unexercised. These targets exist specifically to cover that.
+mftl_add_mpi_test(test_ensemble_parallel 8)
+mftl_add_mpi_test(test_meshgen_parallel 2)
 
-# --- Stage 06: Normals, curvatures, roughness ---
-add_executable(test_curvature test_curvature.c)
-target_link_libraries(test_curvature PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_curvature PRIVATE ${CMAKE_SOURCE_DIR}/include)
-foreach(NP 1 2 4 8)
-    add_test(NAME Curvature-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_curvature>)
-endforeach()
-set_tests_properties(Curvature-np1 Curvature-np2 Curvature-np4 Curvature-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+# The generation contract at a third process count: a thin 4x1x1 decomposition
+# is where periodic wrap-around maps several of the 26 neighbour offsets onto the
+# same rank, which is the case the de-duplication in domain_init_comm exists for.
+mftl_add_mpi_test_at(test_meshgen_parallel_np4 test_meshgen_parallel 4)
 
-# --- Stage 07: Point queries (point-in-object, point-triangle distance, AABB) ---
-add_executable(test_point_query test_point_query.c)
-target_link_libraries(test_point_query PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_point_query PRIVATE ${CMAKE_SOURCE_DIR}/include)
-foreach(NP 1 2 4 8)
-    add_test(NAME PointQuery-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_point_query>)
-endforeach()
-set_tests_properties(PointQuery-np1 PointQuery-np2 PointQuery-np4 PointQuery-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+# The per-body reduction: two routes to one answer, plus a third written in the
+# test to check both against. The rank counts are chosen by what each REACHES,
+# and the reasons are in the file banner -- 2 and 4 are the grids whose
+# comm_graph carries a self-loop, 8 is the first with a corner, and 27 is the
+# first with an interior rank whose 26 neighbours are 26 distinct ranks.
+mftl_add_mpi_test(test_body_reduce 1)
+mftl_add_mpi_test_at(test_body_reduce_np2 test_body_reduce 2)
+mftl_add_mpi_test_at(test_body_reduce_np4 test_body_reduce 4)
+mftl_add_mpi_test_at(test_body_reduce_np8 test_body_reduce 8)
+mftl_add_mpi_test_oversub(test_body_reduce_np27 test_body_reduce 27)
 
-# --- Stage 08: Serial remeshing A (np1 serial operators) ---
-add_executable(test_remesh_quality test_remesh_quality.c)
-target_link_libraries(test_remesh_quality PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_remesh_quality PRIVATE ${CMAKE_SOURCE_DIR}/include)
-add_test(NAME RemeshQuality-np1 COMMAND mpirun -np 1 $<TARGET_FILE:test_remesh_quality>)
-set_tests_properties(RemeshQuality-np1 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+# Redistribution is the one module whose behaviour is a FUNCTION of the process
+# grid, so it is registered at four counts and each is genuinely different:
+#
+#   1   the no-op path (and the guarantee that it really is a no-op)
+#   2   a thin 2x1x1 grid: periodic wrap maps several of the 26 neighbour offsets
+#       onto the same rank, so the neighbour list is shorter than the stencil
+#   4   2x2x1: the first grid with a real diagonal neighbour
+#   8   2x2x2: every one of the 26 offsets is populated (every cell is still a
+#       26-neighbour of every other, so the scatter stays on the graph route;
+#       the global route needs a cell two or more cells away, e.g. 3x3x3)
+mftl_add_mpi_test(test_redistribution 1)
+mftl_add_mpi_test_at(test_redistribution_np2 test_redistribution 2)
+mftl_add_mpi_test_at(test_redistribution_np4 test_redistribution 4)
+mftl_add_mpi_test_at(test_redistribution_np8 test_redistribution 8)
 
-# --- Stage 09: Volume-conserving smoothing ---
-add_executable(test_volume_smoothing test_volume_smoothing.c)
-target_link_libraries(test_volume_smoothing PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_volume_smoothing PRIVATE ${CMAKE_SOURCE_DIR}/include)
-foreach(NP 1 2 4 8)
-    add_test(NAME VolSmooth-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_volume_smoothing>)
-endforeach()
-set_tests_properties(VolSmooth-np1 VolSmooth-np2 VolSmooth-np4 VolSmooth-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+# I/O is registered at three counts, and each covers something different:
+#
+#   1   the piece IS the whole mesh, so the file totals must match the mesh
+#       exactly -- there is no seam duplication to explain a discrepancy away
+#   2   two pieces to concatenate, and a shared file whose exclusive scan is
+#       non-trivial on exactly one rank
+#   4   2x2x1: bodies split across diagonal neighbours, and ranks that
+#       legitimately hold nothing and must still enter every collective write
+mftl_add_mpi_test(test_io 1)
+mftl_add_mpi_test_at(test_io_np2 test_io 2)
+mftl_add_mpi_test_at(test_io_np4 test_io 4)
+# The three share fixed output file prefixes, so under `ctest -j` they would
+# write and delete each other's files.
+set_tests_properties(test_io test_io_np2 test_io_np4 PROPERTIES RESOURCE_LOCK mftl_test_io_files)
 
-# --- Stage 10: Parallel remeshing + load balancing (x-only decomposition) ---
-add_executable(test_remesh_parallel test_remesh_parallel.c)
-target_link_libraries(test_remesh_parallel PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_remesh_parallel PRIVATE ${CMAKE_SOURCE_DIR}/include)
-foreach(NP 1 2 4 8)
-    add_test(NAME RemeshParallel-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_remesh_parallel>)
-endforeach()
-set_tests_properties(RemeshParallel-np1 RemeshParallel-np2 RemeshParallel-np4 RemeshParallel-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+# MFTLComputeVertexNormals is a LOCAL operation, so a second rank count is not
+# about communication -- it is about the empty-object path. MFTLGenerateSphere
+# gives rank 0 the whole mesh, so at nproc == 3 the other two ranks run the pass
+# on a pool with no allocation at all, and any collective accidentally introduced
+# into it would deadlock here rather than in production.
+mftl_add_mpi_test_at(test_vertex_normals_np3 test_vertex_normals 3)
 
-# --- Stage 11: Intersection + overlap volume ---
-add_executable(test_overlap test_overlap.c)
-target_link_libraries(test_overlap PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_overlap PRIVATE ${CMAKE_SOURCE_DIR}/include)
-foreach(NP 1 2 4 8)
-    add_test(NAME Overlap-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_overlap>)
-endforeach()
-set_tests_properties(Overlap-np1 Overlap-np2 Overlap-np4 Overlap-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+# The scaling benchmark is an EXAMPLE, and no scaling sweep belongs in this
+# suite -- the build guide (MFTL_Documentation/pages/building.md) states the
+# rule: "The rank count is not a scaling knob in this suite; it changes which
+# code path is reachable."
+#
+# What is registered is a CORRECTNESS check of that example, because a program
+# whose whole purpose is to report timings has to be right before its numbers
+# mean anything. Rigid per-body translation conserves surface area exactly and
+# redistribution conserves entities exactly, so --verify needs no tolerance
+# beyond round-off, and the example exits non-zero when it drifts. np = 4 is the
+# smallest grid with a real diagonal neighbour.
+if(BUILD_EXAMPLES)
+  add_test(NAME test_advection_scaling_conserves
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:parallel_advection_scaling>
+                   --spheres 8 --refine 1 --steps 3 --warmup 1 --verify ${MPIEXEC_POSTFLAGS})
 
-# --- Stage 12: Opaque per-triangle data transport ---
-add_executable(test_triangle_data test_triangle_data.c)
-target_link_libraries(test_triangle_data PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_triangle_data PRIVATE ${CMAKE_SOURCE_DIR}/include)
-foreach(NP 1 2 4 8)
-    add_test(NAME TriangleData-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_triangle_data>)
-endforeach()
-set_tests_properties(TriangleData-np1 TriangleData-np2 TriangleData-np4 TriangleData-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+  # The SOLVER-SIDE half of the same rule, and it is the half no library test can
+  # reach: a caller that holds an MFTL_Object* across a redistribution advects a
+  # pointer the redistribution invalidated. Every structural invariant survives
+  # it -- the mesh stays a valid closed sphere with good triangles -- and the
+  # enclosed volume is the only thing that moves, so nothing short of a physical
+  # measurement over several timesteps sees it.
+  #
+  # np = 2 because it is invisible at np = 1: nothing is ever destroyed there,
+  # and the same code is correct. Twelve steps is enough for the failure to be a
+  # factor of thirteen rather than a tolerance question.
+  add_test(NAME test_leveque_parallel_conserves
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:leveque_remeshing_parallel>
+                   -steps 12 -budget 4 -quiet -verify ${MPIEXEC_POSTFLAGS})
 
-# --- Stage 13: Periodicity completion (end-to-end battery) ---
-add_executable(test_periodic_endtoend test_periodic_endtoend.c)
-target_link_libraries(test_periodic_endtoend PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_periodic_endtoend PRIVATE ${CMAKE_SOURCE_DIR}/include)
-foreach(NP 1 2 4 8)
-    add_test(NAME PeriodicEndToEnd-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_periodic_endtoend>)
-endforeach()
-set_tests_properties(PeriodicEndToEnd-np1 PeriodicEndToEnd-np2 PeriodicEndToEnd-np4 PeriodicEndToEnd-np8 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
+  # OPEN SURFACES. No library test runs the distributed remesher on a surface
+  # with a rim; these four examples do, and each checks what an open surface
+  # must keep that a closed one cannot lose: every twin-less half-edge of an
+  # owned triangle carries MFTL_FLAG_BOUNDARY (a short halo otherwise), the Euler
+  # characteristic of a disk or an annulus, every rim vertex on its constraint,
+  # no triangle turned over against all its neighbours, and a conserved volume.
+  #
+  # --require-rim-cut is the non-vacuity measure: each run fails unless some rim
+  # triangle was held by two ranks at once. Without it a grid or resolution change
+  # can leave the rim inside one rank's box, and the test would keep passing
+  # with nothing about parallel rims exercised.
+  #
+  # open_surface_creation   no remeshing: a patch and a cap crossing a periodic
+  #                         2x2x1 grid, area/entities/rim exact to round-off
+  # rayleigh_taylor         a rim on four walls, cut by both cut planes of the
+  #                         default 2x2x1 grid
+  # travelling_waves        a rim on two walls AND a periodic seam, i.e. an
+  #                         annulus that must stay one; at np = 2 the seam is
+  #                         itself a partition boundary
+  # liquid_jet              a surface growing through a pinned inflow rim, on
+  #                         2x2x1 so that a cut plane runs through the jet axis
+  #                         and the lip; the default (P,1,1) grid would leave the
+  #                         lip inside rank 0's box
+  add_test(NAME test_open_surface_creation_conserves
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:open_surface_creation>
+                   2 2 1 --steps 20 --no-output --require-rim-cut ${MPIEXEC_POSTFLAGS})
+  add_test(NAME test_rayleigh_taylor_open_remesh
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:rayleigh_taylor_open_surface>
+                   --res 24 --steps 60 --vtk 0 --report 20 --require-rim-cut ${MPIEXEC_POSTFLAGS})
+  add_test(NAME test_travelling_waves_open_remesh
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:travelling_waves_open_surface>
+                   --nx 64 --ny 16 --steps 100 --vtk 0 --report 25 --require-rim-cut ${MPIEXEC_POSTFLAGS})
+  add_test(NAME test_liquid_jet_open_remesh
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:liquid_jet_open_surface>
+                   2 2 1 --sectors 24 --steps 60 --vtk 0 --report 20 --require-rim-cut ${MPIEXEC_POSTFLAGS})
 
-# Sanitizer / debug options for every test executable of this directory (see
-# mftl2_dev_target_options in the top-level CMakeLists.txt).
-get_property(_mftl2_test_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
-foreach(_t ${_mftl2_test_targets})
-    get_target_property(_type ${_t} TYPE)
-    if(_type STREQUAL "EXECUTABLE")
-        mftl2_dev_target_options(${_t})
-    endif()
-endforeach()
-
-# --- Stage 15: library items L1-L7 (rectilinear domains, twin gids, surface scalar, point
-#     query objects, single-vertex curvature, soup builder, native mesh I/O, transfers) ---
-add_executable(test_stage15 test_stage15.c)
-target_link_libraries(test_stage15 PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_stage15 PRIVATE ${CMAKE_SOURCE_DIR}/include)
-foreach(NP 1 2 3 4)
-    add_test(NAME Stage15-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage15>)
-    set_tests_properties(Stage15-np${NP} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
-endforeach()
-
-# --- Stage 16A: twin states (LOCAL/REMOTE/BOUNDARY), builders and declared class, copy/commit,
-#     remote-twin discovery, ghost completion G1/G2, boundary loops, boundary-adjacent operators,
-#     invariant fuzz (plans/16-generalized-surfaces.md §2, §10 T-A) ---
-add_executable(test_stage16a test_stage16a.c)
-target_link_libraries(test_stage16a PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_stage16a PRIVATE ${CMAKE_SOURCE_DIR}/include)
-foreach(NP 1 2 4 8)
-    add_test(NAME Stage16A-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage16a>)
-    set_tests_properties(Stage16A-np${NP} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
-endforeach()
-
-# --- Stage 16A: no raw twin_gid comparisons outside the state predicates (plans/16 §2.1) ---
-add_test(NAME TwinGidReaderAudit COMMAND ${CMAKE_SOURCE_DIR}/tools/check_twin_gid_readers.sh ${CMAKE_SOURCE_DIR})
-
-# --- Stage 16B: periodic image counters, winding/canonicalisation, phase-boundary sets
-#     (plans/16 §3, tests T-B). The phase-set cases (every case of §3.6.10 and of the review
-#     §19.3, with the executable model's statuses/values) are REGENERATED from
-#     tools/phase_set_prototype (python3 + numpy) by a ctest fixture on every test run, so the
-#     tests never run on stale data. The library build never needs Python: the generator is a
-#     test-time dependency only, and without python3+numpy the model cases are skipped (the other
-#     16B tests still run) unless MFTL_PHASE_SET_MODEL_TESTS=ON demands them. ---
-set(MFTL_PHASE_SET_MODEL_TESTS "AUTO" CACHE STRING "Run the phase-set model cases (needs python3 + numpy at test time): AUTO, ON or OFF")
-set_property(CACHE MFTL_PHASE_SET_MODEL_TESTS PROPERTY STRINGS AUTO ON OFF)
-set(_mftl_ps_model OFF)
-if(NOT MFTL_PHASE_SET_MODEL_TESTS STREQUAL "OFF")
-    find_package(Python3 COMPONENTS Interpreter)
-    if(Python3_Interpreter_FOUND)
-        execute_process(COMMAND ${Python3_EXECUTABLE} -c "import numpy"
-                        RESULT_VARIABLE _mftl_numpy_rc OUTPUT_QUIET ERROR_QUIET)
-        if(_mftl_numpy_rc EQUAL 0)
-            set(_mftl_ps_model ON)
-        endif()
-    endif()
-    if(NOT _mftl_ps_model)
-        if(MFTL_PHASE_SET_MODEL_TESTS STREQUAL "ON")
-            message(FATAL_ERROR "MFTL_PHASE_SET_MODEL_TESTS=ON needs python3 with numpy")
-        endif()
-        message(STATUS "MFTL2: python3+numpy not found - the Stage-16B phase-set model cases are skipped")
-    endif()
+  # TOPOLOGY CHANGES on the same three open surfaces. Each run must make a
+  # change actually happen -- the non-vacuity flag fails it otherwise -- and
+  # keep every structural and physical check of its plain run through it, with
+  # the Euler rule generalised per body and the volume the reconstructions moved
+  # booked separately:
+  #
+  #   liquid_jet   a neck pinches and a drop travels on as a closed body to the
+  #                outlet; 2x2x1 so the lip, the jet and the neck are all cut
+  #   rayleigh_    a stronger vortex ring rolls the cap until turns touch and
+  #   taylor       a blob of heavy fluid pinches off it (t ~ 3.5), surviving the
+  #                remesh as a closed body. A coarser patch pinches only blobs
+  #                too small to resolve, which the size floor deletes: an
+  #                honest run in which nothing visible changes
+  #   travelling_  a steep carrier with a ripple plunges and its lip reconnects
+  #   waves        with the face, trapping air as an open body between the
+  #                channel walls. 104 steps: past that the prescribed field's
+  #                e^{kz} feedback runs away, which the example's own guard
+  #                reports and which is not the reconstruction's to fix
+  add_test(NAME test_liquid_jet_topology
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:liquid_jet_open_surface>
+                   2 2 1 --sectors 24 --length 24 --eps 0.1 --weber 2 --vtk 0 --report 20
+                   --require-breakup --require-rim-cut ${MPIEXEC_POSTFLAGS})
+  add_test(NAME test_rayleigh_taylor_topology
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:rayleigh_taylor_open_surface>
+                   --roll 1.6 --vtk 0 --report 50
+                   --require-topology --require-rim-cut ${MPIEXEC_POSTFLAGS})
+  add_test(NAME test_travelling_waves_topology
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:travelling_waves_open_surface>
+                   --nx 64 --ny 16 --components 2 --steepness 0.55 --ripple 0.05 --delta-breakup 0.02
+                   --steps 104 --vtk 0 --report 8 --require-topology --require-rim-cut ${MPIEXEC_POSTFLAGS})
 endif()
-set(MFTL_PS_CASES ${CMAKE_BINARY_DIR}/phase_set_cases.txt)
-set(MFTL_PS_PROTO ${CMAKE_SOURCE_DIR}/tools/phase_set_prototype)
-set(_mftl_ps_arg "")
-if(_mftl_ps_model)
-    add_test(NAME Stage16B-export-model-cases
-             COMMAND ${CMAKE_COMMAND} -E env PYTHONDONTWRITEBYTECODE=1 ${Python3_EXECUTABLE} export_cases.py ${MFTL_PS_CASES}
-             WORKING_DIRECTORY ${MFTL_PS_PROTO})
-    set_tests_properties(Stage16B-export-model-cases PROPERTIES FIXTURES_SETUP s16b_model_cases TIMEOUT 1200)
-    set(_mftl_ps_arg ${MFTL_PS_CASES})
-endif()
-add_executable(test_stage16b test_stage16b.c)
-target_link_libraries(test_stage16b PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_stage16b PRIVATE ${CMAKE_SOURCE_DIR}/include)
-foreach(NP 1 2 4 8)
-    add_test(NAME Stage16B-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage16b> ${_mftl_ps_arg})
-    set_tests_properties(Stage16B-np${NP} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
-    if(_mftl_ps_model)
-        set_tests_properties(Stage16B-np${NP} PROPERTIES FIXTURES_REQUIRED s16b_model_cases)
-    endif()
-endforeach()
-foreach(SL 1 2)
-    add_test(NAME Stage16B-slab${SL}-np4 COMMAND mpirun -np 4 $<TARGET_FILE:test_stage16b> ${_mftl_ps_arg})
-    set_tests_properties(Stage16B-slab${SL}-np4 PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV};S16B_SLABS=${SL};S16B_AXES=z")
-    if(_mftl_ps_model)
-        set_tests_properties(Stage16B-slab${SL}-np4 PROPERTIES FIXTURES_REQUIRED s16b_model_cases)
-    endif()
-endforeach()
-# --- Stage 16B independent review (plans/16 §21): gauge invariance of transforms, winding
-#     validity through every construction path, legacy v1 restart, analytic phase sets ---
-add_executable(test_stage16b_gauge test_stage16b_gauge.c)
-target_link_libraries(test_stage16b_gauge PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_stage16b_gauge PRIVATE ${CMAKE_SOURCE_DIR}/include)
-foreach(NP 1 2 4 8)
-    add_test(NAME Stage16B-gauge-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage16b_gauge>)
-    set_tests_properties(Stage16B-gauge-np${NP} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
-endforeach()
-# --- Stage 16C: generalized geometry kernels and boundary-aware remeshing (plans/16 §4, T-C) ---
-add_executable(test_stage16c test_stage16c.c)
-target_link_libraries(test_stage16c PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_stage16c PRIVATE ${CMAKE_SOURCE_DIR}/include)
-foreach(NP 1 2 4 8)
-    add_test(NAME Stage16C-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage16c>)
-    set_tests_properties(Stage16C-np${NP} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}" TIMEOUT 1800)
-endforeach()
-# --- Stage 16E: geometry of the open-surface boundary models (plans/16 §6, §7; E2/E3 library part) ---
-add_executable(test_stage16e test_stage16e.c)
-target_link_libraries(test_stage16e PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_stage16e PRIVATE ${CMAKE_SOURCE_DIR}/include)
-foreach(NP 1 2 4 8)
-    add_test(NAME Stage16E-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage16e>)
-    set_tests_properties(Stage16E-np${NP} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
-endforeach()
-
-# --- Stage 16F: final validation of the wrapping topology (winding invariance under
-#     redistribution, lattice re-gauge, remeshing, rank count and restart; the abort contract of
-#     the unchecked single-body volume / inertia calls) ---
-add_executable(test_stage16f test_stage16f.c)
-target_link_libraries(test_stage16f PRIVATE MFTL MPI::MPI_C m)
-target_include_directories(test_stage16f PRIVATE ${CMAKE_SOURCE_DIR}/include)
-foreach(NP 1 2 4 8)
-    add_test(NAME Stage16F-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage16f>)
-    set_tests_properties(Stage16F-np${NP} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
-endforeach()
-add_test(NAME Stage16F-restart-write-np4 COMMAND mpirun -np 4 $<TARGET_FILE:test_stage16f> write ${CMAKE_BINARY_DIR}/stage16f_restart)
-set_tests_properties(Stage16F-restart-write-np4 PROPERTIES FIXTURES_SETUP s16f_restart ENVIRONMENT "${MFTL_LSAN_ENV}")
-foreach(NP 1 2 8)
-    add_test(NAME Stage16F-restart-read-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage16f> read ${CMAKE_BINARY_DIR}/stage16f_restart)
-    set_tests_properties(Stage16F-restart-read-np${NP} PROPERTIES FIXTURES_REQUIRED s16f_restart ENVIRONMENT "${MFTL_LSAN_ENV}")
-endforeach()
-# the unchecked calls abort with their documented message (the exit status of an MPI_Abort is not
-# portable, so the message decides). The test runs as an MPI singleton (no launcher) with its output
-# in a file: under load MPICH's launcher ends an aborting job before forwarding its output (observed
-# 2 of 160 runs, even on one rank); without the launcher the message is always there (240 of 240).
-foreach(CASE volume_tube:wraps inertia_ribbon:wraps volume_patch:open inertia_patch:open)
-    string(REPLACE ":" ";" _c ${CASE})
-    list(GET _c 0 WHAT)
-    list(GET _c 1 KIND)
-    if(KIND STREQUAL "wraps")
-        set(_msg "the body wraps a periodic direction")
-    else()
-        set(_msg "the body is an open surface")
-    endif()
-    set(_out ${CMAKE_CURRENT_BINARY_DIR}/stage16f_unchecked_${WHAT}.out)
-    add_test(NAME Stage16F-unchecked-${WHAT}
-             COMMAND sh -c "'$<TARGET_FILE:test_stage16f>' unchecked ${WHAT} > '${_out}' 2>&1; grep -q '${_msg}' '${_out}' && ! grep -q 'NOT ABORTED' '${_out}'")
-    set_tests_properties(Stage16F-unchecked-${WHAT} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
-endforeach()
-add_test(NAME Stage16B-restart-write-np4 COMMAND mpirun -np 4 $<TARGET_FILE:test_stage16b> write ${CMAKE_BINARY_DIR}/stage16b_restart)
-set_tests_properties(Stage16B-restart-write-np4 PROPERTIES FIXTURES_SETUP s16b_restart ENVIRONMENT "${MFTL_LSAN_ENV}")
-foreach(NP 1 2 8)
-    add_test(NAME Stage16B-restart-read-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:test_stage16b> read ${CMAKE_BINARY_DIR}/stage16b_restart)
-    set_tests_properties(Stage16B-restart-read-np${NP} PROPERTIES FIXTURES_REQUIRED s16b_restart ENVIRONMENT "${MFTL_LSAN_ENV}")
-endforeach()
-
-# --- Manual example programs (examples/manual_*.c, listed in doc/MFTL2.tex) ---
-# Built by the top-level BUILD_EXAMPLES glob; every program runs on 1, 2, 4 and 8 ranks and
-# returns non-zero when one of its checks fails.
-set(MFTL_MANUAL_EXAMPLES manual_basic_workflow manual_curvature manual_queries manual_triangle_data
-    manual_remeshing manual_periodic manual_open_surface manual_phase_set)
-foreach(ex ${MFTL_MANUAL_EXAMPLES})
-    if(TARGET ${ex})
-        foreach(NP 1 2 4 8)
-            add_test(NAME Manual-${ex}-np${NP} COMMAND mpirun -np ${NP} $<TARGET_FILE:${ex}>
-                     WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
-            set_tests_properties(Manual-${ex}-np${NP} PROPERTIES ENVIRONMENT "${MFTL_LSAN_ENV}")
-        endforeach()
-    endif()
-endforeach()

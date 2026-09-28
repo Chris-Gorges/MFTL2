@@ -1,84 +1,161 @@
-/*
- * MFTL2 I/O — visualisation output (legacy VTK, VTU/PVTU), GTS surface files and the native
- * restart mesh (v1: MFTL1 `.mesh` format; v2: class, period box, exact positions with image
- * counters and boundary tags).
+/**
+ * @file mftl_io.h
+ * @author Christian Gorges
+ * @date 2026-08-14
+ * @ingroup mftl_io
+ *
+ * @brief Mesh output in VTK formats: a serial legacy debug dump and a parallel
+ *        VTK XML (`.vtu`) writer.
+ *
+ * Nothing is read back by the library. Four decisions define MFTLWriteVtu():
+ *
+ * 1. **Raw binary by default.** Decimal formatting of a double costs about
+ *    100 ns and ~17 bytes, so an ASCII writer is bound by `printf`, not by the
+ *    disk; the appended raw section is a memcpy (23-32x faster, docs/analysis.md
+ *    §3). ASCII is kept for inspection.
+ * 2. **Two file layouts.** One piece per rank plus a `.pvtu` index (no
+ *    contention, but P+1 files per dump -- what overloads a parallel file
+ *    system's metadata server first), or one shared file written collectively
+ *    with MPI-IO. On one local SSD the per-rank layout was faster (the shared
+ *    file: 1.0x at P = 1, 0.45x at P = 4); re-measure on the target system.
+ * 3. **Only owned entities are written.** A ghost is a copy of a triangle another
+ *    rank owns; writing it would count every halo triangle once per holder and
+ *    bias every integral a visualisation tool computes (10-30 % in a typical
+ *    run). `include_ghosts` exists for inspecting the halo.
+ * 4. **Periodic unwrapping at write time.** A triangle straddling a periodic face
+ *    gets three private points at its unwrapped corners; the mesh in memory is
+ *    untouched.
+ *
+ * Theory: src/io/README.md.
  */
+
 #ifndef MFTL_IO_H
 #define MFTL_IO_H
 
-#include "mftl_core.h"
+#include "mftl_types.h"
+
+// -----------------------------------------------------------------------------
+// 1. OPTIONS
+// -----------------------------------------------------------------------------
+
+/** @brief How the numbers are encoded in a .vtu file. */
+typedef enum
+{
+  /** Raw binary in an appended section, in the host byte order (declared in
+   *  the header). The default: 23-32x faster to write than ASCII and about half
+   *  the size; read natively by ParaView and VisIt. */
+  MFTL_VTK_BINARY = 0,
+
+  /** Decimal text inside the DataArray elements: human-readable and diffable.
+   *  Not available with #MFTL_IO_SINGLE_FILE. */
+  MFTL_VTK_ASCII = 1
+} MFTL_VtkEncoding;
+
+/** @brief How the output is spread over files. */
+typedef enum
+{
+  /** `<prefix>_%05d.vtu` from every rank plus `<prefix>.pvtu` from rank 0.
+   *  No shared file; P+1 files per dump. */
+  MFTL_IO_FILE_PER_RANK = 0,
+
+  /** One `<prefix>.vtu` holding a single Piece, written collectively with
+   *  MPI-IO. Implies MFTL_VTK_BINARY. */
+  MFTL_IO_SINGLE_FILE = 1
+} MFTL_IoLayout;
 
 /**
- * @brief Writes the entities stored on the calling rank (owned and ghost) to a legacy ASCII
- * VTK polydata file <base_filename>.vtk, with the stored (wrapped) positions. Rank-local
- * visualisation output.
- * @return MFTL_SUCCESS, or MFTL_ERROR if the file cannot be written.
+ * @struct MFTL_VtkOptions
+ * @brief What to write and how; start from MFTLVtkDefaults().
+ *
+ * The optional arrays are identity and ownership, which are always
+ * well-defined. There is deliberately no option for `tris.area` or
+ * `tris.normal`: nothing records whether they are current and a redistribution
+ * leaves them unspecified, so a file containing them could be stale while
+ * looking right. Compute and write them yourself if needed.
+ */
+typedef struct MFTL_VtkOptions
+{
+  MFTL_IoLayout layout;  ///< Default MFTL_IO_FILE_PER_RANK.
+  MFTL_VtkEncoding encoding;  ///< Default MFTL_VTK_BINARY.
+
+  /** Write ghost entities too. Default false. The merged dataset then contains
+   *  every halo triangle once per rank holding it, so use it to LOOK at the
+   *  halo, never to integrate over the surface. */
+  bool include_ghosts;
+
+  /** `VertexOwner` / `TriangleOwner` (Int32): which rank owns each entity.
+   *  Default true -- this is how you audit a domain decomposition visually. */
+  bool write_owner;
+
+  /** `BodyID` (Int32): the object's `global_id`, per cell. Default true; it is
+   *  what lets a visualisation tool re-separate the bodies after aggregation. */
+  bool write_body_id;
+
+  /** `VertexGID` / `TriangleGID` (Int32): the entity global ids. Default false.
+   *  Useful for following one entity across timesteps or across a
+   *  redistribution; 8 bytes per triangle of file you usually do not want. */
+  bool write_global_id;
+} MFTL_VtkOptions;
+
+/**
+ * @brief The parameter set a caller should start from.
+ * @return Binary encoding, one file per rank, owned entities only, owner and
+ *         body id written, global ids not.
+ */
+MFTL_VtkOptions MFTLVtkDefaults(void);
+
+// -----------------------------------------------------------------------------
+// 2. WRITERS
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief Writes the calling rank's pool of one object to a legacy ASCII `.vtk`
+ *        file: the raw debug dump.
+ *
+ * Every entity the rank holds, ghosts included, with no filtering, no periodic
+ * unwrapping and no communication. It also writes `VertexOwner`,
+ * `TriangleOwner`, `verts.normal` and `tris.area` UNVALIDATED -- its contract is
+ * to show what is in memory, including arrays a redistribution left undefined.
+ *
+ * Strictly single-rank: several ranks writing the same path race. Call it from
+ * one rank, or give every rank its own name.
+ *
+ * @param object        The object (valid topology required).
+ * @param base_filename Base path; ".vtk" is appended.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on a NULL argument or an I/O failure.
  */
 int MFTLWriteVtk(const MFTL_Object *object, const char *base_filename);
 
 /**
- * @brief Writes all objects of the ensemble as one parallel VTK set (collective): every rank
- * writes its stored entities (owned and ghost) to <prefix>_%05d.vtu, rank 0 writes the index
- * <prefix>.pvtu. A triangle crossing a periodic seam is drawn with its own copies of its
- * corners in the image of its first corner (minimum image), so it is not stretched across the
- * box. Point data: VertexOwner; cell data: TriangleOwner, BodyID.
- */
-void MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix);
-
-/**
- * @brief Reads a GTS surface file into an empty object (collective).
+ * @brief Writes every local object of an ensemble as one VTK XML unstructured
+ *        grid (all bodies in one point/cell list per piece).
  *
- * Token-based parser for the MFTL1 GTS layout: "nV nE nT GtsSurface GtsFace
- * GtsEdge GtsVertex" header, then vertex coordinates, 1-based edge vertex
- * pairs, and triangles as 1-based edge triples. Rank 0 parses and builds; the gid
- * counters are broadcast, so the object is immediately redistributable via
- * MFTLRedistributeListOfObjects (as after MFTLGenerateSphere).
+ * Points are the vertices referenced by the written triangles (owned triangles
+ * may reference ghost vertices), plus three private points per triangle that
+ * straddles a periodic face; a seam vertex is therefore written by every rank
+ * with a triangle on it. Cells carry `TriangleOwner`, `BodyID` and optionally
+ * `TriangleGID`; points `VertexOwner` and optionally `VertexGID`. Uses compact
+ * connectivity when current, the half-edge records otherwise; no geometry
+ * precondition.
  *
- * The triangles are oriented consistently; a closed body is then canonicalised to OUTWARD
- * winding (V > 0). The coordinates are continuous input and are lifted to (pos, img). An edge
- * with one triangle is accepted only on a body declared open before the call (its loops become
- * tagged boundaries); non-manifold input is rejected.
+ * - #MFTL_IO_FILE_PER_RANK writes `<prefix>_%05d.vtu` per rank and
+ *   `<prefix>.pvtu` on rank 0.
+ * - #MFTL_IO_SINGLE_FILE writes one `<prefix>.vtu` with one Piece: one
+ *   non-blocking `MPI_Exscan` + `MPI_Allreduce` pair places every block, rank 0
+ *   writes header, length prefixes and footer, and every rank writes its slice of
+ *   each block with `MPI_File_write_at_all` (enabling two-phase collective
+ *   buffering). The file is truncated to its exact size. Requires
+ *   #MFTL_VTK_BINARY and at most \f$2^{31}-1\f$ points and
+ *   \f$(2^{31}-1)/3\f$ cells (Int32 connectivity and offsets).
  *
- * @return MFTL_SUCCESS on success, MFTL_ERROR on error (all ranks agree).
- */
-int MFTLReadGTS(MFTL_Object* obj, const char* path);
-
-/**
- * @brief Writes the object's owned mesh to a GTS file.
+ * @param ensemble        The ensemble; zero objects yield a valid empty dataset.
+ * @param filename_prefix Base path/name; suffixes are appended.
+ * @param options         #MFTL_NULL for MFTLVtkDefaults().
+ * @return #MFTL_SUCCESS if every rank succeeded, #MFTL_ERROR otherwise -- the same
+ *         value on every rank.
  *
- * Single-file serial semantics: rank 0 writes the triangles it owns, with
- * vertices and edges renumbered in first-appearance order and coordinates
- * printed at %.17g (bit-exact round-trip through MFTLReadGTS). Call BEFORE
- * redistribution (or on a serial mesh). If the surface has been distributed
- * (rank 0 no longer owns all of the object's triangles), the function prints
- * an error and returns MFTL_ERROR rather than writing a partial file. The
- * ownership check uses the object's global counts, so refresh them after
- * redistribution (MFTLEnsembleUpdateGlobalCounts).
- *
- * @return MFTL_SUCCESS on success, MFTL_ERROR on error.
+ * @collective In both layouts (the return code is reduced).
  */
-int MFTLWriteGTS(MFTL_Object* obj, const char* path);
-
-/**
- * @brief Writes the ensemble as a parallel VTK collection: per-rank <stem>_%05d.vtu pieces
- * plus the rank-0 <stem>.pvtu index (same as MFTLWriteVtu).
- */
-void MFTLWritePvtu(MFTL_Ensemble* ens, const char* stem);
-
-/**
- * @brief Native restart mesh v1 in the MFTL1 `.mesh` format (surface scalar with %.15e).
- * MFTLWriteNativeMesh writes the LOCALLY stored entities of obj to `path` (gather the object
- * to one rank first, e.g. MFTLEnsembleBeginSerial). MFTLReadNativeMesh builds an EMPTY object
- * from a v1 or v2 file (collective: ranks passing path == NULL contribute nothing; call
- * MFTLRedistribute afterwards). A v1 file is read as closed (or with its boundary derived from
- * the mesh when the object is declared open) with img = 0, then canonicalised.
- */
-int MFTLWriteNativeMesh(const MFTL_Object* obj, const char* path);
-/** @brief Native mesh v2 (declared class, period box, exact %.17g positions with image
- *  counters, boundary tags, explicit vertex triples); read back by MFTLReadNativeMesh on any
- *  rank count (then MFTLRedistribute). The reader re-establishes the canonical image gauge,
- *  so a state written in the canonical gauge is restored exactly. */
-int MFTLWriteNativeMeshV2(const MFTL_Object* obj, const char* path);
-int MFTLReadNativeMesh(MFTL_Object* obj, const char* path);
+int MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix, const MFTL_VtkOptions *options);
 
 #endif  // MFTL_IO_H

@@ -1,9 +1,0 @@
-# LeakSanitizer suppressions for MFTL tests.
-#
-# MPICH keeps small internal bookkeeping allocations alive for the duration
-# of the process (communicator/context registration caches released only at
-# MPI teardown). These are not MFTL leaks; every allocation reported under
-# these patterns has its origin frame inside libmpi.
-leak:libmpi.so*
-leak:libmpich.so*
-leak:libmpl.so*

@@ -1,643 +1,677 @@
-/*
- * MFTL2 core — half-edge topology: array accessors, navigation (next/prev/twin/origin/target),
- * the twin-state predicates, one-ring traversal, flattened connectivity, builders (triples,
- * distributed soups, staged copies), and the topology invariant API of plans/16 (declared class,
- * rings, validation, ghost completion, boundary loops).
+/**
+ * @file mftl_topology.h
+ * @author Christian Gorges
+ * @date 2026-08-14
+ * @ingroup mftl_topology
  *
- * Twin states (plans/16 §2.1): every live half-edge of a quiescent mesh is LOCAL (twin stored
- * here), REMOTE (twin on another rank: an MPI rim) or BOUNDARY (a tagged physical boundary).
- * twin_gid is read only through the predicates below. A NULL from MFTLHeTwin means "no stored
- * twin" — either a physical boundary or an MPI rim — and must not be taken as a boundary.
+ * @brief Half-edge topology: entity flags, implicit index arithmetic,
+ *        navigation, and connectivity maintenance.
+ *
+ * **Everything is an index.** Accessors take and return pool indices
+ * (#MFTL_ERROR = "no such entity"); records are reached with MFTLVertexRec(),
+ * MFTLTriRec() and MFTLHeRec() when identity fields are wanted, and positions
+ * with MFTLVertexPos().
+ *
+ * **Implicit half-edge indexing** (an invariant, mftl_types.h): half-edge
+ * \f$3t+k\f$ belongs to triangle \f$t\f$, so
+ *
+ * \f[
+ *   \mathrm{face}(h) = \lfloor h/3 \rfloor,\quad
+ *   \mathrm{next}(h) = 3\lfloor h/3 \rfloor + (h+1) \bmod 3,\quad
+ *   \mathrm{prev}(h) = 3\lfloor h/3 \rfloor + (h+2) \bmod 3,\quad
+ *   \mathrm{origin}(h) = \mathrm{target}(\mathrm{prev}(h)).
+ * \f]
+ *
+ * None of these is stored, so a broken next-cycle or a half-edge that does not
+ * point back at its triangle cannot be represented. The price is a
+ * triangles-only mesh. Theory: src/topology/README.md.
  */
 
 #ifndef MFTL_TOPOLOGY_H
 #define MFTL_TOPOLOGY_H
 
-#include "mftl_core.h"
 #include "mftl_constants.h"
-#include <assert.h>
+#include "mftl_types.h"
 
 // -----------------------------------------------------------------------------
-// BASE ARRAY ACCESSORS
-// -----------------------------------------------------------------------------
-
-/**
- * @brief Get a pointer to a vertex by its local index.
- */
-static inline MFTL_Vertex *MFTLGetVertex(const MFTL_Object *obj, int idx) { return &obj->vertices[idx]; }
-
-/**
- * @brief Get a pointer to a half-edge by its local index.
- */
-static inline MFTL_HalfEdge *MFTLGetHalfedge(const MFTL_Object *obj, int idx)
-{
-  if (idx == MFTL_ERROR) return MFTL_NULL;
-  return &obj->half_edges[idx];
-}
-
-/**
- * @brief Get a pointer to a triangle by its local index.
- */
-static inline MFTL_Triangle *MFTLGetTriangle(const MFTL_Object *obj, int idx)
-{
-  if (idx == MFTL_ERROR) return MFTL_NULL;
-  return &obj->triangles[idx];
-}
-
-// -----------------------------------------------------------------------------
-// VERTEX NAVIGATION
+// 0. ENTITY FLAGS
 // -----------------------------------------------------------------------------
 
 /**
- * @brief The stored outgoing half-edge of a vertex (the outgoing BOUNDARY half-edge on a
- * boundary vertex, plans/16 §2.6).
- * @return Pointer to the half-edge, or NULL if the vertex has none (out_he_idx == -1).
+ * @brief Flag: the entity lies on the surface's TOPOLOGICAL boundary.
+ *
+ * Set on every half-edge without a partner anywhere in the mesh and on both of
+ * its endpoints, by MFTLMarkMeshBoundary() while the mesh is still COMPLETE;
+ * afterwards it travels with the entity through redistribution and remeshing.
+ * It is a different statement from `twin_idx == MFTL_ERROR`, which means "no
+ * partner in THIS partition" and is also true at the outer rim of a ghost halo.
+ * Anything that must tell "the surface ends here" from "the partition ends
+ * here" uses the flag. On a closed mesh it is clear everywhere.
  */
-static inline MFTL_HalfEdge *MFTLVOutHe(const MFTL_Object *obj, const MFTL_Vertex *v) { return MFTLGetHalfedge(obj, v->out_he_idx); }
+#define MFTL_FLAG_BOUNDARY 0x1
+
+/* ── The flag word ─────────────────────────────────────────────────────────
+ *
+ * Every bit is allocated here, including bits only src/remeshing/ reads, so
+ * the registry cannot collide:
+ *
+ *   BOUNDARY  0x01  topology    persistent (a property of the surface)
+ *   DEAD      0x02  remeshing   transient, removed by compaction
+ *   VISITED   0x04  remeshing   transient, cleared between sweeps
+ *   FEATURE   0x08  remeshing   re-derived each pass, carried by splits between
+ *   CORNER    0x10  remeshing   re-derived each pass, vertices only
+ *   FROZEN    0x20  remeshing   transient, one parallel phase; never transmitted
+ *
+ * Application code must not use bits 0x02 and 0x04 for its own markers.
+ */
+
+/** @brief Flag: entity is retired; removed by the next compaction. */
+#define MFTL_FLAG_DEAD 0x2
+
+/** @brief Flag: entity was modified in the current remeshing sweep; do not touch again. */
+#define MFTL_FLAG_VISITED 0x4
+
+/**
+ * @brief Flag. Half-edge: the angle between the normals of its two triangles
+ *        exceeds the feature threshold, or it is a mesh-boundary edge. Vertex: it lies on a
+ *        feature curve (smoothed only along the curve).
+ *
+ * Set on BOTH half-edges of a sharp edge, so the test needs no twin hop.
+ */
+#define MFTL_FLAG_FEATURE 0x8
+
+/**
+ * @brief Flag, vertex only: a feature CORNER, which the smoother never moves.
+ *
+ * Set where a vertex has one incident feature edge (the end of a ridge), three
+ * or more (a genuine corner), or two that meet at an angle sharper than
+ * `feature_corner_angle`. A separate bit so the smoother does not re-walk the
+ * fan to find out.
+ */
+#define MFTL_FLAG_CORNER 0x10
+
+/**
+ * @brief Flag: this rank may not modify the entity in the current parallel
+ *        remeshing phase.
+ *
+ * Set on every ghost and on every OWNED entity of which another rank holds a
+ * copy:
+ *
+ * \f[ \text{owned entity frozen} \iff \text{some other rank holds it as a ghost}. \f]
+ *
+ * Two ranks therefore never modify the same entity, and no rank modifies what
+ * another is reading -- without any negotiation. MFTLRemeshMarkFrozen() derives
+ * it locally from the ownership prefix: an owned triangle is replicated exactly
+ * when one of its corners or edge neighbours is a ghost (index `>= n_local`).
+ * Recomputed after every migration and never packed onto the wire: it describes
+ * this rank's halo.
+ */
+#define MFTL_FLAG_FROZEN 0x20
 
 // -----------------------------------------------------------------------------
-// TRIANGLE NAVIGATION
+// 1. IMPLICIT HALF-EDGE ARITHMETIC
 // -----------------------------------------------------------------------------
 
 /**
- * @brief The half-edge the triangle stores (he_idx; the "first" half-edge of the triangle).
+ * @brief Index of triangle @p t's first half-edge. Its three are 3t, 3t+1, 3t+2.
+ * @param t Triangle index.
+ * @return \f$3t\f$.
  */
-static inline MFTL_HalfEdge *MFTLTHe(const MFTL_Object *obj, const MFTL_Triangle *t) { return MFTLGetHalfedge(obj, t->he_idx); }
+static inline int MFTLTriFirstHe(int t) { return 3 * t; }
 
 /**
- * @brief The three half-edges of a triangle in winding order, starting at he_idx.
+ * @brief The triangle half-edge @p h belongs to.
+ * @param h Half-edge index.
+ * @return \f$\lfloor h/3 \rfloor\f$. No load, no cache miss, no way to be inconsistent.
  */
-static inline void MFTLGetTriangleHalfedges(const MFTL_Object *obj, const MFTL_Triangle *tri, MFTL_HalfEdge *out_he[3])
+static inline int MFTLHeTriIdx(int h) { return h / 3; }
+
+/**
+ * @brief The corner slot (0, 1 or 2) of half-edge @p h within its triangle.
+ * @param h Half-edge index.
+ * @return \f$h \bmod 3\f$.
+ */
+static inline int MFTLHeCorner(int h) { return h % 3; }
+
+/**
+ * @brief Next half-edge in the triangle's CCW cycle.
+ * @param h Half-edge index.
+ * @return \f$3\lfloor h/3 \rfloor + (h+1) \bmod 3\f$.
+ */
+static inline int MFTLHeNextIdx(int h)
 {
-  out_he[0] = (MFTL_HalfEdge *) &obj->half_edges[tri->he_idx];
-  out_he[1] = (MFTL_HalfEdge *) &obj->half_edges[out_he[0]->next_idx];
-  out_he[2] = (MFTL_HalfEdge *) &obj->half_edges[out_he[1]->next_idx];
+  const int base = h - h % 3;
+  return base + (h + 1 - base) % 3;
 }
 
 /**
- * @brief The three vertices of a triangle in winding order: origin of he0, then the targets
- * of he0 and he1. (v1 - v0) x (v2 - v0) is the triangle normal.
+ * @brief Previous half-edge in the triangle's CCW cycle (== next twice).
+ * @param h Half-edge index.
+ * @return \f$3\lfloor h/3 \rfloor + (h+2) \bmod 3\f$.
  */
-static inline void MFTLGetTriangleVertices(const MFTL_Object *obj, const MFTL_Triangle *tri, MFTL_Vertex *out_verts[3])
+static inline int MFTLHePrevIdx(int h)
 {
-  MFTL_HalfEdge *out_he[3];
-  MFTLGetTriangleHalfedges(obj, tri, out_he);
+  const int base = h - h % 3;
+  return base + (h + 2 - base) % 3;
+}
 
-  // origin of he0 == target of he2
-  out_verts[0] = (MFTL_Vertex *) &obj->vertices[out_he[2]->vertex_idx];
-  out_verts[1] = (MFTL_Vertex *) &obj->vertices[out_he[0]->vertex_idx];
-  out_verts[2] = (MFTL_Vertex *) &obj->vertices[out_he[1]->vertex_idx];
+/**
+ * @brief Number of active half-edges: three per triangle, always.
+ * @param obj The mesh.
+ * @return \f$3 n_\mathrm{tris}\f$, owned and ghost together.
+ */
+static inline int MFTLNumHalfEdges(const MFTL_Object *obj) { return 3 * obj->tris.n; }
+
+/**
+ * @brief Number of locally owned half-edges: three per owned triangle.
+ * @param obj The mesh.
+ * @return \f$3 n_\mathrm{local}\f$. They occupy the prefix \f$[0, 3\nlocal)\f$.
+ */
+static inline int MFTLNumLocalHalfEdges(const MFTL_Object *obj) { return 3 * obj->tris.n_local; }
+
+// -----------------------------------------------------------------------------
+// 2. RECORD ACCESSORS
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief The identity/topology record of vertex @p v.
+ * @param obj The mesh.
+ * @param v   Vertex index. Bounds-asserted in Debug.
+ * @return Pointer into the pool's AoS array. The POSITION is not here -- it is
+ *         `obj->verts.pos[3*v]`, see MFTLVertexPos().
+ */
+static inline MFTL_Vertex *MFTLVertexRec(const MFTL_Object *obj, int v)
+{
+  MFTL_ASSERT(v >= 0 && v < obj->verts.n);
+  return &obj->verts.rec[v];
+}
+
+/**
+ * @brief The identity record of triangle @p t.
+ * @param obj The mesh.
+ * @param t   Triangle index. Bounds-asserted in Debug.
+ * @return Pointer into the pool's AoS array. 12 bytes of pure identity: the
+ *         topology is implicit and the geometry is in the SoA arrays.
+ */
+static inline MFTL_Triangle *MFTLTriRec(const MFTL_Object *obj, int t)
+{
+  MFTL_ASSERT(t >= 0 && t < obj->tris.n);
+  return &obj->tris.rec[t];
+}
+
+/**
+ * @brief The topology record of half-edge @p h.
+ * @param obj The mesh.
+ * @param h   Half-edge index. Bounds-asserted in Debug.
+ * @return Pointer into the pool's AoS array. Only `vertex_idx` and `twin_idx`
+ *         are topology; `next` and `face` are arithmetic.
+ */
+static inline MFTL_HalfEdge *MFTLHeRec(const MFTL_Object *obj, int h)
+{
+  MFTL_ASSERT(h >= 0 && h < 3 * obj->tris.n);
+  return &obj->tris.he[h];
 }
 
 // -----------------------------------------------------------------------------
-// HALF-EDGE NAVIGATION
+// 3. OWNERSHIP
 // -----------------------------------------------------------------------------
 
 /**
- * @brief The vertex at the END (target) of a half-edge.
+ * @brief True if vertex @p v is a ghost (owned by another rank): \f$v \ge \nlocal\f$.
+ *
+ * Loops over owned entities should use `n_local` as their bound instead.
+ *
+ * @param obj The mesh.
+ * @param v   Vertex index.
+ * @return `true` iff \f$v \ge \nlocal\f$.
  */
-static inline MFTL_Vertex *MFTLHeTarget(const MFTL_Object *obj, const MFTL_HalfEdge *he) { return MFTLGetVertex(obj, he->vertex_idx); }
+static inline bool MFTLVertexIsGhost(const MFTL_Object *obj, int v) { return v >= obj->verts.n_local; }
 
 /**
- * @brief The vertex at the START (origin) of a half-edge: the target of the previous
- * half-edge of the same triangle (next->next), so it needs no twin.
+ * @brief True if triangle @p t is a ghost. See MFTLVertexIsGhost().
+ * @param obj The mesh.
+ * @param t   Triangle index.
+ * @return `true` iff @p t lies past the ownership prefix.
  */
-static inline MFTL_Vertex *MFTLHeOrigin(const MFTL_Object *obj, const MFTL_HalfEdge *he)
+static inline bool MFTLTriangleIsGhost(const MFTL_Object *obj, int t) { return t >= obj->tris.n_local; }
+
+/**
+ * @brief True if half-edge @p h belongs to a ghost triangle.
+ * @param obj The mesh.
+ * @param h   Half-edge index.
+ * @return `true` iff \f$\lfloor h/3 \rfloor\f$ lies past the ownership prefix.
+ */
+static inline bool MFTLHeIsGhost(const MFTL_Object *obj, int h) { return MFTLHeTriIdx(h) >= obj->tris.n_local; }
+
+/**
+ * @brief True if this rank may not modify vertex @p v (#MFTL_FLAG_FROZEN).
+ *
+ * The flag, not the index: an owned vertex another rank holds a copy of is
+ * frozen too, while an entity created during the phase sits past the ownership
+ * prefix until compaction and is nevertheless owned and free.
+ *
+ * @param obj The mesh.
+ * @param v   Vertex index.
+ * @return `true` iff #MFTL_FLAG_FROZEN is set on the record.
+ */
+static inline bool MFTLVertexIsFrozen(const MFTL_Object *obj, int v) { return (obj->verts.rec[v].flags & MFTL_FLAG_FROZEN) != 0; }
+
+/**
+ * @brief True if this rank may not modify triangle @p t. See MFTLVertexIsFrozen().
+ * @param obj The mesh.
+ * @param t   Triangle index.
+ * @return `true` iff #MFTL_FLAG_FROZEN is set on the record.
+ */
+static inline bool MFTLTriangleIsFrozen(const MFTL_Object *obj, int t) { return (obj->tris.rec[t].flags & MFTL_FLAG_FROZEN) != 0; }
+
+// -----------------------------------------------------------------------------
+// 4. HALF-EDGE NAVIGATION
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief Vertex at the END (target) of half-edge @p h.
+ * @param obj The mesh.
+ * @param h   Half-edge index.
+ * @return Vertex pool index. The only topological field a half-edge stores
+ *         besides its twin.
+ */
+static inline int MFTLHeTarget(const MFTL_Object *obj, int h) { return obj->tris.he[h].vertex_idx; }
+
+/**
+ * @brief Vertex at the START (origin) of half-edge @p h:
+ *        \f$\mathrm{target}(\mathrm{prev}(h))\f$.
+ *
+ * Not routed through the twin, which does not exist on a boundary half-edge.
+ *
+ * @param obj The mesh.
+ * @param h   Half-edge index.
+ * @return Vertex pool index.
+ */
+static inline int MFTLHeOrigin(const MFTL_Object *obj, int h) { return obj->tris.he[MFTLHePrevIdx(h)].vertex_idx; }
+
+/**
+ * @brief Twin of half-edge @p h, or #MFTL_ERROR if it has none in this partition.
+ * @param obj The mesh.
+ * @param h   Half-edge index.
+ * @return The oppositely oriented half-edge, or #MFTL_ERROR.
+ * @warning #MFTL_ERROR here means "no partner in THIS partition", which is also
+ *          true at a ghost halo's outer rim. For "no partner anywhere in the
+ *          mesh" use MFTLHeIsMeshBoundary().
+ */
+static inline int MFTLHeTwin(const MFTL_Object *obj, int h) { return obj->tris.he[h].twin_idx; }
+
+/**
+ * @brief True if @p h has no twin in the LOCAL pools (mesh boundary OR halo rim).
+ * @param obj The mesh.
+ * @param h   Half-edge index.
+ * @return `true` iff `twin_idx == MFTL_ERROR`. **Partition-dependent** -- see
+ *         MFTLHeIsMeshBoundary() for the partition-independent statement.
+ */
+static inline bool MFTLHeIsLocalBoundary(const MFTL_Object *obj, int h) { return obj->tris.he[h].twin_idx == MFTL_ERROR; }
+
+/**
+ * @brief True if @p h lies on the mesh's topological boundary.
+ * @param obj The mesh.
+ * @param h   Half-edge index.
+ * @return `true` iff #MFTL_FLAG_BOUNDARY is set. Identical on every rank.
+ * @note Meaningful only after MFTLMarkMeshBoundary() has run on the complete mesh.
+ */
+static inline bool MFTLHeIsMeshBoundary(const MFTL_Object *obj, int h) { return (obj->tris.he[h].flags & MFTL_FLAG_BOUNDARY) != 0; }
+
+/**
+ * @brief True if vertex @p v lies on the mesh's topological boundary.
+ * @param obj The mesh.
+ * @param v   Vertex index.
+ * @return `true` iff #MFTL_FLAG_BOUNDARY is set. Identical on every rank.
+ * @note Meaningful only after MFTLMarkMeshBoundary() has run on the complete mesh.
+ */
+static inline bool MFTLVertexIsMeshBoundary(const MFTL_Object *obj, int v) { return (obj->verts.rec[v].flags & MFTL_FLAG_BOUNDARY) != 0; }
+
+/**
+ * @brief The triangle across half-edge @p h, or #MFTL_ERROR without a local twin.
+ *
+ * What `tris.neighbors[h]` caches; streaming loops should read the array.
+ *
+ * @param obj The mesh.
+ * @param h   Half-edge index.
+ * @return Triangle index across @p h, or #MFTL_ERROR.
+ */
+static inline int MFTLHeAdjacentTriangle(const MFTL_Object *obj, int h)
 {
-  const MFTL_HalfEdge *next = &obj->half_edges[he->next_idx];
-  const MFTL_HalfEdge *prev = &obj->half_edges[next->next_idx];
-  return MFTLGetVertex(obj, prev->vertex_idx);
+  const int twin = obj->tris.he[h].twin_idx;
+  return (twin == MFTL_ERROR) ? MFTL_ERROR : MFTLHeTriIdx(twin);
+}
+
+// -----------------------------------------------------------------------------
+// 5. TRIANGLE NAVIGATION
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief The three vertices of triangle @p t in counter-clockwise order.
+ *
+ * Slot k is the ORIGIN of half-edge 3t+k -- the convention of `tris.verts`;
+ * mixing conventions silently rotates triangles. Streaming loops should read
+ * `tris.verts` instead.
+ *
+ * @param      obj The mesh.
+ * @param      t   Triangle index.
+ * @param[out] out Three vertex pool indices, in CCW order.
+ */
+static inline void MFTLGetTriangleVertices(const MFTL_Object *obj, int t, int out[3])
+{
+  const MFTL_HalfEdge *he = &obj->tris.he[3 * t];
+  out[0] = he[2].vertex_idx;  // origin of he0 == target of he2
+  out[1] = he[0].vertex_idx;
+  out[2] = he[1].vertex_idx;
 }
 
 /**
- * @brief The stored twin (LOCAL state).
- * @return Pointer to the twin, or NULL when the twin is not stored on this rank: a physical
- * boundary (BOUNDARY) OR an MPI rim (REMOTE) — use the predicates to tell them apart.
+ * @brief The three neighbouring triangles of @p t, indexed like its half-edges.
+ *
+ * Slot k is the triangle across half-edge \f$3t+k\f$, matching the convention
+ * `tris.neighbors` follows.
+ *
+ * @param      obj The mesh.
+ * @param      t   Triangle index.
+ * @param[out] out Three triangle pool indices, #MFTL_ERROR where the edge has no
+ *                 twin in this partition.
  */
-static inline MFTL_HalfEdge *MFTLHeTwin(const MFTL_Object *obj, const MFTL_HalfEdge *he) { return MFTLGetHalfedge(obj, he->twin_idx); }
-
-/* ---- Twin-state predicates (plans/16 §2.1). The ONLY sanctioned readers of twin_idx-as-state
-   and twin_gid (enforced by tools/check_twin_gid_readers.sh); see MFTL_TWIN_* in
-   mftl_constants.h. ---- */
-static inline bool MFTLHeIsLocal(const MFTL_HalfEdge *he) { return he->twin_idx >= 0; }
-static inline bool MFTLHeIsRemote(const MFTL_HalfEdge *he) { return he->twin_idx < 0 && he->twin_gid >= 0; }
-static inline bool MFTLHeIsBoundary(const MFTL_HalfEdge *he) { return he->twin_idx < 0 && he->twin_gid <= MFTL_TWIN_NONE; }
-/* Illegal at quiescent points: no stored twin and no REMOTE/BOUNDARY code. */
-static inline bool MFTLHeIsUnresolved(const MFTL_HalfEdge *he) { return he->twin_idx < 0 && he->twin_gid == MFTL_TWIN_UNKNOWN; }
-static inline int MFTLBoundaryCode(int tag) { return MFTL_TWIN_NONE - tag; }
-/* Boundary tag of a BOUNDARY half-edge (asserts the state). */
-static inline int MFTLHeBoundaryTag(const MFTL_HalfEdge *he)
+static inline void MFTLGetTriangleNeighbors(const MFTL_Object *obj, int t, int out[3])
 {
-  assert(MFTLHeIsBoundary(he));
-  return MFTL_TWIN_NONE - he->twin_gid;
-}
-/* Mark a half-edge BOUNDARY with a tag / REMOTE with a partner gid (keeps the cache). */
-static inline void MFTLHeSetBoundary(MFTL_HalfEdge *he, int tag)
-{
-  he->twin_idx = MFTL_ERROR;
-  he->twin_gid = MFTLBoundaryCode(tag);
-  he->boundary = MFTL_TRUE;
-}
-static inline void MFTLHeSetRemote(MFTL_HalfEdge *he, int partner_gid)
-{
-  he->twin_idx = MFTL_ERROR;
-  he->twin_gid = partner_gid;
-  he->boundary = MFTL_FALSE;
-}
-
-/* Global id of the opposite half-edge for LOCAL (the stored twin's id) and REMOTE (the
-   retained rim id); MFTL_ERROR for BOUNDARY (and for the transient UNKNOWN state), so a
-   boundary code is never mistaken for a gid. */
-static inline int MFTLHeTwinGid(const MFTL_Object *obj, const MFTL_HalfEdge *he)
-{
-  if (he->twin_idx >= 0) return obj->half_edges[he->twin_idx].global_id;
-  return (he->twin_gid >= 0) ? he->twin_gid : MFTL_ERROR;
-}
-
-/* Raw state code for transport / copies: the twin gid (LOCAL, REMOTE), the boundary code
-   (BOUNDARY) or MFTL_TWIN_UNKNOWN. Unpacking this value reproduces the state. */
-static inline int MFTLHeTwinCode(const MFTL_Object *obj, const MFTL_HalfEdge *he)
-{
-  return (he->twin_idx >= 0) ? obj->half_edges[he->twin_idx].global_id : he->twin_gid;
-}
-
-/* Rank-independent undirected edge id: min(gid, twin gid) for LOCAL/REMOTE, gid for BOUNDARY. */
-static inline int MFTLHeEdgeId(const MFTL_Object *obj, const MFTL_HalfEdge *he)
-{
-  const int tg = MFTLHeTwinGid(obj, he);
-  return (tg != MFTL_ERROR && tg < he->global_id) ? tg : he->global_id;
-}
-
-/**
- * @brief The next half-edge of the same triangle (winding order).
- */
-static inline MFTL_HalfEdge *MFTLHeNext(const MFTL_Object *obj, const MFTL_HalfEdge *he) { return MFTLGetHalfedge(obj, he->next_idx); }
-
-/**
- * @brief The previous half-edge of the same triangle (next->next).
- */
-static inline MFTL_HalfEdge *MFTLHePrev(const MFTL_Object *obj, const MFTL_HalfEdge *he)
-{
-  const MFTL_HalfEdge *next = &obj->half_edges[he->next_idx];
-  return MFTLGetHalfedge(obj, next->next_idx);
-}
-
-/**
- * @brief The triangle this half-edge belongs to (every half-edge has one).
- */
-static inline MFTL_Triangle *MFTLHeTriangle(const MFTL_Object *obj, const MFTL_HalfEdge *he) { return MFTLGetTriangle(obj, he->triangle_idx); }
-
-/**
- * @brief The triangle across the edge; requires a stored twin (LOCAL; asserted).
- */
-static inline MFTL_Triangle *MFTLHeAdjacentTriangle(const MFTL_Object *obj, const MFTL_HalfEdge *he)
-{
-  MFTL_HalfEdge *twin = MFTLHeTwin(obj, he);
-  assert(twin != MFTL_NULL);
-  return MFTLGetTriangle(obj, twin->triangle_idx);
-}
-
-/* VERTEX ONE-RING TRAVERSAL
-   The fan of a vertex is walked through its outgoing half-edges (out -> twin -> next). Seen
-   from the side into which the triangle normals point (outside an outward-wound body),
-   next(twin(h)) turns CLOCKWISE around the vertex and twin(prev(h)) counter-clockwise. The
-   walk stops at an outgoing half-edge without a stored twin (physical boundary OR MPI rim).
-   Unless is_inner is set, the walk first rewinds counter-clockwise to such a stop, so an open
-   or rim-cut fan is returned from one end to the other. MFTLVertexRing classifies a fan as
-   closed / open-complete / incomplete. */
-
-/**
- * @brief The triangles of the stored fan of v (see above); max_tris bounds out_tris.
- * is_inner = MFTL_TRUE skips the rewind (only valid for a closed fan).
- * @return The number of triangles.
- */
-static inline int MFTLGetVertexOneRing(const MFTL_Object *obj, const MFTL_Vertex *v, MFTL_Triangle **out_tris, int max_tris, bool is_inner)
-{
-  int count = 0;
-
-  MFTL_HalfEdge *start_he = MFTL_NULL;
-  start_he = MFTLVOutHe(obj, v);
-  assert(start_he);
-
-  MFTL_HalfEdge *curr = start_he;
-
-  // rewind counter-clockwise to the first outgoing half-edge of an open / cut fan
-  if (is_inner == MFTL_FALSE)
+  const MFTL_HalfEdge *he = &obj->tris.he[3 * t];
+  for (int k = 0; k < 3; ++k)
   {
-    while (true)
-    {
-      MFTL_HalfEdge *incoming = MFTLHePrev(obj, curr);
-      MFTL_HalfEdge *cw_neighbor = MFTLHeTwin(obj, incoming);
+    out[k] = (he[k].twin_idx == MFTL_ERROR) ? MFTL_ERROR : MFTLHeTriIdx(he[k].twin_idx);
+  }
+}
 
-      if (!cw_neighbor) break;  // no stored twin: boundary or rim
+// -----------------------------------------------------------------------------
+// 6. BOUNDARY WALKING
+// -----------------------------------------------------------------------------
 
-      if (cw_neighbor == start_he) break;  // closed fan
+/**
+ * @brief The next half-edge along a boundary loop (a twin-less half-edge).
+ *
+ * The boundary is not a stored cycle; it is recovered by rotating around the
+ * target \f$w\f$ of @p h: starting at next(h), which leaves \f$w\f$, step
+ * counter-clockwise (\f$h \mapsto \mathrm{next}(\mathrm{twin}(h))\f$) until
+ * an outgoing half-edge without a twin is reached. Repeated calls traverse a
+ * boundary loop consistently and return to the start after one lap.
+ *
+ * @param obj The mesh object.
+ * @param h   A half-edge with no twin (asserted in Debug).
+ * @return The next twin-less half-edge, or #MFTL_ERROR if the fan does not
+ *         terminate within #MFTL_MAX_VALENCE steps (non-manifold input).
+ *
+ * @note Partition-dependent like MFTLHeIsLocalBoundary(): on a distributed mesh
+ *       the walk follows halo rims as readily as real boundaries.
+ */
+static inline int MFTLHeNextBoundary(const MFTL_Object *obj, int h)
+{
+  MFTL_ASSERT(MFTLHeIsLocalBoundary(obj, h) && "MFTLHeNextBoundary: half-edge is not on a boundary");
 
-      curr = cw_neighbor;
-    }
-    start_he = curr;
+  int curr = MFTLHeNextIdx(h);
+
+  /* Bounded rather than while(true): a corrupt (non-manifold) fan would
+   * otherwise spin forever inside an inline function with no diagnostics. */
+  for (int guard = 0; guard <= MFTL_MAX_VALENCE; ++guard)
+  {
+    const int twin = obj->tris.he[curr].twin_idx;
+    if (twin == MFTL_ERROR) return curr;
+    curr = MFTLHeNextIdx(twin);
   }
 
-  // clockwise walk (next(twin)) collecting the triangles
+  MFTL_ASSERT(0 && "MFTLHeNextBoundary: fan around the target vertex does not close");
+  return MFTL_ERROR;
+}
+
+// -----------------------------------------------------------------------------
+// 7. VERTEX ONE-RING TRAVERSAL
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief Rewinds to the first outgoing half-edge of a vertex's fan.
+ *
+ * Steps clockwise, \f$h \mapsto \mathrm{twin}(\mathrm{prev}(h))\f$ (the inverse
+ * of the counter-clockwise step \f$h \mapsto \mathrm{next}(\mathrm{twin}(h))\f$
+ * the one-ring walks use). On an OPEN fan it stops where the rotation runs out
+ * of twins, which is the fan's first half-edge. On a CLOSED fan it walks one
+ * full lap and returns the counter-clockwise successor of @p start -- any
+ * outgoing half-edge is a valid start there, but the lap costs one valence of
+ * steps, which is why the walkers accept an `is_inner` shortcut.
+ *
+ * @param      obj      The mesh.
+ * @param      start    Any outgoing half-edge of the vertex.
+ * @param[out] open_fan Set to `true` if the fan is open. May be #MFTL_NULL.
+ * @return A valid first outgoing half-edge. Bounded by #MFTL_MAX_VALENCE steps;
+ *         a fan that does not close asserts in Debug.
+ */
+static inline int MFTLVertexFanStart(const MFTL_Object *obj, int start, bool *open_fan)
+{
+  int curr = start;
+  if (open_fan) *open_fan = MFTL_FALSE;
+
+  for (int guard = 0; guard <= MFTL_MAX_VALENCE; ++guard)
+  {
+    const int cw = obj->tris.he[MFTLHePrevIdx(curr)].twin_idx;
+    if (cw == MFTL_ERROR)
+    {
+      if (open_fan) *open_fan = MFTL_TRUE;
+      return curr;
+    }
+    if (cw == start) return curr;
+    curr = cw;
+  }
+
+  MFTL_ASSERT(0 && "MFTLVertexFanStart: fan does not close within MFTL_MAX_VALENCE");
+  return curr;
+}
+
+/**
+ * @brief The 1-ring of TRIANGLES around vertex @p v, in counter-clockwise order.
+ *
+ * @param obj           The mesh object.
+ * @param v             Vertex pool index.
+ * @param[out] out_tris Buffer for triangle pool indices.
+ * @param max_tris      Capacity of @p out_tris (#MFTL_MAX_VALENCE suffices on a
+ *                      remeshed mesh). Overflow asserts in Debug, truncates in
+ *                      Release.
+ * @param is_inner      `true` if the 1-ring is known to be closed: skips the
+ *                      rewind. Must be `false` for a boundary vertex.
+ * @return Number of triangles written; 0 for an isolated vertex.
+ */
+static inline int MFTLGetVertexOneRing(const MFTL_Object *obj, int v, int *out_tris, int max_tris, bool is_inner)
+{
+  int start = obj->verts.rec[v].out_he_idx;
+  if (start == MFTL_ERROR) return 0;  // isolated vertex
+
+  if (!is_inner) start = MFTLVertexFanStart(obj, start, MFTL_NULL);
+
+  int count = 0;
+  int curr = start;
   do
   {
-    assert(count < max_tris && "Buffer overflow in MFTLGetVertexOneRing");
+    MFTL_ASSERT(count < max_tris && "MFTLGetVertexOneRing: buffer overflow");
+    if (count >= max_tris) break;
 
-    out_tris[count++] = MFTLGetTriangle(obj, curr->triangle_idx);
+    out_tris[count++] = MFTLHeTriIdx(curr);
 
-    MFTL_HalfEdge *twin = MFTL_NULL;
-    twin = MFTLHeTwin(obj, curr);
-
-    // end of an open / cut fan (also checked with is_inner)
-    if (twin == MFTL_NULL) break;
-
-    curr = MFTLHeNext(obj, twin);
-
-  } while (curr != start_he);
+    const int twin = obj->tris.he[curr].twin_idx;
+    if (twin == MFTL_ERROR) break;  // boundary stop
+    curr = MFTLHeNextIdx(twin);
+  } while (curr != start);
 
   return count;
 }
 
 /**
- * @brief The neighbour vertices of v: the targets of the outgoing half-edges of its stored
- * fan (for an open fan the last neighbour across the final edge is not included).
- * is_inner as in MFTLGetVertexOneRing.
- * @return The number of neighbours.
+ * @brief The 1-ring of neighbour VERTICES around vertex @p v, in rotational order.
+ *
+ * @param      obj       The mesh.
+ * @param      v         Vertex pool index.
+ * @param[out] out_verts Buffer for the neighbour vertex indices.
+ * @param      max_verts Capacity of @p out_verts.
+ * @param      is_inner  `true` if the 1-ring is known to be closed: skips the
+ *                       rewind. Must be `false` for any boundary vertex.
+ * @return Number of neighbours. An interior vertex has as many neighbours as
+ *         incident triangles; a vertex on an OPEN fan has one MORE, because
+ *         the fan's closing edge is reachable only as an incoming half-edge.
+ *         That extra neighbour is emitted first, keeping rotational order.
+ *
+ * @warning @p is_inner = `true` on a boundary vertex silently drops a neighbour.
  */
-static inline int MFTLGetVertexOneRingVertices(const MFTL_Object *obj, const MFTL_Vertex *v, MFTL_Vertex **out_verts, int max_verts, bool is_inner)
+static inline int MFTLGetVertexOneRingVertices(const MFTL_Object *obj, int v, int *out_verts, int max_verts, bool is_inner)
 {
+  int start = obj->verts.rec[v].out_he_idx;
+  if (start == MFTL_ERROR) return 0;
+
+  bool open_fan = MFTL_FALSE;
+  if (!is_inner) start = MFTLVertexFanStart(obj, start, &open_fan);
+
   int count = 0;
 
-  MFTL_HalfEdge *start_he = MFTL_NULL;
-  start_he = MFTLVOutHe(obj, v);
-  assert(start_he);
-
-  MFTL_HalfEdge *curr = start_he;
-
-  if (is_inner == MFTL_FALSE)
+  /* The walk below steps through v's OUTGOING half-edges, and on an open fan the
+   * far endpoint of the last boundary edge has none: that edge reaches v as an
+   * INCOMING half-edge whose twin -- the outgoing direction -- is the one that
+   * does not exist. next(start) is the far edge of the fan's first triangle, so
+   * its target is exactly that missing neighbour. */
+  if (open_fan)
   {
-    while (true)
-    {
-      MFTL_HalfEdge *incoming = MFTLHePrev(obj, curr);
-      MFTL_HalfEdge *cw_neighbor = MFTLHeTwin(obj, incoming);
-
-      if (!cw_neighbor || cw_neighbor == start_he) break;
-      curr = cw_neighbor;
-    }
-    start_he = curr;
+    MFTL_ASSERT(count < max_verts && "MFTLGetVertexOneRingVertices: buffer overflow");
+    if (count < max_verts) out_verts[count++] = obj->tris.he[MFTLHeNextIdx(start)].vertex_idx;
   }
 
+  int curr = start;
   do
   {
-    assert(count < max_verts && "Buffer overflow in MFTLGetVertexOneRingVertices");
+    MFTL_ASSERT(count < max_verts && "MFTLGetVertexOneRingVertices: buffer overflow");
+    if (count >= max_verts) break;
 
-    out_verts[count++] = MFTLHeTarget(obj, curr);
+    out_verts[count++] = obj->tris.he[curr].vertex_idx;
 
-    MFTL_HalfEdge *twin = MFTL_NULL;
-    twin = MFTLHeTwin(obj, curr);
-    if (!twin) break;
-
-    curr = MFTLHeNext(obj, twin);
-
-  } while (curr != start_he);
+    const int twin = obj->tris.he[curr].twin_idx;
+    if (twin == MFTL_ERROR) break;
+    curr = MFTLHeNextIdx(twin);
+  } while (curr != start);
 
   return count;
 }
 
 /**
- * @brief The local indices of the outgoing half-edges of the stored fan of v (0 when v has no
- * outgoing half-edge). is_inner as in MFTLGetVertexOneRing.
- * @return The number of half-edges.
+ * @brief The OUTGOING half-edges of vertex @p v, one per incident triangle.
+ *
+ * @param      obj      The mesh.
+ * @param      v        Vertex pool index.
+ * @param[out] out_he   Buffer for the outgoing half-edge indices.
+ * @param      max_he   Capacity of @p out_he.
+ * @param      is_inner `true` if the 1-ring is known to be closed: skips the rewind.
+ * @return One index per incident triangle.
+ *
+ * @warning On an open fan this is one FEWER than the incident EDGES: the closing
+ *          edge exists only as the incoming half-edge `MFTLHePrevIdx(first)`.
+ *          Edge iterations must use MFTLGetVertexOneRingVertices() or add it.
  */
-static inline int MFTLGetVertexOneRingHalfedges(const MFTL_Object *obj, const MFTL_Vertex *v, int *out_he_indices, int max_he, bool is_inner)
+static inline int MFTLGetVertexOneRingHalfedges(const MFTL_Object *obj, int v, int *out_he, int max_he, bool is_inner)
 {
+  int start = obj->verts.rec[v].out_he_idx;
+  if (start == MFTL_ERROR) return 0;
+
+  if (!is_inner) start = MFTLVertexFanStart(obj, start, MFTL_NULL);
+
   int count = 0;
-
-  MFTL_HalfEdge *start_he = MFTLVOutHe(obj, v);
-  if (!start_he) return 0;
-
-  MFTL_HalfEdge *curr = start_he;
-
-  if (is_inner == false)
-  {
-    while (true)
-    {
-      MFTL_HalfEdge *incoming = MFTLHePrev(obj, curr);
-      MFTL_HalfEdge *cw_neighbor = MFTLHeTwin(obj, incoming);
-
-      if (!cw_neighbor || cw_neighbor == start_he) break;
-      curr = cw_neighbor;
-    }
-    start_he = curr;
-  }
-
+  int curr = start;
   do
   {
-    assert(count < max_he && "Buffer overflow in MFTLGetVertexOneRingHalfedges");
+    MFTL_ASSERT(count < max_he && "MFTLGetVertexOneRingHalfedges: buffer overflow");
+    if (count >= max_he) break;
 
-    out_he_indices[count++] = (int) (curr - obj->half_edges);
+    out_he[count++] = curr;
 
-    MFTL_HalfEdge *twin = MFTLHeTwin(obj, curr);
-    if (!twin) break;
-
-    curr = MFTLHeNext(obj, twin);
-
-  } while (curr != start_he);
+    const int twin = obj->tris.he[curr].twin_idx;
+    if (twin == MFTL_ERROR) break;
+    curr = MFTLHeNextIdx(twin);
+  } while (curr != start);
 
   return count;
 }
 
-/**
- * @brief The triangles across the three edges of tri, in half-edge order; NULL where the edge
- * has no stored twin (physical boundary or MPI rim).
- */
-static inline void MFTLGetTriangleNeighbors(MFTL_Object *obj, MFTL_Triangle *tri, MFTL_Triangle *out_neighbors[3])
-{
-  MFTL_HalfEdge *edges[3];
-  MFTLGetTriangleHalfedges(obj, tri, edges);
-
-  for (int i = 0; i < 3; i++)
-  {
-    MFTL_HalfEdge *twin = MFTL_NULL;
-    twin = MFTLHeTwin(obj, edges[i]);
-
-    if (twin)
-    {
-      out_neighbors[i] = MFTLHeTriangle(obj, twin);
-    }
-    else
-    {
-      out_neighbors[i] = MFTL_NULL;
-    }
-  }
-}
+// -----------------------------------------------------------------------------
+// 8. CONNECTIVITY MAINTENANCE  (see src/topology/topology.c)
+// -----------------------------------------------------------------------------
 
 /**
- * @brief Re-pairs the stored half-edges (rank-local): a half-edge u->v becomes LOCAL with the
- * stored v->u; an unpaired half-edge keeps its state code (REMOTE gid / BOUNDARY code / UNKNOWN).
- * Needs local vertex indices; refreshes the boundary cache and the boundary-vertex
- * out-half-edge convention (MFTLRefreshBoundaryCache).
+ * @brief Rebuilds the twin of every half-edge from the vertex indices.
+ *
+ * Half-edges are bucketed by ORIGIN vertex in an intrusive linked list; the twin
+ * of \f$u \to v\f$ is the unlinked half-edge \f$v \to u\f$ in the bucket of
+ * \f$v\f$. \f$O(V + H\cdot\bar{d})\f$ with \f$\bar{d}\f$ the mean valence, one
+ * scratch allocation, no hashing. Pairing only unlinked candidates keeps the
+ * relation symmetric on non-manifold input (surplus half-edges stay twin-less
+ * for MFTLCheckMeshIntegrity() to report). Clears the derived bit.
+ *
+ * @param obj The mesh; every `he.twin_idx` is rewritten.
+ *
+ * @warning Pairs by vertex SLOT: two bodies sharing slots (e.g. foreign
+ *          triangles appended to a pool) would be welded together.
+ *
+ * @rank_local
  */
 void MFTLRebuildTwins(MFTL_Object *obj);
 
 /**
- * @brief After unpacking: converts vertex_idx and out_he_idx from global ids to local indices
- * through the id maps (a vertex whose packed out half-edge is not stored gets the next
- * half-edge of an incoming one). Twins are left to MFTLRebuildTwins. A half-edge whose target
- * vertex is missing is fatal.
- */
-void MFTLConvertGlobalToLocalIndices(MFTL_Object *obj);
-
-/**
- * @brief Builds the flattened connectivity arrays (rank-local):
- *  - flat_tri_verts[3t + j]: target vertex of the j-th half-edge of triangle t (a cyclic
- *    rotation of MFTLGetTriangleVertices' order, same orientation);
- *  - flat_tri_neighbors[3t + j]: triangle across that half-edge, -1 if its twin is not stored;
- *  - vert_offsets / vert_tris: CSR vertex -> incident stored triangles.
- * Rebuild after every topology change.
- */
-void MFTLFlattenConnectivity(MFTL_Object *obj);
-
-/**
- * @brief Rank-local structural check: index bounds, triangle half-edge cycles, twin symmetry
- * and vertex consistency, no unresolved twin state, BOUNDARY only on declared-open bodies.
- * Silent on success; prints every violation. Returns MFTL_SUCCESS / MFTL_ERROR.
- */
-int MFTLCheckMeshIntegrity(MFTL_Object *object);
-
-/**
- * @struct MFTL_Neighborhood
- * @brief Result of MFTLGetNeighborhood: gathered vertex and triangle local indices.
- */
-typedef struct MFTL_Neighborhood
-{
-  int *vert_indices;  ///< Array of gathered vertex local indices
-  int n_verts;  ///< Number of vertices found
-  int cap_verts;  ///< Current capacity of the vertex array
-
-  int *tri_indices;  ///< Array of gathered triangle local indices
-  int n_tris;  ///< Number of triangles found
-  int cap_tris;  ///< Current capacity of the triangle array
-} MFTL_Neighborhood;
-
-/**
- * @brief Frees the arrays of a neighbourhood result.
- */
-static inline void MFTLFreeNeighborhood(MFTL_Neighborhood *nb)
-{
-  free(nb->vert_indices);
-  free(nb->tri_indices);
-  nb->n_verts = 0;
-  nb->n_tris = 0;
-}
-
-/**
- * @brief Breadth-first gathering on the vertex/triangle incidence graph (rank-local, stored
- * entities only). Each step alternates the expansion: vertices -> incident triangles (CSR
- * arrays), triangles -> their corners (flat_tri_verts). One step from a vertex gives its
- * triangles; two steps also their vertices (the full one-ring).
+ * @brief Sets #MFTL_FLAG_BOUNDARY on every twin-less half-edge and both its
+ *        endpoints, after clearing it everywhere.
  *
- * seed_indices are vertex (use_vertex_seeds) or triangle local indices; the seeds themselves
- * are part of the result. The result arrays are allocated here (free with
- * MFTLFreeNeighborhood). MFTL_FLAG_VISITED is used internally and cleared again.
- */
-void MFTLGetNeighborhood(MFTL_Object *restrict obj, int *restrict seed_indices, int n_seeds, bool use_vertex_seeds, int steps,
-                         MFTL_Neighborhood *restrict out_result);
-
-/**
- * @brief Builds complete half-edge topology from a vertex list and a list of
- *        triangle index triples (generators and mesh I/O share this path).
+ * Run once, after MFTLRebuildTwins(), while the mesh is COMPLETE -- every
+ * generator does. On a partitioned mesh a missing twin may just mean "the
+ * neighbour is on another rank", so marking then would turn the halo rim into
+ * a fake surface boundary (asserted: the object must hold no ghosts).
  *
- * Wiring convention (matches the generators): for a triangle triple (a, b, c), the three
- * half-edges target the NEXT vertex (b, c, a) and cycle within the triangle. The caller is
- * responsible for consistent (e.g. outward) winding of the triples — see MFTLObjectVolume's
- * sign.
+ * @param obj The mesh; must be complete.
+ * @return The number of boundary half-edges; 0 for a closed mesh.
  *
- * Fills vertices/triangles/half_edges, assigns sequential global ids and sets
- * the next_*_gid counters, links one outgoing half-edge per vertex, then runs
- * MFTLRebuildTwins + MFTLFlattenConnectivity. Positions are stored verbatim with img = 0 (a
- * caller with continuous input wraps them first, e.g. MFTLWrapContinuous, and sets the
- * counters); the wrap flags are invalid until the next collective canonicalisation. The object
- * must be empty.
+ * @rank_local
+ */
+int MFTLMarkMeshBoundary(MFTL_Object *obj);
+
+/**
+ * @brief Validates the half-edge structure, printing every violation to stderr.
  *
- * Rank-local. A half-edge without a partner becomes BOUNDARY only when the object
- * is declared open (MFTLObjectDeclareOpen; tags = boundary-loop index ordered by the
- * smallest vertex gid of the loop); on a closed object it is an error. Duplicate directed
- * half-edges (non-manifold edge / inconsistent orientation / Mobius) and bow-tie vertices
- * are rejected. Returns MFTL_SUCCESS or MFTL_ERROR (the mesh is then not usable).
- */
-int MFTLBuildTopologyFromTriples(MFTL_Object* obj, int nV, const double positions[][3], int nF, const int triples[][3]);
-
-/**
- * @brief Builds an EMPTY object from a distributed triangle soup with global ids (closed body;
- * see MFTLBuildFromSoupEx for open bodies).
+ * Checks: every vertex has an in-range outgoing half-edge whose origin is that
+ * vertex (an isolated vertex is reported as an error); every half-edge target is
+ * in range; every twin is in range, symmetric (\f$\mathrm{twin}(\mathrm{twin}(h))
+ * = h\f$) and has swapped endpoints. Next-cycle and face back-references need no
+ * check under implicit indexing. Twin-less half-edges are legal (open surfaces,
+ * halo rims) and only counted.
  *
- * Vertex i has global id vgid[i], position pos[i] and owner vowner[i] (NULL: this rank);
- * triangle t has global id tgid[t], vertex global ids tvg[t][0..2] (the order defines the
- * orientation) and owner towner[t] (NULL: this rank). The same vertex/triangle may be passed
- * on several ranks (identical ids); duplicates within one rank are ignored. Half-edge ids
- * are compact and identical on every rank holding the triangle; twins are paired locally and
- * the retained twin gid of every rim half-edge is resolved globally. Every entity is stored
- * as local with the given owner; call MFTLRedistribute afterwards. Collective; returns
- * MFTL_ERROR on every rank if the object was not empty or a triangle references an unknown
- * vertex anywhere.
- */
-int MFTLBuildFromSoup(MFTL_Object *obj, int nV, const int *vgid, const double (*pos)[3], const int *vowner, int nT, const int *tgid, const int (*tvg)[3],
-                      const int *towner);
-
-/* Boundary declaration of a soup (plans/16 §2.2). Honoured only for a body declared open
-   (MFTLObjectDeclareOpen, before the build). */
-typedef struct MFTL_BoundaryEdgeDecl
-{
-  int vgid_a, vgid_b;  ///< undirected edge (vertex global ids)
-  int tag;  ///< boundary tag >= 0
-} MFTL_BoundaryEdgeDecl;
-
-typedef struct MFTL_BoundaryDecl
-{
-  /* "BoundaryFromMesh": every edge unmatched on every rank is a boundary, auto-tagged by
-     loop index ordered by the smallest vertex gid of the loop. */
-  int from_mesh;
-  int n_edges;  ///< explicit list (the union over all ranks is used)
-  const MFTL_BoundaryEdgeDecl *edges;
-} MFTL_BoundaryDecl;
-
-/**
- * @brief MFTLBuildFromSoup with an explicit boundary declaration.
+ * It does NOT check that half-edges were created in aligned triples; that is
+ * `inv_implicit_indexing()` in tests/test_mesh_invariants.h.
  *
- * Twins are paired locally, then every unpaired half-edge is resolved in GLOBAL discovery
- * mode (all ranks, before ownership): a partner anywhere -> REMOTE. An edge unmatched
- * everywhere becomes BOUNDARY only if the body is declared open AND decl declares it (explicit
- * edge list or from_mesh); any other unmatched edge, a declared edge that is not unmatched, a
- * duplicate directed half-edge (non-manifold / inconsistent orientation) or a rim edge that is
- * also interior elsewhere is a collective error. decl == NULL: closed body required.
+ * @param obj The mesh.
+ * @return #MFTL_SUCCESS if every check passes, else #MFTL_ERROR.
  */
-int MFTLBuildFromSoupEx(MFTL_Object *obj, int nV, const int *vgid, const double (*pos)[3], const int *vowner, int nT, const int *tgid,
-                        const int (*tvg)[3], const int *towner, const MFTL_BoundaryDecl *decl);
-
-/** @brief As MFTLBuildFromSoupEx, with the WRAPPED positions and explicit image
- *  counters of every vertex (native restart, §3.2); canonicalised afterwards like every build. */
-int MFTLBuildFromSoupImg(MFTL_Object *obj, int nV, const int *vgid, const double (*pos)[3], const int (*vimg)[3], const int *vowner, int nT,
-                         const int *tgid, const int (*tvg)[3], const int *towner, const MFTL_BoundaryDecl *decl);
+int MFTLCheckMeshIntegrity(const MFTL_Object *obj);
 
 /**
- * @brief Copies triangle tri_idx of src (with its half-edges and missing vertices,
- * payload and surface scalar) into dst unless dst already stores that triangle id. Twins
- * are linked through the retained twin gids. Returns the triangle's index in dst. Rank-local.
+ * @brief Labels the edge-connected components of the triangles in the pool.
  *
- * The copy is STAGED — a half-edge whose twin is not in dst keeps the source's
- * state code (REMOTE gid / BOUNDARY code) and dst is not quiescent until the batch is closed
- * by MFTLObjectCommitCopy (collective).
- */
-int MFTLObjectAppendTriangleCopy(MFTL_Object *dst, const MFTL_Object *src, int tri_idx);
-
-/**
- * @brief Closes a batch of staged copies (collective, GLOBAL discovery mode).
+ * Two triangles share a component when a chain of twin links joins them.
+ * Breadth-first search over `twin_idx`, \f$O(T)\f$, one scratch queue. Seeds
+ * are taken in ascending triangle index, so components are numbered in order of
+ * their smallest triangle -- a function of the pool alone.
  *
- * Every non-LOCAL, non-BOUNDARY half-edge of dst is resolved against the live authoritative
- * (non-ghost) half-edges of dst on all ranks. mode MFTL_COMMIT_ASSEMBLE: an unresolved one is a
- * collective error. mode MFTL_COMMIT_CUT: an unresolved copy of an existing source twin (the
- * explicit cut set) becomes BOUNDARY with ONE new tag (max existing tag + 1); dst must be
- * declared open. Duplicate authoritative copies of one half-edge must be identical (topology
- * and position). Returns MFTL_SUCCESS / MFTL_ERROR on every rank.
+ * An #MFTL_Object is assumed to be ONE connected surface (the per-body
+ * reduction relies on it, MFTLEnsembleReduceBodies()); a topology change uses
+ * this labelling to split a body into one object per component. On a
+ * partitioned mesh the answer is LOCAL: parts joined only through another
+ * rank's triangles count as separate components.
+ *
+ * @param obj The mesh.
+ * @param[out] labels `[obj->tris.n]` component of each triangle, or #MFTL_NULL
+ *                    to only count.
+ * @return The number of components; 0 for an empty pool.
+ * @rank_local No MPI.
  */
-int MFTLObjectCommitCopy(MFTL_Object *dst, int mode);
-
-/* ---------------------------------------------------------------------------------------
- * Twin states, declared class, validation, ghost completion, rings and loops (plans/16 §2).
- * All "collective" functions use obj->domain->comm_cart.
- * --------------------------------------------------------------------------------------- */
-
-/** @brief Declare the body open (1) or closed (0, default). Must be identical on all ranks. */
-void MFTLObjectDeclareOpen(MFTL_Object *obj, int open);
-
-/**
- * @brief Classifies the fan of vertex v_idx: MFTL_RING_CLOSED, MFTL_RING_OPEN_COMPLETE (the fan
- * runs from an incoming BOUNDARY to an outgoing BOUNDARY half-edge) or MFTL_RING_INCOMPLETE (the
- * walk reaches a REMOTE / unresolved half-edge, or the fan is malformed). When out_he != NULL the
- * outgoing half-edges are stored in walk order, h -> next(twin(h)) (clockwise seen from the
- * normal side; for an open fan: starting after the incoming boundary, ending with the outgoing
- * BOUNDARY half-edge), at most max_he; *n_out receives the count (may be NULL). Rank-local.
- */
-int MFTLVertexRing(const MFTL_Object *obj, int v_idx, int *out_he, int max_he, int *n_out);
-
-/**
- * @brief Rank-local twin-state checks (the cheap part of MFTLValidateTwinStates): every live
- * half-edge LOCAL/REMOTE/BOUNDARY, LOCAL symmetry and vertex consistency, boundary cache,
- * BOUNDARY only on declared-open bodies, no duplicate directed half-edge, boundary-vertex
- * out-half-edge convention and bow-ties on complete owned fans; with MFTL_VALIDATE_GHOSTS also
- * G1 (every edge of an owned triangle LOCAL or BOUNDARY) and G2 (complete fan of every owned
- * vertex). Returns the number of violations (printed with gids when verbose).
- */
-int MFTLCheckTwinStatesLocal(const MFTL_Object *obj, int flags, int verbose);
-
-/**
- * @brief Collective validation (plans/16 §2.3): the local checks plus remote liveness — every
- * REMOTE twin gid is held as a live authoritative (non-ghost) half-edge on some rank that names
- * the requester back, and every BOUNDARY half-edge carries the same tag on every rank storing
- * it. Returns MFTL_SUCCESS or MFTL_ERROR on every rank (offending gids printed).
- */
-int MFTLValidateTwinStatesEx(MFTL_Object *obj, int flags);
-static inline int MFTLValidateTwinStates(MFTL_Object *obj) { return MFTLValidateTwinStatesEx(obj, 0); }
-
-/* Ghost-completion / discovery statistics of the last MFTLCompleteGhosts call (for tests). */
-typedef struct MFTL_DiscoveryStats
-{
-  int rounds;  ///< completion rounds executed (the last one found nothing)
-  long n_requested;  ///< global number of requested twin gids (all rounds)
-  long n_round1;  ///< resolved by the owned-mode geometric round
-  long n_fallback;  ///< resolved by the global fallback
-  long n_unresolved;  ///< unresolved (collective error)
-} MFTL_DiscoveryStats;
-
-/**
- * @brief Guaranteed ghost completion (G1/G2, plans/16 §2.5; collective). Imports, as ghosts,
- * the twin triangle of every REMOTE edge of an owned triangle and of every REMOTE edge incident
- * to an owned vertex, until no rank has one. Each round: owned-mode discovery (candidate ranks
- * whose box meets the periodic ball B(edge midpoint, l_max/3 + 2 eps)) followed by the mandatory
- * global fallback. eps is the ghost-position staleness margin (0 right after an update).
- * Called by every MFTLRedistribute*; stats may be NULL.
- */
-int MFTLCompleteGhosts(MFTL_Object *obj, double eps, MFTL_DiscoveryStats *stats);
-
-/** @brief Test hook: 1 disables owned-mode round 1 (everything goes through the fallback). */
-void MFTLDiscoverySetForceFallback(int force);
-
-/** @brief Statistics of the last ghost completion run on this rank's process. */
-void MFTLGetLastDiscoveryStats(MFTL_DiscoveryStats *stats);
-
-/* Boundary loops (plans/16 §2.6), identical on every rank. */
-typedef struct MFTL_BoundaryLoop
-{
-  int n;  ///< number of boundary edges (= vertices) in the loop
-  int *edge_ids;  ///< edge ids in loop order (edge i runs vertex_gids[i] -> vertex_gids[i+1])
-  int *vertex_gids;
-  int tag;  ///< tag of the loop (the smallest tag when mixed)
-  int mixed_tags;  ///< 1 when the loop carries more than one tag
-  double length;  ///< sum of the (minimum-image) edge lengths
-  int winding[3];  ///< sum of the edge lattice shifts around the loop (plans/16 §2.6/§3.3)
-} MFTL_BoundaryLoop;
-
-typedef struct MFTL_BoundaryLoopSet
-{
-  int n_loops;
-  MFTL_BoundaryLoop *loops;  ///< ordered by the smallest vertex gid of each loop
-} MFTL_BoundaryLoopSet;
-
-/**
- * @brief Collective: builds all boundary loops from the owned boundary vertices (requires G2,
- * i.e. call after a redistribution, or on a single rank). Every owned boundary vertex emits
- * (in edge id, out edge id, vertex gid, tag, out-edge length); the records are gathered and
- * chained on every rank. Returns MFTL_ERROR (all ranks) on a broken chain.
- */
-int MFTLBoundaryLoops(MFTL_Object *obj, MFTL_BoundaryLoopSet *out);
-void MFTLFreeBoundaryLoops(MFTL_BoundaryLoopSet *set);
-
-/* Internal (library): after local pairing, sets the boundary cache from the state and points
-   every vertex with an outgoing BOUNDARY half-edge at it (plans/16 §2.6). */
-void MFTLRefreshBoundaryCache(MFTL_Object *obj);
-
-/** @brief Removes every entity (and payload) from an object; rank-local. */
-void MFTLObjectClear(MFTL_Object *obj);
+int MFTLLabelConnectedComponents(const MFTL_Object *obj, int *labels);
 
 #endif  // MFTL_TOPOLOGY_H

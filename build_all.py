@@ -20,7 +20,7 @@ Options:
     --valgrind     : Builds in Debug mode WITHOUT Sanitizers.
                      Use this if you intend to run the executable with Valgrind.
 
-    --lib-only     : Builds only the static library (libMFTL2.a).
+    --lib-only     : Builds only the static library (libMFTL.a).
                      Skips building the example executables in examples/.
 
 Examples:
@@ -35,7 +35,7 @@ import sys
 import shutil
 import argparse
 
-def build_project(build_type="Release", use_sanitizers=True, build_examples=True):
+def build_project(build_type="Release", use_sanitizers=True, build_examples=True, comm_profile=False):
     """
     Configures and builds the project with specific flags.
     """
@@ -56,11 +56,13 @@ def build_project(build_type="Release", use_sanitizers=True, build_examples=True
         f"-DCMAKE_BUILD_TYPE={build_type}",
         f"-DENABLE_SANITIZERS={'ON' if use_sanitizers else 'OFF'}",
         f"-DBUILD_EXAMPLES={'ON' if build_examples else 'OFF'}",
+        f"-DMFTL_COMM_PROFILE={'ON' if comm_profile else 'OFF'}",
         ".."
     ]
 
     # Run CMake
-    print(f"Configuring [{build_type}] | Sanitizers: {use_sanitizers} | Examples: {build_examples}...")
+    print(f"Configuring [{build_type}] | Sanitizers: {use_sanitizers} | Examples: {build_examples} "
+          f"| Comm profiling: {comm_profile}...")
     try:
         subprocess.check_call(cmake_args, cwd=build_dir)
     except subprocess.CalledProcessError:
@@ -94,6 +96,9 @@ if __name__ == "__main__":
 
     # Target Options
     parser.add_argument("--lib-only", action="store_true", help="Build ONLY the library, skip examples")
+    parser.add_argument("--comm-profile", action="store_true",
+                        help="Time the individual phases of MFTLRedistribute (MFTL_RedistributeStats t_* fields). "
+                             "Off by default: the per-body timers cost 1.5-2 %% of the phase.")
 
     args = parser.parse_args()
 
@@ -101,9 +106,9 @@ if __name__ == "__main__":
     build_examples = not args.lib_only
     
     if args.debug:
-        build_project(build_type="Debug", use_sanitizers=True, build_examples=build_examples)
+        build_project(build_type="Debug", use_sanitizers=True, build_examples=build_examples, comm_profile=args.comm_profile)
     elif args.valgrind:
-        build_project(build_type="Debug", use_sanitizers=False, build_examples=build_examples)
+        build_project(build_type="Debug", use_sanitizers=False, build_examples=build_examples, comm_profile=args.comm_profile)
     else:
         # Default to Release
-        build_project(build_type="Release", use_sanitizers=False, build_examples=build_examples)
+        build_project(build_type="Release", use_sanitizers=False, build_examples=build_examples, comm_profile=args.comm_profile)
