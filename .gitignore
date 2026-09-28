@@ -34,7 +34,7 @@ run_mpi.sh
 /Testing/
 *vtk
 
-# The documentation toolchain lives in the separate MFTL_Documentation
+# The documentation toolchain lives in the separate MFTL2_Documentation
 # repository and cannot appear here; only __pycache__ from the helper scripts.
 __pycache__/
 

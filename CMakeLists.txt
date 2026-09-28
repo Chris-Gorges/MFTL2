@@ -137,10 +137,10 @@ endif()
 # the ten src/<module>/README.md theory chapters and the four measurement
 # documents in docs/ are the sources; everything that RENDERS them -- the
 # Doxyfile, the MkDocs site, the page-generation machinery and their Python
-# environment -- lives in the separate MFTL_Documentation repository, which
+# environment -- lives in the separate MFTL2_Documentation repository, which
 # reads this tree from wherever it is checked out.
 #
-#     cd ../MFTL_Documentation
+#     cd ../MFTL2_Documentation
 #     python3 view_manual.py                    # the web manual, one command
 #     python3 build_mkdocs.py --serve --open    # ... with live reload
 #     python3 build_docs.py --strict            # the Doxygen manual, zero-warning

@@ -119,20 +119,22 @@ results as prominently as the positive ones.
 
 ## Documentation
 
-- **Read without building anything:** the pre-built manual in the `MFTL_Documentation` repository —
+- **Read without building anything:** the pre-built manual in the `MFTL2_Documentation` repository —
   `prebuilt/MFTL_Manual.pdf` (the whole manual in one PDF) and `prebuilt/html/index.html` (the web manual for
   offline use, opened straight from disk, with the Doxygen manual — call graphs, source browser — at
   `prebuilt/html/doxygen/index.html`).
-- **In this tree:** the Doxygen comments in `include/` and `src/**`, the eleven `src/<module>/README.md` theory
-  chapters (they render on GitHub next to the code) and one measurement document, `docs/analysis.md`.
+- **In this tree:** the Doxygen comments in `include/` and `src/**` and the eleven `src/<module>/README.md` theory
+  chapters (they render on GitHub next to the code). The measurement document the source comments cite as
+  `docs/analysis.md §N` is kept local and is not part of the repository; the manual leaves its Analysis section out
+  when it is absent.
 
-The documentation build lives in `MFTL_Documentation`, checked out beside this one (`../MFTL2` and
-`../MFTL_Documentation`). One command checks every prerequisite, builds the whole manual — guides, theory
+The documentation build lives in [`MFTL2_Documentation`](https://github.com/Chris-Gorges/MFTL2_Documentation)
+(private), checked out beside this one (`../MFTL2` and `../MFTL2_Documentation`). One command checks every prerequisite, builds the whole manual — guides, theory
 chapters with their figures, API reference, and the Doxygen manual with its call and include graphs — and opens
 it in the browser:
 
 ```bash
-cd ../MFTL_Documentation
+cd ../MFTL2_Documentation
 python3 view_manual.py                  # everything, one command; the first run takes a few minutes
 python3 view_manual.py --check          # only report what is missing, with the command that installs it
 python3 build_mkdocs.py --serve --open  # live-reload while writing prose

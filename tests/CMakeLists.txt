@@ -271,7 +271,7 @@ set_tests_properties(test_io test_io_np2 test_io_np4 PROPERTIES RESOURCE_LOCK mf
 mftl_add_mpi_test_at(test_vertex_normals_np3 test_vertex_normals 3)
 
 # The scaling benchmark is an EXAMPLE, and no scaling sweep belongs in this
-# suite -- the build guide (MFTL_Documentation/pages/building.md) states the
+# suite -- the build guide (MFTL2_Documentation/pages/building.md) states the
 # rule: "The rank count is not a scaling knob in this suite; it changes which
 # code path is reachable."
 #
