@@ -266,14 +266,16 @@ accumulated.
 
 ```bash
 cd ../MFTL_Documentation
+python3 view_manual.py                  # checks every prerequisite, builds everything, opens the browser
+python3 view_manual.py --check          # only report what is missing, with the install command
 python3 build_mkdocs.py                 # -> build/site/index.html   (the web manual)
-python3 build_mkdocs.py --serve --open  # live-reload dev server on :8000
+python3 build_mkdocs.py --serve --open  # live-reload dev server (first free port from :8000)
 python3 build_docs.py --strict          # the Doxygen manual; any warning is a failure
 python3 build_docs.py --no-graphs       # much faster while editing prose
 ```
 
 It locates this checkout through `mftl_paths.py`: `--source-dir`, `$MFTL_SOURCE_DIR`, its own
-`mftl-source.txt`, or a sibling `MFTL_6`/`MFTL` directory — so side-by-side checkouts need no configuration.
+`mftl-source.txt`, or a sibling `MFTL2`/`MFTL` directory — so side-by-side checkouts need no configuration.
 
 **Both manuals build with ZERO warnings, and that is the acceptance criterion.** `WARN_IF_UNDOCUMENTED`,
 `WARN_IF_INCOMPLETE_DOC`, `WARN_NO_PARAMDOC` and `WARN_IF_UNDOC_ENUM_VAL` are all on, so **a new function

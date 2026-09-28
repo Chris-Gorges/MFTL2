@@ -126,19 +126,23 @@ results as prominently as the positive ones.
 - **In this tree:** the Doxygen comments in `include/` and `src/**`, the eleven `src/<module>/README.md` theory
   chapters (they render on GitHub next to the code) and one measurement document, `docs/analysis.md`.
 
-The documentation build lives in `MFTL_Documentation`, normally checked out beside this one:
+The documentation build lives in `MFTL_Documentation`, checked out beside this one (`../MFTL2` and
+`../MFTL_Documentation`). One command checks every prerequisite, builds the whole manual — guides, theory
+chapters with their figures, API reference, and the Doxygen manual with its call and include graphs — and opens
+it in the browser:
 
 ```bash
 cd ../MFTL_Documentation
-python3 build_mkdocs.py --serve --open  # the web manual, live-reload on :8000
-python3 build_mkdocs.py                 # -> build/site/index.html (with the Doxygen manual at /doxygen/)
+python3 view_manual.py                  # everything, one command; the first run takes a few minutes
+python3 view_manual.py --check          # only report what is missing, with the command that installs it
+python3 build_mkdocs.py --serve --open  # live-reload while writing prose
 python3 build_docs.py --open            # the Doxygen manual alone: call graphs, source browser
 python3 export_manual.py                # refresh prebuilt/ (offline HTML + PDF)
 ```
 
 It finds this checkout on its own when the two sit side by side; otherwise pass `--source-dir`, set
-`MFTL_SOURCE_DIR`, or write the path into its `mftl-source.txt`. Requirements: Python ≥ 3.9 and Doxygen (Graphviz
-optional); the MkDocs toolchain installs itself into a private virtual environment on first use. Both manuals build
+`MFTL_SOURCE_DIR`, or write the path into its `mftl-source.txt`. Requirements: Python ≥ 3.9, Doxygen and Graphviz;
+the MkDocs toolchain installs itself into a private virtual environment on first use. Both manuals build
 with **zero warnings**, and that is the acceptance criterion — a new function here without `@param`/`@return`
 fails `build_docs.py --strict` there.
 

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.13)
 
-project(MFTL VERSION 6.0 LANGUAGES C)
+project(MFTL VERSION 2.0 LANGUAGES C)
 
 # --- Options ---
 option(ENABLE_SANITIZERS "Enable Address and Undefined sanitizers in Debug mode" ON)
@@ -141,7 +141,8 @@ endif()
 # reads this tree from wherever it is checked out.
 #
 #     cd ../MFTL_Documentation
-#     python3 build_mkdocs.py --serve --open    # the web manual
+#     python3 view_manual.py                    # the web manual, one command
+#     python3 build_mkdocs.py --serve --open    # ... with live reload
 #     python3 build_docs.py --strict            # the Doxygen manual, zero-warning
 #
 # So this file never calls find_package(Doxygen) and there is no `docs` target:
