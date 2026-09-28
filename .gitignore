@@ -37,3 +37,8 @@ run_mpi.sh
 # The documentation toolchain lives in the separate MFTL_Documentation
 # repository and cannot appear here; only __pycache__ from the helper scripts.
 __pycache__/
+
+# Local only, never published: assistant config, measurement notes, cluster scripts.
+CLAUDE.md
+/docs/
+/run_scaling.py
