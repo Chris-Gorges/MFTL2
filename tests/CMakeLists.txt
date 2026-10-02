@@ -263,6 +263,16 @@ mftl_add_mpi_test_at(test_io_np4 test_io 4)
 # write and delete each other's files.
 set_tests_properties(test_io test_io_np2 test_io_np4 PROPERTIES RESOURCE_LOCK mftl_test_io_files)
 
+# The settings module. Its text handling is rank-local and the same at any
+# count; np = 2 is what tests the three collective promises -- only rank 0
+# reads the file yet every rank gets the same struct and verdict, ranks holding
+# DIFFERENT settings are caught before they can disagree about a collective,
+# and a length derived from the mesh is bit-identical everywhere. Both write
+# the same scratch file, hence the lock.
+mftl_add_mpi_test(test_settings 1)
+mftl_add_mpi_test_at(test_settings_np2 test_settings 2)
+set_tests_properties(test_settings test_settings_np2 PROPERTIES RESOURCE_LOCK mftl_test_settings_files)
+
 # MFTLComputeVertexNormals is a LOCAL operation, so a second rank count is not
 # about communication -- it is about the empty-object path. MFTLGenerateSphere
 # gives rank 0 the whole mesh, so at nproc == 3 the other two ranks run the pass
@@ -301,6 +311,31 @@ if(BUILD_EXAMPLES)
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
                    $<TARGET_FILE:leveque_remeshing_parallel>
                    -steps 12 -budget 4 -quiet -verify ${MPIEXEC_POSTFLAGS})
+
+  # The same flow driven entirely by a settings file, the way a solver would
+  # integrate the library: every call takes its block from MFTL_Settings. The
+  # overrides switch on the topology and contact blocks, so the lengths
+  # MFTLSettingsResolve() derives for them reach a real call, and route the
+  # arguments through MFTLSettingsLoadArgs() on a multi-rank run. The physical
+  # check is the one test_leveque_parallel_conserves makes, for the same
+  # reason: holding an MFTL_Object* across a redistribution breaks nothing
+  # structural.
+  add_test(NAME test_settings_driven_run_conserves
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:settings_driven_run>
+                   ${CMAKE_CURRENT_SOURCE_DIR}/../examples/settings/settings_driven_run.toml
+                   --steps 12 --quiet --verify topology.every=4 contact.every=4 contact.self_pairs=true
+                   ${MPIEXEC_POSTFLAGS})
+
+  # Every settings file shipped with the examples must stay loadable: a key
+  # renamed in src/settings/settings_keys.c fails here, with the line, rather
+  # than in somebody's job.
+  file(GLOB _shipped_settings CONFIGURE_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/../examples/settings/*.toml")
+  foreach(_file IN LISTS _shipped_settings)
+    get_filename_component(_name "${_file}" NAME_WE)
+    add_test(NAME test_shipped_settings_${_name}
+             COMMAND $<TARGET_FILE:mftl_settings> check ${_file} --np 4)
+  endforeach()
 
   # OPEN SURFACES. No library test runs the distributed remesher on a surface
   # with a rim; these four examples do, and each checks what an open surface

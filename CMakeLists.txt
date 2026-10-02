@@ -134,8 +134,8 @@ endif()
 # --- Documentation ---------------------------------------------------------
 #
 # There is none here, on purpose. The Doxygen comments in include/ and src/**,
-# the ten src/<module>/README.md theory chapters and the four measurement
-# documents in docs/ are the sources; everything that RENDERS them -- the
+# the twelve src/<module>/README.md theory chapters and the measurement
+# document docs/analysis.md are the sources; everything that RENDERS them -- the
 # Doxyfile, the MkDocs site, the page-generation machinery and their Python
 # environment -- lives in the separate MFTL2_Documentation repository, which
 # reads this tree from wherever it is checked out.

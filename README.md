@@ -67,6 +67,40 @@ MFTLEnsembleDestroy(&ens);                    // cascades to every object
 MPI_Finalize();
 ```
 
+## Configuring a run
+
+Every runtime option — domain and decomposition, remeshing, topology changes, contact, output — lives in one struct,
+`MFTL_Settings`, filled from one settings file per simulation (a subset of TOML) and `section.key=value` overrides
+on the command line. Each section embeds the parameter block its module already takes, so a call passes
+`&cfg.remesh.params` or `&cfg.output.vtk`; no module reads the settings behind its caller's back.
+
+```toml
+# run.toml
+[remesh]
+every             = 1
+target_length     = 0.0        # 0: hold the mesh's starting resolution
+parallel_strategy = "auto"
+
+[topology]
+every = 5
+```
+
+```c
+MFTL_Settings cfg;
+MFTLSettingsDefaults(&cfg);
+MFTLSettingsLoad(&cfg, "run.toml", MPI_COMM_WORLD);       // rank 0 reads, every rank parses the same text
+MFTLSettingsLoadArgs(&cfg, argc, argv, MPI_COMM_WORLD);   // remesh.every=2 on the command line
+MFTL_Ensemble *ens = MFTLSettingsCreateEnsemble(&cfg, MPI_COMM_WORLD);
+/* ... create the bodies ... */
+MFTLSettingsResolve(&cfg, ens);                           // lengths left at 0, measured from the mesh
+MFTLRemeshEnsemble(ens, &cfg.remesh.params, &stats);
+```
+
+A misspelled key, a wrong type or a value out of range is an error naming the file, the line and the key that was
+probably meant. `./build/mftl_settings template` prints every key with its documentation; `./build/mftl_settings
+check run.toml --np 64` validates a file before a job is queued. Every key, default and admissible value is in the
+manual's Settings reference, generated from the one table that declares them (`src/settings/settings_keys.c`).
+
 A hot loop streams compact triangle indices, gathers current positions and forms
 minimum-image edges in registers:
 
@@ -97,6 +131,10 @@ python3 run_local_tests.py        # build + full CTest suite
 ./build/layout_benchmark             # interleaved vs padded vs split xyz, four access patterns
 ./build/leveque_remeshing_singleproc # what feature detection on a smooth surface costs
 
+# a solver-shaped run configured entirely by a settings file, plus command-line overrides
+./build/mftl_settings check examples/settings/settings_driven_run.toml --np 4
+mpirun -n 4 ./build/settings_driven_run examples/settings/settings_driven_run.toml remesh.every=2 --steps 50
+
 # the whole timestep, distributed: advection, ghost sync, geometry, redistribution
 mpirun -n 4 ./build/parallel_advection_redistribute_list 2 2 1 1 1 1 --spheres 256 --refine 3 --verify
 
@@ -123,7 +161,7 @@ results as prominently as the positive ones.
   `prebuilt/MFTL_Manual.pdf` (the whole manual in one PDF) and `prebuilt/html/index.html` (the web manual for
   offline use, opened straight from disk, with the Doxygen manual — call graphs, source browser — at
   `prebuilt/html/doxygen/index.html`).
-- **In this tree:** the Doxygen comments in `include/` and `src/**` and the eleven `src/<module>/README.md` theory
+- **In this tree:** the Doxygen comments in `include/` and `src/**` and the twelve `src/<module>/README.md` theory
   chapters (they render on GitHub next to the code). The measurement document the source comments cite as
   `docs/analysis.md §N` is kept local and is not part of the repository; the manual leaves its Analysis section out
   when it is absent.
@@ -156,8 +194,9 @@ a triangle, signed-distance rasterisation), sphere generation and marching cubes
 sums over each body's holders, the fused per-timestep geometry + per-body quality pass, radix sort, redistribution
 and ghost synchronisation, VTK output, isotropic remeshing — serial and **distributed, by two strategies**
 (`src/remeshing/`) — the LBVH with exact object–object and self-proximity contact detection (`src/bvh/`), the
-spatial halo that makes contact detection work across ranks, and **topology changes** (breakup and coalescence,
-`src/topology_change/`).
+spatial halo that makes contact detection work across ranks, **topology changes** (breakup and coalescence,
+`src/topology_change/`), and the **run configuration** (every runtime option in one struct, from a settings file and
+the command line, `src/settings/`).
 
 Geometry is split by SCOPE, not by entity: `MFTLCompute*` works on one object and never touches MPI,
 `MFTLEnsembleUpdate*` iterates the object list and owns the collective its result needs — a reduction for the

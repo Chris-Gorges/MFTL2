@@ -17,7 +17,8 @@
  *   layer 3   mftl_object.h     mftl_ensemble.h   mftl_meshgen.h
  *             mftl_communication.h                mftl_io.h
  *             mftl_remeshing.h  mftl_bvh.h        mftl_topology_change.h
- *   layer 4   mftl_core.h  (this file)
+ *   layer 4   mftl_settings.h  (sees every module's parameter block)
+ *   layer 5   mftl_core.h  (this file)
  *
  * A header may only include headers from a strictly lower layer.
  */
@@ -43,5 +44,7 @@
 #include "mftl_object.h"
 #include "mftl_remeshing.h"
 #include "mftl_topology_change.h"
+
+#include "mftl_settings.h"
 
 #endif  // MFTL_CORE_H
