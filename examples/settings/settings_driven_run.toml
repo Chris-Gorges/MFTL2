@@ -1,0 +1,35 @@
+# Settings for examples/settings_driven_run.c: the LeVeque deformation of one
+# sphere, remeshed every step.
+#
+#   mpirun -np 4 build/settings_driven_run examples/settings/settings_driven_run.toml
+#   build/mftl_settings check examples/settings/settings_driven_run.toml --np 4
+#
+# Only what differs from the defaults is written here; `mftl_settings template`
+# prints every key with its documentation. Any key can be overridden on the
+# command line, e.g.  remesh.every=2  output.every=10  output.prefix=out/lv
+
+[domain]
+global_min = [0.0, 0.0, 0.0]
+global_max = [1.0, 1.0, 1.0]
+periodic   = false
+cuts       = [0, 0, 0]          # chosen from the rank count
+
+[sphere]
+refinements = 3                 # 1280 triangles
+radius      = 0.15
+center      = [0.35, 0.35, 0.35]
+
+[remesh]
+every                 = 1
+target_length         = 0.0     # hold the starting resolution
+iterations            = 3
+smooth_iterations     = 3
+parallel_strategy     = "auto"
+parallel_phase_budget = 4       # the measured best in a timestep loop
+
+[topology]
+every = 0                       # the LeVeque sheet thins but must not tear here
+
+[output]
+every  = 0                      # e.g. output.every=10 on the command line
+prefix = "leveque_settings"
