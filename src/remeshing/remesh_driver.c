@@ -72,7 +72,7 @@ static int sweep_split(MFTL_Object *obj, const MFTL_RemeshParameters *params)
   {
     if (freeze_blocks_pair(obj, h)) continue;
     if (!MFTLSplitApproved(obj, h, params)) continue;
-    if (MFTLSplitEdge(obj, h) != MFTL_ERROR) count++;
+    if (MFTLSplitEdge(obj, h, params) != MFTL_ERROR) count++;
   }
   return count;
 }
@@ -97,7 +97,7 @@ static int sweep_collapse(MFTL_Object *obj, const MFTL_RemeshParameters *params,
 
     if (MFTLCollapseApproved(obj, h, params, &reason))
     {
-      if (MFTLCollapseEdge(obj, h) == MFTL_SUCCESS) count++;
+      if (MFTLCollapseEdge(obj, h, params) == MFTL_SUCCESS) count++;
       continue;
     }
 

@@ -577,7 +577,7 @@ static int test_compaction_restores_the_ownership_prefix(void)
     if (MFTLTriangleIsFrozen(obj, t) || MFTLTriangleIsFrozen(obj, MFTLHeTriIdx(tw))) continue;
     if (obj->tris.he[h].flags & MFTL_FLAG_VISITED) continue;
 
-    if (MFTLSplitEdge(obj, h) != MFTL_ERROR) n_split++;
+    if (MFTLSplitEdge(obj, h, MFTL_NULL) != MFTL_ERROR) n_split++;
   }
 
   /* Non-vacuity twice over: the rotation only happens when BOTH trailing blocks

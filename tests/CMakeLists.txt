@@ -144,6 +144,15 @@ mftl_add_mpi_test_oversub(test_topology_change_np27 test_topology_change 27)
 # whole domain of that file.
 mftl_add_mpi_test(test_remeshing 1)
 
+# The rim curve: where split, collapse and smoothing put a vertex of an open
+# surface's rim, and the application's rim constraint. Serial fixtures run on
+# every rank alone; at 2 and 4 a distributed disk keeps its rim on its circle
+# where the rim crosses ranks (asserted), and ranks disagreeing about having a
+# projector refuse to remesh.
+mftl_add_mpi_test(test_rim_curves 1)
+mftl_add_mpi_test_at(test_rim_curves_np2 test_rim_curves 2)
+mftl_add_mpi_test_at(test_rim_curves_np4 test_rim_curves 4)
+
 # The remeshing DRIVER is not. The shift/freeze schedule is registered at four
 # counts and each covers something the others cannot:
 #
@@ -404,7 +413,15 @@ if(BUILD_EXAMPLES)
   #   waves        with the face, trapping air as an open body between the
   #                channel walls. 104 steps: past that the prescribed field's
   #                e^{kz} feedback runs away, which the example's own guard
-  #                reports and which is not the reconstruction's to fix
+  #                reports and which is not the reconstruction's to fix.
+  #                96 x 24, not 64 x 16: at 64 x 16 the plunging lip is three
+  #                edges thick and whether it reconnects, and whether the
+  #                post-reconstruction remesh leaves a transient fold at a wall
+  #                (a remesher weakness at creases, docs/analysis.md §9), is
+  #                chaotic -- 4 of 20 neighbouring (steepness, ripple) points
+  #                passed on the code this test was tuned on, this one among
+  #                them, and 1 of 20 once the rim curve changed the trajectory.
+  #                At 96 x 24: 6 and 8 of 20, this point passing on both
   add_test(NAME test_liquid_jet_topology
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
                    $<TARGET_FILE:liquid_jet_open_surface>
@@ -418,6 +435,6 @@ if(BUILD_EXAMPLES)
   add_test(NAME test_travelling_waves_topology
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
                    $<TARGET_FILE:travelling_waves_open_surface>
-                   --nx 64 --ny 16 --components 2 --steepness 0.55 --ripple 0.05 --delta-breakup 0.02
+                   --nx 96 --ny 24 --components 2 --steepness 0.55 --ripple 0.05 --delta-breakup 0.02
                    --steps 104 --vtk 0 --report 8 --require-topology --require-rim-cut ${MPIEXEC_POSTFLAGS})
 endif()

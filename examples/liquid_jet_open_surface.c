@@ -135,12 +135,14 @@
  * ── The nozzle rim ─────────────────────────────────────────────────────────
  *
  * Pinned in the advection step. It is a feature curve to the remesher -- a mesh
- * boundary always is -- and the ridge smoother may slide a lip vertex ALONG the
- * rim to even out the spacing; it does so along the chord of its two rim
- * neighbours, which leaves it slightly inside the circle. So after every remesh
- * each rim vertex, owned and ghost alike, is projected back onto the nozzle
- * circle: a pure function of the position applied to bit-identical copies, so no
- * message is needed. --verify checks the lip never left the circle.
+ * boundary always is -- and the smoother may slide a lip vertex ALONG the rim to
+ * even out the spacing. The remesher places every lip position it makes (split,
+ * collapse, smoothing move) on the rim curve through the neighbouring lip
+ * vertices, which keeps the inflow wall to the bit and the circle to O(h^4), and
+ * then hands it to lip_project, the rim constraint this example passes as
+ * MFTL_RemeshParameters::rim_project, before any approval clause judges it. A
+ * topology change applies the same constraint to the lip it reconstructs.
+ * --verify checks the lip never left the circle.
  *
  * ── Which strategy runs ────────────────────────────────────────────────────
  *
@@ -788,33 +790,41 @@ static void advect(MFTL_Ensemble *ens, const jet_field *f, double t, double dt)
 }
 
 /**
- * @brief Projects every lip vertex in the pool -- owned and ghost -- back onto
- *        the nozzle circle.
+ * @brief The nozzle lip as the remesher's rim constraint (MFTL_RimProjector):
+ *        a position onto the circle of radius R0 in the inflow wall.
  *
- * Run after each remesh. The ridge smoother slides a lip vertex along the chord
- * of its two rim neighbours, which leaves it inside the circle by O(h^2/R0), and
- * a split of a lip edge puts its midpoint on the chord. The projection is a pure
- * function of the position, applied to bit-identical copies, so owner and ghost
- * agree without a message.
+ * Handed to the remesher as MFTL_RemeshParameters::rim_project, which applies
+ * it wherever it places a lip vertex -- a split, a collapse, a smoothing move --
+ * before its approval clauses judge the position, and to every lip vertex a
+ * topology change reconstructs. The rim curve alone already keeps the lip on
+ * the wall to the bit and within O(h^4) of the circle; this removes the rest.
+ * A pure function of the position, so owner and ghost agree without a message.
+ */
+static int lip_project(const MFTL_Domain *dom, double p[3], void *user)
+{
+  (void) user;
+  const double r = sqrt(p[1] * p[1] + p[2] * p[2]);
+  p[0] = dom->global_min[0];
+  if (r > 0.0)
+  {
+    p[1] *= R0 / r;
+    p[2] *= R0 / r;
+  }
+  return MFTL_SUCCESS;
+}
+
+/**
+ * @brief Projects every lip vertex in the pool -- owned and ghost -- onto the
+ *        nozzle circle, for a topology change made WITHOUT remeshing, which
+ *        then has no rim constraint to apply.
  */
 static void project_lip(MFTL_Ensemble *ens)
 {
-  const double x0 = ens->domain.global_min[0];
   for (int o = 0; o < ens->n_local_objects; ++o)
   {
     MFTL_Object *obj = ens->local_objects[o];
     for (int v = 0; v < obj->verts.n; ++v)
-    {
-      if (!MFTLVertexIsMeshBoundary(obj, v)) continue;
-      double *p = MFTLVertexPosMut(obj, v);
-      const double r = sqrt(p[1] * p[1] + p[2] * p[2]);
-      p[0] = x0;
-      if (r > 0.0)
-      {
-        p[1] *= R0 / r;
-        p[2] *= R0 / r;
-      }
-    }
+      if (MFTLVertexIsMeshBoundary(obj, v)) lip_project(&ens->domain, MFTLVertexPosMut(obj, v), MFTL_NULL);
   }
 }
 
@@ -1208,8 +1218,10 @@ int main(int argc, char **argv)
 
   MFTL_RemeshParameters params;
   /* A smooth interface: feature detection off. The lip is a feature regardless
-   * -- a mesh boundary always is -- and slides as a ridge (see project_lip). */
+   * -- a mesh boundary always is -- and slides along its rim curve, held on the
+   * nozzle circle by lip_project. */
   MFTLInitRemeshParams(&params, MFTL_REMESH_ISOTROPIC, target, cfg.iterations, MFTL_SMOOTH_TRIANGLE_BASED, 180.0);
+  params.rim_project = lip_project;
   params.smooth_iterations = cfg.smooth;
   params.parallel_strategy = cfg.strategy;
   params.parallel_phase_budget = cfg.budget;
@@ -1319,7 +1331,6 @@ int main(int argc, char **argv)
         MPI_Abort(MPI_COMM_WORLD, 1);
       }
       t_remesh += MPI_Wtime() - a;
-      project_lip(ens);
 
       long ops[3] = {st.n_split, st.n_collapse, st.n_flip}, gops[3];
       MPI_Allreduce(ops, gops, 3, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
@@ -1372,7 +1383,7 @@ int main(int argc, char **argv)
           MPI_Abort(MPI_COMM_WORLD, 1);
         }
         free(bodies);
-        project_lip(ens);
+        if (!remeshing) project_lip(ens);  // otherwise topt.remesh carried lip_project
 
         measure(ens, &after);
         v_surgery += after.sum[S_VOLUME] - before.sum[S_VOLUME];

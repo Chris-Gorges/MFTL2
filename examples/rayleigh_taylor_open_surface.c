@@ -112,13 +112,13 @@
  * Restricted to MFTL_FLAG_BOUNDARY vertices the coordinate test is also
  * unambiguous, which is the argument the MFTL_5 comment was really making: every
  * rim vertex of this patch lies on a side wall by construction, and the
- * remeshing operators keep it there -- a split midpoint of two points on one wall
- * is on that wall to the bit, a rim collapse keeps a rim position, the ridge
- * smoother moves a rim vertex along the chord of its two rim neighbours (so the
- * wall coordinate is untouched), and the box corners are CORNER vertices that no
- * operator moves at all. An INTERIOR vertex that wanders onto a wall plane is
- * never asked the question. The snap after every remesh absorbs round-off, and
- * `--verify` checks that no rim vertex has left its wall.
+ * remeshing operators keep it there -- a split or a rim collapse puts its vertex
+ * on the rim curve, which keeps a wall both ends lie on to the bit, the smoother
+ * moves a rim vertex along that curve, and the box corners are CORNER vertices
+ * that no operator moves at all. An INTERIOR vertex that wanders onto a wall
+ * plane is never asked the question. The snap is handed to the remesher as its
+ * rim constraint (rt_rim_project), so it is applied wherever a rim position is
+ * made, and `--verify` checks that no rim vertex has left its wall.
  *
  * ── The loop ───────────────────────────────────────────────────────────────
  *
@@ -661,12 +661,27 @@ static void snap_to_domain(const MFTL_Domain *dom, int mask, double pos[3])
 }
 
 /**
+ * @brief The side walls as the remesher's rim constraint (MFTL_RimProjector).
+ *
+ * Handed over as MFTL_RemeshParameters::rim_project, so every rim position the
+ * remesher or a topology change makes is snapped before anything judges it. The
+ * rim curve already keeps a planar wall to the bit; what this adds is the clamp
+ * that keeps MFTLGetOwnerProc honest at global_max.
+ */
+static int rt_rim_project(const MFTL_Domain *dom, double pos[3], void *user)
+{
+  (void) user;
+  snap_to_domain(dom, wall_mask(dom, pos), pos);
+  return MFTL_SUCCESS;
+}
+
+/**
  * @brief Re-snaps every rim vertex in the pool -- owned AND ghost.
  *
- * Run after each remeshing pass. Ghosts too, and without communication: the snap
- * is a pure function of the position, and after the pass every ghost is a
- * bit-exact copy of its owner (the spanning driver closes with a plain
- * redistribution), so both copies land on the same value.
+ * Only for a topology change made WITHOUT remeshing, which then has no rim
+ * constraint to apply. Ghosts too, and without communication: the snap is a
+ * pure function of the position and every ghost is a bit-exact copy of its
+ * owner, so both copies land on the same value.
  */
 static void snap_rim(MFTL_Ensemble *ens)
 {
@@ -1176,6 +1191,7 @@ int main(int argc, char **argv)
   params.smooth_iterations = cfg.smooth;
   params.parallel_strategy = cfg.strategy;
   params.parallel_phase_budget = cfg.budget;
+  params.rim_project = rt_rim_project;
 
   const bool remeshing = cfg.remesh_every > 0;
   const double h_min = MFTLDomainGetHMin(&ens->domain);
@@ -1273,9 +1289,6 @@ int main(int argc, char **argv)
       }
       t_remesh += MPI_Wtime() - a;
 
-      /* The rim, back onto its walls to the bit (a no-op unless round-off). */
-      snap_rim(ens);
-
       long ops[3] = {st.n_split, st.n_collapse, st.n_flip}, gops[3];
       MPI_Allreduce(ops, gops, 3, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
       win.split += gops[0];
@@ -1317,7 +1330,7 @@ int main(int argc, char **argv)
           MPI_Abort(MPI_COMM_WORLD, 1);
         }
         free(bodies);
-        snap_rim(ens);
+        if (!remeshing) snap_rim(ens);  // otherwise topt.remesh carried rt_rim_project
         measure(ens, &after);
         census_bodies(ens, &bc);
         max_bodies = MFTL_MAX(max_bodies, bc.n_bodies);

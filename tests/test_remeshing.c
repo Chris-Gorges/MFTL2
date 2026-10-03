@@ -310,7 +310,7 @@ static int test_split_appends_one_vertex_and_two_triangles(void)
   const int v0 = obj->verts.n;
   const int t0 = obj->tris.n;
 
-  const int m = MFTLSplitEdge(obj, 0);
+  const int m = MFTLSplitEdge(obj, 0, MFTL_NULL);
   TEST_ASSERT(m != MFTL_ERROR);
 
   TEST_ASSERT_EQUAL_INT(v0 + 1, obj->verts.n);
@@ -336,7 +336,7 @@ static int test_split_places_the_vertex_at_the_midpoint(void)
   double expect[3];
   for (int k = 0; k < 3; ++k) expect[k] = 0.5 * (MFTLVertexPos(obj, a)[k] + MFTLVertexPos(obj, b)[k]);
 
-  const int m = MFTLSplitEdge(obj, 0);
+  const int m = MFTLSplitEdge(obj, 0, MFTL_NULL);
   TEST_ASSERT(m != MFTL_ERROR);
 
   for (int k = 0; k < 3; ++k) TEST_ASSERT_EQUAL_DOUBLE(expect[k], MFTLVertexPos(obj, m)[k], 1e-15);
@@ -368,7 +368,7 @@ static int test_split_of_a_boundary_edge_makes_two_boundary_edges(void)
   TEST_ASSERT(MFTLHeIsMeshBoundary(obj, h_bnd));
 
   const int t0 = obj->tris.n;
-  const int m = MFTLSplitEdge(obj, h_bnd);
+  const int m = MFTLSplitEdge(obj, h_bnd, MFTL_NULL);
   TEST_ASSERT(m != MFTL_ERROR);
 
   /* One triangle only: a boundary edge has one incident face, not two. */
@@ -419,7 +419,7 @@ static int test_split_preserves_the_feature_flag_on_both_halves(void)
   const int ga = obj->verts.rec[a].global_id;
   const int gb = obj->verts.rec[b].global_id;
 
-  const int m = MFTLSplitEdge(obj, h_feat);
+  const int m = MFTLSplitEdge(obj, h_feat, MFTL_NULL);
   TEST_ASSERT(m != MFTL_ERROR);
   MFTLObjectBuildDerived(obj);
 
@@ -474,7 +474,7 @@ static int test_collapse_removes_one_vertex_and_two_triangles(void)
   const int v0 = obj->verts.n;
   const int t0 = obj->tris.n;
 
-  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLCollapseEdge(obj, h));
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLCollapseEdge(obj, h, MFTL_NULL));
   TEST_ASSERT_EQUAL_INT(2, MFTLRemeshCompactObject(obj, MFTL_NULL) - 1);  // 1 vertex + 2 triangles
 
   TEST_ASSERT_EQUAL_INT(v0 - 1, obj->verts.n);

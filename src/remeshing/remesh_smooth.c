@@ -374,6 +374,70 @@ static bool ridge_displacement(const MFTL_Object *obj, int v, const int *fan, in
 }
 
 /**
+ * @brief New position of a RIM vertex: moved along the rim CURVE towards the
+ *        point that splits the rim between its two rim neighbours evenly.
+ *
+ * The same move ridge_displacement() makes -- the arc-length difference of the
+ * two rim edges, halved, scaled by the relaxation and capped at the step
+ * fraction of the shorter edge -- but taken along the rim curve
+ * (MFTLRemeshRimCurvePoint()) rather than along the
+ * tangent: a step along a tangent leaves a curved rim by O(step^2 kappa) every
+ * sweep. On a regular polygon the two edges are equal and the vertex stays; on
+ * a planar domain wall the wall coordinate is kept to the bit. The rim
+ * projector, if any, has the last word.
+ *
+ * @param      obj    The mesh.
+ * @param      v      A ridge vertex on the mesh boundary.
+ * @param      fan    Outgoing half-edges of @p v, from fan_halfedges(); the last
+ *                    of an open fan is the outgoing rim half-edge.
+ * @param      n_fan  Their count.
+ * @param      params Relaxation, step fraction, corner angle, rim projector.
+ * @param[out] out    The new position, wrapped.
+ * @param[out] refused Set when the projector refused: the vertex stays.
+ * @return `true` if @p out is the new position; `false` if the rim through
+ *         @p v could not be followed (the caller then takes the tangent step),
+ *         or the projector refused.
+ */
+static bool rim_smooth_position(const MFTL_Object *obj, int v, const int *fan, int n_fan, const MFTL_RemeshParameters *params, double out[3],
+                                bool *refused)
+{
+  *refused = MFTL_FALSE;
+  int h_out = MFTL_ERROR;
+  for (int i = n_fan - 1; i >= 0 && h_out == MFTL_ERROR; --i)
+    if (he_is_rim(obj, fan[i])) h_out = fan[i];
+  if (h_out == MFTL_ERROR) return MFTL_FALSE;
+  const int h_in = MFTLRemeshRimPrevHe(obj, h_out);
+  if (h_in == MFTL_ERROR) return MFTL_FALSE;
+
+  const double *const p = MFTLVertexPos(obj, v);
+  double d1[3], d2[3];
+  MFTLGetMinimumImageVector(obj->domain, d1, p, MFTLVertexPos(obj, MFTLHeOrigin(obj, h_in)));
+  MFTLGetMinimumImageVector(obj->domain, d2, p, MFTLVertexPos(obj, MFTLHeTarget(obj, h_out)));
+  const double l1 = MFTL_SQRT(d1[0] * d1[0] + d1[1] * d1[1] + d1[2] * d1[2]);
+  const double l2 = MFTL_SQRT(d2[0] * d2[0] + d2[1] * d2[1] + d2[2] * d2[2]);
+  if (!(l1 > 0.0 && l2 > 0.0)) return MFTL_FALSE;
+
+  /* Arc length to move towards the successor (negative: the predecessor). */
+  const double limit = params->smooth_max_step_fraction * MFTL_MIN(l1, l2);
+  double shift = params->smooth_relaxation * 0.5 * (l2 - l1);
+  if (shift > limit) shift = limit;
+  if (shift < -limit) shift = -limit;
+
+  const double straight = MFTLRemeshRimStraightDot(params);
+  if (shift >= 0.0)
+    MFTLRemeshRimCurvePoint(obj, h_out, shift / l2, straight, out);
+  else
+    MFTLRemeshRimCurvePoint(obj, h_in, 1.0 + shift / l1, straight, out);
+
+  if (rim_project(params, obj->domain, out) != MFTL_SUCCESS)
+  {
+    *refused = MFTL_TRUE;
+    return MFTL_FALSE;
+  }
+  return MFTL_TRUE;
+}
+
+/**
  * @brief Displacement of a FREE vertex, projected onto its tangent plane.
  *
  * The neighbourhood sums are accumulated as minimum-image OFFSETS from the
@@ -529,6 +593,22 @@ void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params,
       bool open = MFTL_FALSE;
       const int n_fan = fan_halfedges(obj, v, fan, &open);
       if (n_fan <= 0) continue;  // isolated, or a fan too large to traverse
+
+      /* A rim vertex moves along the rim curve, and that move is already the
+       * relaxed, clamped one. */
+      if ((rec->flags & MFTL_FLAG_FEATURE) && (rec->flags & MFTL_FLAG_BOUNDARY) && open)
+      {
+        double q[3];
+        bool refused = MFTL_FALSE;
+        if (rim_smooth_position(obj, v, fan, n_fan, params, q, &refused))
+        {
+          new_pos[3 * v + 0] = q[0];
+          new_pos[3 * v + 1] = q[1];
+          new_pos[3 * v + 2] = q[2];
+          continue;
+        }
+        if (refused) continue;
+      }
 
       double disp[3];
       double min_edge_sq = MFTL_DBL_MAX;

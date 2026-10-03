@@ -162,6 +162,30 @@ typedef enum
 } MFTL_SmoothMode;
 
 /**
+ * @brief Moves a position onto the constraint of an open surface's rim.
+ *
+ * Supplied by the application through MFTL_RemeshParameters::rim_project when
+ * its rim lies on something the rim's own vertices describe only approximately
+ * -- a nozzle circle (which the rim curve already reproduces), a curved support.
+ * Without one the remesher already places rim vertices on the curve through the
+ * rim's own vertices, and on any planar domain wall to the bit; the projector
+ * removes what interpolating the rim's own vertices cannot know.
+ *
+ * Contract: a PURE function of its arguments and the same function on every
+ * rank. Owner and ghost copies are then projected to the same bits with no
+ * message, which is what lets the library apply it wherever it places a rim
+ * vertex.
+ *
+ * @param dom      The domain.
+ * @param[in,out] pos A position on or near the rim, wrapped into the domain;
+ *                 moved onto the constraint in place.
+ * @param user     MFTL_RemeshParameters::rim_project_user.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR to refuse: the split or collapse that
+ *         wanted the position is not made, the smoothing move not taken.
+ */
+typedef int (*MFTL_RimProjector)(const MFTL_Domain *dom, double pos[3], void *user);
+
+/**
  * @struct MFTL_RemeshParameters
  * @brief Parameters of a remeshing pass; initialise with MFTLInitRemeshParams().
  *
@@ -352,6 +376,32 @@ typedef struct MFTL_RemeshParameters
    * ownership and reports MFTL_RemeshStats::n_bodies_unreachable.
    */
   double dispersed_balance_slack;
+
+  /**
+   * Optional constraint of an open surface's rim (default #MFTL_NULL: the curve
+   * alone).
+   *
+   * Without it a rim vertex is placed on the rim CURVE: a split of a rim edge,
+   * a collapse of one, and the smoother's move of a rim vertex all take the
+   * average of the two circular arcs over the edge through the neighbouring
+   * rim vertices -- exact on a circle at any spacing, the chord on a straight
+   * rim, never past the edge's ends -- break it at corners (#MFTL_FLAG_CORNER,
+   * or a turn sharper than `feature_corner_angle`), and keep every planar
+   * domain wall both ends lie on to the bit. A rim split whose curve point
+   * would turn a new triangle over falls back to the chord midpoint. With it, each such
+   * position is then passed through the projector BEFORE the approval clauses
+   * see it, so they judge where the vertex will actually be. A topology change
+   * whose MFTL_TopologyOptions::remesh carries it applies it to every rim vertex
+   * it reconstructs, inside the volume correction.
+   *
+   * Agreed across ranks as PRESENT or ABSENT (a function pointer has no value
+   * to compare); that it is the same function everywhere is the caller's
+   * contract, see #MFTL_RimProjector.
+   */
+  MFTL_RimProjector rim_project;
+
+  /** Passed to `rim_project` unchanged; not compared across ranks. */
+  void *rim_project_user;
 } MFTL_RemeshParameters;
 
 /**
@@ -606,7 +656,27 @@ static inline void MFTLInitRemeshParams(MFTL_RemeshParameters *params, MFTL_Reme
   params->coarsen_frozen_fraction = 1.0; /* disabled: measured, and it did not pay. See the field. */
   params->serial_gather_max_triangles = 0; /* off: the crossover is unmeasured */
   params->dispersed_balance_slack = 1.25;
+  params->rim_project = MFTL_NULL;
+  params->rim_project_user = MFTL_NULL;
 }
+
+/**
+ * @brief Rim placements in this process since the last reset that fell back to
+ *        the chord because a rim neighbour was not found locally.
+ *
+ * Every operation on a rim runs on entities whose fans are complete, so this
+ * should read 0; it exists so a test can say so.
+ *
+ * @return Fallbacks since the last reset.
+ * @rank_local A plain per-process counter.
+ */
+long MFTLRemeshRimFallbacks(void);
+
+/**
+ * @brief Zeroes the counter MFTLRemeshRimFallbacks() reports.
+ * @rank_local
+ */
+void MFTLRemeshResetRimFallbacks(void);
 
 /**
  * @brief Number of MFTLRemeshMeasureBodies() calls in this process since the
@@ -683,7 +753,8 @@ static inline void MFTLRemeshParamsFinalise(MFTL_RemeshParameters *params)
 bool MFTLSplitApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParameters *params);
 
 /**
- * @brief Splits the edge of half-edge @p h at its midpoint.
+ * @brief Splits the edge of half-edge @p h at its midpoint -- on the rim curve
+ *        for a rim edge.
  *
  *        C                    C
  *       / \                  /|\
@@ -694,15 +765,21 @@ bool MFTLSplitApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParameter
  *        D                    D
  *
  * Rewrites the incident triangle(s) and appends one triangle per side. M is the
- * minimum-image midpoint, wrapped into the domain, and inherits the edge's
- * FEATURE/BOUNDARY classification, as do both halves. M and the halves are
- * marked visited, so the same sweep neither re-splits nor collapses them.
+ * minimum-image midpoint, wrapped into the domain -- or, for an edge of an open
+ * surface's RIM, the point of the rim curve over it (see
+ * MFTL_RemeshParameters::rim_project), then the projector if one is set. M
+ * inherits the edge's FEATURE/BOUNDARY classification, as do both halves. M and
+ * the halves are marked visited, so the same sweep neither re-splits nor
+ * collapses them.
  *
- * @param obj The mesh. **May reallocate the pools.**
- * @param h   Half-edge index, normally one MFTLSplitApproved() accepted.
- * @return Pool index of M, or #MFTL_ERROR if @p h is not a live half-edge.
+ * @param obj    The mesh. **May reallocate the pools.**
+ * @param h      Half-edge index, normally one MFTLSplitApproved() accepted.
+ * @param params Supplies the corner angle and the rim projector of a rim split;
+ *               #MFTL_NULL for 45 degrees and none.
+ * @return Pool index of M, or #MFTL_ERROR if @p h is not a live half-edge or
+ *         the projector refused (nothing is modified then).
  */
-int MFTLSplitEdge(MFTL_Object *obj, int h);
+int MFTLSplitEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *params);
 
 /**
  * @brief Is collapsing half-edge @p h (its origin into its target) legal and
@@ -761,16 +838,19 @@ bool MFTLCollapseApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParame
  * @brief Collapses the edge of half-edge @p h, retiring its ORIGIN vertex.
  *
  * The target survives and moves to the position MFTLCollapseApproved()
- * evaluated: its own position if it is a corner or if it alone lies on a
- * feature curve or boundary, otherwise the minimum-image midpoint. The one or
- * two incident triangles and the origin are flagged #MFTL_FLAG_DEAD; pool
- * indices do not change until MFTLRemeshCompactObject().
+ * evaluated with the same @p params: its own position if it is a corner or if
+ * it alone lies on a feature curve or boundary; the rim curve's point (then the
+ * projector) for an edge of an open surface's rim; otherwise the minimum-image
+ * midpoint. The one or two incident triangles and the origin are flagged
+ * #MFTL_FLAG_DEAD; pool indices do not change until MFTLRemeshCompactObject().
  *
- * @param obj The mesh. Allocates nothing.
- * @param h   Half-edge index, normally one MFTLCollapseApproved() accepted.
- * @return #MFTL_SUCCESS, or #MFTL_ERROR if @p h was not collapsible.
+ * @param obj    The mesh. Allocates nothing.
+ * @param h      Half-edge index, normally one MFTLCollapseApproved() accepted.
+ * @param params As passed to MFTLCollapseApproved(), or #MFTL_NULL.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR if @p h was not collapsible or the
+ *         projector refused.
  */
-int MFTLCollapseEdge(MFTL_Object *obj, int h);
+int MFTLCollapseEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *params);
 
 /**
  * @brief Would flipping half-edge @p h strictly lower the squared valence

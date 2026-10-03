@@ -135,6 +135,7 @@ vertices, in evaluation order:
 | 8 | fold-over | $\cos\angle(\mathbf n_\text{old}, \mathbf n_\text{new}) \ge$ `max_normal_deviation_cos` for every surviving triangle; degenerate results refused | inverted triangles |
 
 $p_m = p_b$ if $b$ is a corner or $b$ alone lies on a feature curve or boundary;
+the point of the rim curve (@ref rem_rim) along an edge of an open surface's rim;
 otherwise the minimum-image midpoint (exact on a straight feature, $O(h^2)$ off a
 curved one, acceptable because the edge is short). None of these clauses fails
 loudly; clauses 3 and 6 are the ones the textbook link condition does not imply
@@ -236,6 +237,80 @@ projection makes a fold unlikely, not impossible, where the normal is ill-define
 All differences are minimum-image vectors and positions are wrapped. The sweep
 reads ghost and frozen vertices but moves neither, which makes a distributed
 sweep exact without communication.
+
+### The rim curve {#rem_rim}
+
+The chord midpoint of two rim vertices lies on the rim only if the rim is
+straight; on a curved one it cuts inside by $h^2\kappa/8$, and a remesher splits,
+collapses and smooths the rim every pass. Measured on a unit disk refined and
+coarsened eight times (`target` 0.07 and 0.2, three iterations each): the rim
+ended at $r \in [0.977, 0.988]$. Every position the remesher MAKES on a rim -- the
+split of a rim edge, the target of a rim-edge collapse, the smoother's move of a
+rim vertex -- is therefore taken on the RIM CURVE through the rim's own vertices.
+
+Over the edge $a$-$b$ the curve is the average of two circular arcs: through
+$\mathrm{pred}(a), a, b$ and through $a, b, \mathrm{succ}(b)$. With
+$\mathbf v = b - a$ ($L = \lVert\mathbf v\rVert$) and $\mathbf u$ the third point
+less $a$, the arc bulges away from the third point's side, half its central
+angle $\varphi$ given by
+
+$$
+  \sin\varphi = \frac{\lVert\mathbf u\times\mathbf v\rVert}{\lVert\mathbf u\rVert\,\lVert\mathbf u - \mathbf v\rVert},
+$$
+
+and its point at fraction $f$ is
+
+$$
+  a + \tfrac{\mathbf v}{2} + \tfrac{L}{2}\Big(\frac{\sin\psi}{\sin\varphi}\,\hat{\mathbf c}
+  + \frac{\cos\psi - \cos\varphi}{\sin\varphi}\,\hat{\mathbf n}\Big),\qquad \psi = \varphi(2f-1).
+$$
+
+| property | why it matters |
+|---|---|
+| exact on a circle at ANY spacing | a remeshed rim is unevenly spaced by construction; the same disk keeps $r = 1$ to $6\cdot10^{-16}$ |
+| the chord on a straight rim | straight rims and their corners stay exactly where they are |
+| never past the edge's ends | arcs project into the chord; a 10:1:1 spacing splits at the midpoint, where a uniform spline lands outside the edge |
+| a planar wall kept to the bit | every term is a combination of offsets from $a$, so a coordinate the three points share stays zero; a wall both $a$ and $b$ lie on is also held explicitly |
+
+The first choice was the centripetal Catmull-Rom spline (no cusps within a
+segment, Yuksel et al. 2011). It is $7\cdot10^{-6}$ inside a regular 48-gon but
+$4\cdot10^{-4}$ inside once the spacing is 1:2 -- $O(h^2)$, five times better
+than the chord and still a shrinking rim ($r \in [0.994, 0.998]$ on the same
+disk). Arcs are parameter-free, which is what uneven spacing needs.
+
+The curve BREAKS at a corner -- a vertex flagged `MFTL_FLAG_CORNER`, or one the rim
+turns at by more than `feature_corner_angle` (`MFTLDetectFeatures`'s own test,
+so an unclassified mesh breaks at the same places); that side's arc is dropped,
+and with neither the point is the chord's. The corner rule also bounds every arc
+used to a quarter circle, so its sagitta is at most $0.21 L$.
+
+**A rim split checks for a fold, which a chord split never needed.** The chord
+midpoint lies on $a$-$b$, so $(a, m, c)$ and $(m, b, c)$ keep the orientation of
+$(a, b, c)$; a point off the chord can turn one over when $c$ sits closer to the
+chord than the arc's bulge -- a sliver on a curved rim. The split then falls back
+to the chord midpoint, and is refused only if that folds too (which takes a
+projector).
+
+**Smoothing a rim vertex** keeps the ridge rule's step -- half the difference of
+its two rim edges, times $\lambda$, capped at $\phi$ times the shorter -- but
+measures it ALONG the curve and evaluates the curve there, rather than stepping
+along the tangent, which leaves a curved rim by $O(\text{step}^2\kappa)$.
+
+**The rim constraint.** `MFTL_RemeshParameters::rim_project` is an optional
+`MFTL_RimProjector`: a pure function, the same on every rank, that moves a
+position onto what the rim's own vertices cannot know (a nozzle circle is not
+among those -- the arcs reproduce it -- but a curved support may be). It is
+applied after each of the three placements above, BEFORE the approval clauses
+see the position; a refusal cancels the operation. A topology change whose
+`MFTL_TopologyOptions::remesh` carries it applies it to every rim vertex it
+reconstructs and inside its volume correction. Its presence is agreed across
+ranks with the rest of the block.
+
+Rim neighbours are found by walking the fans of $a$ and $b$, which are complete
+for every entity an operation may touch (an unfrozen entity's one-ring is
+complete). `MFTLRemeshRimFallbacks` counts placements whose walk failed and
+took the chord; it reads 0 in every test. A closed surface never reaches any of
+this, so its results are bit-identical to the chord remesher's.
 
 ### Feature detection on a smooth surface {#rem_features_off}
 

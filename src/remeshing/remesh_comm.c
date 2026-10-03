@@ -303,7 +303,9 @@ double MFTLRemeshWallTime(void) { return MPI_Wtime(); }
 /**
  * @brief Every field of #MFTL_RemeshParameters, in declaration order. A field
  *        missing here is a field the ranks may silently disagree about, so a new
- *        field goes here too.
+ *        field goes here too. The two pointers that close the struct cannot be
+ *        cast to a double: `rim_project` is compared by presence below, and
+ *        `rim_project_user` is the caller's own data.
  */
 #define MFTL_REMESH_AGREED_FIELDS(X)                                                                                                    \
   X(type) X(smooth_mode) X(iterations) X(min_convergence_ops) X(target_length) X(min_edge_length) X(max_edge_length) X(min_edge_length_sq) \
@@ -317,7 +319,10 @@ double MFTLRemeshWallTime(void) { return MPI_Wtime(); }
 
 int MFTLRemeshAgreeParams(const MFTL_Domain *domain, const MFTL_RemeshParameters *params, const char *caller)
 {
-  static const char *const names[] = {MFTL_REMESH_AGREED_FIELDS(MFTL_REMESH_FIELD_NAME)};
+  /* The rim projector is a function pointer: its PRESENCE is what can be
+   * compared, and it decides whether rim operations may be refused -- i.e.
+   * which entities two ranks create. */
+  static const char *const names[] = {MFTL_REMESH_AGREED_FIELDS(MFTL_REMESH_FIELD_NAME) "rim_project"};
   enum
   {
     N = (int) (sizeof(names) / sizeof(names[0]))
@@ -330,7 +335,7 @@ int MFTLRemeshAgreeParams(const MFTL_Domain *domain, const MFTL_RemeshParameters
    * reduction yields both extremes of every field, and equal extremes mean every
    * rank passed the same value. Broadcasting rank 0's block and comparing would
    * let the check fire on one rank only, which is the failure being fixed. */
-  const double local[N] = {MFTL_REMESH_AGREED_FIELDS(MFTL_REMESH_FIELD_VALUE)};
+  const double local[N] = {MFTL_REMESH_AGREED_FIELDS(MFTL_REMESH_FIELD_VALUE)(params->rim_project != MFTL_NULL) ? 1.0 : 0.0};
   double v[2 * N + 1];
   for (int i = 0; i < N; ++i)
   {

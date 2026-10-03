@@ -195,6 +195,33 @@ static void discard_collapsed(MFTL_Ensemble *ens, MFTL_TopoComponent *comps, int
 }
 
 /**
+ * @brief Moves every rim vertex of @p obj -- owned AND ghost -- onto the
+ *        caller's rim constraint, if MFTL_TopologyOptions::remesh carries one.
+ *
+ * Marching cubes puts a rim ON its wall, because a lattice node plane lies on
+ * every wall, but only at lattice resolution WITHIN it: a nozzle circle comes
+ * back as a polygon of chords. The projector is a pure function, so a ghost and
+ * its owner, bit-identical before, are bit-identical after, with no message. A
+ * refusal leaves the vertex where it was.
+ *
+ * @param obj  A body that came out of the reconstruction.
+ * @param opts The options; nothing happens without a projector.
+ */
+static void project_rim(MFTL_Object *obj, const MFTL_TopologyOptions *opts)
+{
+  if (opts->remesh == MFTL_NULL || opts->remesh->rim_project == MFTL_NULL) return;
+  const MFTL_Domain *const dom = obj->domain;
+  for (int v = 0; v < obj->verts.n; ++v)
+  {
+    if (!(obj->verts.rec[v].flags & MFTL_FLAG_BOUNDARY)) continue;
+    double q[3] = {obj->verts.pos[3 * v + 0], obj->verts.pos[3 * v + 1], obj->verts.pos[3 * v + 2]};
+    if (opts->remesh->rim_project(dom, q, opts->remesh->rim_project_user) != MFTL_SUCCESS) continue;
+    MFTLApplyPeriodicity(dom, q);
+    for (int k = 0; k < 3; ++k) obj->verts.pos[3 * v + k] = q[k];
+  }
+}
+
+/**
  * @brief The volume correction's displacement field, left in `verts.normal`,
  *        and the derivative of the enclosed volume along it.
  *
@@ -551,6 +578,11 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
    * test on a reduced double is two ranks disagreeing in the last ulp about
    * whether to enter another. */
   {
+    /* The rim onto its constraint first, so the correction measures and
+     * restores the volume of the surface the caller will keep. */
+    for (int o = 0; o < ens->n_local_objects; ++o)
+      if (came_from(comps, n_comps, ens->local_objects[o]->global_id) >= 0) project_rim(ens->local_objects[o], opts);
+
     double *const va = (double *) MFTLMallocOrDie(2 * (size_t) MFTL_MAX(n_cl, 1) * sizeof(double), "topology volume and derivative");
     const int n_iter = opts->conserve_volume ? 3 : 0;
     for (int iter = 0; iter <= n_iter; ++iter)
@@ -587,6 +619,10 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
           for (int k = 0; k < 3; ++k) p[k] += d * obj->verts.normal[3 * v + k];
           MFTLApplyPeriodicity(dom, p);
         }
+        /* A rim vertex slid within its wall; back onto the constraint. Newton's
+         * next step measures what the projection did, so the volume still
+         * converges, at a rate the projection's share of the field sets. */
+        project_rim(obj, opts);
       }
       MFTLUpdateGhostPositions(ens);
     }

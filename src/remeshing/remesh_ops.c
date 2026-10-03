@@ -173,11 +173,79 @@ bool MFTLSplitApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParameter
   return MFTLGetEdgeLengthSquared(obj, h) > params->max_edge_length_sq;
 }
 
-int MFTLSplitEdge(MFTL_Object *obj, int h)
+/**
+ * @brief Would putting the split vertex of rim half-edge @p h at @p pm turn
+ *        either new triangle over against the one it is cut from?
+ *
+ * The chord midpoint cannot: it lies on A-B, so (A, M, C) and (M, B, C) keep
+ * the orientation of (A, B, C). A point OFF the chord can, when C sits closer
+ * to the chord than the curve's bulge towards it -- a sliver on a curved rim.
+ * The collapse's fold-over threshold, applied to both halves.
+ *
+ * @param obj     The mesh.
+ * @param h       The rim half-edge A->B, in triangle (A, B, C).
+ * @param pm      The candidate position of M.
+ * @param cos_min Smallest admissible cos between the old and a new normal.
+ * @return `true` if M at @p pm folds or degenerates either half. `false` for a
+ *         triangle that is degenerate already: it has no orientation to lose,
+ *         and refusing would leave a sliver the chord split could cut.
+ */
+static bool rim_split_folds(const MFTL_Object *obj, int h, const double pm[3], double cos_min)
+{
+  const int t = MFTLHeTriIdx(h);
+  double n_old[3], n_amc[3], n_mbc[3];
+  tri_area_vector_substituted(obj, t, MFTL_ERROR, MFTL_ERROR, MFTL_NULL, n_old);
+  if (n_old[0] == 0.0 && n_old[1] == 0.0 && n_old[2] == 0.0) return MFTL_FALSE;  // no orientation to turn over
+  tri_area_vector_substituted(obj, t, MFTLHeTarget(obj, h), MFTL_ERROR, pm, n_amc);  // B -> M: (A, M, C)
+  tri_area_vector_substituted(obj, t, MFTLHeOrigin(obj, h), MFTL_ERROR, pm, n_mbc);  // A -> M: (M, B, C)
+  return area_vector_cos(n_old, n_amc) < cos_min || area_vector_cos(n_old, n_mbc) < cos_min;
+}
+
+/**
+ * @brief Where the split vertex of rim half-edge @p h goes.
+ *
+ * The rim curve's point, then the projector; if that would fold a new triangle,
+ * the chord midpoint, then the projector; if that folds too, nowhere.
+ *
+ * @param      obj    The mesh.
+ * @param      h      A rim half-edge.
+ * @param      params Corner angle, fold threshold, rim projector; or #MFTL_NULL.
+ * @param[out] pm     The position.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR when the split must not be made.
+ */
+static int rim_split_position(const MFTL_Object *obj, int h, const MFTL_RemeshParameters *params, double pm[3])
+{
+  const double cos_min = (params != MFTL_NULL) ? params->max_normal_deviation_cos : 0.2;  // MFTLInitRemeshParams' default
+
+  MFTLRemeshRimCurvePoint(obj, h, 0.5, MFTLRemeshRimStraightDot(params), pm);
+  if (rim_project(params, obj->domain, pm) == MFTL_SUCCESS && !rim_split_folds(obj, h, pm, cos_min)) return MFTL_SUCCESS;
+
+  midpoint_periodic(obj->domain, MFTLVertexPos(obj, MFTLHeOrigin(obj, h)), MFTLVertexPos(obj, MFTLHeTarget(obj, h)), pm);
+  if (rim_project(params, obj->domain, pm) == MFTL_SUCCESS && !rim_split_folds(obj, h, pm, cos_min)) return MFTL_SUCCESS;
+  return MFTL_ERROR;
+}
+
+int MFTLSplitEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *params)
 {
   MFTL_ASSERT(obj != MFTL_NULL);
   if (h < 0 || h >= 3 * obj->tris.n) return MFTL_ERROR;
   if (tri_is_dead(obj, MFTLHeTriIdx(h))) return MFTL_ERROR;
+
+  /* ── 0. Where M goes ───────────────────────────────────────────────────────
+   *
+   * Before anything is modified, so that a projector's refusal leaves the mesh
+   * exactly as it was. An interior edge: the minimum-image midpoint. A RIM edge:
+   * the point of the rim curve over it -- the midpoint cuts a curved rim's
+   * corner by O(h^2 kappa) and a remesher does that every pass. */
+  double pm[3];
+  if (he_is_rim(obj, h))
+  {
+    if (rim_split_position(obj, h, params, pm) != MFTL_SUCCESS) return MFTL_ERROR;
+  }
+  else
+  {
+    midpoint_periodic(obj->domain, MFTLVertexPos(obj, MFTLHeOrigin(obj, h)), MFTLVertexPos(obj, MFTLHeTarget(obj, h)), pm);
+  }
   obj->derived &= ~MFTL_DERIVED_GEOMETRY;
 
   /* ── 1. Read the patch ─────────────────────────────────────────────────────
@@ -225,9 +293,6 @@ int MFTLSplitEdge(MFTL_Object *obj, int h)
     f_ad = he[hnt].flags;
     f_db = he[hpt].flags;
   }
-
-  double pm[3];
-  midpoint_periodic(obj->domain, MFTLVertexPos(obj, va), MFTLVertexPos(obj, vb), pm);
 
   /* ── 2. Allocate. `he` is dangling from here on. ──────────────────────────── */
   const int vm = remesh_new_vertex(obj, pm);
@@ -330,16 +395,21 @@ int MFTLSplitEdge(MFTL_Object *obj, int h)
  * Its own position if it is a corner, or if it alone lies on a feature curve or
  * boundary: collapsing a face vertex INTO a ridge vertex is legal, but the
  * midpoint would drag the ridge into the face and erode it one collapse at a
- * time while every approval clause passes. Otherwise the minimum-image
+ * time while every approval clause passes. Along an edge of the open surface's
+ * RIM, the point of the rim curve over it, then the caller's rim projector:
+ * the midpoint would cut a curved rim's corner. Otherwise the minimum-image
  * midpoint -- exact on a straight feature and \f$O(h^2)\f$ off a curved one,
  * acceptable because the edge is short by construction.
  *
- * @param      obj The mesh.
- * @param      a   The vertex that would be retired.
- * @param      b   The vertex that would survive.
- * @param[out] out The survivor's new position.
+ * @param      obj    The mesh.
+ * @param      h      The half-edge a->b.
+ * @param      a      The vertex that would be retired.
+ * @param      b      The vertex that would survive.
+ * @param      params Corner angle and rim projector, or #MFTL_NULL.
+ * @param[out] out    The survivor's new position.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR when the projector refused.
  */
-static void collapse_target_position(const MFTL_Object *obj, int a, int b, double out[3])
+static int collapse_target_position(const MFTL_Object *obj, int h, int a, int b, const MFTL_RemeshParameters *params, double out[3])
 {
   const bool a_is_pinned = vertex_on_feature(obj, a) || MFTLVertexIsMeshBoundary(obj, a);
   const bool b_is_pinned = vertex_on_feature(obj, b) || MFTLVertexIsMeshBoundary(obj, b);
@@ -353,10 +423,17 @@ static void collapse_target_position(const MFTL_Object *obj, int a, int b, doubl
     out[0] = pb[0];
     out[1] = pb[1];
     out[2] = pb[2];
-    return;
+    return MFTL_SUCCESS;
+  }
+
+  if (he_is_rim(obj, h))
+  {
+    MFTLRemeshRimCurvePoint(obj, h, 0.5, MFTLRemeshRimStraightDot(params), out);
+    return rim_project(params, obj->domain, out);
   }
 
   midpoint_periodic(obj->domain, MFTLVertexPos(obj, a), MFTLVertexPos(obj, b), out);
+  return MFTL_SUCCESS;
 }
 
 bool MFTLCollapseApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParameters *params, int *reject_reason)
@@ -461,7 +538,11 @@ bool MFTLCollapseApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParame
   reason = MFTL_REMESH_REJECT_OTHER;
 
   double pm[3];
-  collapse_target_position(obj, a, b, pm);
+  if (collapse_target_position(obj, h, a, b, params, pm) != MFTL_SUCCESS)
+  {
+    reason = MFTL_REMESH_REJECT_FEATURE;
+    goto done;
+  }
 
   for (int pass = 0; pass < 2; ++pass)
   {
@@ -579,7 +660,7 @@ static void kill_triangle(MFTL_Object *obj, int t)
   for (int k = 0; k < 3; ++k) obj->tris.he[3 * t + k].flags |= MFTL_FLAG_DEAD;
 }
 
-int MFTLCollapseEdge(MFTL_Object *obj, int h)
+int MFTLCollapseEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *params)
 {
   MFTL_ASSERT(obj != MFTL_NULL);
   if (h < 0 || h >= 3 * obj->tris.n) return MFTL_ERROR;
@@ -608,7 +689,7 @@ int MFTLCollapseEdge(MFTL_Object *obj, int h)
   if (n_fan_b <= 0 || n_fan_b >= MFTL_REMESH_RING_MAX) return MFTL_ERROR;
 
   double pm[3];
-  collapse_target_position(obj, a, b, pm);
+  if (collapse_target_position(obj, h, a, b, params, pm) != MFTL_SUCCESS) return MFTL_ERROR;
 
   /* ── 1. Every half-edge that ENDS at A now ends at B ──────────────────────
    *

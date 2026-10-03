@@ -369,6 +369,15 @@ admissible axis -- rims on both walls of every non-periodic axis, or a closed cl
 covering all three periodic axes -- is still left uncorrected, and now counted:
 `MFTL_TopologyStats::n_clusters_unmeasured`.
 
+**A rim constraint is applied to the reconstructed rim.** Marching cubes puts a rim
+ON its wall but only at lattice resolution within it, so a nozzle circle comes back
+as chords. When `MFTL_TopologyOptions::remesh` carries a
+`MFTL_RemeshParameters::rim_project` (@ref rem_rim), every rim vertex of a
+reconstructed body -- owned and ghost alike, the projector being a pure function --
+is moved onto it before the correction measures anything, and again after each
+correction step, which slides rim vertices within their walls. Newton's next step
+measures what the projection did, so the volume still converges.
+
 ---
 
 ## Design alternatives {#topo_departures}

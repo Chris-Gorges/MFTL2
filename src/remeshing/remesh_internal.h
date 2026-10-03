@@ -334,6 +334,86 @@ static inline void midpoint_periodic(const MFTL_Domain *domain, const double pa[
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * The rim curve (remesh_rim.c)
+ *
+ * Where the remesher puts a vertex ON an open surface's rim: on the circular
+ * arcs through the rim's own vertices, instead of the chord.
+ * Every caller holds a complete fan around the vertices it asks about (an
+ * unfrozen entity's one-ring is complete), so the rim neighbours are local.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief The rim half-edge that ends where rim half-edge @p h starts.
+ * @param obj The mesh.
+ * @param h   A mesh-boundary half-edge (no twin, #MFTL_FLAG_BOUNDARY).
+ * @return The previous rim half-edge, or #MFTL_ERROR if the walk around the
+ *         origin of @p h meets a twin-less edge that is not a mesh boundary
+ *         (an incomplete fan) or does not end.
+ */
+int MFTLRemeshRimPrevHe(const MFTL_Object *obj, int h);
+
+/**
+ * @brief The rim half-edge that starts where rim half-edge @p h ends.
+ * @param obj The mesh.
+ * @param h   A mesh-boundary half-edge.
+ * @return The next rim half-edge, or #MFTL_ERROR as for MFTLRemeshRimPrevHe().
+ */
+int MFTLRemeshRimNextHe(const MFTL_Object *obj, int h);
+
+/**
+ * @brief `-cos` of the corner angle, the straightness bound
+ *        MFTLDetectFeatures() classifies a feature vertex with.
+ * @param params Supplies `feature_corner_angle`, or #MFTL_NULL for 45 degrees.
+ * @return The bound on the normalised dot product of the two edge directions
+ *         out of a vertex the curve may pass through.
+ */
+double MFTLRemeshRimStraightDot(const MFTL_RemeshParameters *params);
+
+/**
+ * @brief The point of the rim curve over rim half-edge @p h = a->b at fraction
+ *        @p f of its arc, wrapped into the domain.
+ *
+ * The average of the circular arcs over a-b through pred(a) and through
+ * succ(b), evaluated as offsets from a; an arc is dropped where the curve breaks
+ * at a or b (#MFTL_FLAG_CORNER, or a turn sharper than the corner angle), and
+ * with neither the point is the chord's. On a domain wall both a and b lie on,
+ * the point keeps their wall coordinate to the bit.
+ *
+ * @param      obj          The mesh.
+ * @param      h            A mesh-boundary half-edge.
+ * @param      f            Fraction in [0, 1]; 0.5 is the split point.
+ * @param      straight_dot From MFTLRemeshRimStraightDot().
+ * @param[out] out          The point.
+ * @return `true` on the curve; `false` when a rim neighbour was not found, in
+ *         which case @p out is the chord point and the fallback is counted
+ *         (MFTLRemeshRimFallbacks()).
+ */
+bool MFTLRemeshRimCurvePoint(const MFTL_Object *obj, int h, double f, double straight_dot, double out[3]);
+
+/**
+ * @brief Applies the caller's rim projector, if any, and wraps.
+ * @param      params The parameters, or #MFTL_NULL.
+ * @param      dom    The domain.
+ * @param[in,out] pos A rim position.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR when the projector refused.
+ */
+static inline int rim_project(const MFTL_RemeshParameters *params, const MFTL_Domain *dom, double pos[3])
+{
+  if (params == MFTL_NULL || params->rim_project == MFTL_NULL) return MFTL_SUCCESS;
+  if (params->rim_project(dom, pos, params->rim_project_user) != MFTL_SUCCESS) return MFTL_ERROR;
+  MFTLApplyPeriodicity(dom, pos);
+  return MFTL_SUCCESS;
+}
+
+/**
+ * @brief Is half-edge @p h a piece of the open surface's rim?
+ * @param obj The mesh.
+ * @param h   Half-edge index.
+ * @return `true` when it has no twin and carries #MFTL_FLAG_BOUNDARY.
+ */
+static inline bool he_is_rim(const MFTL_Object *obj, int h) { return obj->tris.he[h].twin_idx == MFTL_ERROR && MFTLHeIsMeshBoundary(obj, h); }
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * The parallel gate
  *
  * Every one of these asks the SAME question -- "is every entity this operation
