@@ -989,13 +989,42 @@ static void fold_state(const MFTL_Object *obj, int t, const double n[3], double 
 }
 
 /**
+ * @brief This rank's share of the volume of every body: MFTLEnsembleBodyIntegrals(),
+ *        each body added by its lowest holder only, so a SUM over ranks counts it
+ *        once. Every body of this example is measurable by construction; one
+ *        that is not is a broken run, reported and aborted.
+ */
+static double bodies_volume_share(MFTL_Ensemble *ens)
+{
+  const int b = ens->n_local_objects;
+  MFTL_BodyIntegrals *bi = (MFTL_BodyIntegrals *) malloc((size_t) (b > 0 ? b : 1) * sizeof(MFTL_BodyIntegrals));
+  if (MFTLEnsembleBodyIntegrals(ens, bi) != MFTL_SUCCESS) MPI_Abort(MPI_COMM_WORLD, 1);
+  double v = 0.0;
+  for (int o = 0; o < b; ++o)
+  {
+    if (bi[o].lowest_holder != ens->domain.rank) continue;
+    if (bi[o].volume_status != MFTL_INTEGRAL_DEFINED)
+    {
+      fprintf(stderr, "body %d: volume not measurable (status %d)\n", ens->local_objects[o]->global_id, (int) bi[o].volume_status);
+      MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    v += bi[o].volume;
+  }
+  free(bi);
+  return v;
+}
+
+/**
  * @brief Collective survey of the whole jet.
  *
  * The VOLUME is taken by the divergence theorem over the jet surface closed by
  * the nozzle disk: V = integral of (x - x_nozzle) n_x dA over the jet, since the
- * disk has x - x_nozzle = 0 and contributes nothing, and the one-point centroid
- * rule is exact on a flat triangle. The field is divergence-free, so the jet
- * gains exactly what flows through the lip polygon: A_lip * U per unit time.
+ * disk has x - x_nozzle = 0 and contributes nothing, and the integrand is
+ * linear on a flat triangle. That is the rule MFTLEnsembleBodyIntegrals()
+ * applies to a body whose rim lies on one wall, so the library measures it
+ * (bodies_volume_share); a drop that pinched off is closed and measured about
+ * its own centre. The field is divergence-free, so the jet gains exactly what
+ * flows through the lip polygon: A_lip * U per unit time.
  */
 static void measure(MFTL_Ensemble *ens, jet_stats *g)
 {
@@ -1048,7 +1077,6 @@ static void measure(MFTL_Ensemble *ens, jet_stats *g)
       x[X_MIN_Q] = MFTL_MIN(x[X_MIN_Q], q);
       s[S_Q_SUM] += q;
       s[S_AREA] += area;
-      s[S_VOLUME] += (c[0] - x0) * n[0] * area;
 
       fold_state(obj, t, n, &s[S_INVERTED], &s[S_CREASES]);
     }
@@ -1066,6 +1094,8 @@ static void measure(MFTL_Ensemble *ens, jet_stats *g)
     s[S_TRIS] += (double) obj->tris.n_local;
     s[S_VERTS] += (double) obj->verts.n_local;
   }
+
+  s[S_VOLUME] += bodies_volume_share(ens);
 
   MPI_Allreduce(s, g->sum, S_N, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
   MPI_Allreduce(x, g->min, X_N, MPI_DOUBLE, MPI_MIN, MPI_COMM_WORLD);

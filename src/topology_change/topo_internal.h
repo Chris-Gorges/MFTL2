@@ -120,20 +120,9 @@ double MFTLTopoLocalOverhang(const MFTL_Ensemble *ens, const MFTL_TopoCluster *c
 /** @brief Allocates this rank's window for every cluster it can contribute to or needs. */
 void MFTLTopoMakeWindows(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, MFTL_TopoCluster *cl, int n_cl);
 
-/** @brief Whether a body's rims all lie on domain walls (local check of owned triangles). */
-bool MFTLTopoRimsOnWalls(const MFTL_Object *obj);
-
-/** @brief Walls the rims of a body's OWNED triangles lie on, as bits 2 * axis + side. */
-int MFTLTopoRimWalls(const MFTL_Object *obj);
-
 /** @brief Picks each cluster's volume measure from its rim walls and extent. */
 void MFTLTopoChooseFlux(const MFTL_Domain *dom, MFTL_TopoCluster *cl, int n_cl);
 
-/**
- * @brief This rank's contribution to the volume and the area of an object,
- *        measured the way cluster @p c measures it: OWNED triangles only.
- */
-void MFTLTopoObjectVolume(const MFTL_Object *obj, const MFTL_TopoCluster *c, double *volume, double *area);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 2. Detection

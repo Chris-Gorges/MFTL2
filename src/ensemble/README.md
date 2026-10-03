@@ -10,6 +10,7 @@
 | `ensemble_update.c` | the fused geometry + quality pass, and the collective vertex-normal pass |
 | `ensemble_reduce.c` | per-body reductions and exclusive scans over each body's holders |
 | `ensemble_extents.c` | the periodic extent rule, checked over every body |
+| `ensemble_integrals.c` | area, volume and centroid of every body |
 
 ---
 
@@ -211,6 +212,19 @@ It is a CHECK the application calls -- at output steps, after a topology change 
 rather than a refusal inside a module, because no module is wrong for a body in
 the band $[L/2, 3L/4)$; the rule is the supported envelope, and this is its
 safety check.
+
+---
+
+## Per-body integrals {#ens_body_integrals}
+
+`MFTLEnsembleBodyIntegrals` returns, by local slot, every held body's area,
+volume and centroid with a status each (@ref geom_body_integrals). Two
+`MFTLEnsembleReduceBodies` calls: the first carries what decides HOW a body is
+measured -- its four-frame extent, the walls its rims lie on, whether a rim leaves
+them, its total area vector -- so every holder makes the same choice from the same
+record; the second the flux integrals. `lowest_holder` comes back with it: summing
+a per-body value over the ranks where it equals the rank counts each body once,
+which is how the examples total their volumes.
 
 ---
 

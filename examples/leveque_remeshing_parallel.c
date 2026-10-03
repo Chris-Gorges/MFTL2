@@ -206,10 +206,6 @@ static void measure(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, rep
       double c[3][3];
       MFTLGetTriangleCorners(obj, t, c);
 
-      s[4] += (c[0][0] * (c[1][1] * c[2][2] - c[1][2] * c[2][1]) - c[0][1] * (c[1][0] * c[2][2] - c[1][2] * c[2][0]) +
-               c[0][2] * (c[1][0] * c[2][1] - c[1][1] * c[2][0])) /
-              6.0;
-
       double n[3];
       double area = 0.0;
       MFTLGetTriangleProperties(obj, t, &area, n, MFTL_NULL);
@@ -239,6 +235,17 @@ static void measure(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, rep
       }
       if (n[0] * vn[0] + n[1] * vn[1] + n[2] * vn[2] <= 0.0) s[7] += 1.0;
     }
+  }
+
+  /* The enclosed volume from the library: each body counted by its lowest
+   * holder, so the SUM below adds it once. */
+  {
+    const int b = ens->n_local_objects;
+    MFTL_BodyIntegrals *bi = (MFTL_BodyIntegrals *) malloc((size_t) (b > 0 ? b : 1) * sizeof(MFTL_BodyIntegrals));
+    if (MFTLEnsembleBodyIntegrals(ens, bi) != MFTL_SUCCESS) MPI_Abort(MPI_COMM_WORLD, 1);
+    for (int o = 0; o < b; ++o)
+      if (bi[o].lowest_holder == ens->domain.rank) s[4] += bi[o].volume;
+    free(bi);
   }
 
   double g[8];

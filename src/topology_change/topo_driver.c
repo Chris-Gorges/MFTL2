@@ -315,7 +315,9 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
     const MFTL_Object *const obj = MFTLEnsembleFindLocalObject(ens, bodies[i]);
     if (obj == MFTL_NULL) continue;
     sizes[i] = obj->tris.n_local;
-    if (!MFTLTopoRimsOnWalls(obj)) sizes[nb + MFTLTopoClusterOf(cl, n_cl, bodies[i])] = 1;
+    bool off_wall = MFTL_FALSE;
+    MFTLBodyRimWalls(obj, &off_wall, MFTL_NULL);
+    if (off_wall) sizes[nb + MFTLTopoClusterOf(cl, n_cl, bodies[i])] = 1;
   }
   MFTLTopoCommAllreduceLongLong(dom, sizes, nb + n_cl, 2);
   for (int c = 0; c < n_cl; ++c)
@@ -334,7 +336,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
     const MFTL_Object *const obj = MFTLEnsembleFindLocalObject(ens, bodies[i]);
     if (obj == MFTL_NULL) continue;
     const int c = MFTLTopoClusterOf(cl, n_cl, bodies[i]);
-    const int m = MFTLTopoRimWalls(obj);
+    const int m = MFTLBodyRimWalls(obj, MFTL_NULL, MFTL_NULL);
     for (int b = 0; b < 6; ++b)
       if (m & (1 << b)) walls[6 * c + b] = 1;
   }
@@ -383,7 +385,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
       const int c = MFTLTopoClusterOf(cl, n_cl, obj->global_id);
       if (c < 0 || cl[c].refused || cl[c].flux_axis < 0) continue;
       double v = 0.0, a = 0.0;
-      MFTLTopoObjectVolume(obj, &cl[c], &v, &a);
+      MFTLBodyFluxVolume(obj, cl[c].flux_axis, cl[c].flux_ref, cl[c].centre, &v, &a);
       vol[c] += v;
     }
     MFTLTopoCommAllreduceDouble(dom, vol, n_cl, 2);
@@ -594,7 +596,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
         const int c = came_from(comps, n_comps, obj->global_id);
         if (c < 0 || cl[c].flux_axis < 0) continue;
         double v = 0.0, a = 0.0;
-        MFTLTopoObjectVolume(obj, &cl[c], &v, &a);
+        MFTLBodyFluxVolume(obj, cl[c].flux_axis, cl[c].flux_ref, cl[c].centre, &v, &a);
         va[2 * c] += v;
         if (iter < n_iter) va[2 * c + 1] += displacement_field(obj);
       }

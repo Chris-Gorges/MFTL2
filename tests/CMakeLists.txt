@@ -252,6 +252,15 @@ mftl_add_mpi_test_at(test_periodic_extents_np4 test_periodic_extents 4)
 mftl_add_mpi_test_at(test_periodic_extents_np8 test_periodic_extents 8)
 mftl_add_mpi_test_oversub(test_periodic_extents_np27 test_periodic_extents 27)
 
+# Per-body area, volume and centroid, closed and wall-closed, against
+# references computed on rank 0 before partitioning by code that shares nothing
+# with the library's: the same counts and reasons as the extents above.
+mftl_add_mpi_test(test_body_integrals 1)
+mftl_add_mpi_test_at(test_body_integrals_np2 test_body_integrals 2)
+mftl_add_mpi_test_at(test_body_integrals_np4 test_body_integrals 4)
+mftl_add_mpi_test_at(test_body_integrals_np8 test_body_integrals 8)
+mftl_add_mpi_test_oversub(test_body_integrals_np27 test_body_integrals 27)
+
 # Redistribution is the one module whose behaviour is a FUNCTION of the process
 # grid, so it is registered at four counts and each is genuinely different:
 #

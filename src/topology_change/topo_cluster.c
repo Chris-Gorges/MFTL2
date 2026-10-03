@@ -325,36 +325,7 @@ void MFTLTopoMakeWindows(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, MF
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 5. The one shape a level set cannot reconstruct
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-bool MFTLTopoRimsOnWalls(const MFTL_Object *obj)
-{
-  const MFTL_Domain *const dom = obj->domain;
-  const int nh = 3 * obj->tris.n_local;
-  for (int h = 0; h < nh; ++h)
-  {
-    if (!(obj->tris.he[h].flags & MFTL_FLAG_BOUNDARY)) continue;
-    const double *const a = MFTLVertexPos(obj, obj->tris.he[h].vertex_idx);
-    const double *const b = MFTLVertexPos(obj, obj->tris.he[MFTLHePrevIdx(h)].vertex_idx);
-
-    /* On a wall: both ends on the same non-periodic boundary plane, to the
-     * tolerance the examples snap rims to. */
-    bool on_wall = MFTL_FALSE;
-    for (int k = 0; k < 3 && !on_wall; ++k)
-    {
-      if (dom == MFTL_NULL || dom->is_periodic[k]) continue;
-      const double tol = 1e-8 * dom->domain_size[k];
-      if (fabs(a[k] - dom->global_min[k]) <= tol && fabs(b[k] - dom->global_min[k]) <= tol) on_wall = MFTL_TRUE;
-      if (fabs(a[k] - dom->global_max[k]) <= tol && fabs(b[k] - dom->global_max[k]) <= tol) on_wall = MFTL_TRUE;
-    }
-    if (!on_wall) return MFTL_FALSE;
-  }
-  return MFTL_TRUE;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * 6. Volume, for the correction that keeps a reconstruction from eating it
+ * 5. Volume, for the correction that keeps a reconstruction from eating it
  *
  * A reconstructed surface loses volume: marching cubes cuts chords across a
  * convex surface, O(dx^2 * curvature) per unit area, and on a whole jet that is
@@ -370,27 +341,13 @@ bool MFTLTopoRimsOnWalls(const MFTL_Object *obj)
  * carries no rim -- the jet's nozzle wall is x_min and k = x; a sheet with its
  * rim on the four side walls takes k = z. A closed cluster takes any axis it
  * does not wrap around, with x_k unwrapped about its centre.
+ *
+ * Where the rims lie (MFTLBodyRimWalls()) and the flux itself
+ * (MFTLBodyFluxVolume()) are the per-body integrals' local kernels in
+ * src/geometry/body_integrals.c, with the arithmetic this module always used.
+ * The choice per CLUSTER stays here: a cluster of several bodies is measured
+ * as one, before and after, along the same axis.
  * ═══════════════════════════════════════════════════════════════════════════ */
-
-int MFTLTopoRimWalls(const MFTL_Object *obj)
-{
-  const MFTL_Domain *const dom = obj->domain;
-  int mask = 0;
-  const int nh = 3 * obj->tris.n_local;
-  for (int h = 0; h < nh; ++h)
-  {
-    if (!(obj->tris.he[h].flags & MFTL_FLAG_BOUNDARY)) continue;
-    const double *const a = MFTLVertexPos(obj, obj->tris.he[h].vertex_idx);
-    for (int k = 0; k < 3; ++k)
-    {
-      if (dom == MFTL_NULL || dom->is_periodic[k]) continue;
-      const double tol = 1e-8 * dom->domain_size[k];
-      if (fabs(a[k] - dom->global_min[k]) <= tol) mask |= 1 << (2 * k);
-      if (fabs(a[k] - dom->global_max[k]) <= tol) mask |= 1 << (2 * k + 1);
-    }
-  }
-  return mask;
-}
 
 void MFTLTopoChooseFlux(const MFTL_Domain *dom, MFTL_TopoCluster *cl, int n_cl)
 {
@@ -421,34 +378,4 @@ void MFTLTopoChooseFlux(const MFTL_Domain *dom, MFTL_TopoCluster *cl, int n_cl)
       cl[c].flux_ref = dom->global_min[k];
     }
   }
-}
-
-void MFTLTopoObjectVolume(const MFTL_Object *obj, const MFTL_TopoCluster *c, double *volume, double *area)
-{
-  const MFTL_Domain *const dom = obj->domain;
-  const int k = c->flux_axis;
-  double v = 0.0, a = 0.0;
-
-  for (int t = 0; t < obj->tris.n_local; ++t)
-  {
-    double T[3][3];
-    MFTLGetTriangleCorners(obj, t, T);
-    const double e1[3] = {T[1][0] - T[0][0], T[1][1] - T[0][1], T[1][2] - T[0][2]};
-    const double e2[3] = {T[2][0] - T[0][0], T[2][1] - T[0][1], T[2][2] - T[0][2]};
-    const double n[3] = {0.5 * (e1[1] * e2[2] - e1[2] * e2[1]), 0.5 * (e1[2] * e2[0] - e1[0] * e2[2]), 0.5 * (e1[0] * e2[1] - e1[1] * e2[0])};
-    a += sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-    if (k < 0) continue;
-
-    double x = (T[0][k] + T[1][k] + T[2][k]) / 3.0;
-    if (dom != MFTL_NULL && dom->is_periodic[k])
-    {
-      /* The image nearest the cluster centre: a closed cluster that crosses the
-       * seam on this axis is measured in one piece. */
-      const double L = dom->domain_size[k];
-      x -= L * nearbyint((x - c->centre[k]) / L);
-    }
-    v += (x - c->flux_ref) * n[k];
-  }
-  *volume = v;
-  *area = a;
 }

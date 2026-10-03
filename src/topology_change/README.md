@@ -14,7 +14,7 @@ caller has, and the result does not depend on the process count.
 | File | Job | MPI? |
 |---|---|---|
 | `topo_detect.c` | the event predicate, and the canonical event list | no |
-| `topo_cluster.c` | the lattice, clusters (union-find), extents, rims, the volume measure | no |
+| `topo_cluster.c` | the lattice, clusters (union-find), extents, the volume measure's axis per cluster | no |
 | `topo_reconstruct.c` | rasterisation into windows, the node exchange, the bias, marching cubes on own cells | no |
 | `topo_split_bodies.c` | distributed component labelling, the id decision, building the objects | no |
 | `topo_driver.c` | the three public entry points and the order of everything | no |

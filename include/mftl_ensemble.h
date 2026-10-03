@@ -393,6 +393,80 @@ typedef struct MFTL_PeriodicExtentReport
 int MFTLEnsembleCheckPeriodicExtents(MFTL_Ensemble *ens, MFTL_PeriodicExtentReport *report);
 
 /**
+ * @brief Whether a per-body integral could be computed.
+ */
+typedef enum MFTL_IntegralStatus
+{
+  MFTL_INTEGRAL_DEFINED = 0,  ///< Computed; exact for the mesh.
+  MFTL_INTEGRAL_UNDEFINED = 1,  ///< No such quantity: a rim off the walls, a centroid along an axis the body wraps, a zero volume.
+  MFTL_INTEGRAL_UNSUPPORTED = 2  ///< Defined physically, but no wall to measure from: rims on both walls of every non-periodic axis, a sheet across a fully periodic box.
+} MFTL_IntegralStatus;
+
+/**
+ * @struct MFTL_BodyIntegrals
+ * @brief Area, volume and centroid of one body. Identical, to the bit, on every
+ *        rank that holds the body.
+ *
+ * The VOLUME is that of the region the surface bounds: alone for a closed body
+ * that encloses one, or together with the domain walls otherwise -- the walls
+ * its rims lie on and, when it touches neither wall of `axis`, the wall at
+ * `reference` (an interface spanning the box: the region below it). It is
+ * SIGNED, positive when the normals point away from the region (outward for a
+ * closed body). The CENTROID is that region's, wrapped into the box on a
+ * periodic axis.
+ */
+typedef struct MFTL_BodyIntegrals
+{
+  double area;  ///< Surface area; always defined.
+  double volume;  ///< Signed volume of the region (see above).
+  double centroid[3];  ///< Centroid of the region.
+  MFTL_IntegralStatus volume_status;  ///< Whether `volume` is defined.
+  MFTL_IntegralStatus centroid_status[3];  ///< Per component; UNDEFINED along an axis the body wraps.
+  int axis;  ///< The flux axis measured along, -1 if none.
+  double reference;  ///< On `axis`: the reference wall, or the body's centre for a closed body.
+  bool closed;  ///< The body has no rim.
+  int lowest_holder;  ///< Lowest rank holding the body: sum a per-body value where this equals your rank to count it once.
+} MFTL_BodyIntegrals;
+
+/**
+ * @brief Area, volume and centroid of every body this rank holds, for closed
+ *        bodies and for open ones closed by the domain walls.
+ *
+ * Every quantity is the flux of a polynomial field through the surface, summed
+ * over owned triangles and reduced over the body's holders; the divergence
+ * theorem makes it a volume integral, exact for the mesh. Which region, and so
+ * which field, is decided per body from one first reduction:
+ *
+ * | the body | measured | along |
+ * |---|---|---|
+ * | closed, area vector zero (it encloses a region) | that region | any axis it does not cover, about its centre |
+ * | open, every rim on a wall | closed by the walls | an axis with rims on exactly one wall, from that wall; else the first non-periodic axis whose walls carry none, from its lower wall; UNSUPPORTED if every non-periodic axis has rims on both |
+ * | closed, area vector non-zero (a sheet across periodic axes) | between sheet and wall | the axis the area vector points along, from its lower wall; UNSUPPORTED if that axis is periodic |
+ * | open, a rim off the walls | -- | UNDEFINED |
+ *
+ * The rule for open bodies is the one every open-surface example hand-coded:
+ * Rayleigh-Taylor and the travelling waves measure along z from the floor, the
+ * jet along x from the nozzle wall; a drop hanging from the ceiling is measured
+ * from the ceiling. A centroid component along an axis the body wraps (covers,
+ * see MFTLPeriodicExtentResolve()) is UNDEFINED. Compositions -- the liquid
+ * around bubbles in a periodic box, \f$V_\mathrm{cell} - \sum_b V_b\f$; the gas
+ * above an interface, \f$V_\mathrm{box} - V\f$ -- are the caller's arithmetic.
+ *
+ * Cost: two MFTLEnsembleReduceBodies() calls, of 37 and 4 values per held body,
+ * and two streaming passes over the owned triangles.
+ *
+ * @param ens      The ensemble.
+ * @param[out] out `[n_local_objects]`, by LOCAL SLOT. May be #MFTL_NULL when
+ *                 this rank holds no body.
+ * @return #MFTL_SUCCESS (the per-body verdicts are in the statuses), or
+ *         #MFTL_ERROR on a NULL ensemble or a NULL @p out on a rank holding
+ *         bodies.
+ *
+ * @collective Ranks holding no bodies must call it too.
+ */
+int MFTLEnsembleBodyIntegrals(MFTL_Ensemble *ens, MFTL_BodyIntegrals *out);
+
+/**
  * @brief Refreshes every local object's `global_n_triangles` /
  *        `global_n_vertices` and the ensemble's `total_global_triangles`.
  *

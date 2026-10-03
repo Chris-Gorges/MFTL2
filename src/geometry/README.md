@@ -12,6 +12,7 @@ Everything in this directory is **local** — no MPI:
 | `vertex_geometry.c` | area- or angle-weighted `verts.normal` for a mesh |
 | `signed_distance.c` | signed distance to a mesh on a (periodic) lattice window |
 | `periodic_extent.c` | a body's extent on a periodic axis, and whether it covers the axis |
+| `body_integrals.c` | a body's flux integrals (volume, first moments) and where its rims lie, per rank |
 
 The collective wrappers (`MFTLEnsembleUpdate`, `MFTLEnsembleUpdateVertexNormals`)
 live in @ref mftl_mod_ensemble; the split is by *scope*, not by entity
@@ -271,3 +272,70 @@ winding needs none of it: it is the cycle sum of the per-edge minimum-image
 wraps. Revive it only for a required case with a compact body of at least
 $L/2$ on a periodic axis -- unit-cell slug flow with a bubble longer than half
 the cell, a drop stretched past half a short periodic shear box.
+
+---
+
+## Area, volume and centroid of a body {#geom_body_integrals}
+
+`MFTLEnsembleBodyIntegrals` (@ref mftl_mod_ensemble) returns, per body, its
+area, the volume of the region it bounds and that region's centroid, each with a
+status. The local half is here. Every quantity is the flux of a polynomial
+field $\mathbf F$ with $\nabla\cdot\mathbf F$ known, so the divergence theorem
+turns a sum over the owned triangles into a volume integral:
+
+| field $\mathbf F$ | $\nabla\cdot\mathbf F$ | flux over the region's boundary |
+|---|---|---|
+| $y_k\,\mathbf e_k$ | 1 | $V$ |
+| $\tfrac12 y_k^2\,\mathbf e_k$ | $y_k$ | $V\,(C_k - r_k)$ |
+| $y_k y_j\,\mathbf e_k$, $j\ne k$ | $y_j$ | $V\,(C_j - r_j)$ |
+
+with $\mathbf y = \mathbf x - \mathbf r$. The integrands are linear and quadratic
+on a flat triangle, so with $S_{t,k}$ its area vector's component the sums are
+exact:
+
+$$
+  \int_T y_k n_k\,dA = S_{t,k}\,\bar y_k,\qquad
+  \int_T y_k y_j n_k\,dA = \frac{S_{t,k}}{12}\Big(\sum_i y_{k,i}y_{j,i} + \sum_i y_{k,i}\sum_i y_{j,i}\Big).
+$$
+
+**Which region.** The flux through the SURFACE equals the volume integral only if
+every other part of the region's boundary contributes nothing:
+
+| the body | the region | $k$ and $r_k$ | why nothing else contributes |
+|---|---|---|---|
+| closed, total area vector zero | the one it encloses | any axis it does not cover; its centre | there is nothing else |
+| open, every rim on a wall | closed by the walls | rims on exactly one wall of $k$: that wall; else an axis whose walls carry no rim: its lower wall | $\mathbf F\cdot\mathbf n = 0$ on walls across the other axes, $\mathbf F = 0$ on the wall at $r_k$ |
+| closed, total area vector non-zero | between the sheet and a wall | the axis the area vector points along, its lower wall | a sheet across periodic axes separates the box along that axis |
+
+The open rule picks what every open-surface example hand-coded: Rayleigh–Taylor
+and the travelling waves from the floor along $z$, the jet from the nozzle wall
+along $x$; a drop hanging from the ceiling is measured from the ceiling. The
+topology change keeps its own choice per CLUSTER (`MFTLTopoChooseFlux`), which
+agrees on all of them, and shares the kernels. A body whose rim leaves the walls has no region
+(UNDEFINED); one with rims on both walls of every non-periodic axis, or a sheet
+across a fully periodic box, has one but no wall to measure it from
+(UNSUPPORTED). A centroid component along an axis the body COVERS
+(@ref geom_periodic_extent) is UNDEFINED: the body wraps it. On a periodic axis
+every triangle is moved rigidly into the image nearest the body's centre, which
+the four-frame extent makes exact for every body narrower than $3L/4$ -- wider
+than the rule allows, and measured right anyway.
+
+The volume is SIGNED, positive when the normals point away from the region:
+outward for a closed body. A closed body's area vector is zero to round-off and a
+separating sheet's is its cross-section, so the test against $10^{-8}$ of the area
+has no length scale and no ambiguity.
+
+**Compositions are the caller's arithmetic**, not machinery: the liquid around $N$
+bubbles in a periodic box is $V_\mathrm{cell} - \sum_b V_b$ (its centre is
+undefined, it wraps); the gas above a wall-closed interface is
+$V_\mathrm{box} - V$; a slab between two films that each wrap $x$ and $y$ is the
+difference of their volumes, each measured from the floor. Inside/outside queries
+for a point are not provided: ray parity with an exact orientation test would be
+the way, when IBM coupling needs one.
+
+**Cost.** Two holder reductions (37 and 4 values per body) and two passes over
+the owned triangles: 23 ns per triangle on a periodic domain against 5.7 for
+`MFTLEnsembleUpdate` (Apple silicon, np = 1, 328 k triangles). The four-frame
+extent (12 ns) and the lifted moments (10 ns) are the bulk; the extent's frames
+keep the arithmetic the topology change is bit-identical with. A call for output
+intervals and diagnostics, not for every timestep.

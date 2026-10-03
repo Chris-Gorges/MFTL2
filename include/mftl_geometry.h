@@ -824,4 +824,96 @@ void MFTLPeriodicExtentAddObject(const MFTL_Object *obj, double acc[MFTL_PERIODI
  */
 void MFTLPeriodicExtentResolve(const MFTL_Domain *dom, const double acc[MFTL_PERIODIC_EXTENT_SLOTS], MFTL_PeriodicExtent *out);
 
+// -----------------------------------------------------------------------------
+// 9. BODY FLUX INTEGRALS  (see src/geometry/body_integrals.c)
+// -----------------------------------------------------------------------------
+//
+// The local half of MFTLEnsembleBodyIntegrals(): sums over one rank's OWNED
+// triangles, to be added up over a body's holders. A body's volume and centroid
+// are fluxes of polynomial fields through its surface; the region they measure
+// is the one the surface bounds alone (closed) or together with the walls its
+// rims lie on.
+
+/**
+ * @brief How far, relative to the domain size, a rim vertex may lie from a wall
+ *        plane and still be ON it: the tolerance the topology change and the
+ *        examples snap rims to.
+ */
+#define MFTL_BODY_WALL_TOL 1e-8
+
+/** @brief Values MFTLBodyFluxMoments() produces: the volume and three moments. */
+#define MFTL_BODY_MOMENT_SLOTS 4
+
+/**
+ * @brief Where the rim of @p obj lies: which domain walls, and whether every rim
+ *        edge lies on one.
+ *
+ * Over the mesh-boundary half-edges of OWNED triangles. A rim edge is on a wall
+ * when both its ends are within #MFTL_BODY_WALL_TOL of the same non-periodic
+ * wall plane; the wall mask records the walls the edges' target vertices touch.
+ *
+ * @param      obj      The mesh.
+ * @param[out] off_wall Set when some rim edge lies on no wall, or #MFTL_NULL.
+ * @param[out] n_rim    Mesh-boundary half-edges counted, or #MFTL_NULL.
+ * @return Bit `2k` for the wall `x_k = min`, bit `2k+1` for `x_k = max`.
+ * @rank_local
+ */
+int MFTLBodyRimWalls(const MFTL_Object *obj, bool *off_wall, int *n_rim);
+
+/**
+ * @brief The extent accumulator and the area vector of the OWNED triangles of
+ *        @p obj, from one gather of each triangle's corners.
+ *
+ * The total area vector \f$\sum_t \vect{S}_t\f$ of a surface that encloses a
+ * region is zero; a sheet that separates a periodic box has one the size of
+ * the cross-section.
+ *
+ * @param      obj    The mesh.
+ * @param[in,out] extent An extent accumulator (MFTLPeriodicExtentInit()), added to.
+ * @param[in,out] S    Summed area vectors, added to.
+ * @param[in,out] area Summed areas, added to.
+ * @rank_local
+ */
+void MFTLBodyShape(const MFTL_Object *obj, double extent[MFTL_PERIODIC_EXTENT_SLOTS], double S[3], double *area);
+
+/**
+ * @brief This rank's share of a body's volume as the flux of
+ *        \f$(x_k - \mathrm{ref})\,\vect{e}_k\f$, and its area, over OWNED triangles.
+ *
+ * Each triangle's centroid coordinate is taken in the image nearest
+ * `centre[k]` on a periodic axis. With @p k < 0 only the area is summed.
+ *
+ * @param      obj    The mesh.
+ * @param      k      The flux axis, or -1.
+ * @param      ref    The reference coordinate on it.
+ * @param      centre The body's centre (MFTLPeriodicExtentResolve()).
+ * @param[out] volume \f$\sum_t (\bar x_k - \mathrm{ref})\,S_{t,k}\f$.
+ * @param[out] area   \f$\sum_t \lVert\vect{S}_t\rVert\f$.
+ * @rank_local The arithmetic of the topology change's volume correction, which
+ *             calls it.
+ */
+void MFTLBodyFluxVolume(const MFTL_Object *obj, int k, double ref, const double centre[3], double *volume, double *area);
+
+/**
+ * @brief This rank's share of a body's volume and first moments along flux axis
+ *        @p k, over OWNED triangles.
+ *
+ * With every triangle moved rigidly into the image nearest @p centre on the
+ * periodic axes, \f$y_k = x_k - \mathrm{ref}\f$ and \f$y_j = x_j - c_j\f$ for
+ * \f$j \ne k\f$, exactly for flat triangles and linear integrands:
+ * `out[0]` \f$= V = \sum_t \bar y_k S_{t,k}\f$ and `out[1+j]`
+ * \f$= \sum_t \frac{S_{t,k}}{12}\big(\sum_i y_{k,i}y_{j,i} + \sum_i y_{k,i}\sum_i y_{j,i}\big)\f$,
+ * i.e. \f$2V(C_k - \mathrm{ref})\f$ for \f$j = k\f$ and \f$V(C_j - c_j)\f$
+ * otherwise, \f$C\f$ the centroid of the region measured.
+ *
+ * @param      obj    The mesh.
+ * @param      k      The flux axis.
+ * @param      ref    The reference coordinate on it.
+ * @param      centre The body's centre: the lift on periodic axes and the
+ *                    reference on the others.
+ * @param[out] out    #MFTL_BODY_MOMENT_SLOTS sums.
+ * @rank_local
+ */
+void MFTLBodyFluxMoments(const MFTL_Object *obj, int k, double ref, const double centre[3], double out[MFTL_BODY_MOMENT_SLOTS]);
+
 #endif  // MFTL_GEOMETRY_H
