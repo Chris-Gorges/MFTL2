@@ -343,6 +343,56 @@ void MFTLEnsembleGetBodyReduceStats(MFTL_BodyReduceStats *out);
 void MFTLEnsembleResetBodyReduceStats(void);
 
 /**
+ * @struct MFTL_PeriodicExtentReport
+ * @brief What MFTLEnsembleCheckPeriodicExtents() found. Every field is GLOBAL,
+ *        identical on every rank.
+ */
+typedef struct MFTL_PeriodicExtentReport
+{
+  int n_violations;  ///< Bodies breaking the periodic extent rule, each counted once.
+  int n_covering;  ///< Bodies covering at least one periodic axis (wrapping it, or at least 3/4 of it wide), each counted once.
+  int first_body_gid;  ///< Smallest offending body id, -1 if none.
+  int first_axis;  ///< Its first offending axis, -1 if none.
+  double first_extent;  ///< Its measured extent along that axis, 0 if none.
+} MFTL_PeriodicExtentReport;
+
+/**
+ * @brief Checks THE PERIODIC EXTENT RULE: on every periodic axis, every body
+ *        either wraps the axis or is narrower than half the period.
+ *
+ * Front tracking on a periodic domain lifts a body into one image by the
+ * nearest image about its centre, and the library measures that centre in
+ * four frames (MFTLPeriodicExtentResolve()). Every body narrower than
+ * \f$3L/4\f$ is measured exactly, so the band \f$[L/2, 3L/4)\f$ is where a body
+ * that grows past half the period is SEEN doing so; a wider compact body is
+ * indistinguishable from a wrapping one and is not reported. Call this at an
+ * interval in which no body can grow by a quarter period -- at output steps, or
+ * after a topology change, which can merge two bodies into one wide one.
+ *
+ * Nothing in the library is wrong for a body in the band, which is why this is
+ * a check the application calls rather than a refusal inside a module: the
+ * remesher's operators are local, topology change and the per-body integrals
+ * measure exactly up to \f$3L/4\f$ and treat anything wider as covering. The rule
+ * is the supported envelope -- physically, a body wider than \f$L/2\f$ is nearer
+ * its own periodic image than its own far side -- and this is its safety check.
+ *
+ * Cost: one MFTLEnsembleReduceBodies() of #MFTL_PERIODIC_EXTENT_SLOTS + 1 MIN
+ * values per held body, and one `MPI_Allreduce` of two integers; two more of one
+ * double each when a body breaks the rule. A body is counted once, by its
+ * lowest-numbered holder. On a violation rank 0 names the first offending body,
+ * its axis and its extent on stderr.
+ *
+ * @param ens          The ensemble.
+ * @param[out] report  What was found, or #MFTL_NULL.
+ * @return #MFTL_SUCCESS when every body obeys the rule (also on a domain with no
+ *         periodic axis, where no MPI call is made), #MFTL_ERROR on every rank
+ *         when one does not, or on a NULL ensemble.
+ *
+ * @collective Ranks holding no bodies must call it too.
+ */
+int MFTLEnsembleCheckPeriodicExtents(MFTL_Ensemble *ens, MFTL_PeriodicExtentReport *report);
+
+/**
  * @brief Refreshes every local object's `global_n_triangles` /
  *        `global_n_vertices` and the ensemble's `total_global_triangles`.
  *

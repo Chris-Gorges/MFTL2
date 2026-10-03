@@ -9,6 +9,7 @@
 | `ensemble.c` | lifecycle: MPI topology, the sorted local object directory, global counts |
 | `ensemble_update.c` | the fused geometry + quality pass, and the collective vertex-normal pass |
 | `ensemble_reduce.c` | per-body reductions and exclusive scans over each body's holders |
+| `ensemble_extents.c` | the periodic extent rule, checked over every body |
 
 ---
 
@@ -194,6 +195,22 @@ value, so summing a per-body verdict over ranks counts a shared body once per
 holder. A MIN slot of the contributing rank yields the body's lowest-numbered
 holder, and `lowest_holder == rank` is the licence to count it
 (`MFTLRemeshMeasureBodies` carries this slot).
+
+---
+
+## The periodic extent rule {#ens_periodic_extent}
+
+`MFTLEnsembleCheckPeriodicExtents` checks, for every body, that on every periodic
+axis it either wraps the axis or is narrower than half the period
+(@ref geom_periodic_extent). One `MFTLEnsembleReduceBodies` call carries the
+four-frame extent (24 MIN slots) and the lowest holder (one more), each body's
+verdict is counted once by its lowest holder, and one `MPI_Allreduce` of two
+integers makes the report global; two more single-double reductions name the
+first offender only when there is one. No periodic axis: no MPI call at all.
+It is a CHECK the application calls -- at output steps, after a topology change --
+rather than a refusal inside a module, because no module is wrong for a body in
+the band $[L/2, 3L/4)$; the rule is the supported envelope, and this is its
+safety check.
 
 ---
 

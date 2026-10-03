@@ -602,6 +602,25 @@ static void scene_breakup_and_merge(MFTL_Ensemble *ens)
   add_body(ens, f_sphere, s2, lo2, hi2, 0.04);
 }
 
+static void scene_straddling_sphere(MFTL_Ensemble *ens)
+{
+  /* 2.3 wide in a periodic box of 4, centred at a quarter of it: on every axis
+   * the sphere straddles BOTH the seam and the middle of the box. */
+  MFTL_Object *obj = MFTLObjectCreate(0);
+  MFTLEnsembleAddObject(ens, obj);
+  double c[3] = {0.25 * L_BOX + 0.013, 0.25 * L_BOX - 0.021, 0.25 * L_BOX + 0.007};
+  MFTLGenerateSphere(obj, c, 1.15, 4);
+}
+
+static void scene_wide_sphere(MFTL_Ensemble *ens)
+{
+  /* 3.2 wide in a periodic box of 4: compact, but past three quarters of it. */
+  MFTL_Object *obj = MFTLObjectCreate(0);
+  MFTLEnsembleAddObject(ens, obj);
+  double c[3] = {C + 0.013, C - 0.021, C + 0.007};
+  MFTLGenerateSphere(obj, c, 1.6, 4);
+}
+
 /** a: level amplitude -- liquid below a wavy surface; the domain decides what is periodic. */
 static double f_wavy_sheet(const double p[3], const double *a)
 {
@@ -952,6 +971,57 @@ static int test_breakup_across_the_periodic_seam(void)
   return 0;
 }
 
+/**
+ * @brief A body that straddles both the seam and the middle of the box on
+ *        every axis is MEASURED, so its volume is corrected.
+ *
+ * The cluster extent used to be taken in two frames, cut at the seam and at
+ * L/2. This sphere contains both cuts on every axis, so both frames measured it
+ * as wide as the box, every axis was declared covered, no flux axis was left,
+ * and the volume correction was SKIPPED -- silently: volume_before came out 0
+ * and the marching-cubes deficit stayed in the mesh. Four frames measure every
+ * body narrower than 3L/4 exactly. The census volume is not used: it unwraps
+ * about one vertex, which a body wider than L/2 defeats.
+ */
+static int test_a_body_straddling_both_half_frames_keeps_its_volume(void)
+{
+  MFTL_TopologyOptions o = base_options(0.0, 0.0);
+  census c;
+  MFTL_TopologyStats st;
+  TEST_ASSERT_EQUAL_INT(0, run_scene(scene_straddling_sphere, MFTL_TRUE, &o, MFTL_TRUE, &c, &st));
+  const double exact = 4.0 / 3.0 * MFTL_PI * 1.15 * 1.15 * 1.15;
+  if (g_rank == 0) printf("\n  V %.10f -> raw %.10f -> %.10f (exact %.10f)\n  ", st.volume_before, st.volume_raw, st.volume_after, exact);
+  TEST_ASSERT(agreed(c.n_live == 1 && c.chi[0] == 2 && c.B[0] == 0, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(st.n_clusters == 1 && st.n_clusters_unmeasured == 0, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(fabs(st.volume_before - exact) / exact < 0.01, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(fabs(st.volume_raw - st.volume_before) >= 1e-4 * exact, MPI_COMM_WORLD));  // there was a deficit to correct
+  TEST_ASSERT(agreed(fabs(st.volume_after - st.volume_before) <= 1e-9 * exact, MPI_COMM_WORLD));
+  free_census(&c);
+  return 0;
+}
+
+/**
+ * @brief A compact body at least 3L/4 wide on every periodic axis is treated as
+ *        covering them all: reconstructed, left uncorrected, and COUNTED.
+ *
+ * Far outside the periodic extent rule. The library cannot tell it from a body
+ * wrapping all three axes at every placement, so it does not try at any: the
+ * reconstruction is still valid, and n_clusters_unmeasured says that no volume
+ * correction was applied.
+ */
+static int test_a_body_covering_every_axis_is_counted_as_unmeasured(void)
+{
+  MFTL_TopologyOptions o = base_options(0.0, 0.0);
+  census c;
+  MFTL_TopologyStats st;
+  TEST_ASSERT_EQUAL_INT(0, run_scene(scene_wide_sphere, MFTL_TRUE, &o, MFTL_TRUE, &c, &st));
+  TEST_ASSERT(agreed(c.n_live == 1 && c.chi[0] == 2 && c.B[0] == 0, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(st.n_clusters == 1 && st.n_clusters_unmeasured == 1, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(st.volume_before == 0.0 && st.volume_after == 0.0, MPI_COMM_WORLD));
+  free_census(&c);
+  return 0;
+}
+
 static int test_breakup_and_coalescence_in_one_call(void)
 {
   MFTL_TopologyOptions o = base_options(0.12, 0.12);
@@ -1153,6 +1223,8 @@ int main(int argc, char **argv)
   RUN_TEST(test_a_satellite_the_remesher_collapses_is_discarded);
   RUN_TEST(test_every_piece_below_the_floor_leaves_no_body);
   RUN_TEST(test_breakup_across_the_periodic_seam);
+  RUN_TEST(test_a_body_straddling_both_half_frames_keeps_its_volume);
+  RUN_TEST(test_a_body_covering_every_axis_is_counted_as_unmeasured);
   RUN_TEST(test_an_annulus_periodic_in_x_keeps_its_rims_on_the_walls);
   RUN_TEST(test_seam_vertices_get_one_owner_on_every_rank);
   RUN_TEST(test_breakup_and_coalescence_in_one_call);

@@ -75,10 +75,10 @@ typedef struct MFTL_TopoCluster
   bool refused;  ///< A body has a rim off the domain walls: left untouched.
 
   /* The global extent, as a centre and half-width per axis; `full[k]` when the
-   * cluster wraps the whole periodic axis. */
+   * cluster covers the periodic axis (MFTL_PeriodicExtent::covers). */
   double centre[3];  ///< Extent centre.
   double half[3];  ///< Extent half-width.
-  bool full[3];  ///< Covers the whole periodic axis.
+  bool full[3];  ///< Covers the periodic axis: wraps it, or is at least 3/4 of it wide.
   bool empty;  ///< No rank holds a triangle of it.
 
   /* The volume measure: the flux of F = (x_k - ref) e_k, which the walls the
@@ -106,8 +106,8 @@ int MFTLTopoClusterOf(const MFTL_TopoCluster *cl, int n, int gid);
 void MFTLTopoLatticeInit(MFTL_TopoLattice *lat, const MFTL_Domain *dom, double dx);
 
 /**
- * @brief This rank's contribution to every cluster's extent: 12 values per
- *        cluster (min, -max in the raw and the half-shifted frame per axis).
+ * @brief This rank's contribution to every cluster's extent:
+ *        #MFTL_PERIODIC_EXTENT_SLOTS MIN values per cluster.
  */
 void MFTLTopoLocalExtents(const MFTL_Ensemble *ens, const MFTL_TopoCluster *cl, int n_cl, double *out);
 

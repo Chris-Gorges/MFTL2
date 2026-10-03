@@ -358,6 +358,17 @@ two, three, four area steps. The count is FIXED at three: a stopping test on a r
 double would be two ranks disagreeing in the last ulp about whether to enter another
 collective.
 
+A closed cluster is measured along an axis it does not COVER, about its centre, with
+every triangle lifted to the image nearest that centre; the centre and the covering
+flags come from the four-frame extent of @ref geom_periodic_extent, reduced over every
+rank in one MIN reduction. That measures every cluster narrower than $3L/4$ exactly,
+whatever its placement. The two-frame measurement it replaced saw a cluster straddling
+both the seam and the middle of the box as covering, and a closed one doing so on all
+three axes then had no flux axis and was silently left uncorrected. A cluster with no
+admissible axis -- rims on both walls of every non-periodic axis, or a closed cluster
+covering all three periodic axes -- is still left uncorrected, and now counted:
+`MFTL_TopologyStats::n_clusters_unmeasured`.
+
 ---
 
 ## Design alternatives {#topo_departures}

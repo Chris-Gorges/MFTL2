@@ -174,7 +174,9 @@ typedef struct MFTL_TopologyOptions
    * The volume of an open surface is measured together with the walls its rims
    * lie on, as the flux of (x_k - x_k,min) e_k along an axis whose far wall
    * carries no rim. A cluster for which no such axis exists -- rims on both
-   * walls of every non-periodic axis -- is left uncorrected.
+   * walls of every non-periodic axis, or a closed cluster covering all three
+   * periodic axes (MFTL_PeriodicExtent::covers) -- is left uncorrected and
+   * counted in MFTL_TopologyStats::n_clusters_unmeasured.
    */
   bool conserve_volume;
 
@@ -201,6 +203,7 @@ typedef struct MFTL_TopologyStats
   int n_coalescence;  ///< Of which coalescence events.
   int n_clusters;  ///< Clusters reconstructed.
   int n_clusters_refused;  ///< Clusters left untouched because a body had a rim off the domain walls.
+  int n_clusters_unmeasured;  ///< Reconstructed clusters with no exact volume measure, hence no volume correction (see `conserve_volume`).
   int n_bodies_reconstructed;  ///< Bodies that went into a reconstruction.
   int n_bodies_out;  ///< Bodies that came out of it.
   int n_bodies_created;  ///< Of those, bodies given a NEW id.

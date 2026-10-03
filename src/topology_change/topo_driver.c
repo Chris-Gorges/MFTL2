@@ -336,17 +336,18 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
   MFTLUpdateGhostVertexNormals(ens);
 
   /* ── Extents, cutoff, pad, windows ───────────────────────────────────────── */
-  double *const ext = (double *) MFTLMallocOrDie(12 * (size_t) MFTL_MAX(n_cl, 1) * sizeof(double), "topology extents");
+  double *const ext = (double *) MFTLMallocOrDie(MFTL_PERIODIC_EXTENT_SLOTS * (size_t) MFTL_MAX(n_cl, 1) * sizeof(double), "topology extents");
   MFTLTopoLocalExtents(ens, cl, n_cl, ext);
   for (int c = 0; c < n_cl; ++c)
-    if (cl[c].refused)
-      for (int i = 0; i < 12; ++i) ext[12 * c + i] = MFTL_DBL_MAX;
-  MFTLTopoCommAllreduceDouble(dom, ext, 12 * n_cl, 0);
+    if (cl[c].refused) MFTLPeriodicExtentInit(&ext[MFTL_PERIODIC_EXTENT_SLOTS * c]);
+  MFTLTopoCommAllreduceDouble(dom, ext, MFTL_PERIODIC_EXTENT_SLOTS * n_cl, 0);
   MFTLTopoResolveExtents(dom, cl, n_cl, ext);
   free(ext);
 
   /* The volume each cluster encloses now, for the correction at the end. */
   MFTLTopoChooseFlux(dom, cl, n_cl);
+  for (int c = 0; c < n_cl; ++c)
+    if (!cl[c].refused && cl[c].flux_axis < 0) st->n_clusters_unmeasured++;
   {
     double *const vol = (double *) MFTLCallocOrDie((size_t) MFTL_MAX(n_cl, 1), sizeof(double), "topology volumes");
     for (int o = 0; o < ens->n_local_objects; ++o)

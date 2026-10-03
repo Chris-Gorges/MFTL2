@@ -11,6 +11,7 @@ Everything in this directory is **local** — no MPI:
 | `triangle_geometry.c` | `tris.area`, `tris.normal`, `tris.center` for a mesh; the closest point on a triangle |
 | `vertex_geometry.c` | area- or angle-weighted `verts.normal` for a mesh |
 | `signed_distance.c` | signed distance to a mesh on a (periodic) lattice window |
+| `periodic_extent.c` | a body's extent on a periodic axis, and whether it covers the axis |
 
 The collective wrappers (`MFTLEnsembleUpdate`, `MFTLEnsembleUpdateVertexNormals`)
 live in @ref mftl_mod_ensemble; the split is by *scope*, not by entity
@@ -193,3 +194,80 @@ it, so a cutoff above $\sqrt3\,\Delta x$ supplies every value marching cubes nee
 without a flood fill. The lattice is **global** and periodic (nodes $g$ and
 $g + N$ coincide), and a caller stores a *window* of it; triangles reach nodes by
 unwrapped index in their own periodic image.
+
+---
+
+## Extent on a periodic axis, and the periodic extent rule {#geom_periodic_extent}
+
+Per-body quantities on a periodic axis -- an enclosed volume, a centroid, a
+reconstruction window -- need the whole body in ONE image. The library lifts a
+coordinate by the nearest image about the body's centre,
+$x \mapsto x - L\,\mathrm{nearbyint}((x-c)/L)$, which is exact when every vertex
+is within $L/2$ of $c$. So the question is how to find $c$ when the stored
+coordinates are wrapped and a body straddling the seam has a raw min/max
+spanning the whole axis.
+
+**The rule.** On every periodic axis, a body either WRAPS the axis (it closes on
+itself only after going around the period: a film across a periodic box, the
+travelling-wave ribbon) or is NARROWER THAN HALF THE PERIOD along it. A body
+wider than $L/2$ is nearer its own periodic image than its own far side, which
+no front-tracking setup wants. `MFTLEnsembleCheckPeriodicExtents` checks it and
+returns `MFTL_ERROR` on every rank, naming the first offending body, when a body
+breaks it.
+
+**Four frames.** Each triangle contributes its bounds in four frames, cut at
+$\min_k + \{0, L/2, L/4, 3L/4\}$: in frame $f$ the triangle is moved rigidly by
+the period multiple that brings corner 0 (shifted by the frame offset) into the
+box. A body whose projection on the axis misses a frame's cut is contiguous in
+that frame and measures its true extent $E$. A cut lying INSIDE the projection
+makes the frame measure at least $L$: every point near the cut is covered, from
+one side or the other, by a triangle placed a period apart. So the smallest
+frame extent below $L$ is always exact. One MIN reduction per body carries all
+four frames (lower bound and negated upper bound, 24 slots).
+
+| frames (cuts) | measures exactly every compact body narrower than |
+|---|---|
+| $\{0, L/2\}$ (the previous measurement) | $L/2$ -- and NO wider one that straddles both cuts |
+| $\{0, L/4, L/2, 3L/4\}$ | $3L/4$ |
+
+A body is COVERING an axis when no frame measures it narrower than $3L/4$. That
+is every wrapping body, and every compact body at least $3L/4$ wide: with four
+cuts such a body is measured exactly at some placements and not at others, so
+the verdict is taken on the size alone. It also keeps the decision a quarter
+period away from $L$, where an exact cover and a sliver of a gap differ in the
+last bit (a marching-cubes vertex lying exactly on the seam). The rule's limit
+is $L/2$ and the measurement's is $3L/4$ on purpose: a body growing through
+$L/2$ is SEEN in the band $[L/2, 3L/4)$ before it becomes indistinguishable from
+a wrapping one, provided the check runs at least once in the time any body
+grows by a quarter period -- at output steps, and after a topology change,
+which can merge two bodies into one wide one.
+
+The two frames cut at 0 and $L/2$ are computed and compared exactly as the
+two-frame code did, and the quarter frames are only read when neither measures
+less than $3L/4$, so every extent that code got right is reproduced to the bit
+(`test_a_chain_is_measured_exactly_below_three_quarters_at_every_offset`).
+
+| consumer | depends on the extent how | a body in $[L/2, 3L/4)$ | wider |
+|---|---|---|---|
+| topology change (`MFTLTopoResolveExtents`) | window, nearest-image volume | exact | covering: whole-axis window, axis not used for the flux; no axis left = `n_clusters_unmeasured` |
+| `MFTLEnsembleCheckPeriodicExtents` | the rule | reported, `MFTL_ERROR` | counted in `n_covering` |
+| remesher (`MFTLRemeshMeasureBodies`) | circular-mean centre, strategy choice only | unaffected: operators are local | unaffected |
+| spatial halo | two-frame share extents, a CONSERVATIVE send decision | over-sends, never misses | over-sends |
+
+The two-frame measurement silently skipped the topology change's volume
+correction for a closed body straddling both of its cuts on every axis: every
+axis came out covered, no flux axis was left, and `volume_before` was 0. That is
+what `test_a_body_straddling_both_half_frames_keeps_its_volume` pins.
+
+**What lifting the rule would take.** Per-vertex periodic image counters
+(LAMMPS's packed image flags, HOOMD-blue's `int3`) remove the limit entirely:
+an `int16` column per axis in the vertex pool block (6 B/vertex) plus a per-body
+`int64` base carried in the redistribution's body header, ghosts following
+their owner by the minimum-image jump on receipt, every position writer (the
+application's advection, split, collapse, the smoother, the topology change)
+maintaining them, and a distributed canonicalisation (a weighted union-find
+with lattice offsets, the label rounds of `topo_split_bodies.c`). A body's
+winding needs none of it: it is the cycle sum of the per-edge minimum-image
+wraps. Revive it only for a required case with a compact body of at least
+$L/2$ on a periodic axis -- unit-cell slug flow with a bubble longer than half
+the cell, a drop stretched past half a short periodic shear box.

@@ -178,49 +178,26 @@ int MFTLTopoClusterOf(const MFTL_TopoCluster *cl, int n, int gid)
 /* ═══════════════════════════════════════════════════════════════════════════
  * 3. Extents: centre and half-width on the circle
  *
- * The same two-frame trick the spatial halo uses (communication/spatial_halo.c):
- * a body straddling a periodic seam has a raw min/max box spanning the whole
- * domain, and in a frame shifted by half a period it does not. Both frames are
- * reduced -- as a MIN of the lower bound and a MIN of the NEGATED upper bound,
- * so one reduction does both -- and the tighter one wins per axis.
+ * The four-frame measurement of src/geometry/periodic_extent.c: a cluster
+ * straddling a periodic seam has a raw min/max box spanning the whole domain,
+ * and in a frame whose cut lies in its gap it does not. Every frame is reduced
+ * -- as a MIN of the lower bound and a MIN of the NEGATED upper bound, so one
+ * reduction does all -- and MFTLPeriodicExtentResolve() picks the exact one.
+ * A cluster narrower than 3L/4 is always measured exactly; a wider one is
+ * treated as covering the axis, which costs it nothing but a whole-axis window
+ * and that axis as a flux axis (MFTLTopoChooseFlux()).
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 void MFTLTopoLocalExtents(const MFTL_Ensemble *ens, const MFTL_TopoCluster *cl, int n_cl, double *out)
 {
-  const MFTL_Domain *const dom = &ens->domain;
-  for (int i = 0; i < 12 * n_cl; ++i) out[i] = MFTL_DBL_MAX;
+  for (int c = 0; c < n_cl; ++c) MFTLPeriodicExtentInit(&out[MFTL_PERIODIC_EXTENT_SLOTS * c]);
 
   for (int o = 0; o < ens->n_local_objects; ++o)
   {
     const MFTL_Object *const obj = ens->local_objects[o];
     const int c = MFTLTopoClusterOf(cl, n_cl, obj->global_id);
     if (c < 0) continue;
-    double *const e = &out[12 * c];
-
-    for (int t = 0; t < obj->tris.n_local; ++t)
-    {
-      double T[3][3];
-      MFTLGetTriangleCorners(obj, t, T);
-      for (int k = 0; k < 3; ++k)
-      {
-        const double lo = fmin(T[0][k], fmin(T[1][k], T[2][k]));
-        const double hi = fmax(T[0][k], fmax(T[1][k], T[2][k]));
-        e[k] = fmin(e[k], lo);
-        e[3 + k] = fmin(e[3 + k], -hi);
-
-        if (dom->is_periodic[k])
-        {
-          /* Shift the triangle so its first corner moves by half a period,
-           * then wrap that corner back; the others follow rigidly. */
-          const double L = dom->domain_size[k];
-          double c0 = T[0][k] + 0.5 * L;
-          c0 -= L * floor((c0 - dom->global_min[k]) / L);
-          const double d = c0 - T[0][k];
-          e[6 + k] = fmin(e[6 + k], lo + d);
-          e[9 + k] = fmin(e[9 + k], -(hi + d));
-        }
-      }
-    }
+    MFTLPeriodicExtentAddObject(obj, &out[MFTL_PERIODIC_EXTENT_SLOTS * c]);
   }
 }
 
@@ -228,32 +205,14 @@ void MFTLTopoResolveExtents(const MFTL_Domain *dom, MFTL_TopoCluster *cl, int n_
 {
   for (int c = 0; c < n_cl; ++c)
   {
-    const double *const e = &reduced[12 * c];
-    cl[c].empty = !(e[0] < MFTL_DBL_MAX);
+    MFTL_PeriodicExtent x;
+    MFTLPeriodicExtentResolve(dom, &reduced[MFTL_PERIODIC_EXTENT_SLOTS * c], &x);
+    cl[c].empty = x.empty;
     for (int k = 0; k < 3; ++k)
     {
-      cl[c].full[k] = MFTL_FALSE;
-      if (cl[c].empty)
-      {
-        cl[c].centre[k] = 0.0;
-        cl[c].half[k] = 0.0;
-        continue;
-      }
-      const double lo0 = e[k], hi0 = -e[3 + k];
-      double lo = lo0, hi = hi0;
-      if (dom->is_periodic[k])
-      {
-        const double L = dom->domain_size[k];
-        const double lo1 = e[6 + k], hi1 = -e[9 + k];
-        if (hi1 - lo1 < hi0 - lo0)
-        {
-          lo = lo1 - 0.5 * L;
-          hi = hi1 - 0.5 * L;
-        }
-        if (hi - lo >= L) cl[c].full[k] = MFTL_TRUE;
-      }
-      cl[c].centre[k] = 0.5 * (lo + hi);
-      cl[c].half[k] = 0.5 * (hi - lo);
+      cl[c].centre[k] = x.centre[k];
+      cl[c].half[k] = x.half[k];
+      cl[c].full[k] = x.covers[k];
     }
   }
 }

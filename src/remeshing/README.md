@@ -491,7 +491,12 @@ $$
 
 the arithmetic mean puts a seam-straddling body in the middle of the domain with
 half the domain as radius
-(`test_a_seam_straddling_droplet_is_not_measured_as_domain_sized`).
+(`test_a_seam_straddling_droplet_is_not_measured_as_domain_sized`). The
+remesher is the one per-body consumer that does NOT depend on the periodic
+extent rule (@ref geom_periodic_extent): its operators see only minimum-image
+edges, and this centre and radius choose a strategy, which a body wider than half
+the period still gets right -- the spanning tests remesh a sphere 0.7 of the
+period wide.
 
 ### Global ids {#rem_ids}
 

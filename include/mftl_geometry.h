@@ -707,4 +707,121 @@ static inline double MFTLSdfMerge(double current, double candidate)
  */
 long MFTLRasterizeSignedDistance(MFTL_SdfGrid *grid, const MFTL_Object *obj, int n_tris, double cutoff);
 
+// -----------------------------------------------------------------------------
+// 8. EXTENT ON A PERIODIC AXIS  (see src/geometry/periodic_extent.c)
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief Doubles one body's extent occupies in a per-body reduction: four frames
+ *        times three axes times (lower bound, NEGATED upper bound), every slot a
+ *        MIN.
+ *
+ * Frame f is cut at `global_min + {0, L/2, L/4, 3L/4}[f]` on each periodic axis;
+ * slots `[6f, 6f+3)` hold the lower bounds and `[6f+3, 6f+6)` the negated upper
+ * bounds. A non-periodic axis uses frame 0 only and leaves the rest at the MIN
+ * identity.
+ */
+#define MFTL_PERIODIC_EXTENT_SLOTS 24
+
+/**
+ * @brief Fraction of the period from which an extent counts as COVERING the
+ *        axis: a body at least this wide is treated as wrapping it.
+ *
+ * With four equally spaced cuts, a compact body narrower than \f$3L/4\f$ always
+ * leaves one cut in its gap and is measured exactly; a wider one is measured
+ * exactly at some placements only. Treating every extent of \f$3L/4\f$ or more as
+ * covering makes the verdict depend on the size alone, never on the placement,
+ * and keeps it a quarter period away from the round-off at \f$L\f$, where an
+ * exact cover and a sliver of a gap differ in the last bit.
+ */
+#define MFTL_PERIODIC_EXTENT_COVER_FRACTION 0.75
+
+/**
+ * @brief Fraction of the period a body that does not wrap a periodic axis must
+ *        stay below: THE PERIODIC EXTENT RULE.
+ *
+ * On every periodic axis a body either wraps the axis or is narrower than half
+ * the period along it. Physically, a body wider than \f$L/2\f$ is closer to its
+ * own periodic image than to its own far side. Numerically, the library
+ * measures every body exactly up to #MFTL_PERIODIC_EXTENT_COVER_FRACTION, so the
+ * band \f$[L/2, 3L/4)\f$ is where a growing body is still SEEN breaking the rule
+ * before it becomes indistinguishable from a wrapping one.
+ * MFTLEnsembleCheckPeriodicExtents() enforces it.
+ */
+#define MFTL_PERIODIC_EXTENT_RULE_FRACTION 0.5
+
+/**
+ * @struct MFTL_PeriodicExtent
+ * @brief A body's extent as a centre and a half-width per axis, measured on the
+ *        circle on a periodic axis.
+ *
+ * A `(lo, hi)` box cannot describe a body straddling a periodic seam: its stored
+ * coordinates span the whole domain. A centre and a half-width can, and the
+ * centre is the point every vertex of the body is within half a period of, so
+ * `x - L nearbyint((x - centre) / L)` lifts the whole body into one image.
+ */
+typedef struct MFTL_PeriodicExtent
+{
+  double centre[3];  ///< Centre per axis; may lie outside the domain box on a periodic axis.
+  double half[3];  ///< Half-width per axis.
+  bool covers[3];  ///< Periodic axis covered: the body wraps it, or is at least #MFTL_PERIODIC_EXTENT_COVER_FRACTION of it wide.
+  bool empty;  ///< No triangle contributed.
+} MFTL_PeriodicExtent;
+
+/**
+ * @brief Sets an accumulator to the identity of its MIN reduction.
+ *
+ * @param[out] acc #MFTL_PERIODIC_EXTENT_SLOTS doubles, every one #MFTL_DBL_MAX.
+ * @rank_local
+ */
+void MFTLPeriodicExtentInit(double acc[MFTL_PERIODIC_EXTENT_SLOTS]);
+
+/**
+ * @brief Adds one triangle to an extent accumulator.
+ *
+ * Frame 0 takes the corners as they are. Frame f > 0 moves the triangle
+ * RIGIDLY by the period multiple that brings corner 0, shifted by the frame's
+ * offset, into the domain box -- so a triangle is never torn, and a body
+ * contiguous in that frame is measured by its true extent.
+ *
+ * @param      dom Supplies the periodicity, bounds and sizes.
+ * @param      T   The corners, in one image (MFTLGetTriangleCorners()).
+ * @param[in,out] acc The accumulator.
+ * @rank_local
+ */
+void MFTLPeriodicExtentAddTriangle(const MFTL_Domain *dom, const double T[3][3], double acc[MFTL_PERIODIC_EXTENT_SLOTS]);
+
+/**
+ * @brief Adds every OWNED triangle of @p obj to an extent accumulator.
+ *
+ * Owned only, so that a reduction over the ranks holding the body sees each
+ * triangle once; a ghost is contributed by its owner.
+ *
+ * @param      obj The mesh; needs no derived state.
+ * @param[in,out] acc The accumulator.
+ * @rank_local
+ */
+void MFTLPeriodicExtentAddObject(const MFTL_Object *obj, double acc[MFTL_PERIODIC_EXTENT_SLOTS]);
+
+/**
+ * @brief Turns a (reduced) accumulator into a centre, a half-width and a
+ *        covering flag per axis.
+ *
+ * On a periodic axis the frames cut at 0 and \f$L/2\f$ are compared first and
+ * the tighter wins (frame 0 on a tie); only when neither measures less than
+ * #MFTL_PERIODIC_EXTENT_COVER_FRACTION are the quarter frames consulted. A cut
+ * lying INSIDE a body's projection makes that frame measure at least \f$L\f$, so
+ * the smallest frame extent below \f$L\f$ is always the exact one. A body is
+ * `covers[k]` when no frame measures it narrower than
+ * #MFTL_PERIODIC_EXTENT_COVER_FRACTION; its centre and half-width are then
+ * those of the first comparison and carry no meaning.
+ *
+ * @param      dom Supplies the periodicity and sizes.
+ * @param      acc An accumulator filled by MFTLPeriodicExtentAddTriangle(),
+ *                 typically MIN-reduced over the ranks holding the body.
+ * @param[out] out The extent.
+ * @rank_local Pure function: bit-identical on every rank given identical input.
+ */
+void MFTLPeriodicExtentResolve(const MFTL_Domain *dom, const double acc[MFTL_PERIODIC_EXTENT_SLOTS], MFTL_PeriodicExtent *out);
+
 #endif  // MFTL_GEOMETRY_H

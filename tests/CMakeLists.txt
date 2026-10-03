@@ -233,6 +233,16 @@ mftl_add_mpi_test_at(test_body_reduce_np4 test_body_reduce 4)
 mftl_add_mpi_test_at(test_body_reduce_np8 test_body_reduce 8)
 mftl_add_mpi_test_oversub(test_body_reduce_np27 test_body_reduce 27)
 
+# The periodic extent rule. The measurement half is local and the same at any
+# count; the check half is a per-body reduction like the one above, registered
+# at the same counts for the same reasons, with its bodies redistributed so
+# that the verdicts are genuinely combined over several holders (asserted).
+mftl_add_mpi_test(test_periodic_extents 1)
+mftl_add_mpi_test_at(test_periodic_extents_np2 test_periodic_extents 2)
+mftl_add_mpi_test_at(test_periodic_extents_np4 test_periodic_extents 4)
+mftl_add_mpi_test_at(test_periodic_extents_np8 test_periodic_extents 8)
+mftl_add_mpi_test_oversub(test_periodic_extents_np27 test_periodic_extents 27)
+
 # Redistribution is the one module whose behaviour is a FUNCTION of the process
 # grid, so it is registered at four counts and each is genuinely different:
 #
