@@ -173,6 +173,7 @@ int MFTLCplMarkersGather(const MFTL_Ensemble *ens, const MFTL_MarkerSpec *spec, 
         MFTLGetTriangleProperties(obj, t, &area, MFTL_NULL, MFTL_NULL);
         MFTLGetTriangleCorners(obj, t, cr);
         const double w = area / ((double) lv * (double) lv);
+        if (!(w > 0.0) || !isfinite(w)) return MFTL_COUPLING_INVALID;
         for (int q = 0; q < lv * lv; ++q, ++at)
         {
           double l1, l2, x[3];

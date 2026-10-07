@@ -993,6 +993,214 @@ static int test_constraints_that_cannot_be_right_are_refused(void)
   return 0;
 }
 
+/** @brief Constraint indices cached by a window must not outlive a map change. */
+static int test_constraint_updates_invalidate_windows(void)
+{
+  adv_lat A;
+  memset(&A, 0, sizeof A);
+  for (int k = 0; k < 3; ++k)
+  {
+    A.N[k] = 8;
+    A.L[k] = 1.0;
+    A.h[k] = 0.125;
+    A.origin[k] = 0.0625;
+    A.per[k] = true;
+  }
+  MFTL_Ensemble *ens = adv_ensemble(&A);
+  MFTL_SolverGrid *g = MFTLSolverGridCreate(MPI_COMM_WORLD);
+  const int loc = adv_add_location(g, "cells", &A, MFTL_BOUNDARY_TRUNCATE);
+  adv_blocks B;
+  adv_decompose(g, loc, &A, g_nproc + 1, 77u, 1, 1, false, &B);
+  MFTL_Coupler *c = MFTL_NULL;
+  TEST_ASSERT(agreed(MFTLCouplerCreate(ens, g, MFTL_NULL, &c) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+  const uint64_t ck = 4 + 8 * (4 + 8 * 4), fk = ck + 1;
+  const int co = con_owner(&B, &A, ck), fo = con_owner(&B, &A, fk);
+  const int64_t rp[2] = {0, 1};
+  const double cf = 0.5, all[3] = {0.52, 0.53, 0.54};
+  MFTL_SolverField F = adv_field(&B, loc, 0, 1, false);
+  int ok = 1;
+  for (int clear = 0; clear < 2; ++clear)
+  {
+    MFTL_CouplingWindow *w = MFTL_NULL;
+    MFTL_CouplingBinding *b = MFTL_NULL;
+    TEST_ASSERT(agreed(adv_bind_list(c, 1, all, 0, MFTL_NULL, &w, &b, MFTL_NULL) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+    MFTL_TransferSpec ts = {MFTL_TRANSFER_SPREAD, w, b, 1, &F, MFTL_SPREAD_INTEGRATED};
+    MFTL_TransferReady *ready = MFTL_NULL;
+    TEST_ASSERT(agreed(MFTLCouplerPrepareTransfer(c, &ts, &ready) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+    MFTL_CouplerStats s0, s1;
+    MFTLCouplerReduceStats(c, &s0);
+    /* Only the constraint owner changes its map. Adding and removing it must
+     * invalidate every consumer, without rebuilding identical directory entries. */
+    if (g_rank == co)
+    {
+      MFTL_ConstraintDesc cd = {loc, clear ? 0 : 1, &ck, rp, &fk, &cf, &fo};
+      ok &= MFTLSolverGridSetConstraints(g, &cd) == MFTL_SUCCESS;
+    }
+    TEST_ASSERT(agreed(MFTLCouplerUpdateGrid(c) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+    MFTLCouplerReduceStats(c, &s1);
+    ok &= s1.n_directory_builds == s0.n_directory_builds;
+    if (!clear)
+    {
+      const double load = 1.0;
+      const int st = MFTLCouplerSpreadBegin(c, ready, &load);
+      ok &= st == MFTL_COUPLING_STALE;
+      if (st == MFTL_COUPLING_OK) MFTLCouplerSpreadEnd(c);
+    }
+    MFTLCouplerReleaseReady(&ready);
+    const int st = MFTLCouplerPrepareTransfer(c, &ts, &ready);
+    if (st != MFTL_COUPLING_STALE && g_rank == 0) printf("\n  constraint %s: old window returned %d", clear ? "removal" : "addition", st);
+    ok &= st == MFTL_COUPLING_STALE;
+    MFTLCouplerReleaseReady(&ready);
+    MFTLCouplerReleaseBinding(&b);
+    MFTLCouplerReleaseWindow(&w);
+  }
+  MFTLCouplerDestroy(&c);
+  adv_free_blocks(&B);
+  MFTLSolverGridDestroy(&g);
+  MFTLEnsembleDestroy(&ens);
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  return 0;
+}
+
+/** @brief Constraint owner ranks belong to the registered solver communicator. */
+static int test_constraints_with_reordered_solver_ranks(void)
+{
+  adv_lat A;
+  memset(&A, 0, sizeof A);
+  for (int k = 0; k < 3; ++k)
+  {
+    A.N[k] = 8;
+    A.L[k] = 1.0;
+    A.h[k] = 0.125;
+    A.origin[k] = 0.0625;
+    A.per[k] = true;
+  }
+  MFTL_Ensemble *ens = adv_ensemble(&A);
+  MPI_Comm reversed;
+  MPI_Comm_split(MPI_COMM_WORLD, 0, g_nproc - 1 - g_rank, &reversed);
+  MFTL_SolverGrid *g = MFTLSolverGridCreate(reversed);
+  const int loc = adv_add_location(g, "cells", &A, MFTL_BOUNDARY_TRUNCATE);
+  adv_blocks B;
+  adv_decompose(g, loc, &A, g_nproc + 1, 77u, 1, 1, false, &B);
+  const uint64_t ck = 4 + 8 * (4 + 8 * 4), fk = 0;
+  const int co = con_owner(&B, &A, ck), fo = g_nproc - 1 - con_owner(&B, &A, fk);
+  const int64_t rp[2] = {0, 1};
+  const double cf = 1.0;
+  MFTL_ConstraintDesc cd = {loc, (g_rank == co) ? 1 : 0, &ck, rp, &fk, &cf, &fo};
+  TEST_ASSERT(agreed(MFTLSolverGridSetConstraints(g, &cd) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  MFTL_Coupler *c = MFTL_NULL;
+  int ok = MFTLCouplerCreate(ens, g, MFTL_NULL, &c) == MFTL_COUPLING_OK;
+  if (agreed(ok, MPI_COMM_WORLD))
+  {
+    MFTL_CouplingWindow *w = MFTL_NULL;
+    MFTL_CouplingBinding *b = MFTL_NULL;
+    const double all[3] = {0.5625, 0.5625, 0.5625};
+    int64_t nm = 0;
+    TEST_ASSERT(agreed(adv_bind_list(c, 1, all, 0, MFTL_NULL, &w, &b, &nm) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+    double moved = 0.0;
+    for (int64_t i = 0; i < nm; ++i)
+    {
+      int ne = 0;
+      const uint64_t *keys;
+      const double *weights;
+      MFTLCouplerBindingRow(b, loc, i, &ne, &keys, &weights);
+      for (int e = 0; e < ne; ++e)
+        if (keys[e] == ck) moved += weights[e];
+    }
+    MPI_Allreduce(MPI_IN_PLACE, &moved, 1, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+    ok &= moved > 0.0;
+    MFTL_SolverField F = adv_field(&B, loc, 0, 1, false);
+    for (int pc = 0; pc < B.n; ++pc) memset(B.a[pc], 0, (size_t) B.n_elem[pc] * sizeof(double));
+    const double load = 1.0;
+    TEST_ASSERT(agreed(MFTLCouplerSpread(c, b, 1, &F, &load, MFTL_SPREAD_INTEGRATED) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+    /* The far-away free key receives exactly the constrained row entry;
+     * it lies outside the marker's direct support. */
+    for (int pc = 0; pc < B.n; ++pc)
+      for (int64_t k = B.lo[pc][2]; k < B.hi[pc][2]; ++k)
+        for (int64_t j = B.lo[pc][1]; j < B.hi[pc][1]; ++j)
+          for (int64_t i = B.lo[pc][0]; i < B.hi[pc][0]; ++i)
+          {
+            const uint64_t key = (uint64_t) (i + 8 * (j + 8 * k));
+            const int64_t e = (i - B.alo[pc][0]) + B.adims[pc][0] * ((j - B.alo[pc][1]) + B.adims[pc][1] * (k - B.alo[pc][2]));
+            if (key == ck || key == fk)
+              ok &= fabs(B.a[pc][e] - (key == fk ? moved : 0.0)) < 1e-14;
+          }
+    MFTLCouplerReleaseBinding(&b);
+    MFTLCouplerReleaseWindow(&w);
+    MFTLCouplerDestroy(&c);
+  }
+  adv_free_blocks(&B);
+  MFTLSolverGridDestroy(&g);
+  MPI_Comm_free(&reversed);
+  MFTLEnsembleDestroy(&ens);
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  return 0;
+}
+
+/** @brief Earlier ordinary rows can need more scratch space than mirror rows. */
+static int test_mirror_after_a_dense_ordinary_location(void)
+{
+  mirror_case M;
+  memset(&M, 0, sizeof M);
+  for (int k = 0; k < 3; ++k)
+  {
+    M.A.N[k] = 16;
+    M.A.L[k] = 1.0;
+    M.A.h[k] = 1.0 / 16.0;
+    M.A.origin[k] = 1.0 / 32.0;
+  }
+  MFTL_Ensemble *ens = adv_ensemble(&M.A);
+  MFTL_SolverGrid *g = MFTLSolverGridCreate(MPI_COMM_WORLD);
+  pts_block pb;
+  const int dense = add_points(g, "dense", 24, 0.0, OWN_SLAB, false, &pb);
+  MFTLSolverGridReset(g);
+  MFTL_PointSetDesc pd;
+  memset(&pd, 0, sizeof pd);
+  pd.location = dense;
+  pd.n = pb.n;
+  pd.keys = pb.key;
+  pd.pos = pb.pos;
+  pd.measure = pb.meas;
+  /* An oversampled cloud with a wide kernel makes the first row much larger. */
+  for (int k = 0; k < 3; ++k) pd.h_uniform[k] = 0.125;
+  TEST_ASSERT(agreed(MFTLSolverGridAddPoints(g, &pd) >= 0, MPI_COMM_WORLD));
+  const int loc = mirror_location(g, "mirror", &M);
+  adv_blocks B;
+  adv_decompose(g, loc, &M.A, g_nproc + 1, 77u, 1, 1, false, &B);
+  MFTL_Coupler *c = MFTL_NULL;
+  MFTL_CouplerParams P;
+  MFTLCouplerDefaultParams(&P);
+  TEST_ASSERT(agreed(MFTLCouplerCreate(ens, g, &P, &c) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+  MFTL_CouplingWindow *w = MFTL_NULL;
+  MFTL_CouplingBinding *b = MFTL_NULL;
+  const double all[3] = {0.02, 0.5, 0.5};
+  int64_t nm = 0;
+  TEST_ASSERT(agreed(adv_bind_list(c, 1, all, 0, MFTL_NULL, &w, &b, &nm) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+  int ok = 1;
+  for (int64_t i = 0; i < nm; ++i)
+  {
+    uint64_t rk[2048];
+    double rw[2048], rc[6], cc[6];
+    const int nr = mirror_ref_row(&M, &P, all, rk, rw, rc, 2048);
+    int ne = 0;
+    const uint64_t *keys;
+    const double *weights;
+    MFTLCouplerBindingRow(b, loc, i, &ne, &keys, &weights);
+    ok &= nr >= 0 && adv_row_diff(ne, keys, weights, nr, rk, rw) < 1e-12;
+    MFTLCouplerBindingWallCoefficients(b, loc, i, cc);
+    for (int f = 0; f < 6; ++f) ok &= fabs(cc[f] - rc[f]) < 1e-12;
+  }
+  MFTLCouplerReleaseBinding(&b);
+  MFTLCouplerReleaseWindow(&w);
+  MFTLCouplerDestroy(&c);
+  adv_free_blocks(&B);
+  free_points(&pb);
+  MFTLSolverGridDestroy(&g);
+  MFTLEnsembleDestroy(&ens);
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
@@ -1007,6 +1215,9 @@ int main(int argc, char **argv)
   RUN_TEST(test_what_cannot_be_mirrored_is_refused);
   RUN_TEST(test_constraints_are_transposed_exactly);
   RUN_TEST(test_constraints_that_cannot_be_right_are_refused);
+  RUN_TEST(test_constraint_updates_invalidate_windows);
+  RUN_TEST(test_constraints_with_reordered_solver_ranks);
+  RUN_TEST(test_mirror_after_a_dense_ordinary_location);
 
   if (g_rank == 0) TEST_REPORT();
   MFTLFreeMpiTypes();

@@ -665,6 +665,17 @@ static int test_quadrature_lifetimes_and_misuse(void)
   TEST_ASSERT(agreed(MFTLCouplerReleaseBinding(&x.b) == MFTL_ERROR && x.b != MFTL_NULL, MPI_COMM_WORLD));
   MFTLCouplerReleaseBinding(&bs);
 
+  /* Stage quadrature weights represent positive sub-triangle areas. A zero
+   * or negative area must not turn a constant projection or nodal force into
+   * silently discarded output. */
+  for (int bad = 0; bad < 2; ++bad)
+  {
+    for (int64_t i = 0; i < nq; ++i) wt[i] = (bad == 0) ? 0.0 : -ref[i].weight;
+    const int st = MFTLCouplerBindStage(x.c, x.b, &sg, &bs);
+    MFTLCouplerReleaseBinding(&bs);
+    TEST_ASSERT(agreed(st == MFTL_COUPLING_INVALID, MPI_COMM_WORLD));
+  }
+
   /* misuse */
   TEST_ASSERT(agreed(MFTLCouplerQuadratureFromVertices(x.c, x.b, 0, Fv, MFTL_SPREAD_INTEGRATED, F1) == MFTL_COUPLING_INVALID, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(MFTLCouplerQuadratureFromVertices(x.c, x.b, 1, Fv, (MFTL_SpreadForm) 7, F1) == MFTL_COUPLING_INVALID, MPI_COMM_WORLD));
@@ -681,6 +692,18 @@ static int test_quadrature_lifetimes_and_misuse(void)
     double *bq = (double *) malloc((size_t) (nq > 0 ? 2 * nq : 1) * sizeof(double)), *bv = (double *) malloc((size_t) (nv > 0 ? 2 * nv : 1) * sizeof(double));
     for (int64_t i = 0; i < 2 * nq; ++i) bq[i] = 1.0;
     TEST_ASSERT(agreed(MFTLCouplerQuadratureToVertices(x.c, x.b, nc, bq, bv) == MFTL_COUPLING_INVALID, MPI_COMM_WORLD));
+    for (int64_t v = 0; v < 2 * nv; ++v) bv[v] = 1.0;
+    /* These used to have the same numeric signature, despite exchanging
+     * different payload sizes and then following different schedules. */
+    const int st = (g_rank == 0) ? MFTLCouplerQuadratureToVertices(x.c, x.b, 2, bq, bv)
+                                 : MFTLCouplerQuadratureFromVertices(x.c, x.b, 1, bv, MFTL_SPREAD_INTEGRATED, bq);
+    TEST_ASSERT(agreed(st == MFTL_COUPLING_INVALID, MPI_COMM_WORLD));
+    MFTL_CouplingBinding *other = MFTL_NULL;
+    TEST_ASSERT(agreed(MFTLCouplerBind(x.c, &ms, x.w, &other) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+    const MFTL_CouplingBinding *mixed = (g_rank == 0) ? x.b : other;
+    TEST_ASSERT(agreed(MFTLCouplerQuadratureToVertices(x.c, mixed, 1, bq, bv) == MFTL_COUPLING_INVALID, MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(MFTLCouplerQuadratureFromVertices(x.c, mixed, 1, bv, MFTL_SPREAD_INTEGRATED, bq) == MFTL_COUPLING_INVALID, MPI_COMM_WORLD));
+    MFTLCouplerReleaseBinding(&other);
     free(bq);
     free(bv);
   }
@@ -708,6 +731,19 @@ static int test_quadrature_lifetimes_and_misuse(void)
   /* the surface moved: stale, everywhere */
   MFTLEnsembleMarkChanged(ens);
   TEST_ASSERT(agreed(MFTLCouplerQuadratureFromVertices(x.c, x.b, 1, Fv, MFTL_SPREAD_INTEGRATED, F1) == MFTL_COUPLING_STALE, MPI_COMM_WORLD));
+  /* A collapsed triangle has no positive quadrature measure. Refuse it at
+   * gathering, before it can produce a zero-mass vertex projection. */
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    MFTL_Object *obj = ens->local_objects[o];
+    for (int i = 0; i < 3 * obj->verts.n; ++i) obj->verts.pos[i] = 0.5;
+    MFTLComputeTriangleGeometry(obj, obj->tris.n);
+  }
+  MFTLEnsembleMarkChanged(ens);
+  MFTL_SupportRequest *bad_req = MFTL_NULL;
+  const MFTL_WindowSpec ws = {{0.0, 0.0, 0.0}};
+  TEST_ASSERT(agreed(MFTLCouplerRequestSupport(x.c, &ms, &ws, &bad_req) == MFTL_COUPLING_INVALID, MPI_COMM_WORLD));
+  MFTLCouplerReleaseRequest(&bad_req);
   free(wt);
   free(Fv);
   free(F1);

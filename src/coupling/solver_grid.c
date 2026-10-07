@@ -700,6 +700,10 @@ int MFTLSolverGridSetConstraints(MFTL_SolverGrid *g, const MFTL_ConstraintDesc *
     l->con_order[c] = (int64_t) pairs[2 * c + 1];
   }
   free(pairs);
+  /* Windows cache constraint row indices and transfer routing. A map change
+   * invalidates those caches even when sample ownership/export is unchanged;
+   * UpdateGrid still retains the directory if its entries match. */
+  g->version_owned++;
   g->version_export++;
   return MFTL_SUCCESS;
 }

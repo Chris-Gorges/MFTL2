@@ -183,7 +183,9 @@ to the indices they mirror by integer arithmetic.
 **Constrained samples.** A sample whose value the solver BUILDS — a hanging node,
 $u_c = \sum_j P_{cj} u_j + u_{bc}$ — is registered on its owner with its row of P
 (`MFTL_ConstraintDesc`); every free-owner claim is checked collectively when the grid is
-taken up. Interpolation reads the stored value; spreading applies the exact transpose:
+taken up. Owner ranks use the solver communicator's ordering and are translated to the
+coupler's ordering, so a reordered solver communicator works for constraints too.
+Interpolation reads the stored value; spreading applies the exact transpose:
 the load a constrained sample accumulates goes to its free samples as $P_{cj} b_c$
 (remote ones through one more exchange), its own element receives nothing, and $b_c$ is
 reported so that the affine part's work closes the power identity,
@@ -261,7 +263,8 @@ connected surface the new owner's own neighbouring markers usually hold those bi
 anyway; the allowance makes it a guarantee
 (`test_a_migrated_user_marker_binds_in_the_old_window`).
 
-**What an update keeps.** A change of what is OWNED stales every window; a change of
+**What an update keeps.** A change of what is OWNED or of a constraint map stales
+every window (constraint indices and transpose routes are cached); a change of
 EXPORTS alone keeps every window whose served samples are all still exported, checked
 by the window's next collective use. A selection that slides past a band costs that
 band nothing; one that withdraws a served sample stales it on every rank, and
@@ -310,6 +313,9 @@ delivers owned values to the ghost copies. The projection equals its definition
 recomputed from geometry vertex by vertex, and the same surface on one rank alone, to
 round-off (`test_coupling_quadrature` — a swapped barycentric pair keeps constants,
 masses and the adjoint identity, and is caught only there).
+Conversions agree the map identity, direction, component count and load form before
+exchanging data. Quadrature areas, including stage weights, must be finite and positive;
+degenerate triangles and invalid stage areas return INVALID.
 
 **Local stage binds.** `MFTLCouplerBindStageLocal` builds the same rows as
 `BindStage`, to the bit, with no communication — it may run while a fetch is in flight
@@ -345,7 +351,7 @@ vertices (`test_a_redistribution_stales_a_binding`); a skipped body keeps its st
 because its pool is bit-identical. A caller writing `verts.pos` owes the call; a Debug
 checksum of the bound positions catches the forgotten one. Registration edits invalidate
 local consumers immediately, before `UpdateGrid`; collective calls agree that rejection
-across ranks. `UpdateGrid` then invalidates what the change reaches: an ownership change
+across ranks. `UpdateGrid` then invalidates what the change reaches: an ownership or constraint-map change
 every window, fetch and transfer token; an export-only change only the windows whose
 served samples left the export. Failed interpolation validates all fields and ranks before writing any
 results. A skin may span several bins; both fresh and stage binds search that full allowance.

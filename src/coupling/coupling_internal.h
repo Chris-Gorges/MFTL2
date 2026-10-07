@@ -435,6 +435,7 @@ typedef struct cpl_locinfo
 {
   bool lattice;
   bool constrained;  ///< some rank registered constrained samples of this location
+  int *con_peer;  ///< local constraint entries' owners, translated from solver ranks to coupler ranks
   bool anisotropic;  ///< point samples carry cell matrices
   bool uniform_metric;  ///< every sample of the location has the same resolution
   double hmin[3];  ///< global minimum resolution
@@ -618,6 +619,7 @@ void MFTLCplMarkersFree(cpl_markers *m);
  */
 typedef struct cpl_quad
 {
+  uint64_t id;  ///< collective map identity, shared by local stage bindings
   int64_t n_own, n_ghost;
   int64_t *corner;  ///< [3 n_markers] vertex-table index of each point's three corners
   double *bary;  ///< [2 n_markers] (lambda1, lambda2)
@@ -723,6 +725,8 @@ void MFTLCplCommFree(MPI_Comm *c);
 void MFTLCplCommRankSize(MPI_Comm c, int *rank, int *size);
 /** @brief Whether @p a and @p b hold the same group of processes (any order). */
 bool MFTLCplCommSameGroup(MPI_Comm a, MPI_Comm b);
+/** @brief Translates only the supplied peer ranks between communicators; rejects out-of-range ranks. Local. */
+bool MFTLCplTranslateRanks(MPI_Comm from, MPI_Comm to, int64_t n, const int *ranks, int *translated);
 /** @brief The maximum of @p v over the ranks. */
 int MFTLCplAgreeMax(MPI_Comm c, int v);
 

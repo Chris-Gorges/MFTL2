@@ -31,6 +31,7 @@
 #include "coupling_internal.h"
 
 #include <mpi.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -62,6 +63,28 @@ bool MFTLCplCommSameGroup(MPI_Comm a, MPI_Comm b)
   int res = MPI_UNEQUAL;
   MPI_Comm_compare(a, b, &res);
   return res != MPI_UNEQUAL;
+}
+
+bool MFTLCplTranslateRanks(MPI_Comm from, MPI_Comm to, int64_t n, const int *ranks, int *translated)
+{
+  int size;
+  MPI_Comm_size(from, &size);
+  for (int64_t i = 0; i < n; ++i)
+    if (ranks[i] < 0 || ranks[i] >= size) return false;
+  MPI_Group src, dst;
+  MPI_Comm_group(from, &src);
+  MPI_Comm_group(to, &dst);
+  for (int64_t off = 0; off < n;)
+  {
+    const int count = (n - off > INT_MAX) ? INT_MAX : (int) (n - off);
+    MPI_Group_translate_ranks(src, count, ranks + off, dst, translated + off);
+    off += count;
+  }
+  MPI_Group_free(&src);
+  MPI_Group_free(&dst);
+  for (int64_t i = 0; i < n; ++i)
+    if (translated[i] == MPI_UNDEFINED) return false;
+  return true;
 }
 
 int MFTLCplAgreeMax(MPI_Comm c, int v)

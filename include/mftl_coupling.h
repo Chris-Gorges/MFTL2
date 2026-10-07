@@ -475,7 +475,7 @@ typedef struct MFTL_ConstraintDesc
   const int64_t *row_ptr;  ///< `[n+1]` rows into the entry arrays.
   const uint64_t *free_keys;  ///< `[row_ptr[n]]` the free samples each is built from.
   const double *coef;  ///< `[row_ptr[n]]` \f$P_{cj}\f$, finite.
-  const int *free_owner;  ///< `[row_ptr[n]]` the rank owning each free sample.
+  const int *free_owner;  ///< `[row_ptr[n]]` the rank owning each free sample, in the solver communicator passed to MFTLSolverGridCreate().
 } MFTL_ConstraintDesc;
 
 /**
@@ -658,7 +658,7 @@ typedef struct MFTL_WindowSpec
 typedef struct MFTL_StageGeometry
 {
   const double *pos;  ///< `[3 n_markers]`; any image -- the minimum image about the base position is used.
-  const double *weight;  ///< `[n_markers]` new integrated weights, or #MFTL_NULL to keep the base ones.
+  const double *weight;  ///< `[n_markers]` new finite integrated weights, strictly positive for QUADRATURE, or #MFTL_NULL to keep the base ones.
 } MFTL_StageGeometry;
 
 /**
@@ -695,19 +695,19 @@ typedef struct MFTL_SolverField
    * are written into those ghost elements of the target instead of being sent
    * to their owners, and every other element of the target's declared ghost
    * layers is set to ZERO -- so exactly one reverse halo accumulation by the
-   * solver (each ghost element added into its owner) completes $W^T F$, and no
+   * solver (each ghost element added into its owner) completes \f$W^T F\f$, and no
    * value the array held there before is added with it. Owned elements are
    * added to as always. Distinct fields of one batch must not share ghost
    * elements. Same on every rank (part of the transfer signature).
    */
   bool halo_transpose;
-  /** FETCH (interpolation): `[6]` the field's value on each ODD mirror face (x-lo, y-lo, z-lo, x-hi, y-hi, z-hi), or #MFTL_NULL for zero. Not retained. */
+  /** FETCH: `[6]` values on ODD mirror faces (x-lo, y-lo, z-lo, x-hi, y-hi, z-hi), or #MFTL_NULL for zero. Kept valid through FetchBegin(), which copies them. */
   const double *wall_value;
   /**
    * SPREAD: `[6]`, or #MFTL_NULL: the job-wide integrated load each ODD mirror
    * face's prescribed value absorbs is ADDED here, identical on every rank --
    * with it, the loads the samples receive plus these sum to the markers'
-   * total. Whether it is requested is part of the transfer signature.
+   * total. May be requested independently on each rank.
    */
   double *wall_reaction;
   /**
@@ -780,8 +780,9 @@ void MFTLCouplerDestroy(MFTL_Coupler **c);
  *        changed it (pieces, coverage, regions, constraints). A rank with no
  *        change passes through.
  *
- * What survives is decided by effect. A change of what some rank OWNS stales
- * every window, binding, fetch and transfer token; the directory is rebuilt
+ * What survives is decided by effect. A change of what some rank OWNS, or of
+ * its constraint map, stales every window, binding, fetch and transfer token;
+ * the directory is rebuilt
  * only if some rank's ownership ENTRIES changed (re-registering the same
  * blocks or extents keeps it). A change of EXPORTS alone keeps the directory
  * and every window whose served samples are all still exported -- checked

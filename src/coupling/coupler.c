@@ -114,11 +114,12 @@ struct MFTL_Coupler
   double dir_reach[3];
 
   uint64_t seen_owned, seen_export;
-  uint64_t grid_epoch;  ///< bumped when some rank's OWNED samples changed: every window is stale
+  uint64_t grid_epoch;  ///< bumped when some rank's sample layout or constraints changed: every window is stale
   uint64_t export_epoch;  ///< bumped when only exports changed: a window survives while its served samples stay exported
   uint64_t own_hash;  ///< hash of this rank's directory entries when the directory was built
   uint64_t window_counter;
   uint64_t transfer_counter;
+  uint64_t quad_counter;
 
   int active;  ///< 0 none, 1 fetch, 2 spread
   cpl_sched sched;
@@ -149,7 +150,7 @@ static bool grid_current(const MFTL_Coupler *c)
 }
 
 /**
- * @brief Is a window current? Ownership must be unchanged since it was built;
+ * @brief Is a window current? Sample layout and constraints must be unchanged;
  *        a change of EXPORTS alone is survived when every sample it serves
  *        from this rank is still exported -- checked once per export epoch,
  *        here, and cached. The verdict is this rank's: it is the providers that
@@ -306,7 +307,11 @@ static int validate_constraints(MFTL_Coupler *c)
 {
   bool any = false;
   for (int l = 0; l < c->n_loc; ++l)
+  {
+    free(c->li[l].con_peer);
+    c->li[l].con_peer = MFTL_NULL;
     if (c->li[l].constrained) any = true;
+  }
   if (!any) return MFTL_COUPLING_OK;
   MFTL_SolverGrid *g = c->grid;
   int status = MFTL_COUPLING_OK;
@@ -327,9 +332,19 @@ static int validate_constraints(MFTL_Coupler *c)
         status = MFTL_COUPLING_INVALID;
       }
     }
-    for (int64_t e = 0; e < (L->n_con > 0 ? L->con_ptr[L->n_con] : 0); ++e)
+    const int64_t ne = (L->n_con > 0) ? L->con_ptr[L->n_con] : 0;
+    if (ne > 0)
     {
-      const int owner = L->con_owner[e];
+      c->li[l].con_peer = (int *) MFTLMallocOrDie((size_t) ne * sizeof(int), "constraint peers");
+      if (!MFTLCplTranslateRanks(g->comm, c->comm, ne, L->con_owner, c->li[l].con_peer))
+      {
+        status = MFTL_COUPLING_INVALID;
+        continue;
+      }
+    }
+    for (int64_t e = 0; e < ne; ++e)
+    {
+      const int owner = c->li[l].con_peer[e];
       const uint64_t key = L->con_free[e];
       if (owner >= c->nproc)
       {
@@ -612,6 +627,7 @@ int MFTLCouplerCreate(MFTL_Ensemble *ens, MFTL_SolverGrid *grid, const MFTL_Coup
   compute_locinfo(c);
   if (agree(c, validate_constraints(c)) != MFTL_COUPLING_OK)
   {
+    for (int l = 0; l < c->n_loc; ++l) free(c->li[l].con_peer);
     free(c->li);
     MFTLCplCommFree(&c->comm);
     free(c);
@@ -668,6 +684,7 @@ void MFTLCouplerDestroy(MFTL_Coupler **pc)
     for (int l = 0; l < c->n_loc; ++l) MFTLCplCoverFree(&c->cover[l]);
   free(c->cover);
   free(c->dir);
+  for (int l = 0; l < c->n_loc; ++l) free(c->li[l].con_peer);
   free(c->li);
   MFTLCplCommFree(&c->comm);
   free(c);
@@ -680,7 +697,7 @@ int MFTLCouplerUpdateGrid(MFTL_Coupler *c)
   int local = (c->active != 0) ? MFTL_COUPLING_INVALID : MFTL_COUPLING_OK;
   if (local == MFTL_COUPLING_OK && MFTLCplGridValidate(c->grid, &c->ens->domain) != MFTL_SUCCESS) local = MFTL_COUPLING_INVALID;
   if (c->grid->n_loc != c->n_loc) local = MFTL_COUPLING_INVALID;
-  /* Two flags ride on the status agreement: did ANY rank change what it owns,
+  /* Two flags ride on the status agreement: did ANY rank change its layout/constraints,
    * or what it exports? One MAX over three ints carries all of it. */
   int v[3] = {local, (c->grid->version_owned != c->seen_owned) ? 1 : 0, (c->grid->version_export != c->seen_export) ? 1 : 0};
   MFTLCplAgreeMaxN(c->comm, v, 3);
@@ -688,7 +705,7 @@ int MFTLCouplerUpdateGrid(MFTL_Coupler *c)
   if (st != MFTL_COUPLING_OK) return st;
   compute_locinfo(c);
   if (agree(c, validate_constraints(c)) != MFTL_COUPLING_OK) return MFTL_COUPLING_INVALID;
-  /* Ownership changed somewhere: every window is stale, but the directory is
+  /* Layout or constraints changed somewhere: every window is stale, but the directory is
    * rebuilt only if some rank's ENTRIES changed -- re-registering the same
    * blocks or the same extents keeps it (one MAX of one int). */
   bool rebuild = false;
@@ -3198,7 +3215,7 @@ static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_Co
   int status = MFTL_COUPLING_OK;
 
   cand_t cd = {0, 0, MFTL_NULL};
-  int cap_c = 0;
+  int cap_c = 0, cap_img = 0;
   int64_t n_sel = 0, *sel = MFTL_NULL;
   double *X = MFTL_NULL, *q = MFTL_NULL, *wt = MFTL_NULL;
   int64_t *isrc = MFTL_NULL;  /* mirror images: their real sample, parity, wall shares */
@@ -3331,12 +3348,15 @@ static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_Co
               q = (double *) MFTLReallocOrDie(q, (size_t) cap_c * sizeof(double), "row candidates");
               wt = (double *) MFTLReallocOrDie(wt, (size_t) cap_c * sizeof(double), "row candidates");
               sel = (int64_t *) MFTLReallocOrDie(sel, (size_t) cap_c * sizeof(int64_t), "row candidates");
-              if (mirror)
-              {
-                isrc = (int64_t *) MFTLReallocOrDie(isrc, (size_t) cap_c * sizeof(int64_t), "row images");
-                ipar = (double *) MFTLReallocOrDie(ipar, (size_t) cap_c * sizeof(double), "row images");
-                icoef = (double *) MFTLReallocOrDie(icoef, 6 * (size_t) cap_c * sizeof(double), "row images");
-              }
+            }
+            /* Ordinary locations can grow the candidate buffers without using
+             * images. Their capacity says nothing about these separate arrays. */
+            if (mirror && need_c > cap_img)
+            {
+              cap_img = (int) MFTLGrowCapacity(cap_img, (int) need_c);
+              isrc = (int64_t *) MFTLReallocOrDie(isrc, (size_t) cap_img * sizeof(int64_t), "row images");
+              ipar = (double *) MFTLReallocOrDie(ipar, (size_t) cap_img * sizeof(double), "row images");
+              icoef = (double *) MFTLReallocOrDie(icoef, 6 * (size_t) cap_img * sizeof(double), "row images");
             }
             n_sel = 0;
             for (int64_t e = 0; e < cd.n; ++e)
@@ -3672,6 +3692,7 @@ int MFTLCouplerBind(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, const MFTL_Cou
     b->quad = qd;
     b->quad_owned = true;
     st = agree(c, local);
+    if (st == MFTL_COUPLING_OK) qd->id = ++c->quad_counter;
   }
   free(locs);
   MFTLCplMarkersFree(&m);
@@ -3730,7 +3751,8 @@ static int bind_stage_core(MFTL_Coupler *c, const MFTL_CouplingBinding *base, co
         xs[k] = x0[k] + dv[k];
         if (!isfinite(xs[k])) local = MFTL_COUPLING_INVALID;
       }
-      if (stage->weight && !isfinite(stage->weight[i])) local = MFTL_COUPLING_INVALID;
+      if (stage->weight && (!isfinite(stage->weight[i]) || (b->kind == MFTL_MARKERS_QUADRATURE && !(stage->weight[i] > 0.0))))
+        local = MFTL_COUPLING_INVALID;
       if (local != MFTL_COUPLING_OK) break;
       if (stage->weight) b->ref[i].weight = stage->weight[i];
       /* the base marker's bin first, then any bin; the frame follows the bin */
@@ -4433,7 +4455,8 @@ int MFTLCouplerSpreadEnd(MFTL_Coupler *c)
         for (int64_t e = L->con_ptr[q]; e < L->con_ptr[q + 1]; ++e)
         {
           const double v = L->con_coef[e] * bc;
-          if (L->con_owner[e] == c->rank)
+          const int owner = c->li[B->location].con_peer[e];
+          if (owner == c->rank)
           {
             GROW(con_local_key, con_local_cap, n_local_con + 1, uint64_t);
             GROW(con_local_val, con_local_vcap, n_local_con + 1, double);
@@ -4444,13 +4467,13 @@ int MFTLCouplerSpreadEnd(MFTL_Coupler *c)
           }
           int at = -1;
           for (int d2 = 0; d2 < con_n_dest; ++d2)
-            if (con_dest[d2] == L->con_owner[e]) at = d2;
+            if (con_dest[d2] == owner) at = d2;
           if (at < 0)
           {
             GROW(con_dest, con_dest_cap, con_n_dest + 1, int);
             GROW(con_bufs, con_bufs_cap, con_n_dest + 1, cpl_buf);
             at = con_n_dest++;
-            con_dest[at] = L->con_owner[e];
+            con_dest[at] = owner;
             memset(&con_bufs[at], 0, sizeof(cpl_buf));
           }
           const int32_t fi = i;
@@ -4752,10 +4775,18 @@ static int quad_check(const MFTL_Coupler *c, const MFTL_CouplingBinding *b, int 
   return MFTL_COUPLING_OK;
 }
 
+/** @brief Identifies the map and the complete conversion protocol before any scheduled exchange. */
+static uint64_t quad_signature(const MFTL_CouplingBinding *b, int ncomp, bool to_vertices, MFTL_SpreadForm form)
+{
+  const uint64_t id = (b && b->quad) ? b->quad->id : 0;
+  const int args[3] = {ncomp, to_vertices ? 1 : 0, (int) form};
+  return cpl_fnv(cpl_fnv(CPL_FNV_INIT, &id, sizeof id), args, sizeof args);
+}
+
 int MFTLCouplerQuadratureToVertices(MFTL_Coupler *c, const MFTL_CouplingBinding *b, int ncomp, const double *Uq, double *Uv)
 {
   if (c == MFTL_NULL) return MFTL_COUPLING_INVALID;
-  const int st = MFTLCplAgreeTransfer(c->comm, quad_check(c, b, ncomp, Uq, Uv, false), (uint64_t) ncomp);
+  const int st = MFTLCplAgreeTransfer(c->comm, quad_check(c, b, ncomp, Uq, Uv, false), quad_signature(b, ncomp, true, MFTL_SPREAD_INTEGRATED));
   if (st != MFTL_COUPLING_OK) return st;
   const cpl_quad *q = b->quad;
   double *acc = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(q->n_own, 1) * (size_t) (ncomp + 1) * sizeof(double), "quadrature projection");
@@ -4774,7 +4805,7 @@ int MFTLCouplerQuadratureFromVertices(MFTL_Coupler *c, const MFTL_CouplingBindin
   if (c == MFTL_NULL) return MFTL_COUPLING_INVALID;
   int local = quad_check(c, b, ncomp, Fv, Fq, true);
   if (local == MFTL_COUPLING_OK && form != MFTL_SPREAD_INTEGRATED && form != MFTL_SPREAD_DENSITY) local = MFTL_COUPLING_INVALID;
-  const int st = MFTLCplAgreeTransfer(c->comm, local, (uint64_t) ncomp * 2u + (uint64_t) (form == MFTL_SPREAD_DENSITY));
+  const int st = MFTLCplAgreeTransfer(c->comm, local, quad_signature(b, ncomp, false, form));
   if (st != MFTL_COUPLING_OK) return st;
   const cpl_quad *q = b->quad;
   const double *g = Fv;
