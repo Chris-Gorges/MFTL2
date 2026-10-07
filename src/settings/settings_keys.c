@@ -60,6 +60,9 @@ _Static_assert(sizeof(MFTL_SmoothMode) == sizeof(int), "keyword storage");
 _Static_assert(sizeof(MFTL_NormalWeighting) == sizeof(int), "keyword storage");
 _Static_assert(sizeof(MFTL_IoLayout) == sizeof(int), "keyword storage");
 _Static_assert(sizeof(MFTL_VtkEncoding) == sizeof(int), "keyword storage");
+_Static_assert(sizeof(MFTL_CouplingKernel) == sizeof(int), "keyword storage");
+_Static_assert(sizeof(MFTL_Reproduction) == sizeof(int), "keyword storage");
+_Static_assert(sizeof(MFTL_SamplingPolicy) == sizeof(int), "keyword storage");
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Sections
@@ -78,6 +81,9 @@ static const MFTL_SettingSection g_sections[] = {
             "derived from the remesh target length by MFTLSettingsResolve()."),
     SECTION("contact", "Contact detection",
             "Triangle contact between and within bodies: `MFTLEnsembleIntersectObjects(ens, &cfg.contact.params, callback, user_data)`."),
+    SECTION("coupling", "Coupling to a flow solver",
+            "Interpolation to markers and spreading back: `MFTLCouplerCreate(ens, grid, &cfg.coupling.params, &coupler)`. Every tolerance is "
+            "dimensionless."),
     SECTION("redistribute", "Redistribution policy",
             "Process-wide switches of MFTLRedistribute(), applied by MFTLSettingsCreateEnsemble()."),
     SECTION("geometry", "Geometry", "Choices a caller passes to the geometry functions."),
@@ -104,6 +110,38 @@ static const MFTL_SettingChoice g_smooth_mode[] = {
 static const MFTL_SettingChoice g_normal_weighting[] = {
     CHOICE("area", MFTL_NORMAL_WEIGHT_AREA, "faces weighted by area; what a flow solver wants"),
     CHOICE("angle", MFTL_NORMAL_WEIGHT_ANGLE, "faces weighted by their angle at the vertex; the pseudo-normal of an exact inside/outside test"),
+    END_CHOICES,
+};
+
+static const MFTL_SettingChoice g_kernel[] = {
+    CHOICE("peskin4", MFTL_KERNEL_PESKIN4, "Peskin's 4-point function, half-width 2; constants and linears on a lattice"),
+    CHOICE("roma3", MFTL_KERNEL_ROMA3, "Roma-Peskin-Berger 3-point function, half-width 1.5; constants and linears on a lattice"),
+    CHOICE("cosine4", MFTL_KERNEL_COSINE4, "the cosine kernel, half-width 2; constants only, so LINEAR rows are corrected"),
+    CHOICE("hat2", MFTL_KERNEL_HAT2, "the linear hat, half-width 1: trilinear interpolation on a lattice"),
+    CHOICE("bspline3", MFTL_KERNEL_BSPLINE3, "the cubic B-spline, half-width 2; constants and linears, C2"),
+    CHOICE("wendland_c2", MFTL_KERNEL_WENDLAND_C2, "radial Wendland C2, support radius 2; no lattice moments, always corrected"),
+    END_CHOICES,
+};
+
+static const MFTL_SettingChoice g_reproduction[] = {
+    CHOICE("linear", MFTL_REPRODUCE_LINEAR, "constants and linear fields: force and torque conservation; weights may be negative"),
+    CHOICE("constant", MFTL_REPRODUCE_CONSTANT, "normalised positive weights: constants and positivity only"),
+    CHOICE("none", MFTL_REPRODUCE_NONE, "the base kernel as it is; the achieved moments are reported"),
+    END_CHOICES,
+};
+
+static const MFTL_SettingChoice g_stencil_failure[] = {
+    CHOICE("error", MFTL_STENCIL_ERROR, "a row that fails its checks fails the bind"),
+    CHOICE("grow", MFTL_STENCIL_GROW, "retry with a wider support, up to max_growth"),
+    CHOICE("lower_order", MFTL_STENCIL_LOWER_ORDER, "accept constant reproduction where linear fails"),
+    CHOICE("grow_then_lower", MFTL_STENCIL_GROW | MFTL_STENCIL_LOWER_ORDER, "grow first, then accept constant reproduction"),
+    END_CHOICES,
+};
+
+static const MFTL_SettingChoice g_sampling[] = {
+    CHOICE("off", MFTL_SAMPLING_OFF, "not checked"),
+    CHOICE("report", MFTL_SAMPLING_REPORT, "measured and counted, never an error"),
+    CHOICE("error", MFTL_SAMPLING_ERROR, "a spreading bind of a too-coarse surface fails"),
     END_CHOICES,
 };
 
@@ -235,6 +273,32 @@ static const MFTL_SettingInfo g_keys[] = {
     KEY("contact", "leaf_size", INT, contact.params.leaf_size, "4", "[1, 64]", NO_CHOICES, "", 1, "Maximum triangles per BVH leaf."),
     KEY("contact", "include_ghosts", BOOL, contact.params.include_ghosts, "false", "", NO_CHOICES, "", 1,
         "Also use redistribution ghosts as primitives. Reports halo contacts once per holder: for inspecting the halo only."),
+
+    /* ── coupling ───────────────────────────────────────────────────────── */
+    KEY("coupling", "kernel", KEYWORD, coupling.params.kernel, "\"peskin4\"", "", g_kernel, "", 0, "The regularised delta function."),
+    KEY("coupling", "reproduction", KEYWORD, coupling.params.reproduction, "\"linear\"", "", g_reproduction, "", 0,
+        "What every row must reproduce exactly."),
+    KEY("coupling", "failure", KEYWORD, coupling.params.failure, "\"error\"", "", g_stencil_failure, "", 0,
+        "What happens to a row that fails its quality checks. Lower order is an explicit choice, counted per row."),
+    KEY("coupling", "max_growth", REAL, coupling.params.max_growth, "1.5", "[1, inf)", NO_CHOICES, "", 1,
+        "Largest support growth factor when failure allows growing; windows are sized for it."),
+    KEY("coupling", "growth_step", REAL, coupling.params.growth_step, "1.25", "(1, inf)", NO_CHOICES, "", 1, "Growth factor per retry."),
+    KEY("coupling", "support_scale", REAL, coupling.params.support_scale, "1.0", "(0, inf)", NO_CHOICES, "", 0,
+        "Kernel metric as a multiple of the local fluid resolution."),
+    KEY("coupling", "pilot_factor", REAL, coupling.params.pilot_factor, "1.5", "(0, inf)", NO_CHOICES, "", 1,
+        "Radius of the neighbourhood that sets a variable metric, in units of the location's largest resolution."),
+    KEY("coupling", "max_condition", REAL, coupling.params.max_condition, "100000000.0", "[1, inf)", NO_CHOICES, "", 1,
+        "Largest admissible condition number of a row's equilibrated moment matrix."),
+    KEY("coupling", "max_amplification", REAL, coupling.params.max_amplification, "4.0", "[1, inf)", NO_CHOICES, "", 1,
+        "Largest admissible sum of the absolute weights of a row."),
+    KEY("coupling", "moment_tolerance", REAL, coupling.params.moment_tolerance, "1e-10", "(0, 1)", NO_CHOICES, "", 1,
+        "Moments within this of exact need no correction, and a corrected row must reach it (relaxed by the conditioning)."),
+    KEY("coupling", "sampling", KEYWORD, coupling.params.sampling, "\"report\"", "", g_sampling, "", 0,
+        "What a surface too coarse for the fluid resolution does."),
+    KEY("coupling", "sampling_ratio", REAL, coupling.params.sampling_ratio, "1.0", "(0, inf)", NO_CHOICES, "", 0,
+        "Largest admissible surface edge over the fluid resolution near it."),
+    KEY("coupling", "directory_margin", REAL, coupling.params.directory_margin, "0.0", "[0, inf)", NO_CHOICES, "length", 1,
+        "How far beyond its rank box the provider directory reaches; 0 derives it. It grows on its own when a request needs more."),
 
     /* ── redistribute ───────────────────────────────────────────────────── */
     KEY("redistribute", "skip_unchanged_bodies", BOOL, redistribute.skip_unchanged_bodies, "true", "", NO_CHOICES, "", 1,

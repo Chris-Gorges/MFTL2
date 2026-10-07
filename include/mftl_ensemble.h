@@ -68,6 +68,19 @@ int MFTLEnsembleAddObject(MFTL_Ensemble *ensemble, MFTL_Object *object);
  */
 void MFTLEnsembleDestroy(MFTL_Ensemble **p_ens);
 
+/**
+ * @brief MFTLObjectMarkChanged() on every body this rank holds.
+ *
+ * What a solver calls after its advection loop has written `verts.pos`, so that
+ * anything holding a description of the old geometry -- a coupling binding --
+ * reports itself stale rather than being applied to the new one.
+ *
+ * @param ens The ensemble; #MFTL_NULL is a no-op.
+ *
+ * @rank_local
+ */
+void MFTLEnsembleMarkChanged(MFTL_Ensemble *ens);
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * The local object directory
  *

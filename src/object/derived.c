@@ -334,4 +334,5 @@ void MFTLObjectReorderMorton(MFTL_Object *obj)
 
   /* The derived arrays were deliberately not permuted; rebuild them instead. */
   MFTLObjectBuildDerived(obj);
+  MFTLObjectMarkChanged(obj);
 }

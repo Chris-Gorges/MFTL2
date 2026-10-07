@@ -375,7 +375,11 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble *ens)
 {
   /* New ghost positions: geometry computed before this is stale on the ghosts. */
   if (ens != MFTL_NULL && ens->local_objects != MFTL_NULL)
-    for (int o = 0; o < ens->n_local_objects; ++o) ens->local_objects[o]->derived &= ~MFTL_DERIVED_GEOMETRY;
+    for (int o = 0; o < ens->n_local_objects; ++o)
+    {
+      ens->local_objects[o]->derived &= ~MFTL_DERIVED_GEOMETRY;
+      MFTLObjectMarkChanged(ens->local_objects[o]);
+    }
   return ghost_sync_vec3(ens, GHOST_FIELD_POSITION);
 }
 

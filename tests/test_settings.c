@@ -102,6 +102,7 @@ static bool is_module_block_key(const MFTL_SettingInfo *k)
       {offsetof(MFTL_Settings, remesh.params), sizeof(MFTL_RemeshParameters)},
       {offsetof(MFTL_Settings, topology.options), sizeof(MFTL_TopologyOptions)},
       {offsetof(MFTL_Settings, contact.params), sizeof(MFTL_BVHBuildParams)},
+      {offsetof(MFTL_Settings, coupling.params), sizeof(MFTL_CouplerParams)},
       {offsetof(MFTL_Settings, output.vtk), sizeof(MFTL_VtkOptions)},
   };
   for (size_t b = 0; b < sizeof blocks / sizeof blocks[0]; ++b)
@@ -222,6 +223,7 @@ static int test_defaults_follow_the_modules(void)
   MFTLInitRemeshParams(&m.remesh.params, MFTL_REMESH_ISOTROPIC, 0.0, 3, MFTL_SMOOTH_TRIANGLE_BASED, 180.0);
   m.topology.options = MFTLTopologyDefaultOptions();
   m.contact.params = MFTL_BVHDefaultParams();
+  MFTLCouplerDefaultParams(&m.coupling.params);
   m.output.vtk = MFTLVtkDefaults();
 
   int n_block_keys = 0, n_different = 0;

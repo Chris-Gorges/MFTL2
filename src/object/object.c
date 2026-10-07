@@ -248,6 +248,15 @@ static void triangle_pool_reserve(MFTL_TrianglePool *p, int capacity)
  * Public: lifecycle
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/** @brief Source of #MFTL_Object::generation stamps; process-wide so a stamp is never reused. */
+static uint64_t g_generation_counter = 0;
+
+void MFTLObjectMarkChanged(MFTL_Object *obj)
+{
+  MFTL_ASSERT(obj != MFTL_NULL);
+  obj->generation = ++g_generation_counter;
+}
+
 MFTL_Object *MFTLObjectCreate(int global_id)
 {
   /* calloc: every count, capacity and pointer starts at 0/NULL, which is exactly
@@ -265,6 +274,7 @@ MFTL_Object *MFTLObjectCreate(int global_id)
   /* Never partitioned, so no current partition: the first redistribution must
    * rebuild it. */
   object->partition_dirty = MFTL_TRUE;
+  MFTLObjectMarkChanged(object);
 
   return object;
 }
@@ -326,6 +336,7 @@ void MFTLObjectSetCounts(MFTL_Object *obj, int n_vertices, int n_local_vertices,
   /* Nor does the partition. Every entity creation or destruction passes through
    * here, so the redistribution's skip of unchanged bodies cannot miss one. */
   obj->partition_dirty = MFTL_TRUE;
+  MFTLObjectMarkChanged(obj);
 }
 
 void MFTLObjectClear(MFTL_Object *obj)
@@ -346,6 +357,7 @@ void MFTLObjectClear(MFTL_Object *obj)
 
   obj->derived = 0u;
   obj->partition_dirty = MFTL_TRUE;
+  MFTLObjectMarkChanged(obj);
 }
 
 size_t MFTLObjectPoolBytes(const MFTL_Object *obj)

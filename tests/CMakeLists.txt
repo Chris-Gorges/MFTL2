@@ -190,6 +190,32 @@ mftl_add_mpi_test_at(test_remeshing_dispersed_np2 test_remeshing_dispersed 2)
 mftl_add_mpi_test_at(test_remeshing_dispersed_np4 test_remeshing_dispersed 4)
 mftl_add_mpi_test_at(test_remeshing_dispersed_np8 test_remeshing_dispersed 8)
 
+# --- Coupling to a flow solver ------------------------------------------------
+#
+# The kernel table and the row core are local, so they run without MPI. The
+# coupler is registered at the counts every distributed module uses, and each
+# reaches something the others cannot: 1 is the serial reference path with
+# every route SELF; 2 a thin 2x1x1 grid on which a periodic axis aliases both
+# neighbours onto one rank; 4 the first diagonal neighbour; 8 every one of the
+# 26 offsets populated; 27 an interior rank whose 26 neighbours are distinct.
+# The solver's decomposition is varied INSIDE the test (aligned, z-slabs,
+# reversed, all on rank 0), so every count also runs mismatched partitions.
+mftl_add_test(test_coupling_kernels)
+mftl_add_mpi_test(test_coupling 1)
+mftl_add_mpi_test_at(test_coupling_np2 test_coupling 2)
+mftl_add_mpi_test_at(test_coupling_np4 test_coupling 4)
+mftl_add_mpi_test_at(test_coupling_np8 test_coupling 8)
+mftl_add_mpi_test_oversub(test_coupling_np27 test_coupling 27)
+# The contracts rather than the numbers: coverage, selection, staleness,
+# failure, agreement. Several assertions only bite with a second rank (ranks
+# that disagree, a duplicate owner on another rank), so 1 is not enough alone.
+mftl_add_mpi_test(test_coupling_protocol 1)
+mftl_add_mpi_test_at(test_coupling_protocol_np2 test_coupling_protocol 2)
+mftl_add_mpi_test_at(test_coupling_protocol_np4 test_coupling_protocol 4)
+mftl_add_mpi_test_at(test_coupling_protocol_np8 test_coupling_protocol 8)
+# More ranks than point-cloud slabs also exercises empty provider regions.
+mftl_add_mpi_test_oversub(test_coupling_protocol_np27 test_coupling_protocol 27)
+
 # --- The remeshing module's MPI must stay in one file ----------------------
 #
 # A source-level test, because it is a source-level property and no runtime
@@ -214,6 +240,15 @@ add_test(NAME test_topology_change_mpi_is_confined
          COMMAND ${CMAKE_COMMAND}
                  -DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../src/topology_change
                  -DALLOWED=topo_comm.c
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/check_mpi_confinement.cmake)
+
+# And the same rule for the coupler: discovery, requests, replies, the fetch
+# and the spread schedules all go through coupling_comm.c, which never touches
+# the solver's communicator.
+add_test(NAME test_coupling_mpi_is_confined
+         COMMAND ${CMAKE_COMMAND}
+                 -DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../src/coupling
+                 -DALLOWED=coupling_comm.c
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/check_mpi_confinement.cmake)
 
 # --- Genuine multi-rank coverage ------------------------------------------
@@ -364,6 +399,22 @@ if(BUILD_EXAMPLES)
     add_test(NAME test_shipped_settings_${_name}
              COMMAND $<TARGET_FILE:mftl_settings> check ${_file} --np 4)
   endforeach()
+
+  # COUPLING, measured on a flow: LeVeque's vortex with the velocity known only
+  # on a solver's samples -- a MAC grid owned in z-slabs (np = 2: every
+  # marker's support crosses the solver's partition) and an unstructured
+  # tetrahedral mesh owned in Morton chunks (np = 4) -- advected with RK4
+  # through stage binds. -verify fails the run unless the vertex error at
+  # maximum deformation converges at better than order 1.5 between the two
+  # meshes, and the remeshed front-tracking run stays a closed sphere that
+  # tracks the direct run's volume. Half a period: the error at T is no
+  # coupling measure (the interpolated field is time-reversible too).
+  add_test(NAME test_leveque_coupled_cartesian
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:leveque_coupled_cartesian> -n 16,32 -steps 75 -verify ${MPIEXEC_POSTFLAGS})
+  add_test(NAME test_leveque_coupled_unstructured
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:leveque_coupled_unstructured> -n 8,16 -steps 75 -verify ${MPIEXEC_POSTFLAGS})
 
   # OPEN SURFACES. No library test runs the distributed remesher on a surface
   # with a rim; these four examples do, and each checks what an open surface

@@ -292,6 +292,20 @@ typedef struct MFTL_Object
    */
   bool partition_settled;
 
+  /**
+   * Surface generation: a stamp from one process-wide counter, renewed by every
+   * library call that can change this mesh's positions, topology, entity set or
+   * pool order (MFTLObjectMarkChanged()). Something that cached a description of
+   * the mesh -- a coupling binding's marker list and rows -- compares stamps to
+   * learn that it is stale; a new object never repeats an old stamp, so a body
+   * destroyed and recreated by a redistribution cannot pass for its predecessor.
+   *
+   * A caller writing `verts.pos` itself owes MFTLObjectMarkChanged(); a
+   * redistribution that SKIPS an unchanged body leaves its stamp alone, because
+   * its pool is then bit-identical.
+   */
+  uint64_t generation;
+
   struct MFTL_Domain *domain;  ///< Borrowed from the ensemble; MFTL_NULL until added.
 
   MFTL_ObjectQualityStatistics quality;  ///< By value: nine doubles do not need their own allocation.

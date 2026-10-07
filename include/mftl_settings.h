@@ -83,6 +83,7 @@
 #include <mpi.h>
 
 #include "mftl_bvh.h"
+#include "mftl_coupling.h"
 #include "mftl_geometry.h"
 #include "mftl_io.h"
 #include "mftl_remeshing.h"
@@ -187,6 +188,16 @@ typedef struct MFTL_ContactSettings
 } MFTL_ContactSettings;
 
 /**
+ * @struct MFTL_CouplingSettings
+ * @brief Coupling to a flow solver: the numerical policy of MFTLCouplerCreate().
+ */
+typedef struct MFTL_CouplingSettings
+{
+  /** The parameters to pass to MFTLCouplerCreate(). `user_kernel` cannot be set from a file. */
+  MFTL_CouplerParams params;
+} MFTL_CouplingSettings;
+
+/**
  * @struct MFTL_RedistributeSettings
  * @brief The process-wide redistribution policy; applied by
  *        MFTLSettingsCreateEnsemble() through MFTLRedistributeSetSkipUnchangedBodies()
@@ -237,6 +248,7 @@ typedef struct MFTL_Settings
   MFTL_RemeshSettings remesh;  ///< `[remesh]`
   MFTL_TopologySettings topology;  ///< `[topology]`
   MFTL_ContactSettings contact;  ///< `[contact]`
+  MFTL_CouplingSettings coupling;  ///< `[coupling]`
   MFTL_RedistributeSettings redistribute;  ///< `[redistribute]`
   MFTL_GeometrySettings geometry;  ///< `[geometry]`
   MFTL_OutputSettings output;  ///< `[output]`

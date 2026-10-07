@@ -224,6 +224,23 @@ static inline void MFTLObjectInvalidateDerived(MFTL_Object *obj) { obj->derived 
 static inline void MFTLObjectMarkPartitionDirty(MFTL_Object *obj) { obj->partition_dirty = MFTL_TRUE; }
 
 /**
+ * @brief Renews the object's surface generation (#MFTL_Object::generation).
+ *
+ * The library calls it wherever it changes a mesh -- entity counts
+ * (MFTLObjectSetCounts()), pool order (MFTLObjectReorderMorton()), ghost
+ * positions (MFTLUpdateGhostPositions()), the remeshing operators and the
+ * smoother, the topology change's volume correction. A caller that moves
+ * vertices by writing `verts.pos` (the advection loop) must call it too, before
+ * anything that cached the old geometry is used again: a coupling binding then
+ * reports itself stale instead of applying rows built at the old positions.
+ *
+ * @param obj The mesh; only `generation` is written.
+ *
+ * @rank_local
+ */
+void MFTLObjectMarkChanged(MFTL_Object *obj);
+
+/**
  * @brief Rebuilds `tris.verts` and `tris.neighbors` from the half-edge records
  *        in one streaming pass and sets #MFTL_DERIVED_TOPOLOGY
  *        (#MFTL_DERIVED_GEOMETRY is left as it was).

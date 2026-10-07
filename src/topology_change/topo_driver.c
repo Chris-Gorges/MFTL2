@@ -219,6 +219,7 @@ static void project_rim(MFTL_Object *obj, const MFTL_TopologyOptions *opts)
     MFTLApplyPeriodicity(dom, q);
     for (int k = 0; k < 3; ++k) obj->verts.pos[3 * v + k] = q[k];
   }
+  MFTLObjectMarkChanged(obj);
 }
 
 /**

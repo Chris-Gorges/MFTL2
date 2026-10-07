@@ -282,6 +282,12 @@ void MFTLEnsembleDestroy(MFTL_Ensemble **p_ens)
   *p_ens = MFTL_NULL;
 }
 
+void MFTLEnsembleMarkChanged(MFTL_Ensemble *ens)
+{
+  if (ens == MFTL_NULL) return;
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLObjectMarkChanged(ens->local_objects[o]);
+}
+
 int MFTLEnsembleAddObject(MFTL_Ensemble *ensemble, MFTL_Object *object)
 {
   if (!ensemble || !object) return MFTL_ERROR;

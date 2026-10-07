@@ -17,6 +17,7 @@
  *   layer 3   mftl_object.h     mftl_ensemble.h   mftl_meshgen.h
  *             mftl_communication.h                mftl_io.h
  *             mftl_remeshing.h  mftl_bvh.h        mftl_topology_change.h
+ *             mftl_coupling.h
  *   layer 4   mftl_settings.h  (sees every module's parameter block)
  *   layer 5   mftl_core.h  (this file)
  *
@@ -38,6 +39,7 @@
 
 #include "mftl_bvh.h"
 #include "mftl_communication.h"
+#include "mftl_coupling.h"
 #include "mftl_ensemble.h"
 #include "mftl_io.h"
 #include "mftl_meshgen.h"
