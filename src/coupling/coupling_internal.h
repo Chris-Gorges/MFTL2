@@ -47,6 +47,7 @@ enum
 typedef struct cpl_kernel
 {
   MFTL_KernelFn eval;
+  MFTL_KernelFn deriv;  ///< #MFTL_NULL when the kernel declares none
   void *ctx;
   double half_width;
   int moment_order;
@@ -86,6 +87,7 @@ typedef struct cpl_points
   double *measure;  ///< [n]
   double *h;  ///< [3n]
   double *cell;  ///< [9n] anisotropic location: cell matrices (row-major), else #MFTL_NULL
+  double *dir;  ///< [3n] directional location: each sample's vector, else #MFTL_NULL
   double *ext;  ///< [3n] half-extents
   int64_t *aidx;  ///< [n] element index in the field arrays
   int64_t *orig;  ///< [n] registration index
@@ -109,6 +111,7 @@ typedef struct cpl_location
   MFTL_BoundaryPolicy boundary;
   MFTL_WallParity wall[6];  ///< MIRROR: parity per face, x-lo .. z-hi
   bool anisotropic;  ///< point samples carry cell matrices
+  bool directional;  ///< point samples are projections s . u
 
   MFTL_GridExposure exposure;
   int n_cov;
@@ -145,6 +148,7 @@ struct MFTL_SolverGrid
   int **kidx_piece;
   int64_t **kidx_elem;
   double **kidx_meas;
+  int64_t **kidx_sidx;  ///< a point's index within its (Morton-sorted) set
   int n_blocks, cap_blocks;
   cpl_block *blocks;
   int n_points, cap_points;
@@ -172,6 +176,14 @@ int64_t MFTLCplConstraintFind(const cpl_location *l, uint64_t key);
  * @return false if this rank does not own the key.
  */
 bool MFTLCplSampleFind(MFTL_SolverGrid *g, int location, uint64_t key, int *piece, int64_t *elem, double *measure);
+
+/**
+ * @brief MFTLCplSampleFind() that also tells a masked lattice sample from an
+ *        absent one, and returns the sample's index: the owned-box linear index
+ *        of a block, or a point's index within its Morton-sorted set.
+ * @return 1 owned, 0 not owned here, -1 a masked (solid) lattice position owned here.
+ */
+int MFTLCplSampleLocate(MFTL_SolverGrid *g, int location, uint64_t key, int *piece, int64_t *elem, double *measure, int64_t *sample);
 
 /** @brief Is owned lattice index @p idx exported (FULL, or inside a coverage box)? */
 bool MFTLCplLatExported(const cpl_location *l, const int64_t idx[3]);
@@ -390,7 +402,12 @@ typedef struct cpl_row_scratch
   double *phi;  ///< [3 cap] per-axis kernel values / radial
   double *psi;  ///< [cap] base weights
   double *r;  ///< [cap] argument scratch
+  int aux_cap;
+  double *aux;  ///< block rows: [CPL_ROW_AUX cap] per-candidate scratch
 } cpl_row_scratch;
+
+/** @brief Doubles of block-row scratch per candidate. */
+#define CPL_ROW_AUX 24
 
 /** @brief Frees row scratch. */
 void MFTLCplRowScratchFree(cpl_row_scratch *s);
@@ -426,6 +443,42 @@ int MFTLCplRowWeightsCell(const MFTL_CouplerParams *p, const cpl_kernel *kern, c
 /** @brief Inverse and determinant of a cell matrix; false when singular relative to its column norms. */
 bool MFTLCplCellInverse(const double Hm[9], double inv[9], double *det);
 
+/**
+ * @brief The metric of a block row: \f$A = \tilde H^{-1}\f$ and, for a derivative
+ *        with a varying metric, its derivatives.
+ */
+typedef struct cpl_metric
+{
+  double H[9];  ///< \f$\tilde H\f$, scale and growth applied (row-major)
+  double A[9];  ///< \f$\tilde H^{-1}\f$
+  double detA;  ///< \f$|\det A|\f$
+  bool varying;  ///< dA and dlogdet are set
+  double dA[27];  ///< \f$\partial A/\partial x_m\f$, m-major
+  double dlogdet[3];  ///< \f$\partial \log|\det A| / \partial x_m\f$
+} cpl_metric;
+
+/**
+ * @brief Fills a metric from a diagonal (@p cell false: @p H `[3]`) or full
+ *        (@p H `[9]`) \f$\tilde H\f$, and optionally its derivative @p dH
+ *        (`[3]` per m for a diagonal one, `[9]` per m for a full one; #MFTL_NULL
+ *        for a constant metric).
+ * @return false when the metric is singular.
+ */
+bool MFTLCplMetricSet(cpl_metric *m, bool cell, const double *H, const double *dH);
+
+/** @brief Components per entry of a block row: 3 for a direction or a gradient, 1 otherwise. */
+static inline int cpl_row_ncomp(MFTL_CouplingOperator op, bool directional) { return (directional || op != MFTL_OPERATOR_VALUE) ? 3 : 1; }
+
+/**
+ * @brief A block row: directional reconstruction, the gradient fit, or the
+ *        derivative of the value row, over given candidates at one metric (no
+ *        growth). @p w receives `cpl_row_ncomp()` weights per candidate.
+ * @return #MFTL_COUPLING_OK, #MFTL_COUPLING_BAD_STENCIL, or
+ *         #MFTL_COUPLING_INVALID for an operator the inputs cannot have.
+ */
+int MFTLCplBlockRow(const MFTL_CouplerParams *p, const cpl_kernel *kern, MFTL_CouplingOperator op, const double x[3], const cpl_metric *met, int n,
+                    const double *X, const double *q, const double *dir, double *w, MFTL_RowQuality *q_out, cpl_row_scratch *s);
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Coupler state (coupler.c)
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -437,6 +490,7 @@ typedef struct cpl_locinfo
   bool constrained;  ///< some rank registered constrained samples of this location
   int *con_peer;  ///< local constraint entries' owners, translated from solver ranks to coupler ranks
   bool anisotropic;  ///< point samples carry cell matrices
+  bool directional;  ///< point samples are projections s . u
   bool uniform_metric;  ///< every sample of the location has the same resolution
   double hmin[3];  ///< global minimum resolution
   double hmax[3];  ///< global maximum resolution (the metric bound)
@@ -457,6 +511,7 @@ typedef struct cpl_band
   double *measure;
   double *h;  ///< [3 n_dof]
   double *cell;  ///< [9 n_dof] anisotropic point location: cell matrices, else #MFTL_NULL
+  double *dir;  ///< [3 n_dof] directional point location: the samples' vectors, else #MFTL_NULL
 
   int64_t n_img;
   double *ipos;  ///< [3 n_img]
@@ -495,6 +550,7 @@ struct MFTL_CouplingWindow
   uint64_t id;
   uint64_t grid_epoch;
   uint64_t export_epoch;  ///< the export epoch at which every served sample was last confirmed exported
+  bool keyed;  ///< built from named samples (MFTLCouplerRequestSamples()): no spatial certificate, imported rows only
   int n_loc;
   int *locs;
   cpl_band *band;
@@ -532,10 +588,13 @@ struct MFTL_CouplingBinding
   double *base_pos;  ///< [3n] positions of the base markers (equal to pos for a base binding)
   int n_loc;
   int *loc_band;  ///< window band index per location
+  MFTL_CouplingOperator op;  ///< what the rows compute
+  bool imported;  ///< rows imported by MFTLCouplerImportRows(): no stage binds
+  int *ncomp;  ///< [n_loc] weights per entry (1, or 3 for a direction or a gradient)
   int64_t **row_ptr;
   int64_t **col;
-  double **w;
-  double **wallc;  ///< [n_loc] MIRROR locations: [6 n_markers] wall coefficients; #MFTL_NULL otherwise
+  double **w;  ///< [n_loc] [ncomp * entries]
+  double **wallc;  ///< [n_loc] MIRROR locations: [6 ncomp n_markers] wall coefficients (6 per component); #MFTL_NULL otherwise
   int n_bodies;
   cpl_body_snap *bodies;
   uint64_t pos_checksum;
@@ -681,6 +740,38 @@ void MFTLCplQuadAccumulate(MPI_Comm comm, const cpl_quad *q, int64_t n_markers, 
 void MFTLCplQuadInterpolate(MPI_Comm comm, const cpl_quad *q, int64_t n_markers, const MFTL_MarkerRef *ref, bool weighted, int ncomp, const double *g,
                             double *out, long *bytes, long *messages);
 
+/**
+ * @brief The vertex table's values, owned and ghost: @p g holds the owned
+ *        vertices' `ncomp` values, @p tab receives `[(n_own + n_ghost) * ncomp]`,
+ *        the ghosts' from their owners. Collective.
+ */
+void MFTLCplQuadGhostValues(MPI_Comm comm, const cpl_quad *q, int ncomp, const double *g, double *tab, long *bytes, long *messages);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Nearest-surface queries (coupling_query.c)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Owned triangle @p t in the frame of its wrapped centroid: corners
+ *        unwrapped about corner 0 and shifted by whole periods so that their
+ *        centroid is @p c, the very centroid (same bits) CENTROIDS markers bin.
+ */
+void MFTLCplTriangleCentroidFrame(const MFTL_Domain *d, const MFTL_Object *obj, int t, double T[3][3], double c[3]);
+
+/** @brief Unit normal of a triangle from its corners (zero for a degenerate one). */
+void MFTLCplFaceNormal(const double T[3][3], double n[3]);
+
+/**
+ * @brief Angle-weighted pseudo-normals of every OWNED vertex of every local
+ *        body, in the vertex table's order (bodies in list order, then pool
+ *        order), summed over the vertex's whole fan -- complete on its owner,
+ *        the halo being vertex-complete -- in ascending triangle id, so the bits
+ *        do not depend on the partition. Local.
+ * @param ens The ensemble.
+ * @param[out] g `[3 * owned vertices]`.
+ */
+void MFTLCplVertexPseudoNormals(const MFTL_Ensemble *ens, double *g);
+
 /** @brief FNV-1a over the bits of @p n positions. */
 uint64_t MFTLCplPositionsChecksum(const double *pos, int64_t n);
 
@@ -714,7 +805,10 @@ enum
   CPL_TAG_QUAD = 107,
   CPL_TAG_CONSTRAINT_SETUP = 108,
   CPL_TAG_CONSTRAINT = 109,
-  CPL_TAG_MIGRATION = 110
+  CPL_TAG_MIGRATION = 110,
+  CPL_TAG_KEYS = 111,
+  CPL_TAG_KEYS_REPLY = 112,
+  CPL_TAG_QUERY = 113
 };
 
 /** @brief Duplicates @p base. */

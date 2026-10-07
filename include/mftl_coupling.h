@@ -152,7 +152,9 @@ typedef void (*MFTL_KernelFn)(const double *r, double *phi, int n, void *ctx);
 typedef struct MFTL_KernelDesc
 {
   MFTL_KernelFn eval;  ///< The evaluator.
-  void *ctx;  ///< Passed through to @c eval.
+  /** The derivative \f$\phi'(r)\f$ (tensor) or \f$\phi'(\rho)\f$ (radial), or #MFTL_NULL: only #MFTL_OPERATOR_VALUE_DERIVATIVE needs it. */
+  MFTL_KernelFn deriv;
+  void *ctx;  ///< Passed through to @c eval and @c deriv.
   double half_width;  ///< Support half-width in units of the metric; \f$\phi(r)=0\f$ for \f$|r|\ge\f$ it. Positive and finite.
   int moment_order;  ///< Moments reproduced on a complete uniform lattice: -1 none, 0 constants, 1 constants and linears.
   bool radial;  ///< `true`: \f$\phi(|d|)\f$ normalised in 3-D; `false`: a tensor product of 1-D \f$\phi\f$.
@@ -193,6 +195,20 @@ int MFTLCouplingKernelInfo(MFTL_CouplingKernel kernel, MFTL_KernelInfo *info);
  */
 int MFTLCouplingKernelEval(MFTL_CouplingKernel kernel, const double *r, double *phi, int n);
 
+/**
+ * @brief Evaluates a built-in kernel's derivative: \f$\phi'(r)\f$ for a tensor
+ *        kernel (odd in r), \f$\phi'(\rho)\f$ for the radial one. Where the
+ *        derivative does not exist (the hat at 0, the breakpoints of a C0
+ *        kernel) the value is one of the one-sided limits or 0.
+ * @param kernel A built-in kernel.
+ * @param r    [n] arguments.
+ * @param dphi [n] derivatives out.
+ * @param n    Number of arguments.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR for an unknown kernel.
+ * @rank_local
+ */
+int MFTLCouplingKernelDerivative(MFTL_CouplingKernel kernel, const double *r, double *dphi, int n);
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * 3. Parameters
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -204,6 +220,37 @@ typedef enum MFTL_Reproduction
   MFTL_REPRODUCE_CONSTANT = 1,  ///< Normalised positive base weights: constants and positivity, no linear precision.
   MFTL_REPRODUCE_NONE = 2  ///< The base kernel as it is; the achieved moments are reported, not enforced.
 } MFTL_Reproduction;
+
+/**
+ * @brief What a binding's rows compute from a location's samples.
+ *
+ * The two gradients are different operations and are named apart on purpose.
+ * The FIT's slope reproduces the gradient of every affine field but is not the
+ * derivative of the interpolated value; the DERIVATIVE differentiates
+ * everything the value row depends on -- the kernel, the moment correction,
+ * the metric -- so it is exactly \f$\partial(Wu)/\partial x\f$, and exists
+ * only where that is differentiable (not at the breakpoints of a C0 kernel,
+ * nor where a row's growth step or reproduction order switches).
+ */
+typedef enum MFTL_CouplingOperator
+{
+  MFTL_OPERATOR_VALUE = 0,  ///< \f$U = W u\f$: the value (a 3-vector at a directional location). The default.
+  /**
+   * \f$\nabla u\f$ from the weighted affine fit \f$u \approx \alpha + \beta\cdot d\f$ the
+   * LINEAR value row is built on: \f$\nabla u = \tilde H^{-T}\beta\f$. Reproduces
+   * the gradient of every affine field exactly; always solves the full
+   * moment matrix (the reproduction policy does not apply, and there is no
+   * lower-order fallback: a constant fit has no slope). Scalar locations only.
+   */
+  MFTL_OPERATOR_GRADIENT_FIT = 1,
+  /**
+   * \f$\partial U / \partial x\f$ of the value row as the reproduction policy builds
+   * it, differentiated exactly: kernel (#MFTL_KernelDesc::deriv), moment
+   * correction and a varying metric included. For a LINEAR row it too
+   * reproduces affine gradients. Scalar locations only.
+   */
+  MFTL_OPERATOR_VALUE_DERIVATIVE = 2
+} MFTL_CouplingOperator;
 
 /** @brief Bit flags: what happens when a row fails its checks. 0 (the default) is an error. */
 typedef enum MFTL_StencilFailure
@@ -345,6 +392,21 @@ typedef struct MFTL_LocationDesc
    * neighbours'.
    */
   bool anisotropic;
+  /**
+   * Point locations: every sample is DIRECTIONAL -- its value is
+   * \f$q_j = s_j \cdot u(X_j)\f$ for the sample's vector
+   * #MFTL_PointSetDesc::direction (a unit normal for a normal velocity, the
+   * oriented area vector for a face flux) -- and a value row reconstructs the
+   * vector \f$u\f$ at the marker: a field at such a location interpolates to,
+   * and spreads from, THREE components per marker, with block weights
+   * \f$A_j \in \mathbb{R}^3\f$ and \f$b_j = A_j^T F\f$. CONSTANT reproduction is
+   * \f$A_j = \psi_j T^{-1}\hat s_j / |s_j|\f$ with \f$T = \sum\psi\hat s\hat s^T\f$;
+   * LINEAR fits a 12-coefficient affine vector field, which reproduces rigid
+   * motions and so conserves force and torque by work. Both need the
+   * directions to span space (directional rank). Not with
+   * #MFTL_BOUNDARY_MIRROR, nor with the gradient operators.
+   */
+  bool directional;
 } MFTL_LocationDesc;
 
 /**
@@ -391,6 +453,8 @@ typedef struct MFTL_PointSetDesc
    * `h` as the sample's resolution bound. Ignored elsewhere.
    */
   const double *cell;
+  /** Directional location: `[3n]` each sample's vector \f$s_j\f$, nonzero and finite; its value is \f$s_j \cdot u\f$. Ignored elsewhere. */
+  const double *direction;
 } MFTL_PointSetDesc;
 
 /** @brief Whether a rank exports everything it owns of a location. */
@@ -622,6 +686,13 @@ typedef struct MFTL_MarkerSpec
   int quadrature_level;  ///< QUADRATURE: points per triangle edge for EVERY triangle (m, so \f$m^2\f$ points); 0 chooses it per triangle.
   double quadrature_ratio;  ///< QUADRATURE, adaptive: largest sub-triangle edge over the local fluid resolution; 0 means the coupler's `sampling_ratio`.
   int quadrature_max_level;  ///< QUADRATURE, adaptive: largest m; 0 means 16. A triangle that needs more is #MFTL_COUPLING_BAD_SAMPLING under an ERROR policy.
+  /**
+   * What the rows compute (#MFTL_CouplingOperator), default the value. A
+   * gradient gives THREE components per marker and field (x, y, z), and its
+   * transpose spreads a vector load per marker -- the adjoint of the gradient,
+   * for a variational use. Stage bindings inherit it.
+   */
+  MFTL_CouplingOperator operation;
 } MFTL_MarkerSpec;
 
 /**
@@ -823,6 +894,8 @@ typedef struct MFTL_RequestRegion
   int64_t index_lo[3];  ///< Lattice: first missing index per axis.
   int64_t index_hi[3];  ///< Lattice: one past the last.
   double box[6];  ///< Physical lo xyz, hi xyz.
+  bool by_key;  ///< MFTLCouplerRequestSamples(): the region is the one sample @c key (a point sample not registered has no box).
+  uint64_t key;  ///< The missing sample's key when @c by_key.
 } MFTL_RequestRegion;
 
 /**
@@ -847,6 +920,40 @@ typedef struct MFTL_RequestView
  * @rank_local
  */
 int MFTLCouplerGetRequests(const MFTL_SupportRequest *req, MFTL_RequestView *view);
+
+/**
+ * @struct MFTL_SampleList
+ * @brief Samples of one location named by KEY, with the rank owning each:
+ *        the columns of rows the solver builds itself (MFTLCouplerImportRows()).
+ */
+typedef struct MFTL_SampleList
+{
+  int location;  ///< The location; at most one list per location.
+  int64_t n;  ///< Keys this rank needs; repeats are allowed.
+  const uint64_t *keys;  ///< `[n]` sample keys (a lattice sample's key is its wrapped index `i + N0 (j + N1 k)`).
+  const int *owner;  ///< `[n]` the rank owning each, in the solver communicator passed to MFTLSolverGridCreate().
+} MFTL_SampleList;
+
+/**
+ * @brief Asks the named owners for exactly the named samples: the coverage of
+ *        an explicit column set, however far its samples lie from the markers.
+ *
+ * Every key must be owned by the rank named for it -- one that does not own it
+ * makes the request INVALID (a solver's ghost map that disagrees with its
+ * registration is a bug to report, not a sample to look for). A key owned but
+ * not exported is NEED_COVERAGE, with the sample named to its owner as a
+ * missing region (a one-sample index box, or the point's position). The window
+ * prepared from it holds those samples and nothing else, so it serves imported
+ * rows only: a kernel bind on it is INVALID.
+ *
+ * @param c       The coupler.
+ * @param n_lists Number of lists; the same locations in the same order on every rank.
+ * @param lists   `[n_lists]` the samples, by location.
+ * @param[out] out The request (also on NEED_COVERAGE); #MFTL_NULL otherwise.
+ * @return The agreed status: OK, NEED_COVERAGE or INVALID.
+ * @collective
+ */
+int MFTLCouplerRequestSamples(MFTL_Coupler *c, int n_lists, const MFTL_SampleList *lists, MFTL_SupportRequest **out);
 
 /**
  * @brief Builds the window of a fully covered request: the band, its spatial
@@ -877,6 +984,58 @@ int MFTLCouplerPrepareWindow(MFTL_Coupler *c, const MFTL_SupportRequest *req, MF
  * @collective
  */
 int MFTLCouplerBind(MFTL_Coupler *c, const MFTL_MarkerSpec *markers, const MFTL_CouplingWindow *win, MFTL_CouplingBinding **out);
+
+/**
+ * @struct MFTL_NativeRows
+ * @brief Rows the solver built for one location -- its own basis evaluated at
+ *        the markers (FE, DG, a constrained or nonlocal operator) -- keyed by
+ *        sample and given in marker order.
+ *
+ * The coupler stores them as it stores its own rows, so interpolation, the
+ * exact transpose, constraints, routing and every transfer check apply
+ * unchanged. What the rows reproduce is DECLARED and CHECKED on the rows
+ * received, with the samples' positions (minimum image about the marker):
+ * LINEAR -- \f$\sum_j W_{ij} = 1\f$ and \f$\sum_j W_{ij}(X_j - x_i) = 0\f$, as a
+ * nodal (Lagrange) basis does; CONSTANT -- the row sum; NONE -- nothing (a
+ * modal DG basis, whose coefficients are not point values). At a directional
+ * location a row's weights are 3-vectors \f$A_j\f$ and the checks are
+ * \f$\sum_j A_j s_j^T = I\f$ and \f$\sum_j A_j (s_j \otimes (X_j - x))^T = 0\f$.
+ * Under CONSTANT and LINEAR the amplification bound applies as to assembled rows.
+ */
+typedef struct MFTL_NativeRows
+{
+  int location;  ///< The location; must be one of the window's.
+  const int64_t *row_ptr;  ///< `[n_markers + 1]`, ascending from 0.
+  const uint64_t *keys;  ///< `[row_ptr[n_markers]]` sample keys; a key repeated within a row is summed.
+  const double *weights;  ///< `[row_ptr[n_markers] * C]`, finite; C = 3 at a directional location, 1 otherwise.
+  MFTL_Reproduction reproduces;  ///< What the rows are declared to reproduce; checked.
+} MFTL_NativeRows;
+
+/**
+ * @brief A binding from rows the solver built (#MFTL_NativeRows), over a
+ *        window that holds their columns -- one from MFTLCouplerRequestSamples()
+ *        for an arbitrary column set, or a support window when the rows are
+ *        local enough to lie in it.
+ *
+ * The markers (#MFTL_MarkerSpec: any kind but QUADRATURE, operator VALUE) fix
+ * the marker order, the positions the reproduction is checked at and the
+ * surface generation the binding goes stale with; their location list is
+ * ignored -- the rows name theirs. A column not in the window is INVALID;
+ * a row failing its declared reproduction or the amplification bound is
+ * BAD_STENCIL (`first_failed_key` in the quality). There are no stage bindings
+ * of imported rows: import the rows of each stage.
+ *
+ * @param c       The coupler.
+ * @param markers The markers the rows belong to.
+ * @param win     The window; must outlive the binding.
+ * @param n_rows  Number of row sets, one per location, the same locations in the same order on every rank.
+ * @param rows    `[n_rows]` the rows.
+ * @param[out] out The binding, or #MFTL_NULL unless OK.
+ * @return The agreed status.
+ * @collective
+ */
+int MFTLCouplerImportRows(MFTL_Coupler *c, const MFTL_MarkerSpec *markers, const MFTL_CouplingWindow *win, int n_rows, const MFTL_NativeRows *rows,
+                          MFTL_CouplingBinding **out);
 
 /**
  * @brief Rows of the same markers at stage positions, within the base binding's
@@ -962,9 +1121,14 @@ int MFTLCouplerFetchEnd(MFTL_Coupler *c, MFTL_CouplingFetch **out);
 /**
  * @brief \f$U = W u\f$: applies a binding's rows to fetched values. No MPI;
  *        allocation-free in Release (Debug checks the surface positions).
+ *
+ * A field contributes MFTLCouplerBindingComponents() consecutive values per
+ * marker: one for a scalar value, three for a directional location's vector or
+ * for a gradient. With every field scalar the layout is `[n_markers * n_fields]`.
+ *
  * @param b The binding.
  * @param f A fetch from the binding's window.
- * @param[out] values `[n_markers * n_fields]`, marker-major, in the fetch's field order.
+ * @param[out] values `[n_markers * C]`, marker-major, C the sum of the fields' components, in the fetch's field order.
  * @return #MFTL_COUPLING_OK; #MFTL_COUPLING_STALE if the fetch is of another
  *         window, its grid changed, or the binding's surface changed; #MFTL_COUPLING_INVALID on a
  *         NULL argument. LOCAL: a caller that can fail here on one rank must
@@ -978,7 +1142,8 @@ int MFTLCouplerInterpolateFetched(const MFTL_CouplingBinding *b, const MFTL_Coup
  *        reverse exchange. The targets are untouched until End.
  * @param c     The coupler.
  * @param ready A SPREAD token.
- * @param loads `[n_markers * n_fields]` integrated marker loads, marker-major;
+ * @param loads `[n_markers * C]` integrated marker loads, marker-major, C the
+ *              sum of the fields' components (MFTLCouplerBindingComponents());
  *              every one finite (a NaN load would poison its owner's sample).
  * @return The agreed status: OK, STALE after a grid/surface change, or INVALID
  *         on misuse, a non-finite load or mismatched tokens. A failed Begin
@@ -1017,7 +1182,7 @@ int MFTLCouplerFetch(MFTL_Coupler *c, const MFTL_CouplingWindow *win, int n_fiel
  * @param b The binding.
  * @param n_fields Number of fields.
  * @param fields The source fields.
- * @param[out] values `[n_markers * n_fields]`, marker-major.
+ * @param[out] values `[n_markers * C]`, marker-major (see MFTLCouplerInterpolateFetched()).
  * @return The agreed status.
  * @collective
  */
@@ -1029,7 +1194,7 @@ int MFTLCouplerInterpolate(MFTL_Coupler *c, const MFTL_CouplingBinding *b, int n
  * @param b The binding.
  * @param n_fields Number of fields.
  * @param targets The target fields; contributions are ADDED.
- * @param loads `[n_markers * n_fields]` integrated loads, marker-major.
+ * @param loads `[n_markers * C]` integrated loads, marker-major (see MFTLCouplerSpreadBegin()).
  * @param form Integrated or density.
  * @return The agreed status.
  * @collective
@@ -1135,6 +1300,124 @@ int MFTLCouplerQuadratureToVertices(MFTL_Coupler *c, const MFTL_CouplingBinding 
  */
 int MFTLCouplerQuadratureFromVertices(MFTL_Coupler *c, const MFTL_CouplingBinding *b, int ncomp, const double *Fv, MFTL_SpreadForm form, double *Fq);
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6c. Nearest-surface queries (for the indicator and the signed distance, plan 07)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @struct MFTL_SurfaceCandidate
+ * @brief The nearest point of the surface a solver sample sees, with what it
+ *        lies on -- one record, merged as a whole.
+ *
+ * Merging keeps the LEAST candidate under a total order, so the result of
+ * merging a set does not depend on the order of the merges, nor on how the set
+ * was split among ranks (MFTLSurfaceCandidateCompare()). A scalar
+ * \f$\min|\phi|\f$ merge is not enough: two triangles at the same distance
+ * carry different bodies, features and signs, and the merged record must name
+ * ONE of them deterministically.
+ */
+typedef struct MFTL_SurfaceCandidate
+{
+  double distance;  ///< Signed distance: negative inside (opposite the outward normals); its magnitude is the distance to the closest point.
+  double offset[3];  ///< Sample minus closest point, a displacement independent of the periodic frame: the closest point is `sample - offset` in any image.
+  int64_t triangle;  ///< Global id of the triangle the closest point lies on; -1 when not valid.
+  int body;  ///< Its body; -1 when not valid.
+  int feature;  ///< The closest point's feature on that triangle (#MFTL_TriangleFeature).
+  int valid;  ///< 1: a surface lies within the query width; 0: unknown -- never "far".
+} MFTL_SurfaceCandidate;
+
+/**
+ * @brief Sets a candidate to UNKNOWN, the merge identity: valid 0, body and
+ *        triangle -1, distance #MFTL_DBL_MAX, everything else zero.
+ * @param c The candidate.
+ * @rank_local
+ */
+void MFTLSurfaceCandidateReset(MFTL_SurfaceCandidate *c);
+
+/**
+ * @brief The total order merges keep the least of: valid before unknown, then
+ *        \f$|d|\f$, then the sign (inside first, so -0 before +0), then body,
+ *        triangle and feature, then the offset (by value, -0 before +0).
+ *
+ * A candidate with a non-finite distance or offset is unknown. Two valid
+ * candidates compare equal exactly when every field is equal, so the least of
+ * a set is one record, the same however the set is merged.
+ *
+ * @param a A candidate.
+ * @param b A candidate.
+ * @return Negative, zero or positive as @p a orders before, with, or after @p b.
+ * @rank_local
+ */
+int MFTLSurfaceCandidateCompare(const MFTL_SurfaceCandidate *a, const MFTL_SurfaceCandidate *b);
+
+/**
+ * @brief `*acc = min(*acc, *c)` under MFTLSurfaceCandidateCompare(); an unknown
+ *        result is the canonical one of MFTLSurfaceCandidateReset().
+ * @param acc The running candidate.
+ * @param c   A new one.
+ * @rank_local
+ */
+void MFTLSurfaceCandidateMerge(MFTL_SurfaceCandidate *acc, const MFTL_SurfaceCandidate *c);
+
+/**
+ * @struct MFTL_QueryField
+ * @brief Where a query's results for one location go: one candidate per owned
+ *        sample, in the solver's own element layout.
+ */
+typedef struct MFTL_QueryField
+{
+  int location;  ///< The location; one of the window's.
+  MFTL_SurfaceCandidate *const *data;  ///< `[pieces of the location on this rank]` base pointers, registration order.
+  ptrdiff_t stride;  ///< Candidates between consecutive elements; 0 means 1.
+} MFTL_QueryField;
+
+/**
+ * @brief Requests the samples of @p locations within @p width of this rank's
+ *        owned triangles: a support request for CENTROIDS markers whose skin
+ *        is the width plus the largest triangle's half-extent (one MAX), so the
+ *        window certifies every sample near every WHOLE triangle, not only near
+ *        its centroid. Prepare the window with MFTLCouplerPrepareWindow().
+ * @param c           The coupler.
+ * @param n_locations Number of locations; same list on every rank.
+ * @param locations   `[n_locations]` the locations.
+ * @param width       Query width, a physical length, > 0; same on every rank.
+ * @param[out] out    The request (also on NEED_COVERAGE), else #MFTL_NULL.
+ * @return The agreed status, as MFTLCouplerRequestSupport().
+ * @collective
+ */
+int MFTLCouplerRequestQuery(MFTL_Coupler *c, int n_locations, const int *locations, double width, MFTL_SupportRequest **out);
+
+/**
+ * @brief The nearest-surface candidate of every solver sample within @p width
+ *        of this rank's owned triangles, MERGED into the solver's arrays
+ *        (MFTLSurfaceCandidateMerge()) -- reset them first, or merge several
+ *        queries (several ensembles) into one.
+ *
+ * Each (sample, triangle) candidate is computed once, by the triangle's owner,
+ * from the same bits on any partition; the sign is the pseudo-normal's of the
+ * closest feature (Baerentzen-Aanaes): the face normal, the sum of the two face
+ * normals at an edge, the angle-weighted normal at a vertex, built here over
+ * each vertex's whole fan in triangle-id order (ghost corners receive their
+ * owner's) -- the caller's `verts.normal` are not read. Candidates travel to the
+ * samples' owners and merge there: the merged record is the same bits at every
+ * process count. A sample farther than the width from every triangle is left as
+ * it was (unknown, unless something else wrote it): a query band is not a
+ * far-field sign.
+ *
+ * Every owned triangle's box, widened by @p width, must lie in what the window
+ * certifies -- true for a window from MFTLCouplerRequestQuery() at this width
+ * and a surface not moved beyond its skin since; otherwise STALE.
+ *
+ * @param c        The coupler.
+ * @param win      The window.
+ * @param width    Query width, > 0; same on every rank.
+ * @param n_fields Number of result arrays (distinct locations), >= 1; same on every rank.
+ * @param fields   `[n_fields]` the result arrays.
+ * @return The agreed status: OK, STALE or INVALID.
+ * @collective
+ */
+int MFTLCouplerQueryNearest(MFTL_Coupler *c, const MFTL_CouplingWindow *win, double width, int n_fields, const MFTL_QueryField *fields);
+
 /**
  * @brief Number of markers in a binding on this rank.
  * @param b The binding.
@@ -1190,13 +1473,24 @@ typedef struct MFTL_BindingQuality
 int MFTLCouplerBindingQuality(const MFTL_CouplingBinding *b, MFTL_BindingQuality *q);
 
 /**
+ * @brief Values per marker a field at @p location gives through a binding: 1
+ *        for a scalar value, 3 for a directional location's vector or for a
+ *        gradient (x, y, z).
+ * @param b        The binding.
+ * @param location The location.
+ * @return The count; 0 if the binding does not cover the location.
+ * @rank_local
+ */
+int MFTLCouplerBindingComponents(const MFTL_CouplingBinding *b, int location);
+
+/**
  * @brief One row of a binding, with its columns as sample KEYS.
  * @param b        The binding.
  * @param loc_pos  Position of the location in the binding's location list.
  * @param marker   Marker index.
  * @param[out] n   Number of entries.
  * @param[out] keys    `[n]` sample keys, pointer into internal scratch valid until the next call on this binding.
- * @param[out] weights `[n]` weights, same lifetime.
+ * @param[out] weights `[n * C]` weights, entry-major, C = MFTLCouplerBindingComponents(); same lifetime.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR on an invalid argument.
  * @rank_local
  */
@@ -1204,16 +1498,17 @@ int MFTLCouplerBindingRow(const MFTL_CouplingBinding *b, int loc_pos, int64_t ma
 
 /**
  * @brief The wall coefficients of one row (#MFTL_BOUNDARY_MIRROR): the weight
- *        of each face's `wall_value` in the interpolated value, x-lo, y-lo,
- *        z-lo, x-hi, y-hi, z-hi. All zero away from ODD faces.
- * @param b       The binding.
- * @param loc_pos Position of the location in the binding's location list.
- * @param marker  Marker index.
+ *        of each face's `wall_value` in one component of the interpolated
+ *        value, x-lo, y-lo, z-lo, x-hi, y-hi, z-hi. All zero away from ODD faces.
+ * @param b         The binding.
+ * @param loc_pos   Position of the location in the binding's location list.
+ * @param marker    Marker index.
+ * @param component Component, `0 <= component < MFTLCouplerBindingComponents()`.
  * @param[out] coef `[6]` the coefficients.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR on an invalid argument.
  * @rank_local
  */
-int MFTLCouplerBindingWallCoefficients(const MFTL_CouplingBinding *b, int loc_pos, int64_t marker, double coef[6]);
+int MFTLCouplerBindingWallCoefficients(const MFTL_CouplingBinding *b, int loc_pos, int64_t marker, int component, double coef[6]);
 
 /** @brief Which DOFs a band mask marks. */
 typedef enum MFTL_BandMaskKind
@@ -1403,6 +1698,39 @@ int MFTLCouplingAssembleRow(const MFTL_CouplerParams *params, const double x[3],
  */
 int MFTLCouplingAssembleRowCell(const MFTL_CouplerParams *params, const double x[3], const double Hc[9], int n, const double *X, const double *q, double *w,
                                 MFTL_RowQuality *quality);
+
+/**
+ * @brief The block-row core of a bind for one operator, over given candidates:
+ *        directional reconstruction and the two gradients as well as plain
+ *        values. LOCAL; the caller guarantees the candidates include every
+ *        sample in the support. No growth, no lower-order fallback.
+ *
+ * @param params  The policy (kernel, reproduction, tolerances).
+ * @param op      The operator.
+ * @param x       Marker position.
+ * @param Hc      `[9]` kernel metric (cell matrix, row-major, columns the edge
+ *                vectors) with `support_scale` applied by the caller; a
+ *                diagonal one is an axis-aligned metric.
+ * @param dHc     #MFTL_OPERATOR_VALUE_DERIVATIVE with a metric that varies with
+ *                the marker position: `[27]` \f$\partial H/\partial x_m\f$, m-major
+ *                (`dHc[9 m + 3 r + c]`); #MFTL_NULL for a constant metric.
+ * @param n       Number of candidates.
+ * @param X       `[3n]` candidate positions.
+ * @param q       `[n]` candidate measures.
+ * @param dir     `[3n]` directional candidates' vectors, or #MFTL_NULL for scalar samples.
+ * @param[out] w  `[C n]` weights, candidate-major, C = 3 for a direction or a
+ *                gradient, 1 otherwise.
+ * @param[out] quality What was achieved; may be #MFTL_NULL. For a gradient,
+ *                `sum_abs` and the residuals are in metric units
+ *                (\f$\tilde H^T\nabla W\f$).
+ * @return #MFTL_COUPLING_OK, #MFTL_COUPLING_BAD_STENCIL, or
+ *         #MFTL_COUPLING_INVALID for a combination that does not exist (a
+ *         gradient of directional samples, a directional NONE row, a derivative
+ *         without a kernel derivative).
+ * @rank_local
+ */
+int MFTLCouplingAssembleBlockRow(const MFTL_CouplerParams *params, MFTL_CouplingOperator op, const double x[3], const double Hc[9], const double *dHc, int n,
+                                 const double *X, const double *q, const double *dir, double *w, MFTL_RowQuality *quality);
 
 /**
  * @brief Test hook: caps every coupling message at @p bytes per MPI message, so

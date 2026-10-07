@@ -491,11 +491,8 @@ void MFTLCplQuadAccumulate(MPI_Comm comm, const cpl_quad *q, int64_t n_markers, 
   free(tab);
 }
 
-void MFTLCplQuadInterpolate(MPI_Comm comm, const cpl_quad *q, int64_t n_markers, const MFTL_MarkerRef *ref, bool weighted, int ncomp, const double *g,
-                            double *out, long *bytes, long *messages)
+void MFTLCplQuadGhostValues(MPI_Comm comm, const cpl_quad *q, int ncomp, const double *g, double *tab, long *bytes, long *messages)
 {
-  const int64_t ntab = q->n_own + q->n_ghost;
-  double *tab = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(ntab, 1) * (size_t) MFTL_MAX(ncomp, 1) * sizeof(double), "quadrature values");
   if (q->n_own > 0) memcpy(tab, g, (size_t) q->n_own * (size_t) ncomp * sizeof(double));
   /* forward: owners send the requested vertices' values; ghosts arrive in table order */
   const int64_t nsend = q->req_off[q->n_req] * ncomp;
@@ -520,6 +517,15 @@ void MFTLCplQuadInterpolate(MPI_Comm comm, const cpl_quad *q, int64_t n_markers,
   }
   MFTLCplSchedWait(&s);
   MFTLCplSchedFree(&s);
+  free(sbuf);
+}
+
+void MFTLCplQuadInterpolate(MPI_Comm comm, const cpl_quad *q, int64_t n_markers, const MFTL_MarkerRef *ref, bool weighted, int ncomp, const double *g,
+                            double *out, long *bytes, long *messages)
+{
+  const int64_t ntab = q->n_own + q->n_ghost;
+  double *tab = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(ntab, 1) * (size_t) MFTL_MAX(ncomp, 1) * sizeof(double), "quadrature values");
+  MFTLCplQuadGhostValues(comm, q, ncomp, g, tab, bytes, messages);
   for (int64_t i = 0; i < n_markers; ++i)
   {
     const double l1 = q->bary[2 * i], l2 = q->bary[2 * i + 1];
@@ -532,6 +538,5 @@ void MFTLCplQuadInterpolate(MPI_Comm comm, const cpl_quad *q, int64_t n_markers,
       out[i * ncomp + k] = w * v;
     }
   }
-  free(sbuf);
   free(tab);
 }

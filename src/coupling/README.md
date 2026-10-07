@@ -16,10 +16,11 @@ kernels can reach ever travels.
 |---|---|---|
 | `solver_grid.c` | registration: locations, lattice blocks, point sets, coverage, ownership regions | no |
 | `coupling_kernels.c` | the kernel table: support, lattice moments, sign, smoothness | no |
-| `coupling_rows.c` | one row from candidates: base weights, moment correction, the four quality checks | no |
+| `coupling_rows.c` | one row from candidates: base weights, moment correction, the four quality checks; block rows (directions, gradients) | no |
 | `coupling_markers.c` | markers from the surface, dual-area weights, quadrature points and their vertex schedule, the generation snapshot | no |
 | `coupling_directory.c` | lattice index arithmetic and images, box algebra, the directory's grid and cover | no |
-| `coupler.c` | the state machine: directory, request, window, binding, transfers | no |
+| `coupling_query.c` | nearest-surface candidates: their total order and merge, vertex pseudo-normals | no |
+| `coupler.c` | the state machine: directory, request, window, binding, transfers, imported rows, queries | no |
 | `coupling_comm.c` | **every MPI call the module makes** | **yes** |
 
 `coupling_internal.h` declares what the files share; `test_coupling_mpi_is_confined`
@@ -112,6 +113,121 @@ stay nonnegative, where the axis-aligned treatment of the same cloud corrects ev
 row (`test_a_rotated_lattice_in_its_own_frame`). The marker's matrix is the Shepard
 average of its neighbours' cells; their per-axis extents $\sum_j |H_{kj}|$ are the
 resolution bounds the directory and the sizing use.
+
+### Directional samples {#cpl_directional}
+
+A face-normal velocity or a face flux is not a point value of a scalar: sample
+$j$ holds $q_j = s_j \cdot u(X_j)$, with $s_j$ a unit normal or the oriented area
+vector. A point location declared `directional` gives every sample its vector,
+and a value row reconstructs the VECTOR at the marker, $U = \sum_j A_j q_j$ with
+$A_j \in \mathbb{R}^3$, its transpose $b_j = A_j^T F$ taking a vector load. The
+fit is made with the unit directions and the magnitude is a pure conversion, so
+a cloud measured in area vectors ten times longer gives the same vector:
+
+$$
+\text{CONSTANT:}\quad A_j = \psi_j\, T^{-1}\hat s_j / |s_j|,\quad T = \sum_j \psi_j \hat s_j \hat s_j^T;
+\qquad
+\text{LINEAR:}\quad \min \sum_j \psi_j \bigl(\hat q_j - \hat s_j^T(a + B d_j)\bigr)^2 ,
+$$
+
+twelve coefficients, $U = a$. LINEAR reproduces every affine vector field and
+therefore every rigid motion, so a spread balances force and torque by work:
+$\sum_j q_j b_j = v\cdot\sum F + \omega\cdot\sum (x - x_0)\times F$ for the
+projections of $v + \omega\times(x-x_0)$ (`test_a_face_cloud_reconstructs_vectors`,
+on the jittered faces of a staggered grid as one cloud). Positions spread in
+space are not enough: the DIRECTIONS must span it, and a cloud whose normals lie
+in one plane is BAD_STENCIL, not a vector with an invented component
+(`test_directional_rank_deficiency_is_refused`). The normal matrix is inverted
+through its equilibrated eigen-decomposition, as a value row's; the four checks
+are measured on the block weights returned ($\sum_j A_j s_j^T = I$,
+$\sum_j A_j (s_j\otimes d_j)^T = 0$, amplification $\max_k \sum_j |A_{jk}||s_j|$).
+A staggered LATTICE is not directional: it is interpolated component by
+component, which is the recognised fast path.
+
+### Two gradients, named apart {#cpl_gradients}
+
+`MFTL_OPERATOR_GRADIENT_FIT` is the slope of the weighted affine fit a LINEAR row
+is built on, $\nabla u = \tilde H^{-T}\beta$; `MFTL_OPERATOR_VALUE_DERIVATIVE` is
+$\partial(Wu)/\partial x$, differentiated through everything the value row depends
+on -- the kernel (each built-in declares its derivative), the moment correction
+($\partial c = -M^{-1}(\partial M)c$), and the metric when it varies with the
+marker (the Shepard average and its $|\det|$). Both reproduce affine gradients;
+on an irregular cloud they are different operators -- their results differ by
+0.5 % of the gradient on the graded cloud below, their weights by up to $0.06/h$ on
+a jittered one (`test_the_fit_and_the_derivative_are_different_operators`) -- which
+is why they have different names. The derivative equals central differences of value
+interpolation through the whole coupler to $4\cdot10^{-9}$ (gradients of order 1), on
+a graded cloud whose metric varies (`test_both_gradients_through_the_coupler`). A gradient binding gives
+three components per field; its transpose spreads a vector load as a DIPOLE:
+zero net load, first moment equal to the total dipole. At a mirror wall the wall
+values enter each gradient component through its own wall coefficients.
+Derivatives do not exist at a C0 kernel's breakpoints, nor where a row's growth
+step or reproduction order switches. Gradients of directional samples are not
+implemented.
+
+---
+
+## Rows the solver builds {#cpl_native}
+
+An FE or DG solver can evaluate its own basis at the markers. `MFTLCouplerImportRows`
+stores such rows -- keyed by sample, one set per location, 3-vectors at a
+directional location (Raviart-Thomas-like) -- exactly as the coupler stores its
+own, so interpolation, the transpose, constraints, routing and every transfer
+check apply unchanged. What a row REPRODUCES is declared and checked on the rows
+received, with the samples' positions: LINEAR (a nodal basis), CONSTANT, or NONE
+(a modal basis, whose coefficients are not point values). A modal row declared
+CONSTANT is BAD_STENCIL; lowest-order face rows declared LINEAR are too.
+
+Native rows can reach anywhere, so their columns are requested BY KEY:
+`MFTLCouplerRequestSamples` names each sample and the rank owning it (the solver
+knows its own ghost map), the owner confirms, and the window holds exactly those
+samples. A key its named owner does not hold is INVALID; an owned one not
+exported is NEED_COVERAGE, named back to its owner as a one-sample region (by key
+for an unregistered point); a kernel bind on such a window is INVALID -- it
+certifies no support. Imported trilinear rows over a keyed window give the
+coupler's own HAT2 rows over a spatial window, values and owner loads, to
+$4\cdot10^{-15}$ (`test_imported_trilinear_rows_equal_the_hat_kernel`): two routes
+to one operator that share nothing upstream of the transfer. Triquadratic rows
+reproduce quadratics; a column at the far corner of the domain is fetched by every
+rank that names it and gets each rank's load exactly once.
+
+---
+
+## Nearest-surface queries {#cpl_queries}
+
+For plan 07's indicator and signed distance a solver sample needs the nearest
+point of the surface, with what it lies on. A query answers it within a width:
+`MFTLCouplerRequestQuery` requests the samples near every WHOLE owned triangle
+(the skin is the width plus the largest triangle's half-extent), and
+`MFTLCouplerQueryNearest` computes each (sample, triangle) candidate once, on the
+triangle's owner, and merges them on the sample's owner. The sign is the
+pseudo-normal's of the closest feature, built over each vertex's whole fan in
+triangle-id order; ghost corners receive their owner's. A sample beyond the
+width is left as it was: UNKNOWN, never "far" -- a query band is not a far-field
+sign.
+
+**The merge is a total order, and that is the whole determinism argument.** A
+scalar $\min|\phi|$ leaves the body, the feature and even the sign of two equally
+distant triangles to whichever arrived first. `MFTL_SurfaceCandidate` orders by
+validity, distance, sign (inside first, $-0$ before $+0$), body, triangle,
+feature and offset; two records compare equal only when they are the same record,
+so the least of a set is one record however the set is split and merged
+(`test_the_merge_is_a_total_order`: 600 random merge orders and tree shapes). The
+merged records are the same bits at np = 2, 4, 8 and 27 as on rank 0 alone, on
+spheres across a periodic seam and on a cube whose corners and edges are lattice
+samples -- 296 samples at distance exactly zero, 1 216 nearest to an edge or a
+corner (`test_the_merged_records_are_partition_independent`). Associativity alone
+would not have shown that: it also needs every candidate computed from the same
+bits on any partition, which is what the test measures.
+
+**A sphere cannot test a pseudo-normal.** On a convex surface any one face normal at
+a vertex gives the right sign wherever that vertex is the nearest point, so taking
+the face normal instead of the vertex's -- or zeros for the ghost corners -- passed
+the first version of the brute-force test on spheres. The second sphere now carries
+needles: outward spikes put samples beside a sharp tip, nearest to it, on the far
+side of one face's plane; inward needles put INSIDE samples nearest to their tip.
+Both mutations fail it (`test_the_query_equals_brute_force` counts the samples
+nearest a vertex on either side, so the scene cannot quietly lose them).
 
 ---
 
@@ -454,17 +570,28 @@ The truncation count, the non-finite-load refusal and the rank-local assertions 
 tests themselves (a `TEST_ASSERT` inside `if (rank holds the marker)` strands the other
 ranks in the next collective) came out of the same exercise.
 
+A third came from C3's cross-check, in its own new code. A keyed window's band was
+assembled like a spatial one, which puts the samples a rank can read from its OWN
+ghost layers at the end of each provider's segment -- but a keyed request sends no
+ghost boxes, so its providers pack in plain key order, and every value past the
+first ghost-readable sample landed on the wrong one. Single-rank runs, point sets
+and blocks without ghosts were all right; imported trilinear rows against HAT2
+kernel rows were wrong by 0.6 at np = 2 on blocks with one ghost layer.
+
 ## What is not here {#cpl_deferred}
 
 From plan 06's milestones, these are not implemented and nothing refers to them:
-directional normal-velocity samples and imported native FE/DG rows; gradient
-operators; the deterministic point-query merge for plan 07 (all C3); persistent
+gradients of directional samples, and directional samples at mirror walls; imported
+rows for QUADRATURE markers (import at USER markers placed at the points instead);
+the far-field sign beyond a query's width (plan 07's own operation); persistent
 point-to-point and neighbour-collective transport backends (the baseline is packed
 non-blocking point-to-point); point-set deltas finer than a re-registration (an update
 that keeps the ownership entries keeps the directory, but any change of a point set
 stales the windows); constraints across locations or of more than one level, and
 coupler-side reconstruction of constrained values (the solver keeps them current).
-Factored tensor rows are not used: every row is CSR.
+A keyed window has no ghost route: its samples are fetched or read as owned.
+Factored tensor rows are not used: every row is CSR. The framework adapters, the
+Fortran forms and the integrated solver demonstrations are milestone C4.
 
 The plan's performance gates also remain open: a configurable memory budget with
 complete peak-allocation accounting, and allocation-free fetches (a fetch is a handle

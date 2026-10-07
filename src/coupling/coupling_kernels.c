@@ -38,6 +38,22 @@ static void k_peskin4(const double *r, double *phi, int n, void *ctx)
   }
 }
 
+/** @brief d/dr of Peskin's function: C1, zero at 0 and at the support's end. */
+static void d_peskin4(const double *r, double *dphi, int n, void *ctx)
+{
+  (void) ctx;
+  for (int i = 0; i < n; ++i)
+  {
+    const double a = fabs(r[i]), sg = (r[i] > 0.0) ? 1.0 : ((r[i] < 0.0) ? -1.0 : 0.0);
+    double v = 0.0;
+    if (a < 1.0)
+      v = 0.125 * (-2.0 + (2.0 - 4.0 * a) / sqrt(1.0 + 4.0 * a - 4.0 * a * a));
+    else if (a < 2.0)
+      v = 0.125 * (-2.0 - (6.0 - 4.0 * a) / sqrt(-7.0 + 12.0 * a - 4.0 * a * a));
+    dphi[i] = sg * v;
+  }
+}
+
 /** @brief Roma, Peskin & Berger's 3-point function. */
 static void k_roma3(const double *r, double *phi, int n, void *ctx)
 {
@@ -57,6 +73,25 @@ static void k_roma3(const double *r, double *phi, int n, void *ctx)
   }
 }
 
+/** @brief d/dr of the 3-point function. */
+static void d_roma3(const double *r, double *dphi, int n, void *ctx)
+{
+  (void) ctx;
+  for (int i = 0; i < n; ++i)
+  {
+    const double a = fabs(r[i]), sg = (r[i] > 0.0) ? 1.0 : ((r[i] < 0.0) ? -1.0 : 0.0);
+    double v = 0.0;
+    if (a < 0.5)
+      v = -a / sqrt(1.0 - 3.0 * a * a);
+    else if (a < 1.5)
+    {
+      const double b = 1.0 - a;
+      v = (-3.0 - 3.0 * b / sqrt(1.0 - 3.0 * b * b)) / 6.0;
+    }
+    dphi[i] = sg * v;
+  }
+}
+
 /** @brief The cosine kernel (1 + cos(pi r / 2)) / 4. */
 static void k_cosine4(const double *r, double *phi, int n, void *ctx)
 {
@@ -68,6 +103,17 @@ static void k_cosine4(const double *r, double *phi, int n, void *ctx)
   }
 }
 
+/** @brief d/dr of the cosine kernel. */
+static void d_cosine4(const double *r, double *dphi, int n, void *ctx)
+{
+  (void) ctx;
+  for (int i = 0; i < n; ++i)
+  {
+    const double a = fabs(r[i]), sg = (r[i] > 0.0) ? 1.0 : ((r[i] < 0.0) ? -1.0 : 0.0);
+    dphi[i] = (a < 2.0) ? -sg * 0.125 * MFTL_PI * sin(0.5 * MFTL_PI * a) : 0.0;
+  }
+}
+
 /** @brief The linear hat. */
 static void k_hat2(const double *r, double *phi, int n, void *ctx)
 {
@@ -76,6 +122,17 @@ static void k_hat2(const double *r, double *phi, int n, void *ctx)
   {
     const double a = fabs(r[i]);
     phi[i] = (a < 1.0) ? 1.0 - a : 0.0;
+  }
+}
+
+/** @brief d/dr of the hat: -sign(r) inside, 0 at r = 0 (where it does not exist) and outside. */
+static void d_hat2(const double *r, double *dphi, int n, void *ctx)
+{
+  (void) ctx;
+  for (int i = 0; i < n; ++i)
+  {
+    const double a = fabs(r[i]), sg = (r[i] > 0.0) ? 1.0 : ((r[i] < 0.0) ? -1.0 : 0.0);
+    dphi[i] = (a < 1.0) ? -sg : 0.0;
   }
 }
 
@@ -95,6 +152,25 @@ static void k_bspline3(const double *r, double *phi, int n, void *ctx)
       v = b * b * b / 6.0;
     }
     phi[i] = v;
+  }
+}
+
+/** @brief d/dr of the cubic B-spline. */
+static void d_bspline3(const double *r, double *dphi, int n, void *ctx)
+{
+  (void) ctx;
+  for (int i = 0; i < n; ++i)
+  {
+    const double a = fabs(r[i]), sg = (r[i] > 0.0) ? 1.0 : ((r[i] < 0.0) ? -1.0 : 0.0);
+    double v = 0.0;
+    if (a < 1.0)
+      v = -2.0 * a + 1.5 * a * a;
+    else if (a < 2.0)
+    {
+      const double b = 2.0 - a;
+      v = -0.5 * b * b;
+    }
+    dphi[i] = sg * v;
   }
 }
 
@@ -120,12 +196,31 @@ static void k_wendland_c2(const double *rho, double *phi, int n, void *ctx)
   }
 }
 
+/** @brief d/drho of Wendland C2: \f$-5 c \rho (1-\rho/2)^3\f$. */
+static void d_wendland_c2(const double *rho, double *dphi, int n, void *ctx)
+{
+  (void) ctx;
+  const double c = 21.0 / (16.0 * MFTL_PI);
+  for (int i = 0; i < n; ++i)
+  {
+    const double a = rho[i];
+    if (a < 2.0)
+    {
+      const double s = 1.0 - 0.5 * a;
+      dphi[i] = -5.0 * c * a * s * s * s;
+    }
+    else
+      dphi[i] = 0.0;
+  }
+}
+
 /** @brief One row of the table. */
 typedef struct
 {
   MFTL_CouplingKernel id;
   const char *name;
   MFTL_KernelFn eval;
+  MFTL_KernelFn deriv;
   double half_width;
   int moment_order;
   int smoothness;
@@ -134,12 +229,12 @@ typedef struct
 } kernel_row;
 
 static const kernel_row g_table[] = {
-    {MFTL_KERNEL_PESKIN4, "peskin4", k_peskin4, 2.0, 1, 1, false, true},
-    {MFTL_KERNEL_ROMA3, "roma3", k_roma3, 1.5, 1, 0, false, true},
-    {MFTL_KERNEL_COSINE4, "cosine4", k_cosine4, 2.0, 0, 1, false, true},
-    {MFTL_KERNEL_HAT2, "hat2", k_hat2, 1.0, 1, 0, false, true},
-    {MFTL_KERNEL_BSPLINE3, "bspline3", k_bspline3, 2.0, 1, 2, false, true},
-    {MFTL_KERNEL_WENDLAND_C2, "wendland_c2", k_wendland_c2, 2.0, -1, 2, true, true},
+    {MFTL_KERNEL_PESKIN4, "peskin4", k_peskin4, d_peskin4, 2.0, 1, 1, false, true},
+    {MFTL_KERNEL_ROMA3, "roma3", k_roma3, d_roma3, 1.5, 1, 0, false, true},
+    {MFTL_KERNEL_COSINE4, "cosine4", k_cosine4, d_cosine4, 2.0, 0, 1, false, true},
+    {MFTL_KERNEL_HAT2, "hat2", k_hat2, d_hat2, 1.0, 1, 0, false, true},
+    {MFTL_KERNEL_BSPLINE3, "bspline3", k_bspline3, d_bspline3, 2.0, 1, 2, false, true},
+    {MFTL_KERNEL_WENDLAND_C2, "wendland_c2", k_wendland_c2, d_wendland_c2, 2.0, -1, 2, true, true},
 };
 
 static const kernel_row *find_row(MFTL_CouplingKernel id)
@@ -170,6 +265,14 @@ int MFTLCouplingKernelEval(MFTL_CouplingKernel kernel, const double *r, double *
   return MFTL_SUCCESS;
 }
 
+int MFTLCouplingKernelDerivative(MFTL_CouplingKernel kernel, const double *r, double *dphi, int n)
+{
+  const kernel_row *row = find_row(kernel);
+  if (row == MFTL_NULL || (n > 0 && (r == MFTL_NULL || dphi == MFTL_NULL))) return MFTL_ERROR;
+  row->deriv(r, dphi, n, MFTL_NULL);
+  return MFTL_SUCCESS;
+}
+
 int MFTLCplKernelResolve(const MFTL_CouplerParams *p, cpl_kernel *k)
 {
   memset(k, 0, sizeof *k);
@@ -178,6 +281,7 @@ int MFTLCplKernelResolve(const MFTL_CouplerParams *p, cpl_kernel *k)
     const MFTL_KernelDesc *u = &p->user_kernel;
     if (u->eval == MFTL_NULL || !(u->half_width > 0.0) || !isfinite(u->half_width) || u->moment_order < -1 || u->moment_order > 1) return MFTL_ERROR;
     k->eval = u->eval;
+    k->deriv = u->deriv;
     k->ctx = u->ctx;
     k->half_width = u->half_width;
     k->moment_order = u->moment_order;
@@ -188,6 +292,7 @@ int MFTLCplKernelResolve(const MFTL_CouplerParams *p, cpl_kernel *k)
   const kernel_row *row = find_row(p->kernel);
   if (row == MFTL_NULL) return MFTL_ERROR;
   k->eval = row->eval;
+  k->deriv = row->deriv;
   k->ctx = MFTL_NULL;
   k->half_width = row->half_width;
   k->moment_order = row->moment_order;

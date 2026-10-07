@@ -1,7 +1,7 @@
 # 06 — Solver-independent coupling between fluid DOFs and surface ensembles
 
-Status: C1 and C2 IMPLEMENTED (2026-10-07, branch `christian`; what is and is not built, and what was
-measured, is in `src/coupling/README.md`); C3 and C4 planned. Revision 4, critical architecture review, 2026-10-06.
+Status: C1, C2 and C3 IMPLEMENTED (2026-10-07, branch `christian`; what is and is not built, and what was
+measured, is in `src/coupling/README.md`); C4 planned. Revision 4, critical architecture review, 2026-10-06.
 Depends on: nothing for the raw-array C1 API. `04-attached-fields.md` supplies optional field storage;
 `05-curvature-and-surface-tension.md` supplies integrated surface forces.
 Used by: `07` (point queries, indicator, surface sizing), `08` (IBM, bindings), `09` (surface sources).
