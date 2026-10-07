@@ -17,7 +17,7 @@ kernels can reach ever travels.
 | `solver_grid.c` | registration: locations, lattice blocks, point sets, coverage, ownership regions | no |
 | `coupling_kernels.c` | the kernel table: support, lattice moments, sign, smoothness | no |
 | `coupling_rows.c` | one row from candidates: base weights, moment correction, the four quality checks | no |
-| `coupling_markers.c` | markers from the surface, dual-area weights, the generation snapshot | no |
+| `coupling_markers.c` | markers from the surface, dual-area weights, quadrature points and their vertex schedule, the generation snapshot | no |
 | `coupling_directory.c` | lattice index arithmetic and images, box algebra, the directory's grid and cover | no |
 | `coupler.c` | the state machine: directory, request, window, binding, transfers | no |
 | `coupling_comm.c` | **every MPI call the module makes** | **yes** |
@@ -103,6 +103,16 @@ a Shepard average of the samples' resolutions over a pilot neighbourhood of radi
 smooth function of the marker's position, computed from samples the window
 certified, so it is the same on every rank.
 
+**An anisotropic point location** gives every sample a full CELL matrix $H$ (its
+columns the cell's edge vectors) and rows use $d = \tilde H^{-1}(X - x)$, normalised by
+$|\det \tilde H|$: a tensor kernel then follows a rotated or sheared cell's own axes.
+A cloud that is a complete lattice in those axes — a rotated anisotropic lattice of
+points — then has the kernel's lattice moments: Peskin's rows need no correction and
+stay nonnegative, where the axis-aligned treatment of the same cloud corrects every
+row (`test_a_rotated_lattice_in_its_own_frame`). The marker's matrix is the Shepard
+average of its neighbours' cells; their per-axis extents $\sum_j |H_{kj}|$ are the
+resolution bounds the directory and the sizing use.
+
 ---
 
 ## Coverage: a contract, never a guess {#cpl_coverage}
@@ -137,9 +147,47 @@ Closed certificates also cover degenerate provider regions (planes, lines and
 points), including the zero-width slabs that can occur on empty ranks.
 
 **Unknown is never a wall.** A region no rank claims is UNPROVIDED — never a truncated
-row. Walls are DECLARED: the domain's non-periodic faces, and the lattice's own extent.
-A row cut by a wall is corrected over the samples inside under `MFTL_BOUNDARY_TRUNCATE`
-(counted), refused under `MFTL_BOUNDARY_ERROR`.
+row. Walls are DECLARED: the domain's non-periodic faces, the lattice's own extent, and
+masked (solid) cells.
+
+**A truncated row is counted, not guessed.** A lattice is declared globally, so a row
+counts by arithmetic the lattice positions its support holds — over the lattice
+extended past its ends by the end spacing — and compares with the samples it got. A
+row missing a position with weight is TRUNCATED: past a wall, past the edge of a
+lattice smaller than the domain, or on a masked cell; corrected under
+`MFTL_BOUNDARY_TRUNCATE`, refused under `MFTL_BOUNDARY_ERROR`. A support that merely
+crosses a wall with no position beyond it — a marker 1.6 cells from it, Peskin's reach
+being two — is complete and not refused (`test_truncation_is_counted_exactly`). The
+same count is a self-check: a row missing an unmasked interior sample cannot happen
+once coverage is proved, and is reported as an internal error rather than corrected
+away (a mutation that drops one sample from the band is caught on the first row).
+
+**Mirror walls.** `MFTL_BOUNDARY_MIRROR` completes a support beyond a wall with mirror
+images of the location's own samples, reflected about the wall plane (in x, then y,
+then z at an edge or corner). Each face has a parity: EVEN images carry the sample's
+value (a zero normal derivative), ODD ones $2u_w - u$, with the wall value $u_w$ given
+per field. The stored row is composed onto the real samples; an ODD face's share is a
+separate per-row coefficient of $u_w$, which interpolation adds and spreading reports
+as the face's REACTION, so
+
+$$
+\sum_j b_j + \sum_f R_f = \sum_m F_m, \qquad U \cdot F = u \cdot b + \sum_f u_{w,f} R_f .
+$$
+
+On a wall-aligned lattice the virtual lattice is complete, so Peskin's rows need no
+correction at a wall at all and EVEN rows stay nonnegative; a profile linear through
+the wall value is reproduced exactly at any distance from an ODD wall. The reference
+in `test_coupling_boundaries` never reflects anything: it maps virtual lattice indices
+to the indices they mirror by integer arithmetic.
+
+**Constrained samples.** A sample whose value the solver BUILDS — a hanging node,
+$u_c = \sum_j P_{cj} u_j + u_{bc}$ — is registered on its owner with its row of P
+(`MFTL_ConstraintDesc`); every free-owner claim is checked collectively when the grid is
+taken up. Interpolation reads the stored value; spreading applies the exact transpose:
+the load a constrained sample accumulates goes to its free samples as $P_{cj} b_c$
+(remote ones through one more exchange), its own element receives nothing, and $b_c$ is
+reported so that the affine part's work closes the power identity,
+$U \cdot F = \sum_{free} u_j b_j + \sum_c u_{bc,c} b_c$.
 
 **FULL and SELECTED give the same answer.** A SELECTED band built by the protocol
 alone — export nothing, export exactly what each NEED_COVERAGE names, retry —
@@ -198,7 +246,27 @@ sample. The rows on a periodic box equal brute force across the seam.
 requesting marker stay inside the window: binds need no new request and no new fetch.
 Anything farther is STALE on every rank, never a row over uncertified samples
 (`test_a_marker_one_bin_outside_the_window_is_stale` — which a mutation that dropped
-the skin test passed until it existed).
+the skin test passed until it existed). A position belongs to the bin `floor()` puts
+it in, judged by the very expression the request binned with: the reconstructed
+interval $[\min + i b, \min + (i+1) b]$ can exclude a position one ulp below a face
+whose quotient rounded up, and such a marker used to be STALE in the window requested
+for it — forever, since a new request reproduced the same bins
+(`test_a_marker_an_ulp_below_a_bin_face_binds`).
+
+**Migration.** With `migration` set, every rank also sends its bins to the ranks whose
+box lies within that distance of them (geometric discovery, one NBX), and their windows
+hold those bins too: after a redistribution has moved markers that far onto another
+rank they bind in the window it already has, with no request and no fetch. On a
+connected surface the new owner's own neighbouring markers usually hold those bins
+anyway; the allowance makes it a guarantee
+(`test_a_migrated_user_marker_binds_in_the_old_window`).
+
+**What an update keeps.** A change of what is OWNED stales every window; a change of
+EXPORTS alone keeps every window whose served samples are all still exported, checked
+by the window's next collective use. A selection that slides past a band costs that
+band nothing; one that withdraws a served sample stales it on every rank, and
+restoring the export revives it. Re-registering identical ownership keeps the
+directory (`test_a_selection_change_keeps_windows_that_stay_exported`).
 
 ---
 
@@ -220,12 +288,48 @@ rank 0 alone). Spreading sums contributions from several ranks, in ascending sou
 rank order on every owner: reproducible at a fixed decomposition, equal to round-off
 across decompositions.
 
+### Surface quadrature {#cpl_quadrature}
+
+`MFTL_MARKERS_QUADRATURE` cuts every owned triangle into $m^2$ congruent sub-triangles
+with one point at each sub-centroid, weight $A/m^2$ — exact for the vertices' linear
+hat functions, so a vertex's points weigh its dual area. $m$ is chosen per triangle so
+that a sub-triangle's longest edge stays within `quadrature_ratio` of the finest fluid
+resolution the directory knows near it: the surface mesh need not be refined to the
+fluid. A quadratic integrated over the facets converges at $1/m^2$ (ratios 3.98–4.00
+measured). Two collective conversions form the composite adjoint pair of plan 06 §2.9,
+with the lumped mass $M_S$ the points define:
+
+$$
+U_v = M_S^{-1} B^T Q\, U_q, \qquad F_q = Q B\, M_S^{-1} F_v, \qquad U_v \cdot F_v = U_q \cdot F_q,
+\quad \sum_q F_q = \sum_v F_v .
+$$
+
+A point contributes to the three corners of its triangle, which may be ghosts; the
+binding holds a ghost schedule (built once, by NBX) that completes per-vertex sums and
+delivers owned values to the ghost copies. The projection equals its definition
+recomputed from geometry vertex by vertex, and the same surface on one rank alone, to
+round-off (`test_coupling_quadrature` — a swapped barycentric pair keeps constants,
+masses and the adjoint identity, and is caught only there).
+
+**Local stage binds.** `MFTLCouplerBindStageLocal` builds the same rows as
+`BindStage`, to the bit, with no communication — it may run while a fetch is in flight
+— and returns THIS rank's status; the caller agrees it in its own step decision or with
+`MFTLCouplerAgreeStatus` before anything depends on it.
+
+**The solver can complete the ghost route.** With `halo_transpose` a spread leaves the
+halo route's loads in the ghost elements they were read from and zeroes every other
+element of the declared ghost layers, so the solver's single reverse halo accumulation
+completes $W^T F$ and adds nothing its arrays held before. A ghost element that is, in
+memory, an owned sample of another block (two blocks over one array) is left alone.
+Refused on a constrained location, whose transpose the solver would bypass.
+
 **Transfers are agreed before they start.** `PrepareTransfer` agrees the direction,
 the locations and flags in order, and the handles' currency. The token retains the
 window and binding. Begin agrees the token identity and rechecks staleness and inputs
 before posting any messages; End agrees its arguments before completing the transfer.
 This catches changes between preparation and use, and a missing load pointer on just
-one rank cannot strand its peers. Tokens cannot be released during an active transfer.
+one rank cannot strand its peers. A non-finite load on one rank is refused on every
+rank before any target is written. Tokens cannot be released during an active transfer.
 Fetch and spread are split into Begin/End
 over fixed schedules; messages larger than the chunk limit travel as several,
 reassembled in order (`test_chunking_and_repetition_change_no_bit` at 40-byte chunks).
@@ -241,8 +345,9 @@ vertices (`test_a_redistribution_stales_a_binding`); a skipped body keeps its st
 because its pool is bit-identical. A caller writing `verts.pos` owes the call; a Debug
 checksum of the bound positions catches the forgotten one. Registration edits invalidate
 local consumers immediately, before `UpdateGrid`; collective calls agree that rejection
-across ranks. `UpdateGrid` then invalidates every window, including existing fetches and
-transfer tokens. Failed interpolation validates all fields and ranks before writing any
+across ranks. `UpdateGrid` then invalidates what the change reaches: an ownership change
+every window, fetch and transfer token; an export-only change only the windows whose
+served samples left the export. Failed interpolation validates all fields and ranks before writing any
 results. A skin may span several bins; both fresh and stage binds search that full allowance.
 
 ---
@@ -321,22 +426,43 @@ not taken.
 
 ---
 
+## Found by attack {#cpl_attack}
+
+`tests/test_coupling_adversarial.c` breaks the habits the first tests were written
+around — several blocks per rank in a random k-d partition, a ghost width per block
+and axis, padding that holds NaN, anisotropic lattices on a box that does not start at
+the origin, periodic on some axes only, interleaved components, more ghosted blocks
+than the halo route tracks, two couplers interleaving their transfers — against brute
+force over the global lattice, and at np = 1 … 27 to the bit against one rank alone.
+Two bugs fell out, both silent in the sense that matters (a plausible status, not a
+crash):
+
+- **A USER marker more than one period away** was wrapped by one period, binned in a
+  frame no provider answers, and came back as NEED_COVERAGE for samples that existed.
+  Every marker is now wrapped onto $[\min, \max)$ however far away it is, and the
+  position one ulp below `min` — which plus a period rounds onto `max` — onto `min`.
+- **A marker one ulp below a bin face** was STALE in the window requested for it,
+  forever (see the skin, above).
+
+The truncation count, the non-finite-load refusal and the rank-local assertions in the
+tests themselves (a `TEST_ASSERT` inside `if (rank holds the marker)` strands the other
+ranks in the next collective) came out of the same exercise.
+
 ## What is not here {#cpl_deferred}
 
 From plan 06's milestones, these are not implemented and nothing refers to them:
-composite AMR constraints and constrained-DOF (boundary, hanging-node) transpose maps;
-directional normal-velocity samples and imported native FE/DG rows; gradient operators;
-adaptive surface quadrature markers; incremental grid deltas (a grid update is a full
-replacement that keeps the directory when ownership did not change); persistent
+directional normal-velocity samples and imported native FE/DG rows; gradient
+operators; the deterministic point-query merge for plan 07 (all C3); persistent
 point-to-point and neighbour-collective transport backends (the baseline is packed
-non-blocking point-to-point); local stage binds without a status agreement; the
-solver-completed transpose halo (HALO loads always go back to the owner); windows
-seeded with the envelopes of markers arriving from other ranks (a window is per rank's
-own markers; a marker that migrated in is STALE and the step re-requests). Factored
-tensor rows are not used: every row is CSR.
+non-blocking point-to-point); point-set deltas finer than a re-registration (an update
+that keeps the ownership entries keeps the directory, but any change of a point set
+stales the windows); constraints across locations or of more than one level, and
+coupler-side reconstruction of constrained values (the solver keeps them current).
+Factored tensor rows are not used: every row is CSR.
 
-The plan's performance gates also remain open: allocation-free repeated operations,
-a configurable memory budget and complete peak-allocation accounting, and removal of
-the temporary rank-count-sized scratch lists used in discovery. `bytes_memory` estimates
-the main directory/window payload, not total allocation. The measurements above predate
-the additional transfer validation; they are not timings of the reviewed implementation.
+The plan's performance gates also remain open: a configurable memory budget with
+complete peak-allocation accounting, and allocation-free fetches (a fetch is a handle
+the caller owns; spreads reuse their accumulation scratch). Discovery holds no array
+sized by the process count any more. `bytes_memory` estimates the main directory/window
+payload, not total allocation. The measurements above predate the additional transfer
+validation; they are not timings of the reviewed implementation.

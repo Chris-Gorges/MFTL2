@@ -340,16 +340,18 @@ int MFTLCplRanksTouching(const MFTL_Domain *d, const double lo[3], const double 
       c1[k] = (int64_t) b;
     }
   }
+  /* The cell ranges never wrap onto themselves (a periodic axis spanning every
+   * cell is enumerated once), and rank_map is a bijection, so every rank
+   * appears at most once and the count is the product of the ranges. */
+  const int64_t total = (c1[0] - c0[0] + 1) * (c1[1] - c0[1] + 1) * (c1[2] - c0[2] + 1);
+  if (total > (int64_t) cap) return (int) total;
   int n = 0;
   for (int64_t z = c0[2]; z <= c1[2]; ++z)
     for (int64_t y = c0[1]; y <= c1[1]; ++y)
       for (int64_t x = c0[0]; x <= c1[0]; ++x)
       {
         const int64_t cx = cpl_mod(x, d->cuts[0]), cy = cpl_mod(y, d->cuts[1]), cz = cpl_mod(z, d->cuts[2]);
-        /* The cell ranges never wrap onto themselves (a periodic axis spanning
-         * every cell is enumerated once), and rank_map is a bijection, so
-         * every rank appears at most once. */
-        if (n < cap) out[n++] = d->rank_map[cx + cy * d->cuts[0] + cz * d->cuts[0] * d->cuts[1]];
+        out[n++] = d->rank_map[cx + cy * d->cuts[0] + cz * d->cuts[0] * d->cuts[1]];
       }
   MFTLSortIds(out, n);
   return n;

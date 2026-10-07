@@ -96,6 +96,11 @@ void MFTLCplAllreduceMax(MPI_Comm c, double *v, int n)
   if (n > 0) MPI_Allreduce(MPI_IN_PLACE, v, n, MPI_DOUBLE, MPI_MAX, c);
 }
 
+void MFTLCplAllreduceSum(MPI_Comm c, double *v, int n)
+{
+  if (n > 0) MPI_Allreduce(MPI_IN_PLACE, v, n, MPI_DOUBLE, MPI_SUM, c);
+}
+
 void MFTLCplAllreduceSumLong(MPI_Comm c, long *v, int n)
 {
   if (n > 0) MPI_Allreduce(MPI_IN_PLACE, v, n, MPI_LONG, MPI_SUM, c);

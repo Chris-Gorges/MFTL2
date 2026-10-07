@@ -288,12 +288,37 @@ typedef struct MFTL_LatticeDesc
   const double *faces[3];  ///< Rectilinear: `[dims[k]+1]` ascending bounds of each sample's cell per axis. Copied.
 } MFTL_LatticeDesc;
 
-/** @brief What a row does where the kernel reaches past a non-periodic domain wall. */
+/**
+ * @brief What a row does where its support holds a position with no sample:
+ *        past a non-periodic domain wall, past the edge of a lattice smaller
+ *        than the domain, or on a masked (solid) cell. Such a row is TRUNCATED;
+ *        a support that crosses a wall with no position beyond it is complete.
+ */
 typedef enum MFTL_BoundaryPolicy
 {
   MFTL_BOUNDARY_TRUNCATE = 0,  ///< Use the samples inside; the reproduction policy corrects the one-sided row. Counted. The default.
-  MFTL_BOUNDARY_ERROR = 1  ///< A truncated row is #MFTL_COUPLING_BAD_STENCIL.
+  MFTL_BOUNDARY_ERROR = 1,  ///< A truncated row is #MFTL_COUPLING_BAD_STENCIL.
+  /**
+   * Complete the support beyond a non-periodic domain wall with MIRROR IMAGES
+   * of the location's own samples (reflected about the wall plane; across two
+   * or three walls at an edge or corner, reflected in x, then y, then z). An
+   * image carries its sample's value times the face's parity, plus the wall
+   * value of an ODD face (#MFTL_WallParity) -- the solver's own ghost-cell
+   * rule -- so the stored row is composed onto the real samples, and an ODD
+   * face's share is a separate per-row coefficient of the field's
+   * `wall_value`. Interpolation adds it; spreading reports it as the face's
+   * reaction (`wall_reaction`): force and power balance with the wall
+   * included. Rows cut by masked cells are corrected as under TRUNCATE.
+   */
+  MFTL_BOUNDARY_MIRROR = 2
 } MFTL_BoundaryPolicy;
+
+/** @brief The parity of a mirror face (#MFTL_BOUNDARY_MIRROR). */
+typedef enum MFTL_WallParity
+{
+  MFTL_WALL_EVEN = 0,  ///< The image carries the sample's value: a zero normal derivative on the wall (symmetry, free slip, insulation).
+  MFTL_WALL_ODD = 1  ///< The image carries \f$2 u_w - u\f$: the field equals \f$u_w\f$ (the field's `wall_value`) on the wall (no slip, a prescribed value).
+} MFTL_WallParity;
 
 /**
  * @struct MFTL_LocationDesc
@@ -308,7 +333,18 @@ typedef struct MFTL_LocationDesc
 {
   const char *name;  ///< At most 31 characters; part of the cross-rank check.
   MFTL_LatticeDesc lattice;  ///< `kind == MFTL_LATTICE_NONE` for point samples.
-  MFTL_BoundaryPolicy boundary;  ///< Wall truncation policy.
+  MFTL_BoundaryPolicy boundary;  ///< Wall policy.
+  /** #MFTL_BOUNDARY_MIRROR: the parity of each domain face, ordered x-lo, y-lo, z-lo, x-hi, y-hi, z-hi; ignored on periodic axes. */
+  MFTL_WallParity wall[6];
+  /**
+   * Point locations: every sample declares a full CELL matrix
+   * (#MFTL_PointSetDesc::cell) and rows use it -- the kernel's offsets are
+   * \f$H^{-1}(X - x)\f$, so a tensor kernel follows a rotated or sheared cell's
+   * own axes, and a cloud that is a complete lattice in those axes needs no
+   * moment correction at all. The marker's matrix is the Shepard average of its
+   * neighbours'.
+   */
+  bool anisotropic;
 } MFTL_LocationDesc;
 
 /**
@@ -348,6 +384,13 @@ typedef struct MFTL_PointSetDesc
   double h_uniform[3];  ///< Resolution of every sample when `h` is #MFTL_NULL.
   const double *extent;  ///< `[3n]` per-axis half-extent of the cell each sample represents (bounds the ownership tiles), or #MFTL_NULL for the resolution.
   const int64_t *array_index;  ///< `[n]` element index in the field arrays, or #MFTL_NULL for 0..n-1.
+  /**
+   * Anisotropic location: `[9n]` each sample's cell matrix, row-major, its
+   * COLUMNS the cell's edge vectors (an axis-aligned cell of widths h is
+   * `diag(h)`); invertible. Its per-axis extents \f$\sum_j |H_{kj}|\f$ replace
+   * `h` as the sample's resolution bound. Ignored elsewhere.
+   */
+  const double *cell;
 } MFTL_PointSetDesc;
 
 /** @brief Whether a rank exports everything it owns of a location. */
@@ -402,6 +445,38 @@ typedef struct MFTL_ProviderRegions
   double h_min[3];  ///< Smallest resolution of the samples owned in the regions, per axis; 0 to derive it from the registered samples.
   double h_max[3];  ///< Largest, likewise; it bounds the kernel metric and therefore every request.
 } MFTL_ProviderRegions;
+
+/**
+ * @struct MFTL_ConstraintDesc
+ * @brief Samples whose value the solver BUILDS from other samples of the same
+ *        location: hanging nodes of a composite mesh, a prescribed sample on a
+ *        wall, any \f$u_c = \sum_j P_{cj} u_j + u_{bc,c}\f$ the solver keeps
+ *        current in the sample's array element (as it does for its ghosts).
+ *
+ * Interpolation reads such a sample as stored. Spreading applies the exact
+ * transpose of the construction: the whole load \f$b_c\f$ a constrained sample
+ * accumulates is passed on as \f$P_{cj} b_c\f$ to each free sample j, wherever
+ * it is owned, and the sample's own element receives nothing -- so a solver
+ * must NOT also condense these loads itself. \f$b_c\f$ is reported through the
+ * field's `constraint_load`, which is what the work of the affine part,
+ * \f$\sum_c u_{bc,c} b_c\f$, needs: \f$U \cdot F = \sum_{free} u_j b_j + \sum_c
+ * u_{bc,c} b_c\f$.
+ *
+ * Registered on the rank that OWNS the constrained samples; one level only (a
+ * free sample is not itself constrained); validated collectively at
+ * MFTLCouplerCreate() / MFTLCouplerUpdateGrid(), including every free-owner
+ * claim. A lattice sample's key is its wrapped index `i + N0 (j + N1 k)`.
+ */
+typedef struct MFTL_ConstraintDesc
+{
+  int location;  ///< The location; its constraints on this rank are REPLACED.
+  int64_t n;  ///< Constrained samples this rank owns; 0 clears them.
+  const uint64_t *keys;  ///< `[n]` their keys.
+  const int64_t *row_ptr;  ///< `[n+1]` rows into the entry arrays.
+  const uint64_t *free_keys;  ///< `[row_ptr[n]]` the free samples each is built from.
+  const double *coef;  ///< `[row_ptr[n]]` \f$P_{cj}\f$, finite.
+  const int *free_owner;  ///< `[row_ptr[n]]` the rank owning each free sample.
+} MFTL_ConstraintDesc;
 
 /**
  * @brief An empty solver grid.
@@ -460,6 +535,16 @@ int MFTLSolverGridSetCoverage(MFTL_SolverGrid *grid, const MFTL_CoverageDesc *de
 int MFTLSolverGridSetProviderRegions(MFTL_SolverGrid *grid, const MFTL_ProviderRegions *desc);
 
 /**
+ * @brief Declares the constrained samples this rank owns of one location
+ *        (#MFTL_ConstraintDesc), replacing earlier ones.
+ * @param grid The grid.
+ * @param desc The constraints; copied.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on an invalid description.
+ * @rank_local
+ */
+int MFTLSolverGridSetConstraints(MFTL_SolverGrid *grid, const MFTL_ConstraintDesc *desc);
+
+/**
  * @brief Drops every block, point set, coverage and region; keeps the locations.
  *        The full-replacement path for a changed grid; follow with
  *        MFTLCouplerUpdateGrid().
@@ -502,7 +587,19 @@ typedef enum MFTL_MarkerKind
 {
   MFTL_MARKERS_VERTICES = 0,  ///< Owned vertices; weight = dual area \f$\sum_{T \ni v} A_T/3\f$.
   MFTL_MARKERS_CENTROIDS = 1,  ///< Owned triangles at their centroids; weight = area.
-  MFTL_MARKERS_USER = 2  ///< Positions and weights supplied by the caller.
+  MFTL_MARKERS_USER = 2,  ///< Positions and weights supplied by the caller.
+  /**
+   * Quadrature points of the owned triangles: each is cut into \f$m^2\f$
+   * congruent sub-triangles (m per edge) with one point at each sub-centroid,
+   * weight \f$A/m^2\f$ -- exact for the linear hat functions of the vertices,
+   * so the points' weights sum, per vertex, to its dual area. m is chosen per
+   * triangle so that a sub-triangle's longest edge stays within
+   * `quadrature_ratio` of the finest fluid resolution near it: the surface
+   * mesh need not be refined to the fluid. Vertex fields and point fields are
+   * converted by MFTLCouplerQuadratureToVertices() and
+   * MFTLCouplerQuadratureFromVertices(), an exact adjoint pair.
+   */
+  MFTL_MARKERS_QUADRATURE = 3
 } MFTL_MarkerKind;
 
 /**
@@ -522,6 +619,9 @@ typedef struct MFTL_MarkerSpec
   const double *user_weight;  ///< USER: `[n_user]` integrated weights, or #MFTL_NULL for 1.
   const uint64_t *user_keys;  ///< USER: `[n_user]` ids, or #MFTL_NULL for the index.
   bool interpolation_only;  ///< Skip the sampling check of a spreading bind.
+  int quadrature_level;  ///< QUADRATURE: points per triangle edge for EVERY triangle (m, so \f$m^2\f$ points); 0 chooses it per triangle.
+  double quadrature_ratio;  ///< QUADRATURE, adaptive: largest sub-triangle edge over the local fluid resolution; 0 means the coupler's `sampling_ratio`.
+  int quadrature_max_level;  ///< QUADRATURE, adaptive: largest m; 0 means 16. A triangle that needs more is #MFTL_COUPLING_BAD_SAMPLING under an ERROR policy.
 } MFTL_MarkerSpec;
 
 /**
@@ -539,6 +639,16 @@ typedef struct MFTL_MarkerSpec
 typedef struct MFTL_WindowSpec
 {
   double skin[3];  ///< Physical displacement allowance per axis; >= 0.
+  /**
+   * Migration allowance per axis; >= 0, 0 for none. A rank's window then
+   * also holds every bin of the OTHER ranks' markers that lies within this
+   * distance of its box -- so after a redistribution has moved markers that far
+   * onto it (with the skin covering how far they moved) they bind in the window
+   * as it is: no request, no fetch. For vertex and centroid markers the skin
+   * is the natural value; quadrature points follow their triangle's centroid,
+   * so add the largest triangle. Costs the replicated bins near rank boundaries.
+   */
+  double migration[3];
 } MFTL_WindowSpec;
 
 /**
@@ -561,6 +671,7 @@ typedef struct MFTL_MarkerRef
   int body_gid;  ///< Body id; -1 for USER markers.
   int slot;  ///< Local object slot at bind time; -1 for USER.
   int entity;  ///< Vertex or triangle pool index, or the user index.
+  int sub;  ///< QUADRATURE: the point's index within its triangle (`key` and `sub` together are unique); 0 otherwise.
   double weight;  ///< Integrated weight (area).
 } MFTL_MarkerRef;
 
@@ -578,6 +689,33 @@ typedef struct MFTL_SolverField
   ptrdiff_t stride;  ///< Doubles between consecutive elements; 0 means 1.
   uint64_t version;  ///< The solver's value token (a step and stage counter); recorded with a fetch.
   bool halo_valid;  ///< The blocks' declared ghost layers hold their owners' current values. Same on every rank.
+  /**
+   * SPREAD only: the SOLVER completes the transpose of the ghost route. The
+   * loads of samples this rank reads from its own ghost layers (the halo route)
+   * are written into those ghost elements of the target instead of being sent
+   * to their owners, and every other element of the target's declared ghost
+   * layers is set to ZERO -- so exactly one reverse halo accumulation by the
+   * solver (each ghost element added into its owner) completes $W^T F$, and no
+   * value the array held there before is added with it. Owned elements are
+   * added to as always. Distinct fields of one batch must not share ghost
+   * elements. Same on every rank (part of the transfer signature).
+   */
+  bool halo_transpose;
+  /** FETCH (interpolation): `[6]` the field's value on each ODD mirror face (x-lo, y-lo, z-lo, x-hi, y-hi, z-hi), or #MFTL_NULL for zero. Not retained. */
+  const double *wall_value;
+  /**
+   * SPREAD: `[6]`, or #MFTL_NULL: the job-wide integrated load each ODD mirror
+   * face's prescribed value absorbs is ADDED here, identical on every rank --
+   * with it, the loads the samples receive plus these sum to the markers'
+   * total. Whether it is requested is part of the transfer signature.
+   */
+  double *wall_reaction;
+  /**
+   * SPREAD: `[constrained samples of the location on this rank]`, in
+   * registration order, or #MFTL_NULL: each one's whole load \f$b_c\f$ -- before
+   * it was passed on to its free samples -- is ADDED here.
+   */
+  double *constraint_load;
 } MFTL_SolverField;
 
 /** @brief Whether spread loads stay integrated or become densities. */
@@ -639,11 +777,21 @@ void MFTLCouplerDestroy(MFTL_Coupler **c);
 
 /**
  * @brief Takes up the grid's current registration after the application
- *        changed it (pieces, coverage, regions). A rank with no change passes
- *        through. Rebuilds the directory only if some rank's ownership changed;
- *        a selection-only change keeps it. Every window becomes stale.
+ *        changed it (pieces, coverage, regions, constraints). A rank with no
+ *        change passes through.
+ *
+ * What survives is decided by effect. A change of what some rank OWNS stales
+ * every window, binding, fetch and transfer token; the directory is rebuilt
+ * only if some rank's ownership ENTRIES changed (re-registering the same
+ * blocks or extents keeps it). A change of EXPORTS alone keeps the directory
+ * and every window whose served samples are all still exported -- checked
+ * lazily by each window's next collective use, so a selection that slides
+ * without touching a window's band costs that window nothing. Constraints are
+ * validated here (#MFTL_ConstraintDesc).
+ *
  * @param c The coupler.
- * @return The agreed status.
+ * @return The agreed status; INVALID for an invalid registration (the grid
+ *         then stays un-taken-up: every consumer is STALE until it is fixed).
  * @collective
  */
 int MFTLCouplerUpdateGrid(MFTL_Coupler *c);
@@ -715,7 +863,10 @@ int MFTLCouplerPrepareWindow(MFTL_Coupler *c, const MFTL_SupportRequest *req, MF
  * @brief Builds the rows of the current markers inside a window.
  *
  * Every marker must lie within the window's skin of a requested position;
- * otherwise the status is STALE and the caller requests a new window.
+ * otherwise the status is STALE and the caller requests a new window. Every
+ * rank must bind the same kind, location list and quadrature policy: the
+ * agreement covers them, so ranks that differ are INVALID, never diverging.
+ * A QUADRATURE bind also builds the vertex ghost schedule (one more exchange).
  *
  * @param c       The coupler.
  * @param markers The markers; their locations must be among the window's.
@@ -737,6 +888,42 @@ int MFTLCouplerBind(MFTL_Coupler *c, const MFTL_MarkerSpec *markers, const MFTL_
  * @collective
  */
 int MFTLCouplerBindStage(MFTL_Coupler *c, const MFTL_CouplingBinding *base, const MFTL_StageGeometry *stage, MFTL_CouplingBinding **out);
+
+/**
+ * @brief The rows of a stage, with NO communication: BindStage() without its
+ *        status agreement, for a caller that already makes one collective
+ *        decision per stage or step.
+ *
+ * Same rows as MFTLCouplerBindStage() to the bit when it succeeds. The status
+ * is THIS rank's alone: a caller must combine it over the ranks -- in its own
+ * step decision, or with MFTLCouplerAgreeStatus() -- before any communicating
+ * call that depends on it, and before committing anything computed from it. A
+ * failure here never starts a request, a rebuild or a fetch behind the other
+ * ranks' backs. May run while a fetch is in flight (it reads only the window).
+ *
+ * @param c     The coupler.
+ * @param base  The binding whose markers move.
+ * @param stage Their stage positions (and optionally weights).
+ * @param[out] out The stage binding, or #MFTL_NULL unless OK.
+ * @return This rank's status: OK, STALE (a position left the window or the
+ *         surface changed), BAD_STENCIL or INVALID.
+ * @rank_local
+ */
+int MFTLCouplerBindStageLocal(MFTL_Coupler *c, const MFTL_CouplingBinding *base, const MFTL_StageGeometry *stage, MFTL_CouplingBinding **out);
+
+/**
+ * @brief Agrees a status over the coupler's ranks: the most severe one.
+ *
+ * The one-call completion of a local operation (MFTLCouplerBindStageLocal(),
+ * MFTLCouplerInterpolateFetched()) for a caller with no step decision of its
+ * own to fold it into.
+ *
+ * @param c     The coupler.
+ * @param local This rank's #MFTL_CouplingStatus.
+ * @return The maximum over the ranks.
+ * @collective
+ */
+int MFTLCouplerAgreeStatus(MFTL_Coupler *c, int local);
 
 /**
  * @brief Agrees a batch: same direction, same locations and flags in the same
@@ -790,16 +977,21 @@ int MFTLCouplerInterpolateFetched(const MFTL_CouplingBinding *b, const MFTL_Coup
  *        reverse exchange. The targets are untouched until End.
  * @param c     The coupler.
  * @param ready A SPREAD token.
- * @param loads `[n_markers * n_fields]` integrated marker loads, marker-major.
+ * @param loads `[n_markers * n_fields]` integrated marker loads, marker-major;
+ *              every one finite (a NaN load would poison its owner's sample).
  * @return The agreed status: OK, STALE after a grid/surface change, or INVALID
- *         on misuse or mismatched tokens. A failed Begin posts no messages.
+ *         on misuse, a non-finite load or mismatched tokens. A failed Begin
+ *         posts no messages.
  * @collective
  */
 int MFTLCouplerSpreadBegin(MFTL_Coupler *c, const MFTL_TransferReady *ready, const double *loads);
 
 /**
  * @brief Completes a spread: every owner adds the contributions of all ranks,
- *        in ascending source-rank order, to its targets.
+ *        in ascending source-rank order, to its targets; passes constrained
+ *        samples' loads on to their free samples (#MFTL_ConstraintDesc); with
+ *        `halo_transpose` writes the halo loads into this rank's ghost
+ *        elements; and reduces the mirror walls' reactions.
  * @param c The coupler.
  * @return #MFTL_COUPLING_OK, or #MFTL_COUPLING_INVALID when no spread is active.
  * @collective
@@ -887,6 +1079,61 @@ void MFTLCouplerReleaseReady(MFTL_TransferReady **r);
  * 7. Inspection
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6b. Surface quadrature (QUADRATURE bindings)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Number of OWNED vertices of this rank's bodies: the length of a vertex
+ *        field of MFTLCouplerQuadratureToVertices() and
+ *        MFTLCouplerQuadratureFromVertices(), in the order of a VERTICES
+ *        binding's markers (bodies by ascending id, then pool order).
+ * @param b A QUADRATURE binding.
+ * @return The count; 0 for anything else.
+ * @rank_local
+ */
+int64_t MFTLCouplerQuadratureVertexCount(const MFTL_CouplingBinding *b);
+
+/**
+ * @brief Projects point values onto the vertices with the lumped surface mass:
+ *        \f$U_v = \sum_q w_q \lambda_{qv} U_q \,/\, \sum_q w_q \lambda_{qv}\f$
+ *        (\f$\lambda\f$ the point's barycentric coordinates, \f$w\f$ its
+ *        weight), i.e. \f$M_S^{-1} B^T Q\f$ applied to interpolated velocities.
+ *
+ * Every rank's points contribute to the vertices of their triangles wherever
+ * those are owned; one reverse exchange along the binding's ghost schedule
+ * completes the sums. The denominator, a vertex's lumped mass, is the dual area
+ * \f$\sum_{T \ni v} A_T/3\f$ to round-off. Constants are reproduced exactly.
+ *
+ * @param c     The coupler.
+ * @param b     A QUADRATURE binding (a stage binding projects with its own weights).
+ * @param ncomp Components per value.
+ * @param Uq    `[n_markers * ncomp]` point values, marker-major.
+ * @param[out] Uv `[vertex count * ncomp]` owned-vertex values, vertex-major.
+ * @return The agreed status: OK, STALE if the surface changed, INVALID on misuse.
+ * @collective
+ */
+int MFTLCouplerQuadratureToVertices(MFTL_Coupler *c, const MFTL_CouplingBinding *b, int ncomp, const double *Uq, double *Uv);
+
+/**
+ * @brief The point loads of vertex loads: \f$F_q = w_q \sum_v \lambda_{qv} g_v\f$
+ *        with \f$g = M_S^{-1} F_v\f$ for INTEGRATED vertex loads (a force per
+ *        vertex) or \f$g = F_v\f$ for a DENSITY (a force per area). The exact
+ *        transpose of MFTLCouplerQuadratureToVertices(): for integrated loads
+ *        \f$U_v \cdot F_v = U_q \cdot F_q\f$, and \f$\sum_q F_q = \sum_v F_v\f$ --
+ *        so spreading \f$F_q\f$ conserves the vertex force and its power.
+ *
+ * @param c     The coupler.
+ * @param b     A QUADRATURE binding.
+ * @param ncomp Components per value.
+ * @param Fv    `[vertex count * ncomp]` owned-vertex loads or densities.
+ * @param form  #MFTL_SPREAD_INTEGRATED or #MFTL_SPREAD_DENSITY: what @p Fv is.
+ * @param[out] Fq `[n_markers * ncomp]` integrated point loads, ready to spread.
+ * @return The agreed status: OK, STALE, or INVALID.
+ * @collective
+ */
+int MFTLCouplerQuadratureFromVertices(MFTL_Coupler *c, const MFTL_CouplingBinding *b, int ncomp, const double *Fv, MFTL_SpreadForm form, double *Fq);
+
 /**
  * @brief Number of markers in a binding on this rank.
  * @param b The binding.
@@ -922,7 +1169,8 @@ typedef struct MFTL_BindingQuality
   int64_t n_corrected;  ///< Rows whose moments needed a correction.
   int64_t n_lower_order;  ///< Rows that fell back to constant reproduction.
   int64_t n_grown;  ///< Rows whose support grew.
-  int64_t n_truncated;  ///< Rows cut by a domain wall.
+  int64_t n_truncated;  ///< Rows missing a lattice position with weight (a wall, the lattice's edge, a masked cell); for a point location, rows crossing a wall.
+  int64_t n_mirrored;  ///< Rows completed by mirror images (#MFTL_BOUNDARY_MIRROR).
   int64_t n_failed;  ///< Rows that failed (only nonzero on a failed bind's diagnostics).
   double max_amplification;  ///< Largest \f$\sum_j |W_{ij}|\f$.
   double min_weight;  ///< Most negative weight.
@@ -952,6 +1200,19 @@ int MFTLCouplerBindingQuality(const MFTL_CouplingBinding *b, MFTL_BindingQuality
  * @rank_local
  */
 int MFTLCouplerBindingRow(const MFTL_CouplingBinding *b, int loc_pos, int64_t marker, int *n, const uint64_t **keys, const double **weights);
+
+/**
+ * @brief The wall coefficients of one row (#MFTL_BOUNDARY_MIRROR): the weight
+ *        of each face's `wall_value` in the interpolated value, x-lo, y-lo,
+ *        z-lo, x-hi, y-hi, z-hi. All zero away from ODD faces.
+ * @param b       The binding.
+ * @param loc_pos Position of the location in the binding's location list.
+ * @param marker  Marker index.
+ * @param[out] coef `[6]` the coefficients.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on an invalid argument.
+ * @rank_local
+ */
+int MFTLCouplerBindingWallCoefficients(const MFTL_CouplingBinding *b, int loc_pos, int64_t marker, double coef[6]);
 
 /** @brief Which DOFs a band mask marks. */
 typedef enum MFTL_BandMaskKind
@@ -998,6 +1259,32 @@ typedef struct MFTL_SpacingResult
 int MFTLCouplerSurfaceSpacing(MFTL_Coupler *c, MFTL_SpacingResult *out);
 
 /**
+ * @brief The edge length the fluid asks of the surface, per owned vertex:
+ *        \f$L_v = \tfrac34\,\theta\,\texttt{sampling\_ratio}\,h_v\f$, with
+ *        \f$h_v\f$ the finest fluid resolution the directory knows over the
+ *        vertex's whole fan (its incident triangles' boxes).
+ *
+ * The 3/4 is the isotropic remesher's: it splits edges above 4/3 of its
+ * target, so a CONVERGED remesh to \f$L\f$ keeps every edge within about
+ * \f$\theta\f$ of the sampling bound -- \f$\theta < 1\f$ is the margin for the
+ * motion and stretching until the next remesh, and absorbs the few per cent a
+ * converged remesh leaves above 4/3 L. Measured from a sevenfold refinement in
+ * one shot at \f$\theta = 0.9\f$: 16 serial iterations reach 0.87 h, 8 only 1.04 h
+ * -- a remesh that has not converged is not sized. Until the remesher takes a
+ * sizing field, the job-wide minimum is the conservative single target. Works
+ * before any bind, like MFTLCouplerSurfaceSpacing().
+ *
+ * @param c      The coupler.
+ * @param theta  Margin, in (0, 1].
+ * @param[out] sizes `[owned vertices]` in VERTICES marker order, or #MFTL_NULL;
+ *               #MFTL_DBL_MAX where no fluid resolution is known near the vertex.
+ * @param[out] global_min The smallest over the job (#MFTL_DBL_MAX if none); identical on every rank.
+ * @return The agreed status: OK, STALE (grid not taken up) or INVALID.
+ * @collective
+ */
+int MFTLCouplerSurfaceSizing(MFTL_Coupler *c, double theta, double *sizes, double *global_min);
+
+/**
  * @struct MFTL_CouplerStats
  * @brief Counters. Local by MFTLCouplerGetStats(), job-wide (sums, maxima) by
  *        MFTLCouplerReduceStats().
@@ -1010,7 +1297,8 @@ typedef struct MFTL_CouplerStats
   long n_need_coverage;  ///< Requests that came back NEED_COVERAGE.
   long n_windows;  ///< Windows prepared.
   long n_binds;  ///< Binds.
-  long n_stage_binds;  ///< Stage binds.
+  long n_stage_binds;  ///< Stage binds, checked and local.
+  long n_local_stage_binds;  ///< Of those, local ones (MFTLCouplerBindStageLocal()), which made no agreement.
   long n_stale;  ///< Binds or transfers refused as stale.
   long n_fetches;  ///< Fetches.
   long n_spreads;  ///< Spreads.
@@ -1093,6 +1381,27 @@ typedef struct MFTL_RowQuality
  */
 int MFTLCouplingAssembleRow(const MFTL_CouplerParams *params, const double x[3], const double H[3], int n, const double *X, const double *q, double *w,
                             MFTL_RowQuality *quality);
+
+/**
+ * @brief MFTLCouplingAssembleRow() with a full cell matrix: offsets
+ *        \f$\tilde H^{-1}(X - x)\f$ with \f$\tilde H\f$ = `support_scale` times the
+ *        growth times @p Hc, base weights normalised by \f$|\det \tilde H|\f$.
+ *        LOCAL; the caller guarantees the candidates include every sample in
+ *        the grown support.
+ *
+ * @param params  The policy.
+ * @param x       Marker position.
+ * @param Hc      `[9]` cell matrix, row-major, columns the cell's edge vectors.
+ * @param n       Number of candidates.
+ * @param X       `[3n]` candidate positions.
+ * @param q       `[n]` candidate measures.
+ * @param[out] w  `[n]` weights.
+ * @param[out] quality What was achieved; may be #MFTL_NULL.
+ * @return #MFTL_COUPLING_OK or #MFTL_COUPLING_BAD_STENCIL.
+ * @rank_local
+ */
+int MFTLCouplingAssembleRowCell(const MFTL_CouplerParams *params, const double x[3], const double Hc[9], int n, const double *X, const double *q, double *w,
+                                MFTL_RowQuality *quality);
 
 /**
  * @brief Test hook: caps every coupling message at @p bytes per MPI message, so

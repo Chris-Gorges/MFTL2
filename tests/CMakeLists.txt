@@ -215,6 +215,48 @@ mftl_add_mpi_test_at(test_coupling_protocol_np4 test_coupling_protocol 4)
 mftl_add_mpi_test_at(test_coupling_protocol_np8 test_coupling_protocol 8)
 # More ranks than point-cloud slabs also exercises empty provider regions.
 mftl_add_mpi_test_oversub(test_coupling_protocol_np27 test_coupling_protocol 27)
+# Configurations chosen to make the coupler return a plausible wrong answer:
+# irregular multi-block decompositions with per-axis ghosts, anisotropic offset
+# lattices, markers on the seam and on bin and rank boundaries, interleaved
+# components, interleaved couplers. Against brute force over the global lattice.
+mftl_add_mpi_test(test_coupling_adversarial 1)
+mftl_add_mpi_test_at(test_coupling_adversarial_np2 test_coupling_adversarial 2)
+mftl_add_mpi_test_at(test_coupling_adversarial_np4 test_coupling_adversarial 4)
+mftl_add_mpi_test_at(test_coupling_adversarial_np8 test_coupling_adversarial 8)
+mftl_add_mpi_test_oversub(test_coupling_adversarial_np27 test_coupling_adversarial 27)
+# Who completes what: the solver-completed transpose of the ghost route (checked
+# against a reverse halo accumulation the test performs itself), stage binds
+# whose status the caller agrees (called by some ranks only: a collective inside
+# would deadlock), and the later lifecycle contracts.
+mftl_add_mpi_test(test_coupling_lifecycle 1)
+mftl_add_mpi_test_at(test_coupling_lifecycle_np2 test_coupling_lifecycle 2)
+mftl_add_mpi_test_at(test_coupling_lifecycle_np4 test_coupling_lifecycle 4)
+mftl_add_mpi_test_at(test_coupling_lifecycle_np8 test_coupling_lifecycle 8)
+mftl_add_mpi_test_oversub(test_coupling_lifecycle_np27 test_coupling_lifecycle 27)
+# Surface quadrature: the points against the triangles, the level against the
+# fluid, and the vertex <-> point conversions as an exact adjoint pair across
+# the ghost schedule (compared with the same surface on one rank alone).
+mftl_add_mpi_test(test_coupling_quadrature 1)
+mftl_add_mpi_test_at(test_coupling_quadrature_np2 test_coupling_quadrature 2)
+mftl_add_mpi_test_at(test_coupling_quadrature_np4 test_coupling_quadrature 4)
+mftl_add_mpi_test_at(test_coupling_quadrature_np8 test_coupling_quadrature 8)
+mftl_add_mpi_test_oversub(test_coupling_quadrature_np27 test_coupling_quadrature 27)
+# Walls: the mirror boundary policy against a reference built from lattice
+# INDICES (no reflection shared), the image rule's exactness, and the balance of
+# force and power with the walls' reactions included.
+mftl_add_mpi_test(test_coupling_boundaries 1)
+mftl_add_mpi_test_at(test_coupling_boundaries_np2 test_coupling_boundaries 2)
+mftl_add_mpi_test_at(test_coupling_boundaries_np4 test_coupling_boundaries 4)
+mftl_add_mpi_test_at(test_coupling_boundaries_np8 test_coupling_boundaries 8)
+mftl_add_mpi_test_oversub(test_coupling_boundaries_np27 test_coupling_boundaries 27)
+# Anisotropic point locations: a rotated anisotropic lattice registered as a
+# cloud with its cell matrix -- complete in the cell's frame, so Peskin needs no
+# correction -- against brute force, and cells that rotate with position.
+mftl_add_mpi_test(test_coupling_anisotropic 1)
+mftl_add_mpi_test_at(test_coupling_anisotropic_np2 test_coupling_anisotropic 2)
+mftl_add_mpi_test_at(test_coupling_anisotropic_np4 test_coupling_anisotropic 4)
+mftl_add_mpi_test_at(test_coupling_anisotropic_np8 test_coupling_anisotropic 8)
+mftl_add_mpi_test_oversub(test_coupling_anisotropic_np27 test_coupling_anisotropic 27)
 
 # --- The remeshing module's MPI must stay in one file ----------------------
 #

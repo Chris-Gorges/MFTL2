@@ -20,6 +20,7 @@
 #ifndef MFTL_COUPLING_INTERNAL_H
 #define MFTL_COUPLING_INTERNAL_H
 
+#include <math.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -84,6 +85,7 @@ typedef struct cpl_points
   double *pos;  ///< [3n]
   double *measure;  ///< [n]
   double *h;  ///< [3n]
+  double *cell;  ///< [9n] anisotropic location: cell matrices (row-major), else #MFTL_NULL
   double *ext;  ///< [3n] half-extents
   int64_t *aidx;  ///< [n] element index in the field arrays
   int64_t *orig;  ///< [n] registration index
@@ -105,6 +107,8 @@ typedef struct cpl_location
   double *coords[3];  ///< rectilinear copies
   double *faces[3];  ///< rectilinear copies
   MFTL_BoundaryPolicy boundary;
+  MFTL_WallParity wall[6];  ///< MIRROR: parity per face, x-lo .. z-hi
+  bool anisotropic;  ///< point samples carry cell matrices
 
   MFTL_GridExposure exposure;
   int n_cov;
@@ -117,6 +121,16 @@ typedef struct cpl_location
   int n_pieces;
   int cap_pieces;
   int *piece_ref;  ///< block or point-set index of each piece
+
+  /* constrained samples this rank owns (MFTL_ConstraintDesc), registration order */
+  int64_t n_con;
+  uint64_t *con_key;  ///< [n_con]
+  int64_t *con_ptr;  ///< [n_con+1]
+  uint64_t *con_free;  ///< [con_ptr[n_con]]
+  double *con_coef;
+  int *con_owner;
+  uint64_t *con_sorted;  ///< [n_con] keys ascending
+  int64_t *con_order;  ///< [n_con] registration index of each sorted key
 } cpl_location;
 
 /** @brief The registry. */
@@ -125,6 +139,12 @@ struct MFTL_SolverGrid
   MPI_Comm comm;
   int n_loc, cap_loc;
   cpl_location *loc;
+  /* per location, built on first use by MFTLCplSampleFind(): point keys ascending with their piece and element */
+  int64_t *kidx_n;  ///< [n_loc] -1 when not built
+  uint64_t **kidx_key;
+  int **kidx_piece;
+  int64_t **kidx_elem;
+  double **kidx_meas;
   int n_blocks, cap_blocks;
   cpl_block *blocks;
   int n_points, cap_points;
@@ -141,6 +161,17 @@ uint64_t MFTLCplGridDefinitionHash(const MFTL_SolverGrid *g);
 
 /** @brief Validates the registration against the domain (reports on stderr). */
 int MFTLCplGridValidate(const MFTL_SolverGrid *g, const MFTL_Domain *d);
+
+/** @brief The registration index of constrained key @p key of location @p l on this rank, or -1. */
+int64_t MFTLCplConstraintFind(const cpl_location *l, uint64_t key);
+
+/**
+ * @brief Where this rank stores sample @p key of location @p l: its piece,
+ *        array element and measure. Lattices by index arithmetic, point sets
+ *        through a sorted key index built on first use.
+ * @return false if this rank does not own the key.
+ */
+bool MFTLCplSampleFind(MFTL_SolverGrid *g, int location, uint64_t key, int *piece, int64_t *elem, double *measure);
 
 /** @brief Is owned lattice index @p idx exported (FULL, or inside a coverage box)? */
 bool MFTLCplLatExported(const cpl_location *l, const int64_t idx[3]);
@@ -190,6 +221,31 @@ int64_t MFTLCplLatDistinct(const cpl_location *l, const MFTL_Domain *d, int k, i
 int MFTLCplLatIntersect(const cpl_location *l, const MFTL_Domain *d, int k, int64_t a, int64_t b, int64_t olo, int64_t ohi, int64_t *lo_out, int64_t *hi_out,
                       int max);
 
+/**
+ * @brief Wraps a position into `[min, max)` on every periodic axis, however
+ *        many periods away it is.
+ *
+ * MFTLApplyPeriodicity() shifts by at most one period, which is all a mesh
+ * wrapped every step needs -- but an application's marker can be anywhere, and
+ * one left two periods out is binned, requested and bound in a frame no
+ * provider answers, which comes back as a false NEED_COVERAGE. The seam case
+ * is the other half: one ulp below `min` plus a period rounds onto `max`
+ * itself, outside the half-open box; such a position is put on `min`, the
+ * same point of the circle.
+ */
+static inline void cpl_wrap(const MFTL_Domain *d, double x[3])
+{
+  for (int k = 0; k < 3; ++k)
+  {
+    if (!d->is_periodic[k] || (x[k] >= d->global_min[k] && x[k] < d->global_max[k])) continue;
+    double t = x[k] - d->global_min[k];
+    t -= d->domain_size[k] * floor(t * d->inv_domain_size[k]);
+    double y = d->global_min[k] + t;
+    if (!(y < d->global_max[k]) || y < d->global_min[k]) y = d->global_min[k];
+    x[k] = y;
+  }
+}
+
 /** @brief Lattice key of wrapped index (i,j,k): `i + N0 (j + N1 k)`. */
 static inline uint64_t cpl_lat_key(const cpl_location *l, int64_t i, int64_t j, int64_t k) { return (uint64_t) (i + l->dims[0] * (j + l->dims[1] * k)); }
 
@@ -234,8 +290,9 @@ bool MFTLCplIboxSubtract(int64_t *rem, int *n_rem, int cap, const int64_t *sub);
  * @brief The ranks whose boxes intersect the closed box `[lo, hi]`, periodic
  *        images included, deduplicated and sorted. Arithmetic on the process
  *        grid; never a loop over the ranks.
- * @return Number of ranks written to @p out (room for @p cap; a box
- *         touching every rank needs `nproc`).
+ * @return The number of such ranks. When it exceeds @p cap nothing is written:
+ *         grow @p out to the returned count and call again (a caller sizes its
+ *         buffer by what boxes actually touch, never by the process count).
  */
 int MFTLCplRanksTouching(const MFTL_Domain *d, const double lo[3], const double hi[3], int *out, int cap);
 
@@ -357,6 +414,18 @@ void MFTLCplRowScratchFree(cpl_row_scratch *s);
 int MFTLCplRowWeights(const MFTL_CouplerParams *p, const cpl_kernel *kern, const double x[3], const double Ht[3], int n, const double *X, const double *q,
                     double *w, MFTL_RowQuality *q_out, cpl_row_scratch *s);
 
+/**
+ * @brief The same with a full CELL matrix @p Hm (row-major; columns the cell's
+ *        edge vectors, scale and growth applied): offsets \f$H^{-1}(X - x)\f$,
+ *        base weights normalised by \f$|\det H|\f$. A tensor kernel then
+ *        follows the cell's own axes.
+ */
+int MFTLCplRowWeightsCell(const MFTL_CouplerParams *p, const cpl_kernel *kern, const double x[3], const double Hm[9], int n, const double *X, const double *q,
+                        double *w, MFTL_RowQuality *q_out, cpl_row_scratch *s);
+
+/** @brief Inverse and determinant of a cell matrix; false when singular relative to its column norms. */
+bool MFTLCplCellInverse(const double Hm[9], double inv[9], double *det);
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Coupler state (coupler.c)
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -365,6 +434,8 @@ int MFTLCplRowWeights(const MFTL_CouplerParams *p, const cpl_kernel *kern, const
 typedef struct cpl_locinfo
 {
   bool lattice;
+  bool constrained;  ///< some rank registered constrained samples of this location
+  bool anisotropic;  ///< point samples carry cell matrices
   bool uniform_metric;  ///< every sample of the location has the same resolution
   double hmin[3];  ///< global minimum resolution
   double hmax[3];  ///< global maximum resolution (the metric bound)
@@ -375,6 +446,7 @@ typedef struct cpl_locinfo
 typedef struct cpl_band
 {
   int location;
+  bool has_masked;  ///< some request box of this band held a masked (solid) sample
   int64_t n_dof;
   uint64_t *key;
   int *owner;
@@ -383,6 +455,7 @@ typedef struct cpl_band
   int64_t *elem;  ///< SELF/HALO: element offset
   double *measure;
   double *h;  ///< [3 n_dof]
+  double *cell;  ///< [9 n_dof] anisotropic point location: cell matrices, else #MFTL_NULL
 
   int64_t n_img;
   double *ipos;  ///< [3 n_img]
@@ -408,6 +481,7 @@ typedef struct cpl_band
   int64_t *served_elem;
   int64_t *served_sample;  ///< owned-box linear index (blocks) or registration index (points)
   double *served_measure;
+  int64_t *served_con;  ///< constrained location: registration index of each served sample's constraint, -1 if free; else #MFTL_NULL
 
   /* REQUESTED mask support: the index boxes / boxes received */
   int n_reqbox;
@@ -419,6 +493,7 @@ struct MFTL_CouplingWindow
   MFTL_Coupler *c;
   uint64_t id;
   uint64_t grid_epoch;
+  uint64_t export_epoch;  ///< the export epoch at which every served sample was last confirmed exported
   int n_loc;
   int *locs;
   cpl_band *band;
@@ -459,12 +534,17 @@ struct MFTL_CouplingBinding
   int64_t **row_ptr;
   int64_t **col;
   double **w;
+  double **wallc;  ///< [n_loc] MIRROR locations: [6 n_markers] wall coefficients; #MFTL_NULL otherwise
   int n_bodies;
   cpl_body_snap *bodies;
   uint64_t pos_checksum;
   MFTL_BindingQuality q;
   uint64_t *scratch_keys;
   int scratch_cap;
+  struct cpl_quad *quad;  ///< QUADRATURE: the vertex table and ghost schedule (the base's, shared by its stage bindings)
+  bool quad_owned;  ///< this binding frees @c quad
+  int q_level, q_max;  ///< QUADRATURE: the spec this binding was gathered with
+  double q_ratio;
 };
 
 struct MFTL_CouplingFetch
@@ -475,6 +555,7 @@ struct MFTL_CouplingFetch
   int *field_band;
   double **values;
   uint64_t *version;
+  double *wall;  ///< [6 n_fields] each field's wall values (zero where none was given)
 };
 
 struct MFTL_TransferReady
@@ -502,15 +583,101 @@ typedef struct cpl_markers
   int64_t n;
   double *pos;  ///< [3n] wrapped
   MFTL_MarkerRef *ref;
+  double *bary;  ///< QUADRATURE: [2n] barycentric coordinates (lambda1, lambda2) in the triangle's vertex order
   int n_bodies;
   cpl_body_snap *bodies;
 } cpl_markers;
 
-/** @brief Gathers markers. @return #MFTL_COUPLING_OK or #MFTL_COUPLING_INVALID. */
-int MFTLCplMarkersGather(const MFTL_Ensemble *ens, const MFTL_MarkerSpec *spec, cpl_markers *m);
+/**
+ * @brief Gathers markers.
+ * @param ens    The ensemble.
+ * @param spec   What to gather.
+ * @param levels QUADRATURE: points per edge of every owned triangle, bodies in
+ *               list order then pool order; ignored otherwise.
+ * @param m      Receives the markers.
+ * @return #MFTL_COUPLING_OK or #MFTL_COUPLING_INVALID.
+ */
+int MFTLCplMarkersGather(const MFTL_Ensemble *ens, const MFTL_MarkerSpec *spec, const int *levels, cpl_markers *m);
+
+/** @brief The barycentric coordinates (lambda1, lambda2) of sub-centroid @p q of a triangle cut @p m per edge. */
+void MFTLCplQuadraturePoint(int m, int q, double *l1, double *l2);
 
 /** @brief Frees what MFTLCplMarkersGather() allocated. */
 void MFTLCplMarkersFree(cpl_markers *m);
+
+/**
+ * @brief The vertex side of a QUADRATURE binding: which vertex every point's
+ *        three barycentric coordinates belong to, and the ghost schedule that
+ *        completes per-vertex sums across ranks.
+ *
+ * The VERTEX TABLE is this rank's owned vertices in VERTICES marker order
+ * (bodies in list order, then pool order), followed by the distinct GHOST
+ * vertices the owned triangles touch, sorted by (owner rank, body id, vertex
+ * id). Ghosts of one owner are therefore contiguous, and both sides of the
+ * exchange know the order without sending it again.
+ */
+typedef struct cpl_quad
+{
+  int64_t n_own, n_ghost;
+  int64_t *corner;  ///< [3 n_markers] vertex-table index of each point's three corners
+  double *bary;  ///< [2 n_markers] (lambda1, lambda2)
+  int n_owner;  ///< ranks owning this rank's ghosts
+  int *owner_rank;  ///< [n_owner] ascending
+  int64_t *owner_off;  ///< [n_owner + 1] into the ghost part of the table
+  int n_req;  ///< ranks holding this rank's owned vertices as ghosts of their triangles
+  int *req_rank;  ///< [n_req] ascending
+  int64_t *req_off;  ///< [n_req + 1]
+  int64_t *req_vt;  ///< owned vertex-table index of every requested vertex, requester by requester
+} cpl_quad;
+
+/**
+ * @brief Builds the vertex table and the ghost schedule of QUADRATURE markers
+ *        (one NBX). Collective over @p comm -- every rank calls it, with or
+ *        without markers.
+ * @return #MFTL_COUPLING_OK, or #MFTL_COUPLING_INVALID when a requested ghost
+ *         is not owned where its record says (a local verdict, to be agreed).
+ */
+int MFTLCplQuadBuild(MPI_Comm comm, const MFTL_Ensemble *ens, const cpl_markers *m, cpl_quad **out, long *bytes, long *messages);
+
+/** @brief Frees a vertex table and schedule. */
+void MFTLCplQuadFree(cpl_quad **q);
+
+/**
+ * @brief Per-vertex sums of point contributions, completed across ranks:
+ *        `acc[v][k] = sum_q w_q lambda_qv val[q][k]` for `k < ncomp`, and
+ *        `acc[v][ncomp] = sum_q w_q lambda_qv` (the lumped mass), for the
+ *        OWNED vertices. Collective.
+ * @param comm      The coupler's private communicator.
+ * @param q         The binding's vertex table and ghost schedule.
+ * @param n_markers Points of the binding on this rank.
+ * @param ref       `[n_markers]` the points (their weights are used).
+ * @param ncomp     Components per value; 0 for the mass alone.
+ * @param val       `[n_markers * ncomp]` point values; #MFTL_NULL when @p ncomp is 0.
+ * @param[out] acc  `[n_own * (ncomp + 1)]` the completed sums.
+ * @param[in,out] bytes    Payload bytes moved, added to.
+ * @param[in,out] messages Messages sent, added to.
+ */
+void MFTLCplQuadAccumulate(MPI_Comm comm, const cpl_quad *q, int64_t n_markers, const MFTL_MarkerRef *ref, int ncomp, const double *val, double *acc,
+                           long *bytes, long *messages);
+
+/**
+ * @brief Point values interpolated from vertex values: `out[q][k] = w_q *
+ *        sum_c lambda_qc g[v_c][k]` (with @p weighted) or without the weight.
+ *        The owned vertices' @p g travel to the ranks holding them as ghosts.
+ *        Collective.
+ * @param comm      The coupler's private communicator.
+ * @param q         The binding's vertex table and ghost schedule.
+ * @param n_markers Points of the binding on this rank.
+ * @param ref       `[n_markers]` the points (their weights are used when @p weighted).
+ * @param weighted  Multiply by the point's weight (a load) or not (a value).
+ * @param ncomp     Components per value.
+ * @param g         `[n_own * ncomp]` owned-vertex values.
+ * @param[out] out  `[n_markers * ncomp]` point values.
+ * @param[in,out] bytes    Payload bytes moved, added to.
+ * @param[in,out] messages Messages sent, added to.
+ */
+void MFTLCplQuadInterpolate(MPI_Comm comm, const cpl_quad *q, int64_t n_markers, const MFTL_MarkerRef *ref, bool weighted, int ncomp, const double *g,
+                            double *out, long *bytes, long *messages);
 
 /** @brief FNV-1a over the bits of @p n positions. */
 uint64_t MFTLCplPositionsChecksum(const double *pos, int64_t n);
@@ -540,7 +707,12 @@ enum
   CPL_TAG_REQUEST = 102,
   CPL_TAG_REPLY = 103,
   CPL_TAG_FETCH = 104,
-  CPL_TAG_SPREAD = 105
+  CPL_TAG_SPREAD = 105,
+  CPL_TAG_QUAD_SETUP = 106,
+  CPL_TAG_QUAD = 107,
+  CPL_TAG_CONSTRAINT_SETUP = 108,
+  CPL_TAG_CONSTRAINT = 109,
+  CPL_TAG_MIGRATION = 110
 };
 
 /** @brief Duplicates @p base. */
@@ -562,6 +734,8 @@ void MFTLCplAgreeMaxN(MPI_Comm c, int *v, int n);
 bool MFTLCplAgreeHash(MPI_Comm c, uint64_t h);
 /** @brief In-place MAX of @p n doubles. */
 void MFTLCplAllreduceMax(MPI_Comm c, double *v, int n);
+/** @brief In-place SUM of @p n doubles. */
+void MFTLCplAllreduceSum(MPI_Comm c, double *v, int n);
 /** @brief In-place SUM of @p n longs. */
 void MFTLCplAllreduceSumLong(MPI_Comm c, long *v, int n);
 /** @brief In-place MAX of @p n longs. */

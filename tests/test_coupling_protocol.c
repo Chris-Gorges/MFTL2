@@ -1009,9 +1009,16 @@ static int test_stale_handles_are_refused(void)
   MFTLCouplerReleaseReady(&ready);
   TEST_ASSERT(agreed(MFTLCouplerSpread(x.c, x.b, 1, &F, L, MFTL_SPREAD_INTEGRATED) == MFTL_COUPLING_STALE, MPI_COMM_WORLD));
 
-  /* a grid update stales every window, even the fresh one */
+  /* an OWNERSHIP update stales every window, even the fresh one (an export-only
+   * one keeps the windows whose samples stay exported -- test_coupling_lifecycle) */
   MFTL_CoverageDesc cv = {blk.loc, MFTL_GRID_FULL, 0, MFTL_NULL, MFTL_NULL};
-  MFTLSolverGridSetCoverage(g, &cv);
+  {
+    MFTL_BlockDesc nb;
+    memset(&nb, 0, sizeof nb);
+    nb.location = blk.loc;
+    for (int k = 0; k < 3; ++k) nb.array_dims[k] = 1; /* owns nothing: a change of what is OWNED all the same */
+    MFTLSolverGridAddBlock(g, &nb);
+  }
   TEST_ASSERT(agreed(MFTLCouplerUpdateGrid(x.c) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
   MFTL_CouplingBinding *b2 = MFTL_NULL;
   TEST_ASSERT(agreed(MFTLCouplerBind(x.c, &ms, w2, &b2) == MFTL_COUPLING_STALE && b2 == MFTL_NULL, MPI_COMM_WORLD));
@@ -1636,9 +1643,14 @@ static int test_grid_edits_invalidate_every_consumer(void)
   TEST_ASSERT(agreed(contract_setup(&f, false) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
   MFTL_CouplingFetch *fetch = MFTL_NULL;
   TEST_ASSERT(agreed(MFTLCouplerFetch(f.c, f.win, 1, f.field, &fetch) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
-  /* Only one rank changes registration, before UpdateGrid has been called. */
-  MFTL_CoverageDesc cv = {0, MFTL_GRID_FULL, 0, MFTL_NULL, MFTL_NULL};
-  if (g_rank == 0) MFTLSolverGridSetCoverage(f.grid, &cv);
+  /* Only one rank changes registration -- what it OWNS -- before UpdateGrid has been called. */
+  if (g_rank == 0)
+  {
+    MFTL_BlockDesc nb;
+    memset(&nb, 0, sizeof nb);
+    for (int k = 0; k < 3; ++k) nb.array_dims[k] = 1;
+    MFTLSolverGridAddBlock(f.grid, &nb);
+  }
   MFTL_CouplingWindow *win = MFTL_NULL;
   TEST_ASSERT(agreed(MFTLCouplerPrepareWindow(f.c, f.req, &win) == MFTL_COUPLING_STALE && !win, MPI_COMM_WORLD));
   MFTL_CouplingBinding *binding = MFTL_NULL;
@@ -1729,9 +1741,15 @@ static int test_transfer_tokens_retain_and_revalidate_handles(void)
   MFTLCouplerReleaseReady(&spread); /* refused until End */
   TEST_ASSERT(agreed(spread != MFTL_NULL, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(MFTLCouplerSpreadEnd(f.c) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
-  /* Tokens prepared before a grid change cannot start an old schedule. */
-  MFTL_CoverageDesc cv = {0, MFTL_GRID_FULL, 0, MFTL_NULL, MFTL_NULL};
-  if (g_rank == 0) MFTLSolverGridSetCoverage(f.grid, &cv);
+  /* Tokens prepared before a change of what is OWNED cannot start an old schedule
+   * (an export-only change that keeps the window keeps them: test_coupling_lifecycle). */
+  if (g_rank == 0)
+  {
+    MFTL_BlockDesc nb;
+    memset(&nb, 0, sizeof nb);
+    for (int k = 0; k < 3; ++k) nb.array_dims[k] = 1;
+    MFTLSolverGridAddBlock(f.grid, &nb);
+  }
   TEST_ASSERT(agreed(MFTLCouplerFetchBegin(f.c, fetch) == MFTL_COUPLING_STALE, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(MFTLCouplerSpreadBegin(f.c, spread, &load) == MFTL_COUPLING_STALE, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(MFTLCouplerUpdateGrid(f.c) == MFTL_COUPLING_OK, MPI_COMM_WORLD));

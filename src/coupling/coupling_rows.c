@@ -127,6 +127,14 @@ static void moments_of(const double *w, const double *d, int n, double *r0, doub
   *dmax = dm;
 }
 
+/**
+ * @brief The row from dimensionless offsets `s->d` already filled for @p n
+ *        candidates: base weights, the reproduction policy, the quality.
+ *        Shared by the diagonal and the full-matrix metric.
+ */
+static int row_from_offsets(const MFTL_CouplerParams *p, const cpl_kernel *kern, double inv_det, int n, const double *q, double *w, MFTL_RowQuality *qo,
+                            cpl_row_scratch *s);
+
 int MFTLCplRowWeights(const MFTL_CouplerParams *p, const cpl_kernel *kern, const double x[3], const double Ht[3], int n, const double *X, const double *q,
                     double *w, MFTL_RowQuality *qo, cpl_row_scratch *s)
 {
@@ -139,12 +147,61 @@ int MFTLCplRowWeights(const MFTL_CouplerParams *p, const cpl_kernel *kern, const
   if (!(Ht[0] > 0.0 && Ht[1] > 0.0 && Ht[2] > 0.0)) return MFTL_COUPLING_BAD_STENCIL;
 
   scratch_reserve(s, n);
-  double *const d = s->d, *const phi = s->phi, *const psi = s->psi, *const r = s->r;
+  double *const d = s->d;
   const double inv[3] = {1.0 / Ht[0], 1.0 / Ht[1], 1.0 / Ht[2]};
   const double inv_det = inv[0] * inv[1] * inv[2];
 
   for (int j = 0; j < n; ++j)
     for (int k = 0; k < 3; ++k) d[3 * j + k] = (X[3 * j + k] - x[k]) * inv[k];
+  return row_from_offsets(p, kern, inv_det, n, q, w, qo, s);
+}
+
+bool MFTLCplCellInverse(const double Hm[9], double inv[9], double *det)
+{
+  const double a = Hm[0], b = Hm[1], c = Hm[2], d = Hm[3], e = Hm[4], f = Hm[5], g = Hm[6], h = Hm[7], i = Hm[8];
+  const double A = e * i - f * h, B = -(d * i - f * g), C = d * h - e * g;
+  const double D = a * A + b * B + c * C;
+  *det = D;
+  /* scale-relative singularity: |det| against the product of the column norms */
+  const double n0 = sqrt(a * a + d * d + g * g), n1 = sqrt(b * b + e * e + h * h), n2 = sqrt(c * c + f * f + i * i);
+  if (!isfinite(D) || !(fabs(D) > 1e-12 * n0 * n1 * n2)) return false;
+  const double id = 1.0 / D;
+  inv[0] = A * id;
+  inv[1] = -(b * i - c * h) * id;
+  inv[2] = (b * f - c * e) * id;
+  inv[3] = B * id;
+  inv[4] = (a * i - c * g) * id;
+  inv[5] = -(a * f - c * d) * id;
+  inv[6] = C * id;
+  inv[7] = -(a * h - b * g) * id;
+  inv[8] = (a * e - b * d) * id;
+  return true;
+}
+
+int MFTLCplRowWeightsCell(const MFTL_CouplerParams *p, const cpl_kernel *kern, const double x[3], const double Hm[9], int n, const double *X, const double *q,
+                        double *w, MFTL_RowQuality *qo, cpl_row_scratch *s)
+{
+  memset(qo, 0, sizeof *qo);
+  qo->status = MFTL_COUPLING_BAD_STENCIL;
+  qo->order = -1;
+  qo->condition = 1.0;
+  for (int k = 0; k < 3; ++k) qo->metric[k] = fabs(Hm[3 * k]) + fabs(Hm[3 * k + 1]) + fabs(Hm[3 * k + 2]);
+  double inv[9], det = 0.0;
+  if (n <= 0 || !MFTLCplCellInverse(Hm, inv, &det)) return MFTL_COUPLING_BAD_STENCIL;
+  scratch_reserve(s, n);
+  double *const d = s->d;
+  for (int j = 0; j < n; ++j)
+  {
+    const double r0 = X[3 * j] - x[0], r1 = X[3 * j + 1] - x[1], r2 = X[3 * j + 2] - x[2];
+    for (int k = 0; k < 3; ++k) d[3 * j + k] = inv[3 * k] * r0 + inv[3 * k + 1] * r1 + inv[3 * k + 2] * r2;
+  }
+  return row_from_offsets(p, kern, 1.0 / fabs(det), n, q, w, qo, s);
+}
+
+static int row_from_offsets(const MFTL_CouplerParams *p, const cpl_kernel *kern, double inv_det, int n, const double *q, double *w, MFTL_RowQuality *qo,
+                            cpl_row_scratch *s)
+{
+  double *const d = s->d, *const phi = s->phi, *const psi = s->psi, *const r = s->r;
 
   /* ── base weights psi_j = q_j / det(H) * phi(d_j): one kernel call per axis ── */
   if (kern->radial)
@@ -312,6 +369,42 @@ int MFTLCouplingAssembleRow(const MFTL_CouplerParams *params, const double x[3],
     {
       const double Ht[3] = {params->support_scale * g * H[0], params->support_scale * g * H[1], params->support_scale * g * H[2]};
       rc = MFTLCplRowWeights(&p, &kern, x, Ht, n, X, q, w, qo, &s);
+      qo->n_grow = step;
+      if (rc == MFTL_COUPLING_OK || !grow || g >= params->max_growth) break;
+      g = fmin(g * params->growth_step, params->max_growth);
+    }
+    if (rc == MFTL_COUPLING_OK && pass == 1) qo->lower_order = true;
+  }
+  MFTLCplRowScratchFree(&s);
+  return rc;
+}
+
+int MFTLCouplingAssembleRowCell(const MFTL_CouplerParams *params, const double x[3], const double Hc[9], int n, const double *X, const double *q, double *w,
+                                MFTL_RowQuality *quality)
+{
+  MFTL_RowQuality local;
+  MFTL_RowQuality *const qo = quality ? quality : &local;
+  memset(qo, 0, sizeof *qo);
+  qo->status = MFTL_COUPLING_BAD_STENCIL;
+  if (params == MFTL_NULL || x == MFTL_NULL || Hc == MFTL_NULL || (n > 0 && (X == MFTL_NULL || q == MFTL_NULL || w == MFTL_NULL)))
+    return MFTL_COUPLING_BAD_STENCIL;
+  cpl_kernel kern;
+  if (MFTLCplKernelResolve(params, &kern) != MFTL_SUCCESS) return MFTL_COUPLING_BAD_STENCIL;
+  cpl_row_scratch s;
+  memset(&s, 0, sizeof s);
+  MFTL_CouplerParams p = *params;
+  const bool grow = (params->failure & MFTL_STENCIL_GROW) != 0 && params->max_growth > 1.0 && params->growth_step > 1.0;
+  const bool lower = (params->failure & MFTL_STENCIL_LOWER_ORDER) != 0 && params->reproduction == MFTL_REPRODUCE_LINEAR;
+  int rc = MFTL_COUPLING_BAD_STENCIL;
+  for (int pass = 0; pass < (lower ? 2 : 1) && rc != MFTL_COUPLING_OK; ++pass)
+  {
+    if (pass == 1) p.reproduction = MFTL_REPRODUCE_CONSTANT;
+    double g = 1.0;
+    for (int step = 0;; ++step)
+    {
+      double Ht[9];
+      for (int a = 0; a < 9; ++a) Ht[a] = params->support_scale * g * Hc[a];
+      rc = MFTLCplRowWeightsCell(&p, &kern, x, Ht, n, X, q, w, qo, &s);
       qo->n_grow = step;
       if (rc == MFTL_COUPLING_OK || !grow || g >= params->max_growth) break;
       g = fmin(g * params->growth_step, params->max_growth);
