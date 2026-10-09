@@ -6,7 +6,8 @@ Depends on: nothing for the raw-array C1 API. `04-attached-fields.md` supplies o
 `05-curvature-and-surface-tension.md` supplies integrated surface forces.
 Used by: `07` (point queries, indicator, surface sizing), `08` (IBM, bindings), `09` (surface sources).
 
-This is an implementation plan, not a claim that the coupler or its performance measurements already exist.
+This plan defines the architecture and milestones; `src/coupling/README.md` records the implemented
+subset, its measured results and remaining limitations.
 Revision 4 replaces the earlier normative design; the review findings below record why.
 
 | Milestone | Independently testable delivery |

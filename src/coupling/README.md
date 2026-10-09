@@ -152,7 +152,9 @@ $\partial(Wu)/\partial x$, differentiated through everything the value row depen
 on -- the kernel (each built-in declares its derivative), the moment correction
 ($\partial c = -M^{-1}(\partial M)c$), and the metric when it varies with the
 marker (the Shepard average and its $|\det|$). Both reproduce affine gradients;
-on an irregular cloud they are different operators -- their results differ by
+the correction is differentiated even where its current value is zero, since
+it can change at neighbouring marker positions.
+On an irregular cloud they are different operators -- their results differ by
 0.5 % of the gradient on the graded cloud below, their weights by up to $0.06/h$ on
 a jittered one (`test_the_fit_and_the_derivative_are_different_operators`) -- which
 is why they have different names. The derivative equals central differences of value
@@ -177,6 +179,7 @@ check apply unchanged. What a row REPRODUCES is declared and checked on the rows
 received, with the samples' positions: LINEAR (a nodal basis), CONSTANT, or NONE
 (a modal basis, whose coefficients are not point values). A modal row declared
 CONSTANT is BAD_STENCIL; lowest-order face rows declared LINEAR are too.
+Weights must remain finite when repeated columns are combined, including for NONE.
 
 Native rows can reach anywhere, so their columns are requested BY KEY:
 `MFTLCouplerRequestSamples` names each sample and the rank owning it (the solver
@@ -577,6 +580,21 @@ ghost boxes, so its providers pack in plain key order, and every value past the
 first ghost-readable sample landed on the wrong one. Single-rank runs, point sets
 and blocks without ghosts were all right; imported trilinear rows against HAT2
 kernel rows were wrong by 0.6 at np = 2 on blocks with one ghost layer.
+
+The C3 review added regressions for five further failures:
+
+- A scalar location could fill the candidate buffer before the first directional
+  location, leaving the directions array unallocated. It now has its own capacity.
+- At a symmetric marker, a cosine-kernel value row needed no correction, but the
+  derivative of that correction was nonzero. Skipping it rejected the derivative
+  as BAD_STENCIL. The derivative now includes the moment inverse at these points,
+  checked against displaced value rows.
+- Finite weights for repeated imported columns could sum to infinity under NONE.
+  The import now returns INVALID before publishing the binding.
+- Keyed requests could accept the same key from two named provider ranks. They
+  now share spatial requests' duplicate-owner check.
+- Nearest queries did not agree the window identity before exchanging candidates.
+  Different windows on different ranks now return INVALID before any exchange.
 
 ## What is not here {#cpl_deferred}
 

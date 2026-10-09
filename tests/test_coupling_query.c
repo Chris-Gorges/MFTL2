@@ -818,6 +818,18 @@ static int test_query_refusals(void)
   TEST_ASSERT(agreed(st == MFTL_COUPLING_OK, MPI_COMM_WORLD));
   MFTL_QueryField F = qlat_field(&Q);
   TEST_ASSERT(agreed(MFTLCouplerQueryNearest(c, w, width, 1, &F) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+  if (g_nproc > 1)
+  {
+    /* Two independently prepared windows are different collective handles,
+     * even when their present geometry happens to give identical schedules. */
+    MFTL_CouplingWindow *w2 = MFTL_NULL;
+    TEST_ASSERT(agreed(MFTLCouplerRequestQuery(c, 1, &Q.loc, width, &req) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(MFTLCouplerPrepareWindow(c, req, &w2) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+    MFTLCouplerReleaseRequest(&req);
+    const int mixed = MFTLCouplerQueryNearest(c, g_rank == 0 ? w2 : w, width, 1, &F);
+    MFTLCouplerReleaseWindow(&w2);
+    TEST_ASSERT(agreed(mixed == MFTL_COUPLING_INVALID, MPI_COMM_WORLD));
+  }
   TEST_ASSERT(agreed(MFTLCouplerQueryNearest(c, w, 8.0 * width, 1, &F) == MFTL_COUPLING_STALE, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(MFTLCouplerQueryNearest(c, w, 0.0, 1, &F) == MFTL_COUPLING_INVALID, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(MFTLCouplerQueryNearest(c, w, NAN, 1, &F) == MFTL_COUPLING_INVALID, MPI_COMM_WORLD));

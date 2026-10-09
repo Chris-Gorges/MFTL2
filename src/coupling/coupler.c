@@ -1593,6 +1593,20 @@ static int cmp_rec_key_provider(const void *a, const void *b)
   return (x->provider > y->provider) - (x->provider < y->provider);
 }
 
+/** @brief Both spatial and keyed requests require one provider per sample. */
+static int check_record_owners(const MFTL_SolverGrid *g, MFTL_SupportRequest *R)
+{
+  if (R->n_rec > 1) qsort(R->rec, (size_t) R->n_rec, sizeof(rec_t), cmp_rec_key_provider);
+  for (int64_t i = 1; i < R->n_rec; ++i)
+    if (R->rec[i].wl == R->rec[i - 1].wl && R->rec[i].key == R->rec[i - 1].key && R->rec[i].provider != R->rec[i - 1].provider)
+    {
+      fprintf(stderr, "MFTL coupling: location '%s': key %llu owned by ranks %d and %d\n", g->loc[R->locs[R->rec[i].wl]].name,
+              (unsigned long long) R->rec[i].key, R->rec[i - 1].provider, R->rec[i].provider);
+      return MFTL_COUPLING_INVALID;
+    }
+  return MFTL_COUPLING_OK;
+}
+
 /** @brief Decodes a bin key into its three signed bin indices. */
 static void bin_unkey3(uint64_t key, int64_t ib[3])
 {
@@ -2242,15 +2256,7 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
     }
   }
   /* One owner per key: the same key from two providers is duplicate ownership. */
-  if (R->n_rec > 1) qsort(R->rec, (size_t) R->n_rec, sizeof(rec_t), cmp_rec_key_provider);
-  for (int64_t i = 1; i < R->n_rec; ++i)
-    if (R->rec[i].wl == R->rec[i - 1].wl && R->rec[i].key == R->rec[i - 1].key && R->rec[i].provider != R->rec[i - 1].provider)
-    {
-      fprintf(stderr, "MFTL coupling: location '%s': key %llu owned by ranks %d and %d\n", g->loc[R->locs[R->rec[i].wl]].name,
-              (unsigned long long) R->rec[i].key, R->rec[i - 1].provider, R->rec[i].provider);
-      local_status = MFTL_COUPLING_INVALID;
-      break;
-    }
+  if (check_record_owners(g, R) != MFTL_COUPLING_OK) local_status = MFTL_COUPLING_INVALID;
 
   for (int i = 0; i < n_dest; ++i)
   {
@@ -2637,6 +2643,7 @@ int MFTLCouplerRequestSamples(MFTL_Coupler *c, int n_lists, const MFTL_SampleLis
     }
   }
   free(got);
+  if (check_record_owners(g, R) != MFTL_COUPLING_OK) local_status = MFTL_COUPLING_INVALID;
   for (int i = 0; i < n_dest; ++i)
   {
     free(dbuf[i].data);
@@ -3631,7 +3638,7 @@ static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_Co
   int status = MFTL_COUPLING_OK;
 
   cand_t cd = {0, 0, MFTL_NULL};
-  int cap_c = 0, cap_img = 0;
+  int cap_c = 0, cap_img = 0, cap_dir = 0;
   int64_t n_sel = 0, *sel = MFTL_NULL;
   double *X = MFTL_NULL, *q = MFTL_NULL, *wt = MFTL_NULL, *dv = MFTL_NULL;
   int64_t *isrc = MFTL_NULL;  /* mirror images: their real sample, parity, wall shares */
@@ -3799,7 +3806,12 @@ static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_Co
               q = (double *) MFTLReallocOrDie(q, (size_t) cap_c * sizeof(double), "row candidates");
               wt = (double *) MFTLReallocOrDie(wt, 3 * (size_t) cap_c * sizeof(double), "row candidates");
               sel = (int64_t *) MFTLReallocOrDie(sel, (size_t) cap_c * sizeof(int64_t), "row candidates");
-              if (B->dir) dv = (double *) MFTLReallocOrDie(dv, 3 * (size_t) cap_c * sizeof(double), "row candidates");
+            }
+            /* Scalar locations may already have grown the shared candidates. */
+            if (B->dir && need_c > cap_dir)
+            {
+              cap_dir = (int) MFTLGrowCapacity(cap_dir, (int) need_c);
+              dv = (double *) MFTLReallocOrDie(dv, 3 * (size_t) cap_dir * sizeof(double), "row directions");
             }
             /* Ordinary locations can grow the candidate buffers without using
              * images. Their capacity says nothing about these separate arrays. */
@@ -4427,7 +4439,11 @@ static int import_location(MFTL_Coupler *c, MFTL_CouplingBinding *b, int lp, con
         b->col[lp][at] = hit->dof;
         for (int k = 0; k < nc; ++k) b->w[lp][nc * at + k] = 0.0;
       }
-      for (int k = 0; k < nc; ++k) b->w[lp][nc * at + k] += nr->weights[nc * e + k];
+      for (int k = 0; k < nc; ++k)
+      {
+        b->w[lp][nc * at + k] += nr->weights[nc * e + k];
+        if (!isfinite(b->w[lp][nc * at + k])) status = MFTL_COUPLING_INVALID;
+      }
     }
     if (status == MFTL_COUPLING_INVALID) break;
     /* an entry whose weights summed to zero is no entry */
@@ -5512,6 +5528,8 @@ int MFTLCouplerQueryNearest(MFTL_Coupler *c, const MFTL_CouplingWindow *w, doubl
   uint64_t sig = CPL_FNV_INIT;
   sig = cpl_fnv(sig, &width, sizeof width);
   sig = cpl_fnv(sig, &n_fields, sizeof n_fields);
+  const uint64_t window_id = w ? w->id : 0;
+  sig = cpl_fnv(sig, &window_id, sizeof window_id);
   for (int f = 0; f < n_fields && local == MFTL_COUPLING_OK; ++f)
   {
     const MFTL_QueryField *Q = &fields[f];

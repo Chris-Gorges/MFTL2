@@ -673,6 +673,51 @@ static int test_raviart_thomas_rows_on_a_face_set(void)
 /** @brief A solid: one node of the lattice has no sample. */
 static bool solid_one(const int64_t idx[3]) { return idx[0] == 4 && idx[1] == 3 && idx[2] == 5; }
 
+/** A keyed request must reject two providers claiming the same column. */
+static int test_keyed_requests_reject_duplicate_ownership(void)
+{
+  if (g_nproc < 2) return 0;
+  {
+    MFTL_Ensemble *ens = adv_unit_box(MPI_COMM_WORLD, false);
+    MFTL_SolverGrid *g = MFTLSolverGridCreate(MPI_COMM_WORLD);
+    MFTL_LocationDesc ld;
+    memset(&ld, 0, sizeof ld);
+    ld.name = "duplicated";
+    ld.lattice.kind = MFTL_LATTICE_UNIFORM;
+    for (int k = 0; k < 3; ++k)
+    {
+      ld.lattice.dims[k] = 4;
+      ld.lattice.spacing[k] = 0.25;
+      ld.lattice.origin[k] = 0.125;
+    }
+    const int loc = MFTLSolverGridAddLocation(g, &ld);
+    MFTL_BlockDesc bd;
+    memset(&bd, 0, sizeof bd);
+    bd.location = loc;
+    for (int k = 0; k < 3; ++k) bd.owned_hi[k] = bd.array_dims[k] = 4;
+    bd.stride[0] = 1;
+    bd.stride[1] = 4;
+    bd.stride[2] = 16;
+    int valid = loc >= 0;
+    const int copies = g_rank < 2 ? 1 : 0;
+    for (int i = 0; i < copies; ++i) valid &= MFTLSolverGridAddBlock(g, &bd) >= 0;
+    TEST_ASSERT(agreed(valid, MPI_COMM_WORLD));
+    MFTL_Coupler *c = MFTL_NULL;
+    TEST_ASSERT(agreed(MFTLCouplerCreate(ens, g, MFTL_NULL, &c) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+    const uint64_t keys[2] = {21, 21};
+    const int owners[2] = {0, 1};
+    const MFTL_SampleList L = {loc, g_rank == 0 ? 2 : 0, keys, owners};
+    MFTL_SupportRequest *rq = MFTL_NULL;
+    const int st = MFTLCouplerRequestSamples(c, 1, &L, &rq);
+    MFTLCouplerReleaseRequest(&rq);
+    MFTLCouplerDestroy(&c);
+    MFTLSolverGridDestroy(&g);
+    MFTLEnsembleDestroy(&ens);
+    TEST_ASSERT(agreed(st == MFTL_COUPLING_INVALID, MPI_COMM_WORLD));
+  }
+  return 0;
+}
+
 /**
  * Every way the protocol can be misused, each agreed on every rank before
  * anything is built or moved: a wrong owner, a masked sample, an unexported
@@ -750,6 +795,20 @@ static int test_the_keyed_protocol_refuses_misuse(void)
       R.keys[0] = keep_k;
     }
   }
+  /* Finite duplicate weights can overflow while the import combines them.
+   * NONE skips reproduction checks, but must never accept an infinite row. */
+  native overflow;
+  native_init(&overflow, S.n_mine);
+  for (int i = 0; i < S.n_mine; ++i)
+  {
+    const int64_t e = R.row_ptr[i];
+    native_push(&overflow, R.keys[e], R.owner[e], g_rank == bad_rank ? DBL_MAX : 0.25);
+    native_push(&overflow, R.keys[e], R.owner[e], g_rank == bad_rank ? DBL_MAX : 0.25);
+    native_close(&overflow, i);
+  }
+  const int overflow_status = import_one(c, &ms, w, S.loc, &overflow, MFTL_REPRODUCE_NONE, &b);
+  native_free(&overflow);
+  TEST_ASSERT(agreed(overflow_status == MFTL_COUPLING_INVALID && b == MFTL_NULL, MPI_COMM_WORLD));
   /* QUADRATURE and gradient imports */
   MFTL_MarkerSpec mq = ms;
   mq.kind = MFTL_MARKERS_QUADRATURE;
@@ -924,6 +983,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_a_column_far_from_every_marker);
   RUN_TEST(test_raviart_thomas_rows_on_a_face_set);
   RUN_TEST(test_the_keyed_protocol_refuses_misuse);
+  RUN_TEST(test_keyed_requests_reject_duplicate_ownership);
   RUN_TEST(test_coverage_by_key);
 
   if (g_rank == 0) TEST_REPORT();

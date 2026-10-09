@@ -670,12 +670,12 @@ static void face_cloud_make(int n, face_cloud *F)
   F->val = (double *) calloc((size_t) (F->n_mine > 0 ? F->n_mine : 1), sizeof(double));
 }
 
-static int face_cloud_register(MFTL_SolverGrid *g, face_cloud *F, const char *name)
+static int face_cloud_register_as(MFTL_SolverGrid *g, face_cloud *F, const char *name, bool directional)
 {
   MFTL_LocationDesc ld;
   memset(&ld, 0, sizeof ld);
   ld.name = name;
-  ld.directional = true;
+  ld.directional = directional;
   F->loc = MFTLSolverGridAddLocation(g, &ld);
   const int64_t m = F->n_mine;
   double *X = (double *) malloc(3 * (size_t) (m > 0 ? m : 1) * sizeof(double)), *S = (double *) malloc(3 * (size_t) (m > 0 ? m : 1) * sizeof(double));
@@ -695,7 +695,7 @@ static int face_cloud_register(MFTL_SolverGrid *g, face_cloud *F, const char *na
   pd.keys = k;
   pd.pos = X;
   pd.measure = q;
-  pd.direction = S;
+  pd.direction = directional ? S : MFTL_NULL;
   for (int a = 0; a < 3; ++a) pd.h_uniform[a] = F->h;
   const int piece = MFTLSolverGridAddPoints(g, &pd);
   free(X);
@@ -703,6 +703,11 @@ static int face_cloud_register(MFTL_SolverGrid *g, face_cloud *F, const char *na
   free(q);
   free(k);
   return piece;
+}
+
+static int face_cloud_register(MFTL_SolverGrid *g, face_cloud *F, const char *name)
+{
+  return face_cloud_register_as(g, F, name, true);
 }
 
 static void face_cloud_free(face_cloud *F)
@@ -747,6 +752,87 @@ static void marker_list(int n, double lo, double hi, uint64_t seed, double *all)
 {
   uint64_t s = seed;
   for (int i = 0; i < 3 * n; ++i) all[i] = lo + (hi - lo) * adv_unif(&s);
+}
+
+/** A scalar location fills the shared candidate buffer before a directional
+ * location with identical geometry. Direction scratch still needs storage. */
+static int test_scalar_then_directional_locations(void)
+{
+  MFTL_Ensemble *ens = adv_unit_box(MPI_COMM_WORLD, false);
+  MFTL_SolverGrid *g = MFTLSolverGridCreate(MPI_COMM_WORLD);
+  face_cloud F;
+  face_cloud_make(9, &F);
+  TEST_ASSERT(agreed(face_cloud_register_as(g, &F, "scalar", false) >= 0, MPI_COMM_WORLD));
+  const int scalar = F.loc;
+  TEST_ASSERT(agreed(face_cloud_register(g, &F, "directional") >= 0, MPI_COMM_WORLD));
+  MFTL_CouplerParams P;
+  MFTLCouplerDefaultParams(&P);
+  P.max_amplification = 20.0;
+  MFTL_Coupler *c = MFTL_NULL;
+  TEST_ASSERT(agreed(MFTLCouplerCreate(ens, g, &P, &c) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+  double all[3 * 48];
+  marker_list(48, 0.3, 0.7, 405, all);
+  MFTL_CouplingWindow *w = MFTL_NULL;
+  MFTL_CouplingBinding *b = MFTL_NULL;
+  int64_t nm;
+  TEST_ASSERT(agreed(adv_bind_list(c, 48, all, 0, MFTL_NULL, &w, &b, &nm) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLCouplerBindingComponents(b, scalar) == 1 && MFTLCouplerBindingComponents(b, F.loc) == 3, MPI_COMM_WORLD));
+  const vfield V = {{0.4, -1.1, 0.7}, {0.3, -0.2, 0.5, 0.1, 0.6, -0.4, -0.3, 0.2, 0.25}, {0.8, -0.5, 1.2}, {0.5, 0.5, 0.5}};
+  face_cloud_fill(&F, &V);
+  double *sv = (double *) malloc((size_t) (F.n_mine + 1) * sizeof(double));
+  for (int64_t i = 0; i < F.n_mine; ++i) sv[i] = 2.0;
+  MFTL_SolverField fld[2];
+  memset(fld, 0, sizeof fld);
+  fld[0].location = scalar;
+  fld[0].data = &sv;
+  fld[1].location = F.loc;
+  fld[1].data = &F.val;
+  double *U = (double *) malloc(4 * (size_t) (nm + 1) * sizeof(double));
+  TEST_ASSERT(agreed(MFTLCouplerInterpolate(c, b, 2, fld, U) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+  const double *pos = MFTLCouplerBindingPositions(b);
+  double worst = 0.0;
+  for (int64_t i = 0; i < nm; ++i)
+  {
+    double u[3];
+    vfield_at(&V, &pos[3 * i], u);
+    worst = fmax(worst, fabs(U[4 * i] - 2.0));
+    for (int k = 0; k < 3; ++k) worst = fmax(worst, fabs(U[4 * i + 1 + k] - u[k]));
+  }
+  TEST_ASSERT(agreed(worst <= 1e-11, MPI_COMM_WORLD));
+  free(U);
+  free(sv);
+  MFTLCouplerReleaseBinding(&b);
+  MFTLCouplerReleaseWindow(&w);
+  MFTLCouplerDestroy(&c);
+  MFTLSolverGridDestroy(&g);
+  MFTLEnsembleDestroy(&ens);
+  face_cloud_free(&F);
+  return 0;
+}
+
+/** At a symmetric marker the cosine row already reproduces linears, but its
+ * correction has a nonzero derivative. Compare with displaced VALUE rows. */
+static int test_derivative_at_a_zero_correction(void)
+{
+  enum { N = 125 };
+  const double x[3] = {0, 0, 0}, H[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1};
+  double X[3 * N], q[N], wd[3 * N], wm[N], wp[N];
+  jitter_cloud(x, 1.0, 5, 0.0, 1, X, q);
+  MFTL_CouplerParams P = params_with(MFTL_KERNEL_COSINE4, MFTL_REPRODUCE_LINEAR);
+  TEST_ASSERT(MFTLCouplingAssembleBlockRow(&P, MFTL_OPERATOR_VALUE_DERIVATIVE, x, H, MFTL_NULL, N, X, q, MFTL_NULL, wd, MFTL_NULL) == MFTL_COUPLING_OK);
+  double worst = 0.0;
+  for (int k = 0; k < 3; ++k)
+  {
+    const double eps = 1e-5;
+    double xm[3] = {0, 0, 0}, xp[3] = {0, 0, 0};
+    xm[k] = -eps;
+    xp[k] = eps;
+    TEST_ASSERT(MFTLCouplingAssembleBlockRow(&P, MFTL_OPERATOR_VALUE, xm, H, MFTL_NULL, N, X, q, MFTL_NULL, wm, MFTL_NULL) == MFTL_COUPLING_OK);
+    TEST_ASSERT(MFTLCouplingAssembleBlockRow(&P, MFTL_OPERATOR_VALUE, xp, H, MFTL_NULL, N, X, q, MFTL_NULL, wp, MFTL_NULL) == MFTL_COUPLING_OK);
+    for (int j = 0; j < N; ++j) worst = fmax(worst, fabs(wd[3 * j + k] - (wp[j] - wm[j]) / (2 * eps)));
+  }
+  TEST_ASSERT(worst <= 1e-6);
+  return 0;
 }
 
 /**
@@ -1662,12 +1748,14 @@ int main(int argc, char **argv)
   if (g_rank == 0) printf("\n=== Coupling operators: directions and gradients (np = %d) ===\n", g_nproc);
 
   RUN_TEST(test_kernel_derivatives_match_differences);
+  RUN_TEST(test_derivative_at_a_zero_correction);
   RUN_TEST(test_directional_rows_reproduce_affine_vector_fields);
   RUN_TEST(test_directional_rank_deficiency_is_refused);
   RUN_TEST(test_the_derivative_is_the_derivative);
   RUN_TEST(test_the_fit_and_the_derivative_are_different_operators);
   RUN_TEST(test_a_user_kernel_needs_its_derivative);
   RUN_TEST(test_a_face_cloud_reconstructs_vectors);
+  RUN_TEST(test_scalar_then_directional_locations);
   RUN_TEST(test_both_gradients_through_the_coupler);
   RUN_TEST(test_gradients_at_mirror_walls);
   RUN_TEST(test_operators_that_do_not_exist_are_refused);

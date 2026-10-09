@@ -857,29 +857,26 @@ int MFTLCplBlockRow(const MFTL_CouplerParams *p, const cpl_kernel *kern, MFTL_Co
       m0 += psi[j];
       for (int k = 0; k < 3; ++k) m1[k] += psi[j] * d[3 * j + k];
     }
-    if (fabs(m0 - 1.0) <= tol && fmax(fabs(m1[0]), fmax(fabs(m1[1]), fabs(m1[2]))) <= tol)
-      for (int j = 0; j < n; ++j) W[j] = psi[j];
-    else
+    corrected = !(fabs(m0 - 1.0) <= tol && fmax(fabs(m1[0]), fmax(fabs(m1[1]), fabs(m1[2]))) <= tol);
+    /* A correction that vanishes at x can still have a nonzero derivative.
+     * Always form its moment inverse for VALUE_DERIVATIVE. */
+    memset(M, 0, sizeof M);
+    for (int j = 0; j < n; ++j)
     {
-      memset(M, 0, sizeof M);
-      for (int j = 0; j < n; ++j)
-      {
-        if (psi[j] == 0.0) continue;
-        const double pj[4] = {1.0, d[3 * j], d[3 * j + 1], d[3 * j + 2]};
-        for (int a = 0; a < 4; ++a)
-          for (int b = a; b < 4; ++b) M[4 * a + b] += psi[j] * pj[a] * pj[b];
-      }
+      if (psi[j] == 0.0) continue;
+      const double pj[4] = {1.0, d[3 * j], d[3 * j + 1], d[3 * j + 2]};
       for (int a = 0; a < 4; ++a)
-        for (int b = 0; b < a; ++b) M[4 * a + b] = M[4 * b + a];
-      if (!spd_inverse(4, M, p->max_condition, Mi, &cond))
-      {
-        qo->condition = cond;
-        return MFTL_COUPLING_BAD_STENCIL;
-      }
-      for (int a = 0; a < 4; ++a) c[a] = Mi[4 * a];
-      for (int j = 0; j < n; ++j) W[j] = (psi[j] == 0.0) ? 0.0 : psi[j] * (c[0] + c[1] * d[3 * j] + c[2] * d[3 * j + 1] + c[3] * d[3 * j + 2]);
-      corrected = true;
+        for (int b = a; b < 4; ++b) M[4 * a + b] += psi[j] * pj[a] * pj[b];
     }
+    for (int a = 0; a < 4; ++a)
+      for (int b = 0; b < a; ++b) M[4 * a + b] = M[4 * b + a];
+    if (!spd_inverse(4, M, p->max_condition, Mi, &cond))
+    {
+      qo->condition = cond;
+      return MFTL_COUPLING_BAD_STENCIL;
+    }
+    for (int a = 0; a < 4; ++a) c[a] = Mi[4 * a];
+    for (int j = 0; j < n; ++j) W[j] = (psi[j] == 0.0) ? 0.0 : psi[j] * (c[0] + c[1] * d[3 * j] + c[2] * d[3 * j + 1] + c[3] * d[3 * j + 2]);
   }
   {
     double r0 = 0.0, r1 = 0.0, vsum = 0.0, dm = 1.0;
@@ -919,7 +916,7 @@ int MFTLCplBlockRow(const MFTL_CouplerParams *p, const cpl_kernel *kern, MFTL_Co
       dpsi[3 * j + m] = q[j] * met->detA * v;
     }
   }
-  if (repro == MFTL_REPRODUCE_NONE || (repro == MFTL_REPRODUCE_LINEAR && !corrected))
+  if (repro == MFTL_REPRODUCE_NONE)
     for (int i = 0; i < 3 * n; ++i) w[i] = dpsi[i];
   else if (repro == MFTL_REPRODUCE_CONSTANT)
   {
