@@ -8,8 +8,8 @@
  *        binding, transfers. No MPI here -- every exchange goes through
  *        coupling_comm.c.
  *
- *     create/update ──> directory (NBX publication of ownership extents)
- *     request       ──> bins of marker positions, request boxes per location,
+ *     create/update ──> directory shards (ownership and local resolution)
+ *     request       ──> bins of marker positions, spatial certificate lookups,
  *                       sub-requests to every owner the directory names (NBX),
  *                       replies (known peers), coverage verified, status agreed
  *     window        ──> band (unique samples, routes), images and their bins,
@@ -27,7 +27,6 @@
 
 #include "coupling_internal.h"
 
-#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +36,7 @@
 #include "mftl_constants.h"
 #include "mftl_geometry.h"
 #include "mftl_memory.h"
+#include "mftl_object.h"
 #include "mftl_topology.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -49,7 +49,7 @@ void MFTLCplBufPut(cpl_buf *b, const void *src, size_t n)
   {
     size_t cap = b->cap ? b->cap : 256;
     while (cap < b->n + n) cap *= 2;
-    b->data = (unsigned char *) MFTLReallocOrDie(b->data, cap, "coupling buffer");
+    b->data = (unsigned char *) MFTLCplRealloc(b->data, cap, "coupling buffer");
     b->cap = cap;
   }
   if (n > 0) memcpy(b->data + b->n, src, n);
@@ -67,7 +67,7 @@ void MFTLCplBufPut(cpl_buf *b, const void *src, size_t n)
     {                                                                                      \
       int64_t _c = (cap) ? (cap) : 16;                                                     \
       while (_c < (int64_t) (need)) _c *= 2;                                               \
-      (ptr) = (type *) MFTLReallocOrDie((ptr), (size_t) _c * sizeof(type), "coupling"); \
+      (ptr) = (type *) MFTLCplRealloc((ptr), (size_t) _c * sizeof(type), "coupling"); \
       (cap) = _c;                                                                          \
     }                                                                                      \
   } while (0)
@@ -97,6 +97,22 @@ static int64_t find_u64(const uint64_t *a, int64_t n, uint64_t key)
  * The coupler
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/** @brief Candidate images of a band in the closed box `[lo, hi]`, in fixed global bin order. */
+typedef struct
+{
+  int64_t n, cap;
+  int64_t *img;
+} cand_t;
+
+/** @brief Reused candidate workspace; bindings retain only their final rows. */
+typedef struct
+{
+  cand_t candidates;
+  int cap_c, cap_img;
+  int64_t *sel, *isrc;
+  double *X, *q, *wt, *ipar, *icoef;
+} bind_scratch;
+
 struct MFTL_Coupler
 {
   MFTL_Ensemble *ens;
@@ -110,9 +126,10 @@ struct MFTL_Coupler
 
   int n_dir;
   cpl_dir_entry *dir;
-  cpl_dir_index *dix;  ///< [n_loc] grids over the directory, one per location
-  cpl_cover *cover;  ///< [n_loc] what the directory's ownership boxes cover near this rank (point locations)
-  double dir_reach[3];
+  cpl_dir_index *dix;  ///< [n_loc] compact directory bounds trees
+  int n_shard;
+  cpl_dir_entry *shard;
+  cpl_dir_index *shard_index;
 
   uint64_t seen_owned, seen_export;
   uint64_t grid_epoch;  ///< bumped when some rank's sample layout or constraints changed: every window is stale
@@ -137,6 +154,7 @@ struct MFTL_Coupler
   int64_t acc_cap;
 
   cpl_row_scratch rs;
+  bind_scratch bs;
   MFTL_CouplerStats stats;
   long live;  ///< windows + bindings + fetches + transfer tokens alive
 };
@@ -181,20 +199,6 @@ static bool window_current(const MFTL_CouplingWindow *wc)
   return true;
 }
 
-/** @brief Physical box of this rank's cell. */
-static void own_box(const MFTL_Coupler *c, double lo[3], double hi[3])
-{
-  const MFTL_Domain *d = &c->ens->domain;
-  int co[3];
-  MFTLCplCartCoords(d, c->rank, co);
-  for (int k = 0; k < 3; ++k)
-  {
-    const double w = d->domain_size[k] / (double) d->cuts[k];
-    lo[k] = d->global_min[k] + (double) co[k] * w;
-    hi[k] = (co[k] == d->cuts[k] - 1) ? d->global_max[k] : d->global_min[k] + (double) (co[k] + 1) * w;
-  }
-}
-
 /** @brief Hash of the parameter fields every rank must share. */
 static uint64_t params_hash(const MFTL_CouplerParams *p)
 {
@@ -230,7 +234,7 @@ static void compute_locinfo(MFTL_Coupler *c)
 {
   const MFTL_SolverGrid *g = c->grid;
   const int nl = g->n_loc;
-  double *v = (double *) MFTLMallocOrDie(7 * (size_t) MFTL_MAX(nl, 1) * sizeof(double), "locinfo");
+  double *v = (double *) MFTLCplAlloc(7 * (size_t) MFTL_MAX(nl, 1) * sizeof(double), "locinfo");
   for (int l = 0; l < nl; ++l)
   {
     const cpl_location *L = &g->loc[l];
@@ -266,14 +270,12 @@ static void compute_locinfo(MFTL_Coupler *c)
   }
   MFTLCplAllreduceMax(c->comm, v, 7 * nl);
 
-  const double gmax = (c->params.failure & MFTL_STENCIL_GROW) ? c->params.max_growth : 1.0;
   for (int l = 0; l < nl; ++l)
   {
     cpl_locinfo *li = &c->li[l];
     li->lattice = cpl_is_lattice(&g->loc[l]);
     li->constrained = v[6 * nl + l] > 0.0;
     li->anisotropic = g->loc[l].anisotropic;
-    li->directional = g->loc[l].directional;
     li->uniform_metric = !li->anisotropic; /* cell matrices are averaged even when equal widths would say uniform */
     for (int k = 0; k < 3; ++k)
     {
@@ -287,14 +289,9 @@ static void compute_locinfo(MFTL_Coupler *c)
       if (li->hmin[k] != li->hmax[k]) li->uniform_metric = false;
     }
     if (li->anisotropic) li->uniform_metric = false;
-    for (int k = 0; k < 3; ++k)
-    {
-      double r = c->kernel.half_width * c->params.support_scale * li->hmax[k] * gmax;
-      if (!li->uniform_metric) r = fmax(r, c->params.pilot_factor * li->hmax[k]);
-      li->reach[k] = r;
-    }
+
   }
-  free(v);
+  MFTLCplFree(v);
 }
 
 /**
@@ -310,7 +307,7 @@ static int validate_constraints(MFTL_Coupler *c)
   bool any = false;
   for (int l = 0; l < c->n_loc; ++l)
   {
-    free(c->li[l].con_peer);
+    MFTLCplFree(c->li[l].con_peer);
     c->li[l].con_peer = MFTL_NULL;
     if (c->li[l].constrained) any = true;
   }
@@ -337,7 +334,7 @@ static int validate_constraints(MFTL_Coupler *c)
     const int64_t ne = (L->n_con > 0) ? L->con_ptr[L->n_con] : 0;
     if (ne > 0)
     {
-      c->li[l].con_peer = (int *) MFTLMallocOrDie((size_t) ne * sizeof(int), "constraint peers");
+      c->li[l].con_peer = (int *) MFTLCplAlloc((size_t) ne * sizeof(int), "constraint peers");
       if (!MFTLCplTranslateRanks(g->comm, c->comm, ne, L->con_owner, c->li[l].con_peer))
       {
         status = MFTL_COUPLING_INVALID;
@@ -373,8 +370,8 @@ static int validate_constraints(MFTL_Coupler *c)
         if (n_dest == cap_dest)
         {
           cap_dest = MFTLGrowCapacity(cap_dest, n_dest + 1);
-          dest = (int *) MFTLReallocOrDie(dest, (size_t) cap_dest * sizeof(int), "constraint claims");
-          bufs = (cpl_buf *) MFTLReallocOrDie(bufs, (size_t) cap_dest * sizeof(cpl_buf), "constraint claims");
+          dest = (int *) MFTLCplRealloc(dest, (size_t) cap_dest * sizeof(int), "constraint claims");
+          bufs = (cpl_buf *) MFTLCplRealloc(bufs, (size_t) cap_dest * sizeof(cpl_buf), "constraint claims");
         }
         at = n_dest++;
         dest[at] = owner;
@@ -385,8 +382,8 @@ static int validate_constraints(MFTL_Coupler *c)
       PUT(&bufs[at], key);
     }
   }
-  unsigned char **sb = (unsigned char **) MFTLMallocOrDie((size_t) MFTL_MAX(n_dest, 1) * sizeof(unsigned char *), "constraint claims");
-  size_t *sz = (size_t *) MFTLMallocOrDie((size_t) MFTL_MAX(n_dest, 1) * sizeof(size_t), "constraint claims");
+  unsigned char **sb = (unsigned char **) MFTLCplAlloc((size_t) MFTL_MAX(n_dest, 1) * sizeof(unsigned char *), "constraint claims");
+  size_t *sz = (size_t *) MFTLCplAlloc((size_t) MFTL_MAX(n_dest, 1) * sizeof(size_t), "constraint claims");
   for (int i = 0; i < n_dest; ++i)
   {
     sb[i] = bufs[i].data;
@@ -414,21 +411,13 @@ static int validate_constraints(MFTL_Coupler *c)
     }
   }
   MFTLCplMsgsFree(in, n_in);
-  free(in);
-  for (int i = 0; i < n_dest; ++i) free(bufs[i].data);
-  free(bufs);
-  free(dest);
-  free(sb);
-  free(sz);
+  MFTLCplFree(in);
+  for (int i = 0; i < n_dest; ++i) MFTLCplFree(bufs[i].data);
+  MFTLCplFree(bufs);
+  MFTLCplFree(dest);
+  MFTLCplFree(sb);
+  MFTLCplFree(sz);
   return status;
-}
-
-/** @brief The largest reach of any location. */
-static void max_reach(const MFTL_Coupler *c, double r[3])
-{
-  r[0] = r[1] = r[2] = 0.0;
-  for (int l = 0; l < c->n_loc; ++l)
-    for (int k = 0; k < 3; ++k) r[k] = fmax(r[k], c->li[l].reach[k]);
 }
 
 /** @brief Gaps thinner than this are floating-point seams between abutting ownership boxes, not gaps. */
@@ -441,16 +430,148 @@ static void point_sliver(const MFTL_Coupler *c, int l, double sliver[3])
   sliver[0] = sliver[1] = sliver[2] = s;
 }
 
+/** @brief Rebuild the compact index after replacing the active directory cache. */
+static void index_directory(MFTL_Coupler *c)
+{
+  if (c->dix)
+    for (int l = 0; l < c->n_loc; ++l) MFTLCplDirIndexFree(&c->dix[l]);
+  MFTLCplFree(c->dix);
+  c->dix = MFTLCplCalloc((size_t) MFTL_MAX(c->n_loc, 1), sizeof(cpl_dir_index), "directory index");
+  for (int l = 0; l < c->n_loc; ++l) MFTLCplDirIndexBuild(&c->dix[l], c->dir, c->n_dir, l);
+}
+
+static int cmp_directory_entry(const void *a, const void *b)
+{
+  /* Entries are zero initialized, including padding, at their provider. */
+  return memcmp(a, b, sizeof(cpl_dir_entry));
+}
+
+typedef struct
+{
+  int location;
+  int metric;
+  double box[6];
+} directory_lookup;
+
+/** @brief Fetch directory certificates from spatial shards. Queries are routed
+ * by their physical boxes, never by an assumed existing provider list. Geometry
+ * is cached only for the current support request; field traffic remains direct. */
+static void lookup_directory(MFTL_Coupler *c, const directory_lookup *queries, int64_t n)
+{
+  const MFTL_Domain *d = &c->ens->domain;
+  int nd = 0, dc = 0, rc = 32;
+  int *dest = MFTL_NULL, *ranks = MFTLCplAlloc((size_t) rc * sizeof(int), "directory routing");
+  cpl_buf *buf = MFTL_NULL;
+  for (int64_t q = 0; q < n; ++q)
+  {
+    int nr = MFTLCplRanksTouching(d, queries[q].box, queries[q].box + 3, ranks, rc);
+    if (nr > rc)
+    {
+      rc = nr;
+      ranks = MFTLCplRealloc(ranks, (size_t) rc * sizeof(int), "directory routing");
+      nr = MFTLCplRanksTouching(d, queries[q].box, queries[q].box + 3, ranks, rc);
+    }
+    for (int j = 0; j < nr; ++j)
+    {
+      int p = 0;
+      while (p < nd && dest[p] != ranks[j]) ++p;
+      if (p == nd)
+      {
+        if (nd == dc)
+        {
+          dc = dc ? 2 * dc : 16;
+          dest = MFTLCplRealloc(dest, (size_t) dc * sizeof(int), "directory routing");
+          buf = MFTLCplRealloc(buf, (size_t) dc * sizeof(cpl_buf), "directory routing");
+        }
+        dest[nd] = ranks[j];
+        memset(&buf[nd++], 0, sizeof(cpl_buf));
+      }
+      MFTLCplBufPut(&buf[p], &queries[q], sizeof(directory_lookup));
+    }
+  }
+  MFTLCplFree(ranks);
+  unsigned char **sb = MFTLCplAlloc((size_t) MFTL_MAX(nd, 1) * sizeof *sb, "directory lookup");
+  size_t *sz = MFTLCplAlloc((size_t) MFTL_MAX(nd, 1) * sizeof *sz, "directory lookup");
+  for (int p = 0; p < nd; ++p) sb[p] = buf[p].data, sz[p] = buf[p].n;
+  cpl_msg *in = MFTL_NULL;
+  int ni = 0;
+  MFTLCplNbx(c->comm, CPL_TAG_LOOKUP, nd, dest, sb, sz, &in, &ni, &c->stats.bytes_discovery, &c->stats.messages);
+  for (int p = 0; p < nd; ++p) MFTLCplFree(buf[p].data);
+  MFTLCplFree(buf); MFTLCplFree(dest); MFTLCplFree(sb); MFTLCplFree(sz);
+  dest = MFTLCplAlloc((size_t) MFTL_MAX(ni, 1) * sizeof(int), "directory replies");
+  buf = MFTLCplCalloc((size_t) MFTL_MAX(ni, 1), sizeof(cpl_buf), "directory replies");
+  sb = MFTLCplAlloc((size_t) MFTL_MAX(ni, 1) * sizeof *sb, "directory replies");
+  sz = MFTLCplAlloc((size_t) MFTL_MAX(ni, 1) * sizeof *sz, "directory replies");
+  int *got = MFTL_NULL, gc = 0;
+  unsigned char *seen = MFTLCplCalloc((size_t) MFTL_MAX(c->n_shard, 1), 1, "directory replies");
+  for (int p = 0; p < ni; ++p)
+  {
+    memset(seen, 0, (size_t) c->n_shard);
+    dest[p] = in[p].peer;
+    const directory_lookup *qs = (const directory_lookup *) in[p].data;
+    for (size_t i = 0; i < in[p].bytes / sizeof(directory_lookup); ++i)
+      for (int z = -1; z <= 1; ++z)
+        for (int y = -1; y <= 1; ++y)
+          for (int x = -1; x <= 1; ++x)
+          {
+            const int shift[3] = {x, y, z};
+            double lo[3], hi[3];
+            bool valid = true;
+            for (int k = 0; k < 3; ++k)
+            {
+              if (shift[k] && !d->is_periodic[k]) valid = false;
+              lo[k] = qs[i].box[k] - shift[k] * d->domain_size[k];
+              hi[k] = qs[i].box[3 + k] - shift[k] * d->domain_size[k];
+            }
+            if (!valid) continue;
+            cpl_dir_index *ix = &c->shard_index[qs[i].location];
+            const int ng = qs[i].metric ? MFTLCplDirMetricQuery(ix, c->shard, lo, hi, &got, &gc)
+                                       : MFTLCplDirIndexQuery(ix, c->shard, lo, hi, &got, &gc);
+            for (int j = 0; j < ng; ++j)
+              if (!seen[got[j]])
+              {
+                seen[got[j]] = 1;
+                MFTLCplBufPut(&buf[p], &c->shard[got[j]], sizeof(cpl_dir_entry));
+              }
+          }
+    sb[p] = buf[p].data;
+    sz[p] = buf[p].n;
+  }
+  MFTLCplFree(seen); MFTLCplFree(got);
+  MFTLCplMsgsFree(in, ni); MFTLCplFree(in);
+  cpl_msg *reply = MFTL_NULL;
+  int nreply = 0;
+  MFTLCplNbx(c->comm, CPL_TAG_LOOKUP_REPLY, ni, dest, sb, sz, &reply, &nreply, &c->stats.bytes_discovery, &c->stats.messages);
+  size_t total = (size_t) c->n_dir;
+  for (int p = 0; p < nreply; ++p) total += reply[p].bytes / sizeof(cpl_dir_entry);
+  c->dir = MFTLCplRealloc(c->dir, MFTL_MAX(total, 1) * sizeof(cpl_dir_entry), "active directory");
+  for (int p = 0; p < nreply; ++p)
+  {
+    const int add = (int) (reply[p].bytes / sizeof(cpl_dir_entry));
+    memcpy(c->dir + c->n_dir, reply[p].data, (size_t) add * sizeof(cpl_dir_entry));
+    c->n_dir += add;
+  }
+  if (c->n_dir > 1) qsort(c->dir, (size_t) c->n_dir, sizeof(cpl_dir_entry), cmp_directory_entry);
+  int kept = 0;
+  for (int i = 0; i < c->n_dir; ++i)
+    if (i == 0 || cmp_directory_entry(&c->dir[i], &c->dir[i - 1])) c->dir[kept++] = c->dir[i];
+  c->n_dir = kept;
+  MFTLCplMsgsFree(reply, nreply); MFTLCplFree(reply);
+  for (int p = 0; p < ni; ++p) MFTLCplFree(buf[p].data);
+  MFTLCplFree(buf); MFTLCplFree(dest); MFTLCplFree(sb); MFTLCplFree(sz);
+  index_directory(c);
+}
+
 /**
- * @brief Builds the provider directory: every rank publishes its ownership
- *        extents, widened by the directory reach, to every rank box they touch
+ * @brief Builds directory shards: each rank publishes ownership and local metric
+ *        influence certificates to the rank boxes they touch
  *        (NBX). Collective.
  */
 static void build_directory(MFTL_Coupler *c)
 {
   const MFTL_Domain *d = &c->ens->domain;
   cpl_dir_entry *own = MFTL_NULL;
-  const int n_own = MFTLCplDirectoryOwnEntries(c->grid, d, &own);
+  const int n_own = MFTLCplDirectoryOwnEntries(c->grid, d, c->params.pilot_factor, &own);
   for (int i = 0; i < n_own; ++i) own[i].provider = c->rank;
   c->own_hash = cpl_fnv(cpl_fnv(CPL_FNV_INIT, &n_own, sizeof n_own), own, (size_t) n_own * sizeof(cpl_dir_entry));
 
@@ -459,9 +580,9 @@ static void build_directory(MFTL_Coupler *c)
   int *dest = MFTL_NULL;
   cpl_buf *bufs = MFTL_NULL;
   int cap_ranks = 32;
-  int *ranks = (int *) MFTLMallocOrDie((size_t) cap_ranks * sizeof(int), "directory ranks");
+  int *ranks = (int *) MFTLCplAlloc((size_t) cap_ranks * sizeof(int), "directory ranks");
 
-  free(c->dir);
+  MFTLCplFree(c->dir);
   c->dir = MFTL_NULL;
   int64_t n_dir = 0, cap_dir = 0;
 
@@ -470,14 +591,14 @@ static void build_directory(MFTL_Coupler *c)
     double lo[3], hi[3];
     for (int k = 0; k < 3; ++k)
     {
-      lo[k] = own[i].lo[k] - c->dir_reach[k];
-      hi[k] = own[i].hi[k] + c->dir_reach[k];
+      lo[k] = own[i].mlo[k] - c->params.directory_margin;
+      hi[k] = own[i].mhi[k] + c->params.directory_margin;
     }
     int nr = MFTLCplRanksTouching(d, lo, hi, ranks, cap_ranks);
     if (nr > cap_ranks)
     {
       cap_ranks = nr;
-      ranks = (int *) MFTLReallocOrDie(ranks, (size_t) cap_ranks * sizeof(int), "directory ranks");
+      ranks = (int *) MFTLCplRealloc(ranks, (size_t) cap_ranks * sizeof(int), "directory ranks");
       nr = MFTLCplRanksTouching(d, lo, hi, ranks, cap_ranks);
     }
     for (int j = 0; j < nr; ++j)
@@ -496,8 +617,8 @@ static void build_directory(MFTL_Coupler *c)
         if (n_dest == cap_dest)
         {
           cap_dest = MFTLGrowCapacity(cap_dest, n_dest + 1);
-          dest = (int *) MFTLReallocOrDie(dest, (size_t) cap_dest * sizeof(int), "directory dest");
-          bufs = (cpl_buf *) MFTLReallocOrDie(bufs, (size_t) cap_dest * sizeof(cpl_buf), "directory bufs");
+          dest = (int *) MFTLCplRealloc(dest, (size_t) cap_dest * sizeof(int), "directory dest");
+          bufs = (cpl_buf *) MFTLCplRealloc(bufs, (size_t) cap_dest * sizeof(cpl_buf), "directory bufs");
         }
         at = n_dest++;
         dest[at] = ranks[j];
@@ -506,10 +627,10 @@ static void build_directory(MFTL_Coupler *c)
       MFTLCplBufPut(&bufs[at], &own[i], sizeof(cpl_dir_entry));
     }
   }
-  free(ranks);
+  MFTLCplFree(ranks);
 
-  unsigned char **sb = (unsigned char **) MFTLMallocOrDie((size_t) MFTL_MAX(n_dest, 1) * sizeof(unsigned char *), "directory send");
-  size_t *sz = (size_t *) MFTLMallocOrDie((size_t) MFTL_MAX(n_dest, 1) * sizeof(size_t), "directory send");
+  unsigned char **sb = (unsigned char **) MFTLCplAlloc((size_t) MFTL_MAX(n_dest, 1) * sizeof(unsigned char *), "directory send");
+  size_t *sz = (size_t *) MFTLCplAlloc((size_t) MFTL_MAX(n_dest, 1) * sizeof(size_t), "directory send");
   for (int q = 0; q < n_dest; ++q)
   {
     sb[q] = bufs[q].data;
@@ -526,48 +647,24 @@ static void build_directory(MFTL_Coupler *c)
     n_dir += ne;
   }
   MFTLCplMsgsFree(in, n_in);
-  free(in);
-  for (int q = 0; q < n_dest; ++q) free(bufs[q].data);
-  free(bufs);
-  free(dest);
-  free(sb);
-  free(sz);
-  free(own);
+  MFTLCplFree(in);
+  for (int q = 0; q < n_dest; ++q) MFTLCplFree(bufs[q].data);
+  MFTLCplFree(bufs);
+  MFTLCplFree(dest);
+  MFTLCplFree(sb);
+  MFTLCplFree(sz);
+  MFTLCplFree(own);
   c->n_dir = (int) n_dir;
-  if (c->dix)
-    for (int l = 0; l < c->n_loc; ++l) MFTLCplDirIndexFree(&c->dix[l]);
-  free(c->dix);
-  c->dix = (cpl_dir_index *) MFTLCallocOrDie((size_t) MFTL_MAX(c->n_loc, 1), sizeof(cpl_dir_index), "directory index");
-  for (int l = 0; l < c->n_loc; ++l) MFTLCplDirIndexBuild(&c->dix[l], c->dir, c->n_dir, l);
-
-  /* The cover of every point location over this rank's reach: the one place
-   * ownership boxes are subtracted, once per directory instead of per request. */
-  if (c->cover)
-    for (int l = 0; l < c->n_loc; ++l) MFTLCplCoverFree(&c->cover[l]);
-  free(c->cover);
-  c->cover = (cpl_cover *) MFTLCallocOrDie((size_t) MFTL_MAX(c->n_loc, 1), sizeof(cpl_cover), "directory cover");
-  {
-    double blo[3], bhi[3];
-    own_box(c, blo, bhi);
-    for (int l = 0; l < c->n_loc; ++l)
-    {
-      if (cpl_is_lattice(&c->grid->loc[l])) continue;
-      double lo[3], hi[3], cell[3], sliver[3];
-      for (int k = 0; k < 3; ++k)
-      {
-        lo[k] = blo[k] - c->dir_reach[k];
-        hi[k] = bhi[k] + c->dir_reach[k];
-        if (!d->is_periodic[k])
-        {
-          lo[k] = fmax(lo[k], d->global_min[k]);
-          hi[k] = fmin(hi[k], d->global_max[k]);
-        }
-        cell[k] = (c->li[l].reach[k] > 0.0) ? c->li[l].reach[k] : d->domain_size[k];
-      }
-      point_sliver(c, l, sliver);
-      MFTLCplCoverBuild(&c->cover[l], &c->dix[l], c->dir, d, lo, hi, cell, sliver);
-    }
-  }
+  if (c->shard_index)
+    for (int l = 0; l < c->n_loc; ++l) MFTLCplDirIndexFree(&c->shard_index[l]);
+  MFTLCplFree(c->shard_index);
+  MFTLCplFree(c->shard);
+  c->n_shard = c->n_dir;
+  c->shard = MFTLCplAlloc((size_t) MFTL_MAX(c->n_shard, 1) * sizeof(cpl_dir_entry), "directory shard");
+  memcpy(c->shard, c->dir, (size_t) c->n_shard * sizeof(cpl_dir_entry));
+  c->shard_index = MFTLCplCalloc((size_t) MFTL_MAX(c->n_loc, 1), sizeof(cpl_dir_index), "directory shard");
+  for (int l = 0; l < c->n_loc; ++l) MFTLCplDirIndexBuild(&c->shard_index[l], c->shard, c->n_shard, l);
+  index_directory(c);
   c->stats.n_directory_builds++;
 }
 
@@ -578,7 +675,7 @@ int MFTLCouplerCreate(MFTL_Ensemble *ens, MFTL_SolverGrid *grid, const MFTL_Coup
   if (MFTLCplAgreeMax(ens->domain.comm_world, grid == MFTL_NULL || out == MFTL_NULL ? MFTL_COUPLING_INVALID : MFTL_COUPLING_OK) != MFTL_COUPLING_OK)
     return MFTL_COUPLING_INVALID;
 
-  MFTL_Coupler *c = (MFTL_Coupler *) MFTLCallocOrDie(1, sizeof(MFTL_Coupler), "MFTLCouplerCreate");
+  MFTL_Coupler *c = (MFTL_Coupler *) MFTLCplCalloc(1, sizeof(MFTL_Coupler), "MFTLCouplerCreate");
   c->ens = ens;
   c->grid = grid;
   if (params)
@@ -590,7 +687,7 @@ int MFTLCouplerCreate(MFTL_Ensemble *ens, MFTL_SolverGrid *grid, const MFTL_Coup
   int local = MFTL_COUPLING_OK;
   if (MFTLCplCommDup(ens->domain.comm_world, &c->comm) != MFTL_SUCCESS)
   {
-    free(c);
+    MFTLCplFree(c);
     return MFTL_COUPLING_INVALID;
   }
   MFTLCplCommRankSize(c->comm, &c->rank, &c->nproc);
@@ -620,24 +717,21 @@ int MFTLCouplerCreate(MFTL_Ensemble *ens, MFTL_SolverGrid *grid, const MFTL_Coup
   if (st != MFTL_COUPLING_OK)
   {
     MFTLCplCommFree(&c->comm);
-    free(c);
+    MFTLCplFree(c);
     return st;
   }
 
   c->n_loc = grid->n_loc;
-  c->li = (cpl_locinfo *) MFTLCallocOrDie((size_t) MFTL_MAX(c->n_loc, 1), sizeof(cpl_locinfo), "locinfo");
+  c->li = (cpl_locinfo *) MFTLCplCalloc((size_t) MFTL_MAX(c->n_loc, 1), sizeof(cpl_locinfo), "locinfo");
   compute_locinfo(c);
   if (agree(c, validate_constraints(c)) != MFTL_COUPLING_OK)
   {
-    for (int l = 0; l < c->n_loc; ++l) free(c->li[l].con_peer);
-    free(c->li);
+    for (int l = 0; l < c->n_loc; ++l) MFTLCplFree(c->li[l].con_peer);
+    MFTLCplFree(c->li);
     MFTLCplCommFree(&c->comm);
-    free(c);
+    MFTLCplFree(c);
     return MFTL_COUPLING_INVALID;
   }
-  double r[3];
-  max_reach(c, r);
-  for (int k = 0; k < 3; ++k) c->dir_reach[k] = (c->params.directory_margin > 0.0) ? c->params.directory_margin : 3.0 * r[k];
   build_directory(c);
   c->seen_owned = grid->version_owned;
   c->seen_export = grid->version_export;
@@ -649,20 +743,20 @@ int MFTLCouplerCreate(MFTL_Ensemble *ens, MFTL_SolverGrid *grid, const MFTL_Coup
 
 static void free_transfer_staging(MFTL_Coupler *c)
 {
-  free(c->sbuf);
-  free(c->rbuf);
+  MFTLCplFree(c->sbuf);
+  MFTLCplFree(c->rbuf);
   c->sbuf = c->rbuf = MFTL_NULL;
   c->scap = c->rcap = 0;
-  for (int i = 0; i < c->spread_scratch_n; ++i) free(c->spread_scratch[i]);
-  free(c->spread_scratch);
-  free(c->spread_scratch_cap);
+  for (int i = 0; i < c->spread_scratch_n; ++i) MFTLCplFree(c->spread_scratch[i]);
+  MFTLCplFree(c->spread_scratch);
+  MFTLCplFree(c->spread_scratch_cap);
   c->spread_scratch = MFTL_NULL;
   c->spread_scratch_cap = MFTL_NULL;
   c->spread_scratch_n = 0;
-  free(c->reaction);
+  MFTLCplFree(c->reaction);
   c->reaction = MFTL_NULL;
   c->reaction_cap = 0;
-  free(c->acc);
+  MFTLCplFree(c->acc);
   c->acc = MFTL_NULL;
   c->acc_cap = 0;
 }
@@ -679,17 +773,26 @@ void MFTLCouplerDestroy(MFTL_Coupler **pc)
   MFTLCplSchedFree(&c->sched);
   free_transfer_staging(c);
   MFTLCplRowScratchFree(&c->rs);
+  MFTLCplFree(c->bs.candidates.img);
+  MFTLCplFree(c->bs.sel);
+  MFTLCplFree(c->bs.X);
+  MFTLCplFree(c->bs.q);
+  MFTLCplFree(c->bs.wt);
+  MFTLCplFree(c->bs.isrc);
+  MFTLCplFree(c->bs.ipar);
+  MFTLCplFree(c->bs.icoef);
   if (c->dix)
     for (int l = 0; l < c->n_loc; ++l) MFTLCplDirIndexFree(&c->dix[l]);
-  free(c->dix);
-  if (c->cover)
-    for (int l = 0; l < c->n_loc; ++l) MFTLCplCoverFree(&c->cover[l]);
-  free(c->cover);
-  free(c->dir);
-  for (int l = 0; l < c->n_loc; ++l) free(c->li[l].con_peer);
-  free(c->li);
+  MFTLCplFree(c->dix);
+  if (c->shard_index)
+    for (int l = 0; l < c->n_loc; ++l) MFTLCplDirIndexFree(&c->shard_index[l]);
+  MFTLCplFree(c->shard_index);
+  MFTLCplFree(c->shard);
+  MFTLCplFree(c->dir);
+  for (int l = 0; l < c->n_loc; ++l) MFTLCplFree(c->li[l].con_peer);
+  MFTLCplFree(c->li);
   MFTLCplCommFree(&c->comm);
-  free(c);
+  MFTLCplFree(c);
   *pc = MFTL_NULL;
 }
 
@@ -714,10 +817,10 @@ int MFTLCouplerUpdateGrid(MFTL_Coupler *c)
   if (v[1])
   {
     cpl_dir_entry *own = MFTL_NULL;
-    const int n_own = MFTLCplDirectoryOwnEntries(c->grid, &c->ens->domain, &own);
+    const int n_own = MFTLCplDirectoryOwnEntries(c->grid, &c->ens->domain, c->params.pilot_factor, &own);
     for (int i = 0; i < n_own; ++i) own[i].provider = c->rank;
     const uint64_t h = cpl_fnv(cpl_fnv(CPL_FNV_INIT, &n_own, sizeof n_own), own, (size_t) n_own * sizeof(cpl_dir_entry));
-    free(own);
+    MFTLCplFree(own);
     rebuild = MFTLCplAgreeMax(c->comm, (h != c->own_hash) ? 1 : 0) != 0;
   }
   if (rebuild)
@@ -796,7 +899,7 @@ static int *quad_levels(const MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
   const MFTL_Ensemble *ens = c->ens;
   int64_t nt = 0;
   for (int o = 0; o < ens->n_local_objects; ++o) nt += ens->local_objects[o]->tris.n_local;
-  int *lv = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(nt, 1) * sizeof(int), "quadrature levels");
+  int *lv = (int *) MFTLCplAlloc((size_t) MFTL_MAX(nt, 1) * sizeof(int), "quadrature levels");
   const double ratio = (spec->quadrature_ratio > 0.0) ? spec->quadrature_ratio : c->params.sampling_ratio;
   const int cap = (spec->quadrature_max_level > 0) ? spec->quadrature_max_level : 16;
   int *got = MFTL_NULL, gcap = 0;
@@ -841,7 +944,7 @@ static int *quad_levels(const MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
       lv[at] = (int) need;
     }
   }
-  free(got);
+  MFTLCplFree(got);
   return lv;
 }
 
@@ -855,7 +958,7 @@ static int gather_markers(const MFTL_Coupler *c, const MFTL_MarkerSpec *spec, co
   int64_t capped = 0;
   int *lv = quad_levels(c, spec, locs, n_locs, &capped);
   const int st = MFTLCplMarkersGather(c->ens, spec, lv, m);
-  free(lv);
+  MFTLCplFree(lv);
   if (n_capped) *n_capped = capped;
   return st;
 }
@@ -888,7 +991,6 @@ typedef struct
   double measure;
   double h[3];
   double cell[9];  ///< anisotropic point location only
-  double dir[3];  ///< directional point location only
 } rec_t;
 
 /** @brief What a provider must send one requester for one location. */
@@ -909,11 +1011,11 @@ static void pack_push(pack_t *pk, uint64_t key, int piece, int64_t elem, int64_t
   if (pk->n == pk->cap)
   {
     pk->cap = (pk->cap == 0) ? 64 : 2 * pk->cap;
-    pk->key = (uint64_t *) MFTLReallocOrDie(pk->key, (size_t) pk->cap * sizeof(uint64_t), "pack");
-    pk->piece = (int *) MFTLReallocOrDie(pk->piece, (size_t) pk->cap * sizeof(int), "pack");
-    pk->elem = (int64_t *) MFTLReallocOrDie(pk->elem, (size_t) pk->cap * sizeof(int64_t), "pack");
-    pk->sample = (int64_t *) MFTLReallocOrDie(pk->sample, (size_t) pk->cap * sizeof(int64_t), "pack");
-    pk->meas = (double *) MFTLReallocOrDie(pk->meas, (size_t) pk->cap * sizeof(double), "pack");
+    pk->key = (uint64_t *) MFTLCplRealloc(pk->key, (size_t) pk->cap * sizeof(uint64_t), "pack");
+    pk->piece = (int *) MFTLCplRealloc(pk->piece, (size_t) pk->cap * sizeof(int), "pack");
+    pk->elem = (int64_t *) MFTLCplRealloc(pk->elem, (size_t) pk->cap * sizeof(int64_t), "pack");
+    pk->sample = (int64_t *) MFTLCplRealloc(pk->sample, (size_t) pk->cap * sizeof(int64_t), "pack");
+    pk->meas = (double *) MFTLCplRealloc(pk->meas, (size_t) pk->cap * sizeof(double), "pack");
   }
   pk->key[pk->n] = key;
   pk->piece[pk->n] = piece;
@@ -925,11 +1027,11 @@ static void pack_push(pack_t *pk, uint64_t key, int piece, int64_t elem, int64_t
 
 static void pack_free(pack_t *pk)
 {
-  free(pk->key);
-  free(pk->piece);
-  free(pk->elem);
-  free(pk->sample);
-  free(pk->meas);
+  MFTLCplFree(pk->key);
+  MFTLCplFree(pk->piece);
+  MFTLCplFree(pk->elem);
+  MFTLCplFree(pk->sample);
+  MFTLCplFree(pk->meas);
 }
 
 /** @brief Box subtraction that never runs out of room (a dropped piece would hide a gap). */
@@ -938,7 +1040,7 @@ static void box_sub_dyn(double **rem, int *n, int *cap, const double *sub_box, c
   if (*cap < 6 * (*n) + 6)
   {
     *cap = 6 * (*n) + 6;
-    *rem = (double *) MFTLReallocOrDie(*rem, 6 * (size_t) *cap * sizeof(double), "box subtraction");
+    *rem = (double *) MFTLCplRealloc(*rem, 6 * (size_t) *cap * sizeof(double), "box subtraction");
   }
   MFTLCplBoxSubtract(*rem, n, *cap, sub_box, sliver);
 }
@@ -948,7 +1050,7 @@ static void ibox_sub_dyn(int64_t **rem, int *n, int *cap, const int64_t *sub_box
   if (*cap < 6 * (*n) + 6)
   {
     *cap = 6 * (*n) + 6;
-    *rem = (int64_t *) MFTLReallocOrDie(*rem, 6 * (size_t) *cap * sizeof(int64_t), "box subtraction");
+    *rem = (int64_t *) MFTLCplRealloc(*rem, 6 * (size_t) *cap * sizeof(int64_t), "box subtraction");
   }
   MFTLCplIboxSubtract(*rem, n, *cap, sub_box);
 }
@@ -959,13 +1061,13 @@ struct MFTL_SupportRequest
   uint64_t grid_epoch;
   uint64_t export_epoch;
   int status;
-  bool keyed;  ///< MFTLCouplerRequestSamples(): named samples, no boxes
   int n_loc;
   int *locs;
   double skin[3], bin[3];
   int64_t n_bins;
   uint64_t *bin_key;
   int64_t *bin_idx;
+  double *reach;  ///< [n_loc * n_bins][3] certified local support radius
   double *qbox;  ///< [n_loc][6] bounding box of each location's request boxes, unwrapped
   int64_t n_q, cap_q;
   query_t *q;
@@ -988,20 +1090,21 @@ void MFTLCouplerReleaseRequest(MFTL_SupportRequest **pr)
 {
   if (pr == MFTL_NULL || *pr == MFTL_NULL) return;
   MFTL_SupportRequest *r = *pr;
-  free(r->locs);
-  free(r->bin_key);
-  free(r->bin_idx);
-  free(r->qbox);
-  free(r->q);
-  free(r->rec);
+  MFTLCplFree(r->locs);
+  MFTLCplFree(r->bin_key);
+  MFTLCplFree(r->bin_idx);
+  MFTLCplFree(r->qbox);
+  MFTLCplFree(r->reach);
+  MFTLCplFree(r->q);
+  MFTLCplFree(r->rec);
   for (int i = 0; i < r->n_pack; ++i) pack_free(&r->pack[i]);
-  free(r->pack);
-  free(r->rbox);
-  free(r->rbox_wl);
-  free(r->missing);
-  free(r->unprovided);
-  free(r->n_inactive);
-  free(r);
+  MFTLCplFree(r->pack);
+  MFTLCplFree(r->rbox);
+  MFTLCplFree(r->rbox_wl);
+  MFTLCplFree(r->missing);
+  MFTLCplFree(r->unprovided);
+  MFTLCplFree(r->n_inactive);
+  MFTLCplFree(r);
   *pr = MFTL_NULL;
 }
 
@@ -1022,7 +1125,7 @@ static void add_region(MFTL_RequestRegion **arr, int *n, int *cap, const MFTL_Re
   if (*n == *cap)
   {
     *cap = MFTLGrowCapacity(*cap, *n + 1);
-    *arr = (MFTL_RequestRegion *) MFTLReallocOrDie(*arr, (size_t) *cap * sizeof(MFTL_RequestRegion), "request regions");
+    *arr = (MFTL_RequestRegion *) MFTLCplRealloc(*arr, (size_t) *cap * sizeof(MFTL_RequestRegion), "request regions");
   }
   (*arr)[(*n)++] = *x;
 }
@@ -1031,7 +1134,7 @@ static void add_region(MFTL_RequestRegion **arr, int *n, int *cap, const MFTL_Re
 static bool resolve_locations(const MFTL_Coupler *c, const MFTL_MarkerSpec *m, int *n_out, int **out)
 {
   const int n = (m->n_locations > 0) ? m->n_locations : c->n_loc;
-  int *l = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n, 1) * sizeof(int), "window locations");
+  int *l = (int *) MFTLCplAlloc((size_t) MFTL_MAX(n, 1) * sizeof(int), "window locations");
   bool ok = true;
   for (int i = 0; i < n; ++i)
   {
@@ -1046,12 +1149,10 @@ static bool resolve_locations(const MFTL_Coupler *c, const MFTL_MarkerSpec *m, i
 }
 
 /**
- * @brief Bin size of a window: half the largest reach over its locations
- *        (never zero). A request box is a bin widened by the reach and the
- *        skin, so the union over-requests by at most one bin on each side of
- *        the true union of supports: half a reach. Wider bins mean fewer,
- *        fatter boxes -- with bins of a whole reach a 642-marker sphere asked
- *        for a band about twice its supports' volume.
+ * @brief Bin size: half the largest minimum reach over the requested locations
+ *        (never zero). Only occupied bins are stored. Global minimum widths set
+ *        search granularity, not the numerical metric; each bin gets its own
+ *        certified reach over the bin plus skin before samples are requested.
  */
 static void window_bin(const MFTL_Coupler *c, int n, const int *locs, double b[3])
 {
@@ -1059,7 +1160,7 @@ static void window_bin(const MFTL_Coupler *c, int n, const int *locs, double b[3
   for (int k = 0; k < 3; ++k)
   {
     b[k] = 0.0;
-    for (int i = 0; i < n; ++i) b[k] = fmax(b[k], 0.5 * c->li[locs[i]].reach[k]);
+    for (int i = 0; i < n; ++i) b[k] = fmax(b[k], c->kernel.half_width * c->params.support_scale * 0.5 * c->li[locs[i]].hmin[k]);
     if (!(b[k] > 0.0)) b[k] = d->domain_size[k];
     /* 21-bit bin keys: never more than 2^19 bins per period. */
     const double floor_b = d->domain_size[k] / (double) (1 << 19);
@@ -1124,8 +1225,8 @@ static void push_rbox(MFTL_SupportRequest *R, const double box[6], int wl)
   if (R->n_rbox == R->cap_rbox)
   {
     R->cap_rbox = (R->cap_rbox == 0) ? 64 : 2 * R->cap_rbox;
-    R->rbox = (double *) MFTLReallocOrDie(R->rbox, 6 * (size_t) R->cap_rbox * sizeof(double), "request boxes");
-    R->rbox_wl = (int *) MFTLReallocOrDie(R->rbox_wl, (size_t) R->cap_rbox * sizeof(int), "request boxes");
+    R->rbox = (double *) MFTLCplRealloc(R->rbox, 6 * (size_t) R->cap_rbox * sizeof(double), "request boxes");
+    R->rbox_wl = (int *) MFTLCplRealloc(R->rbox_wl, (size_t) R->cap_rbox * sizeof(int), "request boxes");
   }
   memcpy(&R->rbox[6 * R->n_rbox], box, 6 * sizeof(double));
   R->rbox_wl[R->n_rbox++] = wl;
@@ -1167,8 +1268,8 @@ static void serve(MFTL_Coupler *c, MFTL_SupportRequest *R, int requester, const 
   /* The requester's ghost boxes, per location. */
   int32_t n_halo = 0;
   GET(msg, bytes, &off, n_halo);
-  int64_t *hbox = (int64_t *) MFTLMallocOrDie(6 * (size_t) MFTL_MAX(n_halo, 1) * sizeof(int64_t), "halo boxes");
-  int *hloc = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_halo, 1) * sizeof(int), "halo boxes");
+  int64_t *hbox = (int64_t *) MFTLCplAlloc(6 * (size_t) MFTL_MAX(n_halo, 1) * sizeof(int64_t), "halo boxes");
+  int *hloc = (int *) MFTLCplAlloc((size_t) MFTL_MAX(n_halo, 1) * sizeof(int), "halo boxes");
   for (int i = 0; i < n_halo; ++i)
   {
     int32_t l;
@@ -1178,16 +1279,16 @@ static void serve(MFTL_Coupler *c, MFTL_SupportRequest *R, int requester, const 
   }
 
   /* marks, per window location and piece, allocated when first touched */
-  marks_t **marks = (marks_t **) MFTLCallocOrDie((size_t) R->n_loc, sizeof(marks_t *), "serve marks");
+  marks_t **marks = (marks_t **) MFTLCplCalloc((size_t) R->n_loc, sizeof(marks_t *), "serve marks");
   for (int wl = 0; wl < R->n_loc; ++wl)
-    marks[wl] = (marks_t *) MFTLCallocOrDie((size_t) MFTL_MAX(g->loc[R->locs[wl]].n_pieces, 1), sizeof(marks_t), "serve marks");
+    marks[wl] = (marks_t *) MFTLCplCalloc((size_t) MFTL_MAX(g->loc[R->locs[wl]].n_pieces, 1), sizeof(marks_t), "serve marks");
 #define CPL_MARKS(wl, pc, size)                                                                    \
   do                                                                                               \
   {                                                                                                \
     if (marks[wl][pc].m == MFTL_NULL)                                                              \
     {                                                                                              \
       marks[wl][pc].n = (size);                                                                    \
-      marks[wl][pc].m = (unsigned char *) MFTLCallocOrDie((size_t) MFTL_MAX(size, 1), 1, "marks"); \
+      marks[wl][pc].m = (unsigned char *) MFTLCplCalloc((size_t) MFTL_MAX(size, 1), 1, "marks"); \
       marks[wl][pc].lo = (size);                                                                   \
       marks[wl][pc].hi = 0;                                                                        \
     }                                                                                              \
@@ -1281,7 +1382,7 @@ static void serve(MFTL_Coupler *c, MFTL_SupportRequest *R, int requester, const 
               if (miss_here > 0)
               {
                 int cap_rem = 16, nrem = 1;
-                int64_t *rem = (int64_t *) MFTLMallocOrDie(6 * (size_t) cap_rem * sizeof(int64_t), "missing regions");
+                int64_t *rem = (int64_t *) MFTLCplAlloc(6 * (size_t) cap_rem * sizeof(int64_t), "missing regions");
                 rem[0] = ilo[0][ix];
                 rem[1] = ilo[1][iy];
                 rem[2] = ilo[2][iz];
@@ -1305,7 +1406,7 @@ static void serve(MFTL_Coupler *c, MFTL_SupportRequest *R, int requester, const 
                   }
                   add_region(&R->missing, &R->n_missing, &R->cap_missing, &reg);
                 }
-                free(rem);
+                MFTLCplFree(rem);
                 miss_here = 0;
               }
             }
@@ -1321,33 +1422,35 @@ static void serve(MFTL_Coupler *c, MFTL_SupportRequest *R, int requester, const 
       for (int pc = 0; pc < L->n_pieces; ++pc)
       {
         const cpl_points *p = &g->points[L->piece_ref[pc]];
-        for (int t = 0; t < p->n_tiles; ++t)
-        {
-          const double *pb = &p->tile_pbox[6 * t];
-          if (!cpl_box_overlap(pb, pb + 3, box, box + 3)) continue;
-          CPL_MARKS(wl, pc, p->n);
-          marks_t *mk = &marks[wl][pc];
-          const int64_t t0 = p->tile_off[t], t1 = p->tile_off[t + 1];
-          if (pb[0] >= box[0] && pb[3] <= box[3] && pb[1] >= box[1] && pb[4] <= box[4] && pb[2] >= box[2] && pb[5] <= box[5])
+        int64_t cursor = 1, leaf;
+        while ((leaf = MFTLCplBoxTreeNext(&p->tile_index, box, box + 3, &cursor)) >= 0)
+          for (int t = (int) leaf * p->tile_index.group; t < MFTL_MIN((leaf + 1) * p->tile_index.group, p->n_tiles); ++t)
           {
-            /* the whole tile is inside: count it, and mark it unless an earlier box did */
-            n_active += t1 - t0;
-            if (mk->tile_full == MFTL_NULL) mk->tile_full = (unsigned char *) MFTLCallocOrDie((size_t) p->n_tiles, 1, "tile marks");
-            if (!mk->tile_full[t])
+            const double *pb = &p->tile_pbox[6 * t];
+            if (!cpl_box_overlap(pb, pb + 3, box, box + 3)) continue;
+            CPL_MARKS(wl, pc, p->n);
+            marks_t *mk = &marks[wl][pc];
+            const int64_t t0 = p->tile_off[t], t1 = p->tile_off[t + 1];
+            if (pb[0] >= box[0] && pb[3] <= box[3] && pb[1] >= box[1] && pb[4] <= box[4] && pb[2] >= box[2] && pb[5] <= box[5])
             {
-              for (int64_t i = t0; i < t1; ++i) mark(mk, i);
-              mk->tile_full[t] = 1;
+              /* the whole tile is inside: count it, and mark it unless an earlier box did */
+              n_active += t1 - t0;
+              if (mk->tile_full == MFTL_NULL) mk->tile_full = (unsigned char *) MFTLCplCalloc((size_t) p->n_tiles, 1, "tile marks");
+              if (!mk->tile_full[t])
+              {
+                for (int64_t i = t0; i < t1; ++i) mark(mk, i);
+                mk->tile_full[t] = 1;
+              }
+              continue;
             }
-            continue;
+            for (int64_t i = t0; i < t1; ++i)
+            {
+              const double *x = &p->pos[3 * i];
+              if (x[0] < box[0] || x[0] > box[3] || x[1] < box[1] || x[1] > box[4] || x[2] < box[2] || x[2] > box[5]) continue;
+              ++n_active;
+              mark(mk, i);
+            }
           }
-          for (int64_t i = t0; i < t1; ++i)
-          {
-            const double *x = &p->pos[3 * i];
-            if (x[0] < box[0] || x[0] > box[3] || x[1] < box[1] || x[1] > box[4] || x[2] < box[2] || x[2] > box[5]) continue;
-            ++n_active;
-            mark(mk, i);
-          }
-        }
       }
       /* SELECTED: what of my ownership in the box is not certified complete? */
       if (L->exposure == MFTL_GRID_SELECTED)
@@ -1359,7 +1462,7 @@ static void serve(MFTL_Coupler *c, MFTL_SupportRequest *R, int requester, const 
           const double *D = &L->prov_boxes[6 * r];
           if (!cpl_box_overlap(D, D + 3, box, box + 3)) continue;
           int cap_rem = 16, nrem = 1;
-          double *rem = (double *) MFTLMallocOrDie(6 * (size_t) cap_rem * sizeof(double), "missing regions");
+          double *rem = (double *) MFTLCplAlloc(6 * (size_t) cap_rem * sizeof(double), "missing regions");
           for (int k = 0; k < 3; ++k)
           {
             rem[k] = fmax(D[k], box[k]);
@@ -1377,7 +1480,7 @@ static void serve(MFTL_Coupler *c, MFTL_SupportRequest *R, int requester, const 
             add_region(&R->missing, &R->n_missing, &R->cap_missing, &reg);
             ++n_missing;
           }
-          free(rem);
+          MFTLCplFree(rem);
         }
       }
     }
@@ -1418,10 +1521,10 @@ static void serve(MFTL_Coupler *c, MFTL_SupportRequest *R, int requester, const 
         for (int64_t i = mk->lo; i < mk->hi; ++i)
           if (mk->m[i]) pack_push(&pk, p->key[i], p->piece, p->aidx[i], i, p->measure[i]);
       }
-      free(mk->m);
-      free(mk->tile_full);
+      MFTLCplFree(mk->m);
+      MFTLCplFree(mk->tile_full);
     }
-    free(marks[wl]);
+    MFTLCplFree(marks[wl]);
 
     int64_t hb[6 * 32];
     int nh = 0;
@@ -1437,15 +1540,15 @@ static void serve(MFTL_Coupler *c, MFTL_SupportRequest *R, int requester, const 
     out.wl = wl;
     const size_t nn = (size_t) MFTL_MAX(pk.n, 1);
     out.cap = pk.n;
-    out.key = (uint64_t *) MFTLMallocOrDie(nn * sizeof(uint64_t), "pack");
-    out.piece = (int *) MFTLMallocOrDie(nn * sizeof(int), "pack");
-    out.elem = (int64_t *) MFTLMallocOrDie(nn * sizeof(int64_t), "pack");
-    out.sample = (int64_t *) MFTLMallocOrDie(nn * sizeof(int64_t), "pack");
-    out.meas = (double *) MFTLMallocOrDie(nn * sizeof(double), "pack");
+    out.key = (uint64_t *) MFTLCplAlloc(nn * sizeof(uint64_t), "pack");
+    out.piece = (int *) MFTLCplAlloc(nn * sizeof(int), "pack");
+    out.elem = (int64_t *) MFTLCplAlloc(nn * sizeof(int64_t), "pack");
+    out.sample = (int64_t *) MFTLCplAlloc(nn * sizeof(int64_t), "pack");
+    out.meas = (double *) MFTLCplAlloc(nn * sizeof(double), "pack");
     if (pk.n > 0)
     {
-      int *perm = (int *) MFTLMallocOrDie((size_t) pk.n * sizeof(int), "pack sort");
-      uint64_t *k2 = (uint64_t *) MFTLMallocOrDie((size_t) pk.n * sizeof(uint64_t), "pack sort");
+      int *perm = (int *) MFTLCplAlloc((size_t) pk.n * sizeof(int), "pack sort");
+      uint64_t *k2 = (uint64_t *) MFTLCplAlloc((size_t) pk.n * sizeof(uint64_t), "pack sort");
       for (int64_t i = 0; i < pk.n; ++i)
       {
         perm[i] = (int) i;
@@ -1475,8 +1578,8 @@ static void serve(MFTL_Coupler *c, MFTL_SupportRequest *R, int requester, const 
         }
         if (pass == 0) out.n_nonhalo = out.n;
       }
-      free(perm);
-      free(k2);
+      MFTLCplFree(perm);
+      MFTLCplFree(k2);
     }
     /* the records, in pack order */
     const int64_t nrec = out.n;
@@ -1492,7 +1595,6 @@ static void serve(MFTL_Coupler *c, MFTL_SupportRequest *R, int requester, const 
         PUT(reply, p->measure[pi]);
         MFTLCplBufPut(reply, &p->h[3 * pi], 3 * sizeof(double));
         if (L->anisotropic) MFTLCplBufPut(reply, &p->cell[9 * pi], 9 * sizeof(double));
-        if (L->directional) MFTLCplBufPut(reply, &p->dir[3 * pi], 3 * sizeof(double));
       }
     }
     /* a point's sample index is its position in the sorted set until here; make it the registration index */
@@ -1507,16 +1609,14 @@ static void serve(MFTL_Coupler *c, MFTL_SupportRequest *R, int requester, const 
     if (R->n_pack == R->cap_pack)
     {
       R->cap_pack = MFTLGrowCapacity(R->cap_pack, R->n_pack + 1);
-      R->pack = (pack_t *) MFTLReallocOrDie(R->pack, (size_t) R->cap_pack * sizeof(pack_t), "pack lists");
+      R->pack = (pack_t *) MFTLCplRealloc(R->pack, (size_t) R->cap_pack * sizeof(pack_t), "pack lists");
     }
     R->pack[R->n_pack++] = out;
   }
-  free(marks);
-  free(hbox);
-  free(hloc);
+  MFTLCplFree(marks);
+  MFTLCplFree(hbox);
+  MFTLCplFree(hloc);
 }
-
-static int absorb_records(MFTL_Coupler *c, MFTL_SupportRequest *R, int provider, const unsigned char *msg, size_t bytes, size_t *offp, int64_t *counts);
 
 /** @brief Requester side: reads one provider's reply into query counts and records. */
 static int absorb_reply(MFTL_Coupler *c, MFTL_SupportRequest *R, int provider, const unsigned char *msg, size_t bytes)
@@ -1537,26 +1637,12 @@ static int absorb_reply(MFTL_Coupler *c, MFTL_SupportRequest *R, int provider, c
     R->n_inactive[q->wl] += n_inactive;
     if (n_missing > 0 && status < MFTL_COUPLING_NEED_COVERAGE) status = MFTL_COUPLING_NEED_COVERAGE;
   }
-  const int rs = absorb_records(c, R, provider, msg, bytes, &off, MFTL_NULL);
-  return (rs > status) ? rs : status;
-}
-
-/**
- * @brief Requester side: one provider's sample records, per window location,
- *        appended to the request. @p counts, when given, receives the number of
- *        records per location (`[n_loc]`).
- */
-static int absorb_records(MFTL_Coupler *c, MFTL_SupportRequest *R, int provider, const unsigned char *msg, size_t bytes, size_t *offp, int64_t *counts)
-{
-  size_t off = *offp;
   for (int wl = 0; wl < R->n_loc; ++wl)
   {
     int64_t nrec = 0;
     if (!GET(msg, bytes, &off, nrec) || nrec < 0) return MFTL_COUPLING_INVALID;
-    if (counts) counts[wl] = nrec;
     const bool points = !cpl_is_lattice(&c->grid->loc[R->locs[wl]]);
     const bool aniso = c->grid->loc[R->locs[wl]].anisotropic;
-    const bool dirn = c->grid->loc[R->locs[wl]].directional;
     GROW(R->rec, R->cap_rec, R->n_rec + nrec, rec_t);
     for (int64_t i = 0; i < nrec; ++i)
     {
@@ -1575,14 +1661,10 @@ static int absorb_records(MFTL_Coupler *c, MFTL_SupportRequest *R, int provider,
         if (aniso)
           for (int a = 0; a < 9; ++a)
             if (!GET(msg, bytes, &off, r->cell[a])) return MFTL_COUPLING_INVALID;
-        if (dirn)
-          for (int a = 0; a < 3; ++a)
-            if (!GET(msg, bytes, &off, r->dir[a])) return MFTL_COUPLING_INVALID;
       }
     }
   }
-  *offp = off;
-  return MFTL_COUPLING_OK;
+  return status;
 }
 
 static int cmp_rec_key_provider(const void *a, const void *b)
@@ -1591,20 +1673,6 @@ static int cmp_rec_key_provider(const void *a, const void *b)
   if (x->wl != y->wl) return (x->wl > y->wl) - (x->wl < y->wl);
   if (x->key != y->key) return (x->key > y->key) - (x->key < y->key);
   return (x->provider > y->provider) - (x->provider < y->provider);
-}
-
-/** @brief Both spatial and keyed requests require one provider per sample. */
-static int check_record_owners(const MFTL_SolverGrid *g, MFTL_SupportRequest *R)
-{
-  if (R->n_rec > 1) qsort(R->rec, (size_t) R->n_rec, sizeof(rec_t), cmp_rec_key_provider);
-  for (int64_t i = 1; i < R->n_rec; ++i)
-    if (R->rec[i].wl == R->rec[i - 1].wl && R->rec[i].key == R->rec[i - 1].key && R->rec[i].provider != R->rec[i - 1].provider)
-    {
-      fprintf(stderr, "MFTL coupling: location '%s': key %llu owned by ranks %d and %d\n", g->loc[R->locs[R->rec[i].wl]].name,
-              (unsigned long long) R->rec[i].key, R->rec[i - 1].provider, R->rec[i].provider);
-      return MFTL_COUPLING_INVALID;
-    }
-  return MFTL_COUPLING_OK;
 }
 
 /** @brief Decodes a bin key into its three signed bin indices. */
@@ -1627,7 +1695,7 @@ static uint64_t *migration_bins(MFTL_Coupler *c, const uint64_t *keys, int64_t n
 {
   const MFTL_Domain *d = &c->ens->domain;
   int n_dest = 0, cap_dest = 0, cap_r = 32;
-  int *dest = MFTL_NULL, *ranks = (int *) MFTLMallocOrDie((size_t) cap_r * sizeof(int), "migration ranks");
+  int *dest = MFTL_NULL, *ranks = (int *) MFTLCplAlloc((size_t) cap_r * sizeof(int), "migration ranks");
   cpl_buf *bufs = MFTL_NULL;
   for (int64_t i = 0; i < nb; ++i)
   {
@@ -1643,7 +1711,7 @@ static uint64_t *migration_bins(MFTL_Coupler *c, const uint64_t *keys, int64_t n
     if (nr > cap_r)
     {
       cap_r = nr;
-      ranks = (int *) MFTLReallocOrDie(ranks, (size_t) cap_r * sizeof(int), "migration ranks");
+      ranks = (int *) MFTLCplRealloc(ranks, (size_t) cap_r * sizeof(int), "migration ranks");
       nr = MFTLCplRanksTouching(d, lo, hi, ranks, cap_r);
     }
     for (int j = 0; j < nr; ++j)
@@ -1657,8 +1725,8 @@ static uint64_t *migration_bins(MFTL_Coupler *c, const uint64_t *keys, int64_t n
         if (n_dest == cap_dest)
         {
           cap_dest = MFTLGrowCapacity(cap_dest, n_dest + 1);
-          dest = (int *) MFTLReallocOrDie(dest, (size_t) cap_dest * sizeof(int), "migration dest");
-          bufs = (cpl_buf *) MFTLReallocOrDie(bufs, (size_t) cap_dest * sizeof(cpl_buf), "migration dest");
+          dest = (int *) MFTLCplRealloc(dest, (size_t) cap_dest * sizeof(int), "migration dest");
+          bufs = (cpl_buf *) MFTLCplRealloc(bufs, (size_t) cap_dest * sizeof(cpl_buf), "migration dest");
         }
         at = n_dest++;
         dest[at] = ranks[j];
@@ -1667,9 +1735,9 @@ static uint64_t *migration_bins(MFTL_Coupler *c, const uint64_t *keys, int64_t n
       MFTLCplBufPut(&bufs[at], &keys[i], sizeof(uint64_t));
     }
   }
-  free(ranks);
-  unsigned char **sb = (unsigned char **) MFTLMallocOrDie((size_t) MFTL_MAX(n_dest, 1) * sizeof(unsigned char *), "migration send");
-  size_t *sz = (size_t *) MFTLMallocOrDie((size_t) MFTL_MAX(n_dest, 1) * sizeof(size_t), "migration send");
+  MFTLCplFree(ranks);
+  unsigned char **sb = (unsigned char **) MFTLCplAlloc((size_t) MFTL_MAX(n_dest, 1) * sizeof(unsigned char *), "migration send");
+  size_t *sz = (size_t *) MFTLCplAlloc((size_t) MFTL_MAX(n_dest, 1) * sizeof(size_t), "migration send");
   for (int q = 0; q < n_dest; ++q)
   {
     sb[q] = bufs[q].data;
@@ -1680,7 +1748,7 @@ static uint64_t *migration_bins(MFTL_Coupler *c, const uint64_t *keys, int64_t n
   MFTLCplNbx(c->comm, CPL_TAG_MIGRATION, n_dest, dest, sb, sz, &in, &n_in, &c->stats.bytes_discovery, &c->stats.messages);
   int64_t total = 0;
   for (int r = 0; r < n_in; ++r) total += (int64_t) (in[r].bytes / sizeof(uint64_t));
-  uint64_t *out = (uint64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(total, 1) * sizeof(uint64_t), "migration bins");
+  uint64_t *out = (uint64_t *) MFTLCplAlloc((size_t) MFTL_MAX(total, 1) * sizeof(uint64_t), "migration bins");
   int64_t at = 0;
   for (int r = 0; r < n_in; ++r)
   {
@@ -1689,12 +1757,12 @@ static uint64_t *migration_bins(MFTL_Coupler *c, const uint64_t *keys, int64_t n
     at += n;
   }
   MFTLCplMsgsFree(in, n_in);
-  free(in);
-  for (int q = 0; q < n_dest; ++q) free(bufs[q].data);
-  free(bufs);
-  free(dest);
-  free(sb);
-  free(sz);
+  MFTLCplFree(in);
+  for (int q = 0; q < n_dest; ++q) MFTLCplFree(bufs[q].data);
+  MFTLCplFree(bufs);
+  MFTLCplFree(dest);
+  MFTLCplFree(sb);
+  MFTLCplFree(sz);
   *n_out = total;
   return out;
 }
@@ -1706,7 +1774,7 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
   const MFTL_Domain *d = &c->ens->domain;
   const MFTL_SolverGrid *g = c->grid;
 
-  MFTL_SupportRequest *R = (MFTL_SupportRequest *) MFTLCallocOrDie(1, sizeof(MFTL_SupportRequest), "MFTLCouplerRequestSupport");
+  MFTL_SupportRequest *R = (MFTL_SupportRequest *) MFTLCplCalloc(1, sizeof(MFTL_SupportRequest), "MFTLCouplerRequestSupport");
   R->c = c;
   R->grid_epoch = c->grid_epoch;
   R->export_epoch = c->export_epoch;
@@ -1743,11 +1811,16 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
   if (st == MFTL_COUPLING_OK && !MFTLCplAgreeHash(c->comm, sig)) st = MFTL_COUPLING_INVALID;
   if (st == MFTL_COUPLING_OK)
   {
-    /* one image per support: the reach plus the skin stays below half a period */
+    /* Reject impossible periodic skins even for an empty marker batch, using
+     * a lower bound rather than letting a remote coarse sample reject fine rows. */
     for (int i = 0; i < R->n_loc; ++i)
       for (int k = 0; k < 3; ++k)
-        if (d->is_periodic[k] && !(c->li[R->locs[i]].reach[k] + R->skin[k] < 0.5 * d->domain_size[k])) st = MFTL_COUPLING_INVALID;
-    if (st != MFTL_COUPLING_OK && c->rank == 0) fprintf(stderr, "MFTL coupling: kernel reach plus skin must stay below half a period\n");
+      {
+        const cpl_locinfo *li = &c->li[R->locs[i]];
+        const double growth = c->params.failure & MFTL_STENCIL_GROW ? c->params.max_growth : 1.0;
+        const double rmin = c->kernel.half_width * c->params.support_scale * growth * li->hmin[k];
+        if (d->is_periodic[k] && !(rmin + R->skin[k] < 0.5 * d->domain_size[k])) st = MFTL_COUPLING_INVALID;
+      }
     /* A point location nobody has described (no samples, no declared bounds)
      * has no reach: a request would silently be the whole domain. */
     for (int i = 0; i < R->n_loc && st == MFTL_COUPLING_OK; ++i)
@@ -1770,13 +1843,13 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
     return st;
   }
 
-  R->n_inactive = (int64_t *) MFTLCallocOrDie((size_t) R->n_loc, sizeof(int64_t), "request masks");
+  R->n_inactive = (int64_t *) MFTLCplCalloc((size_t) R->n_loc, sizeof(int64_t), "request masks");
 
   /* ── marker bins ── */
   window_bin(c, R->n_loc, R->locs, R->bin);
   {
-    uint64_t *keys = (uint64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(m.n, 1) * sizeof(uint64_t), "marker bins");
-    uint64_t *tmp = (uint64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(m.n, 1) * sizeof(uint64_t), "marker bins");
+    uint64_t *keys = (uint64_t *) MFTLCplAlloc((size_t) MFTL_MAX(m.n, 1) * sizeof(uint64_t), "marker bins");
+    uint64_t *tmp = (uint64_t *) MFTLCplAlloc((size_t) MFTL_MAX(m.n, 1) * sizeof(uint64_t), "marker bins");
     for (int64_t i = 0; i < m.n; ++i)
     {
       int64_t ib[3];
@@ -1796,8 +1869,8 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
       uint64_t *recv = migration_bins(c, keys, nb, R->bin, migration, &n_recv);
       if (n_recv > 0)
       {
-        keys = (uint64_t *) MFTLReallocOrDie(keys, (size_t) (nb + n_recv) * sizeof(uint64_t), "marker bins");
-        tmp = (uint64_t *) MFTLReallocOrDie(tmp, (size_t) (nb + n_recv) * sizeof(uint64_t), "marker bins");
+        keys = (uint64_t *) MFTLCplRealloc(keys, (size_t) (nb + n_recv) * sizeof(uint64_t), "marker bins");
+        tmp = (uint64_t *) MFTLCplRealloc(tmp, (size_t) (nb + n_recv) * sizeof(uint64_t), "marker bins");
         memcpy(keys + nb, recv, (size_t) n_recv * sizeof(uint64_t));
         MFTLRadixSort64(keys, tmp, (int) (nb + n_recv));
         int64_t u = 0;
@@ -1805,11 +1878,11 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
           if (i == 0 || keys[i] != keys[i - 1]) keys[u++] = keys[i];
         nb = u;
       }
-      free(recv);
+      MFTLCplFree(recv);
     }
     R->n_bins = nb;
     R->bin_key = keys;
-    R->bin_idx = (int64_t *) MFTLMallocOrDie(3 * (size_t) MFTL_MAX(nb, 1) * sizeof(int64_t), "marker bins");
+    R->bin_idx = (int64_t *) MFTLCplAlloc(3 * (size_t) MFTL_MAX(nb, 1) * sizeof(int64_t), "marker bins");
     const int64_t off = INT64_C(1) << 20, mask = (INT64_C(1) << 21) - 1;
     for (int64_t i = 0; i < nb; ++i)
     {
@@ -1817,62 +1890,101 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
       R->bin_idx[3 * i + 1] = (int64_t) ((keys[i] >> 21) & (uint64_t) mask) - off;
       R->bin_idx[3 * i + 2] = (int64_t) (keys[i] & (uint64_t) mask) - off;
     }
-    free(tmp);
+    MFTLCplFree(tmp);
   }
   MFTLCplMarkersFree(&m);
-  R->qbox = (double *) MFTLMallocOrDie(6 * (size_t) R->n_loc * sizeof(double), "request boxes");
+  /* Resolution certificates over every movement envelope, then ownership
+   * certificates over its locally bounded numerical/metric support. */
+  MFTLCplFree(c->dir);
+  c->n_dir = c->n_shard;
+  c->dir = MFTLCplAlloc((size_t) MFTL_MAX(c->n_dir, 1) * sizeof(cpl_dir_entry), "active directory");
+  memcpy(c->dir, c->shard, (size_t) c->n_dir * sizeof(cpl_dir_entry));
+  index_directory(c);
+  const int64_t nq = R->n_bins * R->n_loc;
+  directory_lookup *look = MFTLCplCalloc((size_t) MFTL_MAX(nq, 1), sizeof(directory_lookup), "resolution queries");
+  R->reach = MFTLCplCalloc(3 * (size_t) MFTL_MAX(nq, 1), sizeof(double), "local support bounds");
+  bool variable_metric = false;
+  for (int wl = 0; wl < R->n_loc; ++wl) variable_metric |= !c->li[R->locs[wl]].uniform_metric;
   for (int wl = 0; wl < R->n_loc; ++wl)
-  {
-    const cpl_locinfo *li = &c->li[R->locs[wl]];
-    for (int k = 0; k < 3; ++k)
+    for (int64_t bi = 0; bi < R->n_bins; ++bi)
     {
-      int64_t lo = INT64_MAX, hi = INT64_MIN;
-      for (int64_t i = 0; i < R->n_bins; ++i)
-      {
-        lo = MFTL_MIN(lo, R->bin_idx[3 * i + k]);
-        hi = MFTL_MAX(hi, R->bin_idx[3 * i + k]);
-      }
-      R->qbox[6 * wl + k] = (R->n_bins > 0) ? d->global_min[k] + (double) lo * R->bin[k] - li->reach[k] - R->skin[k] : 1.0;
-      R->qbox[6 * wl + 3 + k] = (R->n_bins > 0) ? d->global_min[k] + (double) (hi + 1) * R->bin[k] + li->reach[k] + R->skin[k] : 0.0;
-    }
-  }
-
-  /* ── does the directory reach far enough? (one MAX of three doubles) ── */
-  {
-    double blo[3], bhi[3], need[3] = {0.0, 0.0, 0.0};
-    own_box(c, blo, bhi);
-    double rmax[3] = {0.0, 0.0, 0.0};
-    for (int i = 0; i < R->n_loc; ++i)
-      for (int k = 0; k < 3; ++k) rmax[k] = fmax(rmax[k], c->li[R->locs[i]].reach[k]);
-    for (int64_t i = 0; i < R->n_bins; ++i)
+      directory_lookup *q = &look[wl * R->n_bins + bi];
+      q->location = R->locs[wl];
+      q->metric = 1;
       for (int k = 0; k < 3; ++k)
       {
-        const double qlo = d->global_min[k] + (double) R->bin_idx[3 * i + k] * R->bin[k] - rmax[k] - R->skin[k];
-        const double qhi = qlo + R->bin[k] + 2.0 * (rmax[k] + R->skin[k]);
-        double best = MFTL_DBL_MAX;
-        for (int t = -1; t <= 1; ++t)
-        {
-          if (t != 0 && !d->is_periodic[k]) continue;
-          const double sh = (double) t * d->domain_size[k];
-          const double e = fmax(0.0, fmax(blo[k] + sh - qlo, qhi - bhi[k] - sh));
-          best = fmin(best, e);
-        }
-        need[k] = fmax(need[k], best);
+        q->box[k] = d->global_min[k] + (double) R->bin_idx[3 * bi + k] * R->bin[k] - R->skin[k];
+        q->box[3 + k] = d->global_min[k] + (double) (R->bin_idx[3 * bi + k] + 1) * R->bin[k] + R->skin[k];
       }
-    MFTLCplAllreduceMax(c->comm, need, 3);
-    bool rebuild = false;
-    for (int k = 0; k < 3; ++k)
-      if (need[k] > c->dir_reach[k])
+    }
+  /* Locations and their uniform-metric flags are agreed across ranks. Uniform
+   * grids already have exact bounds, so omit both metric-lookup exchanges. */
+  if (variable_metric) lookup_directory(c, look, nq);
+  const double growth = c->params.failure & MFTL_STENCIL_GROW ? c->params.max_growth : 1.0;
+  const double factor = fmax(c->params.pilot_factor, c->kernel.half_width * c->params.support_scale * growth);
+  int *metric_entries = MFTL_NULL, metric_capacity = 0;
+  R->qbox = MFTLCplAlloc(6 * (size_t) R->n_loc * sizeof(double), "request boxes");
+  for (int wl = 0; wl < R->n_loc; ++wl)
+  {
+    const int loc = R->locs[wl];
+    const cpl_locinfo *li = &c->li[loc];
+    for (int k = 0; k < 3; ++k) R->qbox[6 * wl + k] = MFTL_DBL_MAX, R->qbox[6 * wl + 3 + k] = -MFTL_DBL_MAX;
+    for (int64_t bi = 0; bi < R->n_bins; ++bi)
+    {
+      directory_lookup *q = &look[wl * R->n_bins + bi];
+      double bound[3] = {0, 0, 0};
+      if (li->uniform_metric)
+        memcpy(bound, li->hmax, sizeof bound);
+      else
+        for (int z = -1; z <= 1; ++z)
+          for (int y = -1; y <= 1; ++y)
+            for (int x = -1; x <= 1; ++x)
+            {
+              const int shift[3] = {x, y, z};
+              double lo[3], hi[3];
+              bool valid = true;
+              for (int k = 0; k < 3; ++k)
+              {
+                if (shift[k] && !d->is_periodic[k]) valid = false;
+                lo[k] = q->box[k] - shift[k] * d->domain_size[k];
+                hi[k] = q->box[3 + k] - shift[k] * d->domain_size[k];
+              }
+              if (!valid) continue;
+              const int ng = MFTLCplDirMetricQuery(&c->dix[loc], c->dir, lo, hi, &metric_entries, &metric_capacity);
+              for (int j = 0; j < ng; ++j)
+                for (int k = 0; k < 3; ++k) bound[k] = fmax(bound[k], c->dir[metric_entries[j]].hmax[k]);
+            }
+      q->metric = 0;
+      for (int k = 0; k < 3; ++k)
       {
-        c->dir_reach[k] = 1.25 * need[k];
-        rebuild = true;
+        /* No metric certificate: still request a finite region so an ownership
+         * hole is reported as coverage, rather than mistaken for a wall. */
+        if (!(bound[k] > 0.0)) bound[k] = li->hmin[k] < MFTL_DBL_MAX ? li->hmin[k] : R->bin[k];
+        const double reach = li->uniform_metric ? c->kernel.half_width * c->params.support_scale * growth * bound[k] : factor * bound[k];
+        R->reach[3 * (wl * R->n_bins + bi) + k] = reach;
+        if (d->is_periodic[k] && !(reach + R->skin[k] < 0.5 * d->domain_size[k])) st = MFTL_COUPLING_INVALID;
+        q->box[k] -= reach;
+        q->box[3 + k] += reach;
+        R->qbox[6 * wl + k] = fmin(R->qbox[6 * wl + k], q->box[k]);
+        R->qbox[6 * wl + 3 + k] = fmax(R->qbox[6 * wl + 3 + k], q->box[3 + k]);
       }
-    if (rebuild) build_directory(c);
+    }
   }
+  MFTLCplFree(metric_entries);
+  st = agree(c, st);
+  if (st != MFTL_COUPLING_OK)
+  {
+    MFTLCplFree(look);
+    MFTLCouplerReleaseRequest(&R);
+    c->stats.n_requests++;
+    return st;
+  }
+  lookup_directory(c, look, nq);
+  MFTLCplFree(look);
 
   /* ── queries: one per (bin, location) for a lattice, per (bin, location, provider, image) for points ── */
   int cap_asked = 32;
-  int *asked = (int *) MFTLMallocOrDie((size_t) cap_asked * sizeof(int), "asked providers");
+  int *asked = (int *) MFTLCplAlloc((size_t) cap_asked * sizeof(int), "asked providers");
   int n_dest = 0, cap_dest = 0;
   int *dest = MFTL_NULL;
   cpl_buf *dbuf = MFTL_NULL;
@@ -1892,10 +2004,10 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
       if (n_dest == cap_dest)                                                                                              \
       {                                                                                                                    \
         cap_dest = MFTLGrowCapacity(cap_dest, n_dest + 1);                                                                 \
-        dest = (int *) MFTLReallocOrDie(dest, (size_t) cap_dest * sizeof(int), "request dest");                            \
-        dsub = (int64_t **) MFTLReallocOrDie(dsub, (size_t) cap_dest * sizeof(int64_t *), "request dest");                 \
-        dsub_n = (int64_t *) MFTLReallocOrDie(dsub_n, (size_t) cap_dest * sizeof(int64_t), "request dest");                \
-        dsub_cap = (int64_t *) MFTLReallocOrDie(dsub_cap, (size_t) cap_dest * sizeof(int64_t), "request dest");            \
+        dest = (int *) MFTLCplRealloc(dest, (size_t) cap_dest * sizeof(int), "request dest");                            \
+        dsub = (int64_t **) MFTLCplRealloc(dsub, (size_t) cap_dest * sizeof(int64_t *), "request dest");                 \
+        dsub_n = (int64_t *) MFTLCplRealloc(dsub_n, (size_t) cap_dest * sizeof(int64_t), "request dest");                \
+        dsub_cap = (int64_t *) MFTLCplRealloc(dsub_cap, (size_t) cap_dest * sizeof(int64_t), "request dest");            \
       }                                                                                                                    \
       _at = n_dest++;                                                                                                      \
       dest[_at] = (prov);                                                                                                  \
@@ -1911,14 +2023,13 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
   {
     const int loc = R->locs[wl];
     const cpl_location *L = &g->loc[loc];
-    const cpl_locinfo *li = &c->li[loc];
     for (int64_t bi = 0; bi < R->n_bins; ++bi)
     {
       double Q[6];
       for (int k = 0; k < 3; ++k)
       {
-        Q[k] = d->global_min[k] + (double) R->bin_idx[3 * bi + k] * R->bin[k] - li->reach[k] - R->skin[k];
-        Q[3 + k] = d->global_min[k] + (double) (R->bin_idx[3 * bi + k] + 1) * R->bin[k] + li->reach[k] + R->skin[k];
+        Q[k] = d->global_min[k] + (double) R->bin_idx[3 * bi + k] * R->bin[k] - R->reach[3 * (wl * R->n_bins + bi) + k] - R->skin[k];
+        Q[3 + k] = d->global_min[k] + (double) (R->bin_idx[3 * bi + k] + 1) * R->bin[k] + R->reach[3 * (wl * R->n_bins + bi) + k] + R->skin[k];
       }
       if (cpl_is_lattice(L))
       {
@@ -1966,10 +2077,10 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
               if (n_cand + ng > cand_cap)
               {
                 cand_cap = MFTL_MAX(2 * cand_cap, n_cand + ng);
-                cand = (int *) MFTLReallocOrDie(cand, (size_t) cand_cap * sizeof(int), "request candidates");
+                cand = (int *) MFTLCplRealloc(cand, (size_t) cand_cap * sizeof(int), "request candidates");
               }
               for (int i = 0; i < ng; ++i) cand[n_cand++] = got[i];
-              free(got);
+              MFTLCplFree(got);
             }
         for (int ci = 0; ci < n_cand; ++ci)
         {
@@ -2067,35 +2178,41 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
                 ADD_DEST_QUERY(E->provider, R->n_q);
                 R->n_q++;
               }
-              free(got);
+              MFTLCplFree(got);
             }
         /* and is every part of Q owned by somebody? The cover answers, in the
          * image of Q that lies in this rank's frame. */
-        int n_rem = 0, cap_rem = 0;
-        double *rem = MFTL_NULL;
-        {
-          const cpl_cover *cv = &c->cover[loc];
-          double best[6];
-          memcpy(best, Q, sizeof best);
-          for (int tz = -1; tz <= 1; ++tz)
-            for (int ty = -1; ty <= 1; ++ty)
-              for (int tx = -1; tx <= 1; ++tx)
+        int n_rem = 1, cap_rem = 16;
+        double *rem = MFTLCplAlloc(6 * (size_t) cap_rem * sizeof(double), "request cover");
+        memcpy(rem, Q, sizeof Q);
+        for (int z = -1; z <= 1 && n_rem; ++z)
+          for (int y = -1; y <= 1 && n_rem; ++y)
+            for (int x = -1; x <= 1 && n_rem; ++x)
+            {
+              const int shift[3] = {x, y, z};
+              double lo[3], hi[3];
+              bool valid = true;
+              for (int k = 0; k < 3; ++k)
               {
-                const int t[3] = {tx, ty, tz};
-                bool inside = true;
-                double sh[6];
+                if (shift[k] && !d->is_periodic[k]) valid = false;
+                lo[k] = Q[k] - shift[k] * d->domain_size[k];
+                hi[k] = Q[3 + k] - shift[k] * d->domain_size[k];
+              }
+              if (!valid) continue;
+              int *got = MFTL_NULL, gc = 0;
+              const int ng = MFTLCplDirIndexQuery(&c->dix[loc], c->dir, lo, hi, &got, &gc);
+              for (int j = 0; j < ng && n_rem; ++j)
+              {
+                double box[6];
                 for (int k = 0; k < 3; ++k)
                 {
-                  if (t[k] != 0 && !d->is_periodic[k]) inside = false;
-                  sh[k] = Q[k] + (double) t[k] * d->domain_size[k];
-                  sh[3 + k] = Q[3 + k] + (double) t[k] * d->domain_size[k];
-                  const double rlo = cv->lo[k], rhi = cv->lo[k] + (double) cv->dims[k] * cv->cell[k];
-                  if (sh[k] < rlo - sliver[k] || sh[3 + k] > rhi + sliver[k]) inside = false;
+                  box[k] = c->dir[got[j]].lo[k] + shift[k] * d->domain_size[k];
+                  box[3 + k] = c->dir[got[j]].hi[k] + shift[k] * d->domain_size[k];
                 }
-                if (inside) memcpy(best, sh, sizeof best);
+                box_sub_dyn(&rem, &n_rem, &cap_rem, box, sliver);
               }
-          MFTLCplCoverQuery(cv, best, best + 3, sliver, &rem, &n_rem, &cap_rem);
-        }
+              MFTLCplFree(got);
+            }
         for (int r = 0; r < n_rem; ++r)
         {
           MFTL_RequestRegion reg;
@@ -2107,16 +2224,16 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
           add_region(&R->unprovided, &R->n_unprovided, &R->cap_unprovided, &reg);
           if (local_status < MFTL_COUPLING_NEED_COVERAGE) local_status = MFTL_COUPLING_NEED_COVERAGE;
         }
-        free(rem);
+        MFTLCplFree(rem);
       }
     }
   }
 #undef ADD_DEST_QUERY
-  free(asked);
-  free(cand);
+  MFTLCplFree(asked);
+  MFTLCplFree(cand);
 
   /* ── messages: my ghost boxes, then the queries ── */
-  dbuf = (cpl_buf *) MFTLCallocOrDie((size_t) MFTL_MAX(n_dest, 1), sizeof(cpl_buf), "request buffers");
+  dbuf = (cpl_buf *) MFTLCplCalloc((size_t) MFTL_MAX(n_dest, 1), sizeof(cpl_buf), "request buffers");
   int64_t hb[6 * 32];
   for (int i = 0; i < n_dest; ++i)
   {
@@ -2159,9 +2276,9 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
   /* NBX for everyone else; my own queries are answered in place. */
   int self_at = -1;
   int n_out = 0;
-  int *odest = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_dest, 1) * sizeof(int), "request send");
-  unsigned char **osb = (unsigned char **) MFTLMallocOrDie((size_t) MFTL_MAX(n_dest, 1) * sizeof(unsigned char *), "request send");
-  size_t *osz = (size_t *) MFTLMallocOrDie((size_t) MFTL_MAX(n_dest, 1) * sizeof(size_t), "request send");
+  int *odest = (int *) MFTLCplAlloc((size_t) MFTL_MAX(n_dest, 1) * sizeof(int), "request send");
+  unsigned char **osb = (unsigned char **) MFTLCplAlloc((size_t) MFTL_MAX(n_dest, 1) * sizeof(unsigned char *), "request send");
+  size_t *osz = (size_t *) MFTLCplAlloc((size_t) MFTL_MAX(n_dest, 1) * sizeof(size_t), "request send");
   for (int i = 0; i < n_dest; ++i)
   {
     if (dest[i] == c->rank)
@@ -2179,7 +2296,7 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
   MFTLCplNbx(c->comm, CPL_TAG_REQUEST, n_out, odest, osb, osz, &in, &n_in, &c->stats.bytes_discovery, &c->stats.messages);
 
   /* Serve: requesters in rank order, myself at my position. */
-  cpl_buf *replies = (cpl_buf *) MFTLCallocOrDie((size_t) MFTL_MAX(n_in, 1), sizeof(cpl_buf), "replies");
+  cpl_buf *replies = (cpl_buf *) MFTLCplCalloc((size_t) MFTL_MAX(n_in, 1), sizeof(cpl_buf), "replies");
   cpl_buf self_reply = {MFTL_NULL, 0, 0};
   {
     int i = 0;
@@ -2196,16 +2313,16 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
       ++i;
     }
   }
-  int *rdest = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_in, 1) * sizeof(int), "reply dest");
-  unsigned char **rsb = (unsigned char **) MFTLMallocOrDie((size_t) MFTL_MAX(n_in, 1) * sizeof(unsigned char *), "reply send");
-  size_t *rsz = (size_t *) MFTLMallocOrDie((size_t) MFTL_MAX(n_in, 1) * sizeof(size_t), "reply send");
+  int *rdest = (int *) MFTLCplAlloc((size_t) MFTL_MAX(n_in, 1) * sizeof(int), "reply dest");
+  unsigned char **rsb = (unsigned char **) MFTLCplAlloc((size_t) MFTL_MAX(n_in, 1) * sizeof(unsigned char *), "reply send");
+  size_t *rsz = (size_t *) MFTLCplAlloc((size_t) MFTL_MAX(n_in, 1) * sizeof(size_t), "reply send");
   for (int i = 0; i < n_in; ++i)
   {
     rdest[i] = in[i].peer;
     rsb[i] = replies[i].data;
     rsz[i] = replies[i].n;
   }
-  cpl_msg *rin = (cpl_msg *) MFTLCallocOrDie((size_t) MFTL_MAX(n_out, 1), sizeof(cpl_msg), "reply receive");
+  cpl_msg *rin = (cpl_msg *) MFTLCplCalloc((size_t) MFTL_MAX(n_out, 1), sizeof(cpl_msg), "reply receive");
   MFTLCplExchangeKnown(c->comm, CPL_TAG_REPLY, n_in, rdest, rsb, rsz, n_out, odest, rin, &c->stats.bytes_discovery, &c->stats.messages);
 
   /* ── verify, provider by provider in rank order ── */
@@ -2256,417 +2373,40 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
     }
   }
   /* One owner per key: the same key from two providers is duplicate ownership. */
-  if (check_record_owners(g, R) != MFTL_COUPLING_OK) local_status = MFTL_COUPLING_INVALID;
-
-  for (int i = 0; i < n_dest; ++i)
-  {
-    free(dbuf[i].data);
-    free(dsub[i]);
-  }
-  free(dbuf);
-  free(dsub);
-  free(dsub_n);
-  free(dsub_cap);
-  free(dest);
-  for (int i = 0; i < n_in; ++i) free(replies[i].data);
-  free(replies);
-  free(self_reply.data);
-  MFTLCplMsgsFree(in, n_in);
-  free(in);
-  MFTLCplMsgsFree(rin, n_out);
-  free(rin);
-  free(odest);
-  free(osb);
-  free(osz);
-  free(rdest);
-  free(rsb);
-  free(rsz);
-
-  st = agree(c, local_status);
-  R->status = st;
-  c->stats.n_requests++;
-  if (st == MFTL_COUPLING_NEED_COVERAGE) c->stats.n_need_coverage++;
-  if (st == MFTL_COUPLING_OK || st == MFTL_COUPLING_NEED_COVERAGE)
-    *out = R;
-  else
-    MFTLCouplerReleaseRequest(&R);
-  return st;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Requests by key: the columns of imported rows
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/** @brief One requested sample: its owner (coupler rank), window location and key. */
-typedef struct
-{
-  int peer;
-  int wl;
-  uint64_t key;
-} keyreq_t;
-
-static int cmp_keyreq(const void *a, const void *b)
-{
-  const keyreq_t *x = (const keyreq_t *) a, *y = (const keyreq_t *) b;
-  if (x->peer != y->peer) return (x->peer > y->peer) - (x->peer < y->peer);
-  if (x->wl != y->wl) return (x->wl > y->wl) - (x->wl < y->wl);
-  return (x->key > y->key) - (x->key < y->key);
-}
-
-/**
- * @brief Provider side of a keyed request: resolves every named key to an
- *        owned, exported sample, or reports it. Reply: an int32 status, then per
- *        window location the records in key order, exactly as serve() writes
- *        them; the pack lists go to the request.
- */
-static void serve_keys(MFTL_Coupler *c, MFTL_SupportRequest *R, int requester, const unsigned char *msg, size_t bytes, cpl_buf *reply)
-{
-  MFTL_SolverGrid *g = c->grid;
-  size_t off = 0;
-  int32_t n = 0;
-  int32_t status = MFTL_COUPLING_OK;
-  if (!GET(msg, bytes, &off, n) || n < 0) status = MFTL_COUPLING_INVALID;
-  pack_t *pk = (pack_t *) MFTLCallocOrDie((size_t) MFTL_MAX(R->n_loc, 1), sizeof(pack_t), "keyed packs");
-  for (int32_t e = 0; e < n && status != MFTL_COUPLING_INVALID; ++e)
-  {
-    int32_t wl;
-    uint64_t key;
-    if (!GET(msg, bytes, &off, wl) || !GET(msg, bytes, &off, key) || wl < 0 || wl >= R->n_loc)
+  if (R->n_rec > 1) qsort(R->rec, (size_t) R->n_rec, sizeof(rec_t), cmp_rec_key_provider);
+  for (int64_t i = 1; i < R->n_rec; ++i)
+    if (R->rec[i].wl == R->rec[i - 1].wl && R->rec[i].key == R->rec[i - 1].key && R->rec[i].provider != R->rec[i - 1].provider)
     {
-      status = MFTL_COUPLING_INVALID;
+      fprintf(stderr, "MFTL coupling: location '%s': key %llu owned by ranks %d and %d\n", g->loc[R->locs[R->rec[i].wl]].name,
+              (unsigned long long) R->rec[i].key, R->rec[i - 1].provider, R->rec[i].provider);
+      local_status = MFTL_COUPLING_INVALID;
       break;
     }
-    const int loc = R->locs[wl];
-    const cpl_location *L = &g->loc[loc];
-    int piece;
-    int64_t elem, sample;
-    double meas;
-    const int found = MFTLCplSampleLocate(g, loc, key, &piece, &elem, &meas, &sample);
-    bool exported = (found == 1);
-    if (found == 1 && cpl_is_lattice(L))
-    {
-      int64_t idx[3];
-      cpl_lat_unkey(L, key, idx);
-      exported = MFTLCplLatExported(L, idx);
-    }
-    if (found == 1 && exported)
-    {
-      pack_push(&pk[wl], key, piece, elem, sample, meas);
-      continue;
-    }
-    if (found == 1 || (found == 0 && !cpl_is_lattice(L) && L->exposure == MFTL_GRID_SELECTED))
-    {
-      /* owned but not exported -- or, on a SELECTED point location, possibly
-       * so: only the solver's registry can tell an unexported point from a
-       * foreign one, so the key is named back to it */
-      MFTL_RequestRegion reg;
-      memset(&reg, 0, sizeof reg);
-      reg.location = loc;
-      reg.piece = (found == 1) ? piece : -1;
-      reg.requester = requester;
-      reg.by_key = true;
-      reg.key = key;
-      if (cpl_is_lattice(L))
-      {
-        int64_t idx[3];
-        cpl_lat_unkey(L, key, idx);
-        for (int k = 0; k < 3; ++k)
-        {
-          reg.index_lo[k] = idx[k];
-          reg.index_hi[k] = idx[k] + 1;
-          reg.box[k] = reg.box[3 + k] = MFTLCplLatCoord(L, k, idx[k]);
-        }
-      }
-      add_region(&R->missing, &R->n_missing, &R->cap_missing, &reg);
-      if (status < MFTL_COUPLING_NEED_COVERAGE) status = MFTL_COUPLING_NEED_COVERAGE;
-      continue;
-    }
-    fprintf(stderr, "MFTL coupling: location '%s': rank %d named rank %d the owner of sample %llu, which it %s\n", L->name, requester, c->rank,
-            (unsigned long long) key, (found < 0) ? "has as a masked (solid) position" : "does not own");
-    status = MFTL_COUPLING_INVALID;
-  }
-  PUT(reply, status);
-  for (int wl = 0; wl < R->n_loc; ++wl)
-  {
-    const int loc = R->locs[wl];
-    const cpl_location *L = &g->loc[loc];
-    pack_t *p = &pk[wl];
-    /* key order, each once (the requester sent them sorted and unique) */
-    int64_t nrec = (status == MFTL_COUPLING_INVALID) ? 0 : p->n;
-    PUT(reply, nrec);
-    for (int64_t i = 0; i < nrec; ++i)
-    {
-      PUT(reply, p->key[i]);
-      if (!cpl_is_lattice(L))
-      {
-        const cpl_points *pt = &g->points[L->piece_ref[p->piece[i]]];
-        const int64_t si = p->sample[i];
-        MFTLCplBufPut(reply, &pt->pos[3 * si], 3 * sizeof(double));
-        PUT(reply, pt->measure[si]);
-        MFTLCplBufPut(reply, &pt->h[3 * si], 3 * sizeof(double));
-        if (L->anisotropic) MFTLCplBufPut(reply, &pt->cell[9 * si], 9 * sizeof(double));
-        if (L->directional) MFTLCplBufPut(reply, &pt->dir[3 * si], 3 * sizeof(double));
-        p->sample[i] = pt->orig[si]; /* the pack list holds registration indices */
-      }
-    }
-    if (nrec == 0)
-    {
-      pack_free(p);
-      continue;
-    }
-    p->requester = requester;
-    p->wl = wl;
-    p->n_nonhalo = p->n;
-    if (R->n_pack == R->cap_pack)
-    {
-      R->cap_pack = MFTLGrowCapacity(R->cap_pack, R->n_pack + 1);
-      R->pack = (pack_t *) MFTLReallocOrDie(R->pack, (size_t) R->cap_pack * sizeof(pack_t), "pack lists");
-    }
-    R->pack[R->n_pack++] = *p;
-  }
-  free(pk);
-  R->n_served += n;
-}
 
-int MFTLCouplerRequestSamples(MFTL_Coupler *c, int n_lists, const MFTL_SampleList *lists, MFTL_SupportRequest **out)
-{
-  if (out) *out = MFTL_NULL;
-  if (c == MFTL_NULL) return MFTL_COUPLING_INVALID;
-  const MFTL_Domain *d = &c->ens->domain;
-  const MFTL_SolverGrid *g = c->grid;
-  MFTL_SupportRequest *R = (MFTL_SupportRequest *) MFTLCallocOrDie(1, sizeof(MFTL_SupportRequest), "MFTLCouplerRequestSamples");
-  R->c = c;
-  R->grid_epoch = c->grid_epoch;
-  R->export_epoch = c->export_epoch;
-  R->keyed = true;
-  int local = MFTL_COUPLING_OK;
-  if (out == MFTL_NULL || n_lists < 1 || lists == MFTL_NULL || c->active) local = MFTL_COUPLING_INVALID;
-  if (local == MFTL_COUPLING_OK && (g->version_owned != c->seen_owned || g->version_export != c->seen_export)) local = MFTL_COUPLING_STALE;
-  uint64_t sig = CPL_FNV_INIT;
-  keyreq_t *kr = MFTL_NULL;
-  int64_t nk = 0;
-  if (local == MFTL_COUPLING_OK)
-  {
-    R->n_loc = n_lists;
-    R->locs = (int *) MFTLMallocOrDie((size_t) n_lists * sizeof(int), "request locations");
-    int64_t total = 0;
-    for (int i = 0; i < n_lists; ++i)
-    {
-      const MFTL_SampleList *Lst = &lists[i];
-      R->locs[i] = Lst->location;
-      if (Lst->location < 0 || Lst->location >= c->n_loc || Lst->n < 0 || (Lst->n > 0 && (Lst->keys == MFTL_NULL || Lst->owner == MFTL_NULL)))
-        local = MFTL_COUPLING_INVALID;
-      for (int j = 0; j < i; ++j)
-        if (R->locs[j] == R->locs[i]) local = MFTL_COUPLING_INVALID;
-      if (local == MFTL_COUPLING_OK) total += Lst->n;
-    }
-    sig = cpl_fnv(sig, &R->n_loc, sizeof R->n_loc);
-    sig = cpl_fnv(sig, R->locs, (size_t) R->n_loc * sizeof(int));
-    if (local == MFTL_COUPLING_OK)
-    {
-      kr = (keyreq_t *) MFTLMallocOrDie((size_t) MFTL_MAX(total, 1) * sizeof(keyreq_t), "keyed request");
-      int *peer = MFTL_NULL;
-      for (int i = 0; i < n_lists && local == MFTL_COUPLING_OK; ++i)
-      {
-        const MFTL_SampleList *Lst = &lists[i];
-        peer = (int *) MFTLReallocOrDie(peer, (size_t) MFTL_MAX(Lst->n, 1) * sizeof(int), "keyed request");
-        if (Lst->n > 0 && !MFTLCplTranslateRanks(g->comm, c->comm, Lst->n, Lst->owner, peer))
-        {
-          fprintf(stderr, "MFTL coupling: location '%s': a sample owner is not a rank of the solver communicator\n", g->loc[Lst->location].name);
-          local = MFTL_COUPLING_INVALID;
-          break;
-        }
-        for (int64_t e = 0; e < Lst->n; ++e)
-        {
-          kr[nk].peer = peer[e];
-          kr[nk].wl = i;
-          kr[nk].key = Lst->keys[e];
-          ++nk;
-        }
-      }
-      free(peer);
-    }
-  }
-  int st = agree(c, local);
-  if (st == MFTL_COUPLING_OK && !MFTLCplAgreeHash(c->comm, sig)) st = MFTL_COUPLING_INVALID;
-  if (st != MFTL_COUPLING_OK)
-  {
-    free(kr);
-    MFTLCouplerReleaseRequest(&R);
-    c->stats.n_requests++;
-    return st;
-  }
-  if (nk > 1) qsort(kr, (size_t) nk, sizeof(keyreq_t), cmp_keyreq);
-  {
-    int64_t u = 0;
-    for (int64_t i = 0; i < nk; ++i)
-      if (i == 0 || cmp_keyreq(&kr[i], &kr[i - 1]) != 0) kr[u++] = kr[i];
-    nk = u;
-  }
-  /* the window-shaped parts a keyed request has no use for: no bins, and the
-   * domain itself as the image box, so each sample has its canonical image */
-  R->n_inactive = (int64_t *) MFTLCallocOrDie((size_t) R->n_loc, sizeof(int64_t), "request masks");
-  window_bin(c, R->n_loc, R->locs, R->bin);
-  R->n_bins = 0;
-  R->bin_key = (uint64_t *) MFTLMallocOrDie(sizeof(uint64_t), "request bins");
-  R->bin_idx = (int64_t *) MFTLMallocOrDie(3 * sizeof(int64_t), "request bins");
-  R->qbox = (double *) MFTLMallocOrDie(6 * (size_t) R->n_loc * sizeof(double), "request boxes");
-  for (int wl = 0; wl < R->n_loc; ++wl)
-    for (int k = 0; k < 3; ++k)
-    {
-      R->qbox[6 * wl + k] = d->global_min[k];
-      R->qbox[6 * wl + 3 + k] = d->global_max[k];
-    }
-
-  /* one message per owner: (wl, key) pairs; my own answered in place */
-  int n_dest = 0;
-  for (int64_t i = 0; i < nk; ++i)
-    if (i == 0 || kr[i].peer != kr[i - 1].peer) ++n_dest;
-  int *dest = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_dest, 1) * sizeof(int), "keyed request");
-  int64_t *dcount = (int64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(n_dest, 1) * sizeof(int64_t), "keyed request");
-  int64_t **dexp = (int64_t **) MFTLCallocOrDie((size_t) MFTL_MAX(n_dest, 1), sizeof(int64_t *), "keyed request");
-  cpl_buf *dbuf = (cpl_buf *) MFTLCallocOrDie((size_t) MFTL_MAX(n_dest, 1), sizeof(cpl_buf), "keyed request");
-  {
-    int at = -1;
-    for (int64_t i = 0; i < nk; ++i)
-    {
-      if (i == 0 || kr[i].peer != kr[i - 1].peer)
-      {
-        ++at;
-        dest[at] = kr[i].peer;
-        dcount[at] = 0;
-        dexp[at] = (int64_t *) MFTLCallocOrDie((size_t) R->n_loc, sizeof(int64_t), "keyed request");
-        const int32_t zero = 0;
-        PUT(&dbuf[at], zero);
-      }
-      const int32_t wl = kr[i].wl;
-      PUT(&dbuf[at], wl);
-      PUT(&dbuf[at], kr[i].key);
-      dcount[at]++;
-      dexp[at][kr[i].wl]++;
-    }
-    for (int i = 0; i < n_dest; ++i)
-    {
-      const int32_t n32 = (int32_t) dcount[i];
-      memcpy(dbuf[i].data, &n32, sizeof n32);
-      R->n_sent += (long) dcount[i];
-    }
-  }
-  free(kr);
-  int self_at = -1, n_out = 0;
-  int *odest = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_dest, 1) * sizeof(int), "keyed send");
-  int *oidx = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_dest, 1) * sizeof(int), "keyed send");
-  unsigned char **osb = (unsigned char **) MFTLMallocOrDie((size_t) MFTL_MAX(n_dest, 1) * sizeof(unsigned char *), "keyed send");
-  size_t *osz = (size_t *) MFTLMallocOrDie((size_t) MFTL_MAX(n_dest, 1) * sizeof(size_t), "keyed send");
   for (int i = 0; i < n_dest; ++i)
   {
-    if (dest[i] == c->rank)
-    {
-      self_at = i;
-      continue;
-    }
-    odest[n_out] = dest[i];
-    oidx[n_out] = i;
-    osb[n_out] = dbuf[i].data;
-    osz[n_out] = dbuf[i].n;
-    ++n_out;
+    MFTLCplFree(dbuf[i].data);
+    MFTLCplFree(dsub[i]);
   }
-  cpl_msg *in = MFTL_NULL;
-  int n_in = 0;
-  MFTLCplNbx(c->comm, CPL_TAG_KEYS, n_out, odest, osb, osz, &in, &n_in, &c->stats.bytes_discovery, &c->stats.messages);
-  /* serve in requester rank order, myself at my position: the pack lists end up in rank order */
-  cpl_buf *replies = (cpl_buf *) MFTLCallocOrDie((size_t) MFTL_MAX(n_in, 1), sizeof(cpl_buf), "keyed replies");
-  cpl_buf self_reply = {MFTL_NULL, 0, 0};
-  {
-    int i = 0;
-    bool self_done = (self_at < 0);
-    while (i < n_in || !self_done)
-    {
-      if (!self_done && (i == n_in || in[i].peer > c->rank))
-      {
-        serve_keys(c, R, c->rank, dbuf[self_at].data, dbuf[self_at].n, &self_reply);
-        self_done = true;
-        continue;
-      }
-      serve_keys(c, R, in[i].peer, in[i].data, in[i].bytes, &replies[i]);
-      ++i;
-    }
-  }
-  int *rdest = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_in, 1) * sizeof(int), "keyed reply");
-  unsigned char **rsb = (unsigned char **) MFTLMallocOrDie((size_t) MFTL_MAX(n_in, 1) * sizeof(unsigned char *), "keyed reply");
-  size_t *rsz = (size_t *) MFTLMallocOrDie((size_t) MFTL_MAX(n_in, 1) * sizeof(size_t), "keyed reply");
-  for (int i = 0; i < n_in; ++i)
-  {
-    rdest[i] = in[i].peer;
-    rsb[i] = replies[i].data;
-    rsz[i] = replies[i].n;
-  }
-  cpl_msg *rin = (cpl_msg *) MFTLCallocOrDie((size_t) MFTL_MAX(n_out, 1), sizeof(cpl_msg), "keyed reply");
-  MFTLCplExchangeKnown(c->comm, CPL_TAG_KEYS_REPLY, n_in, rdest, rsb, rsz, n_out, odest, rin, &c->stats.bytes_discovery, &c->stats.messages);
-
-  /* absorb, provider by provider in rank order; every named sample must come back once */
-  int local_status = MFTL_COUPLING_OK;
-  int64_t *got = (int64_t *) MFTLMallocOrDie((size_t) R->n_loc * sizeof(int64_t), "keyed counts");
-  {
-    int i = 0;
-    bool self_done = (self_at < 0);
-    while (i < n_out || !self_done)
-    {
-      const unsigned char *msg;
-      size_t bytes;
-      int prov, di;
-      if (!self_done && (i == n_out || odest[i] > c->rank))
-      {
-        msg = self_reply.data;
-        bytes = self_reply.n;
-        prov = c->rank;
-        di = self_at;
-        self_done = true;
-      }
-      else
-      {
-        msg = rin[i].data;
-        bytes = rin[i].bytes;
-        prov = odest[i];
-        di = oidx[i];
-        ++i;
-      }
-      size_t off = 0;
-      int32_t pst = MFTL_COUPLING_INVALID;
-      int rs = MFTL_COUPLING_INVALID;
-      if (GET(msg, bytes, &off, pst)) rs = absorb_records(c, R, prov, msg, bytes, &off, got);
-      if (rs > local_status) local_status = rs;
-      if (pst > local_status) local_status = pst;
-      if (pst == MFTL_COUPLING_OK && rs == MFTL_COUPLING_OK)
-        for (int wl = 0; wl < R->n_loc; ++wl)
-          if (got[wl] != dexp[di][wl]) local_status = MFTL_COUPLING_INVALID;
-    }
-  }
-  free(got);
-  if (check_record_owners(g, R) != MFTL_COUPLING_OK) local_status = MFTL_COUPLING_INVALID;
-  for (int i = 0; i < n_dest; ++i)
-  {
-    free(dbuf[i].data);
-    free(dexp[i]);
-  }
-  free(dbuf);
-  free(dexp);
-  free(dest);
-  free(dcount);
-  for (int i = 0; i < n_in; ++i) free(replies[i].data);
-  free(replies);
-  free(self_reply.data);
+  MFTLCplFree(dbuf);
+  MFTLCplFree(dsub);
+  MFTLCplFree(dsub_n);
+  MFTLCplFree(dsub_cap);
+  MFTLCplFree(dest);
+  for (int i = 0; i < n_in; ++i) MFTLCplFree(replies[i].data);
+  MFTLCplFree(replies);
+  MFTLCplFree(self_reply.data);
   MFTLCplMsgsFree(in, n_in);
-  free(in);
+  MFTLCplFree(in);
   MFTLCplMsgsFree(rin, n_out);
-  free(rin);
-  free(odest);
-  free(oidx);
-  free(osb);
-  free(osz);
-  free(rdest);
-  free(rsb);
-  free(rsz);
+  MFTLCplFree(rin);
+  MFTLCplFree(odest);
+  MFTLCplFree(osb);
+  MFTLCplFree(osz);
+  MFTLCplFree(rdest);
+  MFTLCplFree(rsb);
+  MFTLCplFree(rsz);
+
   st = agree(c, local_status);
   R->status = st;
   c->stats.n_requests++;
@@ -2682,36 +2422,49 @@ int MFTLCouplerRequestSamples(MFTL_Coupler *c, int n_lists, const MFTL_SampleLis
  * Windows
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/** @brief Free a snapshot's storage; its window reference has already been released. */
+static void fetch_storage_free(MFTL_CouplingFetch *f)
+{
+  for (int i = 0; i < f->n_fields; ++i) MFTLCplFree(f->values[i]);
+  MFTLCplFree(f->values);
+  MFTLCplFree(f->field_band);
+  MFTLCplFree(f->version);
+  MFTLCplFree(f->wall);
+  MFTLCplFree(f);
+}
+
 static void free_band(cpl_band *b)
 {
-  free(b->key);
-  free(b->owner);
-  free(b->route);
-  free(b->piece);
-  free(b->elem);
-  free(b->measure);
-  free(b->h);
-  free(b->cell);
-  free(b->dir);
-  free(b->ipos);
-  free(b->idof);
-  free(b->ibin_key);
-  free(b->ibin_off);
-  free(b->src_rank);
-  free(b->src_off);
-  free(b->src_nonhalo);
-  free(b->src_halo);
-  free(b->dst_rank);
-  free(b->dst_off);
-  free(b->dst_nonhalo);
-  free(b->dst_halo);
-  free(b->pack_served);
-  free(b->served_piece);
-  free(b->served_elem);
-  free(b->served_sample);
-  free(b->served_measure);
-  free(b->served_con);
-  free(b->reqbox);
+  MFTLCplBricksFree(b);
+  MFTLCplFree(b->key);
+  MFTLCplFree(b->owner);
+  MFTLCplFree(b->route);
+  MFTLCplFree(b->piece);
+  MFTLCplFree(b->elem);
+  MFTLCplFree(b->measure);
+  MFTLCplFree(b->h);
+  MFTLCplFree(b->cell);
+  MFTLCplFree(b->ipos);
+  MFTLCplFree(b->image_index.box);
+  MFTLCplFree(b->idof);
+  MFTLCplFree(b->ibin_key);
+  MFTLCplFree(b->ibin_off);
+  MFTLCplFree(b->src_rank);
+  MFTLCplFree(b->src_off);
+  MFTLCplFree(b->src_nonhalo);
+  MFTLCplFree(b->src_halo);
+  MFTLCplFree(b->dst_rank);
+  MFTLCplFree(b->dst_peer);
+  MFTLCplFree(b->dst_off);
+  MFTLCplFree(b->dst_nonhalo);
+  MFTLCplFree(b->dst_halo);
+  MFTLCplFree(b->pack_served);
+  MFTLCplFree(b->served_piece);
+  MFTLCplFree(b->served_elem);
+  MFTLCplFree(b->served_sample);
+  MFTLCplFree(b->served_measure);
+  MFTLCplFree(b->served_con);
+  MFTLCplFree(b->reqbox);
   memset(b, 0, sizeof *b);
 }
 
@@ -2720,18 +2473,30 @@ int MFTLCouplerReleaseWindow(MFTL_CouplingWindow **pw)
   if (pw == MFTL_NULL || *pw == MFTL_NULL) return MFTL_SUCCESS;
   MFTL_CouplingWindow *w = *pw;
   if (w->refcount > 0) return MFTL_ERROR;
+  while (w->fetch_pool)
+  {
+    MFTL_CouplingFetch *f = w->fetch_pool;
+    w->fetch_pool = f->next;
+    fetch_storage_free(f);
+  }
   for (int i = 0; i < w->n_loc; ++i) free_band(&w->band[i]);
-  free(w->band);
-  free(w->locs);
-  free(w->bin_key);
-  free(w->fetch_peer);
-  free(w->serve_peer);
+  MFTLCplFree(w->band);
+  MFTLCplFree(w->locs);
+  MFTLCplFree(w->bin_key);
+  MFTLCplFree(w->reach);
+  if (w->candidates)
+    for (int64_t i = 0; i < w->n_loc * w->n_bins; ++i) MFTLCplFree(w->candidates[i].img);
+  MFTLCplFree(w->candidates);
+  MFTLCplFree(w->fetch_peer);
+  MFTLCplFree(w->serve_peer);
+  MFTLCplFree(w->fetch_segment);
+  MFTLCplFree(w->serve_segment);
   if (w->c)
   {
     w->c->live--;
     w->c->stats.bytes_memory -= (long) w->bytes;
   }
-  free(w);
+  MFTLCplFree(w);
   *pw = MFTL_NULL;
   return MFTL_SUCCESS;
 }
@@ -2743,6 +2508,7 @@ typedef struct
   int s[3];
   double pos[3];
   uint64_t bin;
+  uint64_t spatial;
   uint64_t key;
 } img_t;
 
@@ -2759,6 +2525,7 @@ static int cmp_img_bin(const void *a, const void *b)
 {
   const img_t *x = (const img_t *) a, *y = (const img_t *) b;
   if (x->bin != y->bin) return (x->bin > y->bin) - (x->bin < y->bin);
+  if (x->spatial != y->spatial) return (x->spatial > y->spatial) - (x->spatial < y->spatial);
   if (x->key != y->key) return (x->key > y->key) - (x->key < y->key);
   for (int k = 0; k < 3; ++k)
     if (x->s[k] != y->s[k]) return (x->s[k] > y->s[k]) - (x->s[k] < y->s[k]);
@@ -2806,21 +2573,18 @@ static int build_band(MFTL_Coupler *c, const MFTL_SupportRequest *R, int wl, rec
     if (i == 0 || recs[i].key != recs[i - 1].key || recs[i].provider != recs[i - 1].provider) ++n_unique;
 
   const size_t nu = (size_t) MFTL_MAX(n_unique, 1);
-  B->key = (uint64_t *) MFTLMallocOrDie(nu * sizeof(uint64_t), "band");
-  B->owner = (int *) MFTLMallocOrDie(nu * sizeof(int), "band");
-  B->route = (unsigned char *) MFTLMallocOrDie(nu, "band");
-  B->piece = (int *) MFTLMallocOrDie(nu * sizeof(int), "band");
-  B->elem = (int64_t *) MFTLMallocOrDie(nu * sizeof(int64_t), "band");
-  B->measure = (double *) MFTLMallocOrDie(nu * sizeof(double), "band");
-  B->h = (double *) MFTLMallocOrDie(3 * nu * sizeof(double), "band");
-  if (L->anisotropic) B->cell = (double *) MFTLMallocOrDie(9 * nu * sizeof(double), "band");
-  if (L->directional) B->dir = (double *) MFTLMallocOrDie(3 * nu * sizeof(double), "band");
-  int64_t *dof_of_rec = (int64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(n_recs, 1) * sizeof(int64_t), "band");
+  B->key = (uint64_t *) MFTLCplAlloc(nu * sizeof(uint64_t), "band");
+  B->owner = (int *) MFTLCplAlloc(nu * sizeof(int), "band");
+  B->route = (unsigned char *) MFTLCplAlloc(nu, "band");
+  B->piece = (int *) MFTLCplAlloc(nu * sizeof(int), "band");
+  B->elem = (int64_t *) MFTLCplAlloc(nu * sizeof(int64_t), "band");
+  B->measure = (double *) MFTLCplAlloc(nu * sizeof(double), "band");
+  B->h = (double *) MFTLCplAlloc(3 * nu * sizeof(double), "band");
+  if (L->anisotropic) B->cell = (double *) MFTLCplAlloc(9 * nu * sizeof(double), "band");
+  int64_t *dof_of_rec = (int64_t *) MFTLCplAlloc((size_t) MFTL_MAX(n_recs, 1) * sizeof(int64_t), "band");
 
-  /* A keyed request sends no ghost boxes, so its providers pack in plain key
-   * order: its band must not split off a ghost-readable tail they never made. */
   int64_t hb[6 * 32];
-  const int nh = (cpl_is_lattice(L) && !R->keyed) ? halo_boxes(g, loc, hb, 32) : 0;
+  const int nh = cpl_is_lattice(L) ? halo_boxes(g, loc, hb, 32) : 0;
 
   /* the self pack list (for SELF addresses) */
   const pack_t *self_pack = MFTL_NULL;
@@ -2892,7 +2656,6 @@ static int build_band(MFTL_Coupler *c, const MFTL_SupportRequest *R, int wl, rec
           B->measure[n] = recs[r].measure;
           for (int k = 0; k < 3; ++k) B->h[3 * n + k] = recs[r].h[k];
           if (B->cell) memcpy(&B->cell[9 * n], recs[r].cell, 9 * sizeof(double));
-          if (B->dir) memcpy(&B->dir[3 * n], recs[r].dir, 3 * sizeof(double));
         }
         ++n;
       }
@@ -2918,10 +2681,10 @@ static int build_band(MFTL_Coupler *c, const MFTL_SupportRequest *R, int wl, rec
     if (B->n_src == cap_src)
     {
       cap_src = MFTLGrowCapacity(cap_src, B->n_src + 1);
-      B->src_rank = (int *) MFTLReallocOrDie(B->src_rank, (size_t) cap_src * sizeof(int), "band sources");
-      B->src_off = (int64_t *) MFTLReallocOrDie(B->src_off, (size_t) cap_src * sizeof(int64_t), "band sources");
-      B->src_nonhalo = (int64_t *) MFTLReallocOrDie(B->src_nonhalo, (size_t) cap_src * sizeof(int64_t), "band sources");
-      B->src_halo = (int64_t *) MFTLReallocOrDie(B->src_halo, (size_t) cap_src * sizeof(int64_t), "band sources");
+      B->src_rank = (int *) MFTLCplRealloc(B->src_rank, (size_t) cap_src * sizeof(int), "band sources");
+      B->src_off = (int64_t *) MFTLCplRealloc(B->src_off, (size_t) cap_src * sizeof(int64_t), "band sources");
+      B->src_nonhalo = (int64_t *) MFTLCplRealloc(B->src_nonhalo, (size_t) cap_src * sizeof(int64_t), "band sources");
+      B->src_halo = (int64_t *) MFTLCplRealloc(B->src_halo, (size_t) cap_src * sizeof(int64_t), "band sources");
     }
     int64_t nonhalo = 0;
     for (int64_t x = seg_off; x < n; ++x)
@@ -2936,14 +2699,14 @@ static int build_band(MFTL_Coupler *c, const MFTL_SupportRequest *R, int wl, rec
       /* SELF addresses: the self pack list is the same keys in the same order */
       if (self_pack == MFTL_NULL || self_pack->n != n - seg_off)
       {
-        free(dof_of_rec);
+        MFTLCplFree(dof_of_rec);
         return MFTL_COUPLING_INVALID;
       }
       for (int64_t x = 0; x < self_pack->n; ++x)
       {
         if (self_pack->key[x] != B->key[seg_off + x])
         {
-          free(dof_of_rec);
+          MFTLCplFree(dof_of_rec);
           return MFTL_COUPLING_INVALID;
         }
         B->piece[seg_off + x] = self_pack->piece[x];
@@ -2954,6 +2717,9 @@ static int build_band(MFTL_Coupler *c, const MFTL_SupportRequest *R, int wl, rec
     i = j;
   }
   B->n_dof = n;
+  if (L->kind == MFTL_LATTICE_UNIFORM && L->boundary != MFTL_BOUNDARY_MIRROR && c->params.kernel == MFTL_KERNEL_PESKIN4 &&
+      c->params.support_scale == 1.0 && c->params.reproduction == MFTL_REPRODUCE_LINEAR && B->n_dof <= INT32_MAX)
+    MFTLCplBricksBuild(B, L);
 
   /* ── images ──
    * Every periodic image of every sample that lies inside the request's
@@ -3006,7 +2772,7 @@ static int build_band(MFTL_Coupler *c, const MFTL_SupportRequest *R, int wl, rec
           }
         }
   }
-  free(dof_of_rec);
+  MFTLCplFree(dof_of_rec);
   if (n_img > 1) qsort(im, (size_t) n_img, sizeof(img_t), cmp_img_dof);
   int64_t m = 0;
   for (int64_t i = 0; i < n_img; ++i)
@@ -3017,24 +2783,35 @@ static int build_band(MFTL_Coupler *c, const MFTL_SupportRequest *R, int wl, rec
     /* bins as wide as the reach, so a support spans at most three per axis;
      * never so narrow that 21-bit keys could overflow, never zero */
     const double floor_b = d->domain_size[k] / (double) (1 << 18);
-    B->bsize[k] = (li->reach[k] > 0.0) ? fmax(li->reach[k], floor_b) : d->domain_size[k];
+    B->bsize[k] = fmax(c->kernel.half_width * c->params.support_scale * li->hmin[k], floor_b);
   }
   for (int64_t i = 0; i < n_img; ++i)
   {
     int64_t ib[3];
     for (int k = 0; k < 3; ++k) ib[k] = (int64_t) floor((im[i].pos[k] - d->global_min[k]) / B->bsize[k]);
     im[i].bin = bin_key3(ib[0], ib[1], ib[2]);
+    im[i].spatial = 0;
+    if (!li->uniform_metric || !li->lattice)
+    {
+      uint64_t quant[3];
+      for (int k = 0; k < 3; ++k)
+      {
+        const double u = (im[i].pos[k] - d->global_min[k]) / B->bsize[k] - (double) ib[k];
+        quant[k] = (uint64_t) (fmax(0.0, fmin(u, 1.0)) * MFTL_MORTON_MAX);
+      }
+      im[i].spatial = MFTLMorton3D(quant[0], quant[1], quant[2]);
+    }
   }
   if (n_img > 1) qsort(im, (size_t) n_img, sizeof(img_t), cmp_img_bin);
   B->n_img = n_img;
-  B->ipos = (double *) MFTLMallocOrDie(3 * (size_t) MFTL_MAX(n_img, 1) * sizeof(double), "band images");
-  B->idof = (int64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(n_img, 1) * sizeof(int64_t), "band images");
+  B->ipos = (double *) MFTLCplAlloc(3 * (size_t) MFTL_MAX(n_img, 1) * sizeof(double), "band images");
+  B->idof = (int64_t *) MFTLCplAlloc((size_t) MFTL_MAX(n_img, 1) * sizeof(int64_t), "band images");
   int64_t nbins = 0;
   for (int64_t i = 0; i < n_img; ++i)
     if (i == 0 || im[i].bin != im[i - 1].bin) ++nbins;
   B->n_ibins = nbins;
-  B->ibin_key = (uint64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(nbins, 1) * sizeof(uint64_t), "band bins");
-  B->ibin_off = (int64_t *) MFTLMallocOrDie((size_t) (nbins + 1) * sizeof(int64_t), "band bins");
+  B->ibin_key = (uint64_t *) MFTLCplAlloc((size_t) MFTL_MAX(nbins, 1) * sizeof(uint64_t), "band bins");
+  B->ibin_off = (int64_t *) MFTLCplAlloc((size_t) (nbins + 1) * sizeof(int64_t), "band bins");
   nbins = 0;
   for (int64_t i = 0; i < n_img; ++i)
   {
@@ -3048,18 +2825,20 @@ static int build_band(MFTL_Coupler *c, const MFTL_SupportRequest *R, int wl, rec
     B->idof[i] = im[i].dof;
   }
   B->ibin_off[nbins] = n_img;
-  free(im);
+  MFTLCplFree(im);
+  if (!li->uniform_metric || !li->lattice)
+    MFTLCplBoxTreeBuild(&B->image_index, B->ipos, B->n_img, 32, true);
 
   /* ── provider side: pack lists for every requester, and the served table ── */
   int64_t total = 0;
   for (int p = 0; p < R->n_pack; ++p)
     if (R->pack[p].wl == wl) ++B->n_dst, total += R->pack[p].n;
-  B->dst_rank = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(B->n_dst, 1) * sizeof(int), "band dst");
-  B->dst_off = (int64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(B->n_dst, 1) * sizeof(int64_t), "band dst");
-  B->dst_nonhalo = (int64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(B->n_dst, 1) * sizeof(int64_t), "band dst");
-  B->dst_halo = (int64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(B->n_dst, 1) * sizeof(int64_t), "band dst");
-  B->pack_served = (int64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(total, 1) * sizeof(int64_t), "band pack");
-  served_t *sv = (served_t *) MFTLMallocOrDie((size_t) MFTL_MAX(total, 1) * sizeof(served_t), "band served");
+  B->dst_rank = (int *) MFTLCplAlloc((size_t) MFTL_MAX(B->n_dst, 1) * sizeof(int), "band dst");
+  B->dst_off = (int64_t *) MFTLCplAlloc((size_t) MFTL_MAX(B->n_dst, 1) * sizeof(int64_t), "band dst");
+  B->dst_nonhalo = (int64_t *) MFTLCplAlloc((size_t) MFTL_MAX(B->n_dst, 1) * sizeof(int64_t), "band dst");
+  B->dst_halo = (int64_t *) MFTLCplAlloc((size_t) MFTL_MAX(B->n_dst, 1) * sizeof(int64_t), "band dst");
+  B->pack_served = (int64_t *) MFTLCplAlloc((size_t) MFTL_MAX(total, 1) * sizeof(int64_t), "band pack");
+  served_t *sv = (served_t *) MFTLCplAlloc((size_t) MFTL_MAX(total, 1) * sizeof(served_t), "band served");
   /* pack lists are already in requester rank order (they were served that way) */
   int nd = 0;
   int64_t at = 0;
@@ -3085,10 +2864,10 @@ static int build_band(MFTL_Coupler *c, const MFTL_SupportRequest *R, int wl, rec
   for (int64_t i = 0; i < total; ++i)
     if (i == 0 || sv[i].piece_elem_hi != sv[i - 1].piece_elem_hi || sv[i].elem != sv[i - 1].elem) ++ns;
   B->n_served = ns;
-  B->served_piece = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(ns, 1) * sizeof(int), "served");
-  B->served_elem = (int64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(ns, 1) * sizeof(int64_t), "served");
-  B->served_sample = (int64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(ns, 1) * sizeof(int64_t), "served");
-  B->served_measure = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(ns, 1) * sizeof(double), "served");
+  B->served_piece = (int *) MFTLCplAlloc((size_t) MFTL_MAX(ns, 1) * sizeof(int), "served");
+  B->served_elem = (int64_t *) MFTLCplAlloc((size_t) MFTL_MAX(ns, 1) * sizeof(int64_t), "served");
+  B->served_sample = (int64_t *) MFTLCplAlloc((size_t) MFTL_MAX(ns, 1) * sizeof(int64_t), "served");
+  B->served_measure = (double *) MFTLCplAlloc((size_t) MFTL_MAX(ns, 1) * sizeof(double), "served");
   ns = 0;
   for (int64_t i = 0; i < total; ++i)
   {
@@ -3100,12 +2879,12 @@ static int build_band(MFTL_Coupler *c, const MFTL_SupportRequest *R, int wl, rec
     }
     B->pack_served[sv[i].idx] = ns - 1;
   }
-  free(sv);
+  MFTLCplFree(sv);
   /* sample index and measure of each served DOF, from any pack entry naming it;
    * on a constrained location also whose constraint it is */
   if (li->constrained)
   {
-    B->served_con = (int64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(ns, 1) * sizeof(int64_t), "served constraints");
+    B->served_con = (int64_t *) MFTLCplAlloc((size_t) MFTL_MAX(ns, 1) * sizeof(int64_t), "served constraints");
     for (int64_t x = 0; x < ns; ++x) B->served_con[x] = -1;
   }
   at = 0;
@@ -3128,7 +2907,7 @@ static int build_band(MFTL_Coupler *c, const MFTL_SupportRequest *R, int wl, rec
   for (int64_t i = 0; i < R->n_rbox; ++i)
     if (R->rbox_wl[i] == wl) ++nrb;
   B->n_reqbox = (int) nrb;
-  B->reqbox = (double *) MFTLMallocOrDie(6 * (size_t) MFTL_MAX(nrb, 1) * sizeof(double), "request boxes");
+  B->reqbox = (double *) MFTLCplAlloc(6 * (size_t) MFTL_MAX(nrb, 1) * sizeof(double), "request boxes");
   nrb = 0;
   for (int64_t i = 0; i < R->n_rbox; ++i)
     if (R->rbox_wl[i] == wl) memcpy(&B->reqbox[6 * nrb++], &R->rbox[6 * i], 6 * sizeof(double));
@@ -3137,7 +2916,19 @@ static int build_band(MFTL_Coupler *c, const MFTL_SupportRequest *R, int wl, rec
 
 static size_t band_bytes(const cpl_band *b)
 {
-  return (size_t) b->n_dof * (8 + 4 + 1 + 4 + 8 + 8 + 24) + (size_t) b->n_img * 32 + (size_t) b->n_ibins * 16 + (size_t) b->n_served * 28;
+  size_t bytes = (size_t) b->n_dof * (sizeof(uint64_t) + 2 * sizeof(int) + 1 + sizeof(int64_t) + 4 * sizeof(double));
+  if (b->cell) bytes += 9 * (size_t) b->n_dof * sizeof(double);
+  bytes += (size_t) b->n_img * (3 * sizeof(double) + sizeof(int64_t));
+  bytes += (size_t) b->n_ibins * (sizeof(uint64_t) + sizeof(int64_t)) + sizeof(int64_t);
+  bytes += (size_t) (b->n_src + b->n_dst) * (sizeof(int) + 3 * sizeof(int64_t));
+  bytes += (size_t) b->n_dst * sizeof(int);
+  bytes += (size_t) b->n_served * (sizeof(int) + 2 * sizeof(int64_t) + sizeof(double));
+  if (b->served_con) bytes += (size_t) b->n_served * sizeof(int64_t);
+  for (int i = 0; i < b->n_dst; ++i) bytes += (size_t) (b->dst_nonhalo[i] + b->dst_halo[i]) * sizeof(int64_t);
+  bytes += 6 * (size_t) b->n_reqbox * sizeof(double);
+  if (b->brick_hash) bytes += (size_t) b->n_bricks * (sizeof(uint64_t) + 64 * sizeof(int64_t)) + (size_t) b->brick_hash_size * sizeof(int64_t);
+  if (b->image_index.box) bytes += 12 * (size_t) b->image_index.base * sizeof(double);
+  return bytes;
 }
 
 static int cmp_int(const void *a, const void *b)
@@ -3162,20 +2953,21 @@ int MFTLCouplerPrepareWindow(MFTL_Coupler *c, const MFTL_SupportRequest *Rc, MFT
   if (local == MFTL_COUPLING_OK)
   {
     MFTL_SupportRequest *R = (MFTL_SupportRequest *) Rc; /* records are re-sorted in place */
-    w = (MFTL_CouplingWindow *) MFTLCallocOrDie(1, sizeof(MFTL_CouplingWindow), "window");
+    w = (MFTL_CouplingWindow *) MFTLCplCalloc(1, sizeof(MFTL_CouplingWindow), "window");
     w->c = c;
     w->grid_epoch = c->grid_epoch;
     w->export_epoch = c->export_epoch;
-    w->keyed = R->keyed;
     w->n_loc = R->n_loc;
-    w->locs = (int *) MFTLMallocOrDie((size_t) R->n_loc * sizeof(int), "window");
+    w->locs = (int *) MFTLCplAlloc((size_t) R->n_loc * sizeof(int), "window");
     memcpy(w->locs, R->locs, (size_t) R->n_loc * sizeof(int));
     memcpy(w->skin, R->skin, sizeof w->skin);
     memcpy(w->bin, R->bin, sizeof w->bin);
     w->n_bins = R->n_bins;
-    w->bin_key = (uint64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(R->n_bins, 1) * sizeof(uint64_t), "window bins");
+    w->bin_key = (uint64_t *) MFTLCplAlloc((size_t) MFTL_MAX(R->n_bins, 1) * sizeof(uint64_t), "window bins");
     memcpy(w->bin_key, R->bin_key, (size_t) R->n_bins * sizeof(uint64_t));
-    w->band = (cpl_band *) MFTLCallocOrDie((size_t) R->n_loc, sizeof(cpl_band), "window bands");
+    w->reach = MFTLCplAlloc(3 * (size_t) MFTL_MAX((int64_t) R->n_loc * R->n_bins, 1) * sizeof(double), "window support bounds");
+    memcpy(w->reach, R->reach, 3 * (size_t) R->n_loc * (size_t) R->n_bins * sizeof(double));
+    w->band = (cpl_band *) MFTLCplCalloc((size_t) R->n_loc, sizeof(cpl_band), "window bands");
 
     /* records are sorted by (wl, key, provider, q) from the request */
     if (R->n_rec > 1) qsort(R->rec, (size_t) R->n_rec, sizeof(rec_t), cmp_rec_key_provider);
@@ -3230,6 +3022,28 @@ int MFTLCouplerPrepareWindow(MFTL_Coupler *c, const MFTL_SupportRequest *Rc, MFT
     }
     return st;
   }
+  /* Merge sorted sparse peer lists once; no rank search in a transfer. */
+  w->fetch_segment = (int *) MFTLCplAlloc((size_t) MFTL_MAX((size_t) w->n_fetch_peers * w->n_loc, 1) * sizeof(int), "window routes");
+  w->serve_segment = (int *) MFTLCplAlloc((size_t) MFTL_MAX((size_t) w->n_serve_peers * w->n_loc, 1) * sizeof(int), "window routes");
+  for (int wl = 0; wl < w->n_loc; ++wl)
+  {
+    cpl_band *B = &w->band[wl];
+    B->dst_peer = MFTLCplAlloc((size_t) MFTL_MAX(B->n_dst, 1) * sizeof(int), "window routes");
+    for (int d = 0; d < B->n_dst; ++d) B->dst_peer[d] = -1;
+    int f = 0, s = 0;
+    for (int p = 0; p < w->n_fetch_peers; ++p)
+    {
+      while (f < B->n_src && B->src_rank[f] < w->fetch_peer[p]) ++f;
+      w->fetch_segment[(size_t) p * w->n_loc + wl] = f < B->n_src && B->src_rank[f] == w->fetch_peer[p] ? f : -1;
+    }
+    for (int p = 0; p < w->n_serve_peers; ++p)
+    {
+      while (s < B->n_dst && B->dst_rank[s] < w->serve_peer[p]) ++s;
+      const int hit = s < B->n_dst && B->dst_rank[s] == w->serve_peer[p] ? s : -1;
+      w->serve_segment[(size_t) p * w->n_loc + wl] = hit;
+      if (hit >= 0) B->dst_peer[hit] = p;
+    }
+  }
   w->id = ++c->window_counter;
   long self = 0, halo = 0, remote = 0, images = 0, served = 0;
   for (int wl = 0; wl < w->n_loc; ++wl)
@@ -3255,6 +3069,8 @@ int MFTLCouplerPrepareWindow(MFTL_Coupler *c, const MFTL_SupportRequest *Rc, MFT
   c->stats.served = served;
   c->stats.fetch_peers = w->n_fetch_peers;
   c->stats.serve_peers = w->n_serve_peers;
+  w->bytes += sizeof *w + (size_t) w->n_loc * (sizeof(int) + sizeof(cpl_band)) + (size_t) w->n_bins * sizeof(uint64_t);
+  w->bytes += (size_t) (w->n_fetch_peers + w->n_serve_peers) * ((size_t) w->n_loc + 1) * sizeof(int);
   c->stats.n_windows++;
   c->stats.bytes_memory += (long) w->bytes;
   c->live++;
@@ -3273,40 +3089,50 @@ int MFTLCouplerReleaseBinding(MFTL_CouplingBinding **pb)
   if (b->refcount > 0) return MFTL_ERROR;
   for (int i = 0; i < b->n_loc; ++i)
   {
-    free(b->row_ptr[i]);
-    free(b->col[i]);
-    free(b->w[i]);
-    if (b->wallc) free(b->wallc[i]);
+    MFTLCplFree(b->tensor[i]);
+    MFTLCplFree(b->row_ptr[i]);
+    MFTLCplFree(b->col[i]);
+    MFTLCplFree(b->w[i]);
+    if (b->wallc) MFTLCplFree(b->wallc[i]);
   }
-  free(b->row_ptr);
-  free(b->col);
-  free(b->w);
-  free(b->wallc);
-  free(b->ncomp);
-  free(b->loc_band);
-  free(b->ref);
-  free(b->pos);
-  free(b->base_pos);
-  free(b->bodies);
-  free(b->scratch_keys);
+  MFTLCplFree(b->tensor);
+  MFTLCplFree(b->row_ptr);
+  MFTLCplFree(b->col);
+  MFTLCplFree(b->w);
+  MFTLCplFree(b->wallc);
+  MFTLCplFree(b->loc_band);
+  MFTLCplFree(b->ref);
+  MFTLCplFree(b->pos);
+  MFTLCplFree(b->support_bin);
+  MFTLCplFree(b->base_pos);
+  MFTLCplFree(b->bodies);
+  MFTLCplFree(b->scratch_keys);
   if (b->quad_owned) MFTLCplQuadFree(&b->quad);
   if (b->win) ((MFTL_CouplingWindow *) b->win)->refcount--;
   if (b->base) ((MFTL_CouplingBinding *) b->base)->refcount--;
   if (b->c) b->c->live--;
-  free(b);
+  MFTLCplFree(b);
   *pb = MFTL_NULL;
   return MFTL_SUCCESS;
 }
 
-/** @brief Candidate images of a band in the closed box `[lo, hi]`, in fixed global bin order. */
-typedef struct
-{
-  int64_t n, cap;
-  int64_t *img;
-} cand_t;
-
 static void gather_candidates(const cpl_band *B, const MFTL_Domain *d, const double lo[3], const double hi[3], cand_t *cd)
 {
+  if (B->image_index.box)
+  {
+    cd->n = 0;
+    int64_t cursor = 1, leaf;
+    while ((leaf = MFTLCplBoxTreeNext(&B->image_index, lo, hi, &cursor)) >= 0)
+      for (int64_t i = leaf * B->image_index.group; i < MFTL_MIN((leaf + 1) * B->image_index.group, B->n_img); ++i)
+      {
+        const double *x = &B->ipos[3 * i];
+        if (x[0] < lo[0] || x[0] > hi[0] || x[1] < lo[1] || x[1] > hi[1] || x[2] < lo[2] || x[2] > hi[2]) continue;
+        GROW(cd->img, cd->cap, cd->n + 1, int64_t);
+        cd->img[cd->n++] = i;
+      }
+    return;
+  }
+
   cd->n = 0;
   int64_t b0[3], b1[3];
   for (int k = 0; k < 3; ++k)
@@ -3330,8 +3156,58 @@ static void gather_candidates(const cpl_band *B, const MFTL_Domain *d, const dou
       }
 }
 
+/** @brief Reuse candidates over the certified motion envelope. Filtering keeps
+ * the band's canonical order, so cache hits change neither rows nor sums. */
+static void window_candidates(MFTL_Coupler *c, const MFTL_CouplingWindow *wc, int wl, int64_t bin,
+                              const double lo[3], const double hi[3], cand_t *cd)
+{
+  MFTL_CouplingWindow *w = (MFTL_CouplingWindow *) wc;
+  const cpl_band *B = &w->band[wl];
+  const MFTL_Domain *d = &c->ens->domain;
+  if (!w->candidates)
+  {
+    const size_t bytes = (size_t) w->n_loc * (size_t) w->n_bins * sizeof(cpl_candidates);
+    w->candidates = MFTLCplCalloc(1, bytes, "window candidates");
+    w->bytes += bytes;
+    c->stats.bytes_memory += (long) bytes;
+  }
+  cpl_candidates *list = &w->candidates[wl * w->n_bins + bin];
+  if (!list->built)
+  {
+    double lower[3], upper[3];
+    const uint64_t key = w->bin_key[bin], mask = (UINT64_C(1) << 21) - 1;
+    for (int k = 0; k < 3; ++k)
+    {
+      const int64_t idx = (int64_t) ((key >> (42 - 21 * k)) & mask) - (INT64_C(1) << 20);
+      const double r = w->reach[3 * (wl * w->n_bins + bin) + k];
+      lower[k] = d->global_min[k] + (double) idx * w->bin[k] - r - w->skin[k];
+      upper[k] = d->global_min[k] + (double) (idx + 1) * w->bin[k] + r + w->skin[k];
+    }
+    gather_candidates(B, d, lower, upper, cd);
+    list->n = cd->n;
+    const size_t bytes = (size_t) MFTL_MAX(list->n, 1) * sizeof(int64_t);
+    list->img = MFTLCplAlloc(bytes, "window candidates");
+    memcpy(list->img, cd->img, (size_t) list->n * sizeof(int64_t));
+    list->built = true;
+    w->bytes += bytes;
+    c->stats.bytes_memory += (long) bytes;
+    c->stats.n_candidate_builds++;
+  }
+  else
+    c->stats.n_candidate_reuses++;
+  cd->n = 0;
+  for (int64_t j = 0; j < list->n; ++j)
+  {
+    const int64_t i = list->img[j];
+    const double *x = &B->ipos[3 * i];
+    if (x[0] < lo[0] || x[0] > hi[0] || x[1] < lo[1] || x[1] > hi[1] || x[2] < lo[2] || x[2] > hi[2]) continue;
+    GROW(cd->img, cd->cap, cd->n + 1, int64_t);
+    cd->img[cd->n++] = i;
+  }
+}
+
 /** @brief Finds the window bin containing @p x within the skin; writes the frame position. */
-static bool contain(const MFTL_CouplingWindow *w, const MFTL_Domain *d, const double x[3], double frame[3], double flo[3])
+static bool contain(const MFTL_CouplingWindow *w, const MFTL_Domain *d, const double x[3], double frame[3], double flo[3], int64_t *which)
 {
   for (int tz = 0; tz < 3; ++tz)
     for (int ty = 0; ty < 3; ++ty)
@@ -3353,8 +3229,10 @@ static bool contain(const MFTL_CouplingWindow *w, const MFTL_Domain *d, const do
          * [min + i b, min + (i+1) b] can round to exclude a position an ulp
          * below its upper face that floor() put in bin i, and with no skin
          * that marker would be STALE in the window requested for it, forever. */
-        if (find_u64(w->bin_key, w->n_bins, bin_key3(ib[0], ib[1], ib[2])) >= 0)
+        const int64_t direct_bin = find_u64(w->bin_key, w->n_bins, bin_key3(ib[0], ib[1], ib[2]));
+        if (direct_bin >= 0)
         {
+          *which = direct_bin;
           memcpy(frame, xi, sizeof xi);
           for (int k = 0; k < 3; ++k) flo[k] = d->global_min[k] + (double) ib[k] * w->bin[k];
           return true;
@@ -3364,7 +3242,8 @@ static bool contain(const MFTL_CouplingWindow *w, const MFTL_Domain *d, const do
             for (int dx = 0; dx < 3; ++dx)
             {
               const int64_t cb[3] = {ib[0] + ((dx == 2) ? -1 : dx), ib[1] + ((dy == 2) ? -1 : dy), ib[2] + ((dz == 2) ? -1 : dz)};
-              if (find_u64(w->bin_key, w->n_bins, bin_key3(cb[0], cb[1], cb[2])) < 0) continue;
+              const int64_t near_bin = find_u64(w->bin_key, w->n_bins, bin_key3(cb[0], cb[1], cb[2]));
+              if (near_bin < 0) continue;
               bool in = true;
               double lo[3];
               for (int k = 0; k < 3; ++k)
@@ -3373,6 +3252,7 @@ static bool contain(const MFTL_CouplingWindow *w, const MFTL_Domain *d, const do
                 if (xi[k] < lo[k] - w->skin[k] || xi[k] > lo[k] + w->bin[k] + w->skin[k]) in = false;
               }
               if (!in) continue;
+              *which = near_bin;
               memcpy(frame, xi, sizeof xi);
               memcpy(flo, lo, sizeof lo);
               return true;
@@ -3393,6 +3273,7 @@ static bool contain(const MFTL_CouplingWindow *w, const MFTL_Domain *d, const do
               if (xi[k] < lo[k] - w->skin[k] || xi[k] > lo[k] + w->bin[k] + w->skin[k]) in = false;
             }
             if (!in) continue;
+            *which = bi;
             memcpy(frame, xi, sizeof xi);
             memcpy(flo, lo, sizeof lo);
             return true;
@@ -3637,17 +3518,16 @@ static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_Co
   Q->min_weight = 0.0;
   int status = MFTL_COUPLING_OK;
 
-  cand_t cd = {0, 0, MFTL_NULL};
-  int cap_c = 0, cap_img = 0, cap_dir = 0;
-  int64_t n_sel = 0, *sel = MFTL_NULL;
-  double *X = MFTL_NULL, *q = MFTL_NULL, *wt = MFTL_NULL, *dv = MFTL_NULL;
-  int64_t *isrc = MFTL_NULL;  /* mirror images: their real sample, parity, wall shares */
-  double *ipar = MFTL_NULL, *icoef = MFTL_NULL;
+  bind_scratch *scratch = &c->bs;
+  cand_t cd = scratch->candidates;
+  int cap_c = scratch->cap_c, cap_img = scratch->cap_img;
+  int64_t n_sel = 0, *sel = scratch->sel;
+  double *X = scratch->X, *q = scratch->q, *wt = scratch->wt;
+  int64_t *isrc = scratch->isrc;
+  double *ipar = scratch->ipar, *icoef = scratch->icoef;
 
   const bool grow = (P->failure & MFTL_STENCIL_GROW) != 0 && P->max_growth > 1.0;
-  /* a fit's slope has no lower-order fallback: a constant fit has none */
-  const bool lower = (P->failure & MFTL_STENCIL_LOWER_ORDER) != 0 && P->reproduction == MFTL_REPRODUCE_LINEAR && b->op != MFTL_OPERATOR_GRADIENT_FIT;
-  const bool derivative = (b->op == MFTL_OPERATOR_VALUE_DERIVATIVE);
+  const bool lower = (P->failure & MFTL_STENCIL_LOWER_ORDER) != 0 && P->reproduction == MFTL_REPRODUCE_LINEAR;
 
   for (int lp = 0; lp < b->n_loc; ++lp)
   {
@@ -3656,20 +3536,32 @@ static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_Co
     const cpl_location *Lc = &c->grid->loc[B->location];
     const MFTL_BoundaryPolicy bpol = Lc->boundary;
     const bool mirror = (bpol == MFTL_BOUNDARY_MIRROR);
-    const int nc = b->ncomp[lp];
     int64_t cap_e = 0, ne = 0;
-    b->row_ptr[lp] = (int64_t *) MFTLMallocOrDie((size_t) (b->n_markers + 1) * sizeof(int64_t), "rows");
+    b->row_ptr[lp] = (int64_t *) MFTLCplAlloc((size_t) (b->n_markers + 1) * sizeof(int64_t), "rows");
     b->col[lp] = MFTL_NULL;
     b->w[lp] = MFTL_NULL;
     b->row_ptr[lp][0] = 0;
-    if (mirror) b->wallc[lp] = (double *) MFTLCallocOrDie(6 * (size_t) nc * (size_t) MFTL_MAX(b->n_markers, 1), sizeof(double), "wall coefficients");
+    if (mirror) b->wallc[lp] = (double *) MFTLCplCalloc(6 * (size_t) MFTL_MAX(b->n_markers, 1), sizeof(double), "wall coefficients");
 
     for (int64_t i = 0; i < b->n_markers; ++i)
     {
       const double *x = &b->pos[3 * i];
+      cpl_tensor_row direct;
+      double residual, amplification;
+      const int direct_n = MFTLCplCartesianRow(B, Lc, d, &c->kernel, x, P->moment_tolerance, P->max_amplification, &direct, &residual, &amplification);
+      if (direct_n >= 0)
+      {
+        if (!b->tensor[lp]) b->tensor[lp] = MFTLCplCalloc((size_t) b->n_markers, sizeof(cpl_tensor_row), "tensor rows");
+        b->tensor[lp][i] = direct;
+        b->row_ptr[lp][i + 1] = ne;
+        Q->n_entries += direct_n;
+        Q->n_rows++;
+        Q->n_cartesian++;
+        Q->max_amplification = fmax(Q->max_amplification, amplification);
+        Q->max_moment_residual = fmax(Q->max_moment_residual, residual);
+        continue;
+      }
       double H[3], Hm[9];
-      double dH[9], dHm[27]; /* a derivative row with a varying metric: d(H)/dx_m, m-major */
-      bool dmetric = false;
       bool ok = true;
       const bool aniso = (B->cell != MFTL_NULL);
       /* At most two gathers per row: the pilot neighbourhood (a variable
@@ -3683,53 +3575,37 @@ static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_Co
       }
       else
       {
-        /* Shepard average of the sample resolutions over the pilot neighbourhood. */
+        /* Sample-centred compact metric influences. The certified envelope
+         * includes every contributor, even when its own resolution is coarser. */
         double plo[3], phi[3];
         for (int k = 0; k < 3; ++k)
         {
-          Rp[k] = P->pilot_factor * li->hmax[k];
+          Rp[k] = w->reach[3 * (b->loc_band[lp] * w->n_bins + b->support_bin[i]) + k];
           plo[k] = x[k] - Rp[k];
           phi[k] = x[k] + Rp[k];
         }
-        gather_candidates(B, d, plo, phi, &cd);
+        window_candidates(c, w, b->loc_band[lp], b->support_bin[i], plo, phi, &cd);
         double sw = 0.0, sh[3] = {0.0, 0.0, 0.0}, sm[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0};
-        /* the derivative op differentiates the average too: d(sum w)/dx_m, d(sum w h)/dx_m */
-        double s1[3] = {0.0, 0.0, 0.0}, sh1[9] = {0, 0, 0, 0, 0, 0, 0, 0, 0}, sm1[27];
-        if (derivative) memset(sm1, 0, sizeof sm1);
         for (int64_t e = 0; e < cd.n; ++e)
         {
           const double *p = &B->ipos[3 * cd.img[e]];
+          const int64_t dof = B->idof[cd.img[e]];
+          const double *hd = &B->h[3 * dof];
           double rho2 = 0.0;
           for (int k = 0; k < 3; ++k)
           {
-            const double t = (p[k] - x[k]) / Rp[k];
+            const double t = (p[k] - x[k]) / (P->pilot_factor * hd[k]);
             rho2 += t * t;
           }
           if (rho2 >= 1.0) continue;
           const double rho = sqrt(rho2), s = 1.0 - rho;
-          const double wgt = s * s * s * s * (4.0 * rho + 1.0);
-          const double *hd = &B->h[3 * B->idof[cd.img[e]]];
+          const double wgt = (B->measure[dof] / hd[0] / hd[1] / hd[2]) * s * s * s * s * (4.0 * rho + 1.0);
           sw += wgt;
           for (int k = 0; k < 3; ++k) sh[k] += wgt * hd[k];
           if (aniso)
           {
             const double *cl = &B->cell[9 * B->idof[cd.img[e]]];
             for (int a = 0; a < 9; ++a) sm[a] += wgt * cl[a];
-          }
-          if (derivative)
-          {
-            /* d w / d x_m = 20 (1 - rho)^3 (p_m - x_m) / Rp_m^2: smooth, zero on the pilot sphere */
-            for (int mm = 0; mm < 3; ++mm)
-            {
-              const double dw = 20.0 * s * s * s * (p[mm] - x[mm]) / (Rp[mm] * Rp[mm]);
-              s1[mm] += dw;
-              for (int k = 0; k < 3; ++k) sh1[3 * mm + k] += dw * hd[k];
-              if (aniso)
-              {
-                const double *cl = &B->cell[9 * B->idof[cd.img[e]]];
-                for (int a = 0; a < 9; ++a) sm1[9 * mm + a] += dw * cl[a];
-              }
-            }
           }
         }
         if (!(sw > 0.0))
@@ -3744,18 +3620,6 @@ static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_Co
             H[k] = c->kernel.radial ? sqrt(Hm[3 * k] * Hm[3 * k] + Hm[3 * k + 1] * Hm[3 * k + 1] + Hm[3 * k + 2] * Hm[3 * k + 2])
                                     : fabs(Hm[3 * k]) + fabs(Hm[3 * k + 1]) + fabs(Hm[3 * k + 2]);
         }
-        if (ok && derivative)
-        {
-          /* H = S_h / S_w, so dH = (dS_h - H dS_w) / S_w */
-          dmetric = true;
-          for (int mm = 0; mm < 3; ++mm)
-          {
-            if (!aniso)
-              for (int k = 0; k < 3; ++k) dH[3 * mm + k] = (sh1[3 * mm + k] - H[k] * s1[mm]) / sw;
-            else
-              for (int a = 0; a < 9; ++a) dHm[9 * mm + a] = (sm1[9 * mm + a] - Hm[a] * s1[mm]) / sw;
-          }
-        }
       }
       if (ok)
       {
@@ -3769,7 +3633,7 @@ static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_Co
           shi[k] = x[k] + Rs;
           if (Rs > Rp[k]) inside_pilot = false;
         }
-        if (!inside_pilot) gather_candidates(B, d, slo, shi, &cd);
+        if (!inside_pilot) window_candidates(c, w, b->loc_band[lp], b->support_bin[i], slo, shi, &cd);
       }
 
       MFTL_RowQuality rq;
@@ -3802,25 +3666,19 @@ static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_Co
             if (need_c > cap_c)
             {
               cap_c = (int) MFTLGrowCapacity(cap_c, (int) need_c);
-              X = (double *) MFTLReallocOrDie(X, 3 * (size_t) cap_c * sizeof(double), "row candidates");
-              q = (double *) MFTLReallocOrDie(q, (size_t) cap_c * sizeof(double), "row candidates");
-              wt = (double *) MFTLReallocOrDie(wt, 3 * (size_t) cap_c * sizeof(double), "row candidates");
-              sel = (int64_t *) MFTLReallocOrDie(sel, (size_t) cap_c * sizeof(int64_t), "row candidates");
-            }
-            /* Scalar locations may already have grown the shared candidates. */
-            if (B->dir && need_c > cap_dir)
-            {
-              cap_dir = (int) MFTLGrowCapacity(cap_dir, (int) need_c);
-              dv = (double *) MFTLReallocOrDie(dv, 3 * (size_t) cap_dir * sizeof(double), "row directions");
+              X = (double *) MFTLCplRealloc(X, 3 * (size_t) cap_c * sizeof(double), "row candidates");
+              q = (double *) MFTLCplRealloc(q, (size_t) cap_c * sizeof(double), "row candidates");
+              wt = (double *) MFTLCplRealloc(wt, (size_t) cap_c * sizeof(double), "row candidates");
+              sel = (int64_t *) MFTLCplRealloc(sel, (size_t) cap_c * sizeof(int64_t), "row candidates");
             }
             /* Ordinary locations can grow the candidate buffers without using
              * images. Their capacity says nothing about these separate arrays. */
             if (mirror && need_c > cap_img)
             {
               cap_img = (int) MFTLGrowCapacity(cap_img, (int) need_c);
-              isrc = (int64_t *) MFTLReallocOrDie(isrc, (size_t) cap_img * sizeof(int64_t), "row images");
-              ipar = (double *) MFTLReallocOrDie(ipar, (size_t) cap_img * sizeof(double), "row images");
-              icoef = (double *) MFTLReallocOrDie(icoef, 6 * (size_t) cap_img * sizeof(double), "row images");
+              isrc = (int64_t *) MFTLCplRealloc(isrc, (size_t) cap_img * sizeof(int64_t), "row images");
+              ipar = (double *) MFTLCplRealloc(ipar, (size_t) cap_img * sizeof(double), "row images");
+              icoef = (double *) MFTLCplRealloc(icoef, 6 * (size_t) cap_img * sizeof(double), "row images");
             }
             n_sel = 0;
             for (int64_t e = 0; e < cd.n; ++e)
@@ -3829,7 +3687,6 @@ static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_Co
               if (pe[0] < lo[0] || pe[0] > hi[0] || pe[1] < lo[1] || pe[1] > hi[1] || pe[2] < lo[2] || pe[2] > hi[2]) continue;
               memcpy(&X[3 * n_sel], pe, 3 * sizeof(double));
               q[n_sel] = B->measure[B->idof[cd.img[e]]];
-              if (B->dir) memcpy(&dv[3 * n_sel], &B->dir[3 * B->idof[cd.img[e]]], 3 * sizeof(double));
               sel[n_sel++] = cd.img[e];
             }
             n_real = n_sel;
@@ -3859,32 +3716,7 @@ static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_Co
               }
               truncated = npr + npr_img < nv;
             }
-            if (nc > 1)
-            {
-              /* a block row: a direction, the fit's slope, or the derivative */
-              const double sg = P->support_scale * gfac;
-              double Hs[9], dHs[27];
-              cpl_metric met;
-              bool okm;
-              if (aniso)
-              {
-                for (int a = 0; a < 9; ++a) Hs[a] = sg * Hm[a];
-                if (dmetric)
-                  for (int a = 0; a < 27; ++a) dHs[a] = sg * dHm[a];
-                okm = MFTLCplMetricSet(&met, true, Hs, dmetric ? dHs : MFTL_NULL);
-              }
-              else
-              {
-                if (dmetric)
-                  for (int a = 0; a < 9; ++a) dHs[a] = sg * dH[a];
-                okm = MFTLCplMetricSet(&met, false, Ht, dmetric ? dHs : MFTL_NULL);
-              }
-              memset(&rq, 0, sizeof rq);
-              rc = okm ? MFTLCplBlockRow(&pp, &c->kernel, b->op, x, &met, (int) n_sel, X, q, B->dir ? dv : MFTL_NULL, wt, &rq, &c->rs)
-                       : MFTL_COUPLING_BAD_STENCIL;
-              if (rc == MFTL_COUPLING_INVALID) internal = true; /* refused at bind time; reaching it here is a coupler bug */
-            }
-            else if (aniso)
+            if (aniso)
             {
               double Ht9[9];
               for (int a = 0; a < 9; ++a) Ht9[a] = P->support_scale * gfac * Hm[a];
@@ -3919,35 +3751,28 @@ static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_Co
       const int64_t row0 = ne;
       for (int64_t e = 0; e < n_real; ++e)
       {
-        bool any = false;
-        for (int k = 0; k < nc; ++k)
-          if (wt[nc * e + k] != 0.0) any = true;
-        if (!any) continue;
+        if (wt[e] == 0.0) continue;
         if (ne == cap_e)
         {
           cap_e = (cap_e == 0) ? 1024 : 2 * cap_e;
-          b->col[lp] = (int64_t *) MFTLReallocOrDie(b->col[lp], (size_t) cap_e * sizeof(int64_t), "rows");
-          b->w[lp] = (double *) MFTLReallocOrDie(b->w[lp], (size_t) nc * (size_t) cap_e * sizeof(double), "rows");
+          b->col[lp] = (int64_t *) MFTLCplRealloc(b->col[lp], (size_t) cap_e * sizeof(int64_t), "rows");
+          b->w[lp] = (double *) MFTLCplRealloc(b->w[lp], (size_t) cap_e * sizeof(double), "rows");
         }
         b->col[lp][ne] = B->idof[sel[e]];
-        for (int k = 0; k < nc; ++k) b->w[lp][nc * ne + k] = wt[nc * e + k];
+        b->w[lp][ne] = wt[e];
         ++ne;
       }
       if (n_img > 0)
       {
         /* compose: an image's weight goes to its sample times the parity, its
          * wall share to the faces; merged into the real entries in a fixed
-         * order (real first, images in generation order), component by component */
-        double *wc = &b->wallc[lp][6 * nc * i];
+         * order (real first, images in generation order) */
+        double *wc = &b->wallc[lp][6 * i];
         for (int64_t e = 0; e < n_img; ++e)
         {
-          const double *we = &wt[nc * (n_real + e)];
-          bool any = false;
-          for (int k = 0; k < nc; ++k)
-            if (we[k] != 0.0) any = true;
-          if (!any) continue;
-          for (int k = 0; k < nc; ++k)
-            for (int f = 0; f < 6; ++f) wc[6 * k + f] += we[k] * icoef[6 * e + f];
+          const double we = wt[n_real + e];
+          if (we == 0.0) continue;
+          for (int f = 0; f < 6; ++f) wc[f] += we * icoef[6 * e + f];
           const int64_t col = B->idof[sel[isrc[e]]];
           int64_t at = -1;
           for (int64_t r = row0; r < ne; ++r)
@@ -3957,27 +3782,24 @@ static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_Co
             if (ne == cap_e)
             {
               cap_e = (cap_e == 0) ? 1024 : 2 * cap_e;
-              b->col[lp] = (int64_t *) MFTLReallocOrDie(b->col[lp], (size_t) cap_e * sizeof(int64_t), "rows");
-              b->w[lp] = (double *) MFTLReallocOrDie(b->w[lp], (size_t) nc * (size_t) cap_e * sizeof(double), "rows");
+              b->col[lp] = (int64_t *) MFTLCplRealloc(b->col[lp], (size_t) cap_e * sizeof(int64_t), "rows");
+              b->w[lp] = (double *) MFTLCplRealloc(b->w[lp], (size_t) cap_e * sizeof(double), "rows");
             }
             at = ne++;
             b->col[lp][at] = col;
-            for (int k = 0; k < nc; ++k) b->w[lp][nc * at + k] = 0.0;
+            b->w[lp][at] = 0.0;
           }
-          for (int k = 0; k < nc; ++k) b->w[lp][nc * at + k] += we[k] * ipar[e];
+          b->w[lp][at] += we * ipar[e];
         }
         /* an exact cancellation (an ODD image on its own sample) leaves no entry */
         int64_t keep = row0;
         for (int64_t r = row0; r < ne; ++r)
-        {
-          bool any = false;
-          for (int k = 0; k < nc; ++k)
-            if (b->w[lp][nc * r + k] != 0.0) any = true;
-          if (!any) continue;
-          b->col[lp][keep] = b->col[lp][r];
-          for (int k = 0; k < nc; ++k) b->w[lp][nc * keep + k] = b->w[lp][nc * r + k];
-          ++keep;
-        }
+          if (b->w[lp][r] != 0.0)
+          {
+            b->col[lp][keep] = b->col[lp][r];
+            b->w[lp][keep] = b->w[lp][r];
+            ++keep;
+          }
         ne = keep;
         Q->n_mirrored++;
       }
@@ -3995,19 +3817,20 @@ static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_Co
     Q->n_entries += ne;
     if (b->col[lp] == MFTL_NULL)
     {
-      b->col[lp] = (int64_t *) MFTLMallocOrDie(sizeof(int64_t), "rows");
-      b->w[lp] = (double *) MFTLMallocOrDie(3 * sizeof(double), "rows");
+      b->col[lp] = (int64_t *) MFTLCplAlloc(sizeof(int64_t), "rows");
+      b->w[lp] = (double *) MFTLCplAlloc(sizeof(double), "rows");
     }
   }
-  free(cd.img);
-  free(sel);
-  free(X);
-  free(q);
-  free(wt);
-  free(dv);
-  free(isrc);
-  free(ipar);
-  free(icoef);
+  scratch->candidates = cd;
+  scratch->cap_c = cap_c;
+  scratch->cap_img = cap_img;
+  scratch->sel = sel;
+  scratch->X = X;
+  scratch->q = q;
+  scratch->wt = wt;
+  scratch->isrc = isrc;
+  scratch->ipar = ipar;
+  scratch->icoef = icoef;
   return status;
 }
 
@@ -4055,28 +3878,28 @@ static void spacing_local(const MFTL_Coupler *c, double *max_ratio, int64_t *n_o
       }
     }
   }
-  free(got);
+  MFTLCplFree(got);
 }
 
 /** @brief A fresh binding shell. */
 static MFTL_CouplingBinding *new_binding(MFTL_Coupler *c, const MFTL_CouplingWindow *w, int n_loc, int64_t n)
 {
-  MFTL_CouplingBinding *b = (MFTL_CouplingBinding *) MFTLCallocOrDie(1, sizeof(MFTL_CouplingBinding), "binding");
+  MFTL_CouplingBinding *b = (MFTL_CouplingBinding *) MFTLCplCalloc(1, sizeof(MFTL_CouplingBinding), "binding");
   b->c = c;
   b->win = w;
   b->window_id = w->id;
   b->n_loc = n_loc;
-  b->loc_band = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_loc, 1) * sizeof(int), "binding");
-  b->row_ptr = (int64_t **) MFTLCallocOrDie((size_t) MFTL_MAX(n_loc, 1), sizeof(int64_t *), "binding");
-  b->col = (int64_t **) MFTLCallocOrDie((size_t) MFTL_MAX(n_loc, 1), sizeof(int64_t *), "binding");
-  b->w = (double **) MFTLCallocOrDie((size_t) MFTL_MAX(n_loc, 1), sizeof(double *), "binding");
-  b->wallc = (double **) MFTLCallocOrDie((size_t) MFTL_MAX(n_loc, 1), sizeof(double *), "binding");
-  b->ncomp = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_loc, 1) * sizeof(int), "binding");
-  for (int i = 0; i < n_loc; ++i) b->ncomp[i] = 1;
+  b->loc_band = (int *) MFTLCplAlloc((size_t) MFTL_MAX(n_loc, 1) * sizeof(int), "binding");
+  b->row_ptr = (int64_t **) MFTLCplCalloc((size_t) MFTL_MAX(n_loc, 1), sizeof(int64_t *), "binding");
+  b->col = (int64_t **) MFTLCplCalloc((size_t) MFTL_MAX(n_loc, 1), sizeof(int64_t *), "binding");
+  b->w = (double **) MFTLCplCalloc((size_t) MFTL_MAX(n_loc, 1), sizeof(double *), "binding");
+  b->wallc = (double **) MFTLCplCalloc((size_t) MFTL_MAX(n_loc, 1), sizeof(double *), "binding");
+  b->tensor = MFTLCplCalloc((size_t) MFTL_MAX(n_loc, 1), sizeof(cpl_tensor_row *), "binding");
   b->n_markers = n;
-  b->pos = (double *) MFTLMallocOrDie(3 * (size_t) MFTL_MAX(n, 1) * sizeof(double), "binding");
-  b->base_pos = (double *) MFTLMallocOrDie(3 * (size_t) MFTL_MAX(n, 1) * sizeof(double), "binding");
-  b->ref = (MFTL_MarkerRef *) MFTLMallocOrDie((size_t) MFTL_MAX(n, 1) * sizeof(MFTL_MarkerRef), "binding");
+  b->support_bin = MFTLCplAlloc((size_t) MFTL_MAX(n, 1) * sizeof(int64_t), "binding certificates");
+  b->pos = (double *) MFTLCplAlloc(3 * (size_t) MFTL_MAX(n, 1) * sizeof(double), "binding");
+  b->base_pos = (double *) MFTLCplAlloc(3 * (size_t) MFTL_MAX(n, 1) * sizeof(double), "binding");
+  b->ref = (MFTL_MarkerRef *) MFTLCplAlloc((size_t) MFTL_MAX(n, 1) * sizeof(MFTL_MarkerRef), "binding");
   ((MFTL_CouplingWindow *) w)->refcount++;
   c->live++;
   return b;
@@ -4094,29 +3917,6 @@ static int finish_bind(MFTL_Coupler *c, MFTL_CouplingBinding *b, int local, MFTL
   }
   *out = b;
   return MFTL_COUPLING_OK;
-}
-
-/**
- * @brief Whether rows of operator @p op exist at location @p l under this
- *        coupler's policy: a gradient of directional samples, a directional row
- *        that reproduces nothing, and a derivative without the kernel's derivative
- *        do not. Reported once, by rank 0.
- */
-static int operator_check(const MFTL_Coupler *c, MFTL_CouplingOperator op, int l)
-{
-  const char *why = MFTL_NULL;
-  if (op != MFTL_OPERATOR_VALUE && op != MFTL_OPERATOR_GRADIENT_FIT && op != MFTL_OPERATOR_VALUE_DERIVATIVE)
-    why = "unknown operator";
-  else if (c->li[l].directional && op != MFTL_OPERATOR_VALUE)
-    why = "a gradient of directional samples is not implemented";
-  else if (c->li[l].directional && c->params.reproduction == MFTL_REPRODUCE_NONE)
-    why = "a directional row has no base kernel to keep: reproduction NONE does not exist for it";
-  else if (op == MFTL_OPERATOR_VALUE_DERIVATIVE && c->kernel.deriv == MFTL_NULL)
-    why = "the derivative of interpolation needs the kernel's derivative (MFTL_KernelDesc::deriv)";
-  if (why == MFTL_NULL) return MFTL_COUPLING_OK;
-  /* the verdict is the same on every rank: the policy and the location's kind are agreed */
-  if (c->rank == 0) fprintf(stderr, "MFTL coupling: location '%s': %s\n", c->grid->loc[l].name, why);
-  return MFTL_COUPLING_INVALID;
 }
 
 /**
@@ -4139,8 +3939,8 @@ static uint64_t bind_signature(const MFTL_MarkerSpec *spec)
     h = cpl_fnv(h, ql, sizeof ql);
     h = cpl_fnv(h, &spec->quadrature_ratio, sizeof spec->quadrature_ratio);
   }
-  const int io[2] = {spec->interpolation_only ? 1 : 0, (int) spec->operation};
-  return cpl_fnv(h, io, sizeof io);
+  const int io = spec->interpolation_only ? 1 : 0;
+  return cpl_fnv(h, &io, sizeof io);
 }
 
 int MFTLCouplerBind(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, const MFTL_CouplingWindow *w, MFTL_CouplingBinding **out)
@@ -4150,11 +3950,6 @@ int MFTLCouplerBind(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, const MFTL_Cou
   c->stats.n_binds++;
   int local = MFTL_COUPLING_OK;
   if (spec == MFTL_NULL || w == MFTL_NULL || out == MFTL_NULL || w->c != c || c->active) local = MFTL_COUPLING_INVALID;
-  if (local == MFTL_COUPLING_OK && w->keyed)
-  {
-    if (c->rank == 0) fprintf(stderr, "MFTL coupling: a window of named samples certifies no kernel support; it serves imported rows only\n");
-    local = MFTL_COUPLING_INVALID;
-  }
   if (local == MFTL_COUPLING_OK && !window_current(w)) local = MFTL_COUPLING_STALE;
 
   int n_loc = 0;
@@ -4169,7 +3964,6 @@ int MFTLCouplerBind(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, const MFTL_Cou
   {
     b = new_binding(c, w, n_loc, m.n);
     b->kind = spec->kind;
-    b->op = spec->operation;
     b->q_level = spec->quadrature_level;
     b->q_max = spec->quadrature_max_level;
     b->q_ratio = spec->quadrature_ratio;
@@ -4179,8 +3973,6 @@ int MFTLCouplerBind(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, const MFTL_Cou
       for (int j = 0; j < w->n_loc; ++j)
         if (w->locs[j] == locs[i]) b->loc_band[i] = j;
       if (b->loc_band[i] < 0) local = MFTL_COUPLING_INVALID;
-      if (operator_check(c, spec->operation, locs[i]) != MFTL_COUPLING_OK) local = MFTL_COUPLING_INVALID;
-      b->ncomp[i] = cpl_row_ncomp(spec->operation, c->li[locs[i]].directional);
     }
     memcpy(b->ref, m.ref, (size_t) m.n * sizeof(MFTL_MarkerRef));
     b->n_bodies = m.n_bodies;
@@ -4191,7 +3983,7 @@ int MFTLCouplerBind(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, const MFTL_Cou
     for (int64_t i = 0; i < m.n && local == MFTL_COUPLING_OK; ++i)
     {
       double flo[3];
-      if (!contain(w, d, &m.pos[3 * i], &b->pos[3 * i], flo)) local = MFTL_COUPLING_STALE;
+      if (!contain(w, d, &m.pos[3 * i], &b->pos[3 * i], flo, &b->support_bin[i])) local = MFTL_COUPLING_STALE;
     }
     if (local == MFTL_COUPLING_OK)
     {
@@ -4228,7 +4020,7 @@ int MFTLCouplerBind(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, const MFTL_Cou
     st = agree(c, local);
     if (st == MFTL_COUPLING_OK) qd->id = ++c->quad_counter;
   }
-  free(locs);
+  MFTLCplFree(locs);
   MFTLCplMarkersFree(&m);
   if (st != MFTL_COUPLING_OK)
   {
@@ -4249,8 +4041,7 @@ static int bind_stage_core(MFTL_Coupler *c, const MFTL_CouplingBinding *base, co
 {
   *bp = MFTL_NULL;
   int local = MFTL_COUPLING_OK;
-  if (base == MFTL_NULL || stage == MFTL_NULL || base->c != c || (c->active && !allow_active) || (base->n_markers > 0 && stage->pos == MFTL_NULL) ||
-      base->imported)
+  if (base == MFTL_NULL || stage == MFTL_NULL || base->c != c || (c->active && !allow_active) || (base->n_markers > 0 && stage->pos == MFTL_NULL))
     local = MFTL_COUPLING_INVALID;
   if (local == MFTL_COUPLING_OK && !window_current(base->win)) local = MFTL_COUPLING_STALE;
   if (local == MFTL_COUPLING_OK && base->kind != MFTL_MARKERS_USER && !MFTLCplBodiesCurrent(c->ens, base->bodies, base->n_bodies)) local = MFTL_COUPLING_STALE;
@@ -4264,8 +4055,6 @@ static int bind_stage_core(MFTL_Coupler *c, const MFTL_CouplingBinding *base, co
     b->base = base;
     ((MFTL_CouplingBinding *) base)->refcount++;
     b->kind = base->kind;
-    b->op = base->op;
-    memcpy(b->ncomp, base->ncomp, (size_t) base->n_loc * sizeof(int));
     b->quad = base->quad;
     b->quad_owned = false;
     b->q_level = base->q_level;
@@ -4275,7 +4064,7 @@ static int bind_stage_core(MFTL_Coupler *c, const MFTL_CouplingBinding *base, co
     memcpy(b->ref, base->ref, (size_t) base->n_markers * sizeof(MFTL_MarkerRef));
     memcpy(b->base_pos, base->base_pos, 3 * (size_t) base->n_markers * sizeof(double));
     b->n_bodies = base->n_bodies;
-    b->bodies = (cpl_body_snap *) MFTLMallocOrDie((size_t) MFTL_MAX(base->n_bodies, 1) * sizeof(cpl_body_snap), "binding bodies");
+    b->bodies = (cpl_body_snap *) MFTLCplAlloc((size_t) MFTL_MAX(base->n_bodies, 1) * sizeof(cpl_body_snap), "binding bodies");
     memcpy(b->bodies, base->bodies, (size_t) base->n_bodies * sizeof(cpl_body_snap));
     b->pos_checksum = base->pos_checksum;
     for (int64_t i = 0; i < base->n_markers && local == MFTL_COUPLING_OK; ++i)
@@ -4302,9 +4091,13 @@ static int bind_stage_core(MFTL_Coupler *c, const MFTL_CouplingBinding *base, co
         const double lo = d->global_min[k] + (double) ib[k] * w->bin[k];
         if (xs[k] < lo - w->skin[k] || xs[k] > lo + w->bin[k] + w->skin[k]) in = false;
       }
-      if (in && find_u64(w->bin_key, w->n_bins, bin_key3(ib[0], ib[1], ib[2])) >= 0)
+      const int64_t base_bin = find_u64(w->bin_key, w->n_bins, bin_key3(ib[0], ib[1], ib[2]));
+      if (in && base_bin >= 0)
+      {
         memcpy(&b->pos[3 * i], xs, sizeof xs);
-      else if (!contain(w, d, xs, &b->pos[3 * i], flo))
+        b->support_bin[i] = base_bin;
+      }
+      else if (!contain(w, d, xs, &b->pos[3 * i], flo, &b->support_bin[i]))
         local = MFTL_COUPLING_STALE;
     }
     if (local == MFTL_COUPLING_OK) local = assemble_rows(c, b, w);
@@ -4349,275 +4142,6 @@ int MFTLCouplerAgreeStatus(MFTL_Coupler *c, int local)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Imported rows
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/** @brief (key, band DOF) of a band, sorted by key: imported columns are looked up in it. */
-typedef struct
-{
-  uint64_t key;
-  int64_t dof;
-} keydof_t;
-
-static int cmp_keydof(const void *a, const void *b)
-{
-  const keydof_t *x = (const keydof_t *) a, *y = (const keydof_t *) b;
-  return (x->key > y->key) - (x->key < y->key);
-}
-
-/**
- * @brief Stores one location's imported rows in a binding and checks what they
- *        are declared to reproduce, against the samples' positions (minimum
- *        image about the marker). Local; returns the local status.
- */
-static int import_location(MFTL_Coupler *c, MFTL_CouplingBinding *b, int lp, const MFTL_NativeRows *nr)
-{
-  const MFTL_Domain *d = &c->ens->domain;
-  const MFTL_CouplerParams *P = &c->params;
-  const cpl_band *B = &b->win->band[b->loc_band[lp]];
-  const cpl_location *L = &c->grid->loc[B->location];
-  const int nc = b->ncomp[lp];
-  const int64_t nm = b->n_markers;
-  MFTL_BindingQuality *Q = &b->q;
-  b->row_ptr[lp] = (int64_t *) MFTLMallocOrDie((size_t) (nm + 1) * sizeof(int64_t), "imported rows");
-  b->row_ptr[lp][0] = 0;
-  for (int64_t i = 0; i < nm; ++i) b->row_ptr[lp][i + 1] = 0;
-  if (nm > 0 && nr->row_ptr == MFTL_NULL) return MFTL_COUPLING_INVALID;
-  if (nr->reproduces != MFTL_REPRODUCE_LINEAR && nr->reproduces != MFTL_REPRODUCE_CONSTANT && nr->reproduces != MFTL_REPRODUCE_NONE)
-    return MFTL_COUPLING_INVALID;
-  const int64_t nnz = (nm > 0) ? nr->row_ptr[nm] : 0;
-  if (nm > 0 && nr->row_ptr[0] != 0) return MFTL_COUPLING_INVALID;
-  for (int64_t i = 0; i < nm; ++i)
-    if (nr->row_ptr[i + 1] < nr->row_ptr[i]) return MFTL_COUPLING_INVALID;
-  if (nnz > 0 && (nr->keys == MFTL_NULL || nr->weights == MFTL_NULL)) return MFTL_COUPLING_INVALID;
-  for (int64_t e = 0; e < nnz * nc; ++e)
-    if (!isfinite(nr->weights[e])) return MFTL_COUPLING_INVALID;
-
-  /* the band by key, and one position per sample (any image: the minimum one is taken per row) */
-  keydof_t *kd = (keydof_t *) MFTLMallocOrDie((size_t) MFTL_MAX(B->n_dof, 1) * sizeof(keydof_t), "imported keys");
-  for (int64_t x = 0; x < B->n_dof; ++x)
-  {
-    kd[x].key = B->key[x];
-    kd[x].dof = x;
-  }
-  if (B->n_dof > 1) qsort(kd, (size_t) B->n_dof, sizeof(keydof_t), cmp_keydof);
-  double *dpos = (double *) MFTLMallocOrDie(3 * (size_t) MFTL_MAX(B->n_dof, 1) * sizeof(double), "imported positions");
-  unsigned char *have = (unsigned char *) MFTLCallocOrDie((size_t) MFTL_MAX(B->n_dof, 1), 1, "imported positions");
-  for (int64_t e = 0; e < B->n_img; ++e)
-    if (!have[B->idof[e]])
-    {
-      memcpy(&dpos[3 * B->idof[e]], &B->ipos[3 * e], 3 * sizeof(double));
-      have[B->idof[e]] = 1;
-    }
-  free(have);
-
-  int status = MFTL_COUPLING_OK;
-  int64_t ne = 0;
-  b->col[lp] = (int64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(nnz, 1) * sizeof(int64_t), "imported rows");
-  b->w[lp] = (double *) MFTLMallocOrDie((size_t) nc * (size_t) MFTL_MAX(nnz, 1) * sizeof(double), "imported rows");
-  const double tol = P->moment_tolerance;
-  for (int64_t i = 0; i < nm && status != MFTL_COUPLING_INVALID; ++i)
-  {
-    const int64_t row0 = ne;
-    for (int64_t e = nr->row_ptr[i]; e < nr->row_ptr[i + 1]; ++e)
-    {
-      const keydof_t probe = {nr->keys[e], 0};
-      const keydof_t *hit = (const keydof_t *) bsearch(&probe, kd, (size_t) B->n_dof, sizeof(keydof_t), cmp_keydof);
-      if (hit == MFTL_NULL)
-      {
-        fprintf(stderr, "MFTL coupling: location '%s': imported column %llu of marker %llu is not in the window\n", L->name, (unsigned long long) nr->keys[e],
-                (unsigned long long) b->ref[i].key);
-        status = MFTL_COUPLING_INVALID;
-        break;
-      }
-      int64_t at = -1;
-      for (int64_t r = row0; r < ne; ++r)
-        if (b->col[lp][r] == hit->dof) at = r;
-      if (at < 0)
-      {
-        at = ne++;
-        b->col[lp][at] = hit->dof;
-        for (int k = 0; k < nc; ++k) b->w[lp][nc * at + k] = 0.0;
-      }
-      for (int k = 0; k < nc; ++k)
-      {
-        b->w[lp][nc * at + k] += nr->weights[nc * e + k];
-        if (!isfinite(b->w[lp][nc * at + k])) status = MFTL_COUPLING_INVALID;
-      }
-    }
-    if (status == MFTL_COUPLING_INVALID) break;
-    /* an entry whose weights summed to zero is no entry */
-    int64_t keep = row0;
-    for (int64_t r = row0; r < ne; ++r)
-    {
-      bool any = false;
-      for (int k = 0; k < nc; ++k)
-        if (b->w[lp][nc * r + k] != 0.0) any = true;
-      if (!any) continue;
-      b->col[lp][keep] = b->col[lp][r];
-      for (int k = 0; k < nc; ++k) b->w[lp][nc * keep + k] = b->w[lp][nc * r + k];
-      ++keep;
-    }
-    ne = keep;
-    b->row_ptr[lp][i + 1] = ne;
-
-    /* the declared reproduction, on the rows as stored */
-    const double *x = &b->pos[3 * i];
-    double sa[3] = {0, 0, 0}, rmax = 0.0, r0 = 0.0, r1 = 0.0, minw = 0.0;
-    double m0[9] = {0}, m1[27] = {0};
-    for (int64_t r = row0; r < ne; ++r)
-    {
-      const int64_t dof = b->col[lp][r];
-      double rv[3];
-      MFTLGetMinimumImageVector(d, rv, x, &dpos[3 * dof]);
-      rmax = fmax(rmax, fmax(fabs(rv[0]), fmax(fabs(rv[1]), fabs(rv[2]))));
-      const double *wv = &b->w[lp][nc * r];
-      if (nc == 1)
-      {
-        sa[0] += fabs(wv[0]);
-        m0[0] += wv[0];
-        for (int k = 0; k < 3; ++k) m1[k] += wv[0] * rv[k];
-        minw = fmin(minw, wv[0]);
-      }
-      else
-      {
-        const double *sv = &B->dir[3 * dof];
-        const double sg = sqrt(sv[0] * sv[0] + sv[1] * sv[1] + sv[2] * sv[2]);
-        for (int k = 0; k < 3; ++k)
-        {
-          sa[k] += fabs(wv[k]) * sg;
-          minw = fmin(minw, wv[k]);
-          for (int l = 0; l < 3; ++l)
-          {
-            m0[3 * k + l] += wv[k] * sv[l];
-            for (int bb = 0; bb < 3; ++bb) m1[9 * k + 3 * l + bb] += wv[k] * sv[l] * rv[bb];
-          }
-        }
-      }
-    }
-    const double sum_abs = fmax(sa[0], fmax(sa[1], sa[2]));
-    if (nc == 1)
-    {
-      r0 = fabs(m0[0] - 1.0);
-      r1 = fmax(fabs(m1[0]), fmax(fabs(m1[1]), fabs(m1[2])));
-    }
-    else
-    {
-      for (int k = 0; k < 3; ++k)
-        for (int l = 0; l < 3; ++l) r0 = fmax(r0, fabs(m0[3 * k + l] - ((k == l) ? 1.0 : 0.0)));
-      for (int a = 0; a < 27; ++a) r1 = fmax(r1, fabs(m1[a]));
-    }
-    const double bound = fmax(tol, 1e3 * DBL_EPSILON) * fmax(sum_abs, 1.0);
-    bool ok = true;
-    if (nr->reproduces != MFTL_REPRODUCE_NONE)
-    {
-      if (!(r0 <= bound)) ok = false;
-      if (nr->reproduces == MFTL_REPRODUCE_LINEAR && !(r1 <= bound * fmax(rmax, DBL_MIN))) ok = false;
-      if (!(sum_abs <= P->max_amplification)) ok = false;
-    }
-    const double resid = (nr->reproduces == MFTL_REPRODUCE_LINEAR) ? fmax(r0, (rmax > 0.0) ? r1 / rmax : r1)
-                                                                   : ((nr->reproduces == MFTL_REPRODUCE_CONSTANT) ? r0 : 0.0);
-    if (!ok)
-    {
-      if (Q->n_failed == 0) Q->first_failed_key = b->ref[i].key;
-      Q->n_failed++;
-      if (status < MFTL_COUPLING_BAD_STENCIL) status = MFTL_COUPLING_BAD_STENCIL;
-      continue;
-    }
-    Q->n_rows++;
-    Q->max_amplification = fmax(Q->max_amplification, sum_abs);
-    Q->min_weight = fmin(Q->min_weight, minw);
-    Q->max_moment_residual = fmax(Q->max_moment_residual, resid);
-  }
-  Q->n_entries += ne;
-  free(kd);
-  free(dpos);
-  return status;
-}
-
-int MFTLCouplerImportRows(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, const MFTL_CouplingWindow *w, int n_rows, const MFTL_NativeRows *rows,
-                          MFTL_CouplingBinding **out)
-{
-  if (out) *out = MFTL_NULL;
-  if (c == MFTL_NULL) return MFTL_COUPLING_INVALID;
-  c->stats.n_binds++;
-  int local = MFTL_COUPLING_OK;
-  if (spec == MFTL_NULL || w == MFTL_NULL || out == MFTL_NULL || w->c != c || c->active || n_rows < 1 || rows == MFTL_NULL)
-    local = MFTL_COUPLING_INVALID;
-  if (local == MFTL_COUPLING_OK && (spec->kind == MFTL_MARKERS_QUADRATURE || spec->operation != MFTL_OPERATOR_VALUE)) local = MFTL_COUPLING_INVALID;
-  if (local == MFTL_COUPLING_OK && !window_current(w)) local = MFTL_COUPLING_STALE;
-  /* what every rank must import alike: the marker kind and the locations with their declarations */
-  uint64_t sig = CPL_FNV_INIT;
-  {
-    const int hdr[2] = {spec ? (int) spec->kind : -1, n_rows};
-    sig = cpl_fnv(sig, hdr, sizeof hdr);
-    for (int i = 0; i < n_rows && rows; ++i)
-    {
-      const int lr[2] = {rows[i].location, (int) rows[i].reproduces};
-      sig = cpl_fnv(sig, lr, sizeof lr);
-    }
-  }
-  int *locs = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_rows, 1) * sizeof(int), "imported locations");
-  for (int i = 0; i < n_rows && local == MFTL_COUPLING_OK; ++i)
-  {
-    locs[i] = rows[i].location;
-    if (locs[i] < 0 || locs[i] >= c->n_loc) local = MFTL_COUPLING_INVALID;
-    for (int j = 0; j < i; ++j)
-      if (locs[j] == locs[i]) local = MFTL_COUPLING_INVALID;
-  }
-  cpl_markers m;
-  memset(&m, 0, sizeof m);
-  MFTL_CouplingBinding *b = MFTL_NULL;
-  if (local == MFTL_COUPLING_OK) local = gather_markers(c, spec, locs, n_rows, &m, MFTL_NULL);
-  if (local == MFTL_COUPLING_OK)
-  {
-    b = new_binding(c, w, n_rows, m.n);
-    b->kind = spec->kind;
-    b->op = MFTL_OPERATOR_VALUE;
-    b->imported = true;
-    b->q.min_weight = 0.0;
-    for (int i = 0; i < n_rows; ++i)
-    {
-      b->loc_band[i] = -1;
-      for (int j = 0; j < w->n_loc; ++j)
-        if (w->locs[j] == locs[i]) b->loc_band[i] = j;
-      if (b->loc_band[i] < 0) local = MFTL_COUPLING_INVALID;
-      b->ncomp[i] = c->li[locs[i]].directional ? 3 : 1;
-    }
-    memcpy(b->ref, m.ref, (size_t) m.n * sizeof(MFTL_MarkerRef));
-    memcpy(b->pos, m.pos, 3 * (size_t) m.n * sizeof(double));
-    memcpy(b->base_pos, m.pos, 3 * (size_t) m.n * sizeof(double));
-    b->n_bodies = m.n_bodies;
-    b->bodies = m.bodies;
-    m.bodies = MFTL_NULL;
-    b->pos_checksum = MFTLCplPositionsChecksum(m.pos, m.n);
-    for (int i = 0; i < n_rows && local == MFTL_COUPLING_OK; ++i)
-    {
-      const int s2 = import_location(c, b, i, &rows[i]);
-      if (s2 > local) local = s2;
-    }
-    /* every location gets its arrays, so a release after a failure frees what exists */
-    for (int i = 0; i < n_rows; ++i)
-    {
-      if (b->row_ptr[i] == MFTL_NULL) b->row_ptr[i] = (int64_t *) MFTLCallocOrDie((size_t) (m.n + 1), sizeof(int64_t), "imported rows");
-      if (b->col[i] == MFTL_NULL) b->col[i] = (int64_t *) MFTLMallocOrDie(sizeof(int64_t), "imported rows");
-      if (b->w[i] == MFTL_NULL) b->w[i] = (double *) MFTLMallocOrDie(3 * sizeof(double), "imported rows");
-    }
-  }
-  const int st = MFTLCplAgreeTransfer(c->comm, local, sig);
-  free(locs);
-  MFTLCplMarkersFree(&m);
-  if (st != MFTL_COUPLING_OK)
-  {
-    if (st == MFTL_COUPLING_STALE) c->stats.n_stale++;
-    if (b) MFTLCouplerReleaseBinding(&b);
-    return st;
-  }
-  *out = b;
-  return MFTL_COUPLING_OK;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
  * Transfers
  * ═══════════════════════════════════════════════════════════════════════════ */
 
@@ -4632,9 +4156,11 @@ void MFTLCouplerReleaseReady(MFTL_TransferReady **pr)
     if (r->binding) ((MFTL_CouplingBinding *) r->binding)->refcount--;
     r->c->live--;
   }
-  free((*pr)->fields);
-  free((*pr)->field_band);
-  free(*pr);
+  MFTLCplFree((*pr)->fields);
+  MFTLCplFree((*pr)->field_band);
+  MFTLCplFree((*pr)->fetch_off);
+  MFTLCplFree((*pr)->serve_off);
+  MFTLCplFree(*pr);
   *pr = MFTL_NULL;
 }
 
@@ -4642,18 +4168,19 @@ void MFTLCouplerReleaseFetch(MFTL_CouplingFetch **pf)
 {
   if (pf == MFTL_NULL || *pf == MFTL_NULL) return;
   MFTL_CouplingFetch *f = *pf;
-  for (int i = 0; i < f->n_fields; ++i) free(f->values[i]);
-  free(f->values);
-  free(f->field_band);
-  free(f->version);
-  free(f->wall);
-  if (f->win)
+  MFTL_CouplingWindow *w = (MFTL_CouplingWindow *) f->win;
+  w->refcount--;
+  if (w->c) w->c->live--;
+  /* Live snapshots never enter this pool, so simultaneous RK stages remain
+   * immutable. The window owns the cache and frees it with its geometry. */
+  if (w->n_fetch_pool < 3)
   {
-    MFTL_CouplingWindow *w = (MFTL_CouplingWindow *) f->win;
-    w->refcount--;
-    if (w->c) w->c->live--;
+    f->next = w->fetch_pool;
+    w->fetch_pool = f;
+    w->n_fetch_pool++;
   }
-  free(f);
+  else
+    fetch_storage_free(f);
   *pf = MFTL_NULL;
 }
 
@@ -4673,10 +4200,10 @@ static bool positions_moved_silently(const MFTL_Coupler *c, const MFTL_CouplingB
   s.quadrature_max_level = b->q_max;
   s.quadrature_ratio = b->q_ratio;
   cpl_markers m;
-  int *locs = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(b->n_loc, 1) * sizeof(int), "binding locations");
+  int *locs = (int *) MFTLCplAlloc((size_t) MFTL_MAX(b->n_loc, 1) * sizeof(int), "binding locations");
   for (int i = 0; i < b->n_loc; ++i) locs[i] = b->win->locs[b->loc_band[i]];
   const int gst = gather_markers(c, &s, locs, b->n_loc, &m, MFTL_NULL);
-  free(locs);
+  MFTLCplFree(locs);
   if (gst != MFTL_COUPLING_OK) return true;
   const bool moved = (m.n != b->n_markers) || MFTLCplPositionsChecksum(m.pos, m.n) != b->pos_checksum;
   MFTLCplMarkersFree(&m);
@@ -4685,11 +4212,10 @@ static bool positions_moved_silently(const MFTL_Coupler *c, const MFTL_CouplingB
 #endif
 }
 
-int MFTLCouplerPrepareTransfer(MFTL_Coupler *c, const MFTL_TransferSpec *spec, MFTL_TransferReady **out)
+static int prepare_transfer(MFTL_Coupler *c, const MFTL_TransferSpec *spec, MFTL_TransferReady **out, int local)
 {
   if (out) *out = MFTL_NULL;
   if (c == MFTL_NULL) return MFTL_COUPLING_INVALID;
-  int local = MFTL_COUPLING_OK;
   if (spec == MFTL_NULL || out == MFTL_NULL || c->active || spec->n_fields < 0 || (spec->n_fields > 0 && spec->fields == MFTL_NULL))
     local = MFTL_COUPLING_INVALID;
   const MFTL_CouplingWindow *w = MFTL_NULL;
@@ -4714,7 +4240,7 @@ int MFTLCouplerPrepareTransfer(MFTL_Coupler *c, const MFTL_TransferSpec *spec, M
   uint64_t sig = CPL_FNV_INIT;
   if (local == MFTL_COUPLING_OK)
   {
-    r = (MFTL_TransferReady *) MFTLCallocOrDie(1, sizeof(MFTL_TransferReady), "transfer");
+    r = (MFTL_TransferReady *) MFTLCplCalloc(1, sizeof(MFTL_TransferReady), "transfer");
     r->c = c;
     r->direction = spec->direction;
     r->win = w;
@@ -4722,8 +4248,8 @@ int MFTLCouplerPrepareTransfer(MFTL_Coupler *c, const MFTL_TransferSpec *spec, M
     r->window_id = w->id;
     r->n_fields = spec->n_fields;
     r->form = spec->form;
-    r->fields = (MFTL_SolverField *) MFTLMallocOrDie((size_t) MFTL_MAX(spec->n_fields, 1) * sizeof(MFTL_SolverField), "transfer");
-    r->field_band = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(spec->n_fields, 1) * sizeof(int), "transfer");
+    r->fields = (MFTL_SolverField *) MFTLCplAlloc((size_t) MFTL_MAX(spec->n_fields, 1) * sizeof(MFTL_SolverField), "transfer");
+    r->field_band = (int *) MFTLCplAlloc((size_t) MFTL_MAX(spec->n_fields, 1) * sizeof(int), "transfer");
     const int dir = (int) spec->direction, form = (int) spec->form;
     sig = cpl_fnv(sig, &dir, sizeof dir);
     sig = cpl_fnv(sig, &form, sizeof form);
@@ -4762,17 +4288,32 @@ int MFTLCouplerPrepareTransfer(MFTL_Coupler *c, const MFTL_TransferSpec *spec, M
       sig = cpl_fnv(sig, fl, sizeof fl);
     }
   }
-  int st = agree(c, local);
-  if (st == MFTL_COUPLING_OK && !MFTLCplAgreeHash(c->comm, sig))
-  {
-    if (c->rank == 0) fprintf(stderr, "MFTL coupling: transfer signatures differ between ranks\n");
-    st = MFTL_COUPLING_INVALID;
-  }
+  int st = MFTLCplAgreeValidated(c->comm, local, sig);
   if (st != MFTL_COUPLING_OK)
   {
     if (st == MFTL_COUPLING_STALE) c->stats.n_stale++;
     MFTLCouplerReleaseReady(&r);
     return st;
+  }
+  r->fetch_off = (int64_t *) MFTLCplCalloc((size_t) w->n_fetch_peers * r->n_fields + 1, sizeof(int64_t), "transfer offsets");
+  r->serve_off = (int64_t *) MFTLCplCalloc((size_t) w->n_serve_peers * r->n_fields + 1, sizeof(int64_t), "transfer offsets");
+  for (int side = 0; side < 2; ++side)
+  {
+    const int np = side ? w->n_serve_peers : w->n_fetch_peers;
+    const int *segments = side ? w->serve_segment : w->fetch_segment;
+    int64_t *off = side ? r->serve_off : r->fetch_off;
+    for (int p = 0; p < np; ++p)
+      for (int i = 0; i < r->n_fields; ++i)
+      {
+        const cpl_band *B = &w->band[r->field_band[i]];
+        const int j = segments[(size_t) p * w->n_loc + r->field_band[i]];
+        const bool omit_halo = r->direction == MFTL_TRANSFER_FETCH ? r->fields[i].halo_valid : r->fields[i].halo_transpose;
+        int64_t len = 0;
+        if (j >= 0) len = side ? B->dst_nonhalo[j] + (omit_halo ? 0 : B->dst_halo[j])
+                              : B->src_nonhalo[j] + (omit_halo ? 0 : B->src_halo[j]);
+        const int64_t a = (int64_t) p * r->n_fields + i;
+        off[a + 1] = off[a] + len;
+      }
   }
   r->id = ++c->transfer_counter;
   r->retained = true;
@@ -4783,14 +4324,9 @@ int MFTLCouplerPrepareTransfer(MFTL_Coupler *c, const MFTL_TransferSpec *spec, M
   return MFTL_COUPLING_OK;
 }
 
-/** @brief Values per marker of a batch of fields (by window band) through a binding: the sum of their components. */
-static int binding_values(const MFTL_CouplingBinding *b, int nf, const int *field_band)
+int MFTLCouplerPrepareTransfer(MFTL_Coupler *c, const MFTL_TransferSpec *spec, MFTL_TransferReady **out)
 {
-  int nv = 0;
-  for (int i = 0; i < nf; ++i)
-    for (int j = 0; j < b->n_loc; ++j)
-      if (b->loc_band[j] == field_band[i]) nv += b->ncomp[j];
-  return nv;
+  return prepare_transfer(c, spec, out, MFTL_COUPLING_OK);
 }
 
 /** @brief Whether every one of @p n loads is finite: a NaN spread would poison
@@ -4817,7 +4353,7 @@ static int transfer_begin_status(MFTL_Coupler *c, const MFTL_TransferReady *r, M
     const MFTL_CouplingBinding *b = r->binding;
     if (!loads && b->n_markers > 0 && r->n_fields > 0)
       local = MFTL_COUPLING_INVALID;
-    else if (!loads_finite(loads, b->n_markers * (int64_t) binding_values(b, r->n_fields, r->field_band)))
+    else if (!loads_finite(loads, b->n_markers * (int64_t) r->n_fields))
     {
       fprintf(stderr, "MFTL coupling: a spread load is not finite\n");
       local = MFTL_COUPLING_INVALID;
@@ -4839,26 +4375,19 @@ static int transfer_begin_status(MFTL_Coupler *c, const MFTL_TransferReady *r, M
 static int64_t seg_fwd(int64_t nonhalo, int64_t halo, const MFTL_SolverField *F) { return nonhalo + (F->halo_valid ? 0 : halo); }
 static int64_t seg_rev(int64_t nonhalo, int64_t halo, const MFTL_SolverField *F) { return nonhalo + (F->halo_transpose ? 0 : halo); }
 
-static int find_rank(const int *ranks, int n, int r)
-{
-  for (int i = 0; i < n; ++i)
-    if (ranks[i] == r) return i;
-  return -1;
-}
-
 static void ensure_staging(MFTL_Coupler *c, int64_t ns, int64_t nr)
 {
   if (ns > c->scap)
   {
     c->scap = MFTL_MAX(ns, 2 * c->scap);
-    free(c->sbuf);
-    c->sbuf = (double *) MFTLMallocOrDie((size_t) c->scap * sizeof(double), "coupling staging");
+    MFTLCplFree(c->sbuf);
+    c->sbuf = (double *) MFTLCplAlloc((size_t) c->scap * sizeof(double), "coupling staging");
   }
   if (nr > c->rcap)
   {
     c->rcap = MFTL_MAX(nr, 2 * c->rcap);
-    free(c->rbuf);
-    c->rbuf = (double *) MFTLMallocOrDie((size_t) c->rcap * sizeof(double), "coupling staging");
+    MFTLCplFree(c->rbuf);
+    c->rbuf = (double *) MFTLCplAlloc((size_t) c->rcap * sizeof(double), "coupling staging");
   }
 }
 
@@ -4871,53 +4400,56 @@ int MFTLCouplerFetchBegin(MFTL_Coupler *c, const MFTL_TransferReady *r)
   const int st = transfer_begin_status(c, r, MFTL_TRANSFER_FETCH, MFTL_NULL);
   if (st != MFTL_COUPLING_OK) return st;
   const MFTL_CouplingWindow *w = r->win;
-  MFTL_CouplingFetch *f = (MFTL_CouplingFetch *) MFTLCallocOrDie(1, sizeof(MFTL_CouplingFetch), "fetch");
-  f->win = w;
-  f->window_id = w->id;
-  f->n_fields = r->n_fields;
-  f->field_band = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(r->n_fields, 1) * sizeof(int), "fetch");
-  f->values = (double **) MFTLCallocOrDie((size_t) MFTL_MAX(r->n_fields, 1), sizeof(double *), "fetch");
-  f->version = (uint64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(r->n_fields, 1) * sizeof(uint64_t), "fetch");
-  f->wall = (double *) MFTLCallocOrDie(6 * (size_t) MFTL_MAX(r->n_fields, 1), sizeof(double), "fetch walls");
+  MFTL_CouplingWindow *mw = (MFTL_CouplingWindow *) w;
+  MFTL_CouplingFetch *f = mw->fetch_pool;
+  if (f)
+  {
+    mw->fetch_pool = f->next;
+    mw->n_fetch_pool--;
+    bool same = f->n_fields == r->n_fields;
+    for (int i = 0; i < r->n_fields && same; ++i) same = f->field_band[i] == r->field_band[i];
+    if (!same)
+    {
+      fetch_storage_free(f);
+      f = MFTL_NULL;
+    }
+    else
+      c->stats.n_fetch_reused++;
+  }
+  if (!f)
+  {
+    f = (MFTL_CouplingFetch *) MFTLCplCalloc(1, sizeof(MFTL_CouplingFetch), "fetch");
+    f->win = w;
+    f->window_id = w->id;
+    f->n_fields = r->n_fields;
+    f->field_band = (int *) MFTLCplAlloc((size_t) MFTL_MAX(r->n_fields, 1) * sizeof(int), "fetch");
+    f->values = (double **) MFTLCplCalloc((size_t) MFTL_MAX(r->n_fields, 1), sizeof(double *), "fetch");
+    f->version = (uint64_t *) MFTLCplAlloc((size_t) MFTL_MAX(r->n_fields, 1) * sizeof(uint64_t), "fetch");
+    f->wall = (double *) MFTLCplCalloc(6 * (size_t) MFTL_MAX(r->n_fields, 1), sizeof(double), "fetch walls");
+    for (int i = 0; i < r->n_fields; ++i)
+    {
+      f->field_band[i] = r->field_band[i];
+      f->values[i] = (double *) MFTLCplAlloc((size_t) MFTL_MAX(w->band[r->field_band[i]].n_dof, 1) * sizeof(double), "fetch values");
+    }
+  }
+  f->next = MFTL_NULL;
   for (int i = 0; i < r->n_fields; ++i)
   {
-    f->field_band[i] = r->field_band[i];
     f->version[i] = r->fields[i].version;
-    if (r->fields[i].wall_value) memcpy(&f->wall[6 * i], r->fields[i].wall_value, 6 * sizeof(double));
-    f->values[i] = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(w->band[r->field_band[i]].n_dof, 1) * sizeof(double), "fetch values");
+    for (int g = 0; g < 6; ++g) f->wall[6 * i + g] = r->fields[i].wall_value ? r->fields[i].wall_value[g] : 0.0;
   }
   ((MFTL_CouplingWindow *) w)->refcount++;
   c->live++;
 
-  /* sizes */
-  int64_t ns = 0, nr = 0;
-  for (int p = 0; p < w->n_serve_peers; ++p)
-    for (int i = 0; i < r->n_fields; ++i)
-    {
-      const cpl_band *B = &w->band[r->field_band[i]];
-      const int s = find_rank(B->dst_rank, B->n_dst, w->serve_peer[p]);
-      if (s >= 0) ns += seg_fwd(B->dst_nonhalo[s], B->dst_halo[s], &r->fields[i]);
-    }
-  for (int p = 0; p < w->n_fetch_peers; ++p)
-    for (int i = 0; i < r->n_fields; ++i)
-    {
-      const cpl_band *B = &w->band[r->field_band[i]];
-      const int s = find_rank(B->src_rank, B->n_src, w->fetch_peer[p]);
-      if (s >= 0) nr += seg_fwd(B->src_nonhalo[s], B->src_halo[s], &r->fields[i]);
-    }
+  const int64_t ns = r->serve_off[(int64_t) w->n_serve_peers * r->n_fields];
+  const int64_t nr = r->fetch_off[(int64_t) w->n_fetch_peers * r->n_fields];
   ensure_staging(c, ns, nr);
 
   /* receives */
   int64_t at = 0;
   for (int p = 0; p < w->n_fetch_peers; ++p)
   {
-    int64_t len = 0;
-    for (int i = 0; i < r->n_fields; ++i)
-    {
-      const cpl_band *B = &w->band[r->field_band[i]];
-      const int s = find_rank(B->src_rank, B->n_src, w->fetch_peer[p]);
-      if (s >= 0) len += seg_fwd(B->src_nonhalo[s], B->src_halo[s], &r->fields[i]);
-    }
+    const int64_t len = r->fetch_off[(int64_t) (p + 1) * r->n_fields] - r->fetch_off[(int64_t) p * r->n_fields];
     if (len > 0) MFTLCplSchedRecv(c->comm, &c->sched, CPL_TAG_FETCH, w->fetch_peer[p], c->rbuf + at, (size_t) len * sizeof(double));
     at += len;
   }
@@ -4929,7 +4461,7 @@ int MFTLCouplerFetchBegin(MFTL_Coupler *c, const MFTL_TransferReady *r)
     for (int i = 0; i < r->n_fields; ++i)
     {
       const cpl_band *B = &w->band[r->field_band[i]];
-      const int s = find_rank(B->dst_rank, B->n_dst, w->serve_peer[p]);
+      const int s = w->serve_segment[(size_t) p * w->n_loc + r->field_band[i]];
       if (s < 0) continue;
       const int64_t len = seg_fwd(B->dst_nonhalo[s], B->dst_halo[s], &r->fields[i]);
       const MFTL_SolverField *F = &r->fields[i];
@@ -4979,7 +4511,7 @@ int MFTLCouplerFetchEnd(MFTL_Coupler *c, MFTL_CouplingFetch **out)
     for (int i = 0; i < r->n_fields; ++i)
     {
       const cpl_band *B = &w->band[r->field_band[i]];
-      const int s = find_rank(B->src_rank, B->n_src, w->fetch_peer[p]);
+      const int s = w->fetch_segment[(size_t) p * w->n_loc + r->field_band[i]];
       if (s < 0) continue;
       const int64_t len = seg_fwd(B->src_nonhalo[s], B->src_halo[s], &r->fields[i]);
       if (len > 0) memcpy(&f->values[i][B->src_off[s]], c->rbuf + at, (size_t) len * sizeof(double));
@@ -5009,8 +4541,6 @@ int MFTLCouplerInterpolateFetched(const MFTL_CouplingBinding *b, const MFTL_Coup
       if (b->loc_band[j] == f->field_band[i]) bound = true;
     if (!bound) return MFTL_COUPLING_INVALID;
   }
-  const int nv = binding_values(b, nf, f->field_band);
-  int off = 0;
   for (int i = 0; i < nf; ++i)
   {
     int lp = -1;
@@ -5022,28 +4552,17 @@ int MFTLCouplerInterpolateFetched(const MFTL_CouplingBinding *b, const MFTL_Coup
     const double *wt = b->w[lp];
     const double *v = f->values[i];
     const double *wc = b->wallc[lp], *wv = &f->wall[6 * i];
-    const int nc = b->ncomp[lp];
-    if (nc == 1)
-      for (int64_t m = 0; m < b->n_markers; ++m)
-      {
-        double acc = 0.0;
+    for (int64_t m = 0; m < b->n_markers; ++m)
+    {
+      double acc = 0.0;
+      if (b->tensor[lp] && b->tensor[lp][m].count)
+        acc = MFTLCplTensorValue(&b->tensor[lp][m], v);
+      else
         for (int64_t e = rp[m]; e < rp[m + 1]; ++e) acc += wt[e] * v[col[e]];
-        if (wc)
-          for (int g = 0; g < 6; ++g) acc += wc[6 * m + g] * wv[g];
-        values[m * nv + off] = acc;
-      }
-    else
-      for (int64_t m = 0; m < b->n_markers; ++m)
-      {
-        double acc[3] = {0.0, 0.0, 0.0};
-        for (int64_t e = rp[m]; e < rp[m + 1]; ++e)
-          for (int k = 0; k < 3; ++k) acc[k] += wt[3 * e + k] * v[col[e]];
-        if (wc)
-          for (int k = 0; k < 3; ++k)
-            for (int g = 0; g < 6; ++g) acc[k] += wc[6 * (3 * m + k) + g] * wv[g];
-        for (int k = 0; k < 3; ++k) values[m * nv + off + k] = acc[k];
-      }
-    off += nc;
+      if (wc)
+        for (int g = 0; g < 6; ++g) acc += wc[6 * m + g] * wv[g];
+      values[m * nf + i] = acc;
+    }
   }
   return MFTL_COUPLING_OK;
 }
@@ -5056,19 +4575,17 @@ int MFTLCouplerSpreadBegin(MFTL_Coupler *c, const MFTL_TransferReady *r, const d
   const MFTL_CouplingBinding *b = r->binding;
   const MFTL_CouplingWindow *w = r->win;
   const int nf = r->n_fields;
-  const int nv = binding_values(b, nf, r->field_band);
-  int voff = 0;
 
   /* b = W^T F per field, over the band */
   if (c->reaction_cap < 6 * nf)
   {
     c->reaction_cap = 6 * nf;
-    c->reaction = (double *) MFTLReallocOrDie(c->reaction, (size_t) c->reaction_cap * sizeof(double), "wall reactions");
+    c->reaction = (double *) MFTLCplRealloc(c->reaction, (size_t) c->reaction_cap * sizeof(double), "wall reactions");
   }
   if (c->spread_scratch_n < nf)
   {
-    c->spread_scratch = (double **) MFTLReallocOrDie(c->spread_scratch, (size_t) nf * sizeof(double *), "spread scratch");
-    c->spread_scratch_cap = (int64_t *) MFTLReallocOrDie(c->spread_scratch_cap, (size_t) nf * sizeof(int64_t), "spread scratch");
+    c->spread_scratch = (double **) MFTLCplRealloc(c->spread_scratch, (size_t) nf * sizeof(double *), "spread scratch");
+    c->spread_scratch_cap = (int64_t *) MFTLCplRealloc(c->spread_scratch_cap, (size_t) nf * sizeof(int64_t), "spread scratch");
     for (int i = c->spread_scratch_n; i < nf; ++i)
     {
       c->spread_scratch[i] = MFTL_NULL;
@@ -5081,9 +4598,9 @@ int MFTLCouplerSpreadBegin(MFTL_Coupler *c, const MFTL_TransferReady *r, const d
     const cpl_band *B = &w->band[r->field_band[i]];
     if (B->n_dof > c->spread_scratch_cap[i])
     {
-      free(c->spread_scratch[i]);
+      MFTLCplFree(c->spread_scratch[i]);
       c->spread_scratch_cap[i] = B->n_dof;
-      c->spread_scratch[i] = (double *) MFTLMallocOrDie((size_t) B->n_dof * sizeof(double), "spread scratch");
+      c->spread_scratch[i] = (double *) MFTLCplAlloc((size_t) B->n_dof * sizeof(double), "spread scratch");
     }
     double *s = c->spread_scratch[i];
     for (int64_t x = 0; x < B->n_dof; ++x) s[x] = 0.0;
@@ -5093,56 +4610,30 @@ int MFTLCouplerSpreadBegin(MFTL_Coupler *c, const MFTL_TransferReady *r, const d
     const int64_t *rp = b->row_ptr[lp];
     const int64_t *col = b->col[lp];
     const double *wt = b->w[lp];
-    const int nc = b->ncomp[lp];
-    if (nc == 1)
-      for (int64_t m = 0; m < b->n_markers; ++m)
-      {
-        const double F = loads[m * nv + voff];
+    for (int64_t m = 0; m < b->n_markers; ++m)
+    {
+      const double F = loads[m * nf + i];
+      if (b->tensor[lp] && b->tensor[lp][m].count)
+        MFTLCplTensorSpread(&b->tensor[lp][m], F, s);
+      else
         for (int64_t e = rp[m]; e < rp[m + 1]; ++e) s[col[e]] += wt[e] * F;
-      }
-    else
-      for (int64_t m = 0; m < b->n_markers; ++m)
-      {
-        const double *F = &loads[m * nv + voff];
-        for (int64_t e = rp[m]; e < rp[m + 1]; ++e) s[col[e]] += wt[3 * e] * F[0] + wt[3 * e + 1] * F[1] + wt[3 * e + 2] * F[2];
-      }
+    }
     /* the walls' share: what an ODD face's prescribed value absorbs */
     double *R = &c->reaction[6 * i];
     for (int g = 0; g < 6; ++g) R[g] = 0.0;
     if (b->wallc[lp])
       for (int64_t m = 0; m < b->n_markers; ++m)
-        for (int k = 0; k < nc; ++k)
-          for (int g = 0; g < 6; ++g) R[g] += b->wallc[lp][6 * (nc * m + k) + g] * loads[m * nv + voff + k];
-    voff += nc;
+        for (int g = 0; g < 6; ++g) R[g] += b->wallc[lp][6 * m + g] * loads[m * nf + i];
   }
 
   /* reverse exchange: I send to my providers, receive from my requesters */
-  int64_t ns = 0, nr = 0;
-  for (int p = 0; p < w->n_fetch_peers; ++p)
-    for (int i = 0; i < nf; ++i)
-    {
-      const cpl_band *B = &w->band[r->field_band[i]];
-      const int s = find_rank(B->src_rank, B->n_src, w->fetch_peer[p]);
-      if (s >= 0) ns += seg_rev(B->src_nonhalo[s], B->src_halo[s], &r->fields[i]);
-    }
-  for (int p = 0; p < w->n_serve_peers; ++p)
-    for (int i = 0; i < nf; ++i)
-    {
-      const cpl_band *B = &w->band[r->field_band[i]];
-      const int s = find_rank(B->dst_rank, B->n_dst, w->serve_peer[p]);
-      if (s >= 0) nr += seg_rev(B->dst_nonhalo[s], B->dst_halo[s], &r->fields[i]);
-    }
+  const int64_t ns = r->fetch_off[(int64_t) w->n_fetch_peers * nf];
+  const int64_t nr = r->serve_off[(int64_t) w->n_serve_peers * nf];
   ensure_staging(c, ns, nr);
   int64_t at = 0;
   for (int p = 0; p < w->n_serve_peers; ++p)
   {
-    int64_t len = 0;
-    for (int i = 0; i < nf; ++i)
-    {
-      const cpl_band *B = &w->band[r->field_band[i]];
-      const int s = find_rank(B->dst_rank, B->n_dst, w->serve_peer[p]);
-      if (s >= 0) len += seg_rev(B->dst_nonhalo[s], B->dst_halo[s], &r->fields[i]);
-    }
+    const int64_t len = r->serve_off[(int64_t) (p + 1) * nf] - r->serve_off[(int64_t) p * nf];
     if (len > 0) MFTLCplSchedRecv(c->comm, &c->sched, CPL_TAG_SPREAD, w->serve_peer[p], c->rbuf + at, (size_t) len * sizeof(double));
     at += len;
   }
@@ -5153,7 +4644,7 @@ int MFTLCouplerSpreadBegin(MFTL_Coupler *c, const MFTL_TransferReady *r, const d
     for (int i = 0; i < nf; ++i)
     {
       const cpl_band *B = &w->band[r->field_band[i]];
-      const int s = find_rank(B->src_rank, B->n_src, w->fetch_peer[p]);
+      const int s = w->fetch_segment[(size_t) p * w->n_loc + r->field_band[i]];
       if (s < 0) continue;
       const int64_t len = seg_rev(B->src_nonhalo[s], B->src_halo[s], &r->fields[i]);
       memcpy(c->sbuf + at, &c->spread_scratch[i][B->src_off[s]], (size_t) len * sizeof(double));
@@ -5234,21 +4725,6 @@ int MFTLCouplerSpreadEnd(MFTL_Coupler *c)
   int *con_dest = MFTL_NULL;
   cpl_buf *con_bufs = MFTL_NULL;
 
-  /* receive offsets per serve peer */
-  int64_t *poff = (int64_t *) MFTLMallocOrDie((size_t) (w->n_serve_peers + 1) * sizeof(int64_t), "spread offsets");
-  poff[0] = 0;
-  for (int p = 0; p < w->n_serve_peers; ++p)
-  {
-    int64_t len = 0;
-    for (int i = 0; i < nf; ++i)
-    {
-      const cpl_band *B = &w->band[r->field_band[i]];
-      const int s = find_rank(B->dst_rank, B->n_dst, w->serve_peer[p]);
-      if (s >= 0) len += seg_rev(B->dst_nonhalo[s], B->dst_halo[s], &r->fields[i]);
-    }
-    poff[p + 1] = poff[p] + len;
-  }
-
   /* the solver completes the ghost route: clear its ghost layers first (then
    * the owned additions, then the halo loads -- that order survives aliasing) */
   for (int i = 0; i < nf; ++i)
@@ -5273,14 +4749,8 @@ int MFTLCouplerSpreadEnd(MFTL_Coupler *c)
         for (int64_t x = 0; x < len; ++x) acc[B->pack_served[B->dst_off[dsi] + x]] += s[x];
         continue;
       }
-      const int p = find_rank(w->serve_peer, w->n_serve_peers, src);
-      int64_t off = poff[p];
-      for (int j = 0; j < i; ++j)
-      {
-        const cpl_band *Bj = &w->band[r->field_band[j]];
-        const int s = find_rank(Bj->dst_rank, Bj->n_dst, src);
-        if (s >= 0) off += seg_rev(Bj->dst_nonhalo[s], Bj->dst_halo[s], &r->fields[j]);
-      }
+      const int p = B->dst_peer[dsi];
+      const int64_t off = r->serve_off[(int64_t) p * nf + i];
       for (int64_t x = 0; x < len; ++x) acc[B->pack_served[B->dst_off[dsi] + x]] += c->rbuf[off + x];
     }
     /* a constrained sample's load leaves it: P^T to its free samples, here
@@ -5350,7 +4820,6 @@ int MFTLCouplerSpreadEnd(MFTL_Coupler *c)
           *field_at(F, B->piece[x], B->elem[x]) += (r->form == MFTL_SPREAD_DENSITY) ? v / B->measure[x] : v;
         }
   }
-  free(poff);
   /* the constraint transposes owed to other ranks: one NBX when some field's
    * location is constrained (agreed: locations are in the signature) */
   bool any_con = false;
@@ -5358,8 +4827,8 @@ int MFTLCouplerSpreadEnd(MFTL_Coupler *c)
     if (c->li[w->band[r->field_band[i]].location].constrained) any_con = true;
   if (any_con)
   {
-    unsigned char **sb = (unsigned char **) MFTLMallocOrDie((size_t) MFTL_MAX(con_n_dest, 1) * sizeof(unsigned char *), "constraint loads");
-    size_t *sz = (size_t *) MFTLMallocOrDie((size_t) MFTL_MAX(con_n_dest, 1) * sizeof(size_t), "constraint loads");
+    unsigned char **sb = (unsigned char **) MFTLCplAlloc((size_t) MFTL_MAX(con_n_dest, 1) * sizeof(unsigned char *), "constraint loads");
+    size_t *sz = (size_t *) MFTLCplAlloc((size_t) MFTL_MAX(con_n_dest, 1) * sizeof(size_t), "constraint loads");
     for (int i = 0; i < con_n_dest; ++i)
     {
       sb[i] = con_bufs[i].data;
@@ -5385,15 +4854,15 @@ int MFTLCouplerSpreadEnd(MFTL_Coupler *c)
       }
     }
     MFTLCplMsgsFree(in, n_in);
-    free(in);
-    free(sb);
-    free(sz);
+    MFTLCplFree(in);
+    MFTLCplFree(sb);
+    MFTLCplFree(sz);
   }
-  for (int i = 0; i < con_n_dest; ++i) free(con_bufs[i].data);
-  free(con_bufs);
-  free(con_dest);
-  free(con_local_key);
-  free(con_local_val);
+  for (int i = 0; i < con_n_dest; ++i) MFTLCplFree(con_bufs[i].data);
+  MFTLCplFree(con_bufs);
+  MFTLCplFree(con_dest);
+  MFTLCplFree(con_local_key);
+  MFTLCplFree(con_local_val);
   /* wall reactions: one SUM when some field's location mirrors (agreed: the
    * locations are part of the signature, the policy part of their definition) */
   bool any_mirror = false;
@@ -5446,15 +4915,24 @@ int MFTLCouplerInterpolate(MFTL_Coupler *c, const MFTL_CouplingBinding *b, int n
       if (b->win->locs[b->loc_band[j]] == fields[i].location) bound = true;
     if (!bound) local = MFTL_COUPLING_INVALID;
   }
-  int st = agree(c, local);
+  MFTL_TransferSpec spec;
+  memset(&spec, 0, sizeof spec);
+  spec.direction = MFTL_TRANSFER_FETCH;
+  spec.window = b ? b->win : MFTL_NULL;
+  spec.n_fields = n_fields;
+  spec.fields = fields;
+  MFTL_TransferReady *ready = MFTL_NULL;
+  int st = prepare_transfer(c, &spec, &ready, local);
   if (st != MFTL_COUPLING_OK) return st;
   MFTL_CouplingFetch *f = MFTL_NULL;
-  const MFTL_CouplingWindow *w = b ? b->win : MFTL_NULL;
-  st = MFTLCouplerFetch(c, w, n_fields, fields, &f);
-  if (st != MFTL_COUPLING_OK) return st;
-  local = MFTLCouplerInterpolateFetched(b, f, values);
+  st = MFTLCouplerFetchBegin(c, ready);
+  if (st == MFTL_COUPLING_OK) st = MFTLCouplerFetchEnd(c, &f);
+  /* All interpolation preconditions were agreed in preparation. No state can
+   * change during this synchronous call, so a trailing reduction is redundant. */
+  if (st == MFTL_COUPLING_OK) st = MFTLCouplerInterpolateFetched(b, f, values);
   MFTLCouplerReleaseFetch(&f);
-  return agree(c, local);
+  MFTLCouplerReleaseReady(&ready);
+  return st;
 }
 
 int MFTLCouplerSpread(MFTL_Coupler *c, const MFTL_CouplingBinding *b, int n_fields, const MFTL_SolverField *targets, const double *loads, MFTL_SpreadForm form)
@@ -5473,319 +4951,6 @@ int MFTLCouplerSpread(MFTL_Coupler *c, const MFTL_CouplingBinding *b, int n_fiel
   if (st == MFTL_COUPLING_OK) st = MFTLCouplerSpreadEnd(c);
   MFTLCouplerReleaseReady(&r);
   return st;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Nearest-surface queries
- *
- * A query is a support request for the triangles' centroids whose skin covers
- * each WHOLE triangle and the width -- so the window certifies every sample
- * within the width of any owned triangle -- followed by candidates computed by
- * each triangle's owner and merged on each sample's owner along the window's
- * reverse schedule. The merge is a total order, so the result is one record
- * however the candidates are split among ranks.
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-int MFTLCouplerRequestQuery(MFTL_Coupler *c, int n_locations, const int *locations, double width, MFTL_SupportRequest **out)
-{
-  if (out) *out = MFTL_NULL;
-  if (c == MFTL_NULL) return MFTL_COUPLING_INVALID;
-  const MFTL_Domain *d = &c->ens->domain;
-  /* the largest half-extent of an owned triangle about its centroid, job-wide */
-  double ext[3] = {0.0, 0.0, 0.0};
-  for (int o = 0; o < c->ens->n_local_objects; ++o)
-  {
-    const MFTL_Object *obj = c->ens->local_objects[o];
-    for (int t = 0; t < obj->tris.n_local; ++t)
-    {
-      double T[3][3], ce[3];
-      MFTLCplTriangleCentroidFrame(d, obj, t, T, ce);
-      for (int i = 0; i < 3; ++i)
-        for (int k = 0; k < 3; ++k) ext[k] = fmax(ext[k], fabs(T[i][k] - ce[k]));
-    }
-  }
-  MFTLCplAllreduceMax(c->comm, ext, 3);
-  MFTL_MarkerSpec ms;
-  memset(&ms, 0, sizeof ms);
-  ms.kind = MFTL_MARKERS_CENTROIDS;
-  ms.n_locations = n_locations;
-  ms.locations = locations;
-  MFTL_WindowSpec ws;
-  memset(&ws, 0, sizeof ws);
-  /* NaN or a non-positive width makes the skin invalid, which the request agrees */
-  for (int k = 0; k < 3; ++k) ws.skin[k] = (width > 0.0 && isfinite(width)) ? (width + ext[k]) * (1.0 + 1e-12) + 1e-300 : -1.0;
-  return MFTLCouplerRequestSupport(c, &ms, &ws, out);
-}
-
-int MFTLCouplerQueryNearest(MFTL_Coupler *c, const MFTL_CouplingWindow *w, double width, int n_fields, const MFTL_QueryField *fields)
-{
-  if (c == MFTL_NULL) return MFTL_COUPLING_INVALID;
-  const MFTL_Domain *d = &c->ens->domain;
-  int local = MFTL_COUPLING_OK;
-  if (w == MFTL_NULL || w->c != c || w->keyed || c->active || !(width > 0.0) || !isfinite(width) || n_fields < 1 || fields == MFTL_NULL)
-    local = MFTL_COUPLING_INVALID;
-  int *fband = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_fields, 1) * sizeof(int), "query fields");
-  uint64_t sig = CPL_FNV_INIT;
-  sig = cpl_fnv(sig, &width, sizeof width);
-  sig = cpl_fnv(sig, &n_fields, sizeof n_fields);
-  const uint64_t window_id = w ? w->id : 0;
-  sig = cpl_fnv(sig, &window_id, sizeof window_id);
-  for (int f = 0; f < n_fields && local == MFTL_COUPLING_OK; ++f)
-  {
-    const MFTL_QueryField *Q = &fields[f];
-    fband[f] = -1;
-    for (int j = 0; j < w->n_loc; ++j)
-      if (w->locs[j] == Q->location) fband[f] = j;
-    for (int g2 = 0; g2 < f; ++g2)
-      if (fields[g2].location == Q->location) fband[f] = -1;
-    if (fband[f] < 0 || Q->stride < 0 || (c->grid->loc[Q->location].n_pieces > 0 && Q->data == MFTL_NULL)) local = MFTL_COUPLING_INVALID;
-    for (int p = 0; local == MFTL_COUPLING_OK && p < c->grid->loc[Q->location].n_pieces; ++p)
-      if (Q->data[p] == MFTL_NULL) local = MFTL_COUPLING_INVALID;
-    sig = cpl_fnv(sig, &Q->location, sizeof Q->location);
-  }
-  if (local == MFTL_COUPLING_OK && !window_current(w)) local = MFTL_COUPLING_STALE;
-  /* the certificate: every owned triangle, widened by the width, inside the
-   * box its centroid's requested bin was widened to, at every location */
-  if (local == MFTL_COUPLING_OK)
-  {
-    for (int o = 0; o < c->ens->n_local_objects && local == MFTL_COUPLING_OK; ++o)
-    {
-      const MFTL_Object *obj = c->ens->local_objects[o];
-      for (int t = 0; t < obj->tris.n_local && local == MFTL_COUPLING_OK; ++t)
-      {
-        double T[3][3], ce[3];
-        MFTLCplTriangleCentroidFrame(d, obj, t, T, ce);
-        int64_t ib[3];
-        for (int k = 0; k < 3; ++k) ib[k] = (int64_t) floor((ce[k] - d->global_min[k]) / w->bin[k]);
-        if (find_u64(w->bin_key, w->n_bins, bin_key3(ib[0], ib[1], ib[2])) < 0)
-        {
-          local = MFTL_COUPLING_STALE;
-          break;
-        }
-        for (int f = 0; f < n_fields; ++f)
-        {
-          const cpl_locinfo *li = &c->li[fields[f].location];
-          for (int k = 0; k < 3; ++k)
-          {
-            const double flo = d->global_min[k] + (double) ib[k] * w->bin[k];
-            const double lo = fmin(T[0][k], fmin(T[1][k], T[2][k])) - width, hi = fmax(T[0][k], fmax(T[1][k], T[2][k])) + width;
-            if (lo < flo - li->reach[k] - w->skin[k] || hi > flo + w->bin[k] + li->reach[k] + w->skin[k]) local = MFTL_COUPLING_STALE;
-          }
-        }
-      }
-    }
-    if (local == MFTL_COUPLING_STALE) fprintf(stderr, "MFTL coupling: a triangle and the query width reach beyond the window (request it again)\n");
-  }
-  int st = MFTLCplAgreeTransfer(c->comm, local, sig);
-  if (st != MFTL_COUPLING_OK)
-  {
-    if (st == MFTL_COUPLING_STALE) c->stats.n_stale++;
-    free(fband);
-    return st;
-  }
-
-  /* ── the pseudo-normals: owned vertices' over their whole fans, ghosts' from their owners ── */
-  cpl_markers tm;
-  memset(&tm, 0, sizeof tm);
-  for (int o = 0; o < c->ens->n_local_objects; ++o) tm.n += c->ens->local_objects[o]->tris.n_local;
-  tm.ref = (MFTL_MarkerRef *) MFTLCallocOrDie((size_t) MFTL_MAX(tm.n, 1), sizeof(MFTL_MarkerRef), "query triangles");
-  tm.bary = (double *) MFTLMallocOrDie(2 * (size_t) MFTL_MAX(tm.n, 1) * sizeof(double), "query triangles");
-  {
-    int64_t at = 0;
-    for (int o = 0; o < c->ens->n_local_objects; ++o)
-      for (int t = 0; t < c->ens->local_objects[o]->tris.n_local; ++t, ++at)
-      {
-        tm.ref[at].slot = o;
-        tm.ref[at].entity = t;
-        tm.bary[2 * at] = tm.bary[2 * at + 1] = 1.0 / 3.0;
-      }
-  }
-  cpl_quad *qd = MFTL_NULL;
-  const int qs = MFTLCplQuadBuild(c->comm, c->ens, &tm, &qd, &c->stats.bytes_discovery, &c->stats.messages);
-  st = agree(c, qs);
-  if (st != MFTL_COUPLING_OK)
-  {
-    MFTLCplQuadFree(&qd);
-    MFTLCplMarkersFree(&tm);
-    free(fband);
-    return st;
-  }
-  double *g = (double *) MFTLMallocOrDie(3 * (size_t) MFTL_MAX(qd->n_own, 1) * sizeof(double), "pseudo-normals");
-  double *tab = (double *) MFTLMallocOrDie(3 * (size_t) MFTL_MAX(qd->n_own + qd->n_ghost, 1) * sizeof(double), "pseudo-normals");
-  MFTLCplVertexPseudoNormals(c->ens, g);
-  MFTLCplQuadGhostValues(c->comm, qd, 3, g, tab, &c->stats.bytes_discovery, &c->stats.messages);
-  free(g);
-
-  /* ── candidates, per band sample, by the triangles' owner ── */
-  MFTL_SurfaceCandidate **cand = (MFTL_SurfaceCandidate **) MFTLCallocOrDie((size_t) n_fields, sizeof(MFTL_SurfaceCandidate *), "query candidates");
-  cand_t cd = {0, 0, MFTL_NULL};
-  const double w2 = width * width;
-  for (int f = 0; f < n_fields; ++f)
-  {
-    const cpl_band *B = &w->band[fband[f]];
-    cand[f] = (MFTL_SurfaceCandidate *) MFTLMallocOrDie((size_t) MFTL_MAX(B->n_dof, 1) * sizeof(MFTL_SurfaceCandidate), "query candidates");
-    for (int64_t x = 0; x < B->n_dof; ++x) MFTLSurfaceCandidateReset(&cand[f][x]);
-    int64_t at = 0;
-    for (int o = 0; o < c->ens->n_local_objects; ++o)
-    {
-      const MFTL_Object *obj = c->ens->local_objects[o];
-      for (int t = 0; t < obj->tris.n_local; ++t, ++at)
-      {
-        double T[3][3], ce[3], nf[3], lo[3], hi[3];
-        MFTLCplTriangleCentroidFrame(d, obj, t, T, ce);
-        MFTLCplFaceNormal(T, nf);
-        for (int k = 0; k < 3; ++k)
-        {
-          lo[k] = fmin(T[0][k], fmin(T[1][k], T[2][k])) - width;
-          hi[k] = fmax(T[0][k], fmax(T[1][k], T[2][k])) + width;
-        }
-        gather_candidates(B, d, lo, hi, &cd);
-        double ne[3][3];
-        bool have_edge[3] = {false, false, false};
-        for (int64_t e = 0; e < cd.n; ++e)
-        {
-          const double *X = &B->ipos[3 * cd.img[e]];
-          double q[3];
-          MFTL_TriangleFeature feat;
-          const double d2 = MFTLClosestPointOnTriangle(X, T, q, &feat);
-          if (!(d2 <= w2)) continue;
-          const double *n = nf;
-          if (feat >= MFTL_TRI_FEATURE_EDGE0)
-          {
-            const int k = feat - MFTL_TRI_FEATURE_EDGE0;
-            if (!have_edge[k])
-            {
-              /* the edge's pseudo-normal: this face's normal plus its neighbour's (alone at a rim) */
-              const int tw = obj->tris.he[3 * t + k].twin_idx;
-              double nt[3] = {0.0, 0.0, 0.0};
-              if (tw != MFTL_ERROR)
-              {
-                double Tw[3][3];
-                MFTLGetTriangleCorners(obj, MFTLHeTriIdx(tw), Tw);
-                MFTLCplFaceNormal(Tw, nt);
-              }
-              for (int a = 0; a < 3; ++a) ne[k][a] = nf[a] + nt[a];
-              have_edge[k] = true;
-            }
-            n = ne[k];
-          }
-          else if (feat >= MFTL_TRI_FEATURE_VERTEX0)
-            n = &tab[3 * qd->corner[3 * at + (feat - MFTL_TRI_FEATURE_VERTEX0)]];
-          MFTL_SurfaceCandidate cn;
-          memset(&cn, 0, sizeof cn);
-          for (int k = 0; k < 3; ++k) cn.offset[k] = X[k] - q[k];
-          const double dist = sqrt(d2), dot = cn.offset[0] * n[0] + cn.offset[1] * n[1] + cn.offset[2] * n[2];
-          cn.distance = (dot < 0.0) ? -dist : dist;
-          cn.triangle = (int64_t) obj->tris.rec[t].global_id;
-          cn.body = obj->global_id;
-          cn.feature = (int) feat;
-          cn.valid = 1;
-          MFTLSurfaceCandidateMerge(&cand[f][B->idof[cd.img[e]]], &cn);
-        }
-      }
-    }
-  }
-  free(cd.img);
-  free(tab);
-  MFTLCplQuadFree(&qd);
-  MFTLCplMarkersFree(&tm);
-
-  /* ── to the samples' owners: every band sample's candidate, provider by provider ── */
-  const size_t rec = sizeof(MFTL_SurfaceCandidate);
-  int64_t ns = 0, nr = 0;
-  for (int p = 0; p < w->n_fetch_peers; ++p)
-    for (int f = 0; f < n_fields; ++f)
-    {
-      const cpl_band *B = &w->band[fband[f]];
-      const int s2 = find_rank(B->src_rank, B->n_src, w->fetch_peer[p]);
-      if (s2 >= 0) ns += B->src_nonhalo[s2] + B->src_halo[s2];
-    }
-  int64_t *roff = (int64_t *) MFTLMallocOrDie((size_t) (w->n_serve_peers + 1) * sizeof(int64_t), "query receive");
-  roff[0] = 0;
-  for (int p = 0; p < w->n_serve_peers; ++p)
-  {
-    int64_t len = 0;
-    for (int f = 0; f < n_fields; ++f)
-    {
-      const cpl_band *B = &w->band[fband[f]];
-      const int s2 = find_rank(B->dst_rank, B->n_dst, w->serve_peer[p]);
-      if (s2 >= 0) len += B->dst_nonhalo[s2] + B->dst_halo[s2];
-    }
-    roff[p + 1] = roff[p] + len;
-  }
-  nr = roff[w->n_serve_peers];
-  MFTL_SurfaceCandidate *sb = (MFTL_SurfaceCandidate *) MFTLMallocOrDie((size_t) MFTL_MAX(ns, 1) * rec, "query send");
-  MFTL_SurfaceCandidate *rb = (MFTL_SurfaceCandidate *) MFTLMallocOrDie((size_t) MFTL_MAX(nr, 1) * rec, "query receive");
-  cpl_sched sch;
-  memset(&sch, 0, sizeof sch);
-  for (int p = 0; p < w->n_serve_peers; ++p)
-    if (roff[p + 1] > roff[p])
-      MFTLCplSchedRecv(c->comm, &sch, CPL_TAG_QUERY, w->serve_peer[p], rb + roff[p], (size_t) (roff[p + 1] - roff[p]) * rec);
-  {
-    int64_t at = 0;
-    for (int p = 0; p < w->n_fetch_peers; ++p)
-    {
-      const int64_t start = at;
-      for (int f = 0; f < n_fields; ++f)
-      {
-        const cpl_band *B = &w->band[fband[f]];
-        const int s2 = find_rank(B->src_rank, B->n_src, w->fetch_peer[p]);
-        if (s2 < 0) continue;
-        const int64_t len = B->src_nonhalo[s2] + B->src_halo[s2];
-        memcpy(sb + at, &cand[f][B->src_off[s2]], (size_t) len * rec);
-        at += len;
-      }
-      if (at > start)
-      {
-        MFTLCplSchedSend(c->comm, &sch, CPL_TAG_QUERY, w->fetch_peer[p], sb + start, (size_t) (at - start) * rec, &c->stats.messages);
-        c->stats.bytes_spread += (long) ((size_t) (at - start) * rec);
-      }
-    }
-  }
-  MFTLCplSchedWait(&sch);
-  MFTLCplSchedFree(&sch);
-  c->stats.bytes_spread += (long) ((size_t) nr * rec);
-
-  /* ── owners merge, in ascending source rank, then into the solver's arrays ── */
-  for (int f = 0; f < n_fields; ++f)
-  {
-    const cpl_band *B = &w->band[fband[f]];
-    const MFTL_QueryField *Q = &fields[f];
-    const ptrdiff_t stride = (Q->stride > 0) ? Q->stride : 1;
-    MFTL_SurfaceCandidate *acc = (MFTL_SurfaceCandidate *) MFTLMallocOrDie((size_t) MFTL_MAX(B->n_served, 1) * rec, "query merge");
-    for (int64_t x = 0; x < B->n_served; ++x) MFTLSurfaceCandidateReset(&acc[x]);
-    for (int dsi = 0; dsi < B->n_dst; ++dsi)
-    {
-      const int src = B->dst_rank[dsi];
-      const int64_t len = B->dst_nonhalo[dsi] + B->dst_halo[dsi];
-      const MFTL_SurfaceCandidate *in;
-      if (src == c->rank)
-        in = &cand[f][B->src_off[B->self_seg]];
-      else
-      {
-        const int p = find_rank(w->serve_peer, w->n_serve_peers, src);
-        int64_t off = roff[p];
-        for (int g2 = 0; g2 < f; ++g2)
-        {
-          const cpl_band *Bg = &w->band[fband[g2]];
-          const int s2 = find_rank(Bg->dst_rank, Bg->n_dst, src);
-          if (s2 >= 0) off += Bg->dst_nonhalo[s2] + Bg->dst_halo[s2];
-        }
-        in = rb + off;
-      }
-      for (int64_t x = 0; x < len; ++x) MFTLSurfaceCandidateMerge(&acc[B->pack_served[B->dst_off[dsi] + x]], &in[x]);
-    }
-    for (int64_t x = 0; x < B->n_served; ++x)
-      MFTLSurfaceCandidateMerge(&Q->data[B->served_piece[x]][B->served_elem[x] * stride], &acc[x]);
-    free(acc);
-  }
-  for (int f = 0; f < n_fields; ++f) free(cand[f]);
-  free(cand);
-  free(sb);
-  free(rb);
-  free(roff);
-  free(fband);
-  return MFTL_COUPLING_OK;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -5813,35 +4978,36 @@ int MFTLCouplerBindingRow(const MFTL_CouplingBinding *bc, int loc_pos, int64_t m
   MFTL_CouplingBinding *b = (MFTL_CouplingBinding *) bc;
   const cpl_band *B = &b->win->band[b->loc_band[loc_pos]];
   const int64_t a = b->row_ptr[loc_pos][marker], e = b->row_ptr[loc_pos][marker + 1];
-  const int m = (int) (e - a);
+  const cpl_tensor_row *tensor = b->tensor[loc_pos] ? &b->tensor[loc_pos][marker] : MFTL_NULL;
+  const bool factored = tensor && tensor->count;
+  const int m = factored ? tensor->count : (int) (e - a);
   if (m > b->scratch_cap)
   {
     b->scratch_cap = MFTLGrowCapacity(b->scratch_cap, m);
-    b->scratch_keys = (uint64_t *) MFTLReallocOrDie(b->scratch_keys, (size_t) b->scratch_cap * sizeof(uint64_t), "row keys");
+    b->scratch_keys = (uint64_t *) MFTLCplRealloc(b->scratch_keys, (size_t) b->scratch_cap * sizeof(uint64_t), "row keys");
   }
-  for (int i = 0; i < m; ++i) b->scratch_keys[i] = B->key[b->col[loc_pos][a + i]];
+  if (factored)
+  {
+    int64_t columns[64];
+    MFTLCplTensorEntries(tensor, columns, b->scratch_weights);
+    for (int i = 0; i < m; ++i) b->scratch_keys[i] = B->key[columns[i]];
+    *weights = b->scratch_weights;
+  }
+  else
+  {
+    for (int i = 0; i < m; ++i) b->scratch_keys[i] = B->key[b->col[loc_pos][a + i]];
+    *weights = &b->w[loc_pos][a];
+  }
   *n = m;
   *keys = b->scratch_keys;
-  *weights = &b->w[loc_pos][(int64_t) b->ncomp[loc_pos] * a];
   return MFTL_SUCCESS;
 }
 
-int MFTLCouplerBindingWallCoefficients(const MFTL_CouplingBinding *b, int loc_pos, int64_t marker, int component, double coef[6])
+int MFTLCouplerBindingWallCoefficients(const MFTL_CouplingBinding *b, int loc_pos, int64_t marker, double coef[6])
 {
-  if (b == MFTL_NULL || coef == MFTL_NULL || loc_pos < 0 || loc_pos >= b->n_loc || marker < 0 || marker >= b->n_markers || component < 0 ||
-      component >= b->ncomp[loc_pos])
-    return MFTL_ERROR;
-  const int nc = b->ncomp[loc_pos];
-  for (int g = 0; g < 6; ++g) coef[g] = b->wallc[loc_pos] ? b->wallc[loc_pos][6 * (nc * marker + component) + g] : 0.0;
+  if (b == MFTL_NULL || coef == MFTL_NULL || loc_pos < 0 || loc_pos >= b->n_loc || marker < 0 || marker >= b->n_markers) return MFTL_ERROR;
+  for (int g = 0; g < 6; ++g) coef[g] = b->wallc[loc_pos] ? b->wallc[loc_pos][6 * marker + g] : 0.0;
   return MFTL_SUCCESS;
-}
-
-int MFTLCouplerBindingComponents(const MFTL_CouplingBinding *b, int location)
-{
-  if (b == MFTL_NULL) return 0;
-  for (int lp = 0; lp < b->n_loc; ++lp)
-    if (b->win->locs[b->loc_band[lp]] == location) return b->ncomp[lp];
-  return 0;
 }
 
 int MFTLCouplerBandMask(const MFTL_CouplingWindow *w, int location, int piece, MFTL_BandMaskKind kind, unsigned char *mask)
@@ -5957,14 +5123,14 @@ int MFTLCouplerQuadratureToVertices(MFTL_Coupler *c, const MFTL_CouplingBinding 
   const int st = MFTLCplAgreeTransfer(c->comm, quad_check(c, b, ncomp, Uq, Uv, false), quad_signature(b, ncomp, true, MFTL_SPREAD_INTEGRATED));
   if (st != MFTL_COUPLING_OK) return st;
   const cpl_quad *q = b->quad;
-  double *acc = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(q->n_own, 1) * (size_t) (ncomp + 1) * sizeof(double), "quadrature projection");
+  double *acc = (double *) MFTLCplAlloc((size_t) MFTL_MAX(q->n_own, 1) * (size_t) (ncomp + 1) * sizeof(double), "quadrature projection");
   MFTLCplQuadAccumulate(c->comm, q, b->n_markers, b->ref, ncomp, Uq, acc, &c->stats.bytes_spread, &c->stats.messages);
   for (int64_t v = 0; v < q->n_own; ++v)
   {
     const double mass = acc[v * (ncomp + 1) + ncomp];
     for (int k = 0; k < ncomp; ++k) Uv[v * ncomp + k] = (mass > 0.0) ? acc[v * (ncomp + 1) + k] / mass : 0.0;
   }
-  free(acc);
+  MFTLCplFree(acc);
   return MFTL_COUPLING_OK;
 }
 
@@ -5981,16 +5147,16 @@ int MFTLCouplerQuadratureFromVertices(MFTL_Coupler *c, const MFTL_CouplingBindin
   if (form == MFTL_SPREAD_INTEGRATED)
   {
     /* g = M^-1 F with the lumped mass the points themselves define */
-    double *mass = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(q->n_own, 1) * sizeof(double), "quadrature mass");
+    double *mass = (double *) MFTLCplAlloc((size_t) MFTL_MAX(q->n_own, 1) * sizeof(double), "quadrature mass");
     MFTLCplQuadAccumulate(c->comm, q, b->n_markers, b->ref, 0, MFTL_NULL, mass, &c->stats.bytes_spread, &c->stats.messages);
-    dens = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(q->n_own, 1) * (size_t) ncomp * sizeof(double), "quadrature density");
+    dens = (double *) MFTLCplAlloc((size_t) MFTL_MAX(q->n_own, 1) * (size_t) ncomp * sizeof(double), "quadrature density");
     for (int64_t v = 0; v < q->n_own; ++v)
       for (int k = 0; k < ncomp; ++k) dens[v * ncomp + k] = (mass[v] > 0.0) ? Fv[v * ncomp + k] / mass[v] : 0.0;
-    free(mass);
+    MFTLCplFree(mass);
     g = dens;
   }
   MFTLCplQuadInterpolate(c->comm, q, b->n_markers, b->ref, true, ncomp, g, Fq, &c->stats.bytes_spread, &c->stats.messages);
-  free(dens);
+  MFTLCplFree(dens);
   return MFTL_COUPLING_OK;
 }
 
@@ -6041,7 +5207,7 @@ int MFTLCouplerSurfaceSizing(MFTL_Coupler *c, double theta, double *sizes, doubl
     if (nl > cap_hv)
     {
       cap_hv = nl;
-      hv = (double *) MFTLReallocOrDie(hv, (size_t) cap_hv * sizeof(double), "surface sizing");
+      hv = (double *) MFTLCplRealloc(hv, (size_t) cap_hv * sizeof(double), "surface sizing");
     }
     for (int v = 0; v < nl; ++v) hv[v] = MFTL_DBL_MAX;
     /* every triangle of the pool: the halo is vertex-complete, so an owned vertex sees its whole fan */
@@ -6068,8 +5234,8 @@ int MFTLCouplerSurfaceSizing(MFTL_Coupler *c, double theta, double *sizes, doubl
       lmin = fmin(lmin, L);
     }
   }
-  free(hv);
-  free(got);
+  MFTLCplFree(hv);
+  MFTLCplFree(got);
   double neg = -lmin;
   MFTLCplAllreduceMax(c->comm, &neg, 1);
   *global_min = -neg;
@@ -6090,10 +5256,10 @@ int MFTLCouplerReduceStats(MFTL_Coupler *c, MFTL_CouplerStats *out)
   if (agree(c, out == MFTL_NULL ? MFTL_COUPLING_INVALID : MFTL_COUPLING_OK) != MFTL_COUPLING_OK) return MFTL_ERROR;
   MFTL_CouplerStats s;
   MFTLCouplerGetStats(c, &s);
-  long sum[16] = {s.n_directory_builds, s.n_directory_kept, s.n_requests, s.n_need_coverage, s.n_windows, s.n_binds, s.n_stage_binds, s.n_stale,
-                  s.n_fetches, s.n_spreads, s.bytes_discovery, s.bytes_fetch, s.bytes_spread, s.messages, s.bytes_memory, s.n_local_stage_binds};
+  long sum[19] = {s.n_directory_builds, s.n_directory_kept, s.n_requests, s.n_need_coverage, s.n_windows, s.n_binds, s.n_stage_binds, s.n_stale,
+                  s.n_fetches, s.n_spreads, s.bytes_discovery, s.bytes_fetch, s.bytes_spread, s.messages, s.bytes_memory, s.n_local_stage_binds, s.n_fetch_reused, s.n_candidate_builds, s.n_candidate_reuses};
   long mx[7] = {s.band_self, s.band_halo, s.band_remote, s.band_images, s.served, s.fetch_peers, s.serve_peers};
-  MFTLCplAllreduceSumLong(c->comm, sum, 16);
+  MFTLCplAllreduceSumLong(c->comm, sum, 19);
   MFTLCplAllreduceMaxLong(c->comm, mx, 7);
   out->n_directory_builds = sum[0];
   out->n_directory_kept = sum[1];
@@ -6111,6 +5277,9 @@ int MFTLCouplerReduceStats(MFTL_Coupler *c, MFTL_CouplerStats *out)
   out->messages = sum[13];
   out->bytes_memory = sum[14];
   out->n_local_stage_binds = sum[15];
+  out->n_fetch_reused = sum[16];
+  out->n_candidate_builds = sum[17];
+  out->n_candidate_reuses = sum[18];
   out->band_self = mx[0];
   out->band_halo = mx[1];
   out->band_remote = mx[2];

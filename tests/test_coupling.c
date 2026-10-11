@@ -38,7 +38,7 @@
 static int test_rows_match_brute_force(void)
 {
   int ok = 1;
-  long remote = 0;
+  long remote = 0, direct = 0;
   for (int per = 0; per < 2; ++per)
     for (int dec = 0; dec < 4; ++dec)
     {
@@ -78,6 +78,9 @@ static int test_rows_match_brute_force(void)
         MFTL_CouplerStats s;
         MFTLCouplerGetStats(x.c, &s);
         remote += s.band_remote;
+        MFTL_BindingQuality q;
+        MFTLCouplerBindingQuality(x.b, &q);
+        direct += q.n_cartesian;
       }
       uncouple(&x);
       free_block(&blk);
@@ -86,6 +89,7 @@ static int test_rows_match_brute_force(void)
     }
   TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
   TEST_ASSERT(g_nproc == 1 || anywhere(remote > 0, MPI_COMM_WORLD));
+  TEST_ASSERT(anywhere(direct > 0, MPI_COMM_WORLD));
   return 0;
 }
 
@@ -325,24 +329,11 @@ static int ref_point_row(const MFTL_Domain *d, int64_t nc, double jitter, bool v
 {
   const int64_t total = nc * nc * nc;
   const double Hc = 1.0 / (double) nc;
-  double hmax = Hc;
-  if (var_h)
-  {
-    hmax = 0.0;
-    for (int64_t c = 0; c < total; ++c)
-    {
-      double p[3];
-      uint64_t k;
-      point_of_cell(nc, jitter, c, p, &k);
-      hmax = fmax(hmax, var_h_of(Hc, p));
-    }
-  }
   MFTL_CouplerParams P;
   MFTLCouplerDefaultParams(&P);
   double H[3] = {Hc, Hc, Hc};
   if (var_h)
   {
-    const double Rp = P.pilot_factor * hmax;
     double sw = 0.0, sh = 0.0;
     for (int64_t c = 0; c < total; ++c)
     {
@@ -350,9 +341,10 @@ static int ref_point_row(const MFTL_Domain *d, int64_t nc, double jitter, bool v
       uint64_t k;
       point_of_cell(nc, jitter, c, p, &k);
       MFTLGetMinimumImageVector(d, dv, x, p);
-      const double rho = sqrt(dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]) / Rp;
+      const double hj = var_h_of(Hc, p);
+      const double rho = sqrt(dv[0] * dv[0] + dv[1] * dv[1] + dv[2] * dv[2]) / (P.pilot_factor * hj);
       if (rho >= 1.0) continue;
-      const double t = 1.0 - rho, wt = t * t * t * t * (4.0 * rho + 1.0);
+      const double t = 1.0 - rho, wt = pow(Hc / hj, 3) * t * t * t * t * (4.0 * rho + 1.0);
       sw += wt;
       sh += wt * var_h_of(Hc, p);
     }
@@ -1154,6 +1146,116 @@ static int test_a_stretched_lattice(void)
   return 0;
 }
 
+/** @brief A remote coarse sample cannot change a fine region's metric or halo.
+ * Full providers deliberately claim the whole domain: their ownership bounds
+ * must not be reused as uniform resolution bounds. */
+static int test_distant_coarsening_does_not_expand_a_fine_band(void)
+{
+  const double lo[3] = {0, 0, 0}, hi[3] = {1, 1, 1}, region[6] = {0, 0, 0, 1, 1, 1};
+  const bool periodic[3] = {false, false, false};
+  enum { N = 24, TOTAL = N * N * N, NM = 12 };
+  double previous[NM];
+  long previous_band = -1;
+  int ok = 1;
+  for (int pass = 0; pass < 2; ++pass)
+  {
+    MFTL_Ensemble *ens = make_ens(lo, hi, periodic);
+    MFTL_SolverGrid *g = MFTLSolverGridCreate(MPI_COMM_WORLD);
+    MFTL_LocationDesc ld = {0};
+    ld.name = "graded";
+    const int loc = MFTLSolverGridAddLocation(g, &ld);
+    const int cap = TOTAL / g_nproc + 1;
+    double *pos = malloc(3 * (size_t) cap * sizeof(double)), *h = malloc(3 * (size_t) cap * sizeof(double));
+    double *q = malloc((size_t) cap * sizeof(double)), *v = malloc((size_t) cap * sizeof(double));
+    uint64_t *keys = malloc((size_t) cap * sizeof(uint64_t));
+    int n = 0;
+    for (int i = g_rank; i < TOTAL; i += g_nproc)
+    {
+      const int idx[3] = {i % N, (i / N) % N, i / (N * N)};
+      keys[n] = (uint64_t) i;
+      q[n] = 1.0 / TOTAL;
+      for (int k = 0; k < 3; ++k)
+      {
+        pos[3 * n + k] = (idx[k] + 0.5) / N;
+        h[3 * n + k] = i == TOTAL - 1 ? (pass ? 0.42 : 0.18) : 1.0 / N;
+      }
+      v[n] = f_periodic(&pos[3 * n], MFTL_NULL);
+      ++n;
+    }
+    MFTL_PointSetDesc pd = {0};
+    pd.location = loc; pd.n = n; pd.keys = keys; pd.pos = pos; pd.h = h; pd.measure = q;
+    TEST_ASSERT(agreed(MFTLSolverGridAddPoints(g, &pd) >= 0, MPI_COMM_WORLD));
+    MFTL_ProviderRegions pr = {0};
+    pr.location = loc; pr.n_boxes = 1; pr.boxes = region;
+    TEST_ASSERT(agreed(MFTLSolverGridSetProviderRegions(g, &pr) == MFTL_SUCCESS, MPI_COMM_WORLD));
+    MFTL_Coupler *c = MFTL_NULL;
+    TEST_ASSERT(agreed(MFTLCouplerCreate(ens, g, MFTL_NULL, &c) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+    double points[3 * NM], values[NM];
+    for (int i = 0; i < NM; ++i)
+      for (int k = 0; k < 3; ++k) points[3 * i + k] = 0.19 + 0.035 * (1.0 + hash01((uint64_t) (i * 3 + k)));
+    MFTL_MarkerSpec ms = {0};
+    ms.kind = MFTL_MARKERS_USER; ms.n_user = g_rank == g_nproc - 1 ? NM : 0; ms.user_pos = points;
+    MFTL_WindowSpec ws = {{0.01, 0.01, 0.01}};
+    MFTL_SupportRequest *req = MFTL_NULL;
+    MFTL_CouplingWindow *w = MFTL_NULL;
+    MFTL_CouplingBinding *b = MFTL_NULL;
+    TEST_ASSERT(agreed(MFTLCouplerRequestSupport(c, &ms, &ws, &req) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(MFTLCouplerPrepareWindow(c, req, &w) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(MFTLCouplerBind(c, &ms, w, &b) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+    MFTL_SolverField field = {0};
+    field.location = loc; field.data = &v;
+    TEST_ASSERT(agreed(MFTLCouplerInterpolate(c, b, 1, &field, values) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+    MFTL_CouplerStats stats;
+    MFTLCouplerGetStats(c, &stats);
+    double moved[3 * NM], stage_values[NM];
+    for (int i = 0; i < 3 * NM; ++i) moved[i] = points[i] + 0.008;
+    MFTL_StageGeometry stage = {0};
+    stage.pos = moved;
+    MFTL_CouplingBinding *stage_binding = MFTL_NULL;
+    TEST_ASSERT(agreed(MFTLCouplerBindStage(c, b, &stage, &stage_binding) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(MFTLCouplerInterpolate(c, stage_binding, 1, &field, stage_values) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+    MFTL_CouplerStats reused;
+    MFTLCouplerGetStats(c, &reused);
+    if (reused.n_candidate_builds != stats.n_candidate_builds || reused.n_candidate_reuses < stats.n_candidate_reuses + ms.n_user) ok = 0;
+    ref_lattice lattice = {0};
+    for (int k = 0; k < 3; ++k)
+    {
+      lattice.N[k] = N; lattice.h[k] = 1.0 / N; lattice.origin[k] = 0.5 / N; lattice.L[k] = 1.0;
+    }
+    for (int i = 0; i < ms.n_user; ++i)
+    {
+      uint64_t rk[128];
+      double rw[128], offsets[3 * 128], expect = 0.0;
+      const int nr = ref_row(&lattice, &moved[3 * i], rk, rw, offsets, 128);
+      if (nr <= 0) ok = 0;
+      for (int j = 0; j < nr; ++j)
+      {
+        const double xp[3] = {(rk[j] % N + 0.5) / N, ((rk[j] / N) % N + 0.5) / N, (rk[j] / (N * N) + 0.5) / N};
+        expect += rw[j] * f_periodic(xp, MFTL_NULL);
+      }
+      if (fabs(expect - stage_values[i]) > 2e-13) ok = 0;
+    }
+    MFTLCouplerReleaseBinding(&stage_binding);
+    const long band = stats.band_self + stats.band_remote;
+    if (band > TOTAL / 10) ok = 0;
+    if (pass)
+    {
+      if (band != previous_band) ok = 0;
+      if (ms.n_user && memcmp(previous, values, sizeof values)) ok = 0;
+    }
+    else
+    {
+      previous_band = band;
+      if (ms.n_user) memcpy(previous, values, sizeof values);
+    }
+    MFTLCouplerReleaseBinding(&b); MFTLCouplerReleaseWindow(&w); MFTLCouplerReleaseRequest(&req);
+    MFTLCouplerDestroy(&c); MFTLSolverGridDestroy(&g); MFTLEnsembleDestroy(&ens);
+    free(pos); free(h); free(q); free(v); free(keys);
+  }
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
@@ -1162,6 +1264,7 @@ int main(int argc, char **argv)
   MFTLRegisterMpiTypes();
   if (g_rank == 0) printf("\n=== Coupling (np = %d) ===\n", g_nproc);
 
+  RUN_TEST(test_distant_coarsening_does_not_expand_a_fine_band);
   RUN_TEST(test_rows_match_brute_force);
   RUN_TEST(test_linear_fields_are_reproduced);
   RUN_TEST(test_spread_is_the_brute_force_transpose);

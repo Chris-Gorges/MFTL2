@@ -164,7 +164,7 @@ int MFTLEnsembleSurfaceTension(MFTL_Ensemble *ens, const MFTL_SurfaceTensionPara
 ### 4.6 README recipe: balanced force (Shin & Juric 2005; review Popinet 2018)
 
 Spreading `σκn δ` directly produces parasitic currents. The hybrid formulation avoids them, using only
-library outputs and two calls of plan 06:
+library outputs and two calls to the [coupler's spreading interface](../src/coupling/README.md):
 1. Spread the vertex force F (§4.2) and the area-weighted normal `G_v = n_v A_v` to the grid.
 2. On the grid, `κ_H = (F·G) / (σ G·G)`.
 3. Apply `σ κ_H ∇_h I`, where `∇_h` is **the solver's own** pressure-gradient operator.

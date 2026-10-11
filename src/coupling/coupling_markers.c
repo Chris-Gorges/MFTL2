@@ -32,7 +32,7 @@ uint64_t MFTLCplPositionsChecksum(const double *pos, int64_t n) { return cpl_fnv
 static void snapshot_bodies(const MFTL_Ensemble *ens, cpl_markers *m)
 {
   m->n_bodies = ens->n_local_objects;
-  m->bodies = (cpl_body_snap *) MFTLMallocOrDie((size_t) MFTL_MAX(m->n_bodies, 1) * sizeof(cpl_body_snap), "marker body snapshot");
+  m->bodies = (cpl_body_snap *) MFTLCplAlloc((size_t) MFTL_MAX(m->n_bodies, 1) * sizeof(cpl_body_snap), "marker body snapshot");
   for (int o = 0; o < ens->n_local_objects; ++o)
   {
     const MFTL_Object *obj = ens->local_objects[o];
@@ -83,8 +83,8 @@ int MFTLCplMarkersGather(const MFTL_Ensemble *ens, const MFTL_MarkerSpec *spec, 
   {
     if (spec->n_user < 0 || (spec->n_user > 0 && spec->user_pos == MFTL_NULL)) return MFTL_COUPLING_INVALID;
     m->n = spec->n_user;
-    m->pos = (double *) MFTLMallocOrDie(3 * (size_t) MFTL_MAX(m->n, 1) * sizeof(double), "markers");
-    m->ref = (MFTL_MarkerRef *) MFTLMallocOrDie((size_t) MFTL_MAX(m->n, 1) * sizeof(MFTL_MarkerRef), "markers");
+    m->pos = (double *) MFTLCplAlloc(3 * (size_t) MFTL_MAX(m->n, 1) * sizeof(double), "markers");
+    m->ref = (MFTL_MarkerRef *) MFTLCplAlloc((size_t) MFTL_MAX(m->n, 1) * sizeof(MFTL_MarkerRef), "markers");
     int bad = 0;
     for (int64_t i = 0; i < m->n; ++i)
     {
@@ -120,9 +120,9 @@ int MFTLCplMarkersGather(const MFTL_Ensemble *ens, const MFTL_MarkerSpec *spec, 
     }
   }
   m->n = total;
-  m->pos = (double *) MFTLMallocOrDie(3 * (size_t) MFTL_MAX(total, 1) * sizeof(double), "markers");
-  m->ref = (MFTL_MarkerRef *) MFTLMallocOrDie((size_t) MFTL_MAX(total, 1) * sizeof(MFTL_MarkerRef), "markers");
-  if (spec->kind == MFTL_MARKERS_QUADRATURE) m->bary = (double *) MFTLMallocOrDie(2 * (size_t) MFTL_MAX(total, 1) * sizeof(double), "markers");
+  m->pos = (double *) MFTLCplAlloc(3 * (size_t) MFTL_MAX(total, 1) * sizeof(double), "markers");
+  m->ref = (MFTL_MarkerRef *) MFTLCplAlloc((size_t) MFTL_MAX(total, 1) * sizeof(MFTL_MarkerRef), "markers");
+  if (spec->kind == MFTL_MARKERS_QUADRATURE) m->bary = (double *) MFTLCplAlloc(2 * (size_t) MFTL_MAX(total, 1) * sizeof(double), "markers");
   snapshot_bodies(ens, m);
 
   int64_t at = 0, tri_seen = 0;
@@ -138,7 +138,7 @@ int MFTLCplMarkersGather(const MFTL_Ensemble *ens, const MFTL_MarkerSpec *spec, 
       if (nl > dual_cap)
       {
         dual_cap = MFTLGrowCapacity(dual_cap, nl);
-        dual = (double *) MFTLReallocOrDie(dual, (size_t) dual_cap * sizeof(double), "dual areas");
+        dual = (double *) MFTLCplRealloc(dual, (size_t) dual_cap * sizeof(double), "dual areas");
       }
       for (int v = 0; v < nl; ++v) dual[v] = 0.0;
       for (int t = 0; t < obj->tris.n; ++t)
@@ -210,16 +210,16 @@ int MFTLCplMarkersGather(const MFTL_Ensemble *ens, const MFTL_MarkerSpec *spec, 
       }
     }
   }
-  free(dual);
+  MFTLCplFree(dual);
   return MFTL_COUPLING_OK;
 }
 
 void MFTLCplMarkersFree(cpl_markers *m)
 {
-  free(m->pos);
-  free(m->ref);
-  free(m->bary);
-  free(m->bodies);
+  MFTLCplFree(m->pos);
+  MFTLCplFree(m->ref);
+  MFTLCplFree(m->bary);
+  MFTLCplFree(m->bodies);
   memset(m, 0, sizeof *m);
 }
 
@@ -269,33 +269,33 @@ void MFTLCplQuadFree(cpl_quad **pq)
 {
   if (pq == MFTL_NULL || *pq == MFTL_NULL) return;
   cpl_quad *q = *pq;
-  free(q->corner);
-  free(q->bary);
-  free(q->owner_rank);
-  free(q->owner_off);
-  free(q->req_rank);
-  free(q->req_off);
-  free(q->req_vt);
-  free(q);
+  MFTLCplFree(q->corner);
+  MFTLCplFree(q->bary);
+  MFTLCplFree(q->owner_rank);
+  MFTLCplFree(q->owner_off);
+  MFTLCplFree(q->req_rank);
+  MFTLCplFree(q->req_off);
+  MFTLCplFree(q->req_vt);
+  MFTLCplFree(q);
   *pq = MFTL_NULL;
 }
 
 int MFTLCplQuadBuild(MPI_Comm comm, const MFTL_Ensemble *ens, const cpl_markers *m, cpl_quad **out, long *bytes, long *messages)
 {
   int status = MFTL_COUPLING_OK;
-  cpl_quad *q = (cpl_quad *) MFTLCallocOrDie(1, sizeof(cpl_quad), "quadrature");
+  cpl_quad *q = (cpl_quad *) MFTLCplCalloc(1, sizeof(cpl_quad), "quadrature");
   const int nb = ens->n_local_objects;
-  int64_t *body_off = (int64_t *) MFTLMallocOrDie((size_t) (nb + 1) * sizeof(int64_t), "quadrature");
+  int64_t *body_off = (int64_t *) MFTLCplAlloc((size_t) (nb + 1) * sizeof(int64_t), "quadrature");
   body_off[0] = 0;
   for (int o = 0; o < nb; ++o) body_off[o + 1] = body_off[o] + ens->local_objects[o]->verts.n_local;
   q->n_own = body_off[nb];
-  q->corner = (int64_t *) MFTLMallocOrDie(3 * (size_t) MFTL_MAX(m->n, 1) * sizeof(int64_t), "quadrature");
-  q->bary = (double *) MFTLMallocOrDie(2 * (size_t) MFTL_MAX(m->n, 1) * sizeof(double), "quadrature");
+  q->corner = (int64_t *) MFTLCplAlloc(3 * (size_t) MFTL_MAX(m->n, 1) * sizeof(int64_t), "quadrature");
+  q->bary = (double *) MFTLCplAlloc(2 * (size_t) MFTL_MAX(m->n, 1) * sizeof(double), "quadrature");
   if (m->n > 0) memcpy(q->bary, m->bary, 2 * (size_t) m->n * sizeof(double));
 
   /* ── corners: owned ones directly, ghost ones collected ── */
   int64_t ng = 0, cap = 64;
-  qghost_t *gh = (qghost_t *) MFTLMallocOrDie((size_t) cap * sizeof(qghost_t), "quadrature ghosts");
+  qghost_t *gh = (qghost_t *) MFTLCplAlloc((size_t) cap * sizeof(qghost_t), "quadrature ghosts");
   for (int64_t i = 0; i < m->n; ++i)
   {
     const MFTL_Object *obj = ens->local_objects[m->ref[i].slot];
@@ -311,7 +311,7 @@ int MFTLCplQuadBuild(MPI_Comm comm, const MFTL_Ensemble *ens, const cpl_markers 
       if (ng == cap)
       {
         cap *= 2;
-        gh = (qghost_t *) MFTLReallocOrDie(gh, (size_t) cap * sizeof(qghost_t), "quadrature ghosts");
+        gh = (qghost_t *) MFTLCplRealloc(gh, (size_t) cap * sizeof(qghost_t), "quadrature ghosts");
       }
       gh[ng].owner = obj->verts.rec[v[c]].owner_proc;
       gh[ng].body = obj->global_id;
@@ -334,8 +334,8 @@ int MFTLCplQuadBuild(MPI_Comm comm, const MFTL_Ensemble *ens, const cpl_markers 
         if (q->n_owner == cap_own)
         {
           cap_own = MFTLGrowCapacity(cap_own, q->n_owner + 1);
-          q->owner_rank = (int *) MFTLReallocOrDie(q->owner_rank, (size_t) cap_own * sizeof(int), "quadrature owners");
-          q->owner_off = (int64_t *) MFTLReallocOrDie(q->owner_off, (size_t) (cap_own + 1) * sizeof(int64_t), "quadrature owners");
+          q->owner_rank = (int *) MFTLCplRealloc(q->owner_rank, (size_t) cap_own * sizeof(int), "quadrature owners");
+          q->owner_off = (int64_t *) MFTLCplRealloc(q->owner_off, (size_t) (cap_own + 1) * sizeof(int64_t), "quadrature owners");
         }
         q->owner_rank[q->n_owner] = gh[i].owner;
         q->owner_off[q->n_owner] = u;
@@ -345,12 +345,12 @@ int MFTLCplQuadBuild(MPI_Comm comm, const MFTL_Ensemble *ens, const cpl_markers 
     q->corner[gh[i].occ] = q->n_own + u;
   }
   q->n_ghost = u + 1;
-  if (q->owner_off == MFTL_NULL) q->owner_off = (int64_t *) MFTLMallocOrDie(sizeof(int64_t), "quadrature owners");
+  if (q->owner_off == MFTL_NULL) q->owner_off = (int64_t *) MFTLCplAlloc(sizeof(int64_t), "quadrature owners");
   q->owner_off[q->n_owner] = q->n_ghost;
 
   /* ── requests: per owner, the (body, vertex) ids of its ghosts, in table order ── */
-  unsigned char **sb = (unsigned char **) MFTLMallocOrDie((size_t) MFTL_MAX(q->n_owner, 1) * sizeof(unsigned char *), "quadrature requests");
-  size_t *sz = (size_t *) MFTLMallocOrDie((size_t) MFTL_MAX(q->n_owner, 1) * sizeof(size_t), "quadrature requests");
+  unsigned char **sb = (unsigned char **) MFTLCplAlloc((size_t) MFTL_MAX(q->n_owner, 1) * sizeof(unsigned char *), "quadrature requests");
+  size_t *sz = (size_t *) MFTLCplAlloc((size_t) MFTL_MAX(q->n_owner, 1) * sizeof(size_t), "quadrature requests");
   {
     int64_t i = 0;
     for (int o = 0; o < q->n_owner; ++o)
@@ -366,22 +366,22 @@ int MFTLCplQuadBuild(MPI_Comm comm, const MFTL_Ensemble *ens, const cpl_markers 
       sz[o] = b.n;
     }
   }
-  free(gh);
+  MFTLCplFree(gh);
   cpl_msg *in = MFTL_NULL;
   int n_in = 0;
   MFTLCplNbx(comm, CPL_TAG_QUAD_SETUP, q->n_owner, q->owner_rank, sb, sz, &in, &n_in, bytes, messages);
-  for (int o = 0; o < q->n_owner; ++o) free(sb[o]);
-  free(sb);
-  free(sz);
+  for (int o = 0; o < q->n_owner; ++o) MFTLCplFree(sb[o]);
+  MFTLCplFree(sb);
+  MFTLCplFree(sz);
 
   /* ── owner side: resolve every requested id to an owned vertex-table index ── */
   q->n_req = n_in;
-  q->req_rank = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_in, 1) * sizeof(int), "quadrature requesters");
-  q->req_off = (int64_t *) MFTLMallocOrDie((size_t) (n_in + 1) * sizeof(int64_t), "quadrature requesters");
+  q->req_rank = (int *) MFTLCplAlloc((size_t) MFTL_MAX(n_in, 1) * sizeof(int), "quadrature requesters");
+  q->req_off = (int64_t *) MFTLCplAlloc((size_t) (n_in + 1) * sizeof(int64_t), "quadrature requesters");
   int64_t total = 0;
   for (int r = 0; r < n_in; ++r) total += (int64_t) (in[r].bytes / (2 * sizeof(int32_t)));
-  q->req_vt = (int64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(total, 1) * sizeof(int64_t), "quadrature requesters");
-  qvid_t **lookup = (qvid_t **) MFTLCallocOrDie((size_t) MFTL_MAX(nb, 1), sizeof(qvid_t *), "quadrature lookup");
+  q->req_vt = (int64_t *) MFTLCplAlloc((size_t) MFTL_MAX(total, 1) * sizeof(int64_t), "quadrature requesters");
+  qvid_t **lookup = (qvid_t **) MFTLCplCalloc((size_t) MFTL_MAX(nb, 1), sizeof(qvid_t *), "quadrature lookup");
   int64_t at = 0;
   for (int r = 0; r < n_in; ++r)
   {
@@ -413,7 +413,7 @@ int MFTLCplQuadBuild(MPI_Comm comm, const MFTL_Ensemble *ens, const cpl_markers 
         const MFTL_Object *obj = ens->local_objects[slot];
         if (lookup[slot] == MFTL_NULL)
         {
-          lookup[slot] = (qvid_t *) MFTLMallocOrDie((size_t) MFTL_MAX(obj->verts.n_local, 1) * sizeof(qvid_t), "quadrature lookup");
+          lookup[slot] = (qvid_t *) MFTLCplAlloc((size_t) MFTL_MAX(obj->verts.n_local, 1) * sizeof(qvid_t), "quadrature lookup");
           for (int v = 0; v < obj->verts.n_local; ++v)
           {
             lookup[slot][v].gid = obj->verts.rec[v].global_id;
@@ -435,11 +435,11 @@ int MFTLCplQuadBuild(MPI_Comm comm, const MFTL_Ensemble *ens, const cpl_markers 
     }
   }
   q->req_off[n_in] = at;
-  for (int o = 0; o < nb; ++o) free(lookup[o]);
-  free(lookup);
+  for (int o = 0; o < nb; ++o) MFTLCplFree(lookup[o]);
+  MFTLCplFree(lookup);
   MFTLCplMsgsFree(in, n_in);
-  free(in);
-  free(body_off);
+  MFTLCplFree(in);
+  MFTLCplFree(body_off);
   *out = q;
   return status;
 }
@@ -449,7 +449,7 @@ void MFTLCplQuadAccumulate(MPI_Comm comm, const cpl_quad *q, int64_t n_markers, 
 {
   const int nc1 = ncomp + 1;
   const int64_t ntab = q->n_own + q->n_ghost;
-  double *tab = (double *) MFTLCallocOrDie((size_t) MFTL_MAX(ntab, 1) * (size_t) nc1, sizeof(double), "quadrature sums");
+  double *tab = (double *) MFTLCplCalloc((size_t) MFTL_MAX(ntab, 1) * (size_t) nc1, sizeof(double), "quadrature sums");
   for (int64_t i = 0; i < n_markers; ++i)
   {
     const double l1 = q->bary[2 * i], l2 = q->bary[2 * i + 1];
@@ -464,7 +464,7 @@ void MFTLCplQuadAccumulate(MPI_Comm comm, const cpl_quad *q, int64_t n_markers, 
   }
   /* reverse: ghost sums to their owners; owners add requesters' in rank order */
   const int64_t nrecv = q->req_off[q->n_req] * nc1;
-  double *rbuf = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(nrecv, 1) * sizeof(double), "quadrature receive");
+  double *rbuf = (double *) MFTLCplAlloc((size_t) MFTL_MAX(nrecv, 1) * sizeof(double), "quadrature receive");
   cpl_sched s;
   memset(&s, 0, sizeof s);
   for (int r = 0; r < q->n_req; ++r)
@@ -487,16 +487,19 @@ void MFTLCplQuadAccumulate(MPI_Comm comm, const cpl_quad *q, int64_t n_markers, 
   for (int64_t e = 0; e < q->req_off[q->n_req]; ++e)
     for (int k = 0; k < nc1; ++k) tab[q->req_vt[e] * nc1 + k] += rbuf[e * nc1 + k];
   if (q->n_own > 0) memcpy(acc, tab, (size_t) q->n_own * (size_t) nc1 * sizeof(double));
-  free(rbuf);
-  free(tab);
+  MFTLCplFree(rbuf);
+  MFTLCplFree(tab);
 }
 
-void MFTLCplQuadGhostValues(MPI_Comm comm, const cpl_quad *q, int ncomp, const double *g, double *tab, long *bytes, long *messages)
+void MFTLCplQuadInterpolate(MPI_Comm comm, const cpl_quad *q, int64_t n_markers, const MFTL_MarkerRef *ref, bool weighted, int ncomp, const double *g,
+                            double *out, long *bytes, long *messages)
 {
+  const int64_t ntab = q->n_own + q->n_ghost;
+  double *tab = (double *) MFTLCplAlloc((size_t) MFTL_MAX(ntab, 1) * (size_t) MFTL_MAX(ncomp, 1) * sizeof(double), "quadrature values");
   if (q->n_own > 0) memcpy(tab, g, (size_t) q->n_own * (size_t) ncomp * sizeof(double));
   /* forward: owners send the requested vertices' values; ghosts arrive in table order */
   const int64_t nsend = q->req_off[q->n_req] * ncomp;
-  double *sbuf = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(nsend, 1) * sizeof(double), "quadrature send");
+  double *sbuf = (double *) MFTLCplAlloc((size_t) MFTL_MAX(nsend, 1) * sizeof(double), "quadrature send");
   for (int64_t e = 0; e < q->req_off[q->n_req]; ++e)
     for (int k = 0; k < ncomp; ++k) sbuf[e * ncomp + k] = g[q->req_vt[e] * ncomp + k];
   cpl_sched s;
@@ -517,15 +520,6 @@ void MFTLCplQuadGhostValues(MPI_Comm comm, const cpl_quad *q, int ncomp, const d
   }
   MFTLCplSchedWait(&s);
   MFTLCplSchedFree(&s);
-  free(sbuf);
-}
-
-void MFTLCplQuadInterpolate(MPI_Comm comm, const cpl_quad *q, int64_t n_markers, const MFTL_MarkerRef *ref, bool weighted, int ncomp, const double *g,
-                            double *out, long *bytes, long *messages)
-{
-  const int64_t ntab = q->n_own + q->n_ghost;
-  double *tab = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(ntab, 1) * (size_t) MFTL_MAX(ncomp, 1) * sizeof(double), "quadrature values");
-  MFTLCplQuadGhostValues(comm, q, ncomp, g, tab, bytes, messages);
   for (int64_t i = 0; i < n_markers; ++i)
   {
     const double l1 = q->bary[2 * i], l2 = q->bary[2 * i + 1];
@@ -538,5 +532,6 @@ void MFTLCplQuadInterpolate(MPI_Comm comm, const cpl_quad *q, int64_t n_markers,
       out[i * ncomp + k] = w * v;
     }
   }
-  free(tab);
+  MFTLCplFree(sbuf);
+  MFTLCplFree(tab);
 }

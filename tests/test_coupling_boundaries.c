@@ -287,7 +287,7 @@ static int test_mirror_rows_match_the_index_reference(void)
       double wc[2048], cc[6];
       memcpy(kc, keys, (size_t) ne * sizeof(uint64_t));
       memcpy(wc, wts, (size_t) ne * sizeof(double));
-      MFTLCouplerBindingWallCoefficients(x.b, 0, i, 0, cc);
+      MFTLCouplerBindingWallCoefficients(x.b, 0, i, cc);
       const int nr = mirror_ref_row(&M, &P, &bp[3 * i], rk, rw, rc, 2048);
       if (nr < 0)
       {
@@ -1187,7 +1187,7 @@ static int test_mirror_after_a_dense_ordinary_location(void)
     const double *weights;
     MFTLCouplerBindingRow(b, loc, i, &ne, &keys, &weights);
     ok &= nr >= 0 && adv_row_diff(ne, keys, weights, nr, rk, rw) < 1e-12;
-    MFTLCouplerBindingWallCoefficients(b, loc, i, 0, cc);
+    MFTLCouplerBindingWallCoefficients(b, loc, i, cc);
     for (int f = 0; f < 6; ++f) ok &= fabs(cc[f] - rc[f]) < 1e-12;
   }
   MFTLCouplerReleaseBinding(&b);

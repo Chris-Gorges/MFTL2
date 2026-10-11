@@ -1225,8 +1225,8 @@ static int test_the_sampling_policy(void)
 
 /**
  * @brief USER markers anywhere -- every one of them on rank 0, spread over the
- *        whole domain, far outside rank 0's box. The directory must reach
- *        further than it was built for; it grows (collectively) and the answer
+ *        whole domain, far outside rank 0's box. Spatial directory queries
+ *        discover the providers without rebuilding the directory, and the answer
  *        stays exact. Spreading conserves the total load.
  */
 static int test_user_markers_far_from_their_rank(void)
@@ -1264,7 +1264,7 @@ static int test_user_markers_far_from_their_rank(void)
   MFTLCouplerGetStats(cp, &s0);
   TEST_ASSERT(agreed(MFTLCouplerRequestSupport(cp, &ms, &ws, &req) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
   MFTLCouplerGetStats(cp, &s1);
-  if (g_nproc > 1) TEST_ASSERT(agreed(s1.n_directory_builds > s0.n_directory_builds, MPI_COMM_WORLD));
+  if (g_nproc > 1) TEST_ASSERT(agreed(s1.n_directory_builds == s0.n_directory_builds, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(MFTLCouplerPrepareWindow(cp, req, &w) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(MFTLCouplerBind(cp, &ms, w, &b) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
   double U[200];
@@ -1910,6 +1910,67 @@ static int test_band_masks_describe_the_band(void)
   return 0;
 }
 
+/** @brief A missing coarse lattice cell must still influence the metric bound.
+ * The global lattice declares its width even when no provider owns it. Its
+ * pilot reaches a marker well beyond the fine cells' own support radius. */
+static int test_an_unowned_coarse_cell_cannot_hide_from_the_pilot(void)
+{
+  enum { N = 24 };
+  const double lo[3] = {0, 0, 0}, hi[3] = {1, 1, 1};
+  const bool periodic[3] = {false, false, false};
+  double faces[3][N + 1], coords[3][N];
+  for (int k = 0; k < 3; ++k)
+  {
+    for (int j = 0; j <= N; ++j) faces[k][j] = k == 0 && j < N ? 0.02 * j : (double) j / N;
+    for (int j = 0; j < N; ++j) coords[k][j] = 0.5 * (faces[k][j] + faces[k][j + 1]);
+  }
+  int ok = 1;
+  for (int missing = 0; missing < 2; ++missing)
+  {
+    MFTL_Ensemble *ens = make_ens(lo, hi, periodic);
+    MFTL_SolverGrid *grid = MFTLSolverGridCreate(MPI_COMM_WORLD);
+    MFTL_LocationDesc ld = {0};
+    ld.name = "unowned coarse pilot";
+    ld.lattice.kind = MFTL_LATTICE_RECTILINEAR;
+    for (int k = 0; k < 3; ++k)
+    {
+      ld.lattice.dims[k] = N;
+      ld.lattice.coords[k] = coords[k];
+      ld.lattice.faces[k] = faces[k];
+    }
+    const int loc = MFTLSolverGridAddLocation(grid, &ld);
+    int added = loc >= 0;
+    if (g_rank == 0)
+    {
+      MFTL_BlockDesc block = {0};
+      block.location = loc;
+      for (int k = 0; k < 3; ++k) block.owned_hi[k] = block.array_dims[k] = k == 0 ? N - missing : N;
+      added = added && MFTLSolverGridAddBlock(grid, &block) >= 0;
+    }
+    TEST_ASSERT(agreed(added, MPI_COMM_WORLD));
+    MFTL_Coupler *coupler = MFTL_NULL;
+    TEST_ASSERT(agreed(MFTLCouplerCreate(ens, grid, MFTL_NULL, &coupler) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+    const double point[3] = {0.2, 0.5, 0.5};
+    MFTL_MarkerSpec markers = {0};
+    markers.kind = MFTL_MARKERS_USER;
+    markers.n_user = g_rank == g_nproc - 1 ? 1 : 0;
+    markers.user_pos = point;
+    MFTL_WindowSpec window = {{0, 0, 0}};
+    MFTL_SupportRequest *request = MFTL_NULL;
+    const int status = MFTLCouplerRequestSupport(coupler, &markers, &window, &request);
+    if (status != (missing ? MFTL_COUPLING_NEED_COVERAGE : MFTL_COUPLING_OK)) ok = 0;
+    MFTL_RequestView view = {0};
+    if (request) MFTLCouplerGetRequests(request, &view);
+    if (missing && !anywhere(view.n_unprovided > 0, MPI_COMM_WORLD)) ok = 0;
+    MFTLCouplerReleaseRequest(&request);
+    MFTLCouplerDestroy(&coupler);
+    MFTLSolverGridDestroy(&grid);
+    MFTLEnsembleDestroy(&ens);
+  }
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
@@ -1921,6 +1982,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_a_selected_band_built_from_requests_equals_full);
   RUN_TEST(test_a_one_cell_hole_is_found_and_a_masked_cell_is_not);
   RUN_TEST(test_an_ownership_gap_is_never_a_wall);
+  RUN_TEST(test_an_unowned_coarse_cell_cannot_hide_from_the_pilot);
   RUN_TEST(test_duplicate_ownership_is_invalid);
   RUN_TEST(test_the_selected_point_protocol_and_its_limit);
   RUN_TEST(test_degenerate_provider_regions_can_be_certified);

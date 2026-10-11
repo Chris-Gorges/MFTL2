@@ -191,7 +191,7 @@ static int lv_new_window(lv_coupled *cp)
   memset(&ms, 0, sizeof ms);
   ms.kind = MFTL_MARKERS_VERTICES;
   ms.interpolation_only = true;
-  MFTL_WindowSpec ws = {{cp->skin[0], cp->skin[1], cp->skin[2]}};
+  MFTL_WindowSpec ws = {{cp->skin[0], cp->skin[1], cp->skin[2]}, {cp->skin[0], cp->skin[1], cp->skin[2]}};
   MFTL_SupportRequest *req = MFTL_NULL;
   const double t0 = MPI_Wtime();
   int st = MFTLCouplerRequestSupport(cp->c, &ms, &ws, &req);
@@ -214,10 +214,10 @@ static int lv_fetch(lv_coupled *cp, lv_solver *s, double t, MFTL_CouplingFetch *
 }
 
 /**
- * @brief One RK4 step through the coupler: a window requested at the step's
- *        start positions with a skin covering every stage of the step, four
- *        binds inside it, three fetches. Should a stage still leave it (on any
- *        rank -- the STALE is agreed), the step restarts on a fresh window.
+ * @brief One RK4 step using the existing window while its coverage holds.
+ *        Weights are rebuilt at all four stage positions; three field snapshots
+ *        cover the three stage times. A stale window (including after surface
+ *        migration/remeshing) triggers a collective refresh and step retry.
  */
 static int lv_coupled_step(lv_coupled *cp, lv_solver *s, MFTL_Ensemble *ens, double t, double dt, double T)
 {
@@ -230,8 +230,11 @@ static int lv_coupled_step(lv_coupled *cp, lv_solver *s, MFTL_Ensemble *ens, dou
   for (int attempt = 0; attempt < 3 && st == MFTL_COUPLING_STALE; ++attempt)
   {
     if (attempt > 0) cp->n_restarts++;
-    st = lv_new_window(cp);
-    if (st != MFTL_COUPLING_OK) return st;
+    if (cp->win == MFTL_NULL || attempt > 0)
+    {
+      st = lv_new_window(cp);
+      if (st != MFTL_COUPLING_OK) return st;
+    }
     MFTL_CouplingBinding *b0 = MFTL_NULL, *bs = MFTL_NULL;
     MFTL_CouplingFetch *f0 = MFTL_NULL, *fh = MFTL_NULL, *f1 = MFTL_NULL;
     double tb = MPI_Wtime();
@@ -244,6 +247,7 @@ static int lv_coupled_step(lv_coupled *cp, lv_solver *s, MFTL_Ensemble *ens, dou
     double *k = (double *) malloc(4 * 3 * (size_t) (n > 0 ? n : 1) * sizeof(double));
     double *xs = (double *) malloc(3 * (size_t) (n > 0 ? n : 1) * sizeof(double));
     double *k1 = k, *k2 = k + 3 * n, *k3 = k + 6 * n, *k4 = k + 9 * n;
+    double err_max = 0.0, err_sq = 0.0, err_n = 0.0;
 
     st = lv_fetch(cp, s, t, &f0);
     if (st == MFTL_COUPLING_OK) MFTLCouplerInterpolateFetched(b0, f0, k1);
@@ -255,9 +259,9 @@ static int lv_coupled_step(lv_coupled *cp, lv_solver *s, MFTL_Ensemble *ens, dou
       for (int q = 0; q < 3; ++q)
       {
         const double e = fabs(k1[3 * i + q] - u[q]);
-        if (e > cp->err_max) cp->err_max = e;
-        cp->err_sq += e * e;
-        cp->err_n += 1.0;
+        if (e > err_max) err_max = e;
+        err_sq += e * e;
+        err_n += 1.0;
       }
     }
     const double coef[3] = {0.5, 0.5, 1.0};
@@ -277,6 +281,10 @@ static int lv_coupled_step(lv_coupled *cp, lv_solver *s, MFTL_Ensemble *ens, dou
     }
     if (st == MFTL_COUPLING_OK)
     {
+      /* Count only the accepted step, not a stale-window attempt and its retry. */
+      cp->err_max = fmax(cp->err_max, err_max);
+      cp->err_sq += err_sq;
+      cp->err_n += err_n;
       for (int64_t i = 0; i < n; ++i)
       {
         MFTL_Object *obj = ens->local_objects[ref[i].slot];
@@ -537,6 +545,11 @@ static int lv_run_pass_a(lv_solver *s, const MFTL_CouplerParams *P, int refine, 
   }
   double ev[2] = {cp.err_sq, cp.err_n};
   MPI_Allreduce(MPI_IN_PLACE, ev, 2, MPI_DOUBLE, MPI_SUM, MPI_COMM_WORLD);
+  if (st == MFTL_COUPLING_OK && ev[1] != 3.0 * nv * last)
+  {
+    if (lv_rank() == 0) fprintf(stderr, "coupling: velocity diagnostics did not count each accepted vertex step exactly once\n");
+    st = MFTL_COUPLING_INVALID;
+  }
   MPI_Allreduce(&cp.err_max, &out->interp_max, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
   out->interp_rms = sqrt(ev[0] / fmax(ev[1], 1.0));
   out->windows = cp.n_windows;

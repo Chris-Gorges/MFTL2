@@ -12,7 +12,8 @@
  * requester can count the samples a box must contain and compare -- an exact
  * test needing nothing but integers. A POINT location cannot be enumerated by
  * anyone but its owner, so its owners certify regions instead. Point sets are
- * copied and sorted into Morton tiles of #TILE points: the tiles' cell-extent
+ * copied and sorted into Morton tiles of at most #TILE points, split further at
+ * resolution changes: the tiles' cell-extent
  * boxes are the default ownership regions, and their position boxes the search
  * index a provider answers requests with.
  */
@@ -29,12 +30,12 @@
 #include "mftl_memory.h"
 #include "mftl_object.h"
 
-/** @brief Points per Morton tile. */
+/** @brief Maximum points per Morton tile. */
 #define TILE 64
 
 MFTL_SolverGrid *MFTLSolverGridCreate(MPI_Comm solver_comm)
 {
-  MFTL_SolverGrid *g = (MFTL_SolverGrid *) MFTLCallocOrDie(1, sizeof(MFTL_SolverGrid), "MFTLSolverGridCreate");
+  MFTL_SolverGrid *g = (MFTL_SolverGrid *) MFTLCplCalloc(1, sizeof(MFTL_SolverGrid), "MFTLSolverGridCreate");
   g->comm = solver_comm;
   g->version_owned = 1;
   g->version_export = 1;
@@ -43,31 +44,31 @@ MFTL_SolverGrid *MFTLSolverGridCreate(MPI_Comm solver_comm)
 
 static void free_points(cpl_points *p)
 {
-  free(p->key);
-  free(p->pos);
-  free(p->measure);
-  free(p->h);
-  free(p->cell);
-  free(p->dir);
-  free(p->ext);
-  free(p->aidx);
-  free(p->orig);
-  free(p->tile_off);
-  free(p->tile_pbox);
-  free(p->tile_ebox);
-  free(p->tile_h);
+  MFTLCplFree(p->key);
+  MFTLCplFree(p->pos);
+  MFTLCplFree(p->measure);
+  MFTLCplFree(p->h);
+  MFTLCplFree(p->cell);
+  MFTLCplFree(p->ext);
+  MFTLCplFree(p->aidx);
+  MFTLCplFree(p->orig);
+  MFTLCplFree(p->tile_off);
+  MFTLCplFree(p->tile_pbox);
+  MFTLCplFree(p->tile_index.box);
+  MFTLCplFree(p->tile_ebox);
+  MFTLCplFree(p->tile_h);
   memset(p, 0, sizeof *p);
 }
 
 static void free_constraints(cpl_location *l)
 {
-  free(l->con_key);
-  free(l->con_ptr);
-  free(l->con_free);
-  free(l->con_coef);
-  free(l->con_owner);
-  free(l->con_sorted);
-  free(l->con_order);
+  MFTLCplFree(l->con_key);
+  MFTLCplFree(l->con_ptr);
+  MFTLCplFree(l->con_free);
+  MFTLCplFree(l->con_coef);
+  MFTLCplFree(l->con_owner);
+  MFTLCplFree(l->con_sorted);
+  MFTLCplFree(l->con_order);
   l->con_key = MFTL_NULL;
   l->con_ptr = MFTL_NULL;
   l->con_free = MFTL_NULL;
@@ -84,19 +85,16 @@ static void free_key_index(MFTL_SolverGrid *g)
   if (g->kidx_n == MFTL_NULL) return;
   for (int l = 0; l < g->n_loc; ++l)
   {
-    free(g->kidx_key[l]);
-    free(g->kidx_piece[l]);
-    free(g->kidx_elem[l]);
-    free(g->kidx_meas[l]);
-    free(g->kidx_sidx[l]);
+    MFTLCplFree(g->kidx_key[l]);
+    MFTLCplFree(g->kidx_piece[l]);
+    MFTLCplFree(g->kidx_elem[l]);
+    MFTLCplFree(g->kidx_meas[l]);
   }
-  free(g->kidx_n);
-  free(g->kidx_key);
-  free(g->kidx_piece);
-  free(g->kidx_elem);
-  free(g->kidx_meas);
-  free(g->kidx_sidx);
-  g->kidx_sidx = MFTL_NULL;
+  MFTLCplFree(g->kidx_n);
+  MFTLCplFree(g->kidx_key);
+  MFTLCplFree(g->kidx_piece);
+  MFTLCplFree(g->kidx_elem);
+  MFTLCplFree(g->kidx_meas);
   g->kidx_n = MFTL_NULL;
   g->kidx_key = MFTL_NULL;
   g->kidx_piece = MFTL_NULL;
@@ -106,9 +104,9 @@ static void free_key_index(MFTL_SolverGrid *g)
 
 static void free_coverage(cpl_location *l)
 {
-  free(l->cov_index);
-  free(l->cov_boxes);
-  free(l->prov_boxes);
+  MFTLCplFree(l->cov_index);
+  MFTLCplFree(l->cov_boxes);
+  MFTLCplFree(l->prov_boxes);
   l->cov_index = MFTL_NULL;
   l->cov_boxes = MFTL_NULL;
   l->prov_boxes = MFTL_NULL;
@@ -121,7 +119,7 @@ static void free_coverage(cpl_location *l)
 void MFTLSolverGridReset(MFTL_SolverGrid *g)
 {
   if (g == MFTL_NULL) return;
-  for (int i = 0; i < g->n_blocks; ++i) free(g->blocks[i].active);
+  for (int i = 0; i < g->n_blocks; ++i) MFTLCplFree(g->blocks[i].active);
   for (int i = 0; i < g->n_points; ++i) free_points(&g->points[i]);
   g->n_blocks = 0;
   g->n_points = 0;
@@ -146,15 +144,15 @@ void MFTLSolverGridDestroy(MFTL_SolverGrid **pg)
     free_constraints(&g->loc[l]);
     for (int k = 0; k < 3; ++k)
     {
-      free(g->loc[l].coords[k]);
-      free(g->loc[l].faces[k]);
+      MFTLCplFree(g->loc[l].coords[k]);
+      MFTLCplFree(g->loc[l].faces[k]);
     }
-    free(g->loc[l].piece_ref);
+    MFTLCplFree(g->loc[l].piece_ref);
   }
-  free(g->loc);
-  free(g->blocks);
-  free(g->points);
-  free(g);
+  MFTLCplFree(g->loc);
+  MFTLCplFree(g->blocks);
+  MFTLCplFree(g->points);
+  MFTLCplFree(g);
   *pg = MFTL_NULL;
 }
 
@@ -195,16 +193,6 @@ int MFTLSolverGridAddLocation(MFTL_SolverGrid *g, const MFTL_LocationDesc *desc)
   if (desc->anisotropic && lat->kind != MFTL_LATTICE_NONE)
   {
     complain("an anisotropic location is a point location (a lattice is axis-aligned by construction)");
-    return MFTL_ERROR;
-  }
-  if (desc->directional && lat->kind != MFTL_LATTICE_NONE)
-  {
-    complain("a directional location is a point location (a staggered lattice is interpolated component by component)");
-    return MFTL_ERROR;
-  }
-  if (desc->directional && desc->boundary == MFTL_BOUNDARY_MIRROR)
-  {
-    complain("a directional location cannot mirror: the image of a projection depends on the direction's parity per component");
     return MFTL_ERROR;
   }
   if (lat->kind != MFTL_LATTICE_NONE)
@@ -255,7 +243,7 @@ int MFTLSolverGridAddLocation(MFTL_SolverGrid *g, const MFTL_LocationDesc *desc)
   if (g->n_loc == g->cap_loc)
   {
     g->cap_loc = MFTLGrowCapacity(g->cap_loc, g->n_loc + 1);
-    g->loc = (cpl_location *) MFTLReallocOrDie(g->loc, (size_t) g->cap_loc * sizeof(cpl_location), "coupling locations");
+    g->loc = (cpl_location *) MFTLCplRealloc(g->loc, (size_t) g->cap_loc * sizeof(cpl_location), "coupling locations");
   }
   cpl_location *l = &g->loc[g->n_loc];
   memset(l, 0, sizeof *l);
@@ -264,7 +252,6 @@ int MFTLSolverGridAddLocation(MFTL_SolverGrid *g, const MFTL_LocationDesc *desc)
   l->boundary = desc->boundary;
   for (int f = 0; f < 6; ++f) l->wall[f] = (desc->boundary == MFTL_BOUNDARY_MIRROR) ? desc->wall[f] : MFTL_WALL_EVEN;
   l->anisotropic = desc->anisotropic;
-  l->directional = desc->directional;
   l->exposure = MFTL_GRID_FULL;
   for (int k = 0; k < 3; ++k)
   {
@@ -273,8 +260,8 @@ int MFTLSolverGridAddLocation(MFTL_SolverGrid *g, const MFTL_LocationDesc *desc)
     l->spacing[k] = (lat->kind == MFTL_LATTICE_UNIFORM) ? lat->spacing[k] : 0.0;
     if (lat->kind == MFTL_LATTICE_RECTILINEAR)
     {
-      l->coords[k] = (double *) MFTLMallocOrDie((size_t) lat->dims[k] * sizeof(double), "rectilinear coords");
-      l->faces[k] = (double *) MFTLMallocOrDie((size_t) (lat->dims[k] + 1) * sizeof(double), "rectilinear faces");
+      l->coords[k] = (double *) MFTLCplAlloc((size_t) lat->dims[k] * sizeof(double), "rectilinear coords");
+      l->faces[k] = (double *) MFTLCplAlloc((size_t) (lat->dims[k] + 1) * sizeof(double), "rectilinear faces");
       memcpy(l->coords[k], lat->coords[k], (size_t) lat->dims[k] * sizeof(double));
       memcpy(l->faces[k], lat->faces[k], (size_t) (lat->dims[k] + 1) * sizeof(double));
     }
@@ -288,7 +275,7 @@ static int add_piece(cpl_location *l, int ref)
   if (l->n_pieces == l->cap_pieces)
   {
     l->cap_pieces = MFTLGrowCapacity(l->cap_pieces, l->n_pieces + 1);
-    l->piece_ref = (int *) MFTLReallocOrDie(l->piece_ref, (size_t) l->cap_pieces * sizeof(int), "coupling pieces");
+    l->piece_ref = (int *) MFTLCplRealloc(l->piece_ref, (size_t) l->cap_pieces * sizeof(int), "coupling pieces");
   }
   l->piece_ref[l->n_pieces] = ref;
   return l->n_pieces++;
@@ -355,14 +342,14 @@ int MFTLSolverGridAddBlock(MFTL_SolverGrid *g, const MFTL_BlockDesc *desc)
   }
   if (desc->active != MFTL_NULL && vol > 0)
   {
-    b.active = (unsigned char *) MFTLMallocOrDie((size_t) vol, "block mask");
+    b.active = (unsigned char *) MFTLCplAlloc((size_t) vol, "block mask");
     memcpy(b.active, desc->active, (size_t) vol);
   }
 
   if (g->n_blocks == g->cap_blocks)
   {
     g->cap_blocks = MFTLGrowCapacity(g->cap_blocks, g->n_blocks + 1);
-    g->blocks = (cpl_block *) MFTLReallocOrDie(g->blocks, (size_t) g->cap_blocks * sizeof(cpl_block), "coupling blocks");
+    g->blocks = (cpl_block *) MFTLCplRealloc(g->blocks, (size_t) g->cap_blocks * sizeof(cpl_block), "coupling blocks");
   }
   b.piece = add_piece(l, g->n_blocks);
   g->blocks[g->n_blocks++] = b;
@@ -387,8 +374,8 @@ static void tile_points(cpl_points *p)
       }
     double sc[3];
     for (int k = 0; k < 3; ++k) sc[k] = (hi[k] > lo[k]) ? MFTL_MORTON_MAX / (hi[k] - lo[k]) : 0.0;
-    uint64_t *code = (uint64_t *) MFTLMallocOrDie((size_t) n * sizeof(uint64_t), "point morton");
-    int *perm = (int *) MFTLMallocOrDie((size_t) n * sizeof(int), "point morton");
+    uint64_t *code = (uint64_t *) MFTLCplAlloc((size_t) n * sizeof(uint64_t), "point morton");
+    int *perm = (int *) MFTLCplAlloc((size_t) n * sizeof(int), "point morton");
     for (int64_t i = 0; i < n; ++i)
     {
       uint64_t c[3];
@@ -397,18 +384,17 @@ static void tile_points(cpl_points *p)
       perm[i] = (int) i;
     }
     MFTLSortPairs64(code, perm, (int) n);
-    free(code);
+    MFTLCplFree(code);
 
     /* Apply the permutation to every array. */
-    uint64_t *key = (uint64_t *) MFTLMallocOrDie((size_t) n * sizeof(uint64_t), "points");
-    double *pos = (double *) MFTLMallocOrDie(3 * (size_t) n * sizeof(double), "points");
-    double *mea = (double *) MFTLMallocOrDie((size_t) n * sizeof(double), "points");
-    double *h = (double *) MFTLMallocOrDie(3 * (size_t) n * sizeof(double), "points");
-    double *ext = (double *) MFTLMallocOrDie(3 * (size_t) n * sizeof(double), "points");
-    double *cell = p->cell ? (double *) MFTLMallocOrDie(9 * (size_t) n * sizeof(double), "points") : MFTL_NULL;
-    double *dir = p->dir ? (double *) MFTLMallocOrDie(3 * (size_t) n * sizeof(double), "points") : MFTL_NULL;
-    int64_t *aidx = (int64_t *) MFTLMallocOrDie((size_t) n * sizeof(int64_t), "points");
-    int64_t *orig = (int64_t *) MFTLMallocOrDie((size_t) n * sizeof(int64_t), "points");
+    uint64_t *key = (uint64_t *) MFTLCplAlloc((size_t) n * sizeof(uint64_t), "points");
+    double *pos = (double *) MFTLCplAlloc(3 * (size_t) n * sizeof(double), "points");
+    double *mea = (double *) MFTLCplAlloc((size_t) n * sizeof(double), "points");
+    double *h = (double *) MFTLCplAlloc(3 * (size_t) n * sizeof(double), "points");
+    double *ext = (double *) MFTLCplAlloc(3 * (size_t) n * sizeof(double), "points");
+    double *cell = p->cell ? (double *) MFTLCplAlloc(9 * (size_t) n * sizeof(double), "points") : MFTL_NULL;
+    int64_t *aidx = (int64_t *) MFTLCplAlloc((size_t) n * sizeof(int64_t), "points");
+    int64_t *orig = (int64_t *) MFTLCplAlloc((size_t) n * sizeof(int64_t), "points");
     for (int64_t i = 0; i < n; ++i)
     {
       const int64_t s = perm[i];
@@ -423,34 +409,60 @@ static void tile_points(cpl_points *p)
         ext[3 * i + k] = p->ext[3 * s + k];
       }
       if (cell) memcpy(&cell[9 * i], &p->cell[9 * s], 9 * sizeof(double));
-      if (dir) memcpy(&dir[3 * i], &p->dir[3 * s], 3 * sizeof(double));
     }
-    free(perm);
-    free(p->key);
-    free(p->pos);
-    free(p->measure);
-    free(p->h);
-    free(p->ext);
-    free(p->aidx);
-    free(p->orig);
+    MFTLCplFree(perm);
+    MFTLCplFree(p->key);
+    MFTLCplFree(p->pos);
+    MFTLCplFree(p->measure);
+    MFTLCplFree(p->h);
+    MFTLCplFree(p->ext);
+    MFTLCplFree(p->aidx);
+    MFTLCplFree(p->orig);
     p->key = key;
     p->pos = pos;
     p->measure = mea;
     p->h = h;
-    free(p->cell);
+    MFTLCplFree(p->cell);
     p->cell = cell;
-    free(p->dir);
-    p->dir = dir;
     p->ext = ext;
     p->aidx = aidx;
     p->orig = orig;
   }
 
-  p->n_tiles = (int) ((n + TILE - 1) / TILE);
-  p->tile_off = (int64_t *) MFTLMallocOrDie((size_t) (p->n_tiles + 1) * sizeof(int64_t), "point tiles");
-  p->tile_pbox = (double *) MFTLMallocOrDie(6 * (size_t) MFTL_MAX(p->n_tiles, 1) * sizeof(double), "point tiles");
-  p->tile_ebox = (double *) MFTLMallocOrDie(6 * (size_t) MFTL_MAX(p->n_tiles, 1) * sizeof(double), "point tiles");
-  p->tile_h = (double *) MFTLMallocOrDie(6 * (size_t) MFTL_MAX(p->n_tiles, 1) * sizeof(double), "point tiles");
+  /* Split Morton runs also at resolution jumps: an isolated coarse cell
+   * must not enlarge the metadata footprint of an entire fine tile. */
+  int tile_cap = 16;
+  p->tile_off = MFTLCplAlloc((size_t) (tile_cap + 1) * sizeof(int64_t), "point tiles");
+  p->n_tiles = 0;
+  for (int64_t a = 0; a < n;)
+  {
+    double lo[3], hi[3];
+    for (int k = 0; k < 3; ++k) lo[k] = hi[k] = p->h[3 * a + k];
+    int64_t b = a + 1;
+    for (; b < n && b < a + TILE; ++b)
+    {
+      bool split = false;
+      for (int k = 0; k < 3; ++k)
+        if (fmax(hi[k], p->h[3 * b + k]) > 2.0 * fmin(lo[k], p->h[3 * b + k])) split = true;
+      if (split) break;
+      for (int k = 0; k < 3; ++k)
+      {
+        lo[k] = fmin(lo[k], p->h[3 * b + k]);
+        hi[k] = fmax(hi[k], p->h[3 * b + k]);
+      }
+    }
+    if (p->n_tiles == tile_cap)
+    {
+      tile_cap *= 2;
+      p->tile_off = MFTLCplRealloc(p->tile_off, (size_t) (tile_cap + 1) * sizeof(int64_t), "point tiles");
+    }
+    p->tile_off[p->n_tiles++] = a;
+    a = b;
+  }
+  p->tile_off[p->n_tiles] = n;
+  p->tile_pbox = (double *) MFTLCplAlloc(6 * (size_t) MFTL_MAX(p->n_tiles, 1) * sizeof(double), "point tiles");
+  p->tile_ebox = (double *) MFTLCplAlloc(6 * (size_t) MFTL_MAX(p->n_tiles, 1) * sizeof(double), "point tiles");
+  p->tile_h = (double *) MFTLCplAlloc(6 * (size_t) MFTL_MAX(p->n_tiles, 1) * sizeof(double), "point tiles");
   for (int k = 0; k < 3; ++k)
   {
     p->tile_hmin[k] = MFTL_DBL_MAX;
@@ -458,8 +470,7 @@ static void tile_points(cpl_points *p)
   }
   for (int t = 0; t < p->n_tiles; ++t)
   {
-    const int64_t a = (int64_t) t * TILE, b = MFTL_MIN(a + TILE, n);
-    p->tile_off[t] = a;
+    const int64_t a = p->tile_off[t], b = p->tile_off[t + 1];
     double *pb = &p->tile_pbox[6 * t], *eb = &p->tile_ebox[6 * t], *th = &p->tile_h[6 * t];
     for (int k = 0; k < 3; ++k)
     {
@@ -484,6 +495,7 @@ static void tile_points(cpl_points *p)
     }
   }
   p->tile_off[p->n_tiles] = n;
+  MFTLCplBoxTreeBuild(&p->tile_index, p->tile_pbox, p->n_tiles, 4, false);
 }
 
 int MFTLSolverGridAddPoints(MFTL_SolverGrid *g, const MFTL_PointSetDesc *desc)
@@ -532,24 +544,6 @@ int MFTLSolverGridAddPoints(MFTL_SolverGrid *g, const MFTL_PointSetDesc *desc)
         complain("points: h_uniform must be positive when h is NULL");
         return MFTL_ERROR;
       }
-  if (l->directional)
-  {
-    if (n > 0 && desc->direction == MFTL_NULL)
-    {
-      complain("points: a directional location needs a direction vector per sample");
-      return MFTL_ERROR;
-    }
-    for (int64_t i = 0; i < n; ++i)
-    {
-      const double *v = &desc->direction[3 * i];
-      const double m2 = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
-      if (!isfinite(v[0]) || !isfinite(v[1]) || !isfinite(v[2]) || !(m2 > 0.0) || !isfinite(m2))
-      {
-        complain("points: a direction vector is zero or not finite");
-        return MFTL_ERROR;
-      }
-    }
-  }
   for (int64_t i = 0; i < n; ++i)
   {
     for (int k = 0; k < 3; ++k)
@@ -579,15 +573,14 @@ int MFTLSolverGridAddPoints(MFTL_SolverGrid *g, const MFTL_PointSetDesc *desc)
   p.location = desc->location;
   p.n = n;
   const size_t nn = (size_t) MFTL_MAX(n, 1);
-  p.key = (uint64_t *) MFTLMallocOrDie(nn * sizeof(uint64_t), "points");
-  p.pos = (double *) MFTLMallocOrDie(3 * nn * sizeof(double), "points");
-  p.measure = (double *) MFTLMallocOrDie(nn * sizeof(double), "points");
-  p.h = (double *) MFTLMallocOrDie(3 * nn * sizeof(double), "points");
-  p.ext = (double *) MFTLMallocOrDie(3 * nn * sizeof(double), "points");
-  p.aidx = (int64_t *) MFTLMallocOrDie(nn * sizeof(int64_t), "points");
-  p.orig = (int64_t *) MFTLMallocOrDie(nn * sizeof(int64_t), "points");
-  if (l->anisotropic) p.cell = (double *) MFTLMallocOrDie(9 * nn * sizeof(double), "points");
-  if (l->directional) p.dir = (double *) MFTLMallocOrDie(3 * nn * sizeof(double), "points");
+  p.key = (uint64_t *) MFTLCplAlloc(nn * sizeof(uint64_t), "points");
+  p.pos = (double *) MFTLCplAlloc(3 * nn * sizeof(double), "points");
+  p.measure = (double *) MFTLCplAlloc(nn * sizeof(double), "points");
+  p.h = (double *) MFTLCplAlloc(3 * nn * sizeof(double), "points");
+  p.ext = (double *) MFTLCplAlloc(3 * nn * sizeof(double), "points");
+  p.aidx = (int64_t *) MFTLCplAlloc(nn * sizeof(int64_t), "points");
+  p.orig = (int64_t *) MFTLCplAlloc(nn * sizeof(int64_t), "points");
+  if (l->anisotropic) p.cell = (double *) MFTLCplAlloc(9 * nn * sizeof(double), "points");
   for (int64_t i = 0; i < n; ++i)
   {
     p.key[i] = desc->keys[i];
@@ -595,7 +588,6 @@ int MFTLSolverGridAddPoints(MFTL_SolverGrid *g, const MFTL_PointSetDesc *desc)
     p.aidx[i] = desc->array_index ? desc->array_index[i] : i;
     p.orig[i] = i;
     if (p.cell) memcpy(&p.cell[9 * i], &desc->cell[9 * i], 9 * sizeof(double));
-    if (p.dir) memcpy(&p.dir[3 * i], &desc->direction[3 * i], 3 * sizeof(double));
     for (int k = 0; k < 3; ++k)
     {
       p.pos[3 * i + k] = desc->pos[3 * i + k];
@@ -610,7 +602,7 @@ int MFTLSolverGridAddPoints(MFTL_SolverGrid *g, const MFTL_PointSetDesc *desc)
   if (g->n_points == g->cap_points)
   {
     g->cap_points = MFTLGrowCapacity(g->cap_points, g->n_points + 1);
-    g->points = (cpl_points *) MFTLReallocOrDie(g->points, (size_t) g->cap_points * sizeof(cpl_points), "coupling point sets");
+    g->points = (cpl_points *) MFTLCplRealloc(g->points, (size_t) g->cap_points * sizeof(cpl_points), "coupling point sets");
   }
   p.piece = add_piece(l, g->n_points);
   g->points[g->n_points++] = p;
@@ -647,8 +639,8 @@ int MFTLSolverGridSetCoverage(MFTL_SolverGrid *g, const MFTL_CoverageDesc *desc)
         return MFTL_ERROR;
       }
     }
-  free(l->cov_index);
-  free(l->cov_boxes);
+  MFTLCplFree(l->cov_index);
+  MFTLCplFree(l->cov_boxes);
   l->cov_index = MFTL_NULL;
   l->cov_boxes = MFTL_NULL;
   l->exposure = desc->exposure;
@@ -657,12 +649,12 @@ int MFTLSolverGridSetCoverage(MFTL_SolverGrid *g, const MFTL_CoverageDesc *desc)
   {
     if (cpl_is_lattice(l))
     {
-      l->cov_index = (int64_t *) MFTLMallocOrDie(6 * (size_t) n * sizeof(int64_t), "coverage");
+      l->cov_index = (int64_t *) MFTLCplAlloc(6 * (size_t) n * sizeof(int64_t), "coverage");
       memcpy(l->cov_index, desc->index_boxes, 6 * (size_t) n * sizeof(int64_t));
     }
     else
     {
-      l->cov_boxes = (double *) MFTLMallocOrDie(6 * (size_t) n * sizeof(double), "coverage");
+      l->cov_boxes = (double *) MFTLCplAlloc(6 * (size_t) n * sizeof(double), "coverage");
       memcpy(l->cov_boxes, desc->boxes, 6 * (size_t) n * sizeof(double));
     }
   }
@@ -706,13 +698,13 @@ int MFTLSolverGridSetConstraints(MFTL_SolverGrid *g, const MFTL_ConstraintDesc *
   free_constraints(l);
   l->n_con = n;
   const size_t nn = (size_t) MFTL_MAX(n, 1), nne = (size_t) MFTL_MAX(ne, 1);
-  l->con_key = (uint64_t *) MFTLMallocOrDie(nn * sizeof(uint64_t), "constraints");
-  l->con_ptr = (int64_t *) MFTLMallocOrDie((nn + 1) * sizeof(int64_t), "constraints");
-  l->con_free = (uint64_t *) MFTLMallocOrDie(nne * sizeof(uint64_t), "constraints");
-  l->con_coef = (double *) MFTLMallocOrDie(nne * sizeof(double), "constraints");
-  l->con_owner = (int *) MFTLMallocOrDie(nne * sizeof(int), "constraints");
-  l->con_sorted = (uint64_t *) MFTLMallocOrDie(nn * sizeof(uint64_t), "constraints");
-  l->con_order = (int64_t *) MFTLMallocOrDie(nn * sizeof(int64_t), "constraints");
+  l->con_key = (uint64_t *) MFTLCplAlloc(nn * sizeof(uint64_t), "constraints");
+  l->con_ptr = (int64_t *) MFTLCplAlloc((nn + 1) * sizeof(int64_t), "constraints");
+  l->con_free = (uint64_t *) MFTLCplAlloc(nne * sizeof(uint64_t), "constraints");
+  l->con_coef = (double *) MFTLCplAlloc(nne * sizeof(double), "constraints");
+  l->con_owner = (int *) MFTLCplAlloc(nne * sizeof(int), "constraints");
+  l->con_sorted = (uint64_t *) MFTLCplAlloc(nn * sizeof(uint64_t), "constraints");
+  l->con_order = (int64_t *) MFTLCplAlloc(nn * sizeof(int64_t), "constraints");
   l->con_ptr[0] = 0;
   if (n > 0)
   {
@@ -726,7 +718,7 @@ int MFTLSolverGridSetConstraints(MFTL_SolverGrid *g, const MFTL_ConstraintDesc *
     memcpy(l->con_owner, desc->free_owner, (size_t) ne * sizeof(int));
   }
   /* the sorted index: (key, registration index) pairs */
-  uint64_t *pairs = (uint64_t *) MFTLMallocOrDie(2 * nn * sizeof(uint64_t), "constraints");
+  uint64_t *pairs = (uint64_t *) MFTLCplAlloc(2 * nn * sizeof(uint64_t), "constraints");
   for (int64_t c = 0; c < n; ++c)
   {
     pairs[2 * c] = l->con_key[c];
@@ -738,7 +730,7 @@ int MFTLSolverGridSetConstraints(MFTL_SolverGrid *g, const MFTL_ConstraintDesc *
     l->con_sorted[c] = pairs[2 * c];
     l->con_order[c] = (int64_t) pairs[2 * c + 1];
   }
-  free(pairs);
+  MFTLCplFree(pairs);
   /* Windows cache constraint row indices and transfer routing. A map change
    * invalidates those caches even when sample ownership/export is unchanged;
    * UpdateGrid still retains the directory if its entries match. */
@@ -768,7 +760,6 @@ typedef struct
   int piece;
   int64_t elem;
   double meas;
-  int64_t sidx;
 } kidx_t;
 
 static int cmp_kidx(const void *a, const void *b)
@@ -777,45 +768,45 @@ static int cmp_kidx(const void *a, const void *b)
   return (x > y) - (x < y);
 }
 
-int MFTLCplSampleLocate(MFTL_SolverGrid *g, int location, uint64_t key, int *piece, int64_t *elem, double *measure, int64_t *sample)
+bool MFTLCplSampleFind(MFTL_SolverGrid *g, int location, uint64_t key, int *piece, int64_t *elem, double *measure)
 {
   const cpl_location *l = &g->loc[location];
   if (cpl_is_lattice(l))
   {
-    if (key >= (uint64_t) (l->dims[0] * l->dims[1] * l->dims[2])) return 0;
+    if (key >= (uint64_t) (l->dims[0] * l->dims[1] * l->dims[2])) return false;
     int64_t idx[3];
     cpl_lat_unkey(l, key, idx);
     for (int pc = 0; pc < l->n_pieces; ++pc)
     {
       const cpl_block *b = &g->blocks[l->piece_ref[pc]];
       if (idx[0] < b->lo[0] || idx[0] >= b->hi[0] || idx[1] < b->lo[1] || idx[1] >= b->hi[1] || idx[2] < b->lo[2] || idx[2] >= b->hi[2]) continue;
-      const int64_t nx = b->hi[0] - b->lo[0], ny = b->hi[1] - b->lo[1];
-      const int64_t lin = (idx[0] - b->lo[0]) + nx * ((idx[1] - b->lo[1]) + ny * (idx[2] - b->lo[2]));
-      if (b->active && !b->active[lin]) return -1;
+      if (b->active)
+      {
+        const int64_t nx = b->hi[0] - b->lo[0], ny = b->hi[1] - b->lo[1];
+        if (!b->active[(idx[0] - b->lo[0]) + nx * ((idx[1] - b->lo[1]) + ny * (idx[2] - b->lo[2]))]) return false;
+      }
       *piece = pc;
       *elem = cpl_block_elem(b, idx);
       *measure = MFTLCplLatWidth(l, 0, idx[0]) * MFTLCplLatWidth(l, 1, idx[1]) * MFTLCplLatWidth(l, 2, idx[2]);
-      *sample = lin;
-      return 1;
+      return true;
     }
-    return 0;
+    return false;
   }
   if (g->kidx_n == MFTL_NULL)
   {
     const size_t nl = (size_t) MFTL_MAX(g->n_loc, 1);
-    g->kidx_n = (int64_t *) MFTLMallocOrDie(nl * sizeof(int64_t), "key index");
-    g->kidx_key = (uint64_t **) MFTLCallocOrDie(nl, sizeof(uint64_t *), "key index");
-    g->kidx_piece = (int **) MFTLCallocOrDie(nl, sizeof(int *), "key index");
-    g->kidx_elem = (int64_t **) MFTLCallocOrDie(nl, sizeof(int64_t *), "key index");
-    g->kidx_meas = (double **) MFTLCallocOrDie(nl, sizeof(double *), "key index");
-    g->kidx_sidx = (int64_t **) MFTLCallocOrDie(nl, sizeof(int64_t *), "key index");
+    g->kidx_n = (int64_t *) MFTLCplAlloc(nl * sizeof(int64_t), "key index");
+    g->kidx_key = (uint64_t **) MFTLCplCalloc(nl, sizeof(uint64_t *), "key index");
+    g->kidx_piece = (int **) MFTLCplCalloc(nl, sizeof(int *), "key index");
+    g->kidx_elem = (int64_t **) MFTLCplCalloc(nl, sizeof(int64_t *), "key index");
+    g->kidx_meas = (double **) MFTLCplCalloc(nl, sizeof(double *), "key index");
     for (int i = 0; i < g->n_loc; ++i) g->kidx_n[i] = -1;
   }
   if (g->kidx_n[location] < 0)
   {
     int64_t total = 0;
     for (int pc = 0; pc < l->n_pieces; ++pc) total += g->points[l->piece_ref[pc]].n;
-    kidx_t *t = (kidx_t *) MFTLMallocOrDie((size_t) MFTL_MAX(total, 1) * sizeof(kidx_t), "key index");
+    kidx_t *t = (kidx_t *) MFTLCplAlloc((size_t) MFTL_MAX(total, 1) * sizeof(kidx_t), "key index");
     int64_t at = 0;
     for (int pc = 0; pc < l->n_pieces; ++pc)
     {
@@ -826,25 +817,22 @@ int MFTLCplSampleLocate(MFTL_SolverGrid *g, int location, uint64_t key, int *pie
         t[at].piece = pc;
         t[at].elem = p->aidx[i];
         t[at].meas = p->measure[i];
-        t[at].sidx = i;
       }
     }
     if (total > 1) qsort(t, (size_t) total, sizeof(kidx_t), cmp_kidx);
     const size_t nn = (size_t) MFTL_MAX(total, 1);
-    g->kidx_key[location] = (uint64_t *) MFTLMallocOrDie(nn * sizeof(uint64_t), "key index");
-    g->kidx_piece[location] = (int *) MFTLMallocOrDie(nn * sizeof(int), "key index");
-    g->kidx_elem[location] = (int64_t *) MFTLMallocOrDie(nn * sizeof(int64_t), "key index");
-    g->kidx_meas[location] = (double *) MFTLMallocOrDie(nn * sizeof(double), "key index");
-    g->kidx_sidx[location] = (int64_t *) MFTLMallocOrDie(nn * sizeof(int64_t), "key index");
+    g->kidx_key[location] = (uint64_t *) MFTLCplAlloc(nn * sizeof(uint64_t), "key index");
+    g->kidx_piece[location] = (int *) MFTLCplAlloc(nn * sizeof(int), "key index");
+    g->kidx_elem[location] = (int64_t *) MFTLCplAlloc(nn * sizeof(int64_t), "key index");
+    g->kidx_meas[location] = (double *) MFTLCplAlloc(nn * sizeof(double), "key index");
     for (int64_t i = 0; i < total; ++i)
     {
       g->kidx_key[location][i] = t[i].key;
       g->kidx_piece[location][i] = t[i].piece;
       g->kidx_elem[location][i] = t[i].elem;
       g->kidx_meas[location][i] = t[i].meas;
-      g->kidx_sidx[location][i] = t[i].sidx;
     }
-    free(t);
+    MFTLCplFree(t);
     g->kidx_n[location] = total;
   }
   int64_t lo = 0, hi = g->kidx_n[location];
@@ -857,18 +845,11 @@ int MFTLCplSampleLocate(MFTL_SolverGrid *g, int location, uint64_t key, int *pie
     else
       hi = m;
   }
-  if (lo >= g->kidx_n[location] || k[lo] != key) return 0;
+  if (lo >= g->kidx_n[location] || k[lo] != key) return false;
   *piece = g->kidx_piece[location][lo];
   *elem = g->kidx_elem[location][lo];
   *measure = g->kidx_meas[location][lo];
-  *sample = g->kidx_sidx[location][lo];
-  return 1;
-}
-
-bool MFTLCplSampleFind(MFTL_SolverGrid *g, int location, uint64_t key, int *piece, int64_t *elem, double *measure)
-{
-  int64_t sample;
-  return MFTLCplSampleLocate(g, location, key, piece, elem, measure, &sample) == 1;
+  return true;
 }
 
 int MFTLSolverGridSetProviderRegions(MFTL_SolverGrid *g, const MFTL_ProviderRegions *desc)
@@ -904,12 +885,12 @@ int MFTLSolverGridSetProviderRegions(MFTL_SolverGrid *g, const MFTL_ProviderRegi
     l->prov_hmin[k] = desc->h_min[k];
     l->prov_hmax[k] = desc->h_max[k];
   }
-  free(l->prov_boxes);
+  MFTLCplFree(l->prov_boxes);
   l->prov_boxes = MFTL_NULL;
   l->n_prov = desc->n_boxes;
   if (l->n_prov > 0)
   {
-    l->prov_boxes = (double *) MFTLMallocOrDie(6 * (size_t) l->n_prov * sizeof(double), "provider regions");
+    l->prov_boxes = (double *) MFTLCplAlloc(6 * (size_t) l->n_prov * sizeof(double), "provider regions");
     memcpy(l->prov_boxes, desc->boxes, 6 * (size_t) l->n_prov * sizeof(double));
   }
   g->version_owned++;
@@ -932,7 +913,7 @@ uint64_t MFTLCplGridDefinitionHash(const MFTL_SolverGrid *g)
     h = cpl_fnv(h, &kind, sizeof kind);
     h = cpl_fnv(h, &bnd, sizeof bnd);
     h = cpl_fnv(h, l->wall, sizeof l->wall);
-    const int an = (l->anisotropic ? 1 : 0) | (l->directional ? 2 : 0);
+    const int an = l->anisotropic ? 1 : 0;
     h = cpl_fnv(h, &an, sizeof an);
     h = cpl_fnv(h, l->dims, sizeof l->dims);
     h = cpl_fnv(h, l->origin, sizeof l->origin);
@@ -1001,8 +982,8 @@ int MFTLCplGridValidate(const MFTL_SolverGrid *g, const MFTL_Domain *d)
     int64_t total = 0;
     for (int pc = 0; pc < l->n_pieces; ++pc) total += g->points[l->piece_ref[pc]].n;
     if (total < 2) continue;
-    uint64_t *k = (uint64_t *) MFTLMallocOrDie((size_t) total * sizeof(uint64_t), "key check");
-    uint64_t *tmp = (uint64_t *) MFTLMallocOrDie((size_t) total * sizeof(uint64_t), "key check");
+    uint64_t *k = (uint64_t *) MFTLCplAlloc((size_t) total * sizeof(uint64_t), "key check");
+    uint64_t *tmp = (uint64_t *) MFTLCplAlloc((size_t) total * sizeof(uint64_t), "key check");
     int64_t m = 0;
     for (int pc = 0; pc < l->n_pieces; ++pc)
     {
@@ -1013,8 +994,8 @@ int MFTLCplGridValidate(const MFTL_SolverGrid *g, const MFTL_Domain *d)
     int dup = 0;
     for (int64_t j = 1; j < total; ++j)
       if (k[j] == k[j - 1]) dup = 1;
-    free(k);
-    free(tmp);
+    MFTLCplFree(k);
+    MFTLCplFree(tmp);
     if (dup)
     {
       fprintf(stderr, "MFTL coupling: location '%s': duplicate point keys on one rank\n", l->name);

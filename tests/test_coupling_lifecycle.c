@@ -901,14 +901,114 @@ static int test_a_redistributed_surface_binds_in_the_old_window(void)
   return 0;
 }
 
+/** @brief Reusing released buffers must never change a still-live RK snapshot.
+ * Exercise changing batch sizes, invalid ghosts, irregular ownership,
+ * periodic seams and a lattice whose dimensions are not brick multiples. */
+static int test_reused_fetch_buffers_keep_live_snapshots(void)
+{
+  const bool per[3] = {true, true, true};
+  adv_lat A = adv_default_lattice(true, per);
+  MFTL_Ensemble *ens = adv_ensemble(&A);
+  MFTL_SolverGrid *g = MFTLSolverGridCreate(MPI_COMM_WORLD);
+  const int loc = adv_add_location(g, "velocity", &A, MFTL_BOUNDARY_TRUNCATE);
+  adv_blocks B;
+  adv_decompose(g, loc, &A, 3 * g_nproc + 1, 931u, 2, 1, false, &B);
+  MFTL_Coupler *c = MFTL_NULL;
+  TEST_ASSERT(agreed(MFTLCouplerCreate(ens, g, MFTL_NULL, &c) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+  adv_markers M;
+  adv_markers_make(&ens->domain, &A, 2.0 * A.h[0], 40, 117u, 0.0, &M);
+  MFTL_CouplingWindow *w = MFTL_NULL;
+  MFTL_CouplingBinding *b = MFTL_NULL;
+  int64_t n;
+  TEST_ASSERT(agreed(adv_bind_list(c, (int) M.n_all, M.all, 0, MFTL_NULL, &w, &b, &n) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+  MFTL_BindingQuality quality;
+  MFTLCouplerBindingQuality(b, &quality);
+  TEST_ASSERT(agreed(quality.n_cartesian == n, MPI_COMM_WORLD));
+  double *U = malloc((size_t) MFTL_MAX(3 * n, 1) * sizeof(double));
+  MFTL_CouplingFetch *held = MFTL_NULL;
+  affine constant = {2.0, {0, 0, 0}};
+  adv_fill(&B, &A, 0, f_affine, &constant, false);
+  MFTL_SolverField F[3];
+  for (int i = 0; i < 3; ++i) F[i] = adv_field(&B, loc, 0, 0, false);
+  TEST_ASSERT(agreed(MFTLCouplerFetch(c, w, 1, F, &held) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+  int ok = 1;
+  for (int step = 0; step < 12; ++step)
+  {
+    const int nf = 1 + (step / 3) % 3; /* matching layouts and layout changes */
+    constant.a = 5.0 + step;
+    adv_fill(&B, &A, 0, f_affine, &constant, false);
+    MFTL_CouplingFetch *stage = MFTL_NULL;
+    TEST_ASSERT(agreed(MFTLCouplerFetch(c, w, nf, F, &stage) == MFTL_COUPLING_OK, MPI_COMM_WORLD));
+    if (MFTLCouplerInterpolateFetched(b, stage, U) != MFTL_COUPLING_OK) ok = 0;
+    for (int64_t i = 0; i < n * nf; ++i)
+      if (fabs(U[i] - constant.a) > 2e-12) ok = 0;
+    MFTLCouplerReleaseFetch(&stage);
+    if (MFTLCouplerInterpolateFetched(b, held, U) != MFTL_COUPLING_OK) ok = 0;
+    for (int64_t i = 0; i < n; ++i)
+      if (fabs(U[i] - 2.0) > 2e-12) ok = 0;
+  }
+  MFTL_CouplerStats stats;
+  MFTLCouplerGetStats(c, &stats);
+  TEST_ASSERT(agreed(ok && stats.n_requests == 1 && stats.n_windows == 1 && stats.n_fetches == 13 && stats.n_fetch_reused == 8, MPI_COMM_WORLD));
+  free(U);
+  MFTLCouplerReleaseFetch(&held);
+  MFTLCouplerReleaseBinding(&b);
+  TEST_ASSERT(agreed(MFTLCouplerReleaseWindow(&w) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  MFTLCouplerDestroy(&c);
+  adv_markers_free(&M);
+  adv_free_blocks(&B);
+  MFTLSolverGridDestroy(&g);
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/** @brief Accounting includes temporary peaks and returns to its baseline after
+ * grids, windows, bindings, snapshots and reusable scratch are destroyed. */
+static int test_accounted_memory_and_limit(void)
+{
+  MFTL_CouplingMemoryStats initial, loaded, released;
+  MFTLCouplerGetMemoryStats(&initial);
+  TEST_ASSERT(agreed(initial.current_bytes == 0 && initial.live_allocations == 0, MPI_COMM_WORLD));
+  MFTLCouplerResetMemoryPeak();
+  const size_t limit = (size_t) 64 * 1024 * 1024;
+  TEST_ASSERT(agreed(MFTLCouplerSetMemoryLimit(limit) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  MFTL_SolverGrid *grid = MFTLSolverGridCreate(MPI_COMM_WORLD);
+  MFTLCouplerGetMemoryStats(&loaded);
+  TEST_ASSERT(agreed(loaded.current_bytes > 0 && loaded.peak_bytes >= loaded.current_bytes && loaded.limit_bytes == limit, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLCouplerSetMemoryLimit(loaded.current_bytes - 1) == MFTL_ERROR, MPI_COMM_WORLD));
+  MFTLSolverGridDestroy(&grid);
+  TEST_ASSERT(agreed(test_reused_fetch_buffers_keep_live_snapshots() == 0, MPI_COMM_WORLD));
+  MFTLCouplerGetMemoryStats(&released);
+  TEST_ASSERT(agreed(released.current_bytes == 0 && released.live_allocations == 0 && released.peak_bytes > loaded.peak_bytes &&
+                     released.peak_bytes <= limit && released.limit_bytes == limit, MPI_COMM_WORLD));
+  MFTLCouplerResetMemoryPeak();
+  MFTLCouplerGetMemoryStats(&released);
+  TEST_ASSERT(agreed(released.peak_bytes == 0, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLCouplerSetMemoryLimit(0) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
   MPI_Comm_rank(MPI_COMM_WORLD, &g_rank);
   MPI_Comm_size(MPI_COMM_WORLD, &g_nproc);
+  if (argc > 1 && strcmp(argv[1], "-exhaust-memory") == 0)
+  {
+    if (g_rank == g_nproc - 1)
+    {
+      MFTLCouplerSetMemoryLimit(1);
+      MFTL_SolverGrid *grid = MFTLSolverGridCreate(MPI_COMM_WORLD);
+      (void) grid;
+    }
+    MPI_Barrier(MPI_COMM_WORLD); /* must be terminated, never stranded */
+    MPI_Finalize();
+    return 0; /* reaching here is a failure of the budget */
+  }
   MFTLRegisterMpiTypes();
   if (g_rank == 0) printf("\n=== Coupling lifecycle (np = %d) ===\n", g_nproc);
 
+  RUN_TEST(test_accounted_memory_and_limit);
   RUN_TEST(test_the_solver_completes_the_halo_transpose);
   RUN_TEST(test_ghost_layers_aliasing_owned_samples_survive);
   RUN_TEST(test_local_stage_binds_are_local);

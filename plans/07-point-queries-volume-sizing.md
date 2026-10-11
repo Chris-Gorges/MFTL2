@@ -5,7 +5,11 @@ Depends on:
 - `03-body-integrals.md` (volumes, rim walls, the deferred ray-parity design §4.6);
 - `04-attached-fields.md` (sizing field);
 - `05-curvature-and-surface-tension.md` (curvature for adaptive sizing);
-- `06-point-cloud-coupling.md` (the solver points and their exchange).
+- the [coupler's solver-sample interface](../src/coupling/README.md).
+
+Scope note: D1 is a separate geometry-query operation. Its proposed coupler-prefixed
+names and module placement below need revision before implementation; it must not
+expand the transfer scope of [plan 06](06-coupler-improvements.md).
 
 Three independent milestones (D1, D2, D3), in that order of value. Each can land alone.
 
@@ -62,7 +66,7 @@ Three things every FT or IBM solver needs next to forces and interpolation:
 ## 3. Decision
 
 - **D1:**
-  - `MFTLCouplerSignedDistance`, the narrow-band φ at the solver's points through plan 06;
+  - `MFTLCouplerSignedDistance`, the proposed narrow-band φ query at registered solver points (see the scope note above);
   - `MFTLCouplerIndicator`, a smoothed Heaviside from it, plus a per-body box classification;
   - the exact far-field parity as the second step of D1.
 - **D2:** `MFTLEnsembleCorrectVolumes` over a shared local kernel. Topology change calls the kernel

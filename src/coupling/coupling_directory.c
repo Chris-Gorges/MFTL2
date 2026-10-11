@@ -25,6 +25,7 @@
 #include "mftl_arrayfunctions.h"
 #include "mftl_constants.h"
 #include "mftl_memory.h"
+#include "mftl_object.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Lattice arithmetic
@@ -358,304 +359,115 @@ int MFTLCplRanksTouching(const MFTL_Domain *d, const double lo[3], const double 
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * A grid over the directory
+ * Compact bounds trees over directory certificates
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static int cmp_i64pair(const void *a, const void *b)
+typedef struct
 {
-  const int64_t *x = (const int64_t *) a, *y = (const int64_t *) b;
-  if (x[0] != y[0]) return (x[0] > y[0]) - (x[0] < y[0]);
-  return (x[1] > y[1]) - (x[1] < y[1]);
+  uint64_t key;
+  int entry;
+} dir_order;
+
+static int cmp_dir_order(const void *a, const void *b)
+{
+  const dir_order *x = a, *y = b;
+  if (x->key != y->key) return (x->key > y->key) - (x->key < y->key);
+  return (x->entry > y->entry) - (x->entry < y->entry);
 }
 
 void MFTLCplDirIndexBuild(cpl_dir_index *ix, const cpl_dir_entry *e, int n, int location)
 {
   memset(ix, 0, sizeof *ix);
-  double lo[3] = {MFTL_DBL_MAX, MFTL_DBL_MAX, MFTL_DBL_MAX}, hi[3] = {-MFTL_DBL_MAX, -MFTL_DBL_MAX, -MFTL_DBL_MAX}, wsum[3] = {0, 0, 0};
-  int m = 0;
+  double lo[3] = {MFTL_DBL_MAX, MFTL_DBL_MAX, MFTL_DBL_MAX}, hi[3] = {-MFTL_DBL_MAX, -MFTL_DBL_MAX, -MFTL_DBL_MAX};
   for (int i = 0; i < n; ++i)
+    if (e[i].location == location)
+    {
+      ix->n++;
+      for (int k = 0; k < 3; ++k)
+      {
+        lo[k] = fmin(lo[k], e[i].mlo[k]);
+        hi[k] = fmax(hi[k], e[i].mhi[k]);
+      }
+    }
+  dir_order *order = MFTLCplAlloc((size_t) MFTL_MAX(ix->n, 1) * sizeof *order, "directory index");
+  int at = 0;
+  for (int i = 0; i < n; ++i)
+    if (e[i].location == location)
+    {
+      uint64_t u[3];
+      for (int k = 0; k < 3; ++k)
+      {
+        const double x = 0.5 * (e[i].mlo[k] + e[i].mhi[k]);
+        const double f = hi[k] > lo[k] ? (x - lo[k]) / (hi[k] - lo[k]) : 0.0;
+        u[k] = (uint64_t) (fmax(0.0, fmin(1.0, f)) * MFTL_MORTON_MAX);
+      }
+      order[at++] = (dir_order) {MFTLMorton3D(u[0], u[1], u[2]), i};
+    }
+  if (ix->n > 1) qsort(order, (size_t) ix->n, sizeof *order, cmp_dir_order);
+  ix->ent = MFTLCplAlloc((size_t) MFTL_MAX(ix->n, 1) * sizeof(int), "directory index");
+  double *boxes = MFTLCplAlloc(6 * (size_t) MFTL_MAX(ix->n, 1) * sizeof(double), "directory index");
+  for (int i = 0; i < ix->n; ++i)
   {
-    if (e[i].location != location) continue;
-    ++m;
+    ix->ent[i] = order[i].entry;
     for (int k = 0; k < 3; ++k)
     {
-      lo[k] = fmin(lo[k], e[i].lo[k]);
-      hi[k] = fmax(hi[k], e[i].hi[k]);
-      wsum[k] += e[i].hi[k] - e[i].lo[k];
+      boxes[6 * i + k] = e[ix->ent[i]].mlo[k];
+      boxes[6 * i + 3 + k] = e[ix->ent[i]].mhi[k];
     }
   }
-  ix->stamp = (int *) MFTLCallocOrDie((size_t) MFTL_MAX(n, 1), sizeof(int), "directory index");
-  if (m == 0)
-  {
-    ix->n_cells = 0;
-    ix->off = (int64_t *) MFTLCallocOrDie(1, sizeof(int64_t), "directory index");
-    ix->ent = (int *) MFTLMallocOrDie(sizeof(int), "directory index");
-    return;
-  }
-  /* cells about the mean entry size, at most 64 per axis */
-  for (int k = 0; k < 3; ++k)
-  {
-    const double span = fmax(hi[k] - lo[k], 1e-300);
-    double c = fmax(wsum[k] / m, span / 64.0);
-    if (!(c > 0.0)) c = span;
-    ix->lo[k] = lo[k];
-    ix->cell[k] = c;
-    ix->dims[k] = (int64_t) floor(span / c) + 1;
-  }
-  ix->n_cells = ix->dims[0] * ix->dims[1] * ix->dims[2];
-  int64_t np = 0, cap = 0;
-  int64_t *pairs = MFTL_NULL;
-  for (int i = 0; i < n; ++i)
-  {
-    if (e[i].location != location) continue;
-    int64_t c0[3], c1[3];
-    for (int k = 0; k < 3; ++k)
-    {
-      c0[k] = (int64_t) floor((e[i].lo[k] - ix->lo[k]) / ix->cell[k]);
-      c1[k] = (int64_t) floor((e[i].hi[k] - ix->lo[k]) / ix->cell[k]);
-      if (c0[k] < 0) c0[k] = 0;
-      if (c1[k] >= ix->dims[k]) c1[k] = ix->dims[k] - 1;
-    }
-    for (int64_t z = c0[2]; z <= c1[2]; ++z)
-      for (int64_t y = c0[1]; y <= c1[1]; ++y)
-        for (int64_t x = c0[0]; x <= c1[0]; ++x)
-        {
-          if (np == cap)
-          {
-            cap = cap ? 2 * cap : 256;
-            pairs = (int64_t *) MFTLReallocOrDie(pairs, 2 * (size_t) cap * sizeof(int64_t), "directory index");
-          }
-          pairs[2 * np] = x + ix->dims[0] * (y + ix->dims[1] * z);
-          pairs[2 * np + 1] = i;
-          ++np;
-        }
-  }
-  if (np > 1) qsort(pairs, (size_t) np, 2 * sizeof(int64_t), cmp_i64pair);
-  ix->off = (int64_t *) MFTLCallocOrDie((size_t) ix->n_cells + 1, sizeof(int64_t), "directory index");
-  ix->ent = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(np, 1) * sizeof(int), "directory index");
-  for (int64_t p = 0; p < np; ++p)
-  {
-    ix->off[pairs[2 * p] + 1]++;
-    ix->ent[p] = (int) pairs[2 * p + 1];
-  }
-  for (int64_t c = 0; c < ix->n_cells; ++c) ix->off[c + 1] += ix->off[c];
-  free(pairs);
+  MFTLCplBoxTreeBuild(&ix->tree, boxes, ix->n, 4, false);
+  MFTLCplFree(boxes);
+  MFTLCplFree(order);
 }
 
 void MFTLCplDirIndexFree(cpl_dir_index *ix)
 {
-  free(ix->off);
-  free(ix->ent);
-  free(ix->stamp);
+  MFTLCplFree(ix->tree.box);
+  MFTLCplFree(ix->ent);
   memset(ix, 0, sizeof *ix);
+}
+
+static int directory_query(cpl_dir_index *ix, const cpl_dir_entry *e, const double lo[3], const double hi[3], bool metric, int **out, int *cap)
+{
+  int n = 0;
+  int64_t cursor = 1, leaf;
+  while ((leaf = MFTLCplBoxTreeNext(&ix->tree, lo, hi, &cursor)) >= 0)
+    for (int64_t j = leaf * ix->tree.group; j < MFTL_MIN((leaf + 1) * ix->tree.group, ix->n); ++j)
+    {
+      const int i = ix->ent[j];
+      if (!(e[i].roles & (metric ? 2 : 1))) continue;
+      if (!cpl_box_overlap(metric ? e[i].mlo : e[i].lo, metric ? e[i].mhi : e[i].hi, lo, hi)) continue;
+      if (n == *cap)
+      {
+        *cap = *cap ? 2 * *cap : 32;
+        *out = MFTLCplRealloc(*out, (size_t) *cap * sizeof(int), "directory query");
+      }
+      (*out)[n++] = i;
+    }
+  return n;
 }
 
 int MFTLCplDirIndexQuery(cpl_dir_index *ix, const cpl_dir_entry *e, const double lo[3], const double hi[3], int **out, int *cap)
 {
-  int n = 0;
-  if (ix->n_cells == 0) return 0;
-  int64_t c0[3], c1[3];
-  for (int k = 0; k < 3; ++k)
-  {
-    const double a = floor((lo[k] - ix->lo[k]) / ix->cell[k]), b = floor((hi[k] - ix->lo[k]) / ix->cell[k]);
-    if (b < 0.0 || a > (double) (ix->dims[k] - 1)) return 0;
-    c0[k] = (a < 0.0) ? 0 : (int64_t) a;
-    c1[k] = (b > (double) (ix->dims[k] - 1)) ? ix->dims[k] - 1 : (int64_t) b;
-  }
-  if (++ix->stamp_now == 0x7fffffff)
-  {
-    ix->stamp_now = 1;
-    /* the stamps are only ever compared for equality with stamp_now */
-  }
-  for (int64_t z = c0[2]; z <= c1[2]; ++z)
-    for (int64_t y = c0[1]; y <= c1[1]; ++y)
-      for (int64_t x = c0[0]; x <= c1[0]; ++x)
-      {
-        const int64_t c = x + ix->dims[0] * (y + ix->dims[1] * z);
-        for (int64_t p = ix->off[c]; p < ix->off[c + 1]; ++p)
-        {
-          const int i = ix->ent[p];
-          if (ix->stamp[i] == ix->stamp_now) continue;
-          ix->stamp[i] = ix->stamp_now;
-          if (!cpl_box_overlap(e[i].lo, e[i].hi, lo, hi)) continue;
-          if (n == *cap)
-          {
-            *cap = (*cap == 0) ? 64 : 2 * *cap;
-            *out = (int *) MFTLReallocOrDie(*out, (size_t) *cap * sizeof(int), "directory query");
-          }
-          (*out)[n++] = i;
-        }
-      }
-  return n;
+  return directory_query(ix, e, lo, hi, false, out, cap);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * The cover: which parts of a region some ownership box claims
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-void MFTLCplCoverBuild(cpl_cover *cv, cpl_dir_index *ix, const cpl_dir_entry *e, const MFTL_Domain *d, const double lo[3], const double hi[3],
-                       const double cell[3], const double sliver[3])
+int MFTLCplDirMetricQuery(cpl_dir_index *ix, const cpl_dir_entry *e, const double lo[3], const double hi[3], int **out, int *cap)
 {
-  memset(cv, 0, sizeof *cv);
-  int64_t n_cells = 1;
-  for (int k = 0; k < 3; ++k)
-  {
-    const double span = fmax(hi[k] - lo[k], 0.0);
-    double c = fmax(cell[k], span / 128.0);
-    if (!(c > 0.0)) c = fmax(span, 1e-300);
-    cv->lo[k] = lo[k];
-    cv->cell[k] = c;
-    cv->dims[k] = (int64_t) ceil(span / c);
-    if (cv->dims[k] < 1) cv->dims[k] = 1;
-    n_cells *= cv->dims[k];
-  }
-  cv->frag_off = (int64_t *) MFTLCallocOrDie((size_t) n_cells + 1, sizeof(int64_t), "cover");
-  int64_t n_frag = 0, cap_frag = 0;
-  int cap_rem = 64, n_rem = 0, *got = MFTL_NULL, gcap = 0;
-  double *rem = (double *) MFTLMallocOrDie(6 * (size_t) cap_rem * sizeof(double), "cover");
-  for (int64_t c = 0; c < n_cells; ++c)
-  {
-    const int64_t ci[3] = {c % cv->dims[0], (c / cv->dims[0]) % cv->dims[1], c / (cv->dims[0] * cv->dims[1])};
-    n_rem = 1;
-    for (int k = 0; k < 3; ++k)
-    {
-      rem[k] = cv->lo[k] + (double) ci[k] * cv->cell[k];
-      rem[3 + k] = (ci[k] == cv->dims[k] - 1) ? hi[k] : cv->lo[k] + (double) (ci[k] + 1) * cv->cell[k];
-    }
-    for (int tz = -1; tz <= 1 && n_rem > 0; ++tz)
-      for (int ty = -1; ty <= 1 && n_rem > 0; ++ty)
-        for (int tx = -1; tx <= 1 && n_rem > 0; ++tx)
-        {
-          const int t[3] = {tx, ty, tz};
-          bool okimg = true;
-          double qlo[3], qhi[3];
-          for (int k = 0; k < 3; ++k)
-          {
-            if (t[k] != 0 && !d->is_periodic[k]) okimg = false;
-            qlo[k] = rem[k] - (double) t[k] * d->domain_size[k];
-            qhi[k] = rem[3 + k] - (double) t[k] * d->domain_size[k];
-          }
-          if (!okimg) continue;
-          /* the cell, not the remainder: the remainder only shrinks */
-          for (int k = 0; k < 3; ++k)
-          {
-            qlo[k] = cv->lo[k] + (double) ci[k] * cv->cell[k] - (double) t[k] * d->domain_size[k];
-            qhi[k] = ((ci[k] == cv->dims[k] - 1) ? hi[k] : cv->lo[k] + (double) (ci[k] + 1) * cv->cell[k]) - (double) t[k] * d->domain_size[k];
-          }
-          const int ng = MFTLCplDirIndexQuery(ix, e, qlo, qhi, &got, &gcap);
-          for (int gi = 0; gi < ng && n_rem > 0; ++gi)
-          {
-            double eb[6];
-            for (int k = 0; k < 3; ++k)
-            {
-              eb[k] = e[got[gi]].lo[k] + (double) t[k] * d->domain_size[k];
-              eb[3 + k] = e[got[gi]].hi[k] + (double) t[k] * d->domain_size[k];
-            }
-            if (cap_rem < 6 * n_rem + 6)
-            {
-              cap_rem = 6 * n_rem + 6;
-              rem = (double *) MFTLReallocOrDie(rem, 6 * (size_t) cap_rem * sizeof(double), "cover");
-            }
-            MFTLCplBoxSubtract(rem, &n_rem, cap_rem, eb, sliver);
-          }
-        }
-    if (n_frag + n_rem > cap_frag)
-    {
-      cap_frag = MFTL_MAX(2 * cap_frag, n_frag + n_rem + 16);
-      cv->frag = (double *) MFTLReallocOrDie(cv->frag, 6 * (size_t) cap_frag * sizeof(double), "cover");
-    }
-    memcpy(&cv->frag[6 * n_frag], rem, 6 * (size_t) n_rem * sizeof(double));
-    n_frag += n_rem;
-    cv->frag_off[c + 1] = n_frag;
-  }
-  free(rem);
-  free(got);
-  cv->built = true;
+  return directory_query(ix, e, lo, hi, true, out, cap);
 }
 
-void MFTLCplCoverFree(cpl_cover *cv)
+int MFTLCplDirectoryOwnEntries(const MFTL_SolverGrid *g, const MFTL_Domain *d, double pilot, cpl_dir_entry **out)
 {
-  free(cv->frag_off);
-  free(cv->frag);
-  memset(cv, 0, sizeof *cv);
-}
-
-/** @brief Appends one box to a growable list. */
-static void emit_box(double **out, int *n_out, int *cap, const double b[6])
-{
-  if (*n_out == *cap)
-  {
-    *cap = (*cap == 0) ? 16 : 2 * *cap;
-    *out = (double *) MFTLReallocOrDie(*out, 6 * (size_t) *cap * sizeof(double), "cover");
-  }
-  memcpy(&(*out)[6 * (*n_out)++], b, 6 * sizeof(double));
-}
-
-int MFTLCplCoverQuery(const cpl_cover *cv, const double lo[3], const double hi[3], const double sliver[3], double **out, int *n_out, int *cap)
-{
-  int added = 0;
-
-  /* outside the cover's region: report it, it was never checked */
-  for (int k = 0; k < 3; ++k)
-  {
-    const double rlo = cv->lo[k], rhi = cv->lo[k] + (double) cv->dims[k] * cv->cell[k];
-    if (lo[k] < rlo - sliver[k] || hi[k] > rhi + sliver[k])
-    {
-      const double b[6] = {lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]};
-      emit_box(out, n_out, cap, b);
-      return 1;
-    }
-  }
-  int64_t c0[3], c1[3];
-  for (int k = 0; k < 3; ++k)
-  {
-    c0[k] = (int64_t) floor((lo[k] - cv->lo[k]) / cv->cell[k]);
-    c1[k] = (int64_t) floor((hi[k] - cv->lo[k]) / cv->cell[k]);
-    if (c0[k] < 0) c0[k] = 0;
-    if (c1[k] >= cv->dims[k]) c1[k] = cv->dims[k] - 1;
-  }
-  for (int64_t z = c0[2]; z <= c1[2]; ++z)
-    for (int64_t y = c0[1]; y <= c1[1]; ++y)
-      for (int64_t x = c0[0]; x <= c1[0]; ++x)
-      {
-        const int64_t c = x + cv->dims[0] * (y + cv->dims[1] * z);
-        for (int64_t f = cv->frag_off[c]; f < cv->frag_off[c + 1]; ++f)
-        {
-          const double *fb = &cv->frag[6 * f];
-          double b[6];
-          bool thin = false;
-          for (int k = 0; k < 3; ++k)
-          {
-            b[k] = fmax(fb[k], lo[k]);
-            b[3 + k] = fmin(fb[3 + k], hi[k]);
-            if (b[3 + k] - b[k] < sliver[k]) thin = true;
-          }
-          if (!thin)
-          {
-            emit_box(out, n_out, cap, b);
-            ++added;
-          }
-        }
-      }
-  return added;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * This rank's directory entries
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-int MFTLCplDirectoryOwnEntries(const MFTL_SolverGrid *g, const MFTL_Domain *d, cpl_dir_entry **out)
-{
-  (void) d;
   int cap = 16, n = 0;
-  cpl_dir_entry *e = (cpl_dir_entry *) MFTLMallocOrDie((size_t) cap * sizeof(cpl_dir_entry), "directory entries");
+  cpl_dir_entry *e = (cpl_dir_entry *) MFTLCplAlloc((size_t) cap * sizeof(cpl_dir_entry), "directory entries");
 #define CPL_PUSH()                                                                                              \
   do                                                                                                            \
   {                                                                                                             \
     if (n == cap)                                                                                               \
     {                                                                                                           \
       cap *= 2;                                                                                                 \
-      e = (cpl_dir_entry *) MFTLReallocOrDie(e, (size_t) cap * sizeof(cpl_dir_entry), "directory entries");      \
+      e = (cpl_dir_entry *) MFTLCplRealloc(e, (size_t) cap * sizeof(cpl_dir_entry), "directory entries");      \
     }                                                                                                           \
     memset(&e[n], 0, sizeof e[n]);                                                                              \
   } while (0)
@@ -668,6 +480,7 @@ int MFTLCplDirectoryOwnEntries(const MFTL_SolverGrid *g, const MFTL_Domain *d, c
     CPL_PUSH();
     cpl_dir_entry *x = &e[n++];
     x->location = b->location;
+    x->roles = l->kind == MFTL_LATTICE_UNIFORM ? 3 : 1;
     for (int k = 0; k < 3; ++k)
     {
       x->ilo[k] = b->lo[k];
@@ -713,6 +526,7 @@ int MFTLCplDirectoryOwnEntries(const MFTL_SolverGrid *g, const MFTL_Domain *d, c
         CPL_PUSH();
         cpl_dir_entry *x = &e[n++];
         x->location = li;
+        x->roles = l->exposure == MFTL_GRID_FULL ? 1 : 3;
         for (int k = 0; k < 3; ++k)
         {
           x->lo[k] = l->prov_boxes[6 * r + k];
@@ -732,6 +546,7 @@ int MFTLCplDirectoryOwnEntries(const MFTL_SolverGrid *g, const MFTL_Domain *d, c
           CPL_PUSH();
           cpl_dir_entry *x = &e[n++];
           x->location = li;
+          x->roles = 3;
           for (int k = 0; k < 3; ++k)
           {
             x->lo[k] = p->tile_ebox[6 * t + k];
@@ -742,7 +557,68 @@ int MFTLCplDirectoryOwnEntries(const MFTL_SolverGrid *g, const MFTL_Domain *d, c
         }
       }
     }
+    if (l->n_prov > 0 && l->exposure == MFTL_GRID_FULL)
+      for (int pc = 0; pc < l->n_pieces; ++pc)
+      {
+        const cpl_points *p = &g->points[l->piece_ref[pc]];
+        for (int t = 0; t < p->n_tiles; ++t)
+        {
+          CPL_PUSH();
+          cpl_dir_entry *x = &e[n++];
+          x->location = li;
+          x->roles = 2;
+          for (int k = 0; k < 3; ++k)
+          {
+            x->lo[k] = p->tile_pbox[6 * t + k];
+            x->hi[k] = p->tile_pbox[6 * t + 3 + k];
+            x->hmin[k] = p->tile_h[6 * t + k];
+            x->hmax[k] = p->tile_h[6 * t + 3 + k];
+          }
+        }
+      }
+
   }
+  /* A rectilinear lattice declares every position and width independently of
+   * ownership. Publish its metric tiles even across ownership holes: otherwise
+   * an unowned coarse cell could disappear from the pilot and shrink a request
+   * until that very hole escaped the coverage check. Share tile construction
+   * across ranks; these role-2 records certify resolution, never ownership. */
+  for (int li = 0; li < g->n_loc; ++li)
+  {
+    const cpl_location *l = &g->loc[li];
+    if (l->kind != MFTL_LATTICE_RECTILINEAR) continue;
+    const int64_t dims[3] = {(l->dims[0] + 7) / 8, (l->dims[1] + 7) / 8, (l->dims[2] + 7) / 8};
+    const int64_t total = dims[0] * dims[1] * dims[2];
+    for (int64_t t = d->rank; t < total; t += d->nproc)
+    {
+      CPL_PUSH();
+      cpl_dir_entry *x = &e[n++];
+      x->location = li;
+      x->roles = 2;
+      const int64_t start[3] = {8 * (t % dims[0]), 8 * ((t / dims[0]) % dims[1]), 8 * (t / (dims[0] * dims[1]))};
+      for (int k = 0; k < 3; ++k)
+      {
+        const int64_t end = MFTL_MIN(start[k] + 8, l->dims[k]);
+        x->lo[k] = MFTLCplLatCoord(l, k, start[k]);
+        x->hi[k] = MFTLCplLatCoord(l, k, end - 1);
+        x->hmin[k] = MFTL_DBL_MAX;
+        for (int64_t j = start[k]; j < end; ++j)
+        {
+          const double h = MFTLCplLatWidth(l, k, j);
+          x->hmin[k] = fmin(x->hmin[k], h);
+          x->hmax[k] = fmax(x->hmax[k], h);
+        }
+      }
+    }
+  }
+  for (int i = 0; i < n; ++i)
+    for (int k = 0; k < 3; ++k)
+    {
+      const double r = e[i].roles & 2 ? pilot * e[i].hmax[k] : 0.0;
+      e[i].mlo[k] = e[i].lo[k] - r;
+      e[i].mhi[k] = e[i].hi[k] + r;
+    }
+
 #undef CPL_PUSH
   *out = e;
   return n;

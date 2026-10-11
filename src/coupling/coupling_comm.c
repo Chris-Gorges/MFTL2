@@ -11,7 +11,7 @@
  * not cause):
  *
  *   agreements    one small Allreduce per collective decision (status, hashes,
- *                 the directory reach); O(1) payload, independent of P.
+ *                 registration bounds); O(1) payload, independent of P.
  *   NBX           sparse exchange to receivers that do not know they will
  *                 receive (directory publication, support requests): Hoefler,
  *                 Siebert & Lumsdaine's protocol -- synchronous sends, probe and
@@ -26,9 +26,13 @@
  * Every message larger than the chunk limit (1 GiB, or the test hook's value)
  * travels as several messages on the same (source, tag): MPI's non-overtaking
  * rule keeps them in order, and no count ever exceeds an int.
+ * Fatal allocation/budget failure is the exception to communicator isolation:
+ * it aborts MPI_COMM_WORLD to avoid stranding peers, including during registration.
  */
 
 #include "coupling_internal.h"
+
+
 
 #include <mpi.h>
 #include <limits.h>
@@ -37,6 +41,18 @@
 
 #include "mftl_constants.h"
 #include "mftl_memory.h"
+
+_Noreturn void MFTLCplMemoryAbort(const char *what, size_t bytes, size_t current, size_t limit)
+{
+  fprintf(stderr, "MFTL coupling: allocation/budget failure in %s: requested %zu bytes, live %zu, limit %zu (0=unlimited)\n",
+          what, bytes, current, limit);
+  fflush(stderr);
+  int initialized = 0, finalized = 0;
+  MPI_Initialized(&initialized);
+  if (initialized) MPI_Finalized(&finalized);
+  if (initialized && !finalized) MPI_Abort(MPI_COMM_WORLD, EXIT_FAILURE);
+  exit(EXIT_FAILURE);
+}
 
 static size_t g_chunk = (size_t) 1 << 30;
 
@@ -99,6 +115,14 @@ int MFTLCplAgreeTransfer(MPI_Comm c, int status, uint64_t token)
   uint64_t v[3] = {(uint64_t) status, token, ~token}, g[3];
   MPI_Allreduce(v, g, 3, MPI_UINT64_T, MPI_MAX, c);
   return g[1] == ~g[2] ? (int) g[0] : MFTL_COUPLING_INVALID;
+}
+
+int MFTLCplAgreeValidated(MPI_Comm c, int status, uint64_t signature)
+{
+  uint64_t v[3] = {(uint64_t) status, signature, ~signature}, g[3];
+  MPI_Allreduce(v, g, 3, MPI_UINT64_T, MPI_MAX, c);
+  if (g[0] != MFTL_COUPLING_OK) return (int) g[0];
+  return g[1] == ~g[2] ? MFTL_COUPLING_OK : MFTL_COUPLING_INVALID;
 }
 
 void MFTLCplAgreeMaxN(MPI_Comm c, int *v, int n)
@@ -170,7 +194,7 @@ static MPI_Request *req_push(reqs *q)
   if (q->n == q->cap)
   {
     q->cap = MFTLGrowCapacity(q->cap, q->n + 1);
-    q->r = (MPI_Request *) MFTLReallocOrDie(q->r, (size_t) q->cap * sizeof(MPI_Request), "coupling requests");
+    q->r = (MPI_Request *) MFTLCplRealloc(q->r, (size_t) q->cap * sizeof(MPI_Request), "coupling requests");
   }
   return &q->r[q->n++];
 }
@@ -178,7 +202,7 @@ static MPI_Request *req_push(reqs *q)
 /** @brief A payload with its 8-byte length header, the unit NBX and replies send. */
 static unsigned char *frame(const unsigned char *data, size_t bytes, size_t *framed)
 {
-  unsigned char *f = (unsigned char *) MFTLMallocOrDie(bytes + 8, "coupling frame");
+  unsigned char *f = (unsigned char *) MFTLCplAlloc(bytes + 8, "coupling frame");
   const uint64_t n = (uint64_t) bytes;
   memcpy(f, &n, 8);
   if (bytes > 0) memcpy(f + 8, data, bytes);
@@ -213,16 +237,16 @@ static void recv_framed(MPI_Comm c, int tag, MPI_Status *st, cpl_msg *m)
   int count = 0;
   MPI_Get_count(st, MPI_BYTE, &count);
   const int src = st->MPI_SOURCE;
-  unsigned char *first = (unsigned char *) MFTLMallocOrDie((size_t) MFTL_MAX(count, 8), "coupling receive");
+  unsigned char *first = (unsigned char *) MFTLCplAlloc((size_t) MFTL_MAX(count, 8), "coupling receive");
   MPI_Recv(first, count, MPI_BYTE, src, tag, c, MPI_STATUS_IGNORE);
   uint64_t total = 0;
   memcpy(&total, first, 8);
   m->peer = src;
   m->bytes = (size_t) total;
-  m->data = (unsigned char *) MFTLMallocOrDie((size_t) MFTL_MAX(total, 1), "coupling message");
+  m->data = (unsigned char *) MFTLCplAlloc((size_t) MFTL_MAX(total, 1), "coupling message");
   size_t have = (size_t) count - 8;
   if (have > 0) memcpy(m->data, first + 8, have);
-  free(first);
+  MFTLCplFree(first);
   while (have < (size_t) total)
   {
     MPI_Status s2;
@@ -244,7 +268,7 @@ int MFTLCplNbx(MPI_Comm c, int tag, int n_out, const int *dest, unsigned char *c
             long *messages)
 {
   reqs q = {MFTL_NULL, 0, 0};
-  unsigned char **framed = (unsigned char **) MFTLMallocOrDie((size_t) MFTL_MAX(n_out, 1) * sizeof(unsigned char *), "nbx frames");
+  unsigned char **framed = (unsigned char **) MFTLCplAlloc((size_t) MFTL_MAX(n_out, 1) * sizeof(unsigned char *), "nbx frames");
   for (int i = 0; i < n_out; ++i)
   {
     size_t fb = 0;
@@ -254,7 +278,7 @@ int MFTLCplNbx(MPI_Comm c, int tag, int n_out, const int *dest, unsigned char *c
   }
 
   int cap = 8, n = 0;
-  cpl_msg *got = (cpl_msg *) MFTLMallocOrDie((size_t) cap * sizeof(cpl_msg), "nbx receive list");
+  cpl_msg *got = (cpl_msg *) MFTLCplAlloc((size_t) cap * sizeof(cpl_msg), "nbx receive list");
   MPI_Request barrier = MPI_REQUEST_NULL;
   bool barrier_active = false;
   for (;;)
@@ -267,7 +291,7 @@ int MFTLCplNbx(MPI_Comm c, int tag, int n_out, const int *dest, unsigned char *c
       if (n == cap)
       {
         cap *= 2;
-        got = (cpl_msg *) MFTLReallocOrDie(got, (size_t) cap * sizeof(cpl_msg), "nbx receive list");
+        got = (cpl_msg *) MFTLCplRealloc(got, (size_t) cap * sizeof(cpl_msg), "nbx receive list");
       }
       recv_framed(c, tag, &st, &got[n]);
       if (bytes) *bytes += (long) got[n].bytes + 8;
@@ -291,9 +315,9 @@ int MFTLCplNbx(MPI_Comm c, int tag, int n_out, const int *dest, unsigned char *c
       if (done) break;
     }
   }
-  for (int i = 0; i < n_out; ++i) free(framed[i]);
-  free(framed);
-  free(q.r);
+  for (int i = 0; i < n_out; ++i) MFTLCplFree(framed[i]);
+  MFTLCplFree(framed);
+  MFTLCplFree(q.r);
   qsort(got, (size_t) n, sizeof(cpl_msg), cmp_msg);
   *in = got;
   *n_in = n;
@@ -304,7 +328,7 @@ int MFTLCplExchangeKnown(MPI_Comm c, int tag, int n_out, const int *dest, unsign
                        cpl_msg *in, long *bytes, long *messages)
 {
   reqs q = {MFTL_NULL, 0, 0};
-  unsigned char **framed = (unsigned char **) MFTLMallocOrDie((size_t) MFTL_MAX(n_out, 1) * sizeof(unsigned char *), "reply frames");
+  unsigned char **framed = (unsigned char **) MFTLCplAlloc((size_t) MFTL_MAX(n_out, 1) * sizeof(unsigned char *), "reply frames");
   for (int i = 0; i < n_out; ++i)
   {
     size_t fb = 0;
@@ -320,16 +344,16 @@ int MFTLCplExchangeKnown(MPI_Comm c, int tag, int n_out, const int *dest, unsign
     if (bytes) *bytes += (long) in[i].bytes + 8;
   }
   MPI_Waitall(q.n, q.r, MPI_STATUSES_IGNORE);
-  for (int i = 0; i < n_out; ++i) free(framed[i]);
-  free(framed);
-  free(q.r);
+  for (int i = 0; i < n_out; ++i) MFTLCplFree(framed[i]);
+  MFTLCplFree(framed);
+  MFTLCplFree(q.r);
   return MFTL_SUCCESS;
 }
 
 void MFTLCplMsgsFree(cpl_msg *m, int n)
 {
   if (m == MFTL_NULL) return;
-  for (int i = 0; i < n; ++i) free(m[i].data);
+  for (int i = 0; i < n; ++i) MFTLCplFree(m[i].data);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -341,7 +365,7 @@ static MPI_Request *sched_push(cpl_sched *s)
   if (s->n_req == s->cap_req)
   {
     s->cap_req = MFTLGrowCapacity(s->cap_req, s->n_req + 1);
-    s->req = MFTLReallocOrDie(s->req, (size_t) s->cap_req * sizeof(MPI_Request), "coupling schedule");
+    s->req = MFTLCplRealloc(s->req, (size_t) s->cap_req * sizeof(MPI_Request), "coupling schedule");
   }
   return &((MPI_Request *) s->req)[s->n_req++];
 }
@@ -375,6 +399,6 @@ void MFTLCplSchedWait(cpl_sched *s)
 
 void MFTLCplSchedFree(cpl_sched *s)
 {
-  free(s->req);
+  MFTLCplFree(s->req);
   memset(s, 0, sizeof *s);
 }

@@ -4,7 +4,9 @@
 **Public header:** `include/mftl_coupling.h` · **Layer:** 3 ·
 **Module group:** @ref mftl_coupling
 
-A flow solver owns velocities, pressures and forces on ITS samples — cell centres,
+**Improvement plan:** `plans/06-coupler-improvements.md`.
+
+A flow solver owns velocity components and force targets on ITS samples — cell centres,
 staggered faces, the centroids of an unstructured mesh — distributed its own way. A
 front tracker needs those velocities at the surface's markers, and returns surface
 forces to the samples. This module is that exchange, for any solver: the solver
@@ -16,17 +18,20 @@ kernels can reach ever travels.
 |---|---|---|
 | `solver_grid.c` | registration: locations, lattice blocks, point sets, coverage, ownership regions | no |
 | `coupling_kernels.c` | the kernel table: support, lattice moments, sign, smoothness | no |
-| `coupling_rows.c` | one row from candidates: base weights, moment correction, the four quality checks; block rows (directions, gradients) | no |
+| `coupling_rows.c` | one general row: base weights, moment correction, quality checks | no |
 | `coupling_markers.c` | markers from the surface, dual-area weights, quadrature points and their vertex schedule, the generation snapshot | no |
-| `coupling_directory.c` | lattice index arithmetic and images, box algebra, the directory's grid and cover | no |
-| `coupling_query.c` | nearest-surface candidates: their total order and merge, vertex pseudo-normals | no |
-| `coupler.c` | the state machine: directory, request, window, binding, transfers, imported rows, queries | no |
+| `coupling_directory.c` | lattice index arithmetic and images, box algebra, indexed ownership/resolution certificates | no |
+| `coupling_index.c` | compact bounds over provider tiles and irregular cached samples | no |
+| `coupling_stencil.c` | direct Cartesian brick lookup, factored Peskin rows and their transpose | no |
+| `coupling_memory.c` | module allocation accounting, peak and optional capacity limit | no |
+| `coupler.c` | the state machine: directory, request, window, binding, transfers | no |
 | `coupling_comm.c` | **every MPI call the module makes** | **yes** |
 
 `coupling_internal.h` declares what the files share; `test_coupling_mpi_is_confined`
 fails the build if an MPI call appears anywhere else. The coupler communicates on its
 own duplicate of the ensemble's communicator and never probes a message it did not
-cause.
+cause. Fatal allocation/budget failure aborts the MPI job, including if it occurs
+during registration before a private communicator exists.
 
 ---
 
@@ -98,11 +103,28 @@ sample.
 ### The metric {#cpl_metric}
 
 A location whose samples all share one resolution (a uniform lattice, a point set with
-`h_uniform`) uses it: the kernel metric is `support_scale` times $h$. Otherwise the metric is
-a Shepard average of the samples' resolutions over a pilot neighbourhood of radius
-`pilot_factor` times the location's largest resolution, with a Wendland weight — a
-smooth function of the marker's position, computed from samples the window
-certified, so it is the same on every rank.
+`h_uniform`) uses it: the kernel metric is `support_scale` times $h$. Otherwise,
+each sample influences the metric within `pilot_factor` times **its own** directional
+resolution. With $a =$ `pilot_factor`, define
+
+$$
+r_j^2 = \sum_k \left(\frac{X_{j,k}-x_k}{a h_{j,k}}\right)^2,\qquad
+\omega_j = \frac{q_j}{h_{j,x}h_{j,y}h_{j,z}}(1-r_j)^4(4r_j+1)
+$$
+
+for $r_j<1$, and zero otherwise. The marker resolution is
+$h(x)=\sum_j\omega_j h_j/\sum_j\omega_j$, with `support_scale` applied afterwards.
+This compact Wendland C2 average varies smoothly wherever the denominator is
+positive; no contributor means BAD_STENCIL. There is no global-maximum-radius
+pilot. Refining or coarsening a distant region changes neither the metric nor its
+required samples unless that region's own influence reaches the marker.
+
+The directory bounds every contributor over the whole marker bin plus motion skin
+before a window is built. The metric is evaluated from the certified samples in
+canonical order, independently of their rank ownership. This is a numerical change
+from the earlier global-bound average; variable-resolution results need not match
+the old ones. Independent whole-mesh references test the formula and a distant
+coarsening test checks locality and unchanged band size.
 
 **An anisotropic point location** gives every sample a full CELL matrix $H$ (its
 columns the cell's edge vectors) and rows use $d = \tilde H^{-1}(X - x)$, normalised by
@@ -111,128 +133,10 @@ A cloud that is a complete lattice in those axes — a rotated anisotropic latti
 points — then has the kernel's lattice moments: Peskin's rows need no correction and
 stay nonnegative, where the axis-aligned treatment of the same cloud corrects every
 row (`test_a_rotated_lattice_in_its_own_frame`). The marker's matrix is the Shepard
-average of its neighbours' cells; their per-axis extents $\sum_j |H_{kj}|$ are the
-resolution bounds the directory and the sizing use.
-
-### Directional samples {#cpl_directional}
-
-A face-normal velocity or a face flux is not a point value of a scalar: sample
-$j$ holds $q_j = s_j \cdot u(X_j)$, with $s_j$ a unit normal or the oriented area
-vector. A point location declared `directional` gives every sample its vector,
-and a value row reconstructs the VECTOR at the marker, $U = \sum_j A_j q_j$ with
-$A_j \in \mathbb{R}^3$, its transpose $b_j = A_j^T F$ taking a vector load. The
-fit is made with the unit directions and the magnitude is a pure conversion, so
-a cloud measured in area vectors ten times longer gives the same vector:
-
-$$
-\text{CONSTANT:}\quad A_j = \psi_j\, T^{-1}\hat s_j / |s_j|,\quad T = \sum_j \psi_j \hat s_j \hat s_j^T;
-\qquad
-\text{LINEAR:}\quad \min \sum_j \psi_j \bigl(\hat q_j - \hat s_j^T(a + B d_j)\bigr)^2 ,
-$$
-
-twelve coefficients, $U = a$. LINEAR reproduces every affine vector field and
-therefore every rigid motion, so a spread balances force and torque by work:
-$\sum_j q_j b_j = v\cdot\sum F + \omega\cdot\sum (x - x_0)\times F$ for the
-projections of $v + \omega\times(x-x_0)$ (`test_a_face_cloud_reconstructs_vectors`,
-on the jittered faces of a staggered grid as one cloud). Positions spread in
-space are not enough: the DIRECTIONS must span it, and a cloud whose normals lie
-in one plane is BAD_STENCIL, not a vector with an invented component
-(`test_directional_rank_deficiency_is_refused`). The normal matrix is inverted
-through its equilibrated eigen-decomposition, as a value row's; the four checks
-are measured on the block weights returned ($\sum_j A_j s_j^T = I$,
-$\sum_j A_j (s_j\otimes d_j)^T = 0$, amplification $\max_k \sum_j |A_{jk}||s_j|$).
-A staggered LATTICE is not directional: it is interpolated component by
-component, which is the recognised fast path.
-
-### Two gradients, named apart {#cpl_gradients}
-
-`MFTL_OPERATOR_GRADIENT_FIT` is the slope of the weighted affine fit a LINEAR row
-is built on, $\nabla u = \tilde H^{-T}\beta$; `MFTL_OPERATOR_VALUE_DERIVATIVE` is
-$\partial(Wu)/\partial x$, differentiated through everything the value row depends
-on -- the kernel (each built-in declares its derivative), the moment correction
-($\partial c = -M^{-1}(\partial M)c$), and the metric when it varies with the
-marker (the Shepard average and its $|\det|$). Both reproduce affine gradients;
-the correction is differentiated even where its current value is zero, since
-it can change at neighbouring marker positions.
-On an irregular cloud they are different operators -- their results differ by
-0.5 % of the gradient on the graded cloud below, their weights by up to $0.06/h$ on
-a jittered one (`test_the_fit_and_the_derivative_are_different_operators`) -- which
-is why they have different names. The derivative equals central differences of value
-interpolation through the whole coupler to $4\cdot10^{-9}$ (gradients of order 1), on
-a graded cloud whose metric varies (`test_both_gradients_through_the_coupler`). A gradient binding gives
-three components per field; its transpose spreads a vector load as a DIPOLE:
-zero net load, first moment equal to the total dipole. At a mirror wall the wall
-values enter each gradient component through its own wall coefficients.
-Derivatives do not exist at a C0 kernel's breakpoints, nor where a row's growth
-step or reproduction order switches. Gradients of directional samples are not
-implemented.
-
----
-
-## Rows the solver builds {#cpl_native}
-
-An FE or DG solver can evaluate its own basis at the markers. `MFTLCouplerImportRows`
-stores such rows -- keyed by sample, one set per location, 3-vectors at a
-directional location (Raviart-Thomas-like) -- exactly as the coupler stores its
-own, so interpolation, the transpose, constraints, routing and every transfer
-check apply unchanged. What a row REPRODUCES is declared and checked on the rows
-received, with the samples' positions: LINEAR (a nodal basis), CONSTANT, or NONE
-(a modal basis, whose coefficients are not point values). A modal row declared
-CONSTANT is BAD_STENCIL; lowest-order face rows declared LINEAR are too.
-Weights must remain finite when repeated columns are combined, including for NONE.
-
-Native rows can reach anywhere, so their columns are requested BY KEY:
-`MFTLCouplerRequestSamples` names each sample and the rank owning it (the solver
-knows its own ghost map), the owner confirms, and the window holds exactly those
-samples. A key its named owner does not hold is INVALID; an owned one not
-exported is NEED_COVERAGE, named back to its owner as a one-sample region (by key
-for an unregistered point); a kernel bind on such a window is INVALID -- it
-certifies no support. Imported trilinear rows over a keyed window give the
-coupler's own HAT2 rows over a spatial window, values and owner loads, to
-$4\cdot10^{-15}$ (`test_imported_trilinear_rows_equal_the_hat_kernel`): two routes
-to one operator that share nothing upstream of the transfer. Triquadratic rows
-reproduce quadratics; a column at the far corner of the domain is fetched by every
-rank that names it and gets each rank's load exactly once.
-
----
-
-## Nearest-surface queries {#cpl_queries}
-
-For plan 07's indicator and signed distance a solver sample needs the nearest
-point of the surface, with what it lies on. A query answers it within a width:
-`MFTLCouplerRequestQuery` requests the samples near every WHOLE owned triangle
-(the skin is the width plus the largest triangle's half-extent), and
-`MFTLCouplerQueryNearest` computes each (sample, triangle) candidate once, on the
-triangle's owner, and merges them on the sample's owner. The sign is the
-pseudo-normal's of the closest feature, built over each vertex's whole fan in
-triangle-id order; ghost corners receive their owner's. A sample beyond the
-width is left as it was: UNKNOWN, never "far" -- a query band is not a far-field
-sign.
-
-**The merge is a total order, and that is the whole determinism argument.** A
-scalar $\min|\phi|$ leaves the body, the feature and even the sign of two equally
-distant triangles to whichever arrived first. `MFTL_SurfaceCandidate` orders by
-validity, distance, sign (inside first, $-0$ before $+0$), body, triangle,
-feature and offset; two records compare equal only when they are the same record,
-so the least of a set is one record however the set is split and merged
-(`test_the_merge_is_a_total_order`: 600 random merge orders and tree shapes). The
-merged records are the same bits at np = 2, 4, 8 and 27 as on rank 0 alone, on
-spheres across a periodic seam and on a cube whose corners and edges are lattice
-samples -- 296 samples at distance exactly zero, 1 216 nearest to an edge or a
-corner (`test_the_merged_records_are_partition_independent`). Associativity alone
-would not have shown that: it also needs every candidate computed from the same
-bits on any partition, which is what the test measures.
-
-**A sphere cannot test a pseudo-normal.** On a convex surface any one face normal at
-a vertex gives the right sign wherever that vertex is the nearest point, so taking
-the face normal instead of the vertex's -- or zeros for the ghost corners -- passed
-the first version of the brute-force test on spheres. The second sphere now carries
-needles: outward spikes put samples beside a sharp tip, nearest to it, on the far
-side of one face's plane; inward needles put INSIDE samples nearest to their tip.
-Both mutations fail it (`test_the_query_equals_brute_force` counts the samples
-nearest a vertex on either side, so the scene cannot quietly lose them).
-
----
+average of its neighbours' cells with the same sample-centred weights; their per-axis
+extents $\sum_j |H_{kj}|$ are the resolution bounds the directory and sizing use.
+The averaged matrix must still pass the existing invertibility and stencil-quality
+checks; arbitrary cell orientations do not guarantee a usable average.
 
 ## Coverage: a contract, never a guess {#cpl_coverage}
 
@@ -255,7 +159,8 @@ arithmetic.
 **A POINT location** cannot be enumerated by anyone but its owner, so its owners
 certify regions: `MFTL_ProviderRegions` (where a rank owns samples, exported or not)
 and `MFTL_CoverageDesc` (where its export is complete). A FULL point set defaults to
-tiles of 64 Morton-consecutive samples' cell extents. Two limits are stated rather than
+tiles of at most 64 Morton-consecutive samples' cell extents, split further when
+their resolution ratio would exceed two on any axis. Two limits are stated rather than
 hidden. A false certificate cannot be detected from a point cloud: a withheld sample
 inside a certified region goes through, and only an independent full input shows the
 difference (`test_the_selected_point_protocol_and_its_limit` asserts both halves). And
@@ -322,11 +227,12 @@ the directory.
 ## Discovery and the window {#cpl_window}
 
 ```
-create/update  directory: every rank publishes its ownership extents, widened by
-               the directory reach, to every rank box they touch          (NBX)
-request        markers binned at half the kernel reach; per bin and location
-               one box: the bin widened by the reach and the skin; per box
-               the owners the directory names                            (NBX)
+create/update  publish ownership and local metric influence certificates
+               to the rank boxes they touch                              (NBX)
+request        occupied marker bins plus skin: look up metric certificates
+               and bound each bin's possible resolution                  (NBX)
+               look up ownership for bin + skin + local support bound    (NBX)
+               request samples from the certified owners                 (NBX)
                replies: counts per box, each sample once per requester   (known peers)
                coverage verified, status agreed                          (one MAX)
 window         band (routes, images, bins), pack lists, served table     (no messages)
@@ -338,17 +244,37 @@ entries go by Hoefler–Siebert–Lumsdaine's NBX: synchronous sends, probe and 
 a non-blocking barrier once this rank's sends have been matched; a phase's messages
 can never leak into the next. Nothing assumes 26 neighbours: a kernel wider than a
 rank box reaches owners several boxes away (`test_a_support_wider_than_a_rank_box`,
-nine or more peers on 3×3×3). The directory's reach grows, collectively, when a
-request needs more (USER markers far from their rank,
-`test_user_markers_far_from_their_rank`).
+nine or more peers on 3×3×3). Directory shards use compact bounds trees. A marker
+far from its rank looks up certificates in the relevant shards; it does not grow
+every rank's directory (`test_user_markers_far_from_their_rank`). The active lookup
+cache is reset at each new support request, so motion does not gradually replicate
+the global directory. `directory_margin` is optional extra advertisement padding,
+not a globally enlarged numerical reach.
+
+Uniform locations already have exact resolution bounds. Requests involving only
+uniform locations skip the metric-lookup exchanges entirely.
+
+**Resolution certificates are separate from ownership.** FULL point providers use
+actual sample tiles for metric bounds even if their declared ownership box spans
+the domain. Rectilinear locations use small index tiles derived from the declared
+lattice, including positions nobody owns; otherwise an unowned coarse cell could
+shrink the pilot until the request missed that ownership gap. Tile construction is
+distributed across ranks, separately from sample ownership. SELECTED point providers must
+declare conservative bounds for unseen samples: a broad coarse certificate can
+still over-request. No tighter bound is inferred from an incomplete export.
+Every certificate bounds the sample-centred pilot influences that can touch the
+movement envelope. Their maximum resolution bounds both the pilot contributors
+and the final averaged kernel, including allowed support growth. The subsequent
+ownership/sample request therefore covers all stages admitted by that window.
 
 **Requests overlap, replies do not.** A request box is a marker bin widened by the
-reach and the skin — about ten bins across — so a sample lies in hundreds of them.
+local reach and the skin, so a sample can lie in many of them.
 Lattice ownership boxes are checked for overlap before their counts are accepted:
 a duplicate masked sample must not cancel an unowned hole. Every box is COUNTED,
 but a sample is returned, packed and
 fetched once per requester. The first version enumerated, sent and sorted every sample
-once per overlapping box: 148 ms per window on a 64³ MAC grid, against 7 ms now.
+once per overlapping box. A historical comparison measured 148 ms versus 7 ms per
+window on a 64³ MAC grid; these are not timings of the current architecture.
 
 **Routes.** A band sample is SELF (owned here, read in place), HALO (owned elsewhere
 but held in a ghost layer this rank's block declares, read in place when the field
@@ -392,6 +318,55 @@ directory (`test_a_selection_change_keeps_windows_that_stay_exported`).
 
 ---
 
+## Fast paths and reuse {#cpl_fast_paths}
+
+The intermediate Cartesian structure contains **original fluid samples**. It is a
+search and communication cache, never a second interpolated velocity mesh.
+
+On complete uniform lattices with the default four-point Peskin policy, sparse
+4×4×4 bricks map global `ijk` indices to cached sample columns. A bind computes the
+stencil by floor/index arithmetic and evaluates twelve 1-D kernel values. The row
+stores those twelve factors and 32-bit local columns (360 bytes with the present
+layout, versus 1024 bytes for 64 double weights and 64-bit columns). Interpolation
+and spreading evaluate the same products in the same order. Sample ownership has
+no role in the local stencil loop. `BindingQuality.n_cartesian` reports this path.
+
+Walls, masks, mirror boundaries, stretched coordinates, changed support scale,
+other kernels, and irregular point sets use the checked general row path as
+needed. Missing coverage is never replaced by a guessed stencil. Mirror locations
+always use their existing wall-aware builder. Bands beyond the compact column
+index range also use general rows.
+
+Point providers keep an index over their Morton tiles. Irregular cached samples
+are ordered spatially inside Cartesian bins and indexed in groups of 32. Queries
+skip disjoint groups while retaining a global, partition-independent accumulation
+order. All coordinates and bounds are physical; bin width does not replace the
+numerical kernel metric.
+
+General rows lazily construct one candidate-image list per occupied marker bin and
+location, covering that bin's certified movement and support envelope. Stage binds
+and later bindings reuse the list, filter it to their actual support and recompute
+all weights. Remeshing can reuse the same lists while the window remains valid.
+`n_candidate_builds` and `n_candidate_reuses` expose this reuse. A successful direct
+Cartesian stencil needs no such list. Only occupied bins exist; global minimum
+resolution sets their search granularity, never a dense finest-level grid.
+
+Windows cache peer-to-band segments. Transfer preparation caches packed offsets
+for the field batch and agrees validation plus signatures in one reduction.
+Repeated transfers use these maps and reusable communication buffers; released
+fetch buffers are reused without overwriting any still-live snapshot. General-row
+candidate scratch is also reused across binds. A checked convenience interpolation
+uses three validation reductions instead of six; prepared Begin/End uses two.
+These checks remain collective so a stale handle or bad load on one rank cannot
+strand the others or partly modify targets.
+
+Both LeVeque examples first bind in the existing window and refresh collectively
+only when it is stale. They request a migration allowance as well as a motion skin.
+Weights are still rebuilt at every RK stage and fields are fetched at each distinct
+stage time. Remeshing invalidates bindings, not every fluid window.
+
+---
+
 ## Bindings and transfers {#cpl_binding}
 
 A binding is the rows of an ordered set of markers at one geometry: VERTICES (owned
@@ -418,7 +393,7 @@ hat functions, so a vertex's points weigh its dual area. $m$ is chosen per trian
 that a sub-triangle's longest edge stays within `quadrature_ratio` of the finest fluid
 resolution the directory knows near it: the surface mesh need not be refined to the
 fluid. A quadratic integrated over the facets converges at $1/m^2$ (ratios 3.98–4.00
-measured). Two collective conversions form the composite adjoint pair of plan 06 §2.9,
+measured). Two collective conversions form a composite adjoint pair,
 with the lumped mass $M_S$ the points define:
 
 $$
@@ -477,12 +452,42 @@ results. A skin may span several bins; both fresh and stage binds search that fu
 
 ---
 
+## The three surface loads {#cpl_surface_loads}
+
+`Spread` takes integrated marker loads; it does not multiply by marker area.
+For three components, pass three target fields and `loads[3*i + component]`.
+The same code handles all three requested uses:
+
+| Source | Integrated load at marker i |
+|---|---|
+| Surface tension | The integrated force supplied by the surface-force calculation; if supplied as traction, multiply by the marker area once |
+| IBM | The integrated reaction force from the caller's IBM enforcement step |
+| Indicator gradient | For indicator 1 inside and 0 outside, `-normal[i] * area[i]`, with outward normals |
+
+Use `MFTL_SPREAD_INTEGRATED` for per-sample integrated loads, or
+`MFTL_SPREAD_DENSITY` to divide each load by the registered sample measure.
+Quadrature markers provide the area weights needed for triangle sources. Normals
+must correspond to the geometry being bound; a stage's moved marker positions
+alone do not determine its triangle normals. An indicator-gradient source is
+spread as a vector source; this does not reconstruct the indicator or solve its
+Poisson equation. No solenoidal projection is applied.
+
+For power consistency, pair spreading with interpolation on the same binding and
+at the same geometry. Vertex↔quadrature conversion has its own exact transpose;
+an independently assembled quadrature interpolation is not automatically the
+vertex interpolation composed with that conversion.
+
+---
+
 ## The solver loop {#cpl_loop}
 
 ```
+window = none
 for each step:
-    window  = request + prepare at X^n, skin covering every stage of the step
-    b0      = bind(window)                       # rows at X^n
+    b0 = bind(window)                           # rows at X^n, if a window exists
+    if no window or any rank is STALE:
+        window = request + prepare at X^n, with motion skin and migration allowance
+        b0 = bind(window)
     k1      = interpolate(b0, fetch(u at t))
     b2      = bind_stage(b0, X^n + dt/2 k1);  k2 = interpolate(b2, fetch(u at t + dt/2))
     b3      = bind_stage(b0, X^n + dt/2 k2);  k3 = interpolate(b3, same fetch)
@@ -491,7 +496,8 @@ for each step:
     ghosts, geometry, redistribute (or remesh)
 ```
 
-A time-dependent field is fetched at each distinct stage time; reusing the stage-1
+If a later stage leaves the window, release its dependent handles, refresh and
+retry the step before committing positions. A time-dependent field is fetched at each distinct stage time; reusing the stage-1
 rows at every stage would be Euler. Frozen-field RK4 (one fetch) is fourth order for
 the frozen field only, not for a coupled scheme.
 
@@ -501,7 +507,8 @@ the frozen field only, not for a coupled scheme.
 
 `examples/leveque_coupled_cartesian.c` and `examples/leveque_coupled_unstructured.c`
 advect LeVeque's sphere with the velocity known only on a solver's samples, and
-compare with the same RK4 on the analytic field. np = 4, laptop (Apple M-series),
+compare with the same RK4 on the analytic field. The following are historical
+measurements, before the current cache/stencil refactor and local metric: np = 4, laptop (Apple M-series),
 Release, refine 3 (642 vertices), T = 3, dt = 0.02.
 
 **Pass A** — no remeshing; every vertex against its own exact trajectory at maximum
@@ -545,9 +552,8 @@ ghost layers, 4 200 remote, against 9 500 / 0 / 33 700.
 **Cost**, coupling only, per RK4 step on 4 ranks: 15.6 ms on the 64³ MAC grid
 (window 7.8, four binds 7.1, three fetches 0.3), 30 ms on 196 608 tetrahedra
 (window 14, binds 15). Getting there took three measured fixes, each recorded in
-`docs/analysis.md` §11. Re-measure before optimising further; factored tensor rows
-on lattices and the per-bin binary search of the candidate gather are the levers
-not taken.
+`docs/analysis.md` §11. Factored Cartesian rows and reusable candidate lists have
+since been implemented; their performance has not been measured here.
 
 ---
 
@@ -573,47 +579,76 @@ The truncation count, the non-finite-load refusal and the rank-local assertions 
 tests themselves (a `TEST_ASSERT` inside `if (rank holds the marker)` strands the other
 ranks in the next collective) came out of the same exercise.
 
-A third came from C3's cross-check, in its own new code. A keyed window's band was
-assembled like a spatial one, which puts the samples a rank can read from its OWN
-ghost layers at the end of each provider's segment -- but a keyed request sends no
-ghost boxes, so its providers pack in plain key order, and every value past the
-first ghost-readable sample landed on the wrong one. Single-rank runs, point sets
-and blocks without ghosts were all right; imported trilinear rows against HAT2
-kernel rows were wrong by 0.6 at np = 2 on blocks with one ghost layer.
+## Scope and limits {#cpl_deferred}
 
-The C3 review added regressions for five further failures:
+The module transfers velocity components to front-tracking/IBM markers and returns
+integrated surface loads to fluid samples. It does not interpret a solver's
+populations, basis functions, modal coefficients or flux DOFs. A solver supplies
+physical component samples and their integration measures. Active AMR leaves can
+be supplied as point sets; covered parent cells must not also be exported.
 
-- A scalar location could fill the candidate buffer before the first directional
-  location, leaving the directions array unallocated. It now has its own capacity.
-- At a symmetric marker, a cosine-kernel value row needed no correction, but the
-  derivative of that correction was nonzero. Skipping it rejected the derivative
-  as BAD_STENCIL. The derivative now includes the moment inverse at these points,
-  checked against displaced value rows.
-- Finite weights for repeated imported columns could sum to infinity under NONE.
-  The import now returns INVALID before publishing the binding.
-- Keyed requests could accept the same key from two named provider ranks. They
-  now share spatial requests' duplicate-owner check.
-- Nearest queries did not agree the window identity before exchanging candidates.
-  Different windows on different ranks now return INVALID before any exchange.
+The former C3 directional reconstruction, arbitrary gradient operators, imported
+rows and nearest-surface queries have been removed, including their public APIs and
+feature-specific tests. Nearest-surface/indicator reconstruction is a separate
+geometry/solver task. Scalar field batches again have one value per marker per
+field; `BindingWallCoefficients` takes no component argument. Callers using C3
+must migrate; there are no compatibility stubs.
 
-## What is not here {#cpl_deferred}
+There is no divergence-free Cartesian B-spline/Bao mode. Ordinary Peskin transfer
+is not pointwise divergence-free. The existing small scalar kernel table (including
+`BSPLINE3`) is unrelated to a staggered divergence-free scheme and adds no separate
+architecture. The default remains `PESKIN4`.
 
-From plan 06's milestones, these are not implemented and nothing refers to them:
-gradients of directional samples, and directional samples at mirror walls; imported
-rows for QUADRATURE markers (import at USER markers placed at the points instead);
-the far-field sign beyond a query's width (plan 07's own operation); persistent
-point-to-point and neighbour-collective transport backends (the baseline is packed
-non-blocking point-to-point); point-set deltas finer than a re-registration (an update
-that keeps the ownership entries keeps the directory, but any change of a point set
-stales the windows); constraints across locations or of more than one level, and
-coupler-side reconstruction of constrained values (the solver keeps them current).
-A keyed window has no ghost route: its samples are fetched or read as owned.
-Factored tensor rows are not used: every row is CSR. The framework adapters, the
-Fortran forms and the integrated solver demonstrations are milestone C4.
+Packed nonblocking point-to-point MPI remains the transport. There are no PETSc,
+LBM or FEM dependencies, framework adapters, GPU transport or Fortran wrappers.
+Both decompositions use the same MPI process group, although rank order and spatial
+partitions may differ. Point-set changes still require re-registration; constraint
+maps are single-level and within one location.
 
-The plan's performance gates also remain open: a configurable memory budget with
-complete peak-allocation accounting, and allocation-free fetches (a fetch is a handle
-the caller owns; spreads reuse their accumulation scratch). Discovery holds no array
-sized by the process count any more. `bytes_memory` estimates the main directory/window
-payload, not total allocation. The measurements above predate the additional transfer
-validation; they are not timings of the reviewed implementation.
+The variable-resolution metric is local, but genuinely coarse samples whose
+influence reaches a marker can still enlarge its neighbourhood. Coarse SELECTED
+provider certificates can also over-request. Arbitrarily sparse or badly shaped
+clouds can fail the numerical stencil checks; search cannot fix missing numerical
+support. The directory and bands are sparse; there is no replicated process-count
+or process-count-squared routing table.
+
+Released fetch storage is cached in at most three snapshots per window and is freed
+with that window. Live snapshots are immutable. Candidate lists also live with the
+window. The optional memory limit described below covers both kinds of storage;
+it does not evict caches or recover from exhaustion. Persistent MPI requests and
+automatic overlap of communication with interior interpolation are not implemented.
+Performance claims require measurements; the historical timings above are not
+timings of this revision.
+
+## Allocation accounting and budget {#cpl_memory}
+
+`MFTLCouplerGetMemoryStats` reports the current and peak accounted allocation
+capacity across **all grids and couplers on this rank**, including registry data,
+directories, live handles, rows, snapshots, retained caches and temporary buffers.
+Each allocation carries a small aligned size header, also counted. This measures
+module-owned capacity, not process RSS: solver arrays, MFTL surface storage, MPI
+buffers and the C allocator's internal storage are excluded. The older
+`MFTL_CouplerStats.bytes_memory` remains an estimate of directory/window payload;
+use the new API for allocation totals.
+
+For example, before grid registration, set a 256 MiB limit on every rank:
+
+```c
+if (MFTLCouplerSetMemoryLimit((size_t)256 * 1024 * 1024) != MFTL_SUCCESS)
+  return MFTL_ERROR; /* A proposed limit below current usage is rejected. */
+MFTL_CouplingMemoryStats memory;
+MFTLCouplerGetMemoryStats(&memory);
+```
+
+Zero disables the limit (the default). Configure it only while no other thread is
+inside coupling calls on this rank. `MFTLCouplerResetMemoryPeak` sets the peak to
+current usage without freeing storage. Read at a quiescent point for a consistent
+snapshot of the counters.
+
+An allocation that would exceed the limit fails **before allocation** and aborts
+the MPI job with the allocation name, requested bytes, live bytes and limit.
+This follows MFTL's fatal allocation-failure policy, rather than returning from one
+rank while peers wait or a transfer is partly applied. It is not a recoverable
+NEED_COVERAGE condition. The budget test exhausts one rank while another waits in
+MPI, checks the diagnostic and requires prompt process termination; lifecycle
+tests check that releasing all module objects returns live bytes and blocks to zero.

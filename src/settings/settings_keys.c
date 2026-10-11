@@ -286,7 +286,7 @@ static const MFTL_SettingInfo g_keys[] = {
     KEY("coupling", "support_scale", REAL, coupling.params.support_scale, "1.0", "(0, inf)", NO_CHOICES, "", 0,
         "Kernel metric as a multiple of the local fluid resolution."),
     KEY("coupling", "pilot_factor", REAL, coupling.params.pilot_factor, "1.5", "(0, inf)", NO_CHOICES, "", 1,
-        "Radius of the neighbourhood that sets a variable metric, in units of the location's largest resolution."),
+        "Radius of each sample's influence on a variable metric, in units of that sample's directional resolution."),
     KEY("coupling", "max_condition", REAL, coupling.params.max_condition, "100000000.0", "[1, inf)", NO_CHOICES, "", 1,
         "Largest admissible condition number of a row's equilibrated moment matrix."),
     KEY("coupling", "max_amplification", REAL, coupling.params.max_amplification, "4.0", "[1, inf)", NO_CHOICES, "", 1,
@@ -298,7 +298,7 @@ static const MFTL_SettingInfo g_keys[] = {
     KEY("coupling", "sampling_ratio", REAL, coupling.params.sampling_ratio, "1.0", "(0, inf)", NO_CHOICES, "", 0,
         "Largest admissible surface edge over the fluid resolution near it."),
     KEY("coupling", "directory_margin", REAL, coupling.params.directory_margin, "0.0", "[0, inf)", NO_CHOICES, "length", 1,
-        "How far beyond its rank box the provider directory reaches; 0 derives it. It grows on its own when a request needs more."),
+        "Extra advertisement padding beyond each provider's local influence bounds; 0 adds none. Remote certificates are looked up on demand."),
 
     /* ── redistribute ───────────────────────────────────────────────────── */
     KEY("redistribute", "skip_unchanged_bodies", BOOL, redistribute.skip_unchanged_bodies, "true", "", NO_CHOICES, "", 1,

@@ -233,6 +233,11 @@ mftl_add_mpi_test_at(test_coupling_lifecycle_np2 test_coupling_lifecycle 2)
 mftl_add_mpi_test_at(test_coupling_lifecycle_np4 test_coupling_lifecycle 4)
 mftl_add_mpi_test_at(test_coupling_lifecycle_np8 test_coupling_lifecycle 8)
 mftl_add_mpi_test_oversub(test_coupling_lifecycle_np27 test_coupling_lifecycle 27)
+add_test(NAME test_coupling_memory_limit
+         COMMAND ${CMAKE_COMMAND} -DMPIEXEC=${MPIEXEC_EXECUTABLE} -DNPFLAG=${MPIEXEC_NUMPROC_FLAG}
+                 "-DPREFLAGS=${MPIEXEC_PREFLAGS}" "-DPOSTFLAGS=${MPIEXEC_POSTFLAGS}"
+                 -DTEST_BINARY=$<TARGET_FILE:test_coupling_lifecycle>
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/check_coupling_budget.cmake)
 # Surface quadrature: the points against the triangles, the level against the
 # fluid, and the vertex <-> point conversions as an exact adjoint pair across
 # the ghost schedule (compared with the same surface on one rank alone).
@@ -257,31 +262,6 @@ mftl_add_mpi_test_at(test_coupling_anisotropic_np2 test_coupling_anisotropic 2)
 mftl_add_mpi_test_at(test_coupling_anisotropic_np4 test_coupling_anisotropic 4)
 mftl_add_mpi_test_at(test_coupling_anisotropic_np8 test_coupling_anisotropic 8)
 mftl_add_mpi_test_oversub(test_coupling_anisotropic_np27 test_coupling_anisotropic 27)
-# Directional samples and the two gradients (plan 06, C3): the row core against
-# an independent 12-coefficient fit, closed forms and central differences, and
-# the same operators through the coupler.
-mftl_add_mpi_test(test_coupling_operators 1)
-mftl_add_mpi_test_at(test_coupling_operators_np2 test_coupling_operators 2)
-mftl_add_mpi_test_at(test_coupling_operators_np4 test_coupling_operators 4)
-mftl_add_mpi_test_at(test_coupling_operators_np8 test_coupling_operators 8)
-mftl_add_mpi_test_oversub(test_coupling_operators_np27 test_coupling_operators 27)
-# Rows the solver builds itself (plan 06, C3): requests by key with owners the
-# solver names, imported rows checked against their declared reproduction, and
-# imported trilinear rows against the coupler's own HAT2 kernel rows.
-mftl_add_mpi_test(test_coupling_native 1)
-mftl_add_mpi_test_at(test_coupling_native_np2 test_coupling_native 2)
-mftl_add_mpi_test_at(test_coupling_native_np4 test_coupling_native 4)
-mftl_add_mpi_test_at(test_coupling_native_np8 test_coupling_native 8)
-mftl_add_mpi_test_oversub(test_coupling_native_np27 test_coupling_native 27)
-# Nearest-surface queries (plan 06, C3, for plan 07): the candidate's total
-# order, the query against brute force, and the merged records bit-identical
-# to a rerun on rank 0 alone -- on spheres and on a cube full of exact ties.
-mftl_add_mpi_test(test_coupling_query 1)
-mftl_add_mpi_test_at(test_coupling_query_np2 test_coupling_query 2)
-mftl_add_mpi_test_at(test_coupling_query_np4 test_coupling_query 4)
-mftl_add_mpi_test_at(test_coupling_query_np8 test_coupling_query 8)
-mftl_add_mpi_test_oversub(test_coupling_query_np27 test_coupling_query 27)
-
 # --- The remeshing module's MPI must stay in one file ----------------------
 #
 # A source-level test, because it is a source-level property and no runtime

@@ -969,8 +969,7 @@ static double adv_width(const adv_lat *A, int k, int64_t j) { return A->faces[k]
 static int adv_ref_row_rect(const adv_lat *A, const MFTL_CouplerParams *P, const double hmax[3], const double x[3], uint64_t *keys, double *w, int cap,
                             double H[3])
 {
-  double Rp[3];
-  for (int k = 0; k < 3; ++k) Rp[k] = P->pilot_factor * hmax[k];
+  (void) hmax;
   /* index ranges wide enough for the pilot and for the support (both < half a period) */
   int64_t a[3], b[3];
   for (int k = 0; k < 3; ++k)
@@ -989,7 +988,8 @@ static int adv_ref_row_rect(const adv_lat *A, const MFTL_CouplerParams *P, const
         double hj[3];
         for (int k = 0; k < 3; ++k)
         {
-          const double t = (adv_pos(A, k, idx[k]) - x[k]) / Rp[k];
+          hj[k] = adv_width(A, k, A->per[k] ? ref_mod(idx[k], A->N[k]) : idx[k]);
+          const double t = (adv_pos(A, k, idx[k]) - x[k]) / (P->pilot_factor * hj[k]);
           if (fabs(t) > 1.0) in = false;
           rho2 += t * t;
           hj[k] = adv_width(A, k, A->per[k] ? ref_mod(idx[k], A->N[k]) : idx[k]);

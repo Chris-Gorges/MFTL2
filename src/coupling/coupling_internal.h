@@ -28,6 +28,14 @@
 #include "mftl_coupling.h"
 #include "mftl_types.h"
 
+/** @brief Accounted module allocations; the per-rank budget follows MFTL's fatal allocation policy. */
+void *MFTLCplAlloc(size_t bytes, const char *what);
+void *MFTLCplCalloc(size_t count, size_t size, const char *what);
+void *MFTLCplRealloc(void *ptr, size_t bytes, const char *what);
+void MFTLCplFree(void *ptr);
+/** @brief Fatal allocation/budget failure; terminates the MPI job if MPI is active. */
+_Noreturn void MFTLCplMemoryAbort(const char *what, size_t bytes, size_t current, size_t limit);
+
 /** @brief Longest location name, terminating NUL included. */
 #define CPL_NAME_MAX 32
 
@@ -47,7 +55,6 @@ enum
 typedef struct cpl_kernel
 {
   MFTL_KernelFn eval;
-  MFTL_KernelFn deriv;  ///< #MFTL_NULL when the kernel declares none
   void *ctx;
   double half_width;
   int moment_order;
@@ -76,6 +83,19 @@ typedef struct cpl_block
   unsigned char *active;  ///< Owned box x-fastest, #MFTL_NULL if all active.
 } cpl_block;
 
+/** @brief Bounds over contiguous groups in spatial order; storage is linear in the groups. */
+typedef struct cpl_box_tree
+{
+  int64_t base, count;
+  int group;
+  double *box;  ///< implicit binary tree, root 1, leaves at base
+} cpl_box_tree;
+
+/** @brief Build over points (triples) or boxes (lo/hi sextuples). */
+void MFTLCplBoxTreeBuild(cpl_box_tree *tree, const double *data, int64_t n, int group, bool points);
+/** @brief Next overlapping leaf group in original order; initialize cursor=1. Returns -1 at end. */
+int64_t MFTLCplBoxTreeNext(const cpl_box_tree *tree, const double lo[3], const double hi[3], int64_t *cursor);
+
 /** @brief One registered point set, sorted into Morton tiles. */
 typedef struct cpl_points
 {
@@ -87,7 +107,6 @@ typedef struct cpl_points
   double *measure;  ///< [n]
   double *h;  ///< [3n]
   double *cell;  ///< [9n] anisotropic location: cell matrices (row-major), else #MFTL_NULL
-  double *dir;  ///< [3n] directional location: each sample's vector, else #MFTL_NULL
   double *ext;  ///< [3n] half-extents
   int64_t *aidx;  ///< [n] element index in the field arrays
   int64_t *orig;  ///< [n] registration index
@@ -97,6 +116,7 @@ typedef struct cpl_points
   double *tile_ebox;  ///< [n_tiles][6] box of the cell extents (ownership)
   double tile_hmin[3], tile_hmax[3];  ///< over the set
   double *tile_h;  ///< [n_tiles][6] hmin xyz, hmax xyz per tile
+  cpl_box_tree tile_index;
 } cpl_points;
 
 /** @brief One location: global definition plus this rank's coverage. */
@@ -111,7 +131,6 @@ typedef struct cpl_location
   MFTL_BoundaryPolicy boundary;
   MFTL_WallParity wall[6];  ///< MIRROR: parity per face, x-lo .. z-hi
   bool anisotropic;  ///< point samples carry cell matrices
-  bool directional;  ///< point samples are projections s . u
 
   MFTL_GridExposure exposure;
   int n_cov;
@@ -148,7 +167,6 @@ struct MFTL_SolverGrid
   int **kidx_piece;
   int64_t **kidx_elem;
   double **kidx_meas;
-  int64_t **kidx_sidx;  ///< a point's index within its (Morton-sorted) set
   int n_blocks, cap_blocks;
   cpl_block *blocks;
   int n_points, cap_points;
@@ -176,14 +194,6 @@ int64_t MFTLCplConstraintFind(const cpl_location *l, uint64_t key);
  * @return false if this rank does not own the key.
  */
 bool MFTLCplSampleFind(MFTL_SolverGrid *g, int location, uint64_t key, int *piece, int64_t *elem, double *measure);
-
-/**
- * @brief MFTLCplSampleFind() that also tells a masked lattice sample from an
- *        absent one, and returns the sample's index: the owned-box linear index
- *        of a block, or a point's index within its Morton-sorted set.
- * @return 1 owned, 0 not owned here, -1 a masked (solid) lattice position owned here.
- */
-int MFTLCplSampleLocate(MFTL_SolverGrid *g, int location, uint64_t key, int *piece, int64_t *elem, double *measure, int64_t *sample);
 
 /** @brief Is owned lattice index @p idx exported (FULL, or inside a coverage box)? */
 bool MFTLCplLatExported(const cpl_location *l, const int64_t idx[3]);
@@ -318,24 +328,22 @@ typedef struct cpl_dir_entry
 {
   int provider;
   int location;
+  int roles;  ///< bit 1: ownership certificate; bit 2: resolution certificate
   int64_t ilo[3], ihi[3];  ///< lattice: owned index box
   double lo[3], hi[3];  ///< physical extent (lattice: positions +- half a width; points: ownership box)
   double hmin[3], hmax[3];  ///< resolution bounds inside
+  double mlo[3], mhi[3];  ///< sample-centred pilot influence bounds
 } cpl_dir_entry;
 
 /**
- * @brief A uniform grid over the directory entries of one location, so a
+ * @brief A compact Morton-ordered bounds tree over one location's directory, so a
  *        request box meets only the entries near it rather than all of them.
  */
 typedef struct cpl_dir_index
 {
-  double lo[3], cell[3];
-  int64_t dims[3];
-  int64_t n_cells;
-  int64_t *off;  ///< [n_cells+1] CSR
-  int *ent;  ///< entry indices
-  int *stamp;  ///< [n_dir] dedup stamps
-  int stamp_now;
+  cpl_box_tree tree;
+  int *ent;  ///< spatially ordered entry indices
+  int n;
 } cpl_dir_index;
 
 /** @brief Builds the index of the entries of @p location (entries need not be sorted). */
@@ -349,46 +357,14 @@ void MFTLCplDirIndexFree(cpl_dir_index *ix);
  *        each once, appended to @p out (grown). Returns the count.
  */
 int MFTLCplDirIndexQuery(cpl_dir_index *ix, const cpl_dir_entry *e, const double lo[3], const double hi[3], int **out, int *cap);
-
-/**
- * @brief Which part of a region the directory's ownership boxes of one point
- *        location cover: a grid whose cells are either fully covered or carry
- *        the fragments nobody claims. Built once per directory, so a request
- *        box's "is every part of me owned by someone" costs cell lookups, not
- *        a subtraction of every overlapping ownership box.
- */
-typedef struct cpl_cover
-{
-  double lo[3], cell[3];
-  int64_t dims[3];
-  int64_t *frag_off;  ///< [n_cells+1] CSR into frag; an empty range is a fully covered cell
-  double *frag;  ///< [n][6] uncovered fragments
-  bool built;
-} cpl_cover;
-
-/**
- * @brief Builds the cover of the closed box `[lo, hi]` (periodic images of the
- *        entries included) at a cell size of about @p cell.
- */
-void MFTLCplCoverBuild(cpl_cover *cv, cpl_dir_index *ix, const cpl_dir_entry *e, const MFTL_Domain *d, const double lo[3], const double hi[3],
-                       const double cell[3], const double sliver[3]);
-
-/** @brief Frees a cover. */
-void MFTLCplCoverFree(cpl_cover *cv);
-
-/**
- * @brief The parts of the closed box `[lo, hi]` no ownership box covers,
- *        appended to @p out as boxes (grown). The box must lie inside the
- *        cover's region (the directory reach guarantees it); a part outside is
- *        reported as uncovered. Returns the number of boxes appended.
- */
-int MFTLCplCoverQuery(const cpl_cover *cv, const double lo[3], const double hi[3], const double sliver[3], double **out, int *n_out, int *cap);
+/** @brief Resolution certificates whose pilot influence intersects the box. */
+int MFTLCplDirMetricQuery(cpl_dir_index *ix, const cpl_dir_entry *e, const double lo[3], const double hi[3], int **out, int *cap);
 
 /**
  * @brief This rank's own directory entries, from the registry.
  * @return Number of entries; @p out is allocated (free it).
  */
-int MFTLCplDirectoryOwnEntries(const MFTL_SolverGrid *g, const MFTL_Domain *d, cpl_dir_entry **out);
+int MFTLCplDirectoryOwnEntries(const MFTL_SolverGrid *g, const MFTL_Domain *d, double pilot, cpl_dir_entry **out);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Rows (coupling_rows.c)
@@ -402,12 +378,7 @@ typedef struct cpl_row_scratch
   double *phi;  ///< [3 cap] per-axis kernel values / radial
   double *psi;  ///< [cap] base weights
   double *r;  ///< [cap] argument scratch
-  int aux_cap;
-  double *aux;  ///< block rows: [CPL_ROW_AUX cap] per-candidate scratch
 } cpl_row_scratch;
-
-/** @brief Doubles of block-row scratch per candidate. */
-#define CPL_ROW_AUX 24
 
 /** @brief Frees row scratch. */
 void MFTLCplRowScratchFree(cpl_row_scratch *s);
@@ -443,42 +414,6 @@ int MFTLCplRowWeightsCell(const MFTL_CouplerParams *p, const cpl_kernel *kern, c
 /** @brief Inverse and determinant of a cell matrix; false when singular relative to its column norms. */
 bool MFTLCplCellInverse(const double Hm[9], double inv[9], double *det);
 
-/**
- * @brief The metric of a block row: \f$A = \tilde H^{-1}\f$ and, for a derivative
- *        with a varying metric, its derivatives.
- */
-typedef struct cpl_metric
-{
-  double H[9];  ///< \f$\tilde H\f$, scale and growth applied (row-major)
-  double A[9];  ///< \f$\tilde H^{-1}\f$
-  double detA;  ///< \f$|\det A|\f$
-  bool varying;  ///< dA and dlogdet are set
-  double dA[27];  ///< \f$\partial A/\partial x_m\f$, m-major
-  double dlogdet[3];  ///< \f$\partial \log|\det A| / \partial x_m\f$
-} cpl_metric;
-
-/**
- * @brief Fills a metric from a diagonal (@p cell false: @p H `[3]`) or full
- *        (@p H `[9]`) \f$\tilde H\f$, and optionally its derivative @p dH
- *        (`[3]` per m for a diagonal one, `[9]` per m for a full one; #MFTL_NULL
- *        for a constant metric).
- * @return false when the metric is singular.
- */
-bool MFTLCplMetricSet(cpl_metric *m, bool cell, const double *H, const double *dH);
-
-/** @brief Components per entry of a block row: 3 for a direction or a gradient, 1 otherwise. */
-static inline int cpl_row_ncomp(MFTL_CouplingOperator op, bool directional) { return (directional || op != MFTL_OPERATOR_VALUE) ? 3 : 1; }
-
-/**
- * @brief A block row: directional reconstruction, the gradient fit, or the
- *        derivative of the value row, over given candidates at one metric (no
- *        growth). @p w receives `cpl_row_ncomp()` weights per candidate.
- * @return #MFTL_COUPLING_OK, #MFTL_COUPLING_BAD_STENCIL, or
- *         #MFTL_COUPLING_INVALID for an operator the inputs cannot have.
- */
-int MFTLCplBlockRow(const MFTL_CouplerParams *p, const cpl_kernel *kern, MFTL_CouplingOperator op, const double x[3], const cpl_metric *met, int n,
-                    const double *X, const double *q, const double *dir, double *w, MFTL_RowQuality *q_out, cpl_row_scratch *s);
-
 /* ═══════════════════════════════════════════════════════════════════════════
  * Coupler state (coupler.c)
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -490,11 +425,9 @@ typedef struct cpl_locinfo
   bool constrained;  ///< some rank registered constrained samples of this location
   int *con_peer;  ///< local constraint entries' owners, translated from solver ranks to coupler ranks
   bool anisotropic;  ///< point samples carry cell matrices
-  bool directional;  ///< point samples are projections s . u
   bool uniform_metric;  ///< every sample of the location has the same resolution
   double hmin[3];  ///< global minimum resolution
-  double hmax[3];  ///< global maximum resolution (the metric bound)
-  double reach[3];  ///< the largest distance a row can look from its marker
+  double hmax[3];  ///< global maximum: registration checks and uniform-metric recognition, not variable pilot sizing
 } cpl_locinfo;
 
 /** @brief One rank's band of one location in a window. */
@@ -511,7 +444,6 @@ typedef struct cpl_band
   double *measure;
   double *h;  ///< [3 n_dof]
   double *cell;  ///< [9 n_dof] anisotropic point location: cell matrices, else #MFTL_NULL
-  double *dir;  ///< [3 n_dof] directional point location: the samples' vectors, else #MFTL_NULL
 
   int64_t n_img;
   double *ipos;  ///< [3 n_img]
@@ -520,6 +452,13 @@ typedef struct cpl_band
   uint64_t *ibin_key;
   int64_t *ibin_off;  ///< [n_ibins+1]
   double bsize[3];
+  cpl_box_tree image_index;  ///< irregular bands: skip groups inside coarse Cartesian bins
+
+  /* Sparse 4^3 Cartesian bricks: direct lattice address -> band column.
+   * Allocated only for the uniform Peskin path, independently of ownership. */
+  int64_t n_bricks, brick_hash_size;
+  uint64_t *brick_key;
+  int64_t *brick_col, *brick_hash;
 
   /* requester side: one segment of DOFs per provider (self included) */
   int n_src;
@@ -530,6 +469,7 @@ typedef struct cpl_band
   /* provider side: one pack list per requester (self included) */
   int n_dst;
   int *dst_rank;
+  int *dst_peer;  ///< index in the window's serve-peer list, -1 for self
   int64_t *dst_off, *dst_nonhalo, *dst_halo;
   int64_t *pack_served;  ///< [total pack] index into the served table
   int64_t n_served;
@@ -544,27 +484,59 @@ typedef struct cpl_band
   double *reqbox;  ///< [n][6]: lattice: index box as doubles; points: physical box
 } cpl_band;
 
+/** @brief Build/free the optional direct uniform-grid index. */
+void MFTLCplBricksBuild(cpl_band *b, const cpl_location *l);
+void MFTLCplBricksFree(cpl_band *b);
+
+/** @brief Complete Cartesian row: factored weights and local columns; zero count denotes CSR fallback. */
+typedef struct cpl_tensor_row
+{
+  double phi[12];
+  int32_t col[64];  ///< -1 for an exactly zero weight
+  int count;
+} cpl_tensor_row;
+
+/** @brief Construct a complete, uncorrected four-point row; -1 requests the general path. */
+int MFTLCplCartesianRow(const cpl_band *b, const cpl_location *l, const MFTL_Domain *d, const cpl_kernel *kernel,
+                        const double x[3], double tolerance, double max_amplification, cpl_tensor_row *row, double *residual, double *amplification);
+/** @brief Apply a factored row and its exact transpose, or inspect its nonzero entries. */
+double MFTLCplTensorValue(const cpl_tensor_row *row, const double *values);
+void MFTLCplTensorSpread(const cpl_tensor_row *row, double load, double *values);
+void MFTLCplTensorEntries(const cpl_tensor_row *row, int64_t col[64], double weights[64]);
+
 struct MFTL_CouplingWindow
 {
   MFTL_Coupler *c;
   uint64_t id;
   uint64_t grid_epoch;
   uint64_t export_epoch;  ///< the export epoch at which every served sample was last confirmed exported
-  bool keyed;  ///< built from named samples (MFTLCouplerRequestSamples()): no spatial certificate, imported rows only
   int n_loc;
   int *locs;
   cpl_band *band;
   double skin[3];
   double bin[3];
+  double *reach;  ///< [n_loc * n_bins][3] certified local support radii
+  struct cpl_candidates *candidates;  ///< lazy lists per certified (location, bin) envelope
   int64_t n_bins;
   uint64_t *bin_key;
   int n_fetch_peers;
   int *fetch_peer;  ///< ranks this rank receives fetch values from (sorted, self excluded)
   int n_serve_peers;
   int *serve_peer;  ///< ranks this rank sends fetch values to (sorted, self excluded)
+  int *fetch_segment, *serve_segment;  ///< [peer * n_loc + band], -1 when absent
+  struct MFTL_CouplingFetch *fetch_pool;  ///< released snapshots only; bounded to three RK stage buffers
+  int n_fetch_pool;
   int refcount;
   size_t bytes;
 };
+
+/** @brief Candidates in one certified envelope, reusable through marker motion. */
+typedef struct cpl_candidates
+{
+  int64_t n;
+  int64_t *img;
+  bool built;
+} cpl_candidates;
 
 /** @brief Per-body snapshot taken by a bind. */
 typedef struct cpl_body_snap
@@ -584,22 +556,22 @@ struct MFTL_CouplingBinding
   MFTL_MarkerKind kind;
   int64_t n_markers;
   MFTL_MarkerRef *ref;
+  int64_t *support_bin;  ///< containing window envelope per marker
   double *pos;  ///< [3n] row positions (frame of the window bin)
   double *base_pos;  ///< [3n] positions of the base markers (equal to pos for a base binding)
   int n_loc;
   int *loc_band;  ///< window band index per location
-  MFTL_CouplingOperator op;  ///< what the rows compute
-  bool imported;  ///< rows imported by MFTLCouplerImportRows(): no stage binds
-  int *ncomp;  ///< [n_loc] weights per entry (1, or 3 for a direction or a gradient)
   int64_t **row_ptr;
   int64_t **col;
-  double **w;  ///< [n_loc] [ncomp * entries]
-  double **wallc;  ///< [n_loc] MIRROR locations: [6 ncomp n_markers] wall coefficients (6 per component); #MFTL_NULL otherwise
+  double **w;
+  cpl_tensor_row **tensor;  ///< optional uniform rows, indexed by marker; other rows use CSR
+  double **wallc;  ///< [n_loc] MIRROR locations: [6 n_markers] wall coefficients; #MFTL_NULL otherwise
   int n_bodies;
   cpl_body_snap *bodies;
   uint64_t pos_checksum;
   MFTL_BindingQuality q;
   uint64_t *scratch_keys;
+  double scratch_weights[64];  ///< materialized tensor weights for row inspection
   int scratch_cap;
   struct cpl_quad *quad;  ///< QUADRATURE: the vertex table and ghost schedule (the base's, shared by its stage bindings)
   bool quad_owned;  ///< this binding frees @c quad
@@ -609,6 +581,7 @@ struct MFTL_CouplingBinding
 
 struct MFTL_CouplingFetch
 {
+  struct MFTL_CouplingFetch *next;
   const MFTL_CouplingWindow *win;
   uint64_t window_id;
   int n_fields;
@@ -631,6 +604,7 @@ struct MFTL_TransferReady
   MFTL_SolverField *fields;
   int *field_band;
   MFTL_SpreadForm form;
+  int64_t *fetch_off, *serve_off;  ///< packed field offsets [peer * n_fields + field], plus sentinel
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -740,38 +714,6 @@ void MFTLCplQuadAccumulate(MPI_Comm comm, const cpl_quad *q, int64_t n_markers, 
 void MFTLCplQuadInterpolate(MPI_Comm comm, const cpl_quad *q, int64_t n_markers, const MFTL_MarkerRef *ref, bool weighted, int ncomp, const double *g,
                             double *out, long *bytes, long *messages);
 
-/**
- * @brief The vertex table's values, owned and ghost: @p g holds the owned
- *        vertices' `ncomp` values, @p tab receives `[(n_own + n_ghost) * ncomp]`,
- *        the ghosts' from their owners. Collective.
- */
-void MFTLCplQuadGhostValues(MPI_Comm comm, const cpl_quad *q, int ncomp, const double *g, double *tab, long *bytes, long *messages);
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Nearest-surface queries (coupling_query.c)
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/**
- * @brief Owned triangle @p t in the frame of its wrapped centroid: corners
- *        unwrapped about corner 0 and shifted by whole periods so that their
- *        centroid is @p c, the very centroid (same bits) CENTROIDS markers bin.
- */
-void MFTLCplTriangleCentroidFrame(const MFTL_Domain *d, const MFTL_Object *obj, int t, double T[3][3], double c[3]);
-
-/** @brief Unit normal of a triangle from its corners (zero for a degenerate one). */
-void MFTLCplFaceNormal(const double T[3][3], double n[3]);
-
-/**
- * @brief Angle-weighted pseudo-normals of every OWNED vertex of every local
- *        body, in the vertex table's order (bodies in list order, then pool
- *        order), summed over the vertex's whole fan -- complete on its owner,
- *        the halo being vertex-complete -- in ascending triangle id, so the bits
- *        do not depend on the partition. Local.
- * @param ens The ensemble.
- * @param[out] g `[3 * owned vertices]`.
- */
-void MFTLCplVertexPseudoNormals(const MFTL_Ensemble *ens, double *g);
-
 /** @brief FNV-1a over the bits of @p n positions. */
 uint64_t MFTLCplPositionsChecksum(const double *pos, int64_t n);
 
@@ -806,9 +748,8 @@ enum
   CPL_TAG_CONSTRAINT_SETUP = 108,
   CPL_TAG_CONSTRAINT = 109,
   CPL_TAG_MIGRATION = 110,
-  CPL_TAG_KEYS = 111,
-  CPL_TAG_KEYS_REPLY = 112,
-  CPL_TAG_QUERY = 113
+  CPL_TAG_LOOKUP = 111,
+  CPL_TAG_LOOKUP_REPLY = 112
 };
 
 /** @brief Duplicates @p base. */
@@ -826,6 +767,9 @@ int MFTLCplAgreeMax(MPI_Comm c, int v);
 
 /** @brief Agrees status and token identity before a transfer posts messages. */
 int MFTLCplAgreeTransfer(MPI_Comm c, int status, uint64_t token);
+
+/** @brief Agree validation and, only if all ranks are valid, its signature in one reduction. */
+int MFTLCplAgreeValidated(MPI_Comm c, int status, uint64_t signature);
 /** @brief In-place MAX of @p n ints. */
 void MFTLCplAgreeMaxN(MPI_Comm c, int *v, int n);
 /** @brief Whether @p h is the same on every rank (one reduction of two values). */
