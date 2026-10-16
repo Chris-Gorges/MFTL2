@@ -123,6 +123,16 @@ if(BUILD_EXAMPLES)
         add_executable(${TARGET_NAME} ${SOURCE_FILE})
         target_link_libraries(${TARGET_NAME} PRIVATE MFTL)
     endforeach()
+
+    # The cluster scaling drivers (scaling/strong_scaling.c, scaling/weak_scaling.c),
+    # built here rather than by hand so they get exactly the library's toolchain,
+    # build type, LTO setting and MFTL_COMM_PROFILE definition. See scaling/README.md.
+    file(GLOB SCALING_SOURCES CONFIGURE_DEPENDS "scaling/*.c")
+    foreach(SOURCE_FILE ${SCALING_SOURCES})
+        get_filename_component(TARGET_NAME ${SOURCE_FILE} NAME_WE)
+        add_executable(${TARGET_NAME} ${SOURCE_FILE})
+        target_link_libraries(${TARGET_NAME} PRIVATE MFTL)
+    endforeach()
 endif()
 
 # --- Testing ---

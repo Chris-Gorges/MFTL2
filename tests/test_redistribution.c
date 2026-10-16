@@ -950,6 +950,62 @@ static int test_multibody_round(void)
  * ─────────────────────────────────────────────────────────────────────────── */
 
 /**
+ * @brief Arrivals that grow the work list preserve its existing body pointers.
+ */
+static int test_arrivals_preserve_a_growing_work_list(void)
+{
+  if (g_nproc < 2) return 0;
+
+  const int per_cell = 128;
+  const int nb = per_cell * g_nproc;
+  int cuts[3] = {g_nproc, 1, 1};
+  double lo[3] = {-1.0, -1.0, -1.0}, hi[3] = {1.0, 1.0, 1.0};
+  bool periodic[3] = {MFTL_TRUE, MFTL_TRUE, MFTL_TRUE};
+  MFTL_Ensemble *ens = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, lo, hi, periodic, nb);
+  const double dx = 2.0 / (double) g_nproc;
+  int ok = 1;
+  for (int b = 0; b < nb; ++b)
+  {
+    MFTL_Object *obj = MFTLObjectCreate(b);
+    if (MFTLEnsembleAddObject(ens, obj) != MFTL_SUCCESS) ok = 0;
+    double centre[3] = {-1.0 + ((double) (b / per_cell) + 0.5) * dx, 0.0, 0.0};
+    if (MFTLGenerateSphereLocal(obj, centre, 0.1 * dx, 0) != MFTL_SUCCESS) ok = 0;
+  }
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLPublishGeneratedBodies(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLRedistribute(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ens->n_local_objects == per_cell && ensemble_is_sound(ens), MPI_COMM_WORLD));
+
+  /* Startup reserved room for every body, masking growth on later arrivals.
+   * Start fresh, as a batch-initialized ensemble does: 128 old bodies plus 128
+   * incoming bodies must coexist until the departing objects are removed. */
+  MFTLCommWorkspaceDestroy(&ens->comm_workspace);
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    MFTL_Object *obj = ens->local_objects[o];
+    MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += dx; MFTLApplyPeriodicity(&ens->domain, pos););
+  }
+  refresh_geometry(ens);
+  TEST_ASSERT(agreed(MFTLRedistribute(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ens->n_local_objects == per_cell && ensemble_is_sound(ens), MPI_COMM_WORLD));
+
+  for (int b = 0; b < nb; ++b)
+  {
+    double centre[3] = {-1.0 + ((double) ((b / per_cell + 1) % g_nproc) + 0.5) * dx, 0.0, 0.0};
+    const MFTL_Object *obj = body(ens, b);
+    if (MFTLGetOwnerProc(&ens->domain, centre) == g_rank)
+    {
+      if (obj == MFTL_NULL || obj->tris.n_local != 20 || obj->verts.n_local != 12) ok = 0;
+    }
+    else if (obj != MFTL_NULL) ok = 0;
+  }
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLRedistribute(ens) == MFTL_SUCCESS && ensemble_is_sound(ens), MPI_COMM_WORLD));
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/**
  * @brief A body that moves out of a rank entirely leaves nothing behind.
  *
  * The degenerate end of the kept path: the kept set is EMPTY, so the compaction
@@ -1761,6 +1817,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_ghost_vertex_normals_are_exact);
   RUN_TEST(test_ghost_syncs_leave_topology_current);
   RUN_TEST(test_multibody_round);
+  RUN_TEST(test_arrivals_preserve_a_growing_work_list);
   RUN_TEST(test_body_can_leave_a_rank_entirely);
   RUN_TEST(test_body_straddling_a_periodic_seam);
   RUN_TEST(test_non_periodic_domain);

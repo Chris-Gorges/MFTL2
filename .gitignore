@@ -30,7 +30,6 @@ poltergeist.config.json
 run_mpi.sh
 .claude/
 /results/
-/scaling/
 /Testing/
 *vtk
 

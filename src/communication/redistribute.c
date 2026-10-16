@@ -860,8 +860,8 @@ static void ws_bytes(void **p, int *cap, int need, size_t elem, const char *what
 }
 
 /**
- * @brief Grows the per-body arrays, PRESERVING `states` (it must survive growth
- *        within a call when arrivals extend the work list) and zeroing its tail.
+ * @brief Grows the per-body arrays, preserving the work list and states when
+ *        arrivals extend them within a call, and zeroing the new states.
  *
  * @param ws The workspace.
  * @param n  Bodies the arrays must hold.
@@ -876,6 +876,7 @@ static void ws_bodies_reserve(comm_workspace *ws, int n)
   MFTL_Object **const work = (MFTL_Object **) MFTLMallocOrDie((size_t) c * sizeof(MFTL_Object *), "redistribution work list");
   body_state *const states = (body_state *) MFTLCallocOrDie((size_t) c, sizeof(body_state), "redistribution body states");
 
+  if (had > 0 && ws->work != MFTL_NULL) memcpy(work, ws->work, (size_t) had * sizeof(MFTL_Object *));
   if (had > 0 && ws->states != MFTL_NULL) memcpy(states, ws->states, (size_t) had * sizeof(body_state));
 
   free(ws->work);
