@@ -1,10 +1,13 @@
 #!/bin/bash
 # One problem size, varied rank count; no problem-size sweep.
-# Defaults use 1, 2, 4, 8, 16 and 30 full 36-core nodes.
+# Defaults use 1, 2, 4 and 8 full 36-core nodes. MAX_NODES caps submissions;
+# NODES selects node counts, or RANKS overrides them with explicit rank counts.
 # Each point is one job, capped at one hour. Initialization distributes only
 # new batches, and a 50-minute soft budget can omit further timed repeats.
 #
 #   scaling/launch_strong.sh --dry-run
+#   MAX_NODES=4 scaling/launch_strong.sh
+#   NODES="1 2 4 8" MEMORY_PER_NODE=default scaling/launch_strong.sh
 #   scaling/launch_strong.sh
 #
 # Build first with the site's modules: python3 build_all.py --comm-profile
@@ -17,7 +20,7 @@ source "$HERE/site.sh"
 source "$HERE/sweep_common.sh"
 
 MODE=strong
-RANKS="${RANKS:-36 72 144 288 576 1080}"
+RANKS="${RANKS:-}"          # otherwise derived from NODES x RANKS_PER_NODE
 SPHERES="${SPHERES:-110592}" # 48^3 spheres, 141,557,760 triangles; one fixed problem
 REFINE="${REFINE:-3}"        # 1280 triangles per body
 STEPS="${STEPS:-200}"        # one trajectory advances the lattice (3,2,1) spacings

@@ -6,7 +6,10 @@
 
 # ---- Machine -----------------------------------------------------------------
 CORES_PER_NODE="${CORES_PER_NODE:-36}"
-MAX_NODES="${MAX_NODES:-30}"   # points needing more nodes are skipped, not queued forever
+MAX_NODES="${MAX_NODES:-8}"    # submission cap; changing it never changes a problem size
+NODES="${NODES:-1 2 4 8 16 30}" # candidate points; only those <= MAX_NODES are submitted
+RANKS_PER_NODE="${RANKS_PER_NODE:-$CORES_PER_NODE}"
+# Optional RANKS="36 72" overrides NODES for partial-node or custom rank studies.
 
 # ---- Slurm -------------------------------------------------------------------
 # Extra sbatch flags: partition, account, QoS, constraint ... e.g.
@@ -17,9 +20,11 @@ SBATCH_EXTRA="${SBATCH_EXTRA:-}"
 # with another job is the commonest way to get a scaling curve that measures
 # somebody else's memory bandwidth. Keep it on.
 EXCLUSIVE="${EXCLUSIVE:-1}"
-# --exclusive allocates CPUs, not all RAM. Allow room for mesh and MPI workspace.
-# 0 requests all Slurm-configured node memory; use e.g. 110G if required locally.
-MEMORY_PER_NODE="${MEMORY_PER_NODE:-0}"
+# default (or empty) omits --mem, matching the original site's working job.sh.
+# 0 requests all Slurm-configured node memory; e.g. 100G requests a fixed amount.
+# --exclusive alone does NOT grant all RAM. Check the allocation's memory before
+# large runs; site defaults/policies differ. No automatic retry with less memory.
+MEMORY_PER_NODE="${MEMORY_PER_NODE:-default}"
 
 # ---- Software ----------------------------------------------------------------
 # The same modules must be loaded to BUILD the library (python3 build_all.py

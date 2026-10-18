@@ -55,6 +55,7 @@ print(100 + int(os.getenv("NRANKS", "0")))
             "SUBMIT_LOG": str(self.root / "submits.jsonl"), "RANKS": "1 72 1080",
             "OUT_DIR": str(self.root / "sweep"), "JOB_REPEATS": "1",
             "CORES_PER_NODE": "36", "MAX_NODES": "30", "RANKS_PER_NODE": "36",
+            "NODES": "", "ALLOW_NO_PROFILE": "0",
             "EXCLUSIVE": "1", "MEMORY_PER_NODE": "0", "SBATCH_EXTRA": "",
             "BUILD_DIR": str(self.root / "build"),
             "SLURM_JOB_ID": "",
@@ -90,15 +91,73 @@ print(100 + int(os.getenv("NRANKS", "0")))
         for mode, size in (("strong", "--spheres 110592"), ("weak", "--spheres-per-rank 1000")):
             executable(self.root / f"build/{mode}_scaling", "#!/bin/bash\nexit 0\n")
             env = {**self.env, "RANKS": "", "OUT_DIR": str(self.root / mode),
-                   "RANKS_PER_NODE": "", "SPHERES": "", "PER_RANK": "", "TIME_LIMIT": ""}
+                   "RANKS_PER_NODE": "", "SPHERES": "", "PER_RANK": "", "TIME_LIMIT": "",
+                   "MAX_NODES": "", "MEMORY_PER_NODE": ""}
             result = run(["bash", str(self.root / f"scaling/launch_{mode}.sh"), "--dry-run"], env=env)
             self.assertEqual(result.returncode, 0, result.stderr)
             with (self.root / mode / "points.tsv").open() as f:
                 points = list(csv.DictReader(f, delimiter="\t"))
-            self.assertEqual([int(p["np"]) for p in points], [36, 72, 144, 288, 576, 1080])
-            self.assertTrue(all(int(p["rpn"]) == 36 and int(p["np"]) == 36*int(p["nodes"]) for p in points))
+            eligible = [p for p in points if p["status"] == "dry-run"]
+            self.assertEqual([int(p["np"]) for p in eligible], [36, 72, 144, 288])
+            self.assertTrue(all(int(p["rpn"]) == 36 and int(p["np"]) == 36*int(p["nodes"]) for p in eligible))
             self.assertIn(size, (self.root / mode / "sweep.txt").read_text())
-            self.assertEqual(result.stdout.count("--time=01:00:00"), 6)
+            self.assertEqual(result.stdout.count("--time=01:00:00"), 4)
+            self.assertNotIn("--mem=", result.stdout)
+
+    def test_node_cap_filters_without_changing_problem_or_density(self):
+        for cap, expected in ((1, [1]), (3, [1, 2]), (8, [1, 2, 4, 8]),
+                              (10, [1, 2, 4, 8]), (30, [1, 2, 4, 8, 16, 30])):
+            out = self.root / f"cap-{cap}"
+            result = self.launch(RANKS="", MAX_NODES=str(cap), OUT_DIR=str(out))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with (out / "points.tsv").open() as f:
+                points = list(csv.DictReader(f, delimiter="\t"))
+            submitted = [p for p in points if p["status"] == "submitted"]
+            self.assertEqual([int(p["nodes"]) for p in submitted], expected)
+            self.assertTrue(all(int(p["np"]) == 36*int(p["nodes"]) and p["rpn"] == "36" for p in submitted))
+            config = (out / "sweep.txt").read_text()
+            self.assertIn("--spheres 110592", config)
+            self.assertIn("  ranks         " + " ".join(str(36*n) for n in expected) + "\n", config)
+            calls = [json.loads(s) for s in (self.root / "submits.jsonl").read_text().splitlines()]
+            dependency = "--dependency=afterany:" + ":".join(str(100+36*n) for n in expected)
+            self.assertIn(dependency, calls[-1]["args"])
+            result = run(["bash", str(self.root / "scaling/collect.sh"), str(out)])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            missing = next(l for l in (out / "summary.txt").read_text().splitlines() if "no verified report" in l)
+            for p in points:
+                if p["status"] == "skipped":
+                    self.assertNotIn(p["tag"], missing)
+
+    def test_custom_nodes_follow_rank_density_and_ranks_override(self):
+        result = self.launch(RANKS="", NODES="1 3 6", MAX_NODES="6", CORES_PER_NODE="24", RANKS_PER_NODE="24")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(s) for s in (self.root / "submits.jsonl").read_text().splitlines()]
+        for call, n in zip(calls, (1, 3, 6)):
+            self.assertIn(f"--nodes={n}", call["args"])
+            self.assertIn(f"--ntasks={n*24}", call["args"])
+            self.assertIn("--ntasks-per-node=24", call["args"])
+        result = self.launch(RANKS="1 2", NODES="1 3 6", OUT_DIR=str(self.root / "explicit-ranks"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("  ranks         1 2\n", (self.root / "explicit-ranks/sweep.txt").read_text())
+
+    def test_optional_memory_request(self):
+        for i, value in enumerate(("default", "", "0", "100G", "64000")):
+            result = self.launch(RANKS="36", MEMORY_PER_NODE=value, OUT_DIR=str(self.root / f"memory-{i}"))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            calls = [json.loads(s) for s in (self.root / "submits.jsonl").read_text().splitlines()]
+            args = calls[-2]["args"]
+            expected = [] if value in ("default", "") else [f"--mem={value}"]
+            self.assertEqual([a for a in args if a.startswith("--mem=")], expected)
+            self.assertIn("--exclusive", args)
+            self.assertFalse(any(a.startswith("--mem=") for a in calls[-1]["args"]))
+
+    def test_unprofiled_build_is_refused_before_submission(self):
+        (self.root / "build/CMakeCache.txt").write_text(
+            "CMAKE_BUILD_TYPE:STRING=Release\nMFTL_COMM_PROFILE:BOOL=OFF\n")
+        result = self.launch()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--comm-profile", result.stderr)
+        self.assertFalse((self.root / "submits.jsonl").exists())
 
     def test_submission_failure_and_missing_repeat(self):
         result = self.launch(RANKS="1 4", FAIL_RANK="4", JOB_REPEATS="2")
@@ -112,7 +171,10 @@ print(100 + int(os.getenv("NRANKS", "0")))
 
     def test_invalid_rank_settings(self):
         for env in ({"RANKS": "0"}, {"RANKS": "1 1"}, {"RANKS_PER_NODE": "37"},
-                    {"MAX_NODES": "0"}, {"JOB_REPEATS": "oops"}):
+                    {"MAX_NODES": "0"}, {"JOB_REPEATS": "oops"},
+                    {"RANKS": "", "NODES": "1 0"}, {"RANKS": "", "NODES": "1 1"},
+                    {"RANKS": "", "NODES": "1 x"}, {"MEMORY_PER_NODE": "-1"},
+                    {"MEMORY_PER_NODE": "100 G"}):
             self.assertNotEqual(self.launch(**env).returncode, 0, env)
 
     def test_collector_excludes_invalid_and_preserves_samples(self):

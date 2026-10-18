@@ -11,6 +11,50 @@ sweep_usage()
   sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//'
 }
 
+# Resolve placement once, before making snapshots or submitting anything.
+# Keep the requested points for the manifest, but use only eligible points in
+# sweep.txt and the collector. A cap exclusion is not a failed measurement.
+sweep_resolve_points()
+{
+  local value n p nodes seen=" " selected=""
+  for value in "$CORES_PER_NODE" "$MAX_NODES" "$RANKS_PER_NODE" "$JOB_REPEATS"; do
+    if [[ ! "$value" =~ ^[1-9][0-9]*$ ]] || [ "${#value}" -gt 7 ]; then
+      echo "error: ranks, node counts and repeats must be positive integers (at most 7 digits)." >&2
+      return 2
+    fi
+  done
+  if [ "$RANKS_PER_NODE" -gt "$CORES_PER_NODE" ]; then
+    echo "error: use RANKS_PER_NODE <= CORES_PER_NODE." >&2
+    return 2
+  fi
+  if [ -n "$RANKS" ]; then
+    POINT_SOURCE="RANKS"
+    REQUESTED_RANKS="$RANKS"
+  else
+    POINT_SOURCE="NODES"
+    REQUESTED_RANKS=""
+    for n in $NODES; do
+      if [[ ! "$n" =~ ^[1-9][0-9]*$ ]] || [ "${#n}" -gt 7 ]; then
+        echo "error: NODES must contain positive integers (at most 7 digits)." >&2
+        return 2
+      fi
+      REQUESTED_RANKS="$REQUESTED_RANKS $((n * RANKS_PER_NODE))"
+    done
+  fi
+  for p in $REQUESTED_RANKS; do
+    if [[ ! "$p" =~ ^[1-9][0-9]*$ ]] || [ "${#p}" -gt 7 ]; then
+      echo "error: rank counts must be positive integers (at most 7 digits)." >&2
+      return 2
+    fi
+    if [[ "$seen" == *" $p "* ]]; then echo "error: duplicate rank count $p" >&2; return 2; fi
+    seen="$seen$p "
+    nodes=$(((p + RANKS_PER_NODE - 1) / RANKS_PER_NODE))
+    if [ "$nodes" -le "$MAX_NODES" ]; then selected="$selected $p"; fi
+  done
+  RANKS="${selected# }"
+  return 0
+}
+
 # Refuses to queue a sweep whose numbers would be useless: no binary, a
 # non-Release build, or a build without the redistribution timers.
 sweep_preflight()
@@ -66,22 +110,15 @@ sweep_main()
   BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
   BUILD_DIR="$(cd "$BUILD_DIR" && pwd -P)" || return 1
   BIN="$BUILD_DIR/${MODE}_scaling"
-  local value
-  for value in "$CORES_PER_NODE" "$MAX_NODES" "${RANKS_PER_NODE:-$CORES_PER_NODE}" "$JOB_REPEATS" $RANKS; do
-    if [[ ! "$value" =~ ^[1-9][0-9]*$ ]] || [ "${#value}" -gt 7 ]; then
-      echo "error: ranks, node counts and repeats must be positive integers (at most 7 digits)." >&2
+  sweep_resolve_points || return $?
+  local memory=()
+  if [ -n "$MEMORY_PER_NODE" ] && [ "$MEMORY_PER_NODE" != default ]; then
+    if [[ ! "$MEMORY_PER_NODE" =~ ^[0-9]+[KMGTkmgt]?$ ]]; then
+      echo "error: MEMORY_PER_NODE must be default, empty, 0, or an integer size such as 100G." >&2
       return 2
     fi
-  done
-  if [ -z "$RANKS" ] || [ "${RANKS_PER_NODE:-$CORES_PER_NODE}" -gt "$CORES_PER_NODE" ]; then
-    echo "error: provide ranks and use RANKS_PER_NODE <= CORES_PER_NODE." >&2
-    return 2
+    memory=(--mem="$MEMORY_PER_NODE")
   fi
-  local seen=" " p
-  for p in $RANKS; do
-    if [[ "$seen" == *" $p "* ]]; then echo "error: duplicate rank count $p" >&2; return 2; fi
-    seen="$seen$p "
-  done
   sweep_preflight || return 1
   if [ $dry = 0 ] && ! command -v sbatch >/dev/null 2>&1; then
     echo "error: sbatch not found (use --dry-run to only print the commands)." >&2
@@ -117,10 +154,11 @@ sweep_main()
     echo "  commit        $git"
     echo "  binary        $BIN"
     echo "  ranks         $RANKS"
+    echo "  point source  $POINT_SOURCE   candidate nodes $NODES   candidate ranks $REQUESTED_RANKS"
     echo "  driver args   $RUN_ARGS"
     echo "  job repeats   $JOB_REPEATS   time limit $TIME_LIMIT   cores/node $CORES_PER_NODE   ranks/node ${RANKS_PER_NODE:-$CORES_PER_NODE}   max nodes $MAX_NODES"
     echo "  sbatch extra  ${SBATCH_EXTRA:-none}   exclusive $EXCLUSIVE"
-    echo "  memory/node   $MEMORY_PER_NODE   (0 = all configured node memory)"
+    echo "  memory/node   ${MEMORY_PER_NODE:-default}   (default = no --mem; 0 = all configured node memory)"
     echo "  cores/node    $CORES_PER_NODE"
     echo "  snapshot      $OUT_DIR/snapshot"
     echo "  binary cksum  $(cksum "$OUT_DIR/snapshot/${MODE}_scaling")"
@@ -133,10 +171,11 @@ sweep_main()
   [ -n "$SBATCH_EXTRA" ] && read -r -a extra <<< "$SBATCH_EXTRA"
 
   local rpn="${RANKS_PER_NODE:-$CORES_PER_NODE}"
+  echo "campaign: $MODE; eligible ranks: ${RANKS:-none}; ranks/node=$rpn; MAX_NODES=$MAX_NODES; memory/node=${MEMORY_PER_NODE:-default}"
   local ids=() rep nodes tpn tag id submit_errors=0
   # Submit repeats round robin. Slurm still chooses execution order and nodes.
   for rep in $(seq 1 "$JOB_REPEATS"); do
-    for p in $RANKS; do
+    for p in $REQUESTED_RANKS; do
       tag="$(printf 'np%05d' "$p")"
       [ "$JOB_REPEATS" -gt 1 ] && tag="${tag}_r${rep}"
       # Keep the requested rank density. Never silently repack a large point.
@@ -151,7 +190,7 @@ sweep_main()
       local cmd=(sbatch --parsable
         --job-name="mftl-${MODE}-np${p}"
         --nodes="$nodes" --ntasks="$p" --ntasks-per-node="$tpn" --cpus-per-task=1
-        --mem="$MEMORY_PER_NODE"
+        ${memory[@]+"${memory[@]}"}
         --time="$TIME_LIMIT"
         --output="$OUT_DIR/slurm/${tag}-%j.out"
         ${excl[@]+"${excl[@]}"} ${extra[@]+"${extra[@]}"}
@@ -169,6 +208,9 @@ sweep_main()
       else
         if ! id="$(env "${vars[@]}" "${cmd[@]}")"; then
           echo "error: sbatch failed for np=$p" >&2
+          printf '  request: nodes=%s tasks=%s tasks/node=%s memory/node=%s; sbatch extras: %s\n' \
+            "$nodes" "$p" "$tpn" "${MEMORY_PER_NODE:-default}" "${SBATCH_EXTRA:-none}" >&2
+          echo "  Check sinfo -N and scontrol show partition for CPU/memory limits; MEMORY_PER_NODE=default omits --mem." >&2
           echo "sbatch submission failed" >"$OUT_DIR/reports/${tag}.failed"
           printf '%s\t%s\t%s\t%s\tsubmit-failed\t-\n' "$tag" "$p" "$nodes" "$tpn" >>"$OUT_DIR/points.tsv"
           submit_errors=1
@@ -183,7 +225,7 @@ sweep_main()
   done
 
   if [ ${#ids[@]} -eq 0 ]; then
-    echo "nothing submitted." >&2
+    echo "nothing submitted: check MAX_NODES/NODES/RANKS and any sbatch errors above." >&2
     return 1
   fi
 
@@ -212,7 +254,8 @@ sweep_main()
     echo "results:   $OUT_DIR"
     echo "           (also $ROOT/results/scaling/${MODE}_latest)"
     echo "summary:   $OUT_DIR/summary.txt  -- written when the last point has finished"
-    echo "watch:     squeue -u \$USER"
+    echo "watch:     squeue -u \$USER -o '%.18i %.24j %.9P %.2t %.6D %R'"
+    echo "queue:     Resources = waiting for nodes; Dependency = collector waiting for benchmark jobs."
     echo "by hand:   scaling/collect.sh $OUT_DIR   (any time; partial sweeps are fine)"
   fi
   return "$submit_errors"

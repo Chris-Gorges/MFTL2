@@ -1,12 +1,18 @@
 # One larger workload per scaling mode
 
 The current launchers sweep **rank count only**. They do not loop over problem
-sizes. Both use full 36-core nodes, with P = 36, 72, 144, 288, 576, 1080.
+sizes. Both default to full 36-core nodes, with P = 36, 72, 144, 288.
+`MAX_NODES=8` caps submissions; `NODES` selects candidate node counts. The
+candidate list also includes 16 and 30 nodes, enabled by raising the cap.
+Explicit `RANKS` takes precedence over `NODES`.
 
 | Mode | Fixed parameter | Global triangles | Average owned triangles/rank |
 |---|---|---:|---:|
-| Strong | 110,592 spheres, refinement 3 | 141,557,760 | 3,932,160 at P=36; 131,072 at P=1080 |
-| Weak | 1,000 spheres/rank, refinement 3 | 46,080,000 at P=36; 1,382,400,000 at P=1080 | 1,280,000 |
+| Strong | 110,592 spheres, refinement 3 | 141,557,760 | 3,932,160 at P=36; 491,520 at P=288 |
+| Weak | 1,000 spheres/rank, refinement 3 | 46,080,000 at P=36; 368,640,000 at P=288 | 1,280,000 |
+
+The optional 30-node point has 131,072 triangles/rank in strong mode and
+1,382,400,000 global triangles in weak mode. It is not submitted by default.
 
 There are 1,280 triangles and 642 vertices per sphere. Body spacing is 1 in
 both modes: the strong domain has edge 48; each weak rank box has edge 10.
@@ -106,8 +112,11 @@ refinement/count/decomposition settings.
 The node peak-sum adds ranks' individual RSS high-water marks. Those peaks need
 not coincide and shared pages can be counted repeatedly; it is an upper bound
 rather than a simultaneous node measurement. Keep Slurm/cgroup memory data
-where available. `MEMORY_PER_NODE=0` requests all configured node memory;
-physical RAM and the scheduler's allocatable RAM need not be identical.
+where available. `MEMORY_PER_NODE=default` omits the explicit memory request,
+matching the site's accepted submission. It does not guarantee enough memory
+for the large runs: inspect the actual allocation in the job log.
+`MEMORY_PER_NODE=0` explicitly requests all configured memory, or use a
+site-approved size. Physical RAM and scheduler-allocated RAM can differ.
 
 ## Runtime and allocation cost
 
@@ -123,10 +132,12 @@ interpreting minima. If setup has exhausted the budget before any repeat, the
 run fails. The first repeat is not predicted, so a sufficiently slow job can
 still time out without a report. Slurm provides the hard cap.
 
-Six points per mode and one job per point keep the first campaign to 12 jobs.
-The sum of node counts is 63 per mode, so the one-hour limits correspond to at
-most 126 benchmark node-hours. Actual use should be lower; scheduling/queue
-time is separate.
+Four points per mode and one job per point keep the default campaign to 8 jobs.
+The sum of node counts is 15 per mode, so the one-hour limits correspond to at
+most 30 benchmark node-hours (excluding smoke/collection jobs). With
+`MAX_NODES=30`, all six candidates correspond to 12 jobs and 126 node-hours.
+Actual use should be lower; scheduling/queue time is separate. Lower caps keep
+the workload fixed, but naturally provide less evidence about large-P scaling.
 
 Keep `STEPS=200`: it sets the motion per step. Each trajectory translates the
 lattice by (3,2,1) body spacings. `CYCLES` repeats trajectories at unchanged

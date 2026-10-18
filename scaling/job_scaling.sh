@@ -63,6 +63,11 @@ echo "modules     ${LOADEDMODULES:-none}"
 echo "launcher    $(command -v "${LAUNCHER[0]}" || echo "${LAUNCHER[0]} NOT FOUND")"
 echo "binary      $BIN"
 cksum "$BIN"
+if [ -n "${SLURM_JOB_ID:-}" ] && command -v scontrol >/dev/null 2>&1; then
+  # Records the actual CPU/memory allocation, including partition defaults when
+  # --mem was omitted. Diagnostic only; site restrictions must not kill a run.
+  scontrol show job "$SLURM_JOB_ID" || true
+fi
 command -v lscpu >/dev/null 2>&1 && lscpu
 
 # Free /dev/shm (MPI's shared-memory transport) and free memory, once per node.

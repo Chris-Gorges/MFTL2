@@ -191,6 +191,12 @@
  *     mpirun -n 4 ./build/parallel_advection_scaling --mode weak --spheres-per-rank 32 --refine 3
  */
 
+/* Expose gethostname() under strict C11 on POSIX systems. Feature-test macros
+ * must precede every system header (including headers pulled in by MPI). */
+#if !defined(__APPLE__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>

@@ -12,14 +12,15 @@ for memory estimates and interpretation.
 | Spheres | 110,592 total | 1,000 per rank |
 | Refinement | 3 | 3 |
 | Triangles | 141,557,760 total | 1,280,000 per rank |
-| Rank counts | 36, 72, 144, 288, 576, 1080 | same |
+| Default rank counts | 36, 72, 144, 288 | same |
 | Ranks per node | 36 throughout | 36 throughout |
 | Job limit | 1 hour | 1 hour |
 | Default repeats | 3 × 200 steps inside one job/point | same |
 | Initialization | batches of 512 new spheres | same |
 
-At 1,080 ranks the weak problem has 1,080,000 spheres and 1,382,400,000 triangles.
-The two launchers submit 12 benchmark jobs total, plus collection jobs.
+At the default maximum of 8 nodes, the weak problem has 288,000 spheres and
+368,640,000 triangles. The two launchers submit 8 benchmark jobs total, plus
+collection jobs. `MAX_NODES=30` also enables the 16- and 30-node candidates.
 
 ## Run
 
@@ -39,11 +40,21 @@ before the production campaign. Launchers require a current Release build with
 `MFTL_COMM_PROFILE=ON`. The library workspace-growth fix in this change must be
 included in that build.
 
-All launcher parameters are environment overrides; for example,
-`RANKS="36 72" INIT_BATCH=100 scaling/launch_strong.sh` runs the same strong size
-on just the first two node counts with smaller initialization batches.
+All launcher parameters are environment overrides. `MAX_NODES=4` limits a run to
+1, 2 and 4 nodes; `NODES="1 3 6" MAX_NODES=6` selects custom points. Candidate
+nodes above the cap are recorded as skipped, and excluded from dependencies
+and missing-result checks. The default candidates are `1 2 4 8 16 30`.
+Ranks are derived as nodes × `RANKS_PER_NODE`; neither the cap nor the node list
+changes the workload. Explicit `RANKS="36 72"` overrides `NODES` when needed.
+
+`MEMORY_PER_NODE=default` (or empty) omits `--mem`; `0` requests all configured
+memory, and a size such as `100G` requests a fixed amount. Default omission
+matches the site's working template. Check the actual allocation's memory for
+large workloads; exclusive CPUs do not imply all node RAM is allocated.
+
 `BUILD_DIR` selects another build. `EXTRA_ARGS` and `SBATCH_EXTRA` are
 whitespace-delimited argument lists, not shell commands or quoted expressions.
+See [BUILD_WARNINGS.md](BUILD_WARNINGS.md) for the GCC 11/MVAPICH build log.
 
 ## Initialization, timestep and runtime
 
