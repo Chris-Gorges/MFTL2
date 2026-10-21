@@ -8,9 +8,9 @@ Everything in this directory is **local** — no MPI:
 
 | File | Produces |
 |---|---|
-| `triangle_geometry.c` | `tris.area`, `tris.normal`, `tris.center` for a mesh; the closest point on a triangle |
+| `triangle_geometry.c` | `tris.area`, `tris.normal`, `tris.center` for a mesh; the closest point on a triangle, and between two |
 | `vertex_geometry.c` | area- or angle-weighted `verts.normal` for a mesh |
-| `signed_distance.c` | signed distance to a mesh on a (periodic) lattice window |
+| `signed_distance.c` | signed distance to a mesh on a (periodic) lattice window, at one cutoff or two |
 | `periodic_extent.c` | a body's extent on a periodic axis, and whether it covers the axis |
 | `body_integrals.c` | a body's flux integrals (volume, first moments) and where its rims lie, per rank |
 
@@ -195,6 +195,34 @@ it, so a cutoff above $\sqrt3\,\Delta x$ supplies every value marching cubes nee
 without a flood fill. The lattice is **global** and periodic (nodes $g$ and
 $g + N$ coincide), and a caller stores a *window* of it; triangles reach nodes by
 unwrapped index in their own periodic image.
+
+`MFTLRasterizeSignedDistanceBanded` gives marked nodes a WIDER cutoff. A node's
+value is the merge over exactly the triangles within its own cutoff, provided the
+caller flags every triangle that can come within the wide cutoff of a marked node.
+Its nearest triangle is always one of those, so each node holds the value the plain
+rasterisation at its own cutoff would give, to the bit. Topology change uses it to
+pay the bias-wide band only near events. Both entry points skip a node before the
+closest-point query when a lower bound on its distance — to the triangle's plane,
+or to its bounding sphere minus that sphere's radius — exceeds the node's cutoff or
+the value it already holds by more than a few ulps of the largest coordinate
+involved. That skip is exact by construction: it drops only queries the exact test
+would reject. It is checked bit for bit against a brute-force nearest-triangle
+reference at the origin and a million units from it.
+
+`MFTLRasterizeEdgeCrossings` records, per lattice edge, where the surface crosses
+it: each triangle tests the lattice lines through its projected box, and a line
+inside it names an edge (its lower node) and a fraction along it. A slot keeps that
+fraction when exactly ONE triangle crossed the edge; two make it MANY
+(`MFTLSdfCrossMerge`, commutative and associative like `MFTLSdfMerge`). A line
+through an edge both its triangles count therefore costs that edge its crossing and
+never puts it in a wrong place. Marching cubes puts the vertex of a once-crossed
+edge on the crossing instead of where the linear interpolant of `phi` vanishes,
+which is $O(\Delta x^2\kappa)$ off a curved surface (Wojtan et al.'s type-1
+vertices).
+
+`MFTLClosestPointsBetweenTriangles` returns the witnesses of two disjoint
+triangles' minimum distance: six corner-face and nine segment-segment candidates
+in a fixed order, so the pair it returns is a function of its arguments.
 
 ---
 

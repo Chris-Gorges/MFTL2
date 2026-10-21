@@ -253,7 +253,8 @@ static const MFTL_SettingInfo g_keys[] = {
     KEY("topology", "min_body_triangles", INT, topology.options.min_body_triangles, "16", "[0, inf)", NO_CHOICES, "", 0,
         "Closed components with fewer triangles are deleted and their volume given to the survivors. 0 keeps everything."),
     KEY("topology", "normal_tol_deg", REAL, topology.options.normal_tol_deg, "60.0", "[0, 90]", NO_CHOICES, "degrees", 1,
-        "Two triangles oppose each other when their normals are within this angle of anti-parallel."),
+        "Two triangles oppose each other when their normals are within this angle of anti-parallel, and face each other when "
+        "the segment between their closest points is within it of both normals."),
     KEY("topology", "bias_factor", REAL, topology.options.bias_factor, "1.5", "(0, inf)", NO_CHOICES, "", 1,
         "Bias at each event, in units of half its threshold; above 1 so a feature at the threshold is decided with margin."),
     KEY("topology", "bias_radius_factor", REAL, topology.options.bias_radius_factor, "1.5", "(0, inf)", NO_CHOICES, "", 1,

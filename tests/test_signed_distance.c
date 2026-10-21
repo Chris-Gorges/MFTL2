@@ -452,6 +452,252 @@ static int test_rasterising_in_pieces_is_bit_identical_to_all_at_once(void)
   return 0;
 }
 
+/**
+ * @brief The banded rasterisation is the wide field on the zone and the narrow
+ *        field off it, to the bit -- and flagging more triangles changes nothing.
+ *
+ * This is the property MFTLEnsembleReconstructBodies() leans on when it pays the
+ * bias-wide cutoff only near the events, so it is checked against two plain
+ * rasterisations rather than against a re-derivation of the same loop.
+ */
+static int test_a_banded_rasterisation_is_each_band_bit_for_bit(void)
+{
+  const double lo[3] = {-1.8, -1.8, -1.8}, hi[3] = {1.8, 1.8, 1.8};
+  MFTL_Object *obj = mesh_from_field(g_ens, lo, hi, 0.09, star_field, MFTL_NULL);
+  prepare(obj);
+
+  const double narrow = 0.13, wide = 0.25, zone_r = 0.5;
+  const double p[3] = {1.0, 0.2, -0.1};
+  const double glo[3] = {-1.7, -1.7, -1.7};
+  const int dim = 49;
+  const size_t n = (size_t) dim * dim * dim;
+  MFTL_SdfGrid g_wide, g_narrow, g_band, g_over;
+  blank_grid(&g_wide, glo, 0.07, dim);
+  blank_grid(&g_narrow, glo, 0.07, dim);
+  blank_grid(&g_band, glo, 0.07, dim);
+  blank_grid(&g_over, glo, 0.07, dim);
+
+  /* The zone: nodes within zone_r of p. The flags: every triangle that can come
+   * within `wide` of it -- centroid within zone_r + wide + its bounding radius. */
+  unsigned char *zone = (unsigned char *) calloc(n, 1);
+  for (size_t i = 0; i < n; ++i)
+  {
+    double x[3];
+    node_coord(&g_band, i, x);
+    const double d2 = (x[0] - p[0]) * (x[0] - p[0]) + (x[1] - p[1]) * (x[1] - p[1]) + (x[2] - p[2]) * (x[2] - p[2]);
+    zone[i] = d2 <= zone_r * zone_r;
+  }
+  const int nt = obj->tris.n;
+  unsigned char *flag = (unsigned char *) calloc((size_t) nt, 1), *all = (unsigned char *) malloc((size_t) nt);
+  int n_flagged = 0;
+  for (int t = 0; t < nt; ++t)
+  {
+    double c[3][3], m[3] = {0, 0, 0}, rad = 0.0;
+    MFTLGetTriangleCorners(obj, t, c);
+    for (int j = 0; j < 3; ++j)
+      for (int k = 0; k < 3; ++k) m[k] += c[j][k] / 3.0;
+    for (int j = 0; j < 3; ++j)
+      rad = fmax(rad, sqrt((c[j][0] - m[0]) * (c[j][0] - m[0]) + (c[j][1] - m[1]) * (c[j][1] - m[1]) + (c[j][2] - m[2]) * (c[j][2] - m[2])));
+    const double d = sqrt((m[0] - p[0]) * (m[0] - p[0]) + (m[1] - p[1]) * (m[1] - p[1]) + (m[2] - p[2]) * (m[2] - p[2]));
+    flag[t] = d <= zone_r + wide + rad;
+    n_flagged += flag[t];
+    all[t] = 1;
+  }
+
+  MFTLRasterizeSignedDistance(&g_wide, obj, nt, wide);
+  MFTLRasterizeSignedDistance(&g_narrow, obj, nt, narrow);
+  MFTLRasterizeSignedDistanceBanded(&g_band, obj, nt, narrow, wide, zone, flag);
+  MFTLRasterizeSignedDistanceBanded(&g_over, obj, nt, narrow, wide, zone, all);
+
+  int mismatch = 0, zone_gain = 0, band_saving = 0;
+  for (size_t i = 0; i < n; ++i)
+  {
+    const double want = zone[i] ? g_wide.phi[i] : g_narrow.phi[i];
+    if (memcmp(&want, &g_band.phi[i], sizeof(double)) != 0) mismatch++;
+    if (memcmp(&g_band.phi[i], &g_over.phi[i], sizeof(double)) != 0) mismatch++;
+    /* Non-vacuity: the zone really holds values the narrow band lacks, and away
+     * from it the banded field really is narrower than the wide one. */
+    if (g_narrow.phi[i] == MFTL_SDF_UNKNOWN && g_wide.phi[i] != MFTL_SDF_UNKNOWN)
+    {
+      if (zone[i])
+        zone_gain++;
+      else
+        band_saving++;
+    }
+  }
+  TEST_ASSERT_EQUAL_INT(0, mismatch);
+  TEST_ASSERT(n_flagged > 0 && n_flagged < nt);
+  TEST_ASSERT(zone_gain > 100);
+  TEST_ASSERT(band_saving > 1000);
+
+  free(zone);
+  free(flag);
+  free(all);
+  MFTLSdfGridFree(&g_wide);
+  MFTLSdfGridFree(&g_narrow);
+  MFTLSdfGridFree(&g_band);
+  MFTLSdfGridFree(&g_over);
+  return 0;
+}
+
+/**
+ * @brief Every rasterised magnitude is the exact distance to the NEAREST
+ *        triangle, found here by brute force -- also a million units from the
+ *        origin, where the rasteriser's early rejections are closest to the
+ *        rounding they must stay clear of.
+ *
+ * The rasteriser skips a closest-point query when a cheap lower bound (plane,
+ * bounding sphere) already exceeds the node's cutoff or its current value. A skip
+ * that dropped the nearest triangle would leave a larger magnitude, or an unknown
+ * node inside the cutoff; comparing bit for bit against a minimum over ALL
+ * triangles with MFTLClosestPointOnTriangle() catches either.
+ */
+static int test_every_magnitude_is_the_nearest_triangle_even_far_from_the_origin(void)
+{
+  int worst = 0;
+  for (int pass = 0; pass < 2; ++pass)
+  {
+    const double off = pass ? 1.0e6 : 0.0;
+    int cuts[3] = {1, 1, 1};
+    double lo[3] = {off - 4.0, off - 4.0, off - 4.0}, hi[3] = {off + 4.0, off + 4.0, off + 4.0};
+    MFTL_Ensemble *ens = MFTLEnsembleCreate(MPI_COMM_SELF, cuts, lo, hi, MFTL_NULL, 4);
+    MFTL_Object *obj = MFTLObjectCreate(0);
+    MFTLEnsembleAddObject(ens, obj);
+    double c[3] = {off + 0.013, off - 0.021, off + 0.007};
+    MFTLGenerateSphere(obj, c, 0.9, 3);
+    prepare(obj);
+
+    const double cutoff = 0.2, glo[3] = {off - 1.2, off - 1.2, off - 1.2};
+    const int dim = 25;
+    MFTL_SdfGrid g;
+    blank_grid(&g, glo, 0.1, dim);
+    MFTLRasterizeSignedDistance(&g, obj, obj->tris.n, cutoff);
+
+    int bad = 0, known = 0;
+    for (size_t i = 0; i < (size_t) dim * dim * dim; ++i)
+    {
+      double x[3];
+      node_coord(&g, i, x);
+      double best = MFTL_DBL_MAX;
+      for (int t = 0; t < obj->tris.n; ++t)
+      {
+        double T[3][3], q[3];
+        MFTL_TriangleFeature f;
+        MFTLGetTriangleCorners(obj, t, T);
+        best = fmin(best, MFTLClosestPointOnTriangle(x, T, q, &f));
+      }
+      if (best > cutoff * cutoff)
+      {
+        if (g.phi[i] != MFTL_SDF_UNKNOWN) bad++;
+        continue;
+      }
+      known++;
+      const double want = sqrt(best);
+      if (g.phi[i] == MFTL_SDF_UNKNOWN || fabs(g.phi[i]) != want) bad++;
+    }
+    TEST_ASSERT(known > 1000);
+    worst += bad;
+    MFTLSdfGridFree(&g);
+    MFTLEnsembleDestroy(&ens);
+  }
+  TEST_ASSERT_EQUAL_INT(0, worst);
+  return 0;
+}
+
+/**
+ * @brief Edge crossings: in a permuted pool they are the same bits, every
+ *        single crossing lies ON the mesh, and marching cubes puts its vertices
+ *        there.
+ *
+ * The slot of an edge holds a fraction only when exactly one triangle crossed
+ * it, merged by a rule that ignores order -- what lets a distributed run agree
+ * with a serial one. A crossing is checked against the mesh by brute force, and
+ * a surface extracted with crossings must have most of its vertices on the mesh
+ * to round-off, where the linear interpolant puts almost none.
+ */
+static int test_edge_crossings_are_order_free_and_on_the_mesh(void)
+{
+  const double lo[3] = {-1.8, -1.8, -1.8}, hi[3] = {1.8, 1.8, 1.8};
+  MFTL_Object *obj = mesh_from_field(g_ens, lo, hi, 0.05, star_field, MFTL_NULL);
+  prepare(obj);
+  const int nt = obj->tris.n, dim = 49;
+  const double glo[3] = {-1.7, -1.7, -1.7}, dx = 0.07;
+  const size_t n = (size_t) dim * dim * dim;
+
+  MFTL_SdfGrid a, p;
+  blank_grid(&a, glo, dx, dim);
+  MFTLRasterizeSignedDistance(&a, obj, nt, sqrt(3.0) * dx + 0.5 * dx);
+  const long n_cross = MFTLRasterizeEdgeCrossings(&a, obj, nt);
+  TEST_ASSERT(n_cross > 1000);
+
+  /* A permuted pool: the order a different partition would produce. (Unlike
+   * phi, a slot cannot be rasterised twice from overlapping pieces -- a
+   * triangle met twice is two crossings, MANY -- so order is the property.) */
+  MFTLObjectReorderMorton(obj);
+  blank_grid(&p, glo, dx, dim);
+  MFTLRasterizeSignedDistance(&p, obj, nt, sqrt(3.0) * dx + 0.5 * dx);
+  MFTLRasterizeEdgeCrossings(&p, obj, nt);
+  TEST_ASSERT(memcmp(a.cross, p.cross, 3 * n * sizeof(double)) == 0);
+  TEST_ASSERT(memcmp(a.phi, p.phi, n * sizeof(double)) == 0);
+
+  /* Every single crossing is on the mesh, every MANY slot really is crossed. */
+  int off = 0, singles = 0;
+  for (size_t i = 0; i < n && singles < 3000; ++i)
+    for (int k = 0; k < 3; ++k)
+    {
+      const double f = a.cross[3 * i + k];
+      if (!(f >= 0.0)) continue;
+      singles++;
+      double x[3];
+      node_coord(&a, i, x);
+      x[k] += f * dx;
+      double best = MFTL_DBL_MAX;
+      for (int t = 0; t < nt; ++t)
+      {
+        double T[3][3], q[3];
+        MFTLGetTriangleCorners(obj, t, T);
+        best = fmin(best, MFTLClosestPointOnTriangle(x, T, q, MFTL_NULL));
+      }
+      if (sqrt(best) > 1e-12) off++;
+    }
+  TEST_ASSERT(singles > 1000);
+  TEST_ASSERT_EQUAL_INT(0, off);
+
+  /* Marching cubes with and without the crossings, against the mesh. */
+  int on[2] = {0, 0}, tot[2] = {0, 0};
+  for (int pass = 0; pass < 2; ++pass)
+  {
+    MFTL_SdfGrid *g = &a;
+    double *saved = g->cross;
+    if (pass == 0) g->cross = MFTL_NULL;
+    MFTL_LevelSetSurface surf;
+    memset(&surf, 0, sizeof surf);
+    const int clo[3] = {0, 0, 0}, chi[3] = {dim - 2, dim - 2, dim - 2};
+    MFTLExtractLevelSet(g, clo, chi, 1e-2, &surf);
+    g->cross = saved;
+    for (int v = 0; v < surf.n_verts; v += 3)
+    {
+      double best = MFTL_DBL_MAX;
+      for (int t = 0; t < nt; ++t)
+      {
+        double T[3][3], q[3];
+        MFTLGetTriangleCorners(obj, t, T);
+        best = fmin(best, MFTLClosestPointOnTriangle(&surf.pos[3 * v], T, q, MFTL_NULL));
+      }
+      tot[pass]++;
+      on[pass] += sqrt(best) <= 1e-12;
+    }
+    MFTLLevelSetSurfaceFree(&surf);
+  }
+  printf("\n    vertices on the mesh: %d of %d interpolated, %d of %d with crossings ", on[0], tot[0], on[1], tot[1]);
+  TEST_ASSERT(on[1] > 0.9 * tot[1]);
+  TEST_ASSERT(on[0] < 0.3 * tot[0]);
+
+  MFTLSdfGridFree(&a);
+  MFTLSdfGridFree(&p);
+  return 0;
+}
+
 /* ═════════════════════════════════════════════════════════════════════════════
  * 4. Periodicity and windows
  * ═════════════════════════════════════════════════════════════════════════════ */
@@ -596,6 +842,9 @@ int main(int argc, char **argv)
   RUN_TEST(test_a_gap_narrower_than_a_cell_stays_outside);
   RUN_TEST(test_vertex_signs_on_a_spiky_mesh_need_angle_weighting);
   RUN_TEST(test_rasterising_in_pieces_is_bit_identical_to_all_at_once);
+  RUN_TEST(test_a_banded_rasterisation_is_each_band_bit_for_bit);
+  RUN_TEST(test_every_magnitude_is_the_nearest_triangle_even_far_from_the_origin);
+  RUN_TEST(test_edge_crossings_are_order_free_and_on_the_mesh);
   RUN_TEST(test_a_body_across_the_seam_is_measured_in_its_own_image);
   RUN_TEST(test_mesh_to_field_to_mesh_preserves_shape_and_topology);
   RUN_TEST(test_an_open_patch_and_a_degenerate_face_are_harmless);

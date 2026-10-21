@@ -290,3 +290,102 @@ double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], dou
   }
   return d_sq;
 }
+
+/**
+ * @brief Closest points of two segments, p1 + s (q1 - p1) and p2 + t (q2 - p2).
+ *
+ * Ericson, *Real-Time Collision Detection*, §5.1.9, with the degeneracy tests
+ * made scale-free: a segment is a point only when it has exactly zero length,
+ * and two segments are parallel when sin^2 of their angle is below 1e-15.
+ *
+ * @return The squared distance; @p c1 and @p c2 are the witnesses.
+ */
+static double closest_segment_segment(const double p1[3], const double q1[3], const double p2[3], const double q2[3], double c1[3], double c2[3])
+{
+  double d1[3], d2[3], r[3];
+  for (int k = 0; k < 3; ++k)
+  {
+    d1[k] = q1[k] - p1[k];
+    d2[k] = q2[k] - p2[k];
+    r[k] = p1[k] - p2[k];
+  }
+  const double a = d1[0] * d1[0] + d1[1] * d1[1] + d1[2] * d1[2];
+  const double e = d2[0] * d2[0] + d2[1] * d2[1] + d2[2] * d2[2];
+  const double f = d2[0] * r[0] + d2[1] * r[1] + d2[2] * r[2];
+  double s = 0.0, t = 0.0;
+
+  if (a > 0.0 || e > 0.0)
+  {
+    if (!(a > 0.0))
+      t = fmin(fmax(f / e, 0.0), 1.0);
+    else
+    {
+      const double c = d1[0] * r[0] + d1[1] * r[1] + d1[2] * r[2];
+      if (!(e > 0.0))
+        s = fmin(fmax(-c / a, 0.0), 1.0);
+      else
+      {
+        const double b = d1[0] * d2[0] + d1[1] * d2[1] + d1[2] * d2[2];
+        const double denom = a * e - b * b;
+        s = (denom > 1e-15 * a * e) ? fmin(fmax((b * f - c * e) / denom, 0.0), 1.0) : 0.0;
+        t = (b * s + f) / e;
+        if (t < 0.0)
+        {
+          t = 0.0;
+          s = fmin(fmax(-c / a, 0.0), 1.0);
+        }
+        else if (t > 1.0)
+        {
+          t = 1.0;
+          s = fmin(fmax((b - c) / a, 0.0), 1.0);
+        }
+      }
+    }
+  }
+
+  double d_sq = 0.0;
+  for (int k = 0; k < 3; ++k)
+  {
+    c1[k] = p1[k] + s * d1[k];
+    c2[k] = p2[k] + t * d2[k];
+    const double d = c1[k] - c2[k];
+    d_sq += d * d;
+  }
+  return d_sq;
+}
+
+double MFTLClosestPointsBetweenTriangles(const double A[3][3], const double B[3][3], double pa[3], double pb[3])
+{
+  /* Two disjoint closed triangles meet their minimum distance at a corner of
+   * one against the other (six candidates) or between two edges (nine). The
+   * candidates are visited in a fixed order and only a STRICTLY smaller one
+   * replaces the current witness, so the result is a function of (A, B). */
+  double best = MFTL_DBL_MAX, q[3], c1[3], c2[3];
+
+  for (int i = 0; i < 3; ++i)
+  {
+    const double da = MFTLClosestPointOnTriangle(A[i], B, q, MFTL_NULL);
+    if (da < best)
+    {
+      best = da;
+      for (int k = 0; k < 3; ++k) pa[k] = A[i][k], pb[k] = q[k];
+    }
+    const double db = MFTLClosestPointOnTriangle(B[i], A, q, MFTL_NULL);
+    if (db < best)
+    {
+      best = db;
+      for (int k = 0; k < 3; ++k) pa[k] = q[k], pb[k] = B[i][k];
+    }
+  }
+  for (int i = 0; i < 3; ++i)
+    for (int j = 0; j < 3; ++j)
+    {
+      const double d = closest_segment_segment(A[i], A[(i + 1) % 3], B[j], B[(j + 1) % 3], c1, c2);
+      if (d < best)
+      {
+        best = d;
+        for (int k = 0; k < 3; ++k) pa[k] = c1[k], pb[k] = c2[k];
+      }
+    }
+  return best;
+}

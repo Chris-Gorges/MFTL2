@@ -10,11 +10,12 @@
  *
  * ## WHAT HAPPENS
  *
- *   1. DETECT. Pairs of triangles with opposing normals closer than a threshold,
- *      within one body and between two (MFTLEnsembleIntersectObjects with
- *      self-proximity). A pair whose gap lies INSIDE the liquid is a thread or
- *      sheet about to BREAK; one whose gap lies outside is a film about to
- *      RUPTURE and let two surfaces COALESCE.
+ *   1. DETECT. Pairs of triangles with opposing normals closer than a threshold
+ *      and FACING each other across the gap -- the closest-point segment runs
+ *      along both normals -- within one body and between two
+ *      (MFTLEnsembleIntersectObjects with self-proximity). A pair whose gap lies
+ *      INSIDE the liquid is a thread or sheet about to BREAK; one whose gap lies
+ *      outside is a film about to RUPTURE and let two surfaces COALESCE.
  *   2. AGREE. Every rank learns every event, and the bodies they touch are
  *      grouped into CLUSTERS by union-find: bodies joined by a coalescence event
  *      are reconstructed together.
@@ -97,7 +98,14 @@ typedef struct MFTL_TopologyOptions
 {
   double delta_breakup;  ///< A liquid thread or sheet thinner than this breaks. Absolute length.
   double delta_coalescence;  ///< A film between surfaces thinner than this ruptures. Absolute length.
-  double normal_tol_deg;  ///< Two triangles oppose each other when n_A . n_B <= -cos(this). Default 60.
+  /**
+   * @brief Angle tolerance of the pair test, degrees. Default 60.
+   *
+   * Two triangles OPPOSE each other when n_A . n_B <= -cos(this), and FACE each
+   * other across their gap when the segment between their closest points is
+   * within this angle of both normals. Both are required of an event.
+   */
+  double normal_tol_deg;
 
   /**
    * @brief Target lattice spacing for the reconstruction. Absolute length.
@@ -254,7 +262,9 @@ void MFTLTopologyLattice(const MFTL_Domain *domain, double dx, double spacing[3]
  * The returned list is IDENTICAL on every rank: gathered, sorted and with
  * duplicates removed (a gap seen from both sides, or by two ranks, is one
  * event; event points in one cell of a quarter of max(smaller threshold, dx)
- * are merged). Pairs sharing a vertex are never events.
+ * are merged). Pairs sharing a vertex are never events, nor crossing pairs, nor
+ * pairs whose closest-point segment is not within `normal_tol_deg` of both
+ * normals -- a pair offset sideways across a small gap would read the wrong side.
  *
  * @param      ens      The ensemble. Needs current derived connectivity; reads
  *                      positions only.

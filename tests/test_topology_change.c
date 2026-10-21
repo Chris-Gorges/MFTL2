@@ -531,6 +531,18 @@ static void scene_two_spheres(MFTL_Ensemble *ens)
   add_body(ens, f_sphere, b, lo_b, hi_b, 0.05);
 }
 
+static void scene_two_nearly_touching_spheres(MFTL_Ensemble *ens)
+{
+  /* A gap of 0.005 -- a twentieth of the coalescence threshold, far below the
+   * lattice -- on the x cut plane: two drops the detection meets only once they
+   * have almost touched, as after a fast approach between two calls. */
+  const double a[4] = {C - 0.5025, C, C, 0.5}, b[4] = {C + 0.5025, C, C, 0.5};
+  const double lo_a[3] = {C - 1.1, C - 0.6, C - 0.6}, hi_a[3] = {C + 0.05, C + 0.6, C + 0.6};
+  const double lo_b[3] = {C - 0.05, C - 0.6, C - 0.6}, hi_b[3] = {C + 1.1, C + 0.6, C + 0.6};
+  add_body(ens, f_sphere, a, lo_a, hi_a, 0.05);
+  add_body(ens, f_sphere, b, lo_b, hi_b, 0.05);
+}
+
 static void scene_three_in_a_row(MFTL_Ensemble *ens)
 {
   const double r = 0.35;
@@ -701,6 +713,147 @@ static int test_reconstructing_a_sphere_without_events_is_faithful(void)
   return 0;
 }
 
+/**
+ * @brief Rank 0: how many census vertices lie ON the icosphere of scene_sphere()
+ *        to round-off, and how many of them within / beyond a radius of @p e.
+ *
+ * Brute force against a freshly generated copy of the original mesh -- shares
+ * nothing with the rasteriser or the extractor.
+ */
+static void count_on_the_original(const census *c, const double e[3], double r_in, double r_out, int *on_in, int *n_in, int *on_out, int *n_out)
+{
+  *on_in = *n_in = *on_out = *n_out = 0;
+  int one[3] = {1, 1, 1};
+  double lo[3] = {g_origin, g_origin, g_origin}, hi[3] = {g_origin + L_BOX, g_origin + L_BOX, g_origin + L_BOX};
+  MFTL_Ensemble *e0 = MFTLEnsembleCreate(MPI_COMM_SELF, one, lo, hi, MFTL_NULL, 2);
+  MFTL_Object *ref = MFTLObjectCreate(0);
+  MFTLEnsembleAddObject(e0, ref);
+  double ctr[3] = {C + 0.013, C - 0.021, C + 0.007};
+  MFTLGenerateSphere(ref, ctr, 0.9, 4);
+  for (int i = 0; i < c->n_pos; ++i)
+  {
+    const double *x = &c->pos[4 * i + 1];
+    const double de = sqrt((x[0] - e[0]) * (x[0] - e[0]) + (x[1] - e[1]) * (x[1] - e[1]) + (x[2] - e[2]) * (x[2] - e[2]));
+    if (de >= r_in && de <= r_out) continue;
+    double best = MFTL_DBL_MAX;
+    for (int t = 0; t < ref->tris.n; ++t)
+    {
+      double T[3][3], q[3];
+      MFTLGetTriangleCorners(ref, t, T);
+      best = fmin(best, MFTLClosestPointOnTriangle(x, T, q, MFTL_NULL));
+    }
+    const int on = sqrt(best) <= 1e-10;
+    if (de < r_in)
+    {
+      (*n_in)++;
+      *on_in += on;
+    }
+    else
+    {
+      (*n_out)++;
+      *on_out += on;
+    }
+  }
+  MFTLEnsembleDestroy(&e0);
+}
+
+/**
+ * @brief A re-gridded body keeps its vertices ON the surface that went in: each
+ *        marching-cubes vertex is put on its lattice edge's exact crossing of
+ *        the old mesh, identically at every process count.
+ *
+ * Linear interpolation of the exact distance puts a vertex O(dx^2 kappa) off a
+ * curved surface -- and inwards on a convex one. Without the volume correction,
+ * so the raw placement is what is judged: measured, 96.7 % of the vertices on
+ * the original polyhedron to 1e-10, against 13.9 % interpolated; the rest are
+ * the ones the snap keeps off a lattice node.
+ */
+static int test_a_regridded_body_keeps_its_vertices_on_the_old_surface(void)
+{
+  MFTL_TopologyOptions o = base_options(0.0, 0.0);
+  o.conserve_volume = MFTL_FALSE;
+  census c;
+  MFTL_TopologyStats st;
+  TEST_ASSERT_EQUAL_INT(0, run_scene(scene_sphere, MFTL_FALSE, &o, MFTL_TRUE, &c, &st));
+  int ok = 1;
+  if (g_rank == 0)
+  {
+    const double far[3] = {1e9, 1e9, 1e9};
+    int on_in, n_in, on_out, n_out;
+    count_on_the_original(&c, far, 0.0, 0.0, &on_in, &n_in, &on_out, &n_out);
+    ok = n_out > 1000 && on_out > 0.9 * n_out;
+  }
+  MPI_Bcast(&ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  free_census(&c);
+  return 0;
+}
+
+/** @brief One breakup event on the surface of scene_sphere(), on its +x pole. */
+static MFTL_TopologyEvent g_pole_event;
+
+static int test_a_biased_edge_follows_the_bias_not_the_old_surface(void)
+{
+  /* The bias moves the level set inwards around the event: there the exact
+   * crossing of the OLD surface is the wrong place, and every edge with a
+   * biased end must interpolate the biased field instead. Judged on both sides:
+   * no vertex well inside the bump lies on the original polyhedron, and away
+   * from it the vertices still do. Dropping the invalidation puts the tail of
+   * the bump back onto the old surface. */
+  MFTL_TopologyOptions o = base_options(0.12, 0.0);
+  o.conserve_volume = MFTL_FALSE;
+  o.bias_radius_factor = 3.0;  // a wide tail, where the bias is small and the old surface close
+  const double ctr[3] = {C + 0.013, C - 0.021, C + 0.007};
+  g_pole_event.body_a = g_pole_event.body_b = 0;
+  g_pole_event.kind = MFTL_TOPOLOGY_BREAKUP;
+  g_pole_event.gap = 0.1;
+  g_pole_event.point[0] = ctr[0] + 0.9;
+  g_pole_event.point[1] = ctr[1];
+  g_pole_event.point[2] = ctr[2];
+
+  int ok = 1, rc = MFTL_SUCCESS, same = 1;
+  census c;
+  MFTL_TopologyStats st;
+  for (int pass = 0; pass < 2; ++pass)  // distributed, then the np = 1 reference on rank 0
+  {
+    if (pass == 1 && (g_rank != 0 || g_nproc == 1)) break;
+    MFTL_Ensemble *ens = make_ens(pass ? MPI_COMM_SELF : MPI_COMM_WORLD, MFTL_FALSE);
+    scene_sphere(ens);
+    settle(ens);
+    int body = 0;
+    const int r = MFTLEnsembleReconstructBodies(ens, &body, 1, &g_pole_event, 1, &o, &st);
+    census here;
+    take_census(ens, &here);
+    MFTLEnsembleDestroy(&ens);
+    if (pass == 0)
+    {
+      rc = r;
+      c = here;
+    }
+    else
+    {
+      same = same_result(&c, &here);
+      free_census(&here);
+    }
+  }
+  if (g_rank == 0)
+  {
+    const double dx_max = DX;
+    const double rho = o.bias_radius_factor * fmax(o.delta_breakup, dx_max);
+    int on_in, n_in, on_out, n_out;
+    /* An axis edge holding a vertex within rho - dx of the event has both ends
+     * strictly inside the bump, i.e. biased; beyond rho + D nothing is. */
+    count_on_the_original(&c, g_pole_event.point, rho - dx_max, rho + 1.8 * dx_max, &on_in, &n_in, &on_out, &n_out);
+    printf("\n    inside the bump: %d of %d on the old surface; outside: %d of %d ", on_in, n_in, on_out, n_out);
+    ok = n_in > 10 && on_in == 0 && on_out > 0.9 * n_out;
+  }
+  MPI_Bcast(&ok, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  MPI_Bcast(&same, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  TEST_ASSERT(agreed(rc == MFTL_SUCCESS && same && ok, MPI_COMM_WORLD));
+  free_census(&c);
+  return 0;
+}
+
 static int test_a_thin_neck_breaks_into_two_bodies(void)
 {
   MFTL_TopologyOptions o = base_options(0.12, 0.02);
@@ -758,6 +911,33 @@ static int test_two_close_spheres_coalesce(void)
   /* The bridge adds volume; it must not be more than a few percent. */
   const double two = 2.0 * 4.0 / 3.0 * MFTL_PI * 0.125;
   TEST_ASSERT(agreed(c.volume[0] > 0.97 * two && c.volume[0] < 1.06 * two, MPI_COMM_WORLD));
+  free_census(&c);
+  return 0;
+}
+
+/**
+ * @brief Two drops almost touching coalesce into ONE sphere-like body, with no
+ *        breakup event anywhere.
+ *
+ * Near contact, a pair of triangles offset sideways across the gap has a
+ * centroid difference whose lateral part, projected on the tilted normals,
+ * outweighs the gap: read from centroids, each lies "behind" the other and the
+ * pair is a BREAKUP. Its bias then opens the very neck the coalescence events
+ * close, and the merged drop came out as a torus at a gap of 0.005, with genus
+ * two when touching and an entrained bubble at 0.01 -- while every gap of 0.02
+ * or more came out right. The side is read along the closest-point segment and
+ * only for a pair facing each other across it, and this test fails without that.
+ */
+static int test_two_nearly_touching_drops_merge_into_one(void)
+{
+  MFTL_TopologyOptions o = base_options(0.12, 0.1);
+  census c;
+  MFTL_TopologyStats st;
+  TEST_ASSERT_EQUAL_INT(0, run_scene(scene_two_nearly_touching_spheres, MFTL_FALSE, &o, MFTL_FALSE, &c, &st));
+  TEST_ASSERT(agreed(st.n_coalescence > 0 && st.n_breakup == 0, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(c.n_live == 1 && c.gid[0] == 0 && c.chi[0] == 2 && c.B[0] == 0, MPI_COMM_WORLD));
+  const double both = 2.0 * 4.0 / 3.0 * MFTL_PI * 0.125;
+  TEST_ASSERT(agreed(fabs(c.volume[0] - both) / both < 0.02, MPI_COMM_WORLD));
   free_census(&c);
   return 0;
 }
@@ -1212,9 +1392,12 @@ int main(int argc, char **argv)
 
   RUN_TEST(test_the_lattice_divides_every_axis_per_rank);
   RUN_TEST(test_reconstructing_a_sphere_without_events_is_faithful);
+  RUN_TEST(test_a_regridded_body_keeps_its_vertices_on_the_old_surface);
+  RUN_TEST(test_a_biased_edge_follows_the_bias_not_the_old_surface);
   RUN_TEST(test_a_thin_neck_breaks_into_two_bodies);
   RUN_TEST(test_breakup_is_not_undone_by_the_next_call);
   RUN_TEST(test_two_close_spheres_coalesce);
+  RUN_TEST(test_two_nearly_touching_drops_merge_into_one);
   RUN_TEST(test_a_chain_of_three_merges_into_one);
   RUN_TEST(test_a_narrow_torus_hole_closes);
   RUN_TEST(test_a_bubble_bursts_through_a_thin_film);

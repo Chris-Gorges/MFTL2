@@ -459,6 +459,29 @@ typedef enum MFTL_TriangleFeature
  */
 double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], double closest[3], MFTL_TriangleFeature *feature);
 
+/**
+ * @brief Closest points of two DISJOINT closed triangles, and their squared
+ *        distance.
+ *
+ * The minimum is attained at a corner of one triangle against the other or
+ * between two edges; all fifteen candidates are evaluated, the corners with
+ * MFTLClosestPointOnTriangle(), the edges with Ericson's segment-segment
+ * closest points (§5.1.9) made scale-free. When several pairs are equally close
+ * -- two parallel faces -- the first in a fixed order is returned, so the result
+ * is a pure function of the arguments.
+ *
+ * For triangles that INTERSECT the result is the closest pair of boundary
+ * points, not zero: test MFTL_TriTriIntersect() first when that matters.
+ *
+ * @param      A  Corners of the first triangle.
+ * @param      B  Corners of the second, in the same periodic image.
+ * @param[out] pa The witness on @p A.
+ * @param[out] pb The witness on @p B.
+ * @return \f$|p_b - p_a|^2\f$.
+ * @rank_local Pure function.
+ */
+double MFTLClosestPointsBetweenTriangles(const double A[3][3], const double B[3][3], double pa[3], double pb[3]);
+
 // -----------------------------------------------------------------------------
 // 6. BULK GEOMETRY PASSES
 // -----------------------------------------------------------------------------
@@ -567,6 +590,12 @@ void MFTLComputeVertexNormals(MFTL_Object *obj, MFTL_NormalWeighting weighting);
  *
  * `phi` is negative INSIDE (opposite the outward normals), positive outside,
  * #MFTL_SDF_UNKNOWN where nothing was rasterised; x varies fastest.
+ *
+ * `cross` is OPTIONAL (MFTLSdfGridEnableCrossings()): for every node and axis
+ * k, where the lattice edge from that node to its neighbour along +k crosses
+ * the rasterised surface (MFTLRasterizeEdgeCrossings()), as a fraction of the
+ * edge, or #MFTL_SDF_CROSS_NONE / #MFTL_SDF_CROSS_MANY. Marching cubes puts a
+ * vertex there instead of interpolating `phi` (MFTLExtractLevelSet()).
  */
 typedef struct MFTL_SdfGrid
 {
@@ -577,7 +606,36 @@ typedef struct MFTL_SdfGrid
   int lo[3];  ///< Global (unwrapped) index of the window's node 0.
   int dims[3];  ///< Nodes the window stores per axis.
   double *phi;  ///< [dims[0]*dims[1]*dims[2]] values, x fastest.
+  double *cross;  ///< #MFTL_NULL, or [3 * nodes] edge crossings, slot `3 * node + k` (MFTLSdfCrossMerge()).
 } MFTL_SdfGrid;
+
+/** @brief An edge crossing slot no triangle crossed. */
+#define MFTL_SDF_CROSS_NONE (-1.0)
+
+/** @brief An edge crossing slot two or more triangles crossed: no single crossing to use. */
+#define MFTL_SDF_CROSS_MANY (-2.0)
+
+/**
+ * @brief Combines two contributions to one edge-crossing slot.
+ *
+ * NONE is the identity, two crossings make MANY, and MANY absorbs everything:
+ * the slot holds a fraction in [0, 1] exactly when ONE triangle crossed the
+ * edge. Commutative and associative, so the merged slots do not depend on the
+ * order in which triangles or ranks contribute -- the property MFTLSdfMerge()
+ * gives `phi`. A triangle met twice (a lattice line through an edge both its
+ * triangles count) becomes MANY, which falls back to interpolation: never a
+ * wrong crossing, at worst no crossing.
+ *
+ * @param current   The slot so far.
+ * @param candidate A new contribution: a fraction, NONE or MANY.
+ * @return The merged slot.
+ */
+static inline double MFTLSdfCrossMerge(double current, double candidate)
+{
+  if (candidate == MFTL_SDF_CROSS_NONE) return current;
+  if (current == MFTL_SDF_CROSS_NONE) return candidate;
+  return MFTL_SDF_CROSS_MANY;
+}
 
 /**
  * @brief A standalone grid: `dims` nodes from `origin`, no periodicity, every
@@ -608,9 +666,17 @@ void MFTLSdfGridInitWindow(MFTL_SdfGrid *grid, const double origin[3], const dou
 
 /**
  * @brief Releases the values. Safe on a zeroed or already-freed grid.
- * @param grid The grid; `phi` is freed and set to #MFTL_NULL.
+ * @param grid The grid; `phi` and `cross` are freed and set to #MFTL_NULL.
  */
 void MFTLSdfGridFree(MFTL_SdfGrid *grid);
+
+/**
+ * @brief Gives the grid its edge-crossing slots, every one #MFTL_SDF_CROSS_NONE.
+ *        Does nothing if it has them.
+ * @param grid The grid.
+ * @rank_local
+ */
+void MFTLSdfGridEnableCrossings(MFTL_SdfGrid *grid);
 
 /**
  * @brief Window index of global node @p g on axis @p k, or -1 if the window
@@ -706,6 +772,67 @@ static inline double MFTLSdfMerge(double current, double candidate)
  * @rank_local No MPI.
  */
 long MFTLRasterizeSignedDistance(MFTL_SdfGrid *grid, const MFTL_Object *obj, int n_tris, double cutoff);
+
+/**
+ * @brief MFTLRasterizeSignedDistance() with a WIDER cutoff on marked nodes:
+ *        every node takes the merge over exactly the triangles within its own
+ *        cutoff.
+ *
+ * A node flagged in @p wide_nodes is written by every triangle within
+ * @p wide_cutoff of it, any other node by every triangle within @p cutoff. Only
+ * triangles flagged in @p wide_tris look past @p cutoff, so the caller must flag
+ * EVERY triangle within @p wide_cutoff of a flagged node -- flagging more costs
+ * time and changes nothing. With that, each node's value is the one the plain
+ * rasterisation at its own cutoff would give, bit for bit: the nearest triangle
+ * of a node that gets a value is always among those it is merged over.
+ *
+ * Why a second band: a cutoff exists to give marching cubes every corner of
+ * every cell the zero level set crosses. Where nothing will be added to the
+ * field one cell diagonal suffices; where a bias of up to \f$\varepsilon\f$ will
+ * move the level set, the band must be \f$\varepsilon\f$ wider. Paying the wide
+ * band only near the bias is what MFTLEnsembleReconstructBodies() uses this for.
+ *
+ * @param grid        The grid; values are MERGED as by MFTLRasterizeSignedDistance().
+ * @param obj         The mesh, with the same requirements.
+ * @param n_tris      Rasterise `[0, n_tris)`.
+ * @param cutoff      Distance within which every node is written; > 0.
+ * @param wide_cutoff Distance within which a flagged node is written; >= @p cutoff.
+ * @param wide_nodes  `[dims[0]*dims[1]*dims[2]]` nonzero where @p wide_cutoff
+ *                    applies, x fastest; #MFTL_NULL flags every node.
+ * @param wide_tris   `[n_tris]` nonzero for every triangle that may come within
+ *                    @p wide_cutoff of a flagged node; #MFTL_NULL flags none, which
+ *                    is MFTLRasterizeSignedDistance() at @p cutoff.
+ * @return The number of node updates that changed a value.
+ * @rank_local No MPI.
+ */
+long MFTLRasterizeSignedDistanceBanded(MFTL_SdfGrid *grid, const MFTL_Object *obj, int n_tris, double cutoff, double wide_cutoff,
+                                       const unsigned char *wide_nodes, const unsigned char *wide_tris);
+
+/**
+ * @brief Records where the lattice edges cross triangles `[0, n_tris)`, merged
+ *        into `grid->cross` with MFTLSdfCrossMerge().
+ *
+ * For each triangle and axis k, every lattice line along k through the
+ * triangle's projected box is tested against the triangle in the other two
+ * coordinates; a line inside it crosses it at one coordinate along k, which
+ * names the edge it lies on (its lower node) and the fraction along it. The
+ * slot of the edge's lower node is written when that node is in the window.
+ *
+ * Marching cubes interpolates `phi` linearly along an edge, which puts a vertex
+ * O(dx^2 kappa) off a curved surface, and inwards on a convex one; a recorded
+ * crossing is ON the rasterised surface (Wojtan et al.'s type-1 vertices). A
+ * triangle parallel to the axis has no crossing; a line through a shared edge
+ * or corner may be counted by both triangles, which makes the slot MANY and the
+ * vertex fall back to interpolation. Triangles are unwrapped around corner 0
+ * and lines reached by unwrapped index, as in MFTLRasterizeSignedDistance().
+ *
+ * @param grid   The grid; MFTLSdfGridEnableCrossings() is called if needed.
+ * @param obj    The mesh, with current `tris.verts`.
+ * @param n_tris Use `[0, n_tris)`; `tris.n_local` in a distributed run.
+ * @return The number of crossings recorded in the window.
+ * @rank_local No MPI.
+ */
+long MFTLRasterizeEdgeCrossings(MFTL_SdfGrid *grid, const MFTL_Object *obj, int n_tris);
 
 // -----------------------------------------------------------------------------
 // 8. EXTENT ON A PERIODIC AXIS  (see src/geometry/periodic_extent.c)

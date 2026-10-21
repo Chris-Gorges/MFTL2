@@ -13,6 +13,11 @@
  * size h and cutoff r, independent of the rest of the mesh. The sign comes from
  * the pseudo-normal of the closest FEATURE (face, edge or vertex) -- see
  * MFTLRasterizeSignedDistance().
+ *
+ * Most of a triangle's box is out of its reach or already claimed by a nearer
+ * triangle, so the closest-point query is guarded by two exact lower bounds
+ * (plane, bounding sphere); MFTLRasterizeSignedDistanceBanded() gives a marked
+ * zone a wider cutoff. Neither changes a single bit of the field.
  */
 
 #include "mftl_geometry.h"
@@ -46,6 +51,16 @@ void MFTLSdfGridInitWindow(MFTL_SdfGrid *grid, const double origin[3], const dou
 
   grid->phi = (double *) MFTLMallocOrDie(n * sizeof(double), "SDF grid");
   for (size_t i = 0; i < n; ++i) grid->phi[i] = MFTL_SDF_UNKNOWN;
+  grid->cross = MFTL_NULL;
+}
+
+void MFTLSdfGridEnableCrossings(MFTL_SdfGrid *grid)
+{
+  MFTL_ASSERT(grid != MFTL_NULL);
+  if (grid->cross != MFTL_NULL || grid->phi == MFTL_NULL) return;
+  const size_t n = 3 * (size_t) grid->dims[0] * grid->dims[1] * grid->dims[2];
+  grid->cross = (double *) MFTLMallocOrDie(n * sizeof(double), "SDF grid edge crossings");
+  for (size_t i = 0; i < n; ++i) grid->cross[i] = MFTL_SDF_CROSS_NONE;
 }
 
 void MFTLSdfGridInit(MFTL_SdfGrid *grid, const double origin[3], const double spacing[3], const int dims[3])
@@ -58,7 +73,9 @@ void MFTLSdfGridFree(MFTL_SdfGrid *grid)
 {
   if (grid == MFTL_NULL) return;
   free(grid->phi);
+  free(grid->cross);
   grid->phi = MFTL_NULL;
+  grid->cross = MFTL_NULL;
 }
 
 /**
@@ -86,14 +103,20 @@ static void face_normal(const double c[3][3], double n[3])
 
 long MFTLRasterizeSignedDistance(MFTL_SdfGrid *grid, const MFTL_Object *obj, int n_tris, double cutoff)
 {
+  return MFTLRasterizeSignedDistanceBanded(grid, obj, n_tris, cutoff, cutoff, MFTL_NULL, MFTL_NULL);
+}
+
+long MFTLRasterizeSignedDistanceBanded(MFTL_SdfGrid *grid, const MFTL_Object *obj, int n_tris, double cutoff, double wide_cutoff,
+                                       const unsigned char *wide_nodes, const unsigned char *wide_tris)
+{
   MFTL_ASSERT(grid != MFTL_NULL && obj != MFTL_NULL);
-  MFTL_ASSERT(cutoff > 0.0);
+  MFTL_ASSERT(cutoff > 0.0 && wide_cutoff >= cutoff);
   MFTL_ASSERT(n_tris <= obj->tris.n);
   MFTL_ASSERT((n_tris == 0 || MFTLObjectHasTopology(obj)) && "MFTLRasterizeSignedDistance: stale tris.verts -- MFTLObjectBuildDerived first");
 
   if (grid->phi == MFTL_NULL || n_tris <= 0) return 0;
 
-  const double cut_sq = cutoff * cutoff;
+  const double cut_sq = cutoff * cutoff, wide_sq = wide_cutoff * wide_cutoff;
   const int nx = grid->dims[0], ny = grid->dims[1];
   long n_updates = 0;
 
@@ -102,13 +125,20 @@ long MFTLRasterizeSignedDistance(MFTL_SdfGrid *grid, const MFTL_Object *obj, int
     double T[3][3];
     MFTLGetTriangleCorners(obj, t, T);
 
+    /* A flagged triangle reaches the wide band, and there only; every other
+     * node -- and every node of an unflagged triangle -- takes the narrow one. */
+    const bool wide = (wide_tris != MFTL_NULL && wide_tris[t]);
+    const double reach = wide ? wide_cutoff : cutoff;
+    const unsigned char *const band = wide ? wide_nodes : MFTL_NULL;
+    const double reach_sq = wide ? wide_sq : cut_sq;
+
     /* ── The node box this triangle can reach ───────────────────────────── */
     int g_lo[3], g_hi[3];
     bool empty = MFTL_FALSE;
     for (int k = 0; k < 3; ++k)
     {
-      const double mn = fmin(T[0][k], fmin(T[1][k], T[2][k])) - cutoff;
-      const double mx = fmax(T[0][k], fmax(T[1][k], T[2][k])) + cutoff;
+      const double mn = fmin(T[0][k], fmin(T[1][k], T[2][k])) - reach;
+      const double mx = fmax(T[0][k], fmax(T[1][k], T[2][k])) + reach;
       g_lo[k] = (int) ceil((mn - grid->origin[k]) / grid->spacing[k]);
       g_hi[k] = (int) floor((mx - grid->origin[k]) / grid->spacing[k]);
       if (g_hi[k] < g_lo[k]) empty = MFTL_TRUE;
@@ -122,6 +152,27 @@ long MFTLRasterizeSignedDistance(MFTL_SdfGrid *grid, const MFTL_Object *obj, int
     face_normal(T, n_face);
     double n_edge[3][3];
     bool have_edge[3] = {MFTL_FALSE, MFTL_FALSE, MFTL_FALSE};
+
+    /* Two LOWER bounds on a node's distance to T, a few flops each: to T's
+     * plane, and to its bounding sphere (centroid, farthest corner). A node is
+     * skipped only when a bound exceeds what would reject it anyway -- its
+     * cutoff, or the nearer value it already holds -- by a margin covering the
+     * rounding of both the bound and the exact distance (a few ulps of the
+     * largest coordinate involved). Every skip is therefore one the exact test
+     * below would also have made, and the field is the same bits; what is saved
+     * is the closest-point query for a node outside T's reach, or one some
+     * nearer triangle already claimed, which inside the band is most of them. */
+    double ctr[3], rad_sq = 0.0, mag = 0.0;
+    for (int k = 0; k < 3; ++k) ctr[k] = (T[0][k] + T[1][k] + T[2][k]) / 3.0;
+    for (int j = 0; j < 3; ++j)
+    {
+      const double ex = T[j][0] - ctr[0], ey = T[j][1] - ctr[1], ez = T[j][2] - ctr[2];
+      rad_sq = fmax(rad_sq, ex * ex + ey * ey + ez * ez);
+      for (int k = 0; k < 3; ++k) mag = fmax(mag, fabs(T[j][k]));
+    }
+    const double rad = sqrt(rad_sq);
+    const double slack = 1e-12 * (mag + reach + fabs(grid->origin[0]) + fabs(grid->origin[1]) + fabs(grid->origin[2]));
+    const double plane = n_face[0] * T[0][0] + n_face[1] * T[0][1] + n_face[2] * T[0][2];
 
     for (int gz = g_lo[2]; gz <= g_hi[2]; ++gz)
     {
@@ -141,12 +192,21 @@ long MFTLRasterizeSignedDistance(MFTL_SdfGrid *grid, const MFTL_Object *obj, int
           if (lx < 0) continue;
 
           const double x[3] = {MFTLSdfGridCoord(grid, 0, gx), y, z};
+          const size_t idx = ((size_t) lz * ny + ly) * nx + lx;
+          double *const node = &grid->phi[idx];
+
+          /* The distance that would still be written here: within this node's
+           * cutoff, and not beaten by what it holds. */
+          const double limit = fmin((band != MFTL_NULL && !band[idx]) ? cutoff : reach, fabs(*node)) + slack;
+          if (fabs(n_face[0] * x[0] + n_face[1] * x[1] + n_face[2] * x[2] - plane) > limit) continue;
+          const double cx = x[0] - ctr[0], cy = x[1] - ctr[1], cz = x[2] - ctr[2];
+          if (cx * cx + cy * cy + cz * cz > (rad + limit) * (rad + limit)) continue;
+
           double q[3];
           MFTL_TriangleFeature f;
           const double d_sq = MFTLClosestPointOnTriangle(x, T, q, &f);
-          if (d_sq > cut_sq) continue;
-
-          double *const node = &grid->phi[((size_t) lz * ny + ly) * nx + lx];
+          if (d_sq > reach_sq) continue;
+          if (band != MFTL_NULL && !band[idx] && d_sq > cut_sq) continue;
           const double d = sqrt(d_sq);
           /* A node already holding something strictly nearer cannot change. */
           if (d > fabs(*node)) continue;
@@ -188,4 +248,78 @@ long MFTLRasterizeSignedDistance(MFTL_SdfGrid *grid, const MFTL_Object *obj, int
     }
   }
   return n_updates;
+}
+
+long MFTLRasterizeEdgeCrossings(MFTL_SdfGrid *grid, const MFTL_Object *obj, int n_tris)
+{
+  MFTL_ASSERT(grid != MFTL_NULL && obj != MFTL_NULL);
+  MFTL_ASSERT(n_tris <= obj->tris.n);
+  if (grid->phi == MFTL_NULL) return 0;
+  MFTLSdfGridEnableCrossings(grid);
+  if (n_tris <= 0) return 0;
+
+  const int nx = grid->dims[0], ny = grid->dims[1];
+  long n_recorded = 0;
+
+  for (int t = 0; t < n_tris; ++t)
+  {
+    double T[3][3];
+    MFTLGetTriangleCorners(obj, t, T);
+
+    for (int a = 0; a < 3; ++a)
+    {
+      const int b = (a + 1) % 3, c = (a + 2) % 3;
+
+      /* The triangle projected along a; twice its signed area. A triangle
+       * containing the axis direction has none and no isolated crossing. */
+      const double u0 = T[0][b], v0 = T[0][c], u1 = T[1][b], v1 = T[1][c], u2 = T[2][b], v2 = T[2][c];
+      const double area2 = (u1 - u0) * (v2 - v0) - (u2 - u0) * (v1 - v0);
+      if (area2 == 0.0) continue;
+
+      const int gb_lo = (int) ceil((fmin(u0, fmin(u1, u2)) - grid->origin[b]) / grid->spacing[b]);
+      const int gb_hi = (int) floor((fmax(u0, fmax(u1, u2)) - grid->origin[b]) / grid->spacing[b]);
+      const int gc_lo = (int) ceil((fmin(v0, fmin(v1, v2)) - grid->origin[c]) / grid->spacing[c]);
+      const int gc_hi = (int) floor((fmax(v0, fmax(v1, v2)) - grid->origin[c]) / grid->spacing[c]);
+
+      for (int gc = gc_lo; gc <= gc_hi; ++gc)
+      {
+        const int lc = MFTLSdfGridLocal(grid, c, gc);
+        if (lc < 0) continue;
+        const double yc = MFTLSdfGridCoord(grid, c, gc);
+        for (int gb = gb_lo; gb <= gb_hi; ++gb)
+        {
+          const int lb = MFTLSdfGridLocal(grid, b, gb);
+          if (lb < 0) continue;
+          const double yb = MFTLSdfGridCoord(grid, b, gb);
+
+          /* Edge functions of the line's foot against the projected edges,
+           * each opposite the corner it weights. Inside, all have the sign of
+           * the area; on an edge one is zero and the neighbour across it may
+           * count the line too, which only makes the slot MANY. */
+          const double w0 = (u2 - u1) * (yc - v1) - (v2 - v1) * (yb - u1);
+          const double w1 = (u0 - u2) * (yc - v2) - (v0 - v2) * (yb - u2);
+          const double w2 = (u1 - u0) * (yc - v0) - (v1 - v0) * (yb - u0);
+          const bool inside = (area2 > 0.0) ? (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) : (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
+          if (!inside) continue;
+
+          const double w = w0 + w1 + w2;
+          if (w == 0.0) continue;
+          const double xa = (w0 * T[0][a] + w1 * T[1][a] + w2 * T[2][a]) / w;
+          const int ga = (int) floor((xa - grid->origin[a]) / grid->spacing[a]);
+          const int la = MFTLSdfGridLocal(grid, a, ga);
+          if (la < 0) continue;
+          const double f = fmin(fmax((xa - MFTLSdfGridCoord(grid, a, ga)) / grid->spacing[a], 0.0), 1.0);
+
+          int l[3];
+          l[a] = la;
+          l[b] = lb;
+          l[c] = lc;
+          double *const slot = &grid->cross[3 * (((size_t) l[2] * ny + l[1]) * nx + l[0]) + a];
+          *slot = MFTLSdfCrossMerge(*slot, f);
+          n_recorded++;
+        }
+      }
+    }
+  }
+  return n_recorded;
 }

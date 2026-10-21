@@ -89,17 +89,21 @@ Two triangles $A$, $B$ — of one body or of two — are an EVENT when
 
 1. they share no vertex;
 2. their unit normals oppose, $\mathbf n_A\cdot\mathbf n_B \le -\cos\theta$;
-3. each lies on the same side of the other, along its own normal:
+3. they FACE each other across their gap, which lies on one side of both. With
+   $\mathbf q_A$, $\mathbf q_B$ the closest points of the two triangles and
+   $\mathbf g$ the unit vector from $\mathbf q_A$ to $\mathbf q_B$,
 
    $$
-   s_A = \mathbf n_A\cdot(\mathbf c_B-\mathbf c_A), \qquad
-   s_B = \mathbf n_B\cdot(\mathbf c_A-\mathbf c_B)
+   s_A = \mathbf n_A\cdot\mathbf g, \qquad
+   s_B = -\mathbf n_B\cdot\mathbf g
    $$
 
-   both negative — each is BEHIND the other, the gap is inside the liquid, a thread
-   or a sheet: **breakup**. Both positive — the gap is outside, a film:
-   **coalescence**. Mixed signs are a fold seen edge-on and are not events;
-4. their distance is within the threshold of THAT kind.
+   both $\le -\cos\theta$ — each is BEHIND the other, the gap is inside the liquid, a
+   thread or a sheet: **breakup**. Both $\ge \cos\theta$ — the gap is outside, a film:
+   **coalescence**. Anything else is not an event: a fold seen edge-on, or a pair
+   offset sideways that does not face across a gap at all. Crossing triangles have
+   no gap and are not events either;
+4. their distance $|\mathbf q_B-\mathbf q_A|$ is within the threshold of THAT kind.
 
 Condition 3 is what lets one predicate serve both directions. A Rayleigh–Taylor cap rolling onto its own
 stem and a jet's neck thinning are both "two opposing triangles within $\delta$ on
@@ -107,6 +111,24 @@ one body"; only the side the gap is on tells them apart, so "intra-body means
 breakup, inter-body means coalescence" is wrong in both directions — a film inside
 one body coalesces, and a liquid film between a drop and a bubble inside it is a
 breakup between two bodies.
+
+**The side is read along the gap segment, not between the centroids.** Reading it
+from $\mathbf c_B-\mathbf c_A$ was wrong near contact: two convex surfaces a gap
+$g$ apart carry pairs offset sideways by more than $g$, and the lateral part of the
+centroid difference, projected on normals tilted by the curvature, outweighs $g$ —
+the pair reads "each behind the other", a breakup in the gas between two drops,
+and its bias opens the neck the coalescence events close. On two spheres of radius
+0.5 at $\delta_c = 0.1$, every gap from 0.02 up merged into one sphere; at 0.01 the
+merge entrained a bubble, at 0.005 it came out a torus, touching it had genus two,
+with 2, 28 and 42 such breakup events. That is the state the detection meets after
+a fast approach between two calls. The closest-point segment of a pair that faces
+across the gap runs along both normals and cannot be confused; a sideways pair is
+dropped, and the facing pairs next to it carry the event
+(`test_two_nearly_touching_drops_merge_into_one`). It is the pair-local form of
+what Wojtan et al. (2009) read off the voxelised sign of a whole cell: whether the
+gap region is inside the material or outside it. The event POINT stays the
+midpoint of the centroids, because the closest points of two parallel faces are not
+unique and the point must not depend on which side found the pair.
 
 <!-- figure: topo-events
 An event is classified by the side its gap is on, not by how many bodies it
@@ -227,6 +249,25 @@ set, so marching cubes skips it without needing to know which side it is on. A
 flood fill would be a global, sequential sign propagation across ranks — exactly what
 the cutoff removes.
 
+**That cutoff is paid only where a bias can reach.** The bias term is there because a
+bias moves the level set; a node no bias can reach needs only
+$r_\text{far} = \|(\Delta x_0,\Delta x_1,\Delta x_2)\| + \tfrac12\Delta x$, by the
+same argument with $\varepsilon = 0$. The ZONE is every node within
+$\rho_e + \|\Delta\mathbf x\|$ of an event point $e$ — every cell with a biased corner
+has all eight corners in it — and there the cutoff is $r_\text{cut}$, elsewhere
+$r_\text{far}$ (`MFTLRasterizeSignedDistanceBanded`). A node's value is the merge over
+exactly the triangles within its own cutoff; its nearest triangle is always among
+them, so every node that gets a value gets the one a single band of $r_\text{cut}$
+gave, to the bit, and a node it no longer gets lies only in cells of one sign that
+marching cubes would have left empty. Inside the rasteriser, a node is skipped
+before the closest-point query when a lower bound on its distance — to the
+triangle's plane, or to its bounding sphere — already exceeds its cutoff or the
+value it holds, by a margin above the rounding of both. With 12 % of the triangles
+near an event, rasterisation on the Rayleigh–Taylor run went from 0.80 s to 0.20 s
+over 47 reconstructions (np = 4), and every surface, digest and example output is
+unchanged to the bit. This is Wojtan et al.'s narrow band — distances only at the
+corners of cells the surface crosses — with MFTL's bias accounted for.
+
 ---
 
 ## The bias {#topo_bias}
@@ -270,6 +311,19 @@ stitching: each rank extracts its own cells plus one layer of its neighbours', s
 triangles around every vertex it owns are present — the vertex-complete halo, built
 by the extraction — and two ranks that both produce a vertex produce it from the same
 two node values and name it the same.
+
+**A vertex is put ON the old surface where it can be.** Linear interpolation of the
+exact distance along an edge puts a vertex $O(\Delta x^2\kappa)$ off a curved surface.
+So each rank also records, for its owned triangles, where the lattice lines pierce them
+(`MFTLRasterizeEdgeCrossings`): per lattice edge a slot that holds the fraction of the
+crossing when exactly one triangle crossed it, merged by a rule that ignores order
+(`MFTLSdfCrossMerge`) and shipped with the node values, tagged. An edge with a biased end
+gives up its slot — the bias moved the level set off the old surface — and so does one
+crossed twice. Marching cubes uses a slot that holds one crossing, clamped by the snap,
+and interpolates everywhere else: a doubtful edge can only fall back to what it did
+before. With the volume correction, which already removes the uniform part of the
+interpolation error, the gain is in the part that varies with the curvature: 5–12 %
+smoother on a non-convex body, neutral on a sphere (`docs/analysis.md` §13.4).
 
 **Positions are computed from WRAPPED node indices.** On a periodic axis the same
 lattice edge is reached as node $n$ by one rank and as node $n - N$ by the rank across
@@ -397,6 +451,12 @@ measurement.
 | a typed 256-row table | generated from one face rule | no crack between cells by construction; all 256 cases tested |
 | ghosts only through `MFTLRedistribute` | a halo built by the extraction, then a redistribution | component labelling and dense ids need the halo before the redistribution can run |
 | `float` field | `double` | the partition-independence argument is bit-level |
+| one cutoff $r_\text{cut}$ for every node | $r_\text{cut}$ in the bias zone, $r_\text{far}$ elsewhere, plus exact lower-bound skips | the same bits, and 4.0× less rasterisation on the Rayleigh–Taylor run — the phase that was 91 % of the reconstruction |
+| the side from the centroid difference | the side along the closest-point segment, facing pairs only | near-contact drops merged with handles and bubbles (§ detection) |
+| keep a cluster whose topology came out unchanged (Wojtan et al.: re-sample only where the topology changes) | commit every reconstruction | measured, `docs/analysis.md` §13: eroding sub-$\delta$ edges and filling sub-$\delta$ creases is load-bearing — kept, the RT blob never pinched, the jet lost 5.7 % of its volume instead of 4.3 %, the waves folded and ran away |
+| linear interpolation of the exact field along each edge | the vertex on the edge's exact crossing of the old surface (Wojtan's type-1 vertices), interpolation where the edge is crossed more than once or biased | 5–12 % smoother where the curvature varies, after the volume correction and the remesh, for ~2 % of the reconstruction phase (`docs/analysis.md` §13.4) |
+| convex hull of the cell's surface points (Wojtan et al. 2010) | biased marching cubes plus the volume correction | a cell-sized geometric error and a systematic volume gain, and it can merge but hardly split |
+| topology decided by complex/deep cells at the lattice scale (Wojtan et al. 2009) | opposing pairs within physical thresholds | the change happens at $\delta$, a length of the physics, not at the lattice spacing |
 
 ---
 
@@ -430,7 +490,27 @@ t ≈ 3.5) and `test_travelling_waves_topology` (a plunging lip reconnects with 
   error, $O(\Delta x^2\kappa)$. Bodies outside every cluster are not touched at all.
   A local reconstruction that re-extracts only a neighbourhood of each event and
   stitches it to the old mesh would avoid that; it needs a seam between a lattice
-  surface and a remeshed one, and was not attempted.
+  surface and a remeshed one, and was not attempted. The seam exists in the
+  literature — Wojtan et al. (2009) cut the old mesh at the faces of the marked
+  cells and collapse it onto the marching-cubes segments; Wojtan et al. (2010)
+  subdivide only the NEW surface until its boundary matches the old one, which
+  keeps every Lagrangian vertex — and its premise survives one measurement and not
+  another: most reconstructions change no topology (46 of 47 on the RT run), but
+  NOT committing them breaks all three examples (`docs/analysis.md` §13). A local
+  form would keep the event's erosion and only drop the far-field re-sampling; what
+  that buys was not measured.
+- **Bodies that already interpenetrate are reconstructed wrongly.** The field is
+  signed by the nearest surface, which is exact for nested and for separate bodies
+  but not where two liquids overlap: there a node near one body's buried surface
+  reads "outside" although it lies inside the other. Two spheres of radius 0.5
+  overlapping by 0.02 came out as one body of genus three; by 0.05 as a torus and a
+  zero-volume sliver; by 0.1 and 0.2 as closed bodies with holes in them; by 0.4
+  nothing was detected at all. It is what a
+  coalescence missed between two calls leaves behind. Wojtan et al. sign the field
+  by ray parity, which counts an overlap as inside twice; along lattice lines that
+  is a prefix sum across the ranks of a row, the global step the cutoff avoids, and
+  a periodic axis gives it no starting point. Not done; call the detection often
+  enough that an approach never outruns $\delta_c$.
 - **Detection runs every call** and is the part that scales with the whole
   ensemble's surface rather than with the change: one self- and pair-proximity query
   over every body. It dominates a call that finds nothing, which is most calls.

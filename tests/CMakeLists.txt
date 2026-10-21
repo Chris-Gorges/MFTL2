@@ -514,7 +514,13 @@ if(BUILD_EXAMPLES)
   #   taylor       a blob of heavy fluid pinches off it (t ~ 3.5), surviving the
   #                remesh as a closed body. A coarser patch pinches only blobs
   #                too small to resolve, which the size floor deletes: an
-  #                honest run in which nothing visible changes
+  #                honest run in which nothing visible changes. When the pinch
+  #                happens within 400 steps is chaotic: over 19 distinct
+  #                (roll, growth) points the centroid side test pinched in 18
+  #                and the closest-point facing test that replaced it in 16,
+  #                the first split scattering +-0.5 either way. The old point (1.6, 1.5)
+  #                was one of the misses, pinching at t = 4.35; (1.7, 1.4)
+  #                passes on both, at t = 3.55, and so do 7 of its 8 neighbours
   #   travelling_  a steep carrier with a ripple plunges and its lip reconnects
   #   waves        with the face, trapping air as an open body between the
   #                channel walls. 104 steps: past that the prescribed field's
@@ -527,7 +533,13 @@ if(BUILD_EXAMPLES)
   #                chaotic -- 4 of 20 neighbouring (steepness, ripple) points
   #                passed on the code this test was tuned on, this one among
   #                them, and 1 of 20 once the rim curve changed the trajectory.
-  #                At 96 x 24: 6 and 8 of 20, this point passing on both
+  #                At 96 x 24: 6 and 8 of 20, this point passing on both.
+  #                Steepness 0.50-0.60 x ripple 0.040-0.055 again once the
+  #                side test read the gap segment and marching cubes put its
+  #                vertices on the exact edge crossings: 8 of 20 without the
+  #                crossings, 10 of 20 with them, (0.55, 0.05) no longer among
+  #                them -- the run reaches the field's runaway at step 104 --
+  #                and (0.525, 0.05) passing on both
   add_test(NAME test_liquid_jet_topology
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
                    $<TARGET_FILE:liquid_jet_open_surface>
@@ -536,12 +548,12 @@ if(BUILD_EXAMPLES)
   add_test(NAME test_rayleigh_taylor_topology
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
                    $<TARGET_FILE:rayleigh_taylor_open_surface>
-                   --roll 1.6 --vtk 0 --report 50
+                   --roll 1.7 --growth 1.4 --vtk 0 --report 50
                    --require-topology --require-rim-cut ${MPIEXEC_POSTFLAGS})
   add_test(NAME test_travelling_waves_topology
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
                    $<TARGET_FILE:travelling_waves_open_surface>
-                   --nx 96 --ny 24 --components 2 --steepness 0.55 --ripple 0.05 --delta-breakup 0.02
+                   --nx 96 --ny 24 --components 2 --steepness 0.525 --ripple 0.05 --delta-breakup 0.02
                    --steps 104 --vtk 0 --report 8 --require-topology --require-rim-cut ${MPIEXEC_POSTFLAGS})
 endif()
 

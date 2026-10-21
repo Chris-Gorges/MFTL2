@@ -61,7 +61,8 @@ typedef struct MFTL_TopoLattice
   bool periodic[3];  ///< Domain periodicity.
   int per_rank[3];  ///< Cells per rank box per axis (cells / cuts).
   int coords[3];  ///< This rank's Cartesian coordinates.
-  double r_cut;  ///< Rasterisation cutoff.
+  double r_cut;  ///< Rasterisation cutoff where a bias can reach (the wide band); sizes the window pad.
+  double r_far;  ///< Rasterisation cutoff everywhere else: one cell diagonal plus half a cell.
   int pad;  ///< Window padding in nodes beyond the box.
 } MFTL_TopoLattice;
 
@@ -149,8 +150,13 @@ void MFTLTopoCanonicaliseEvents(const MFTL_Domain *dom, double quantum, MFTL_Top
  * 3. Reconstruction
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/** @brief Rasterises this rank's OWNED triangles of every cluster into its window. */
-void MFTLTopoRasterise(const MFTL_Ensemble *ens, MFTL_TopoCluster *cl, int n_cl, const MFTL_TopoLattice *lat);
+/**
+ * @brief Rasterises this rank's OWNED triangles of every cluster into its window:
+ *        at `lat->r_cut` where a cluster event's bias can reach, at `lat->r_far`
+ *        everywhere else.
+ */
+void MFTLTopoRasterise(const MFTL_Ensemble *ens, MFTL_TopoCluster *cl, int n_cl, const MFTL_TopoLattice *lat, const MFTL_TopologyEvent *events,
+                       const MFTL_TopologyOptions *opts);
 
 /**
  * @brief Packs every known window node that another rank needs:

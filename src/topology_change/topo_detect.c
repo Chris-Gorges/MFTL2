@@ -12,19 +12,41 @@
  *
  *   1. they share no vertex (MFTLEnsembleIntersectObjects' self filter);
  *   2. their unit normals OPPOSE: n_A . n_B <= -cos(theta);
- *   3. each lies on the same side of the other, as seen along its normal:
- *        s_A = n_A . (c_B - c_A)   and   s_B = n_B . (c_A - c_B)
- *      both negative means each is BEHIND the other -- the gap between them is
- *      inside the body, a thread or sheet: BREAKUP. Both positive means each is
- *      in FRONT of the other -- the gap is outside, a film: COALESCENCE. Mixed
- *      signs are a fold seen edge-on, not a thin feature, and are not events;
- *   4. their distance is within the threshold of THAT kind.
+ *   3. they FACE each other across their gap, and the gap is on one side of
+ *      both. With q_A, q_B their closest points and g = (q_B - q_A)/|q_B - q_A|,
+ *        s_A = n_A . g   and   s_B = -n_B . g
+ *      both <= -cos(theta) means each is BEHIND the other -- the gap between
+ *      them is inside the body, a thread or sheet: BREAKUP. Both >= cos(theta)
+ *      means each is in FRONT of the other -- the gap is outside, a film:
+ *      COALESCENCE. Anything else is not an event: a fold seen edge-on, or a
+ *      pair that is offset sideways and does not face across a gap at all.
+ *      Crossing triangles have no gap and are not events either;
+ *   4. their distance |q_B - q_A| is within the threshold of THAT kind.
  *
  * Condition 3 is what the original design's detection criteria left implicit, and it is
  * the one that makes the same machinery serve both directions of a topology
  * change: the RT cap rolling onto its own stem and a jet's neck thinning are
  * both "two opposing triangles within delta", and only the side the gap is on
  * tells them apart.
+ *
+ * ## WHY THE GAP SEGMENT AND NOT THE CENTROIDS
+ *
+ * The side used to be read from the centroid difference, s_A = n_A . (c_B - c_A).
+ * Near contact that is wrong: two convex surfaces a gap g apart carry pairs
+ * offset sideways by more than g, and the lateral part of c_B - c_A, projected
+ * on normals tilted by the curvature, outweighs g. Read that way such a pair is
+ * "each behind the other", a BREAKUP in the gas gap between two drops -- whose
+ * bias then opens the neck the coalescence events close. Measured on two
+ * spheres of radius 0.5 at delta_c = 0.1: every gap from 0.02 up merged into
+ * one sphere; at 0.01 an entrained bubble, at 0.005 a torus, touching genus two,
+ * with 2, 28 and 42 such breakup events. The closest-point segment of a pair
+ * that faces across the gap runs along both normals, so its side cannot be
+ * confused; a sideways pair is dropped, and the facing pairs beside it carry
+ * the event (test_two_nearly_touching_drops_merge_into_one). This is the
+ * pair-local form of what Wojtan et al. (2009) read off the voxelised sign of a
+ * whole cell: whether the gap region is inside the material or outside it.
+ * The event POINT stays the centroid midpoint: closest points of parallel faces
+ * are not unique, and the point must not depend on which side found the pair.
  *
  * ## THE CANONICAL LIST
  *
@@ -58,6 +80,7 @@ typedef struct
   double cos_tol;
   double delta_b;
   double delta_c;
+  double delta_max;
   MFTL_TopoEventList *out;
 } detect_ctx;
 
@@ -108,27 +131,33 @@ static void detect_pair(const MFTL_BVH *bvhA, int pa, const MFTL_BVH *bvhB, int 
 
   if (nA[0] * nB[0] + nA[1] * nB[1] + nA[2] * nB[2] > -ctx->cos_tol) return;
 
-  const double sA = nA[0] * d[0] + nA[1] * d[1] + nA[2] * d[2];
-  const double sB = -(nB[0] * d[0] + nB[1] * d[1] + nB[2] * d[2]);
+  /* The side is read along the segment that IS the gap -- closest point to
+   * closest point -- and only when that segment runs along both normals. See
+   * the file comment: a laterally offset pair reads the wrong side. Crossing
+   * triangles have no gap to read. */
+  if (MFTL_TriTriIntersect(TA, TB)) return;
+  double qa[3], qb[3];
+  const double gap = sqrt(MFTLClosestPointsBetweenTriangles(TA, TB, qa, qb));
+  if (!(gap > 0.0) || gap > ctx->delta_max) return;
+  const double g[3] = {(qb[0] - qa[0]) / gap, (qb[1] - qa[1]) / gap, (qb[2] - qa[2]) / gap};
+  const double sA = nA[0] * g[0] + nA[1] * g[1] + nA[2] * g[2];
+  const double sB = -(nB[0] * g[0] + nB[1] * g[1] + nB[2] * g[2]);
 
   int kind;
   double delta;
-  if (sA < 0.0 && sB < 0.0)
+  if (sA <= -ctx->cos_tol && sB <= -ctx->cos_tol)
   {
     kind = MFTL_TOPOLOGY_BREAKUP;
     delta = ctx->delta_b;
   }
-  else if (sA > 0.0 && sB > 0.0)
+  else if (sA >= ctx->cos_tol && sB >= ctx->cos_tol)
   {
     kind = MFTL_TOPOLOGY_COALESCENCE;
     delta = ctx->delta_c;
   }
   else
     return;
-  if (!(delta > 0.0)) return;
-
-  const double gap = sqrt(MFTL_TriTriDistanceSq(TA, TB));
-  if (gap > delta) return;
+  if (!(delta > 0.0) || gap > delta) return;
 
   int ta, tb;
   const MFTL_Object *const oa = MFTL_BVHPrimTriangle(bvhA, pa, &ta);
@@ -169,6 +198,7 @@ int MFTLTopoDetectLocal(MFTL_Ensemble *ens, const MFTL_TopologyOptions *opts, MF
   ctx.cos_tol = cos(opts->normal_tol_deg * MFTL_PI / 180.0);
   ctx.delta_b = opts->delta_breakup;
   ctx.delta_c = opts->delta_coalescence;
+  ctx.delta_max = MFTL_MAX(opts->delta_breakup, opts->delta_coalescence);
   ctx.out = out;
 
   /* The envelope is ABSOLUTE and the same for every body: a thread breaks at

@@ -372,8 +372,18 @@ int MFTLExtractLevelSet(const MFTL_SdfGrid *grid, const int cell_lo[3], const in
             {
               /* From the WRAPPED node: two ranks reaching one lattice edge as
                * node 0 and node n across a seam must compute identical bits,
-               * or the vertex gets two owners and the surface tears. */
-              const double t = v[c0] / (v[c0] - v[c1]);
+               * or the vertex gets two owners and the surface tears. Where the
+               * grid recorded exactly one crossing of this edge, the vertex is
+               * put ON it -- clamped by the same snap the values get, so it
+               * never lands on a node -- instead of where the linear
+               * interpolant of phi vanishes, which on a curved surface is
+               * O(dx^2 kappa) off it. */
+              double t = v[c0] / (v[c0] - v[c1]);
+              if (grid->cross != MFTL_NULL)
+              {
+                const double x = grid->cross[3 * (size_t) lidx[c0] + a];
+                if (x >= 0.0) t = fmin(fmax(x, snap), 1.0 - snap);
+              }
               const int g0[3] = {wrap_node(grid, 0, gx + (c0 & 1)), wrap_node(grid, 1, gy + ((c0 >> 1) & 1)), wrap_node(grid, 2, gz + ((c0 >> 2) & 1))};
               double *q = &out->pos[3 * (size_t) out->n_verts];
               for (int k = 0; k < 3; ++k) q[k] = MFTLSdfGridCoord(grid, k, g0[k]);

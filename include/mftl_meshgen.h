@@ -211,9 +211,11 @@ typedef struct MFTL_LevelSetSurface
  *
  * A cell is extracted iff its eight corners are in the window and none is
  * #MFTL_SDF_UNKNOWN. A vertex lies on each crossed lattice edge at the linear
- * interpolant \f$t = \phi_0/(\phi_0-\phi_1)\f$. Values closer to zero than
- * `snap * min(spacing)` are pushed out to that distance (sign preserved, zero
- * counted positive), so no vertex lands on a lattice node. Vertices on one
+ * interpolant \f$t = \phi_0/(\phi_0-\phi_1)\f$ -- or, when the grid carries edge
+ * crossings and this edge's slot holds exactly one (MFTLRasterizeEdgeCrossings()),
+ * at that crossing, clamped to `[snap, 1 - snap]` of the edge. Values closer to
+ * zero than `snap * min(spacing)` are pushed out to that distance (sign
+ * preserved, zero counted positive), so no vertex lands on a lattice node. Vertices on one
  * lattice edge are shared between the cells of one call. On a periodic axis the
  * range must not exceed one period.
  *

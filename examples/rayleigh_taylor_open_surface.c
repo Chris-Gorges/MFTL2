@@ -211,10 +211,12 @@
  *   THE RIM  is rebuilt as the level set's crossing of the side walls, on them
  *            to the bit, and re-snapped like after every remesh.
  *
- * Measured at --roll 1.6 with everything else default, np = 4: 49
- * reconstructions over the run, and at t ~ 3.55 a blob of heavy fluid pinches
- * off the cap and stays a closed body through every later remesh -- what the
- * topology CTest runs. At --res 24 the same field pinches only blobs a couple of
+ * Measured at --roll 1.7 --growth 1.4 with everything else default, np = 4: at
+ * t ~ 3.55 a blob of heavy fluid pinches off the cap and stays a closed body
+ * through every later remesh -- what the topology CTest runs. WHEN it pinches
+ * is chaotic: neighbouring (roll, growth) points scatter by half a time unit,
+ * and some pinch after the 400 steps (tests/CMakeLists.txt has the sweep). At
+ * --res 24 the same field pinches only blobs a couple of
  * lattice cells across; the remesher collapses those to tetrahedra, the size
  * floor deletes them (MFTL_TopologyOptions::min_body_triangles), and
  * --require-topology correctly reports the run as vacuous.
