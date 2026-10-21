@@ -910,7 +910,7 @@ typedef struct
 
   // --- Ghost synchronisation -------------------------------------------------
 
-  double g_t_total;  ///< The whole of MFTLUpdateGhostPositions()/VertexNormals().
+  double g_t_total;  ///< Total ghost-sync time, including optional field batches.
   double g_t_collect;  ///< Scanning the ghost suffix and building the request lists.
   double g_t_counts;  ///< The count exchange.
   double g_t_requests;  ///< Sending the (body, global id) requests.
@@ -921,7 +921,7 @@ typedef struct
   double g_t_teardown;  ///< Freeing the per-call request lists, buffers and id table.
 
   long g_n_calls;  ///< Syncs performed.
-  long g_n_ghosts_requested;  ///< Ghost vertices asked for, summed over calls.
+  long g_n_ghosts_requested;  ///< Ghost entities asked for, summed over calls.
   long g_n_orphaned;  ///< Ghosts whose owner was not a graph neighbour, and were SKIPPED.
   long g_n_bytes_sent;  ///< Request bytes out plus reply bytes out.
   long g_n_bytes_recv;  ///< Request bytes in plus reply bytes in.
@@ -943,5 +943,17 @@ void MFTLRedistributeStatsReset(void);
  * @rank_local
  */
 void MFTLRedistributeGetStats(MFTL_RedistributeStats *out);
+
+/**
+ * @brief Collectively overwrite selected vertex/triangle ghosts with owner values.
+ * @param ens Ensemble on the canonical partition (owners must be graph neighbours).
+ * @param ids Registered field ids, identical and in the same order on every rank.
+ * @param nfields Number of ids; no duplicates. Zero preserves the position-only path.
+ * @param with_positions Also refresh vertex positions and invalidate mesh-derived data.
+ * @return MFTL_SUCCESS, or MFTL_ERROR for invalid ids or unreachable/unserved ghosts.
+ * Field-only updates leave the surface generation unchanged. Recomputed fields may
+ * be explicitly exchanged. All ranks must agree the selection and call order.
+ */
+int MFTLUpdateGhostFields(MFTL_Ensemble *ens, const int *ids, int nfields, bool with_positions);
 
 #endif  // MFTL_COMMUNICATION_H

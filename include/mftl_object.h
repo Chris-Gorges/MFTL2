@@ -57,6 +57,24 @@ MFTL_Object *MFTLObjectCreate(int global_id);
  */
 void MFTLObjectDestroy(MFTL_Object **p_object);
 
+/**
+ * @brief Access an attached field, indexed by entity * ncomp + component.
+ * @param obj Mesh with an attached registry.
+ * @param field_id Id returned by MFTLEnsembleRegisterField().
+ * @return Borrowed storage, or NULL for an invalid id or an empty pool.
+ * @warning Reacquire after pool growth, redistribution or object replacement.
+ * Recomputed fields must be filled again after mesh or physical-input changes.
+ */
+double *MFTLObjectField(MFTL_Object *obj, int field_id);
+
+/**
+ * @brief Number of components in an attached field.
+ * @param obj Mesh with an attached registry.
+ * @param field_id Registered field id.
+ * @return Component count, or MFTL_ERROR for an invalid id.
+ */
+int MFTLObjectFieldComponents(const MFTL_Object *obj, int field_id);
+
 // -----------------------------------------------------------------------------
 // 2. SIZE (the only sanctioned way to change it)
 // -----------------------------------------------------------------------------

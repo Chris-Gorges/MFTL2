@@ -1000,6 +1000,9 @@ static int test_arrivals_preserve_a_growing_work_list(void)
     else if (obj != MFTL_NULL) ok = 0;
   }
   TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  /* Arrivals have unspecified cached geometry, even when the next
+   * redistribution is intended only to check idempotence. */
+  refresh_geometry(ens);
   TEST_ASSERT(agreed(MFTLRedistribute(ens) == MFTL_SUCCESS && ensemble_is_sound(ens), MPI_COMM_WORLD));
   MFTLEnsembleDestroy(&ens);
   return 0;

@@ -8,6 +8,7 @@
  */
 
 #include "mftl_ensemble.h"
+#include "../object/fields_internal.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -265,6 +266,8 @@ void MFTLEnsembleDestroy(MFTL_Ensemble **p_ens)
   // 1. Destroy every object the ensemble owns
   for (int i = 0; i < ens->n_local_objects; ++i) MFTLObjectDestroy(&ens->local_objects[i]);
   free(ens->local_objects);
+  for (int f = 0; f < ens->fields.n; ++f) free(ens->fields.entries[f].name);
+  free(ens->fields.entries);
 
   // 1a. And the communication module's scratch, if a redistribution built one
   MFTLCommWorkspaceDestroy(&ens->comm_workspace);
@@ -291,6 +294,7 @@ void MFTLEnsembleMarkChanged(MFTL_Ensemble *ens)
 int MFTLEnsembleAddObject(MFTL_Ensemble *ensemble, MFTL_Object *object)
 {
   if (!ensemble || !object) return MFTL_ERROR;
+  if (object->fields && object->fields != &ensemble->fields) return MFTL_ERROR;
 
   object->domain = &ensemble->domain;
 
@@ -338,6 +342,9 @@ MFTL_Object *MFTLEnsembleFindLocalObject(const MFTL_Ensemble *ens, int body_gid)
 int MFTLEnsembleInsertLocalObject(MFTL_Ensemble *ens, MFTL_Object *object)
 {
   if (ens == MFTL_NULL || object == MFTL_NULL) return MFTL_ERROR;
+  if (object->fields && object->fields != &ens->fields) return MFTL_ERROR;
+
+  MFTLObjectAttachFields(object, &ens->fields);
 
   /* Geometric growth: bodies are added one at a time. */
   MFTL_ENSURE_CAPACITY(ens->local_objects, &ens->n_local_objects, &ens->capacity_objects, 1, MFTL_Object *);

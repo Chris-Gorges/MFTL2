@@ -45,6 +45,7 @@
 #include "mftl_object.h"
 #include "mftl_topology.h"
 #include "remesh_internal.h"
+#include "remesh_fields.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Shared predicate helpers
@@ -295,6 +296,23 @@ int MFTLSplitEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *params)
     f_db = he[hpt].flags;
   }
 
+  const bool triangle_fields = MFTLFieldsStride(obj, 1) != 0;
+  const int old_ids[2] = {t1, t2};
+  const int new_ids[4] = {t1, obj->tris.n, t2, obj->tris.n + 1};
+  const int parent[4] = {0, 0, 1, 1};
+  const int nparent = ht == MFTL_ERROR ? 1 : 2;
+  double old_area[2], new_area[4];
+  double *field_values = NULL;
+  if ((triangle_fields || MFTLFieldsStride(obj, 0)) && freeze_blocks_pair(obj, h)) return MFTL_ERROR;
+  if (triangle_fields)
+  {
+    const int corners[4][3] = {{va, -1, vc}, {-1, vb, vc}, {vb, -1, vd}, {-1, va, vd}};
+    for (int i = 0; i < nparent; ++i) old_area[i] = MFTLGetTriangleArea(obj, old_ids[i]);
+    for (int i = 0; i < 2 * nparent; ++i) new_area[i] = MFTLRemeshFieldArea(obj, corners[i], pm);
+    field_values = MFTLRemeshFieldPrepare(obj, old_ids, old_area, nparent, corners, pm, new_area, 2 * nparent, parent, false);
+    if (!field_values) return MFTL_ERROR;
+  }
+
   /* ── 2. Allocate. `he` is dangling from here on. ──────────────────────────── */
   const int vm = remesh_new_vertex(obj, pm);
   const int t3 = remesh_new_triangle(obj);
@@ -382,6 +400,8 @@ int MFTLSplitEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *params)
    * moves off it. */
   if (f_ab & MFTL_FLAG_FEATURE) obj->verts.rec[vm].flags |= MFTL_FLAG_FEATURE;
 
+  if (triangle_fields) MFTLRemeshFieldCommit(obj, new_ids, new_area, 2 * nparent, field_values);
+  if (MFTLFieldsStride(obj, 0)) MFTLRemeshFieldVertex(obj, va, vb, vm, MFTLRemeshFieldEdgeParameter(obj, va, vb, pm));
   MFTLObjectInvalidateDerived(obj);
   return vm;
 }
@@ -693,6 +713,45 @@ int MFTLCollapseEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *param
   double pm[3];
   if (collapse_target_position(obj, h, a, b, params, pm) != MFTL_SUCCESS) return MFTL_ERROR;
 
+  const bool triangle_fields = MFTLFieldsStride(obj, 1) != 0;
+  const bool vertex_fields = MFTLFieldsStride(obj, 0) != 0;
+  if ((triangle_fields || vertex_fields) && freeze_blocks_collapse(obj, h)) return MFTL_ERROR;
+  const double fraction = vertex_fields ? MFTLRemeshFieldEdgeParameter(obj, a, b, pm) : 0.0;
+  int patch[2 * MFTL_REMESH_RING_MAX], npatch = 0;
+  double old_area[2 * MFTL_REMESH_RING_MAX], new_area[2 * MFTL_REMESH_RING_MAX];
+  double *field_values = NULL;
+  if (triangle_fields)
+  {
+    int corners[2 * MFTL_REMESH_RING_MAX][3];
+    const int twin = he[h].twin_idx;
+    for (int pass = 0; pass < 2; ++pass)
+    {
+      const int *fan = pass ? fan_b : fan_a;
+      const int count = pass ? n_fan_b : n_fan_a;
+      for (int i = 0; i < count; ++i)
+      {
+        const int t = MFTLHeTriIdx(fan[i]);
+        bool seen = false;
+        for (int j = 0; j < npatch; ++j) seen |= patch[j] == t;
+        if (seen) continue;
+        patch[npatch] = t;
+        old_area[npatch] = MFTLGetTriangleArea(obj, t);
+        new_area[npatch] = 0.0;
+        if (t != t1 && (twin == MFTL_ERROR || t != MFTLHeTriIdx(twin)))
+        {
+          MFTLGetTriangleVertices(obj, t, corners[npatch]);
+          for (int k = 0; k < 3; ++k)
+            if (corners[npatch][k] == a || corners[npatch][k] == b) corners[npatch][k] = -1;
+          new_area[npatch] = MFTLRemeshFieldArea(obj, corners[npatch], pm);
+          if (!(new_area[npatch] > 0.0)) return MFTL_ERROR;
+        }
+        ++npatch;
+      }
+    }
+    field_values = MFTLRemeshFieldPrepare(obj, patch, old_area, npatch, (const int (*)[3]) corners, pm, new_area, npatch, NULL, true);
+    if (!field_values) return MFTL_ERROR;
+  }
+
   /* ── 1. Every half-edge that ENDS at A now ends at B ──────────────────────
    *
    * For an outgoing half-edge o of A, prev(o) is the incoming one, and the set
@@ -747,6 +806,8 @@ int MFTLCollapseEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *param
     }
   }
 
+  if (triangle_fields) MFTLRemeshFieldCommit(obj, patch, new_area, npatch, field_values);
+  if (vertex_fields) MFTLRemeshFieldVertex(obj, a, b, b, fraction);
   MFTLObjectInvalidateDerived(obj);
   return MFTL_SUCCESS;
 }
@@ -931,6 +992,23 @@ int MFTLFlipEdge(MFTL_Object *obj, int h)
   const int f_ad = he[hnt].flags;
   const int f_db = he[hpt].flags;
 
+  const bool triangle_fields = MFTLFieldsStride(obj, 1) != 0;
+  const int patch[2] = {t1, t2};
+  double old_area[2], new_area[2];
+  double *field_values = NULL;
+  if (triangle_fields)
+  {
+    if (freeze_blocks_pair(obj, h)) return MFTL_ERROR;
+    const int corners[2][3] = {{va, vd, vc}, {vd, vb, vc}};
+    for (int i = 0; i < 2; ++i)
+    {
+      old_area[i] = MFTLGetTriangleArea(obj, patch[i]);
+      new_area[i] = MFTLRemeshFieldArea(obj, corners[i], NULL);
+    }
+    field_values = MFTLRemeshFieldPrepare(obj, patch, old_area, 2, corners, NULL, new_area, 2, NULL, false);
+    if (!field_values) return MFTL_ERROR;
+  }
+
   /* The quad is A -> D -> B -> C. Cutting it along the other diagonal gives
    * (A, D, C) and (D, B, C), both still counter-clockwise. */
   tri_write(obj, t1, va, vd, vc);
@@ -964,6 +1042,7 @@ int MFTLFlipEdge(MFTL_Object *obj, int h)
   he[3 * t1 + 1].flags |= MFTL_FLAG_VISITED;
   he[3 * t2 + 2].flags |= MFTL_FLAG_VISITED;
 
+  if (triangle_fields) MFTLRemeshFieldCommit(obj, patch, new_area, 2, field_values);
   MFTLObjectInvalidateDerived(obj);
   return MFTL_SUCCESS;
 }

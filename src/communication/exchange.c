@@ -14,6 +14,8 @@
 #include "mftl_communication.h"
 
 #include <stddef.h>
+#include <limits.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -174,6 +176,12 @@ void MFTLExchangeStart(const MFTL_Domain *domain, MFTL_Exchange *x, int n_payloa
     int s_tot = 0, r_tot = 0;
     for (int i = 0; i < nt; ++i)
     {
+      if (sc[i] < 0 || rc[i] < 0 || sc[i] > INT_MAX - s_tot || rc[i] > INT_MAX - r_tot)
+      {
+        fprintf(stderr, "MFTL exchange count exceeds MPI int displacement range\n");
+        MPI_Abort(domain->comm_world, MFTL_ERROR);
+        abort();
+      }
       sd[i] = s_tot;
       s_tot += sc[i];
       rd[i] = r_tot;
@@ -186,7 +194,7 @@ void MFTLExchangeStart(const MFTL_Domain *domain, MFTL_Exchange *x, int n_payloa
      * implementations differ on whether they validate the pointer first. */
     x[p].recv_buf = MFTLMallocOrDie((size_t) (r_tot > 0 ? r_tot : 1) * x[p].type_size, "MFTLExchangeStart recv");
     ctx->flat_send[p] = (char *) MFTLMallocOrDie((size_t) (s_tot > 0 ? s_tot : 1) * x[p].type_size, "MFTLExchangeStart send");
-    cs_alloc((size_t) ((r_tot > 0 ? r_tot : 1) + (s_tot > 0 ? s_tot : 1)) * x[p].type_size);
+    cs_alloc(((size_t) (r_tot > 0 ? r_tot : 1) + (size_t) (s_tot > 0 ? s_tot : 1)) * x[p].type_size);
 
     for (int i = 0; i < nt; ++i)
     {

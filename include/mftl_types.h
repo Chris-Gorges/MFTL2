@@ -120,6 +120,39 @@ typedef struct MFTL_HalfEdge
 // Pools: one allocation each, AoS and SoA cut from the same block
 //------------------------------------------------------------------------------
 
+/** @brief Entity class of an attached field. */
+typedef enum
+{
+  MFTL_FIELD_VERTEX = 0,  ///< One value per vertex.
+  MFTL_FIELD_TRIANGLE = 1  ///< One value per triangle.
+} MFTL_FieldEntity;
+
+/** @brief Lifetime and remeshing policy of an attached double field. */
+typedef enum
+{
+  MFTL_FIELD_RECOMPUTED = 0,  ///< Storage only; recompute after mesh or physical-input changes.
+  MFTL_FIELD_INTERPOLATED = 1,  ///< Persistent samples, transferred without an integral constraint.
+  MFTL_FIELD_CONSERVATIVE_DENSITY = 2  ///< Non-negative triangle density; remeshing preserves area-weighted amount.
+} MFTL_FieldMode;
+
+/** @brief One ensemble-owned field descriptor. Treat as read-only after registration. */
+typedef struct
+{
+  char *name;  ///< Owned, unique, NUL-terminated name.
+  MFTL_FieldEntity entity;  ///< Vertex or triangle pool.
+  MFTL_FieldMode mode;  ///< Lifetime and remeshing transfer policy.
+  int ncomp;  ///< Positive number of interleaved components.
+} MFTL_FieldDescriptor;
+
+/** @brief Run-wide registry, frozen when the first object is attached. */
+typedef struct
+{
+  MFTL_FieldDescriptor *entries;  ///< [n] descriptors in registration order.
+  int n;  ///< Number of registered fields.
+  int stride[2];  ///< Persistent doubles per vertex / triangle on the wire.
+  bool locked;  ///< Registration is no longer permitted.
+} MFTL_FieldRegistry;
+
 /**
  * @struct MFTL_VertexPool
  * @brief Every vertex of one object: AoS records plus the per-vertex SoA arrays.
@@ -308,6 +341,9 @@ typedef struct MFTL_Object
 
   struct MFTL_Domain *domain;  ///< Borrowed from the ensemble; MFTL_NULL until added.
 
+  const MFTL_FieldRegistry *fields;  ///< Borrowed nonempty registry; NULL when no fields are attached.
+  double **field_data;  ///< [fields->n] pointers into the pools; written only by object.c.
+
   MFTL_ObjectQualityStatistics quality;  ///< By value: nine doubles do not need their own allocation.
 } MFTL_Object;
 
@@ -405,6 +441,8 @@ typedef struct MFTL_Ensemble
    * and freed by MFTLEnsembleDestroy(). Never mesh state; kept off
    * #MFTL_Domain so the domain stays read-only during a redistribution.
    */
+  MFTL_FieldRegistry fields;  ///< Optional attached-field schema, owned by this ensemble.
+
   void *comm_workspace;
 } MFTL_Ensemble;
 

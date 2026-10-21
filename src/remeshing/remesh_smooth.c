@@ -47,6 +47,7 @@
 #include "mftl_object.h"
 #include "mftl_topology.h"
 #include "remesh_internal.h"
+#include "remesh_fields.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Fan traversal
@@ -639,9 +640,9 @@ void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params,
       new_pos[3 * v + 2] = p[2];
     }
 
+    if ((MFTLFieldsStride(obj, 0) || MFTLFieldsStride(obj, 1)) && !MFTLRemeshFieldSmooth(obj, new_pos)) continue;
     memcpy(obj->verts.pos, new_pos, (size_t) n_v * 3 * sizeof(double));
   }
 
   free(new_pos);
-
 }

@@ -600,4 +600,24 @@ static inline int MFTLDomainNeighborIndex(const MFTL_Domain *domain, int r)
   return MFTL_ERROR;
 }
 
+/**
+ * @brief Collectively register a double field before adding the first body.
+ * @param ens Ensemble; every rank calls in the same order.
+ * @param name Unique nonempty field name, identical on every rank.
+ * @param entity Vertex or triangle storage.
+ * @param ncomp Positive component count, identical on every rank.
+ * @param mode Lifetime/transfer policy. Conservative density currently requires triangles.
+ * @return Dense field id, or MFTL_ERROR on every rank for invalid/mismatched registration.
+ * Registration does not update densities during application-driven physical motion.
+ */
+int MFTLEnsembleRegisterField(MFTL_Ensemble *ens, const char *name, MFTL_FieldEntity entity, int ncomp, MFTL_FieldMode mode);
+
+/**
+ * @brief Look up a field locally by name.
+ * @param ens Ensemble holding the registry.
+ * @param name Registered name.
+ * @return Field id, or MFTL_ERROR if absent.
+ */
+int MFTLEnsembleFindField(const MFTL_Ensemble *ens, const char *name);
+
 #endif  // MFTL_ENSEMBLE_H

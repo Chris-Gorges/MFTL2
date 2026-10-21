@@ -51,6 +51,57 @@ geometry pass streams one component of every entity.
 
 ---
 
+## Optional fields {#object_fields}
+
+Register `double` arrays collectively on the ensemble **before adding the first
+body**. All ranks register the same names, entity classes, component counts and
+modes in the same order. Registration returns a dense field id, or `MFTL_ERROR`
+on all ranks for invalid or mismatched descriptors. The registry is fixed for
+the ensemble's lifetime and applies to every body.
+
+```c
+int gamma = MFTLEnsembleRegisterField(ens, "concentration",
+    MFTL_FIELD_TRIANGLE, 1, MFTL_FIELD_CONSERVATIVE_DENSITY);
+int velocity = MFTLEnsembleRegisterField(ens, "velocity",
+    MFTL_FIELD_VERTEX, 3, MFTL_FIELD_RECOMPUTED);
+/* Add/generate bodies, then fill owned rows. */
+double *c = MFTLObjectField(obj, gamma); /* c[t] */
+double *u = MFTLObjectField(obj, velocity); /* u[3*v + component] */
+```
+
+| Mode | Storage and movement | Remeshing |
+|---|---|---|
+| `MFTL_FIELD_RECOMPUTED` | Allocated, initially zero; not redistributed | Contents unspecified afterwards; caller recomputes |
+| `MFTL_FIELD_INTERPOLATED` | Persistent; follows entities through all permutations and migrations | Interpolated samples, no integral guarantee |
+| `MFTL_FIELD_CONSERVATIVE_DENSITY` | Persistent, non-negative **triangle** density | Preserves owned `sum(area * value)` componentwise |
+
+Each optional array is appended, cache-line aligned, to its entity pool's
+existing allocation. There is no second capacity and no allocation per field.
+Reserve/shrink preserve all live rows, including recomputed ones. The registry
+owns descriptors; the object owns only a pointer table and its two pools.
+An empty registry allocates no optional arrays or pointer table.
+
+Reacquire field pointers after reserve, shrink, redistribution or reconstruction.
+Reorder and remeshing also change entity indices; remeshing can renumber global
+ids. Recomputed values must be filled whenever their physical inputs change,
+as well as after mesh changes. MFTL does not infer their validity from a mesh
+generation stamp.
+
+Update owners first and use `MFTLUpdateGhostFields(ens, ids, nfields, false)` to
+refresh selected ghost rows, including recomputed fields. Persistent **vertex**
+ghosts must be current before redistribution: several triangle owners can send
+copies of the same vertex. Pass `true` to bundle positions, then recompute
+triangle geometry before redistribution. Field-only sync leaves the surface
+generation unchanged.
+
+Triangle density conservation here applies to library remeshing. The application
+still owns density changes during physical motion, including area dilution,
+sources and diffusion. Remapping uses local constant reconstruction, patch mass
+corrections and shared-edge smoothing fluxes; it remains diffusive. See
+@ref rem_fields and `examples/attached_fields.c` for its measured accuracy.
+
+---
+
 ## The size API {#object_size_api}
 
 ```c

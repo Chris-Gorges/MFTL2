@@ -52,7 +52,7 @@ ghost here.
 
 ### What the wire carries {#comm_wire}
 
-Only topology, identity and vertex **positions** travel:
+The built-in payload carries topology, identity and vertex **positions**:
 
 | Record | Contents | Size |
 |---|---|---|
@@ -67,6 +67,21 @@ receiver. `vertex_gid[k]` is the **target** of half-edge $3t+k$, not
 cannot re-derive them. The MPI datatypes are one or two contiguous blocks with
 extents pinned to the C `sizeof` (`MPI_Type_create_resized`), guarded by static
 assertions.
+
+Persistent optional fields add a fourth `MPI_DOUBLE` payload to the existing
+exchange, sharing its count exchange. For each destination it contains vertex
+rows followed by triangle rows, with fields in registration order and components
+interleaved within a row. Values follow the same deduplicated entity lists as the
+built-in records. With no persistent fields, the original three-payload exchange
+is unchanged; recomputed fields consume no wire bytes. The byte statistics
+include the optional values, which cost eight bytes per component per sent row.
+
+`MFTLUpdateGhostFields` requests both vertex and triangle global ids and returns
+the selected fields in one request/reply batch, optionally including positions.
+All ranks must use the same id list and position flag. Updates copy owner rows
+to ghosts; reverse accumulation is not provided. Persistent vertex ghosts must
+already be current before redistribution, whose senders can include several
+copies of a vertex. Debug builds check duplicate values bitwise.
 
 **Postcondition.** A redistributed object has valid topology, valid positions and
 #MFTL_DERIVED_TOPOLOGY set; `tris.area/normal/center` and `verts.normal` are
@@ -90,8 +105,8 @@ assertions.
    outside the 26-neighbourhood. Graph route: `MPI_Neighbor_alltoallv` over
    `comm_graph`; global route (e.g. the initial scatter from rank 0):
    `MPI_Alltoallv` over `comm_cart`.
-4. **Exchange.** `MFTLExchangeStart` sends three payloads — vertices, triangles,
-   and a 7-int header per (body, destination) — after **one** merged count
+4. **Exchange.** `MFTLExchangeStart` sends vertices, triangles,
+   a 7-int header per (body, destination), and optional persistent fields after **one** merged count
    exchange. All bodies share the messages, so the message count is independent
    of the body count, and the headers let a receiver split the stream into per-body
    runs without sorting.

@@ -20,6 +20,7 @@
 #include "mftl_communication.h"
 
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -384,3 +385,246 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble *ens)
 }
 
 int MFTLUpdateGhostVertexNormals(MFTL_Ensemble *ens) { return ghost_sync_vec3(ens, GHOST_FIELD_NORMAL); }
+
+/* Attached fields use the same request/reply protocol, with a variable row per
+ * entity class. The fixed vec3 entry points above retain their original path. */
+int MFTLUpdateGhostFields(MFTL_Ensemble *ens, const int *ids, int nfields, bool with_positions)
+{
+  if (!ens) return MFTL_ERROR;
+  if (nfields == 0) return with_positions ? MFTLUpdateGhostPositions(ens) : MFTL_SUCCESS;
+  CS_BEGIN(ts_fields);
+  MFTL_Domain *dom = &ens->domain;
+  int valid = nfields > 0 && ids != NULL;
+  int width[2] = {with_positions ? 3 : 0, 0};
+  if (valid)
+    for (int j = 0; j < nfields; ++j)
+    {
+      if (ids[j] < 0 || ids[j] >= ens->fields.n)
+      {
+        valid = 0;
+        break;
+      }
+      const MFTL_FieldDescriptor *d = &ens->fields.entries[ids[j]];
+      if (d->ncomp > INT_MAX - 1 - width[d->entity])
+      {
+        valid = 0;
+        break;
+      }
+      width[d->entity] += d->ncomp;
+      for (int k = 0; k < j; ++k)
+        if (ids[k] == ids[j]) valid = 0;
+    }
+  int agreed;
+  MPI_Allreduce(&valid, &agreed, 1, MPI_INT, MPI_MIN, dom->comm_world);
+  if (!agreed)
+  {
+    CS_END(ts_fields, g_t_total);
+    return MFTL_ERROR;
+  }
+
+  CS_BEGIN(ts_collect);
+  const int nn = dom->num_neighbors, np = dom->nproc;
+  MFTL_SendBuffer *requests = MFTLCallocOrDie((size_t) np, sizeof(*requests), "field ghost requests");
+  mftl_int_buffer *targets = MFTLCallocOrDie((size_t) MFTL_MAX(nn, 1), sizeof(*targets), "field ghost targets");
+  int *neighbor = MFTLMallocOrDie((size_t) np * sizeof(int), "field ghost neighbors");
+  for (int r = 0; r < np; ++r) neighbor[r] = MFTL_ERROR;
+  for (int r = 0; r < nn; ++r) neighbor[dom->neighbors[r]] = r;
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    MFTL_Object *obj = ens->local_objects[o];
+    for (int e = 0; e < 2; ++e)
+    {
+      if (!width[e]) continue;
+      const int first = e ? obj->tris.n_local : obj->verts.n_local;
+      const int end = e ? obj->tris.n : obj->verts.n;
+      for (int i = first; i < end; ++i)
+      {
+        const int owner = e ? obj->tris.rec[i].owner_proc : obj->verts.rec[i].owner_proc;
+        if (owner < 0 || owner >= np || neighbor[owner] == MFTL_ERROR)
+        {
+          MFTLCommStats.g_n_orphaned++;
+          valid = 0;
+          continue;
+        }
+        MFTL_SendBuffer *b = &requests[owner];
+        if (b->count > INT_MAX - 3) MPI_Abort(dom->comm_world, MFTL_ERROR);
+        if (b->count + 3 > b->capacity)
+        {
+          b->capacity = MFTLGrowCapacity(b->capacity, b->count + 3);
+          b->buffer = MFTLReallocOrDie(b->buffer, (size_t) b->capacity * sizeof(int), "field request buffer");
+        }
+        int *q = (int *) b->buffer + b->count;
+        q[0] = obj->global_id;
+        q[1] = e;
+        q[2] = e ? obj->tris.rec[i].global_id : obj->verts.rec[i].global_id;
+        b->count += 3;
+        ib_add(&targets[neighbor[owner]], o);
+        ib_add(&targets[neighbor[owner]], e);
+        ib_add(&targets[neighbor[owner]], i);
+      }
+    }
+  }
+  free(neighbor);
+  CS_END(ts_collect, g_t_collect);
+  MPI_Allreduce(&valid, &agreed, 1, MPI_INT, MPI_MIN, dom->comm_world);
+  if (!agreed)
+  {
+    for (int r = 0; r < np; ++r) free(requests[r].buffer);
+    for (int r = 0; r < nn; ++r) ib_free(&targets[r]);
+    free(requests);
+    free(targets);
+    CS_END(ts_fields, g_t_total);
+    return MFTL_ERROR; /* A noncanonical partition needs a supported route. */
+  }
+
+  MFTL_Exchange x = {0};
+  x.send_bufs = requests;
+  x.type = MPI_INT;
+  x.type_size = sizeof(int);
+  MFTL_ExchangeCtx ctx;
+  MFTLExchangeStart(dom, &x, 1, false, &ctx);
+  MFTLExchangeWait(&ctx, 0);
+  const int *wire = x.recv_buf;
+  const int nr = x.recv_count / 3;
+  int *counts = MFTLCallocOrDie((size_t) MFTL_MAX(nn, 1) * 4, sizeof(int), "field ghost reply counts");
+  int *sc = counts, *rc = sc + MFTL_MAX(nn, 1), *sd = rc + MFTL_MAX(nn, 1), *rd = sd + MFTL_MAX(nn, 1);
+  int *offset = MFTLMallocOrDie(((size_t) nr + 1) * sizeof(int), "field ghost reply offsets");
+  int ns = 0, ni = 0, request = 0;
+  for (int r = 0; r < nn; ++r)
+  {
+    sd[r] = ns;
+    rd[r] = ni;
+    const int number = ctx.counts[MFTL_MAX(nn, 1) + r] / 3;
+    for (int j = 0; j < number; ++j, ++request)
+    {
+      const int w = 1 + width[wire[3 * request + 1]];
+      if (ns > INT_MAX - w) MPI_Abort(dom->comm_world, MFTL_ERROR);
+      offset[request] = ns;
+      ns += w;
+    }
+    for (int j = 0; j < targets[r].size; j += 3)
+    {
+      const int w = 1 + width[targets[r].data[j + 1]];
+      if (ni > INT_MAX - w) MPI_Abort(dom->comm_world, MFTL_ERROR);
+      ni += w;
+    }
+    sc[r] = ns - sd[r];
+    rc[r] = ni - rd[r];
+  }
+  offset[nr] = ns;
+  double *reply = MFTLCallocOrDie((size_t) MFTL_MAX(ns, 1), sizeof(double), "field ghost replies");
+  double *incoming = MFTLMallocOrDie((size_t) MFTL_MAX(ni, 1) * sizeof(double), "field ghost incoming");
+
+  /* Group requests by (local object, entity class); build each owned gid table
+   * only once, exactly as the fixed-width exchange does for vertices. */
+  if (ens->n_local_objects > (INT_MAX - 1) / 2) MPI_Abort(dom->comm_world, MFTL_ERROR);
+  const int ng = 2 * ens->n_local_objects;
+  int *groups = MFTLCallocOrDie((size_t) ng + 1, sizeof(int), "field request groups");
+  int *order = MFTLMallocOrDie((size_t) MFTL_MAX(nr, 1) * sizeof(int), "field request order");
+  int *group_of = MFTLMallocOrDie((size_t) MFTL_MAX(nr, 1) * sizeof(int), "field request group ids");
+  for (int k = 0; k < nr; ++k)
+  {
+    const int o = MFTLEnsembleFindLocalSlot(ens, wire[3 * k]);
+    group_of[k] = o < 0 ? MFTL_ERROR : 2 * o + wire[3 * k + 1];
+    if (o < 0)
+      valid = 0;
+    else
+      groups[group_of[k] + 1]++;
+  }
+  for (int g = 0; g < ng; ++g) groups[g + 1] += groups[g];
+  int *cursor = MFTLMallocOrDie(((size_t) ng + 1) * sizeof(int), "field group cursor");
+  memcpy(cursor, groups, ((size_t) ng + 1) * sizeof(int));
+  for (int k = 0; k < nr; ++k)
+    if (group_of[k] >= 0) order[cursor[group_of[k]]++] = k;
+  mftl_gid_table *tbl = MFTLCommWorkspaceGhostTable(ens);
+  for (int g = 0; g < ng; ++g)
+  {
+    if (groups[g] == groups[g + 1]) continue;
+    const int e = g % 2;
+    MFTL_Object *obj = ens->local_objects[g / 2];
+    const int n = e ? obj->tris.n_local : obj->verts.n_local;
+    gt_begin(tbl, n, MFTL_MAX(e ? obj->next_triangle_gid : obj->next_vertex_gid, 1));
+    for (int i = 0; i < n; ++i) gt_put(tbl, e ? obj->tris.rec[i].global_id : obj->verts.rec[i].global_id, i);
+    for (int j = groups[g]; j < groups[g + 1]; ++j)
+    {
+      const int k = order[j], gid = wire[3 * k + 2];
+      if (gid < 0 || !gt_has(tbl, gid))
+      {
+        valid = 0;
+        continue;
+      }
+      const int i = gt_get(tbl, gid);
+      double *out = reply + offset[k];
+      *out++ = 1.0;
+      if (e == 0 && with_positions)
+      {
+        memcpy(out, obj->verts.pos + 3 * i, 3 * sizeof(double));
+        out += 3;
+      }
+      for (int f = 0; f < nfields; ++f)
+      {
+        const MFTL_FieldDescriptor *d = &ens->fields.entries[ids[f]];
+        if ((int) d->entity != e) continue;
+        memcpy(out, obj->field_data[ids[f]] + (size_t) i * d->ncomp, (size_t) d->ncomp * sizeof(double));
+        out += d->ncomp;
+      }
+    }
+  }
+  MPI_Neighbor_alltoallv(reply, sc, sd, MPI_DOUBLE, incoming, rc, rd, MPI_DOUBLE, dom->comm_graph);
+  for (int r = 0; r < nn; ++r)
+  {
+    const double *in = incoming + rd[r];
+    for (int j = 0; j < targets[r].size; j += 3)
+    {
+      const int *t = targets[r].data + j;
+      MFTL_Object *obj = ens->local_objects[t[0]];
+      const int e = t[1], i = t[2];
+      if (*in++ != 1.0)
+      {
+        valid = 0;
+        in += width[e];
+        continue;
+      }
+      if (e == 0 && with_positions)
+      {
+        memcpy(obj->verts.pos + 3 * i, in, 3 * sizeof(double));
+        in += 3;
+      }
+      for (int f = 0; f < nfields; ++f)
+      {
+        const MFTL_FieldDescriptor *d = &ens->fields.entries[ids[f]];
+        if ((int) d->entity != e) continue;
+        memcpy(obj->field_data[ids[f]] + (size_t) i * d->ncomp, in, (size_t) d->ncomp * sizeof(double));
+        in += d->ncomp;
+      }
+    }
+  }
+  if (with_positions)
+    for (int o = 0; o < ens->n_local_objects; ++o)
+    {
+      ens->local_objects[o]->derived &= ~MFTL_DERIVED_GEOMETRY;
+      MFTLObjectMarkChanged(ens->local_objects[o]);
+    }
+  MFTLCommStats.g_n_calls++;
+  for (int r = 0; r < nn; ++r) MFTLCommStats.g_n_ghosts_requested += targets[r].size / 3;
+  MFTLCommStats.g_n_bytes_sent += (long) ns * sizeof(double);
+  MFTLCommStats.g_n_bytes_recv += (long) ni * sizeof(double) + (long) x.recv_count * sizeof(int);
+  for (int r = 0; r < np; ++r) MFTLCommStats.g_n_bytes_sent += (long) requests[r].count * sizeof(int);
+  for (int r = 0; r < np; ++r) free(requests[r].buffer);
+  for (int r = 0; r < nn; ++r) ib_free(&targets[r]);
+  free(requests);
+  free(targets);
+  free(counts);
+  free(offset);
+  free(reply);
+  free(incoming);
+  free(groups);
+  free(order);
+  free(group_of);
+  free(cursor);
+  free(x.recv_buf);
+  MFTLExchangeFree(&ctx);
+  MPI_Allreduce(&valid, &agreed, 1, MPI_INT, MPI_MIN, dom->comm_world);
+  CS_END(ts_fields, g_t_total);
+  return agreed ? MFTL_SUCCESS : MFTL_ERROR;
+}

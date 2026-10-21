@@ -279,6 +279,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
   memset(st, 0, sizeof(*st));
 
   if (ens == MFTL_NULL || opts == MFTL_NULL || n_bodies_in < 0 || (n_bodies_in > 0 && bodies_in == MFTL_NULL)) return MFTL_ERROR;
+  if (ens->fields.stride[0] || ens->fields.stride[1]) return MFTL_ERROR;
   if (!(opts->dx > 0.0)) return MFTL_ERROR;
   if (n_bodies_in == 0) return MFTL_SUCCESS;  // identical on every rank: the list is an agreed input
 
@@ -656,6 +657,7 @@ int MFTLEnsembleApplyTopologyChanges(MFTL_Ensemble *ens, const MFTL_TopologyOpti
   MFTL_TopologyStats *const st = stats ? stats : &sink;
   memset(st, 0, sizeof(*st));
   if (ens == MFTL_NULL || opts == MFTL_NULL) return MFTL_ERROR;
+  if (ens->fields.stride[0] || ens->fields.stride[1]) return MFTL_ERROR;
 
   const double t0 = MFTLTopoCommTime();
   MFTL_TopologyEvent *events = MFTL_NULL;

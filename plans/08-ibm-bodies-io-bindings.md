@@ -1,7 +1,7 @@
 # 08 — IBM bodies, mesh input, checkpoint/restart, Fortran bindings
 
 Status: PLANNED (2026-10-05, branch `christian`)
-Depends on: `03-body-integrals.md` (moment kernels, reference frames), `04-attached-fields.md` (checkpointed state), the [coupler's spreading interface](../src/coupling/README.md) (the IBM force path; the Fortran API wraps it)
+Depends on: `03-body-integrals.md` (moment kernels, reference frames), the implemented [optional fields](../src/object/README.md) (checkpointed state), the [coupler's spreading interface](../src/coupling/README.md) (the IBM force path; the Fortran API wraps it)
 
 Four milestones (E1 loads and rigid motion, E2 mesh reader, E3 checkpoint/restart, E4 Fortran). Each lands
 alone.

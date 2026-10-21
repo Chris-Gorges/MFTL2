@@ -17,6 +17,8 @@
 
 #include "mftl_object.h"
 
+#include "fields_internal.h"
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -227,6 +229,13 @@ static bool reorder_vertices(MFTL_Object *obj, int *old_of_new, int *new_of_old,
   permute_vertex_recs(obj->verts.rec, (MFTL_Vertex *) scratch, old_of_new, nv);
   permute_doubles(obj->verts.pos, (double *) scratch, old_of_new, nv, 3);
   permute_doubles(obj->verts.normal, (double *) scratch, old_of_new, nv, 3);
+  if (MFTLFieldsStride(obj, MFTL_FIELD_VERTEX))
+    for (int f = 0; f < obj->fields->n; ++f)
+    {
+      const MFTL_FieldDescriptor *d = &obj->fields->entries[f];
+      if (d->entity == MFTL_FIELD_VERTEX && d->mode != MFTL_FIELD_RECOMPUTED)
+        permute_doubles(obj->field_data[f], (double *) scratch, old_of_new, obj->verts.n, d->ncomp);
+    }
 
   /* Every reference INTO the vertex pool. (`out_he_idx` is a half-edge index;
    * it is remapped with the triangles.) */
@@ -286,6 +295,13 @@ static bool reorder_triangles(MFTL_Object *obj, int *old_of_new, int *new_of_old
   permute_doubles(obj->tris.area, (double *) scratch, old_of_new, nt, 1);
   permute_doubles(obj->tris.normal, (double *) scratch, old_of_new, nt, 3);
   permute_doubles(obj->tris.center, (double *) scratch, old_of_new, nt, 3);
+  if (MFTLFieldsStride(obj, MFTL_FIELD_TRIANGLE))
+    for (int f = 0; f < obj->fields->n; ++f)
+    {
+      const MFTL_FieldDescriptor *d = &obj->fields->entries[f];
+      if (d->entity == MFTL_FIELD_TRIANGLE && d->mode != MFTL_FIELD_RECOMPUTED)
+        permute_doubles(obj->field_data[f], (double *) scratch, old_of_new, obj->tris.n, d->ncomp);
+    }
 
   /* Every reference INTO the half-edge array: keep the corner h % 3, remap the
    * triangle h / 3 (implicit indexing survives the permutation). */
@@ -320,7 +336,7 @@ void MFTLObjectReorderMorton(MFTL_Object *obj)
 
   /* One scratch block for every permutation, sized for the widest element moved:
    * a triangle's three half-edge records, 48 bytes. */
-  const size_t widest = 48;
+  const size_t widest = MFTLFieldsWidth(obj, 48);
   void *scratch = MFTLMallocOrDie((size_t) n_max * widest, "MFTLObjectReorderMorton scratch");
 
   int *old_of_new = (int *) MFTLMallocOrDie(2 * (size_t) n_max * sizeof(int), "MFTLObjectReorderMorton maps");

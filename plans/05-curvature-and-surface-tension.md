@@ -1,7 +1,7 @@
 # 05 — Curvature and surface tension
 
 Status: PLANNED (2026-10-05, branch `christian`)
-Depends on: `04-attached-fields.md` (σ as a field, outputs as fields; both are optional, since raw arrays work without 04)
+Uses: the implemented [optional fields](../src/object/README.md) for σ and outputs; raw arrays remain supported.
 Used by: `06` (the force that gets spread), `07` (curvature-adaptive sizing), `09` (Helfrich bending, Marangoni with surfactant)
 
 ## 1. Purpose

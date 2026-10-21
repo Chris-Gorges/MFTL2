@@ -544,3 +544,11 @@ if(BUILD_EXAMPLES)
                    --nx 96 --ny 24 --components 2 --steepness 0.55 --ripple 0.05 --delta-breakup 0.02
                    --steps 104 --vtk 0 --report 8 --require-topology --require-rim-cut ${MPIEXEC_POSTFLAGS})
 endif()
+
+# Optional attached fields, including both distributed remeshing strategies.
+mftl_add_mpi_test(test_field_transfer 1)
+mftl_add_mpi_test(test_fields 1)
+mftl_add_mpi_test_at(test_fields_np2 test_fields 2)
+mftl_add_mpi_test_at(test_fields_np4 test_fields 4)
+mftl_add_mpi_test_oversub(test_fields_np8 test_fields 8)
+mftl_add_mpi_test_oversub(test_fields_np27 test_fields 27)

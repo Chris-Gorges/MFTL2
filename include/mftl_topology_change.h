@@ -292,6 +292,10 @@ int MFTLTopologyDetectEvents(MFTL_Ensemble *ens, const MFTL_TopologyOptions *opt
  * geometry and global counts -- and then, when `opts->remesh` is set, one
  * MFTLRemeshEnsemble() over the whole ensemble.
  *
+ * Ensembles with persistent attached fields return #MFTL_ERROR before mutation:
+ * this reconstruction has no material-transfer policy yet. Recomputed-only
+ * fields are supported and receive fresh storage on replacement bodies.
+ *
  * @param ens      The ensemble. After the call every #MFTL_Object pointer of a
  *                 listed body is invalid -- use MFTLEnsembleFindLocalObject() --
  *                 and so are all local indices, as after any redistribution.
@@ -318,6 +322,8 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies, int n_b
  *
  * Call it where a remeshing pass would go: after the vertices moved and the
  * ghost positions were synchronised, before the geometry a solver reads.
+ * Persistent attached fields are rejected before detection or mutation, even
+ * when no event would occur; use MFTLTopologyDetectEvents() for detection alone.
  *
  * @param ens   The ensemble. Same pointer rules as MFTLEnsembleReconstructBodies().
  * @param opts  The options.

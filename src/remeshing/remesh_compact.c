@@ -65,6 +65,8 @@
 
 #include "mftl_remeshing.h"
 
+#include "../object/fields_internal.h"
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -290,21 +292,32 @@ int MFTLRemeshCompactObject(MFTL_Object *obj, MFTL_RemeshStats *stats)
     }
   }
 
+  if (obj->fields)
+    for (int f = 0; f < obj->fields->n; ++f)
+    {
+      const MFTL_FieldDescriptor *d = &obj->fields->entries[f];
+      if (d->mode == MFTL_FIELD_RECOMPUTED) continue;
+      const int *map = d->entity == MFTL_FIELD_VERTEX ? v_map : t_map;
+      const int n = d->entity == MFTL_FIELD_VERTEX ? n_v_old : n_t_old;
+      for (int i = 0; i < n; ++i)
+        if (map[i] != MFTL_ERROR && map[i] != i)
+          memmove(obj->field_data[f] + (size_t) map[i] * d->ncomp, obj->field_data[f] + (size_t) i * d->ncomp, (size_t) d->ncomp * sizeof(double));
+    }
+
   /* ── 3b. Restore the ownership prefix ─────────────────────────────────────
    *
    * The survivors are now [owned][ghost][created]; exchanging the last two
    * blocks makes the owned entities a prefix again. Every sub-array of a pool is
-   * permuted the same way, which is what one allocation per pool buys -- there is
-   * no list of arrays here that a later addition could be left out of, because
-   * the loop below IS the layout.
+   * permuted the same way. Built-in rows are listed below; optional rows are
+   * traversed through the field registry, including arbitrary component widths.
    *
    * The derived arrays (`verts`, `neighbors`) are deliberately
    * absent: they are rebuilt at the end of this function, so moving them would be
    * work thrown away. */
   if (swap_v || swap_t)
   {
-    const size_t need_v = swap_v ? (size_t) MFTL_MIN(vpart.n_ghost, vpart.n_created) * 3 * sizeof(double) : 0;
-    const size_t need_t = swap_t ? (size_t) MFTL_MIN(tpart.n_ghost, tpart.n_created) * 3 * sizeof(MFTL_HalfEdge) : 0;
+    const size_t need_v = swap_v ? (size_t) MFTL_MIN(vpart.n_ghost, vpart.n_created) * MFTLFieldsWidth(obj, 3 * sizeof(double)) : 0;
+    const size_t need_t = swap_t ? (size_t) MFTL_MIN(tpart.n_ghost, tpart.n_created) * MFTLFieldsWidth(obj, 3 * sizeof(MFTL_HalfEdge)) : 0;
 
     void *const tmp = MFTLMallocOrDie(MFTL_MAX(MFTL_MAX(need_v, need_t), (size_t) 1), "remesh partition scratch");
 
@@ -329,6 +342,17 @@ int MFTLRemeshCompactObject(MFTL_Object *obj, MFTL_RemeshStats *stats)
       swap_adjacent_blocks(tp->normal, 3 * sizeof(double), f, a, b, tmp);
       swap_adjacent_blocks(tp->center, 3 * sizeof(double), f, a, b, tmp);
     }
+
+    if (obj->fields)
+      for (int f = 0; f < obj->fields->n; ++f)
+      {
+        const MFTL_FieldDescriptor *d = &obj->fields->entries[f];
+        if (d->mode == MFTL_FIELD_RECOMPUTED) continue;
+        if (d->entity == MFTL_FIELD_VERTEX && swap_v)
+          swap_adjacent_blocks(obj->field_data[f], (size_t) d->ncomp * sizeof(double), vpart.n_kept_owned, vpart.n_ghost, vpart.n_created, tmp);
+        if (d->entity == MFTL_FIELD_TRIANGLE && swap_t)
+          swap_adjacent_blocks(obj->field_data[f], (size_t) d->ncomp * sizeof(double), tpart.n_kept_owned, tpart.n_ghost, tpart.n_created, tmp);
+      }
 
     free(tmp);
 

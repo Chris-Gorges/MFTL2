@@ -864,6 +864,69 @@ on a cluster.
 
 ---
 
+## Attached-field transfer {#rem_fields}
+
+The optional arrays described in @ref object_fields follow every permutation
+and migration, including the temporary placements of both parallel strategies.
+The local operators share the same transfer rules in serial and distributed
+runs. Replicated entities remain frozen; their values travel with the existing
+migrations. Recomputed fields require no numerical transfer.
+
+For a conservative triangle component, let $m_T=A_T\rho_T$ with fresh
+minimum-image triangle areas. Transfer uses constant reconstruction and only the
+triangles changed by an operation; no neighbouring field rows supply material.
+
+- **Split:** distribute each parent's amount among its own children in proportion
+  to their new areas, conserving the two parents separately.
+- **Collapse/flip:** project each new triangle centroid onto the nearest old
+  triangle in the changed patch and take that donor's concentration. Collapse
+  includes the full union of endpoint fans, including surviving moved triangles.
+  Resolve distance ties by global id with a scale-relative tolerance. For the
+  predicted amounts $\widehat m_j=A_j^{new}\widehat\rho_j$, apply the local correction
+  $m_j^{new}=M_{patch}^{old}\widehat m_j/\sum_k\widehat m_k$. A zero predictor with
+  positive old material uses the original positive area-based transfer; zero
+  old material remains zero. This is approximate interpolation, not an overlap map.
+- **Smooth:** retain the Jacobi geometry proposals and old field values. Each
+  moving internal edge defines a signed swept quadrilateral in the frame given
+  by its adjacent old unit normals. Its signed area times the upwind concentration
+  gives a mass flux, applied with opposite signs to the two triangles. Scale a
+  donor's outgoing fluxes together if they exceed its available mass. Fixed edges
+  have zero flux, and open rims supply no external material. Divide final amounts
+  by actual new triangle areas. A degenerate edge frame selects the old per-triangle
+  area-ratio rule for the entire sweep, before any field writes.
+
+These rules conserve patch/sweep amount to round-off and preserve non-negativity.
+They do not guarantee an upper bound on concentration when areas shrink or a patch
+correction is needed. Invalid old densities or nonpositive new areas reject an
+edit before topology, positions or fields are changed. All triangle components
+are prepared before mutation and committed after reacquiring any reallocated
+pool pointers. Smoothing rejects the entire candidate sweep if its transfer is
+invalid or an affected triangle reverses orientation. Unchanged triangle rows
+are never written; replicated entities remain frozen.
+
+Ordinary triangle samples inherit on
+split, use an old-area-weighted patch average on collapse/flip, and stay unchanged
+on smoothing. Vertex samples use the clamped endpoint fraction on split/collapse;
+on smoothing they use barycentric interpolation at the closest point in the old
+incident fan, reading the old values for the entire Jacobi sweep.
+
+**Conservation does not establish spatial accuracy.** The constant reconstruction
+remains diffusive. Planar tests show first-order behaviour; curved-surface swept
+areas are local approximations, and no second-order guarantee is made. On a fixed
+planar domain, small smoothing moves preserve constant density through the signed
+area balance. On curved surfaces constant density cannot stay constant when total
+area changes while amount is fixed. The demonstrated accuracy gain does not turn
+remeshing into a physical surfactant transport solver.
+`examples/attached_fields.c` measures mass, profile error and concentration
+centroid movement separately on a stationary sphere; `docs/analysis.md` §12
+records its refinement study and the before/after transfer comparison. Linear
+gradients are deferred: the measured constant-reconstruction upgrade already
+substantially reduces the profile error without a wider read stencil.
+
+Physical advection remains the solver's responsibility. Breakup/coalescence
+reconstruction currently rejects ensembles with persistent fields before any
+mutation; recomputed-only ensembles are supported and receive fresh storage.
+
 ## Reading the diagnostics {#rem_diagnostics}
 
 | Symptom | Read | Likely cause, remedy |

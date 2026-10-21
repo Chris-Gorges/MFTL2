@@ -3,7 +3,7 @@
 Status: PLANNED (2026-10-05, branch `christian`)
 Depends on:
 - `03-body-integrals.md` (volumes, rim walls, the deferred ray-parity design §4.6);
-- `04-attached-fields.md` (sizing field);
+- the implemented [optional fields](../src/object/README.md) (sizing field);
 - `05-curvature-and-surface-tension.md` (curvature for adaptive sizing);
 - the [coupler's solver-sample interface](../src/coupling/README.md).
 
@@ -57,7 +57,7 @@ Three things every FT or IBM solver needs next to forces and interpolation:
 - **A sizing field is one mechanism for both needs.**
   - Per-body sizing is a constant per body.
   - Curvature sizing is `L = √(6ε/κ − 3ε²)` (Botsch–Kobbelt, the ε-chord rule).
-  - Both are a per-vertex INTENSIVE field from `04`, and the split interpolates it for free.
+  - Both use a per-vertex `MFTL_FIELD_INTERPOLATED` field; the existing split hook interpolates it.
   - The edge bounds become `min(L_a, L_b)·{4/5, 4/3}`.
   - The global bounds are read in nine places across four files (`remesh_ops.c` 3, `remesh_driver.c` 2,
     `remesh_parallel.c` 2, `remesh_comm.c` 2). Those, and the frozen-band rule `h > 4·delta`, are the
@@ -135,7 +135,7 @@ int MFTLEnsembleCorrectVolumes(MFTL_Ensemble *ens, const double *target_by_slot,
 - `MFTL_RemeshParameters` gains `int sizing_field` (-1 = off) and `double sizing_gradation` (default 0.3).
   The field id rides in the parameter checksum (`remesh_comm.c:311`).
 - **Edge test.** `L_e = min(L_a, L_b)`; split if `ℓ² > (4/3 L_e)²`, collapse if `ℓ² < (4/5 L_e)²`.
-  - The split vertex inherits L by 04's INTENSIVE rule.
+  - The split vertex receives L through the existing endpoint interpolation rule.
   - The collapse-approval stretch bound uses the same `L_e`.
 - **Smoother.** The area-weighted tangential target is weighted by `1/L²` (density-adapted, Botsch–Kobbelt
   adaptive remeshing).

@@ -1,7 +1,7 @@
 # 09 — Surface PDE operators, membranes, contact-line hooks
 
 Status: PLANNED (2026-10-05, branch `christian`)
-Depends on: `04-attached-fields.md` (unknowns live in fields; reference shapes are COPY fields), `05-curvature-and-surface-tension.md` (curvature, the area-gradient force, Marangoni with σ(Γ))
+Depends on: the implemented [optional fields](../src/object/README.md) (unknown storage; membrane reference semantics belong to F3), `05-curvature-and-surface-tension.md` (curvature, the area-gradient force, Marangoni with σ(Γ))
 
 Four milestones (F1 operators + solver, F2 interfacial rheology recipes, F3 membranes, F4 contact-line
 hooks), plus one recorded non-decision (continuous collision).
@@ -32,7 +32,7 @@ yet.
   diffusion, curvature and surface tension share one consistent operator family. That consistency is the
   discrete form of the identity Δ_s x = −κn.
 - **A matvec on owned vertices is local** after one ghost refresh of the input, by the vertex-complete halo.
-  `MFTLUpdateGhostFields` (04) is that refresh.
+  The implemented `MFTLUpdateGhostFields` provides that refresh.
 - **Membrane bending is NOT 1-ring local, and that decides a new primitive.**
   - The dihedral-angle energy of edge (j,k) involves the two triangles at the edge. For an owned vertex v,
     the edges opposite v in its fan have their outer triangle in the 2-RING, which the halo does not contain.
@@ -54,7 +54,8 @@ yet.
   remap. Capsule codes keep the mesh fixed, which is standard in the literature (Krüger et al. 2011;
   Guckenberger et al. 2016).
   - The plan says so.
-  - A Debug check refuses to remesh a body carrying a membrane reference field.
+  - F3 must refuse remeshing a body carrying a membrane reference field in both Release and Debug;
+    the current registry has no membrane-specific transfer policy or guard.
 - **The contact angle is a geometric quantity at the rim.** The library knows it exactly; the model that
   turns it into a velocity or a force (Cox–Voinov, Navier slip, hysteresis) is solver physics.
   - `MFTL_RimProjector` (plan 02) already lets the application place rim vertices.
@@ -67,7 +68,7 @@ yet.
   - The ghost → owner accumulation.
   - A preconditioned-CG ensemble solver for `(αM + βK) x = b`, with a deterministic stopping rule.
 - **F2.** README recipes plus one force kernel (surface viscosity). Surfactant transport is a recipe over F1
-  and 04, not a black box: Lagrangian or ALE, soluble or not, is the solver's choice.
+  and the existing field storage, not a black box: Lagrangian or ALE, soluble or not, is the solver's choice.
 - **F3.**
   - Skalak / neo-Hookean in-plane forces and dihedral bending (Helfrich-cotangent as an option).
   - Global area and volume penalty terms.
@@ -87,7 +88,7 @@ void MFTLSurfaceDivergenceApply(const MFTL_Object *obj, const double *w, int nco
 
 /* COLLECTIVE, the transpose of MFTLUpdateGhostFields: ghost partial sums are added into the owners
    (ascending source rank), then the ghost copies are zeroed. */
-int MFTLAccumulateGhostFields(MFTL_Ensemble *ens, uint32_t mask);
+int MFTLAccumulateGhostFields(MFTL_Ensemble *ens, const int *ids, int nfields);
 
 /* COLLECTIVE: solves (alpha M + beta K) x = b per vertex field, all bodies at once, Jacobi-preconditioned CG.
    Residual norms reduced with a fixed fold order; stops on the reduced value (bit-identical everywhere)
@@ -98,9 +99,12 @@ int MFTLEnsembleSurfaceSolve(MFTL_Ensemble *ens, double alpha, double beta, int 
 ### 4.2 F2 — recipes and the surface-viscosity force
 
 - **Insoluble surfactant, Lagrangian mesh** (vertices move with the full fluid velocity): the mass per
-  element is conserved, so `Γ^{n+1} = Γ^n A^n / A^{n+1}` per triangle (a triangle EXTENSIVE field from 04 does
-  this automatically). Diffusion is implicit: `(M + Δt D K) Γ = M Γ*` via `MFTLEnsembleSurfaceSolve`.
-  Remeshing conserves Γ by 04's rules.
+  element is conserved, so the application applies `Γ^{n+1} = Γ^n A^n / A^{n+1}` per triangle during
+  physical motion. Registering `MFTL_FIELD_CONSERVATIVE_DENSITY` does not perform this update; its
+  [local remeshing transfer](../src/remeshing/README.md) preserves `sum(A * Γ)` during remeshing.
+  Diffusion is implicit: `(M + Δt D K) Γ = M Γ*` via `MFTLEnsembleSurfaceSolve`. These P1 operators use
+  vertex unknowns, so F2 still needs an explicit conservative triangle/vertex conversion or a conservative
+  vertex-field policy with its nodal measure. Neither is supplied by the current field API.
 - **ALE mesh** (normal velocity plus tangential smoothing): adds `∇_s·(Γ u_t)`. Advection operator deferred
   (§8). The README states that the Lagrangian form is the supported one.
 - **Equation of state.** Langmuir `σ = σ₀ (1 + β ln(1 − Γ/Γ∞))` gives a σ field, which 05 turns into
@@ -123,7 +127,7 @@ typedef struct MFTL_MembraneParams {
   int bending_model;          /* MFTL_BENDING_DIHEDRAL | MFTL_BENDING_HELFRICH_COTAN                   */
   double bending_modulus, spontaneous_curvature;
   double area_penalty, volume_penalty;              /* global constraints, 0 = off                       */
-  int reference_field;        /* triangle COPY field, 3 components: the reference triangle in 2D       */
+  int reference_field;        /* persistent triangle reference data; representation defined by F3      */
 } MFTL_MembraneParams;
 
 int MFTLEnsembleSetMembraneReference(MFTL_Ensemble *ens, int reference_field);               /* collective: store current shape */
@@ -144,8 +148,8 @@ int MFTLEnsembleMembraneForce(MFTL_Ensemble *ens, const MFTL_MembraneParams *p, 
   - Guckenberger et al. 2016 compare the two; the README cites their recommendation and our measurement.
 - **Constraints.** Global area and volume from `MFTLEnsembleBodyIntegrals` (holder reduction), then local
   penalty forces.
-- **Refusal.** `MFTLRemeshEnsemble` refuses, in Debug, a body carrying a `reference_field` (the
-  not-remeshed rule).
+- **Refusal.** F3 must add a Release and Debug guard covering all public remeshing entry points for a
+  body carrying a `reference_field`; ordinary field interpolation is not a reference-shape remap.
 
 ### 4.4 F4 — contact-line hooks (`src/geometry/rim_geometry.c` new or `remesh_rim.c`'s neighbour)
 
@@ -214,7 +218,7 @@ point into. A spherical cap of contact angle θ on a wall reports θ.
 - **Contact-line models** (Cox–Voinov, hysteresis, slip): physics owned by the solver. The library measures.
 - **Continuous collision detection** (deferred issue 16).
   - When: the solver's CFL step lets surfaces close a gap larger than the contact envelope in one step.
-  - How: 04 makes it implementable, since a previous-position vertex field gives each triangle its swept
+  - How: an optional previous-position vertex field gives each triangle its swept
     volume. Then swept AABBs in the LBVH (`MFTL_RefitLBVH` over the union of both positions), followed by
     exact vertex–face and edge–edge CCD (Brochu, Edwards & Bridson 2012; Wang 2015).
   - Not now: nothing has measured a tunnelled contact in a real run. The pinned miss

@@ -30,6 +30,8 @@
  */
 
 #include "mftl_communication.h"
+#include "../object/fields_internal.h"
+#include <limits.h>
 
 #include <stdint.h>
 #include <stdio.h>
@@ -80,10 +82,16 @@ static void calc_buffer_hints(int n_tris_global, int n_verts_global, int nproc, 
  */
 static void sb_reserve(MFTL_SendBuffer *sb, int needed, size_t elem)
 {
+  if (needed < 0 || sb->count > INT_MAX - needed)
+  {
+    fprintf(stderr, "MFTL redistribution send count overflow\n");
+    MPI_Abort(MPI_COMM_WORLD, MFTL_ERROR);
+    abort();
+  }
   if (sb->count + needed <= sb->capacity) return;
 
   int cap = (sb->capacity == 0) ? MFTL_MAX(needed, 256) : sb->capacity;
-  while (cap < sb->count + needed) cap *= 2;
+  cap = MFTLGrowCapacity(cap, sb->count + needed);
 
   sb->buffer = MFTLReallocOrDie(sb->buffer, (size_t) cap * elem, "MFTL redistribution send buffer");
   sb->capacity = cap;
@@ -665,6 +673,8 @@ typedef struct
 {
   void *v_rec;  ///< kept vertex records
   size_t v_rec_cap;  ///< Its allocated size in bytes.
+  void *v_fields, *t_fields;  ///< Retained persistent field records.
+  size_t v_fields_cap, t_fields_cap;  ///< Their allocated byte counts.
   void *v_pos;  ///< kept vertex positions
   size_t v_pos_cap;  ///< Its allocated size in bytes.
   void *t_rec;  ///< kept triangle records
@@ -768,6 +778,9 @@ typedef struct
   MFTL_SendBuffer *send_tris;  ///< [nproc] packed triangle payloads.
   MFTL_SendBuffer *send_verts;  ///< [nproc] packed vertex payloads.
   MFTL_SendBuffer *send_counts;  ///< [nproc] per-body run lengths, multi-body only.
+  MFTL_SendBuffer *send_fv, *send_ft, *send_fields;  ///< Optional double payloads, allocated together.
+  double *recv_fv, *recv_ft;  ///< Received fields in entity record order.
+  int cap_recv_fv, cap_recv_ft;  ///< Receive capacities in doubles.
   int *touched;  ///< [nproc] destinations this body reached.
   int *rank_bit;  ///< [nproc] de-duplication bit handed to each destination.
 
@@ -837,6 +850,12 @@ static void ws_free_rank_arrays(comm_workspace *ws)
     free(ws->send_tris[r].buffer);
     free(ws->send_verts[r].buffer);
     free(ws->send_counts[r].buffer);
+    if (ws->send_fields)
+    {
+      free(ws->send_fv[r].buffer);
+      free(ws->send_ft[r].buffer);
+      free(ws->send_fields[r].buffer);
+    }
   }
   free(ws->is_neighbor);
   free(ws->tri_ids);
@@ -844,6 +863,10 @@ static void ws_free_rank_arrays(comm_workspace *ws)
   free(ws->send_tris);
   free(ws->send_verts);
   free(ws->send_counts);
+  free(ws->send_fv);
+  free(ws->send_ft);
+  free(ws->send_fields);
+  ws->send_fv = ws->send_ft = ws->send_fields = NULL;
   free(ws->touched);
   free(ws->rank_bit);
 }
@@ -1012,10 +1035,14 @@ static void ws_free(comm_workspace *ws)
   free(ws->runs);
   free(ws->grp_idx_v);
   free(ws->grp_idx_t);
+  free(ws->recv_fv);
+  free(ws->recv_ft);
 
   rebuild_scratch *const s = &ws->scratch;
   free(s->v_rec);
   free(s->v_pos);
+  free(s->v_fields);
+  free(s->t_fields);
   free(s->t_rec);
   free(s->t_he);
   free(s->v_final_of_old);
@@ -1117,13 +1144,15 @@ static void repair_twins(MFTL_Object *obj, const int *restrict u_list, int n_u, 
  *                positions, #MFTL_DERIVED_TOPOLOGY set, cached geometry
  *                unspecified, `partition_dirty` cleared.
  * @param bs      Per-body state from build_kept_lists().
+ * @param recv_fv Persistent field rows aligned with recv_v, or NULL.
+ * @param recv_ft Persistent field rows aligned with recv_t, or NULL.
  * @param recv_v  Received vertex records.
  * @param recv_t  Received triangle records.
  * @param my_rank This rank.
  * @param s       Reusable scratch, grown monotonically across calls.
  */
 static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_PackedVertex *recv_v, const MFTL_PackedTriangleComplex *recv_t, int my_rank,
-                           rebuild_scratch *s)
+                           rebuild_scratch *s, const double *recv_fv, const double *recv_ft)
 {
   const int n_old_v = obj->verts.n;
   const int n_old_t = obj->tris.n;
@@ -1198,6 +1227,19 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
   }
 
   CS_LAP(tm, t_kept_gather);
+
+  const int fv = MFTLFieldsStride(obj, MFTL_FIELD_VERTEX);
+  const int ft = MFTLFieldsStride(obj, MFTL_FIELD_TRIANGLE);
+  if (fv)
+  {
+    ensure_bytes(&s->v_fields, &s->v_fields_cap, (size_t) MFTL_MAX(n_kept_v, 1) * fv * sizeof(double));
+    for (int i = 0; i < n_kept_v; ++i) MFTLFieldsRecord(obj, 0, bs->kept_v[i], (double *) s->v_fields + (size_t) i * fv, false);
+  }
+  if (ft)
+  {
+    ensure_bytes(&s->t_fields, &s->t_fields_cap, (size_t) MFTL_MAX(n_kept_t, 1) * ft * sizeof(double));
+    for (int i = 0; i < n_kept_t; ++i) MFTLFieldsRecord(obj, 1, bs->kept_t[i], (double *) s->t_fields + (size_t) i * ft, false);
+  }
 
   /* ── 2. Classify the arrivals against the kept entities ──────────────────── */
 
@@ -1313,6 +1355,38 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
   }
   MFTLObjectSetCounts(obj, n_v, n_v_local, n_t, n_t_local);
   CS_LAP(tm, t_reserve);
+  if (fv)
+  {
+    for (int i = 0; i < n_kept_v; ++i) MFTLFieldsRecord(obj, 0, s->v_final_of_logical[i], (double *) s->v_fields + (size_t) i * fv, true);
+    for (int i = 0; i < bs->n_recv_v; ++i)
+      if (s->recv_v_logical[i] != MFTL_ERROR)
+        MFTLFieldsRecord(obj, 0, s->v_final_of_logical[s->recv_v_logical[i]], (double *) recv_fv + (size_t) bs->recv_v_idx[i] * fv, true);
+  }
+  if (ft)
+  {
+    for (int i = 0; i < n_kept_t; ++i) MFTLFieldsRecord(obj, 1, s->t_final_of_logical[i], (double *) s->t_fields + (size_t) i * ft, true);
+    for (int i = 0; i < bs->n_recv_t; ++i)
+      if (s->recv_t_logical[i] != MFTL_ERROR)
+        MFTLFieldsRecord(obj, 1, s->t_final_of_logical[s->recv_t_logical[i]], (double *) recv_ft + (size_t) bs->recv_t_idx[i] * ft, true);
+  }
+#ifndef NDEBUG
+  if (fv)
+    for (int i = 0; i < bs->n_recv_v; ++i)
+    {
+      const int ri = bs->recv_v_idx[i];
+      const int logical = gt_get(&s->v_tbl, recv_v[ri].global_id);
+      int off = 0;
+      for (int f = 0; f < obj->fields->n; ++f)
+      {
+        const MFTL_FieldDescriptor *d = &obj->fields->entries[f];
+        if (d->entity != MFTL_FIELD_VERTEX || d->mode == MFTL_FIELD_RECOMPUTED) continue;
+        MFTL_ASSERT(memcmp(obj->field_data[f] + (size_t) s->v_final_of_logical[logical] * d->ncomp, recv_fv + (size_t) ri * fv + off,
+                           (size_t) d->ncomp * sizeof(double)) == 0 &&
+                    "persistent vertex ghosts must be synced before redistribution");
+        off += d->ncomp;
+      }
+    }
+#endif
 
   {
     const int a = bs->n_kept_v_owned;
@@ -1671,6 +1745,20 @@ static int analyze_and_pack_body(comm_workspace *ws, MFTL_Object *obj, int my_ra
     append_destination(obj, obj->global_id, ws->vert_gid, &ws->tri_ids[r], &ws->vert_ids[r], &ws->send_tris[r], &ws->send_verts[r],
                        dd->rank_bit[r] == MFTL_DEDUP_NO_BIT);
 
+    if (ws->send_fields)
+      for (int e = 0; e < 2; ++e)
+      {
+        const int stride = MFTLFieldsStride(obj, e);
+        const int n = e ? ws->send_tris[r].count - tri_before : ws->send_verts[r].count - vert_before;
+        const int *indices = e ? ws->tri_ids[r].data : ws->vert_ids[r].data;
+        MFTL_SendBuffer *out = e ? &ws->send_ft[r] : &ws->send_fv[r];
+        if (!stride || !n) continue;
+        if ((size_t) n * stride > (size_t) INT_MAX - out->count) MPI_Abort(obj->domain->comm_world, MFTL_ERROR);
+        sb_reserve(out, n * stride, sizeof(double));
+        for (int j = 0; j < n; ++j) MFTLFieldsRecord(obj, e, indices[j], (double *) out->buffer + out->count + (size_t) j * stride, false);
+        out->count += n * stride;
+      }
+
     sb_reserve(&ws->send_counts[r], MFTL_BODY_COUNT_INTS, sizeof(int));
     int *const c = (int *) ws->send_counts[r].buffer + ws->send_counts[r].count;
     c[MFTL_BODY_HDR_GID] = obj->global_id;  // the body GID, not this rank's slot for it
@@ -1707,9 +1795,7 @@ static int analyze_and_pack_body(comm_workspace *ws, MFTL_Object *obj, int my_ra
  */
 static void check_object_lists_agree(const MFTL_Domain *dom, int n_bodies_global)
 {
-
   unsigned sig = (unsigned) n_bodies_global * 2u + (g_skip_unchanged ? 1u : 0u);
-
 
   unsigned v[2] = {sig, ~sig};
   MPI_Allreduce(MPI_IN_PLACE, v, 2, MPI_UNSIGNED, MPI_MIN, dom->comm_world);
@@ -1819,6 +1905,13 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
   memset(is_neighbor, 0, (size_t) nproc);
   for (int i = 0; i < domain->num_neighbors; ++i) is_neighbor[domain->neighbors[i]] = 1;
 
+  const bool with_fields = ens->fields.stride[0] || ens->fields.stride[1];
+  if (with_fields && !ws->send_fields)
+  {
+    ws->send_fv = MFTLCallocOrDie((size_t) nproc, sizeof(MFTL_SendBuffer), "vertex field buffers");
+    ws->send_ft = MFTLCallocOrDie((size_t) nproc, sizeof(MFTL_SendBuffer), "triangle field buffers");
+    ws->send_fields = MFTLCallocOrDie((size_t) nproc, sizeof(MFTL_SendBuffer), "field payload buffers");
+  }
   MFTL_SendBuffer *const send_tris = ws->send_tris;
   MFTL_SendBuffer *const send_verts = ws->send_verts;
   MFTL_SendBuffer *const send_counts = ws->send_counts;
@@ -1838,6 +1931,7 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
   {
     send_tris[r].count = 0;
     send_verts[r].count = 0;
+    if (with_fields) ws->send_fv[r].count = ws->send_ft[r].count = ws->send_fields[r].count = 0;
     send_counts[r].count = 0;
   }
   memset(ws->states, 0, (size_t) n_pre * sizeof(body_state));
@@ -1917,8 +2011,6 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
     if (dirty_global[o] == 0.0) MFTLCommStats.n_objects_settled++;
   }
 
-
-
   /* ── Phase 2: agree on the route. Collective by necessity: a non-neighbour
    * receiver cannot know it must listen on the global path. */
   CS_BEGIN(ts_route);
@@ -1931,7 +2023,7 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
     MFTLCommStats.n_route_neighbor++;
 
   /* ── Phase 3: exchange ─────────────────────────────────────────────────── */
-  MFTL_Exchange xfer[3];
+  MFTL_Exchange xfer[4];
   xfer[0].send_bufs = send_verts;
   xfer[0].type = MFTL_MPI_PackedVertex;
   xfer[0].type_size = sizeof(MFTL_PackedVertex);
@@ -1942,10 +2034,30 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
   xfer[2].type = MPI_INT;
   xfer[2].type_size = sizeof(int);
 
+  if (with_fields)
+  {
+    for (int r = 0; r < nproc; ++r)
+    {
+      const int v = ws->send_fv[r].count, t = ws->send_ft[r].count;
+      if (v > INT_MAX - t) MPI_Abort(domain->comm_world, MFTL_ERROR);
+      if (v + t)
+      {
+        sb_reserve(&ws->send_fields[r], v + t, sizeof(double));
+        double *out = (double *) ws->send_fields[r].buffer;
+        if (v) memcpy(out, ws->send_fv[r].buffer, (size_t) v * sizeof(double));
+        if (t) memcpy(out + v, ws->send_ft[r].buffer, (size_t) t * sizeof(double));
+      }
+      ws->send_fields[r].count = v + t;
+    }
+    xfer[3].send_bufs = ws->send_fields;
+    xfer[3].type = MPI_DOUBLE;
+    xfer[3].type_size = sizeof(double);
+  }
+
   for (int r = 0; r < nproc; ++r)
   {
     const long bytes = (long) send_verts[r].count * (long) sizeof(MFTL_PackedVertex) + (long) send_tris[r].count * (long) sizeof(MFTL_PackedTriangleComplex) +
-                       (long) send_counts[r].count * (long) sizeof(int);
+                       (long) send_counts[r].count * (long) sizeof(int) + (with_fields ? (long) ws->send_fields[r].count * (long) sizeof(double) : 0);
     if (bytes > 0)
     {
       MFTLCommStats.n_bytes_sent += bytes;
@@ -1954,7 +2066,7 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
   }
 
   MFTL_ExchangeCtx ctx;
-  MFTLExchangeStart(domain, xfer, 3, global_decision != 0, &ctx);
+  MFTLExchangeStart(domain, xfer, with_fields ? 4 : 3, global_decision != 0, &ctx);
 
   /* The send buffers were copied; they persist for the next call. */
 
@@ -1987,6 +2099,7 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
       ws_bodies_reserve(ws, n_work + 1);
       MFTL_Object *const arrived = MFTLObjectCreate(gid);
       arrived->domain = domain;
+      MFTLObjectAttachFields(arrived, &ens->fields);
       arrived->derived = MFTL_DERIVED_TOPOLOGY;  // an empty mesh is trivially described
 
       /* The persistent slot may hold the previous call's state: clear it. */
@@ -2026,6 +2139,31 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
   MFTLExchangeWait(&ctx, 0);
   MFTLExchangeWait(&ctx, 1);
   CS_END(ts_w01, t_wait);
+  if (with_fields)
+  {
+    MFTLExchangeWait(&ctx, 3);
+    const int fv = ens->fields.stride[0], ft = ens->fields.stride[1];
+    if ((size_t) xfer[0].recv_count * fv > INT_MAX || (size_t) xfer[1].recv_count * ft > INT_MAX) MPI_Abort(domain->comm_world, MFTL_ERROR);
+    ws_bytes((void **) &ws->recv_fv, &ws->cap_recv_fv, MFTL_MAX(xfer[0].recv_count * fv, 1), sizeof(double), "received vertex fields");
+    ws_bytes((void **) &ws->recv_ft, &ws->cap_recv_ft, MFTL_MAX(xfer[1].recv_count * ft, 1), sizeof(double), "received triangle fields");
+    /* Count layout belongs to this communication module: one payload-major
+     * receive-count block follows the send-count block. Source order is shared. */
+    const int stride = MFTL_MAX(ctx.n_targets, 1);
+    const int *counts = ctx.counts + ctx.n_payloads * stride;
+    int vo = 0, to = 0, fo = 0;
+    for (int r = 0; r < ctx.n_targets; ++r)
+    {
+      const int v = counts[r] * fv, t = counts[stride + r] * ft;
+      MFTL_ASSERT(v + t == counts[3 * stride + r]);
+      const double *in = (const double *) xfer[3].recv_buf + fo;
+      if (v) memcpy(ws->recv_fv + vo, in, (size_t) v * sizeof(double));
+      if (t) memcpy(ws->recv_ft + to, in + v, (size_t) t * sizeof(double));
+      vo += v;
+      to += t;
+      fo += v + t;
+    }
+    MFTLCommStats.n_bytes_recv += (long) xfer[3].recv_count * (long) sizeof(double);
+  }
 
   CS_BEGIN(ts_g01);
   MFTL_ASSERT(t_off == xfer[1].recv_count && "redistribute: body triangle counts do not add up to the arrival count");
@@ -2077,7 +2215,8 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
       continue;
     }
 
-    rebuild_object(obj, &ws->states[o], (const MFTL_PackedVertex *) xfer[0].recv_buf, (const MFTL_PackedTriangleComplex *) xfer[1].recv_buf, my_rank, scratch);
+    rebuild_object(obj, &ws->states[o], (const MFTL_PackedVertex *) xfer[0].recv_buf, (const MFTL_PackedTriangleComplex *) xfer[1].recv_buf, my_rank, scratch,
+                   ws->recv_fv, ws->recv_ft);
   }
 
   /* ── Phase 5b: optional shrink, after every rebuild (no pool pointer is live
@@ -2140,6 +2279,7 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
   free(xfer[0].recv_buf);
   free(xfer[1].recv_buf);
   free(xfer[2].recv_buf);
+  if (with_fields) free(xfer[3].recv_buf);
 
   MFTLExchangeFree(&ctx);
   MFTLCommStats.n_frees += 3;
