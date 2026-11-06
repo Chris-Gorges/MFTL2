@@ -43,3 +43,4 @@ __pycache__/
 CLAUDE.md
 /docs/
 /run_scaling.py
+/studies/
