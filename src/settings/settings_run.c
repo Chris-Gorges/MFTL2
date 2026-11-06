@@ -370,7 +370,8 @@ int MFTLSettingsResolve(MFTL_Settings *s, MFTL_Ensemble *ens)
   MFTL_TopologyOptions *t = &s->topology.options;
   const bool derive_min = (p->min_edge_length == 0.0);
   const bool derive_max = (p->max_edge_length == 0.0);
-  const bool band_needs_length = derive_min || derive_max;
+  const bool curvature = (p->sizing == MFTL_REMESH_SIZING_CURVATURE);
+  const bool band_needs_length = derive_min || derive_max || (curvature && (p->curvature_tolerance == 0.0 || p->min_target_length == 0.0));
   const bool topology_needs_length = (t->dx == 0.0 || t->delta_breakup == 0.0 || t->delta_coalescence == 0.0);
 
   /* Every branch below reads only values that are identical on every rank --
@@ -384,8 +385,23 @@ int MFTLSettingsResolve(MFTL_Settings *s, MFTL_Ensemble *ens)
   const double L = p->target_length;
   if (L > 0.0)
   {
-    if (derive_min) p->min_edge_length = (4.0 / 5.0) * L;
-    if (derive_max) p->max_edge_length = (4.0 / 3.0) * L;
+    /* The envelope [min_edge_length, max_edge_length] per sizing mode -- the
+     * shortest and longest edge the pass can want, which is what the frozen
+     * band and the parameter check read (MFTL_RemeshParameters::sizing). */
+    switch (p->sizing)
+    {
+      case MFTL_REMESH_SIZING_CURVATURE:
+        if (p->min_target_length == 0.0) p->min_target_length = s->remesh.min_target_factor * L;
+        if (p->curvature_tolerance == 0.0) p->curvature_tolerance = s->remesh.curvature_tolerance_factor * L;
+        if (derive_min) p->min_edge_length = MFTL_REMESH_COLLAPSE_RATIO * p->min_target_length;
+        if (derive_max) p->max_edge_length = MFTL_REMESH_SPLIT_RATIO * L;
+        break;
+      case MFTL_REMESH_SIZING_UNIFORM:
+      default:
+        if (derive_min) p->min_edge_length = (4.0 / 5.0) * L;
+        if (derive_max) p->max_edge_length = (4.0 / 3.0) * L;
+        break;
+    }
     if (t->dx == 0.0) t->dx = s->topology.dx_factor * L;
     if (t->delta_breakup == 0.0) t->delta_breakup = s->topology.delta_breakup_factor * L;
     if (t->delta_coalescence == 0.0) t->delta_coalescence = s->topology.delta_coalescence_factor * L;

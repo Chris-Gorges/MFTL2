@@ -169,9 +169,19 @@ typedef struct MFTL_VertexPool
   double *pos;  ///< [3*capacity]    AUTHORITATIVE position, xyz interleaved.
   double *normal;  ///< [3*capacity]    unit vertex normal, xyz interleaved; valid only after MFTLComputeVertexNormals().
 
+  /**
+   * [capacity] OPTIONAL target edge length of a curvature-adaptive remesh, or
+   * #MFTL_NULL. Laid out only after MFTLObjectEnableSizing() -- zero bytes
+   * otherwise -- and written by MFTLRemeshPrepareSizing(). Permuted by
+   * compaction and reordering like `normal`, never sent by a redistribution, so
+   * its values are unspecified outside a remeshing pass.
+   */
+  double *sizing;
+
   int n;  ///< Active vertices (owned + ghost).
   int n_local;  ///< Owned vertices; they occupy [0, n_local).
   int capacity;  ///< Entities every array above is sized for. One number, one writer.
+  bool has_sizing;  ///< `sizing` is part of the layout. Set by MFTLObjectEnableSizing(), cleared by a release.
 
   void *block;  ///< The single allocation. Freed with free().
 } MFTL_VertexPool;
@@ -338,6 +348,17 @@ typedef struct MFTL_Object
    * its pool is then bit-identical.
    */
   uint64_t generation;
+
+  /**
+   * The volume this body should enclose, or NaN when nobody set one: what
+   * MFTLEnsembleCorrectVolumes() restores. Set by MFTLEnsembleSetReferenceVolumes()
+   * (or by the application, to the same bits on every holder), carried by every
+   * redistribution to the ranks that newly hold the body, and handed on by a
+   * topology change to the bodies a cluster becomes, in proportion to their
+   * volumes. A per-body value every holder needs is the kind that must travel:
+   * a rank that never held the body before a redistribution could not know it.
+   */
+  double reference_volume;
 
   struct MFTL_Domain *domain;  ///< Borrowed from the ensemble; MFTL_NULL until added.
 

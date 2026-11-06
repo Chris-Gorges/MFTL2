@@ -188,6 +188,24 @@ bool MFTLObjectShrinkToFit(MFTL_Object *obj, double slack);
 size_t MFTLObjectPoolBytes(const MFTL_Object *obj);
 
 /**
+ * @brief Adds the optional `verts.sizing` array to the vertex pool's layout.
+ *
+ * One double per vertex, cut from the same block as every other vertex array,
+ * so it grows with the pool and cannot be forgotten by a growth site. Only a
+ * curvature-adaptive remesh needs it (MFTLRemeshPrepareSizing() calls this);
+ * a pool that never enables it carries zero bytes for it. Live rows of every
+ * other array are preserved. A no-op when the array is already present. A
+ * release (MFTLObjectReleasePools(), or an emptied pool) drops it again.
+ *
+ * @param obj The mesh.
+ *
+ * @warning Every pointer into the vertex pool is dangling afterwards.
+ *
+ * @rank_local
+ */
+void MFTLObjectEnableSizing(MFTL_Object *obj);
+
+/**
  * @brief Structural check of the pools themselves (not of the mesh).
  *
  * Counts within capacity, owned counts within active counts, and every

@@ -728,6 +728,8 @@ void MFTLSettingsDefaults(MFTL_Settings *s)
    * what the module would give; the table then sets every key. */
   MFTLInitRemeshParams(&s->remesh.params, MFTL_REMESH_ISOTROPIC, 0.0, 3, MFTL_SMOOTH_TRIANGLE_BASED, 180.0);
   s->topology.options = MFTLTopologyDefaultOptions();
+  s->volume.params = MFTLVolumeCorrectionDefaultParameters();
+  s->undulation.params = MFTLUndulationDefaultParameters();
   s->contact.params = MFTL_BVHDefaultParams();
   MFTLCouplerDefaultParams(&s->coupling.params);
   s->output.vtk = MFTLVtkDefaults();

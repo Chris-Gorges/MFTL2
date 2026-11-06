@@ -229,6 +229,7 @@ static bool reorder_vertices(MFTL_Object *obj, int *old_of_new, int *new_of_old,
   permute_vertex_recs(obj->verts.rec, (MFTL_Vertex *) scratch, old_of_new, nv);
   permute_doubles(obj->verts.pos, (double *) scratch, old_of_new, nv, 3);
   permute_doubles(obj->verts.normal, (double *) scratch, old_of_new, nv, 3);
+  if (obj->verts.has_sizing) permute_doubles(obj->verts.sizing, (double *) scratch, old_of_new, nv, 1);
   if (MFTLFieldsStride(obj, MFTL_FIELD_VERTEX))
     for (int f = 0; f < obj->fields->n; ++f)
     {

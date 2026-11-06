@@ -83,6 +83,7 @@
 #include <mpi.h>
 
 #include "mftl_bvh.h"
+#include "mftl_correction.h"
 #include "mftl_coupling.h"
 #include "mftl_geometry.h"
 #include "mftl_io.h"
@@ -141,9 +142,16 @@ typedef struct MFTL_RemeshSettings
    * The block to pass to MFTLRemeshEnsemble(). `target_length`,
    * `min_edge_length` and `max_edge_length` may be 0 in a file, meaning "derive
    * it"; MFTLSettingsResolve() replaces them by the measured values, so the
-   * block is valid only after that call.
+   * block is valid only after that call. So may `curvature_tolerance` and
+   * `min_target_length`, derived from the two factors below.
    */
   MFTL_RemeshParameters params;
+
+  /** Curvature sizing: `params.curvature_tolerance` = this times `params.target_length`, when it is 0. */
+  double curvature_tolerance_factor;
+
+  /** Curvature sizing: `params.min_target_length` = this times `params.target_length`, when it is 0. */
+  double min_target_factor;
 } MFTL_RemeshSettings;
 
 /**
@@ -172,6 +180,34 @@ typedef struct MFTL_TopologySettings
    */
   MFTL_TopologyOptions options;
 } MFTL_TopologySettings;
+
+/**
+ * @struct MFTL_VolumeSettings
+ * @brief Volume restoration: the schedule and the parameters of
+ *        MFTLEnsembleCorrectVolumes().
+ */
+typedef struct MFTL_VolumeSettings
+{
+  /** Restore every body's reference volume every this many timesteps, 0 never. Read by the caller's loop. */
+  int every;
+
+  /** The parameters to pass to MFTLEnsembleCorrectVolumes(). `rim_project` cannot be set from a file. */
+  MFTL_VolumeCorrectionParameters params;
+} MFTL_VolumeSettings;
+
+/**
+ * @struct MFTL_UndulationSettings
+ * @brief TSUR3D undulation removal: the schedule and the parameters of
+ *        MFTLEnsembleRemoveUndulations().
+ */
+typedef struct MFTL_UndulationSettings
+{
+  /** Remove undulations every this many timesteps, 0 never. Read by the caller's loop. */
+  int every;
+
+  /** The parameters to pass to MFTLEnsembleRemoveUndulations(). */
+  MFTL_UndulationParameters params;
+} MFTL_UndulationSettings;
 
 /**
  * @struct MFTL_ContactSettings
@@ -247,6 +283,8 @@ typedef struct MFTL_Settings
   MFTL_SphereSettings sphere;  ///< `[sphere]`
   MFTL_RemeshSettings remesh;  ///< `[remesh]`
   MFTL_TopologySettings topology;  ///< `[topology]`
+  MFTL_VolumeSettings volume;  ///< `[volume]`
+  MFTL_UndulationSettings undulation;  ///< `[undulation]`
   MFTL_ContactSettings contact;  ///< `[contact]`
   MFTL_CouplingSettings coupling;  ///< `[coupling]`
   MFTL_RedistributeSettings redistribute;  ///< `[redistribute]`
@@ -567,6 +605,10 @@ MFTL_Ensemble *MFTLSettingsCreateEnsemble(const MFTL_Settings *s, MPI_Comm comm)
  *   scheduled, which is an error.
  * - `remesh.min_edge_length` / `max_edge_length` 0: \f$\tfrac45L\f$ and
  *   \f$\tfrac43L\f$ (Botsch & Kobbelt); the squared bounds are finalised.
+ *   Under curvature sizing \f$L\f$ is the coarsest target and the pair is the
+ *   envelope \f$\tfrac45L_\min\f$, \f$\tfrac43L\f$.
+ * - `remesh.curvature_tolerance` / `min_target_length` 0: their `*_factor`
+ *   times the target length.
  * - `topology.dx`, `delta_breakup`, `delta_coalescence` 0: their `*_factor`
  *   times the target length; `options.remesh` points at this struct's remesh
  *   block when `topology.remesh_after` is set.

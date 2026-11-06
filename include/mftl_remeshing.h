@@ -23,6 +23,11 @@
  * 5. FLIP every edge whose flip strictly lowers the squared valence deviation;
  * 6. detect features again and smooth tangentially (MFTLSmoothTangential()).
  *
+ * **Sizing.** MFTL_RemeshParameters::sizing can replace the one target
+ * \f$L\f$ by a per-vertex target from the curvature (Dunyach et al. 2013).
+ * Only the decision makers change (section 4b); the steps above, the operators
+ * and both distributed drivers are shared.
+ *
  * A split of an edge longer than \f$\tfrac43 L\f$ gives halves longer than
  * \f$\tfrac23 L\f$, i.e. no further from \f$L\f$ than the original edge; the
  * collapse's stretch clause keeps split and collapse from undoing each other.
@@ -64,6 +69,8 @@
 
 #ifndef MFTL_REMESHING_H
 #define MFTL_REMESHING_H
+
+#include <math.h>
 
 #include "mftl_constants.h"
 #include "mftl_topology.h"
@@ -162,6 +169,86 @@ typedef enum
 } MFTL_SmoothMode;
 
 /**
+ * @brief How the remesher decides what length an edge should have. Chosen once
+ *        per run; the driver, the sweep order and both distributed strategies
+ *        are the same for both, only the decision makers differ (split wanted,
+ *        collapse wanted, collapse stretch, smoothing target).
+ *
+ * See src/remeshing/README.md, "Sizing", for the derivations and for every
+ * place the implementation deviates from the papers.
+ */
+typedef enum
+{
+  /** One target length everywhere (Botsch & Kobbelt 2004). The default, and bit-identical to the remesher before sizing existed. */
+  MFTL_REMESH_SIZING_UNIFORM = 0,
+
+  /**
+   * Curvature-adaptive ISOTROPIC remeshing (Dunyach, Vanderhaeghe, Barthe &
+   * Botsch 2013): a per-vertex target \f$L(v) = \sqrt{6\varepsilon/\kappa -
+   * 3\varepsilon^2}\f$ from the maximum absolute curvature \f$\kappa\f$ and the
+   * approximation tolerance \f$\varepsilon\f$ (`curvature_tolerance`), clamped
+   * to [`min_target_length`, `target_length`]; an edge's target is the smaller
+   * of its two ends'. The smoother weights each incident triangle by its area
+   * over its squared target (the ODT density).
+   */
+  MFTL_REMESH_SIZING_CURVATURE
+} MFTL_RemeshSizing;
+
+/**
+ * @brief Where a split puts its new vertex, or a collapse its merged one, on an
+ *        interior edge between two free vertices
+ *        (MFTL_RemeshParameters::split_placement and
+ *        MFTL_RemeshParameters::collapse_placement, chosen separately).
+ *
+ * Rim edges always use the rim curve, and pinned (feature, corner, boundary)
+ * vertices keep their own rules. A fit that cannot be made -- too few
+ * samples, an undetermined height, a correction beyond a quarter of the edge,
+ * a split that would fold a new triangle -- falls back to the midpoint
+ * (counted by MFTLRemeshGetFitCounters()).
+ */
+typedef enum
+{
+  /** The chord midpoint (the default, bit-identical to before placement existed). */
+  MFTL_REMESH_PLACE_MIDPOINT = 0,
+
+  /**
+   * Above the midpoint, on a weighted least-squares height paraboloid fitted to
+   * the vertex POSITIONS of the edge's two-ring (src/remeshing/remesh_fit.c):
+   * frame from the endpoints' normals, coordinates in units of the local edge
+   * length, Wendland C2 weights of support `fit_radius`, solved by
+   * MFTLFitHeightParaboloid().
+   */
+  MFTL_REMESH_PLACE_PARABOLOID,
+
+  /** As #MFTL_REMESH_PLACE_PARABOLOID, with each sample's vertex-normal slopes as two more equations. */
+  MFTL_REMESH_PLACE_PARABOLOID_NORMALS
+} MFTL_RemeshPlacement;
+
+/**
+ * @brief What the smoother does with a free vertex after its tangential move
+ *        (MFTL_RemeshParameters::projection).
+ */
+typedef enum
+{
+  /** Nothing: the tangential move stands (the default, bit-identical to before). */
+  MFTL_REMESH_PROJECT_NONE = 0,
+
+  /**
+   * Onto the Phong surface (Boubekeur & Alexa 2008, \f$\alpha = \tfrac12\f$,
+   * angle-weighted vertex normals) of the mesh as the remeshing KERNEL CALL
+   * received it: the closest point on that mesh's flat triangles, lifted by
+   * \f$-\tfrac12\sum_i u_i ((\vect{p}-\vect{x}_i)\cdot\vect{n}_i)\vect{n}_i\f$.
+   * The reference is copied once per call and the projection made once, after
+   * the last smoothing sweep of the call's last iteration, so the moved
+   * vertices end on the surface the call received: what that call's
+   * collapses, flips and smoothing moved off it is put back. A
+   * corner that is a feature, corner, boundary or ghost vertex contributes no
+   * lift (Phong degrades to flat there). See src/remeshing/remesh_project.c.
+   */
+  MFTL_REMESH_PROJECT_PHONG
+} MFTL_RemeshProjection;
+
+/**
  * @brief Moves a position onto the constraint of an open surface's rim.
  *
  * Supplied by the application through MFTL_RemeshParameters::rim_project when
@@ -203,7 +290,14 @@ typedef struct MFTL_RemeshParameters
   MFTL_RemeshType type;  ///< How min/max are derived from `target_length`.
   MFTL_SmoothMode smooth_mode;  ///< Which neighbourhood the smoother's target point is built from.
 
-  /** Outer iterations (detect/split/collapse/flip/smooth rounds). */
+  /**
+   * Outer iterations (detect/split/collapse/flip/smooth rounds) -- per
+   * PLACEMENT in the spanning driver, which converges each placement fully.
+   * Under #MFTL_REMESH_SIZING_CURVATURE in a timestep loop use 1: every
+   * placement recomputes the field, and three iterations per placement lost
+   * 0.717 of the LeVeque volume at np = 4 against 0.881 with one (serial,
+   * three: 0.903), at 2.4 times the cost (docs/analysis.md §14.5).
+   */
   int iterations;
 
   /** Stop after an iteration that performs at most this many operations (default 0). */
@@ -220,6 +314,75 @@ typedef struct MFTL_RemeshParameters
   double max_edge_length;  ///< Split above this. \f$\tfrac43 L\f$ under #MFTL_REMESH_ISOTROPIC.
   double min_edge_length_sq;  ///< Squared bound; every length test compares squares.
   double max_edge_length_sq;  ///< Squared bound; see MFTLRemeshParamsFinalise().
+
+  // --- Sizing (MFTLRemeshUseCurvatureSizing()) -------------------------------
+  /**
+   * How edge lengths are judged (default #MFTL_REMESH_SIZING_UNIFORM). Under
+   * the curvature mode the length fields above change meaning:
+   *
+   * | field | UNIFORM | CURVATURE |
+   * |---|---|---|
+   * | `target_length` | \f$L\f$ | \f$L_\max\f$, the coarsest target |
+   * | `max_edge_length` | split above | \f$\tfrac43 L_\max\f$, the longest edge ever wanted |
+   * | `min_edge_length` | collapse below | \f$\tfrac45 L_\min\f$, the shortest edge ever wanted |
+   *
+   * so `max_edge_length` is always the longest edge the remesher keeps, which
+   * is what the frozen-band bound and the agreement check read.
+   */
+  MFTL_RemeshSizing sizing;
+
+  /**
+   * CURVATURE only: the approximation tolerance \f$\varepsilon\f$, a LENGTH --
+   * the largest admitted distance between an edge and the smooth surface it
+   * cuts (Dunyach et al. 2013, Eq. 2). Must be positive under that mode. The
+   * settings layer derives it as a fraction of `target_length`.
+   */
+  double curvature_tolerance;
+
+  /** CURVATURE only: \f$L_\min\f$, the smallest per-vertex target (\f$0 < L_\min \le\f$ `target_length`). */
+  double min_target_length;
+
+  // --- Vertex placement and projection (src/remeshing/remesh_fit.c, remesh_project.c)
+  /** Where a split puts its new vertex (default #MFTL_REMESH_PLACE_MIDPOINT). */
+  MFTL_RemeshPlacement split_placement;
+
+  /**
+   * Where a collapse puts its merged vertex, before `collapse_preserves_volume`
+   * moves it (default #MFTL_REMESH_PLACE_MIDPOINT).
+   */
+  MFTL_RemeshPlacement collapse_placement;
+
+  /**
+   * Move the point `collapse_placement` chose for a collapse of two free
+   * vertices so that the collapse leaves the enclosed volume unchanged (default
+   * false). The volume change of a collapse is LINEAR in the merged vertex's
+   * position p -- every surviving triangle of the patch holds p once -- with
+   * gradient \f$\vect{g} = \tfrac16\sum (\vect{y}-\vect{p})\times(\vect{z}-\vect{p})\f$
+   * over those triangles' other two corners, so
+   * \f$\vect{p} \leftarrow \vect{p} - \Delta V\,\vect{g}/|\vect{g}|^2\f$, the
+   * nearest point of the plane \f$\Delta V = 0\f$, makes it exact (the volume
+   * constraint of Lindstrom & Turk 1998). The stretch and fold clauses judge the
+   * moved point. Rim, feature and pinned collapses are left as they are.
+   *
+   * Over the LeVeque period it removes the collapses' share of the volume loss
+   * (2.9 % of V0 at refinement 4, from collapses of bent patches on the
+   * stretched filament) for +0.5 to 1.0 % of a step. With the Phong `projection` it
+   * improved the volume, the position and the curvature error together; without
+   * it the position improves and the curvature noise grows, because a patch's
+   * deficit is restored at one vertex (docs/analysis.md §15.4).
+   */
+  bool collapse_preserves_volume;
+
+  /**
+   * Support radius of the fit's Wendland C2 weights, in units of the local edge
+   * length (the mean length of the edges at both endpoints); must exceed 1.
+   * Read only by the paraboloid placements. Default 3: the endpoints weigh
+   * 0.80, their neighbours about 0.46, the two-ring about 0.05.
+   */
+  double fit_radius;
+
+  /** What the smoother does after each tangential move (default #MFTL_REMESH_PROJECT_NONE). */
+  MFTL_RemeshProjection projection;
 
   // --- Features -------------------------------------------------------------
   /**
@@ -574,9 +737,20 @@ typedef struct
   double t_total;  ///< The whole call.
   double t_migrate;  ///< Migrations, including the closing MFTLRedistribute.
   double t_geometry;  ///< The pre-migration geometry passes. Invariant to how much moves.
-  double t_freeze;  ///< Freeze marking, band dilation, and the hidden-edge scan.
+  double t_freeze;  ///< Freeze marking, band dilation, the hidden-edge scan and, under curvature sizing, the sizing field and its ghost exchange.
   double t_sweep;  ///< MFTLRemeshIterate, i.e. the actual remeshing.
   double t_reduce;  ///< The id and convergence collectives.
+
+  /** RANK-LOCAL, #MFTL_REMESH_PROJECT_PHONG: building the reference copies, summed over kernel calls. */
+  double t_reference;
+  /** RANK-LOCAL, #MFTL_REMESH_PROJECT_PHONG: the projection loops of the smoother. */
+  double t_projection;
+  /** RANK-LOCAL, #MFTL_REMESH_PROJECT_PHONG: largest reference held by one kernel call, in bytes. */
+  double reference_bytes;
+  /** RANK-LOCAL, #MFTL_REMESH_PROJECT_PHONG: vertex moves projected. */
+  int n_projected;
+  /** RANK-LOCAL, #MFTL_REMESH_PROJECT_PHONG: vertex moves left unprojected (no reference triangle found). */
+  int n_projection_missed;
 
   /**
    * RANK-LOCAL: owned entities this rank sent away, summed over the pass's
@@ -658,6 +832,15 @@ static inline void MFTLInitRemeshParams(MFTL_RemeshParameters *params, MFTL_Reme
   params->dispersed_balance_slack = 1.25;
   params->rim_project = MFTL_NULL;
   params->rim_project_user = MFTL_NULL;
+
+  params->sizing = MFTL_REMESH_SIZING_UNIFORM;
+  params->curvature_tolerance = 0.0;  /* unset: required by, and checked under, the curvature mode */
+  params->min_target_length = 0.0;
+  params->split_placement = MFTL_REMESH_PLACE_MIDPOINT;
+  params->collapse_placement = MFTL_REMESH_PLACE_MIDPOINT;
+  params->collapse_preserves_volume = MFTL_FALSE;
+  params->fit_radius = 3.0;
+  params->projection = MFTL_REMESH_PROJECT_NONE;
 }
 
 /**
@@ -677,6 +860,33 @@ long MFTLRemeshRimFallbacks(void);
  * @rank_local
  */
 void MFTLRemeshResetRimFallbacks(void);
+
+/**
+ * @struct MFTL_RemeshFitCounters
+ * @brief What the paraboloid placement did in this process since the last reset
+ *        (MFTLRemeshGetFitCounters()).
+ */
+typedef struct MFTL_RemeshFitCounters
+{
+  long n_fits;  ///< Fits attempted.
+  long n_rank_deficient;  ///< Fits that dropped at least one coefficient and still placed the vertex.
+  long n_fallbacks;  ///< Fits that fell back to the midpoint (too few samples, undetermined height, correction too large, fold).
+  long n_with_ghosts;  ///< Fits with at least one ghost sample (positions only; never an endpoint's fan).
+  double t_fit;  ///< Wall time inside the fits, in seconds.
+} MFTL_RemeshFitCounters;
+
+/**
+ * @brief The paraboloid placement's counters since the last reset.
+ * @param[out] out The counters.
+ * @rank_local Plain per-process counters.
+ */
+void MFTLRemeshGetFitCounters(MFTL_RemeshFitCounters *out);
+
+/**
+ * @brief Zeroes the counters MFTLRemeshGetFitCounters() reports.
+ * @rank_local
+ */
+void MFTLRemeshResetFitCounters(void);
 
 /**
  * @brief Number of MFTLRemeshMeasureBodies() calls in this process since the
@@ -729,6 +939,37 @@ static inline void MFTLRemeshParamsFinalise(MFTL_RemeshParameters *params)
   params->max_edge_length_sq = params->max_edge_length * params->max_edge_length;
 }
 
+/** @brief Upper end of the per-edge band of the curvature mode: split above \f$\tfrac43 L(e)\f$ (Dunyach et al. 2013, step 1). */
+#define MFTL_REMESH_SPLIT_RATIO (4.0 / 3.0)
+
+/** @brief Lower end of the per-edge band of the curvature mode: collapse below \f$\tfrac45 L(e)\f$. */
+#define MFTL_REMESH_COLLAPSE_RATIO (4.0 / 5.0)
+
+/**
+ * @brief Switches @p params to curvature-adaptive sizing
+ *        (#MFTL_REMESH_SIZING_CURVATURE) and derives the length envelope.
+ *
+ * Sets `target_length` to @p max_length, and `min_edge_length` /
+ * `max_edge_length` to \f$\tfrac45 L_\min\f$ / \f$\tfrac43 L_\max\f$ -- the
+ * shortest and longest edge the pass can ever want, which is what the frozen
+ * band and the parameter check read. Everything else in @p params is kept.
+ *
+ * @param[in,out] params     Initialised parameter block (MFTLInitRemeshParams()).
+ * @param         tolerance  \f$\varepsilon\f$, a length (> 0).
+ * @param         min_length \f$L_\min\f$ (> 0).
+ * @param         max_length \f$L_\max \ge L_\min\f$, typically tied to the fluid spacing.
+ */
+static inline void MFTLRemeshUseCurvatureSizing(MFTL_RemeshParameters *params, double tolerance, double min_length, double max_length)
+{
+  params->sizing = MFTL_REMESH_SIZING_CURVATURE;
+  params->curvature_tolerance = tolerance;
+  params->min_target_length = min_length;
+  params->target_length = max_length;
+  params->min_edge_length = MFTL_REMESH_COLLAPSE_RATIO * min_length;
+  params->max_edge_length = MFTL_REMESH_SPLIT_RATIO * max_length;
+  MFTLRemeshParamsFinalise(params);
+}
+
 // -----------------------------------------------------------------------------
 // 2. TOPOLOGICAL OPERATORS  (src/remeshing/remesh_ops.c)
 // -----------------------------------------------------------------------------
@@ -741,13 +982,14 @@ static inline void MFTLRemeshParamsFinalise(MFTL_RemeshParameters *params)
 /**
  * @brief Is half-edge @p h a legal and wanted split candidate?
  *
- * Wanted: longer than `max_edge_length`. Legal: alive, not touched earlier in
- * this sweep, and the canonical half of its edge (the smaller half-edge index,
- * or the only one at a boundary), so every undirected edge is offered once.
+ * Wanted: MFTLRemeshEdgeWantsSplit() -- under uniform sizing, longer than
+ * `max_edge_length`. Legal: alive, not touched earlier in this sweep, and the
+ * canonical half of its edge (the smaller half-edge index, or the only one at a
+ * boundary), so every undirected edge is offered once.
  *
  * @param obj    The mesh.
  * @param h      Half-edge index.
- * @param params Supplies `max_edge_length_sq`.
+ * @param params Supplies the sizing mode and its lengths.
  * @return `true` if the split sweep should split this edge.
  */
 bool MFTLSplitApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParameters *params);
@@ -765,9 +1007,12 @@ bool MFTLSplitApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParameter
  *        D                    D
  *
  * Rewrites the incident triangle(s) and appends one triangle per side. M is the
- * minimum-image midpoint, wrapped into the domain -- or, for an edge of an open
+ * minimum-image midpoint, wrapped into the domain -- or, under a paraboloid
+ * `split_placement` and for an interior non-feature edge, the fitted point above it
+ * unless that would fold a new triangle -- or, for an edge of an open
  * surface's RIM, the point of the rim curve over it (see
- * MFTL_RemeshParameters::rim_project), then the projector if one is set. M
+ * MFTL_RemeshParameters::rim_project), then the projector if one is set. Under
+ * curvature sizing M's target is interpolated from A's and B's. M
  * inherits the edge's FEATURE/BOUNDARY classification, as do both halves. M and
  * the halves are marked visited, so the same sweep neither re-splits nor
  * collapses them.
@@ -785,8 +1030,9 @@ int MFTLSplitEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *params);
  * @brief Is collapsing half-edge @p h (its origin into its target) legal and
  *        wanted?
  *
- * Wanted: shorter than `min_edge_length`. Each clause prevents a result that is
- * a valid data structure but not a valid surface, and none of them fails loudly:
+ * Wanted: MFTLRemeshEdgeWantsCollapse() -- under uniform sizing, shorter than
+ * `min_edge_length`. Each clause prevents a result that is a valid data
+ * structure but not a valid surface, and none of them fails loudly:
  *
  * - **Features:** a corner is never retired; a feature (boundary) vertex may
  *   only collapse into a feature (boundary) vertex; two feature (boundary)
@@ -797,13 +1043,16 @@ int MFTLSplitEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *params);
  * - **Valence:** the merged vertex has valence in [3, #MFTL_MAX_VALENCE], and
  *   each wing vertex has at least 4 neighbours (a tetrahedron passes the link
  *   condition and would dissolve).
- * - **Stretch:** no edge of the merged vertex exceeds `max_edge_length`, or
- *   split and collapse oscillate.
+ * - **Stretch:** no edge of the merged vertex is one the split sweep would split
+ *   (`max_edge_length`; under curvature sizing \f$\tfrac43\f$ of the smaller
+ *   target of its ends), or split and collapse oscillate.
  * - **Fold-over:** no surviving triangle's normal turns by more than
  *   `max_normal_deviation_cos` or becomes degenerate (the test is relative to
  *   the triangle's own edges, so it is independent of the length unit).
  *
- * Truncated one-ring walks (valence beyond the scratch size) are refused.
+ * Stretch and fold-over are judged at the position MFTLCollapseEdge() will use,
+ * `collapse_placement` and `collapse_preserves_volume` included. Truncated
+ * one-ring walks (valence beyond the scratch size) are refused.
  *
  * @param      obj           The mesh.
  * @param      h             Half-edge index; its ORIGIN would be retired.
@@ -841,7 +1090,9 @@ bool MFTLCollapseApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParame
  * evaluated with the same @p params: its own position if it is a corner or if
  * it alone lies on a feature curve or boundary; the rim curve's point (then the
  * projector) for an edge of an open surface's rim; otherwise the minimum-image
- * midpoint. The one or two incident triangles and the origin are flagged
+ * midpoint, or under a paraboloid `collapse_placement` the fitted point above
+ * it, and under `collapse_preserves_volume` that point moved to keep the
+ * enclosed volume. The one or two incident triangles and the origin are flagged
  * #MFTL_FLAG_DEAD; pool indices do not change until MFTLRemeshCompactObject().
  *
  * @param obj    The mesh. Allocates nothing.
@@ -976,7 +1227,10 @@ int MFTLDetectFeatures(MFTL_Object *obj, double angle_degrees, double corner_ang
  *   the chord and erodes the ridge.
  * - **Free:** the pull towards the target point of `smooth_mode`, minus its
  *   component along the area-weighted vertex normal (2D). Without the
- *   projection, Laplacian smoothing shrinks the surface.
+ *   projection, Laplacian smoothing shrinks the surface. Under curvature
+ *   sizing each triangle is weighted by its area over its squared mean target
+ *   (Dunyach et al. 2013, with the ODT density). Ridge and rim vertices follow
+ *   the sized 1D rule under curvature sizing.
  *
  * Vertex normals come from MFTLComputeVertexNormals(), refreshed every sweep; a
  * vertex whose normal is zero (degenerate one-ring) stays put. Steps are scaled
@@ -987,15 +1241,116 @@ int MFTLDetectFeatures(MFTL_Object *obj, double angle_degrees, double corner_ang
  * without communication. Jacobi updates make the result independent of pool
  * order.
  *
+ * Under #MFTL_REMESH_PROJECT_PHONG every free vertex the last sweep moved is
+ * then projected onto the Phong surface of the mesh as this call received it
+ * (a reference copied here; MFTLRemeshObject() copies one per kernel call
+ * instead, before its first split, and projects after its last sweep).
+ *
  * @param obj        The mesh; positions updated in place.
- * @param params     Supplies `smooth_mode`, `smooth_relaxation` and
- *                   `smooth_max_step_fraction`.
+ * @param params     Supplies `smooth_mode`, `smooth_relaxation`,
+ *                   `smooth_max_step_fraction` and `projection`.
  * @param iterations Sweeps to perform.
  *
  * @note Requires #MFTL_DERIVED_TOPOLOGY and a current feature classification.
  * @rank_local
  */
 void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params, int iterations);
+
+// -----------------------------------------------------------------------------
+// 4b. SIZING  (src/remeshing/remesh_sizing.c)
+// -----------------------------------------------------------------------------
+//
+// The decision makers of MFTL_RemeshParameters::sizing. The operators, the
+// sweeps and the spanning driver's convergence certificate all judge an edge
+// through the two predicates below, so they cannot disagree.
+
+/**
+ * @brief Is the edge of half-edge @p h too long for the current sizing mode?
+ *
+ * - **Uniform:** longer than `max_edge_length`.
+ * - **Curvature:** longer than \f$\tfrac43 \min(L(a), L(b))\f$.
+ *
+ * No legality test: the split sweep adds those (MFTLSplitApproved()).
+ *
+ * @param obj    The mesh (with `verts.sizing` prepared under curvature sizing).
+ * @param h      Half-edge index.
+ * @param params The parameter block.
+ * @return `true` if a split is wanted.
+ */
+bool MFTLRemeshEdgeWantsSplit(const MFTL_Object *obj, int h, const MFTL_RemeshParameters *params);
+
+/**
+ * @brief Is the edge of half-edge @p h too short for the current sizing mode?
+ *
+ * - **Uniform:** shorter than `min_edge_length`.
+ * - **Curvature:** shorter than \f$\tfrac45 \min(L(a), L(b))\f$.
+ *
+ * No legality test: MFTLCollapseApproved() adds those.
+ *
+ * @param obj    The mesh (with `verts.sizing` prepared under curvature sizing).
+ * @param h      Half-edge index.
+ * @param params The parameter block.
+ * @return `true` if a collapse is wanted.
+ */
+bool MFTLRemeshEdgeWantsCollapse(const MFTL_Object *obj, int h, const MFTL_RemeshParameters *params);
+
+/**
+ * @brief Dunyach's target edge length for maximum absolute curvature @p kappa:
+ *        \f$L = \sqrt{6\varepsilon/\kappa - 3\varepsilon^2}\f$, clamped to
+ *        [`min_target_length`, `target_length`].
+ *
+ * Evaluated without dividing before the clamps: \f$\kappa \le 0\f$ (flat)
+ * gives the coarsest target and \f$\kappa \ge 2/\varepsilon\f$ (where the
+ * formula's square turns negative) the finest, so no input yields NaN.
+ *
+ * @param kappa  Maximum absolute curvature.
+ * @param params Supplies \f$\varepsilon\f$ (`curvature_tolerance`) and the clamps.
+ * @return The target length.
+ */
+double MFTLRemeshCurvatureSizing(double kappa, const MFTL_RemeshParameters *params);
+
+/**
+ * @brief Computes the curvature sizing field `verts.sizing` of @p obj
+ *        (#MFTL_REMESH_SIZING_CURVATURE); a no-op under the other modes.
+ *
+ * Enables the array (MFTLObjectEnableSizing()), classifies features, takes the
+ * discrete curvature of every vertex (MFTLComputeVertexCurvatures(),
+ * \f$\kappa = H + \sqrt{\max(H^2 - K, 0)}\f$) through
+ * MFTLRemeshCurvatureSizing(), and gives every feature, corner and boundary
+ * vertex the mean target of its non-feature neighbours (Dunyach et al. 2013,
+ * Sect. 3). The remeshing drivers call it once per kernel call; the operators
+ * then CARRY the field (a split interpolates it, a collapse moves it with the
+ * survivor, compaction permutes it). Call it yourself only to use the operators
+ * directly under curvature sizing.
+ *
+ * @param obj    The mesh.
+ * @param params The parameter block.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR if the block is invalid for its mode.
+ * @rank_local Exact on owned vertices; a ghost's value is a partial-fan value.
+ */
+int MFTLRemeshPrepareSizing(MFTL_Object *obj, const MFTL_RemeshParameters *params);
+
+/**
+ * @brief MFTLRemeshPrepareSizing() for every local body, with the ghost copies
+ *        made equal to their owners' values; a no-op unless the curvature mode
+ *        is set.
+ *
+ * The sizing is a one-ring quantity, exact on owned vertices of a partitioned
+ * mesh and partial on ghosts. Two owner-to-ghost exchanges (one after the
+ * curvature pass, one after the feature-vertex average, which reads
+ * neighbours) make every copy of a vertex hold the same target -- what the
+ * spanning driver's convergence certificate needs, since it judges edges whose
+ * ends may be ghosts. The spanning driver calls this after every migration; it
+ * is public so the field can be inspected (or written out) on the canonical
+ * partition.
+ *
+ * @param ens    The ensemble.
+ * @param params The parameter block, identical on every rank.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR for an invalid block (on every rank) or
+ *         an unserved ghost (on the rank that holds it).
+ * @collective
+ */
+int MFTLRemeshEnsemblePrepareSizing(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params);
 
 // -----------------------------------------------------------------------------
 // 5. DRIVERS  (src/remeshing/remesh_driver.c)

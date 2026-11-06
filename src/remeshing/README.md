@@ -6,8 +6,11 @@
 
 | File | Job | MPI |
 |---|---|---|
-| `remesh_ops.c` | split, collapse, flip: an approval predicate and an execution function each | no |
+| `remesh_ops.c` | split, collapse, flip: an approval predicate and an execution function each; the volume-preserving collapse target | no |
 | `remesh_smooth.c` | feature detection, tangential smoothing | no |
+| `remesh_sizing.c` | the decision makers of the two sizing modes: edge predicates, the curvature field | no |
+| `remesh_fit.c` | paraboloid placement of split and collapse vertices | no |
+| `remesh_project.c` | the smoother's back-projection onto the Phong surface of the call's input | no |
 | `remesh_compact.c` | remove dead entities, restore the ownership prefix, re-densify ids | no |
 | `remesh_driver.c` | the sweep loop, the serial driver, the dispatch | no |
 | `remesh_parallel.c` | SPANNING: shift the cut planes | no |
@@ -23,7 +26,8 @@ declares the communication layer and the shifted ownership rules.
 
 | Symbol | Meaning | Where |
 |---|---|---|
-| $L$ | target edge length | `params.target_length` |
+| $L$ | target edge length (the coarsest under curvature sizing) | `params.target_length` |
+| $L(v)$, $\varepsilon$ | per-vertex curvature target; approximation tolerance | `verts.sizing`, `params.curvature_tolerance` |
 | $\ell_{\min}, \ell_{\max}$ | length band, $\tfrac45 L$ and $\tfrac43 L$ | `params.min/max_edge_length` |
 | $P$ | rank count | `domain.nproc` |
 | $h_k$, $h$ | rank box width on axis $k$; its minimum over cut axes | `MFTLDomainGetHMin` |
@@ -82,6 +86,13 @@ ping-pong.
 - **DETECT twice:** splits and collapses change which edges exist. A split of a
   rim edge creates a midpoint on the rim; classified as free, it would slide off
   the rim, leaving a notch no structural check can see.
+
+Jiao et al.'s §5.4 order (smooth, collapse, flip, split, flip, smooth) and
+length-sorted sweeps (longest split first, shortest collapse first) were
+implemented, measured over the LeVeque period and removed (`docs/analysis.md`
+§14.8). Jiao's order lost more volume in every mode, even at equal smoothing work:
+uniform sizing at refinement 4 lost 9.5 ± 1.1 % against 3.9 ± 0.1 %, at 1.8–2.0
+times the cost. Sorting changed nothing beyond the run-to-run spread.
 
 ---
 
@@ -321,6 +332,352 @@ is exempt from smoothing, collapse and flip. Final minimum quality 0.76 with
 detection off against 0.0002 at 45°, monotone over five thresholds
 (`docs/analysis.md` §4). **Set `feature_angle_threshold` to 180 for smooth closed
 interfaces**; boundaries remain features.
+
+---
+
+## Sizing: uniform and curvature-adaptive {#rem_sizing}
+
+`params.sizing` chooses how the remesher judges an edge, once per run. The
+driver, the sweep order, the freeze discipline and both distributed strategies
+are the same for both; what differs is four decision makers:
+
+| Decision | `UNIFORM` | `CURVATURE` (Dunyach et al. 2013) |
+|---|---|---|
+| split wanted | $\ell > \ell_{\max}$ | $\ell > \tfrac43\min(L(a),L(b))$ |
+| collapse wanted | $\ell < \ell_{\min}$ | $\ell < \tfrac45\min(L(a),L(b))$ |
+| collapse stretch | new edge $> \ell_{\max}$ | new edge $> \tfrac43\min(L_m, L(w))$ |
+| free-vertex target | area-weighted centroid | centroid weighted by area $/\bar L^2$ |
+
+Flips (valence) and new-vertex positions (chord midpoint) are the same in both.
+
+Every judgement goes through `MFTLRemeshEdgeWantsSplit` and
+`MFTLRemeshEdgeWantsCollapse` — the operators' predicates, the collapse's
+stretch clause and the spanning driver's convergence certificate alike — so they
+cannot disagree about what "too long" means. The `UNIFORM` branches are the
+expressions the remesher had before sizing existed, and every uniform digest is
+unchanged. The topological operators themselves are untouched: a split
+interpolates the curvature target to its new vertex and a collapse to its
+survivor, one line each.
+
+`max_edge_length` is always the longest edge the mode can want —
+$\tfrac43 L_{\max}$ under curvature sizing — because the frozen band
+($3\,\ell_{\max}$) and the parameter check read it.
+`MFTLRemeshUseCurvatureSizing` sets the mode and derives that envelope; the
+settings layer does the same from `remesh.sizing`.
+
+### Curvature-adaptive {#rem_sizing_curvature}
+
+The target of a vertex comes from its maximum absolute curvature $\kappa$ and the
+approximation tolerance $\varepsilon$ — the largest gap between an edge and the
+surface it cuts — through the circumcircle of an equilateral triangle:
+
+$$
+  L(v) = \sqrt{6\varepsilon/\kappa - 3\varepsilon^2}\ \in [L_{\min}, L_{\max}],
+  \qquad \kappa = H + \sqrt{\max(H^2 - K, 0)} .
+$$
+
+$H = \tfrac12\lVert\Delta\mathbf x\rVert$ and $K = (2\pi - \sum\theta)/A_\text{mixed}$
+are the paper's operators (Meyer et al. 2003: cotangent Laplacian, angle defect,
+mixed Voronoi area with the obtuse cases), computed by
+`MFTLComputeVertexCurvatures` in `src/geometry/`. `MFTLRemeshCurvatureSizing`
+evaluates the formula without dividing before the clamps: $\kappa \le 0$ is the
+coarsest target, $\kappa \ge 2/\varepsilon$ the finest, and no input gives NaN.
+An edge's target is the smaller of its ends'. A feature, corner or rim vertex has
+no curvature of its own — a crease is unbounded, a half fan is not a curvature —
+and takes the mean of its non-feature neighbours (paper, Sect. 3, item 1).
+
+**One smoothing pass over the one-ring, before the length is taken.** Not in the
+paper; in its reference implementation (pmp-library smooths the curvature tensor
+once), and it is load-bearing. The edge rule takes a MINIMUM of two noisy
+estimates, which is biased low, so without the pass a remeshed mesh reads about
+6 % more curvature than its input and every pass that recomputes the field
+refines further: five repeated serial remeshes of an ellipsoid went
+4578 → 5092 → 5040 → 4952 → 4958 triangles and were still operating
+(`docs/analysis.md` §14.1). With it they reach a fixed point — no operation
+from the sixth call on — within 4 % of the first.
+
+**The field is computed once per kernel call and then carried.** A split
+interpolates it to the new vertex, a collapse to the survivor, compaction and
+reordering permute it (`verts.sizing`, an optional array of the vertex pool's one
+block: zero bytes unless enabled). Recomputing after every operation (what the
+old mftl did) would feed the chord midpoints the operators create straight back
+into the curvature.
+
+**Smoothing** moves a free vertex to
+$\sum_t |t|\rho_t\mathbf b_t / \sum_t |t|\rho_t$ with the density
+$\rho_t = \bar L_t^{-2}$ ($\bar L_t$ the mean of the three corner targets). This is a deliberate deviation from the printed Eq. 6,
+which weights by $|t|\,L(\mathbf b_t)$: the Optimal Delaunay Triangulation the
+paper cites weights by a density that DECREASES with the target, and so does
+pmp-library. The printed weight pulls vertices towards the coarse side, against
+the sizing field; `test_the_smoother_moves_towards_the_fine_side` asserts the
+sign. A ridge or rim vertex follows the 1D form of the same rule along its curve
+(edge midpoints weighted by length over squared target), whose fixed point is
+$\ell_1/L_1 = \ell_2/L_2$ and which is the uniform rule when the targets agree.
+
+**Distributed.** The field is a one-ring quantity, exact on owned vertices (the
+halo is vertex-complete) and partial on ghosts. No admitted operation reads a
+ghost's value; the convergence certificate does, and `hidden_long` is exact only
+if every copy of a vertex holds the same target. So
+`MFTLRemeshEnsemblePrepareSizing` runs the curvature pass, gives the ghosts their
+owners' values (`MFTLRemeshSyncGhostSizing`, `remesh_comm.c`, the route of the
+ghost-id exchange including its global fallback), runs the neighbour pass, and
+exchanges again. A redistribution does not carry the field, so the spanning
+driver recomputes it after every migration; each recomputation on a part-remeshed
+mesh is another chance to split at a dip the band's hysteresis then keeps, and
+the distributed fixed point carries 1.3 / 3.9 / 6.0 / 4.0 % more triangles than
+the one-rank fixed point at np = 2 / 4 / 8 / 27 (`docs/analysis.md` §14.2).
+Carrying the field through the remesher's migrations would remove that and
+needs a payload in the redistribution's wire format; not done.
+
+**Run ONE iteration per placement under curvature sizing.** The spanning driver
+converges every placement fully, so a budget of 4 is four times the serial
+kernel work per remesh, each time with a recomputed field. A uniform mesh is
+near converged every step and does not care; a curvature-sized mesh tracks a
+curvature that moves, and every extra pass splits and collapses for real: the
+LeVeque period at np = 4 kept 0.717 of its volume with three iterations per
+placement and 0.881 with one (serial: 0.903), at 45 against 19 ms/step
+(`docs/analysis.md` §14.5).
+
+### Removed: anisotropic adaptation and quadric-error placement {#rem_sizing_removed}
+
+Jiao et al.'s anisotropic mode (2010: a quadric metric for the flip and the
+smoother, the paper's split and collapse criteria, quadric-error placement of new
+vertices) was implemented as a third mode, measured over the LeVeque period, and
+removed with its tests (`docs/analysis.md` §14.4, §14.7–§14.9;
+`studies/leveque_remeshing/REPORT.md` §7; the code is archived as
+`studies/leveque_remeshing/archive/sizing_with_anisotropic_and_qem.patch`
+against commit `bb3c785`). It held the enclosed volume best of the three modes
+(+0.06 % at refinement 5, uniform −1.17 %), but the follow-up located that in
+how rarely it COLLAPSES under a stretching flow, not in its metric: the
+volume a remesher loses on a convex surface is lost by collapses and valence
+flips, and a mode that tolerates stretched triangles makes a seventh of the
+collapses. It carried three times the triangles, cost 3–4 times as much, and
+returned the noisiest curvature of all modes. Quadric-error placement, which
+it used and which was also an option for the other two, lowered the volume and
+position errors of uniform and curvature sizing and raised their curvature
+noise 1.4–3 times. A back-projection onto a smooth reconstruction of the
+call's input, measured in the same study, beat both on every measure.
+
+---
+
+## Vertex placement and back-projection {#rem_placement}
+
+A remesher that splits at chord midpoints, collapses to them and smooths in the
+tangent plane loses volume on a convex front, and only two of its sweeps do:
+a collapse replaces two surface points by one on the chord, and a valence flip
+away from the convex diagonal cuts off a tetrahedron. Each call's loss becomes
+the next call's input. Over the LeVeque period at refinement 4 that is −2.7 %
+(collapses) and −1.2 % (flips) under uniform sizing; a midpoint split is exactly
+neutral and tangential smoothing gains +0.2 % (`docs/analysis.md` §14.9). Three
+independent options attack it, all off by default and bit-identical to the old
+remesher when off: where splits and collapses put their vertex (chosen
+separately), a volume-preserving collapse, and a back-projection of the
+smoother.
+
+### Placement: a paraboloid through the edge's two-ring {#rem_placement_fit}
+
+`params.split_placement` = `MFTL_REMESH_PLACE_PARABOLOID` puts a split's new
+vertex, and `params.collapse_placement` = `MFTL_REMESH_PLACE_PARABOLOID` a
+collapse's merged vertex between two free vertices, on a weighted
+least-squares height paraboloid above the edge midpoint
+(`MFTLRemeshFitEdgePoint`). The two are separate switches; both default to the
+midpoint:
+
+- **Frame.** Origin at the minimum-image midpoint $m$, $z$ along the normalised
+  sum of the endpoints' vertex normals, $x$ along the edge projected into the
+  tangent plane. Normals use Max's weights
+  $\sum (\mathbf e_1\times\mathbf e_2)/(|\mathbf e_1|^2|\mathbf e_2|^2)$,
+  exact for vertices on a sphere; they measured better than angle weights here.
+- **Samples.** The vertices of the edge's two-ring, 20–30 of them, each weighted
+  by Wendland's C2 function $(1-q)^4(1+4q)$ of
+  $q = |\mathbf x - m| / (\rho h)$, with $h$ the mean length of the edges at
+  both endpoints and $\rho$ = `fit_radius`. A sample whose normal is more than 60° from $z$ is
+  dropped: it is on the far side of a fold or a sheet.
+- **Scale.** Coordinates in units of $h$, so every column is O(1) and the rank
+  tolerance is dimensionless. A mesh scaled by $2^{-20}$ remeshes to the scaled
+  result bit for bit.
+- **Solve.** `MFTLFitHeightParaboloid`, QR with column pivoting grouped as
+  {height, slopes} then {curvatures} (`src/geometry/README.md`, "Least squares").
+  An undetermined curvature component is set to zero; an undetermined height, a
+  correction beyond a quarter of the edge, fewer than six samples or, for a
+  split, a fold of a new triangle fall back to the midpoint.
+- **With normals** (`MFTL_REMESH_PLACE_PARABOLOID_NORMALS`), every owned sample
+  with a complete fan off any feature adds its normal's slopes
+  $\partial_x z = -n_x/n_z$, $\partial_y z = -n_y/n_z$ as two more equations.
+
+**Partitioned meshes.** An operation is only allowed on an unfrozen edge, whose
+one-ring is owned and unreplicated, so both endpoint fans are complete. The
+two-ring may reach ghosts (about 30 % of the fits at np = 4): their positions
+are exact (a ghost is frozen on its owner), their normals partial, so a ghost
+contributes its position only. Giving the ghosts their owners' normals (one
+exchange per placement) measured the same within the spread, so there is none.
+
+**What changed against mftl's fit.** mftl fitted the same quadric to eight
+vertices (the edge's two triangles and the four across their outer edges),
+unweighted, in physical coordinates, through LAPACK `dgelsy` with
+`rcond = 1e-10`, the frame normal summed over the rank's owned vertices only.
+Its coordinate transformation was right: it formed the cofactor matrix over the
+determinant, i.e. the inverse transposed, which for an orthonormal frame is the
+frame itself, the rotation it needed. Its failure was the scale: below an edge
+length of about $10^{-5}$ in the units of the coordinates the curvature
+columns fall under `rcond` and the height comes out wrong by several sagittas
+(4.5 on a sphere of radius $10^{-4}$). Scaled, its eight samples are as
+accurate on an exact sphere as a two-ring with radius 2; the wider, weighted
+stencil trades a little of that accuracy for noise rejection on a real front.
+
+**Cost.** A collapse's position is fitted only for candidates whose midpoint
+already passes the stretch and fold clauses, then judged again at the fitted
+point, and its execution reuses the approval's fit (cached on the mesh's
+generation stamp). Without that a run spent five times as many fits on
+candidates the fold or stretch clause then refused.
+
+### The volume-preserving collapse {#rem_placement_volume}
+
+`params.collapse_preserves_volume` moves the point `collapse_placement` chose,
+midpoint or fitted, so that the collapse leaves the enclosed volume unchanged
+(the volume constraint of Lindstrom & Turk 1998). Measured from the merged
+position $\mathbf p$, a surviving triangle of the patch (the triangles at the two
+endpoints) holds $\mathbf p$ as a corner and contributes nothing after the
+collapse, so the change is minus the patch's old contribution,
+
+$$
+  \Delta V(\mathbf p) = -\tfrac16 \sum_{\text{patch}}
+  \det(\mathbf x_0-\mathbf p,\ \mathbf x_1-\mathbf p,\ \mathbf x_2-\mathbf p),
+$$
+
+independent of the origin because the patch's rim is the same closed loop
+before and after. Every surviving triangle holds $\mathbf p$ exactly once, so
+$\Delta V$ is LINEAR in $\mathbf p$, with gradient
+$\mathbf g = \tfrac16\sum_{\text{surviving}} (\mathbf y-\mathbf p)\times(\mathbf z-\mathbf p)$
+over each triangle's other two corners in cyclic order (a third of the new
+fan's vector area). One step
+
+$$
+  \mathbf p \leftarrow \mathbf p - \Delta V\,\mathbf g/|\mathbf g|^2
+$$
+
+reaches the plane $\Delta V = 0$ at its point nearest the chosen one; it is
+exact up to rounding, so there is no iteration
+(`test_a_volume_preserving_collapse_keeps_the_volume`: below $10^{-15}$ of V
+per collapse, against $2\cdot10^{-4}$ without). The move is along the fan's
+normal by $3|\Delta V|/A_\text{fan}$, a fraction of the sagitta.
+
+- **Scope.** An interior edge between two free vertices, whose link is a closed
+  loop. Rim collapses keep the rim curve, a collapse into a pinned vertex keeps
+  its position, and a truncated fan or a zero gradient leaves the chosen point.
+- **Judged.** The stretch and fold clauses judge the moved point, the midpoint
+  candidate and the fitted one alike; the move costs one pass over the two fans.
+- **Partitioned meshes.** Only unfrozen edges collapse, so both fans are owned
+  and complete and no ghost is read; `test_leveque_parallel_conserves_vpcollapse`
+  runs it at np = 2.
+
+**Why collapses.** Over the LeVeque period at refinement 4, 94 % of the
+collapse loss comes from patches bent by more than 5°, which are 47 % of the
+collapses: the stretched filament's under-resolved rims. The flow stretches one
+direction while it compresses the other, so splits and collapses run on the
+same material at the same time (8 777 collapses against 15 417 splits even in
+the growing half of the period), and every midpoint collapse of a bent patch
+cuts off a cap. A midpoint split leaves the triangulated surface unchanged.
+
+**Measured** (uniform sizing, four orientations, `docs/analysis.md` §15.4):
+
+| refinement 5, at T | V/V(0) − 1 | d_rms [% R0] | E_H | N_H |
+|---|---|---|---|---|
+| projection | −0.182 % | 0.247 | 0.17 | 0.082 |
+| projection + volume-preserving collapse | −0.175 % | 0.236 | 0.15 | 0.066 |
+| midpoint, no projection | −1.18 % | 0.63 | 1.29 | 1.52 |
+| volume-preserving collapse, no projection | −0.41 % | 0.26 | 1.78 | 2.18 |
+
+With the projection it improves every measure, more at refinement 4 (E_H
+0.55 → 0.38, N_H 0.33 → 0.22), for +0.5–1.0 % of a step. Without the projection the
+position improves and the curvature noise grows: a patch's deficit is put back
+at one vertex, a bump the next smoothing does not remove.
+
+**Measured and not taken, for flips.** A flip's volume change is
+$\det(\mathbf d,\mathbf b,\mathbf c)/6$ from $\mathbf a$. Refusing a flip whose
+change exceeds a threshold halves the flips' loss, but the valences it leaves
+make the collapses lose more (net −3.74 against −3.90 % at refinement 4).
+Restoring it exactly by a common shift of the quad's four vertices along its
+normal helps only without the projection, which takes the shift back.
+
+### Back-projection onto the Phong surface of the call's input {#rem_placement_project}
+
+`params.projection` = `MFTL_REMESH_PROJECT_PHONG` moves every free vertex the
+call's last smoothing sweep moved onto the Phong surface (Boubekeur & Alexa 2008,
+$\alpha = \tfrac12$) of the mesh as THIS kernel call received it:
+
+$$
+  \mathbf p \leftarrow \mathbf p_\flat - \tfrac12 \sum_i u_i\,
+  \big((\mathbf p_\flat - \mathbf x_i)\cdot\mathbf n_i\big)\,\mathbf n_i ,
+$$
+
+$\mathbf p_\flat$ the closest point on the reference's flat triangles, $u_i$ its
+barycentrics, $\mathbf n_i$ the reference's angle-weighted normals.
+
+- **Why the call's input, and why curved.** Botsch & Kobbelt project onto the
+  original surface kept as a mesh, fixed and usually finer. In front tracking
+  that mesh is the previous step's at the same resolution, and projecting onto
+  its flat triangles puts every smoothed vertex on a chord: −12.5 % of the
+  volume over the LeVeque period at refinement 4. Its Phong surface passes
+  through the same vertices and is curved like the front, so the smoother
+  re-lifts what this call's collapses and flips cut off. A reference rebuilt
+  from the current mesh does not: it reconstructs the surface from the samples
+  being smoothed and loses more volume than no projection (`docs/analysis.md`
+  §14.9).
+- **What it means physically.** The call receives the surface the flow advected;
+  remeshing is meant to change its discretisation, not its position. Every
+  normal displacement the operators and the tangential smoother make is a
+  discretisation error, and the projection takes it back to the advected
+  surface, known through its vertices and their normals. It does not touch
+  what the advection put there, noise included, and it undoes any normal
+  motion made on purpose INSIDE the call: a denoising or volume-correcting step
+  (TSUR3D, say) belongs outside the remesher, or must produce the reference.
+  Mesh quality is unaffected: the correction is a sagitta, the smoother's
+  moves are a fraction of an edge (mean quality at T 0.9767 against 0.9775
+  without, uniform sizing at refinement 4; `docs/analysis.md` §14.10).
+- **Once per call.** The projection runs after the last smoothing sweep of the
+  call's last iteration. After every sweep it measured the same within the
+  run-to-run spread (under-resolved uniform sizing at refinement 4: −1.49
+  against −1.60 % volume) at about three times the cost; the intermediate
+  sweeps and operators work on a slightly perturbed surface and the final
+  projection puts every moved vertex back.
+- **The reference** (`MFTL_RemeshReference`) is copied once per kernel call,
+  after the first feature detection, and kept for all its iterations:
+  positions, normals, corners, edge neighbours, and the vertex global ids,
+  sorted. A corner that is a feature, corner, boundary or ghost vertex gets no
+  normal, so the Phong surface degrades to the flat triangle towards it.
+- **Finding the closest triangle without a search structure.** A kernel call does
+  not renumber global ids, so a vertex the call received is found in the copy
+  by binary search on its id, a vertex a split created through a neighbour. A
+  walk over the copy's edge neighbours then reaches the closest triangle, and
+  each later sweep starts from the triangle the previous one found. No grid, no
+  communication: a moved vertex is unfrozen and its fan owned. Since the
+  projection runs once, each lookup starts cold (about 120 ns a vertex). A projection
+  that would bridge more than half the vertex's shortest edge is not made.
+- **Normals.** Angle weights. Max's weights are exact on a sphere and make the
+  lift fourth-order on an irregular sphere mesh, where angle weights leave it
+  second-order with a three times smaller constant than no projection
+  (`test_projected_smoothing_stays_on_the_sphere`), but over the LeVeque period
+  they were worse at refinement 4 and equal at 5.
+
+### Measured {#rem_placement_measured}
+
+LeVeque period, four orientations, one rank (`docs/analysis.md` §14.10):
+
+| curvature sizing, V/V(0) − 1 at T, N_H | refinement 4 | refinement 5 |
+|---|---|---|
+| midpoint, no projection | −3.15 %, 2.57 | −0.97 %, 1.58 |
+| paraboloid placement (positions) | −0.56 %, 0.58 | −0.32 %, 0.38 |
+| paraboloid placement (+ normals) | +0.01 %, 0.90 | −0.22 %, 0.36 |
+| Phong projection | −0.089 %, 0.075 | −0.030 %, 0.023 |
+| projection + paraboloid placement | −0.089 %, 0.079 | −0.030 %, 0.022 |
+
+**The projection is the one to switch on**; with it the placement adds nothing
+measurable. Projecting once per call costs 3.3–3.7 % of the remesh time in
+projections and 2.4–2.8 % in reference copies, +5–10 % per triangle-step, and a
+transient 53 B per triangle during a kernel call against the pool's ~172. The
+placement on its own is the cheaper partial remedy: 2.3 µs (positions) or
+3.1 µs (with normals) per fit, 2.4–5.4 % of the remesh time.
 
 ---
 

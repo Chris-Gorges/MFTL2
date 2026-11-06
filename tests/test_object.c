@@ -46,6 +46,7 @@ static void touch_every_array_at_capacity(MFTL_Object *obj)
     obj->verts.rec[vc - 1].global_id = 1;
     obj->verts.pos[3 * vc - 1] = 1.0;
     obj->verts.normal[3 * vc - 1] = 1.0;
+    if (obj->verts.has_sizing) obj->verts.sizing[vc - 1] = 1.0;
   }
 
   if (tc > 0)
@@ -77,6 +78,7 @@ static void fill_pattern(MFTL_Object *obj, int seed)
       obj->verts.pos[3 * v + k] = (double) (seed + 3 * v + k);
       obj->verts.normal[3 * v + k] = (double) (seed - 3 * v - k);
     }
+    if (obj->verts.has_sizing) obj->verts.sizing[v] = (double) (seed + 7 * v);
   }
 
   for (int t = 0; t < obj->tris.n; ++t)
@@ -114,6 +116,7 @@ static int check_pattern(const MFTL_Object *obj, int seed, int nv, int nt)
       if (obj->verts.pos[3 * v + k] != (double) (seed + 3 * v + k)) return 0;
       if (obj->verts.normal[3 * v + k] != (double) (seed - 3 * v - k)) return 0;
     }
+    if (obj->verts.has_sizing && obj->verts.sizing[v] != (double) (seed + 7 * v)) return 0;
   }
 
   for (int t = 0; t < nt; ++t)
@@ -724,6 +727,65 @@ static int test_update_global_counts_counts_the_owned_prefix(void)
   return 0;
 }
 
+/**
+ * @brief The optional `verts.sizing` array costs nothing until enabled, then
+ *        lives in the same block as every other vertex array: preserved by
+ *        enabling, by growth and by a shrink, addressable to capacity - 1
+ *        (an ASan failure otherwise), and dropped by a release.
+ */
+static int test_the_sizing_array_is_optional_and_part_of_the_block(void)
+{
+  MFTL_Object *obj = MFTLObjectCreate(1);
+  MFTLObjectSetCounts(obj, 50, 50, 40, 40);
+  TEST_ASSERT(!obj->verts.has_sizing && obj->verts.sizing == MFTL_NULL);
+  const size_t without = MFTLObjectPoolBytes(obj);
+  fill_pattern(obj, 11);
+
+  MFTLObjectEnableSizing(obj);
+  TEST_ASSERT(obj->verts.has_sizing && obj->verts.sizing != MFTL_NULL);
+  TEST_ASSERT(MFTLObjectPoolsAreConsistent(obj));
+  TEST_ASSERT(MFTLObjectPoolBytes(obj) >= without + (size_t) obj->verts.capacity * sizeof(double));
+  for (int v = 0; v < obj->verts.n; ++v) TEST_ASSERT(obj->verts.sizing[v] == 0.0);  // a new array starts zeroed
+  fill_pattern(obj, 11);
+  TEST_ASSERT(check_pattern(obj, 11, 50, 40));
+
+  MFTLObjectEnableSizing(obj);  // idempotent
+  TEST_ASSERT(check_pattern(obj, 11, 50, 40));
+
+  MFTLObjectReserve(obj, 5000, 4000);  // both pools past their counts, so the touches below hit no live entity
+  TEST_ASSERT(MFTLObjectPoolsAreConsistent(obj) && check_pattern(obj, 11, 50, 40));
+  touch_every_array_at_capacity(obj);
+  TEST_ASSERT(MFTLObjectShrinkToFit(obj, MFTL_SHRINK_SLACK_DEFAULT));
+  TEST_ASSERT(MFTLObjectPoolsAreConsistent(obj) && check_pattern(obj, 11, 50, 40));
+  touch_every_array_at_capacity(obj);
+
+  MFTLObjectSetCounts(obj, 0, 0, 0, 0);
+  MFTLObjectReleasePools(obj);
+  TEST_ASSERT(!obj->verts.has_sizing && obj->verts.sizing == MFTL_NULL && MFTLObjectPoolsAreConsistent(obj));
+  MFTLObjectDestroy(&obj);
+  return 0;
+}
+
+/** @brief A Morton reorder moves `verts.sizing` with its vertices. */
+static int test_a_reorder_carries_the_sizing(void)
+{
+  MFTL_Object *obj = MFTLObjectCreate(0);
+  MFTLEnsembleAddObject(g_ens, obj);
+  double centre[3] = {0.0, 0.0, 0.0};
+  MFTLGenerateSphere(obj, centre, 0.5, 3);
+  MFTLObjectEnableSizing(obj);
+  for (int v = 0; v < obj->verts.n; ++v) obj->verts.sizing[v] = 0.5 + obj->verts.rec[v].global_id;
+  MFTLObjectReorderMorton(obj);
+  int moved = 0, ok = 1;
+  for (int v = 0; v < obj->verts.n; ++v)
+  {
+    ok &= (obj->verts.sizing[v] == 0.5 + obj->verts.rec[v].global_id);
+    moved += (obj->verts.rec[v].global_id != v);
+  }
+  TEST_ASSERT(ok && moved > 0);
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
@@ -757,6 +819,8 @@ int main(int argc, char **argv)
   RUN_TEST(test_shrink_to_fit_leaves_the_bookkeeping_alone);
   RUN_TEST(test_zeroed_on_first_allocation);
   RUN_TEST(test_update_global_counts_counts_the_owned_prefix);
+  RUN_TEST(test_the_sizing_array_is_optional_and_part_of_the_block);
+  RUN_TEST(test_a_reorder_carries_the_sizing);
 
   TEST_REPORT();
 

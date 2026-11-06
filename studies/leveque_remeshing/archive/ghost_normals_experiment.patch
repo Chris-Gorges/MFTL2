@@ -1,0 +1,150 @@
+--- a/src/remeshing/remesh_fit.c
++++ b/src/remeshing/remesh_fit.c
+@@ -70,6 +70,100 @@
+ #define MFTL_REMESH_FIT_MAX_HEIGHT 0.25
+ 
+ static long g_fit_counts[4] = {0, 0, 0, 0};
++
++/* ── EXPERIMENT: exact ghost normals for the fit (MFTL_EXP_GHOSTNRM) ───────
++ * 1: ghost samples use their OWNER's Max normal (exchanged once per placement,
++ *    kept by global id) for the filter and the slope rows;
++ * 2: ghost samples are dropped altogether. */
++#include <stdlib.h>
++#include "mftl_arrayfunctions.h"
++typedef struct
++{
++  const MFTL_Object *obj;
++  int n;
++  int *gid;
++  int *idx;
++  double *nrm;
++} exp_ghost_table;
++static exp_ghost_table g_exp_tab[256];
++static int g_exp_ntab = 0;
++static int exp_ghost_mode(void)
++{
++  static int m = -1;
++  if (m < 0)
++  {
++    const char *e = getenv("MFTL_EXP_GHOSTNRM");
++    m = e ? atoi(e) : 0;
++  }
++  return m;
++}
++int MFTLRemeshExpGhostMode(void) { return exp_ghost_mode(); }
++
++/* Max normals of every vertex into verts.normal (exact on owned vertices). */
++void MFTLRemeshExpMaxNormals(MFTL_Object *obj)
++{
++  double *nrm = obj->verts.normal;
++  memset(nrm, 0, (size_t) obj->verts.n * 3 * sizeof(double));
++  for (int t = 0; t < obj->tris.n; ++t)
++  {
++    if (obj->tris.rec[t].flags & MFTL_FLAG_DEAD) continue;
++    int tv[3];
++    for (int k = 0; k < 3; ++k) tv[k] = MFTLHeOrigin(obj, 3 * t + k);
++    for (int i = 0; i < 3; ++i)
++    {
++      const double *p = MFTLVertexPos(obj, tv[i]);
++      double e1[3], e2[3], c[3];
++      MFTLGetMinimumImageVector(obj->domain, e1, p, MFTLVertexPos(obj, tv[(i + 1) % 3]));
++      MFTLGetMinimumImageVector(obj->domain, e2, p, MFTLVertexPos(obj, tv[(i + 2) % 3]));
++      MFTLVectorCrossVector(c, e1, e2);
++      const double w = MFTLVectorNormSq(e1) * MFTLVectorNormSq(e2);
++      if (w > 0.0)
++        for (int k = 0; k < 3; ++k) nrm[3 * tv[i] + k] += c[k] / w;
++    }
++  }
++  for (int v = 0; v < obj->verts.n; ++v) MFTLNormalizeVector(&nrm[3 * v]);
++}
++
++/* After the ghost exchange: keep the ghosts' normals by global id. */
++void MFTLRemeshExpStoreGhostNormals(const MFTL_Object *obj)
++{
++  exp_ghost_table *t = MFTL_NULL;
++  for (int i = 0; i < g_exp_ntab; ++i)
++    if (g_exp_tab[i].obj == obj) t = &g_exp_tab[i];
++  if (!t && g_exp_ntab < 256) t = &g_exp_tab[g_exp_ntab++];
++  if (!t) return;
++  free(t->gid);
++  free(t->idx);
++  free(t->nrm);
++  const int ng = obj->verts.n - obj->verts.n_local;
++  t->obj = obj;
++  t->n = ng;
++  t->gid = malloc(sizeof(int) * (size_t) MFTL_MAX(ng, 1));
++  t->idx = malloc(sizeof(int) * (size_t) MFTL_MAX(ng, 1));
++  t->nrm = malloc(sizeof(double) * 3 * (size_t) MFTL_MAX(ng, 1));
++  for (int i = 0; i < ng; ++i)
++  {
++    const int v = obj->verts.n_local + i;
++    t->gid[i] = obj->verts.rec[v].global_id;
++    t->idx[i] = i;
++    for (int k = 0; k < 3; ++k) t->nrm[3 * i + k] = obj->verts.normal[3 * v + k];
++  }
++  MFTLSortPairs32(t->gid, t->idx, ng);
++}
++
++static bool exp_ghost_normal(const MFTL_Object *obj, int v, double n[3])
++{
++  for (int i = 0; i < g_exp_ntab; ++i)
++  {
++    if (g_exp_tab[i].obj != obj) continue;
++    const int j = MFTLSortedIndexOf(g_exp_tab[i].gid, g_exp_tab[i].n, obj->verts.rec[v].global_id);
++    if (j < 0) return MFTL_FALSE;
++    const double *q = &g_exp_tab[i].nrm[3 * g_exp_tab[i].idx[j]];
++    n[0] = q[0], n[1] = q[1], n[2] = q[2];
++    return MFTLVectorNormSq(n) > 0.0;
++  }
++  return MFTL_FALSE;
++}
+ static double g_fit_time = 0.0;
+ 
+ void MFTLRemeshGetFitCounters(MFTL_RemeshFitCounters *out)
+@@ -274,7 +368,13 @@
+     if (!(wi > 0.0)) continue;
+ 
+     double nv[3];
+-    const bool closed = max_normal(obj, v, nv);
++    bool closed = max_normal(obj, v, nv);
++    bool exact_ghost = MFTL_FALSE;
++    if (v >= obj->verts.n_local)
++    {
++      if (exp_ghost_mode() == 2) continue;
++      if (exp_ghost_mode() == 1 && exp_ghost_normal(obj, v, nv)) exact_ghost = closed = MFTL_TRUE;
++    }
+     const double nzl = MFTLVectorInProd(nv, nz);
+     if (!(nzl >= MFTL_REMESH_FIT_NORMAL_COS)) continue;
+ 
+@@ -287,7 +387,7 @@
+     /* Slopes only from a normal that describes the whole fan of an owned,
+      * smooth vertex; a ghost's fan is partial. */
+     const int f = obj->verts.rec[v].flags;
+-    use_slope[n] = with_normals && closed && v < obj->verts.n_local && !(f & (MFTL_FLAG_FEATURE | MFTL_FLAG_CORNER | MFTL_FLAG_BOUNDARY));
++    use_slope[n] = with_normals && closed && (v < obj->verts.n_local || exact_ghost) && !(f & (MFTL_FLAG_FEATURE | MFTL_FLAG_CORNER | MFTL_FLAG_BOUNDARY));
+     if (use_slope[n])
+     {
+       slopes[2 * n + 0] = -MFTLVectorInProd(nv, ex) / nzl;
+--- a/src/remeshing/remesh_parallel.c
++++ b/src/remeshing/remesh_parallel.c
+@@ -1469,6 +1469,20 @@
+      * reason to pay for another migration -- which is what keeps the migration
+      * count proportional to the number of PHASES rather than to the number of
+      * remeshing iterations. */
++    /* EXPERIMENT (MFTL_EXP_GHOSTNRM=1): owners' Max normals on the ghosts, for the fit. */
++    {
++      extern int MFTLRemeshExpGhostMode(void);
++      extern void MFTLRemeshExpMaxNormals(MFTL_Object *obj);
++      extern void MFTLRemeshExpStoreGhostNormals(const MFTL_Object *obj);
++      if (MFTLRemeshExpGhostMode() == 1)
++      {
++        for (int o = 0; o < ens->n_local_objects; ++o)
++          if (ens->local_objects[o]->tris.n > 0) MFTLRemeshExpMaxNormals(ens->local_objects[o]);
++        MFTLUpdateGhostVertexNormals(ens);
++        for (int o = 0; o < ens->n_local_objects; ++o) MFTLRemeshExpStoreGhostNormals(ens->local_objects[o]);
++      }
++    }
++
+     t_mark = MFTLRemeshWallTime();
+     int local_ops = 0;
+ 

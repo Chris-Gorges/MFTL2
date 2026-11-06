@@ -414,6 +414,203 @@ static inline int rim_project(const MFTL_RemeshParameters *params, const MFTL_Do
 static inline bool he_is_rim(const MFTL_Object *obj, int h) { return obj->tris.he[h].twin_idx == MFTL_ERROR && MFTLHeIsMeshBoundary(obj, h); }
 
 /* ═══════════════════════════════════════════════════════════════════════════
+ * Sizing (remesh_sizing.c)
+ *
+ * The decision makers of the three sizing modes. The public predicates
+ * (MFTLRemeshEdgeWantsSplit(), MFTLRemeshEdgeWantsCollapse()) are in
+ * mftl_remeshing.h; these are the pieces only the operators, the smoother and
+ * the drivers use.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Why @p params cannot drive its sizing mode, or #MFTL_NULL if it can.
+ *
+ * Local and pure, so every rank reaches the same verdict on the same block;
+ * MFTLRemeshAgreeParams() makes "the same block" a fact.
+ *
+ * @param params The parameter block.
+ * @return A static description of the first violated condition, or #MFTL_NULL.
+ */
+const char *MFTLRemeshSizingProblem(const MFTL_RemeshParameters *params);
+
+/**
+ * @brief First half of MFTLRemeshPrepareSizing(): enables `verts.sizing`,
+ *        classifies features, and gives every vertex its own curvature's
+ *        target.
+ *
+ * Split from the second half because a distributed pass synchronises the ghost
+ * copies between the two (the second half reads neighbours).
+ *
+ * @param obj    The mesh.
+ * @param params The parameter block; a no-op unless the curvature mode is set.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR for an invalid block.
+ */
+int MFTLRemeshSizingBegin(MFTL_Object *obj, const MFTL_RemeshParameters *params);
+
+/**
+ * @brief Second half: every feature, corner and boundary vertex takes the mean
+ *        target of its non-feature neighbours (Dunyach et al., Sect. 3).
+ * @param obj    The mesh, after MFTLRemeshSizingBegin().
+ * @param params The parameter block.
+ */
+void MFTLRemeshSizingFinish(MFTL_Object *obj, const MFTL_RemeshParameters *params);
+
+/**
+ * @brief Target of the vertex a collapse of a->b leaves at @p pm: the two
+ *        targets interpolated at pm's fraction along the edge.
+ * @param obj The mesh, with `verts.sizing`.
+ * @param a   Retired vertex.
+ * @param b   Survivor.
+ * @param pm  Where the survivor goes.
+ * @return The survivor's new target -- what MFTLCollapseEdge() stores.
+ */
+double MFTLRemeshMergedTarget(const MFTL_Object *obj, int a, int b, const double pm[3]);
+
+/**
+ * @brief Carries the curvature target to a vertex an operator just made or
+ *        moved: `sizing[dest]` = the targets of @p a and @p b interpolated at
+ *        @p fraction. A no-op without `verts.sizing`.
+ * @param obj      The mesh.
+ * @param a        First edge end.
+ * @param b        Second edge end.
+ * @param dest     The vertex written (the split's new vertex, a collapse's survivor).
+ * @param fraction Position along a->b in [0, 1].
+ */
+void MFTLRemeshSizingCarry(MFTL_Object *obj, int a, int b, int dest, double fraction);
+
+/**
+ * @brief The collapse's STRETCH clause for one new edge: would it be longer
+ *        than the split threshold, so that the next split sweep undoes the
+ *        collapse?
+ * @param obj           The mesh.
+ * @param length_sq     Squared length of the new edge (merged vertex to @p ring_vertex).
+ * @param merged_target MFTLRemeshMergedTarget() (read only under curvature sizing).
+ * @param ring_vertex   The edge's other end.
+ * @param params        The parameter block.
+ * @return `true` if the collapse must be refused.
+ */
+bool MFTLRemeshCollapseStretches(const MFTL_Object *obj, double length_sq, double merged_target, int ring_vertex, const MFTL_RemeshParameters *params);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Vertex placement by a local paraboloid fit (remesh_fit.c)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief The point above the midpoint of edge @p h on a weighted least-squares
+ *        height paraboloid through the edge's two-ring
+ *        (MFTL_RemeshParameters::split_placement, ::collapse_placement).
+ *
+ * Frame: origin at the minimum-image midpoint m, z along the normalised sum of
+ * the endpoints' vertex normals (Max's weights, exact on a sphere), x along the
+ * edge projected into the tangent plane. Coordinates in units of the local edge
+ * length h (the mean length of the edges at both endpoints). Samples: the edge's
+ * two-ring, each weighted by Wendland's C2 function of |x - m| / (`fit_radius`
+ * h), dropped when its normal is more than 60 degrees from z (the far side of
+ * a fold or a sheet). Under #MFTL_REMESH_PLACE_PARABOLOID_NORMALS an owned
+ * sample with a complete fan, off any feature, adds its normal's slopes.
+ *
+ * Reads positions only through minimum-image differences, and every fan it
+ * walks around an endpoint is complete wherever an operation is allowed
+ * (an unfrozen edge's one-ring is owned and unreplicated). Two-ring samples may
+ * be ghosts: their positions are exact (frozen on their owner) and their
+ * normals are partial, so they contribute positions only.
+ *
+ * @param      obj    The mesh.
+ * @param      h      The edge, neither of whose endpoints is pinned.
+ * @param      params    Supplies `fit_radius`.
+ * @param      placement #MFTL_REMESH_PLACE_PARABOLOID or
+ *                       #MFTL_REMESH_PLACE_PARABOLOID_NORMALS: the operation's
+ *                       own placement.
+ * @param[out] out       The point, wrapped into the domain.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR when the caller should keep the
+ *         midpoint (counted as a fallback).
+ */
+int MFTLRemeshFitEdgePoint(const MFTL_Object *obj, int h, const MFTL_RemeshParameters *params, MFTL_RemeshPlacement placement, double out[3]);
+
+/**
+ * @brief Counts one fallback to the midpoint that the caller decided on after
+ *        a successful fit (a split that would have folded a triangle).
+ */
+void MFTLRemeshFitNoteFallback(void);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * The projection reference (remesh_project.c)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @struct MFTL_RemeshReference
+ * @brief A copy of the mesh as a remeshing kernel call received it, enough to
+ *        evaluate its Phong surface (#MFTL_REMESH_PROJECT_PHONG).
+ *
+ * Index space of the INPUT: vertex r, triangle t. Found again from the current
+ * mesh through vertex global ids, which a kernel call does not renumber
+ * (`gid` sorted, `gid_v` the vertex it names); from there a walk over `tn`
+ * reaches the triangle closest to a query point.
+ */
+typedef struct MFTL_RemeshReference
+{
+  const MFTL_Domain *domain;  ///< For minimum-image differences.
+  int n_v;  ///< Vertices.
+  int n_t;  ///< Triangles.
+  double *pos;  ///< [3 n_v] positions.
+  double *nrm;  ///< [3 n_v] angle-weighted unit normals; zero where a corner contributes no lift.
+  int *tv;  ///< [3 n_t] corners, -1 for a dead triangle.
+  int *tn;  ///< [3 n_t] triangle across edge k (corner k to k+1), MFTL_ERROR at a rim.
+  int *vtri;  ///< [n_v] one incident triangle, -1 if none.
+  int *gid;  ///< [n_v] vertex global ids, ascending.
+  int *gid_v;  ///< [n_v] the vertex of `gid[i]`.
+  double bytes;  ///< Heap held by the arrays above.
+} MFTL_RemeshReference;
+
+/**
+ * @brief Copies @p obj into @p ref: positions, angle-weighted normals (zeroed on
+ *        feature, corner, boundary and ghost vertices), corners, edge
+ *        neighbours, and the sorted global ids.
+ *
+ * Overwrites `verts.normal` (with angle-weighted normals). Needs a current
+ * feature classification.
+ *
+ * @param[out] ref The reference; free with MFTLRemeshReferenceFree().
+ * @param      obj The mesh, with no dead entities.
+ */
+void MFTLRemeshReferenceBuild(MFTL_RemeshReference *ref, MFTL_Object *obj);
+
+/**
+ * @brief Releases what MFTLRemeshReferenceBuild() allocated.
+ * @param ref The reference.
+ */
+void MFTLRemeshReferenceFree(MFTL_RemeshReference *ref);
+
+/**
+ * @brief Moves @p p onto the reference's Phong surface: the closest point on its
+ *        flat triangles, found by a walk from @p hint (or from the reference copy
+ *        of vertex @p v or of one of its neighbours), then the Phong lift.
+ *
+ * @param         ref      The reference.
+ * @param         obj      The current mesh (for @p v's global id and neighbours).
+ * @param         v        The vertex being moved.
+ * @param[in,out] hint     Reference triangle to start from (-1: none); the
+ *                         triangle found on success.
+ * @param         max_d_sq Largest admissible squared distance from @p p to the
+ *                         flat reference; beyond it nothing is moved.
+ * @param[in,out] p        The position, projected and wrapped on success.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR with @p p unchanged.
+ */
+int MFTLRemeshReferenceProject(const MFTL_RemeshReference *ref, const MFTL_Object *obj, int v, int *hint, double max_d_sq, double p[3]);
+
+/**
+ * @brief MFTLSmoothTangential() with the projection reference supplied by the
+ *        caller (or #MFTL_NULL: no projection), applied after the LAST of the
+ *        @p iterations sweeps, and its cost recorded.
+ * @param         obj        The mesh.
+ * @param         params     The parameter block.
+ * @param         iterations Sweeps.
+ * @param         ref        The reference, or #MFTL_NULL.
+ * @param[in,out] st         Accumulates `t_projection`, `n_projected`, `n_projection_missed`; may be #MFTL_NULL.
+ */
+void MFTLRemeshSmooth(MFTL_Object *obj, const MFTL_RemeshParameters *params, int iterations, const MFTL_RemeshReference *ref, MFTL_RemeshStats *st);
+
+/* ═══════════════════════════════════════════════════════════════════════════
  * The parallel gate
  *
  * Every one of these asks the SAME question -- "is every entity this operation
@@ -509,6 +706,11 @@ static inline void remesh_stats_accumulate(MFTL_RemeshStats *dst, const MFTL_Rem
   dst->n_vertices_removed += src->n_vertices_removed;
   dst->n_orphans_removed += src->n_orphans_removed;
   dst->iterations = MFTL_MAX(dst->iterations, src->iterations);
+  dst->t_reference += src->t_reference;
+  dst->t_projection += src->t_projection;
+  dst->reference_bytes = MFTL_MAX(dst->reference_bytes, src->reference_bytes);
+  dst->n_projected += src->n_projected;
+  dst->n_projection_missed += src->n_projection_missed;
 }
 
 /**

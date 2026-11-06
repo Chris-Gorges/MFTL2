@@ -157,3 +157,41 @@ void MFTLBodyFluxMoments(const MFTL_Object *obj, int k, double ref, const double
   }
   for (int i = 0; i < MFTL_BODY_MOMENT_SLOTS; ++i) out[i] = q[i];
 }
+
+double MFTLBodyVolumeDisplacement(MFTL_Object *obj)
+{
+  const MFTL_Domain *const dom = obj->domain;
+  MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
+  for (int v = 0; v < obj->verts.n_local; ++v)
+  {
+    if (!(obj->verts.rec[v].flags & MFTL_FLAG_BOUNDARY)) continue;
+    const double *const p = &obj->verts.pos[3 * v];
+    for (int k = 0; k < 3; ++k)
+    {
+      if (dom->is_periodic[k]) continue;
+      const double tol = MFTL_BODY_WALL_TOL * dom->domain_size[k];
+      if (fabs(p[k] - dom->global_min[k]) <= tol || fabs(p[k] - dom->global_max[k]) <= tol) obj->verts.normal[3 * v + k] = 0.0;
+    }
+  }
+
+  /* Over EVERY triangle, ghosts included: an owned corner of a ghost triangle is
+   * a (triangle, corner) pair no other rank counts, because the corner's owner
+   * is this rank. */
+  double dvdd = 0.0;
+  for (int t = 0; t < obj->tris.n; ++t)
+  {
+    double T[3][3];
+    MFTLGetTriangleCorners(obj, t, T);
+    const double e1[3] = {T[1][0] - T[0][0], T[1][1] - T[0][1], T[1][2] - T[0][2]};
+    const double e2[3] = {T[2][0] - T[0][0], T[2][1] - T[0][1], T[2][2] - T[0][2]};
+    const double S[3] = {0.5 * (e1[1] * e2[2] - e1[2] * e2[1]), 0.5 * (e1[2] * e2[0] - e1[0] * e2[2]), 0.5 * (e1[0] * e2[1] - e1[1] * e2[0])};
+    for (int k = 0; k < 3; ++k)
+    {
+      const int v = obj->tris.verts[3 * t + k];
+      if (v >= obj->verts.n_local) continue;
+      const double *const u = &obj->verts.normal[3 * v];
+      dvdd += (S[0] * u[0] + S[1] * u[1] + S[2] * u[2]) / 3.0;
+    }
+  }
+  return dvdd;
+}

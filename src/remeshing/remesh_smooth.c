@@ -46,6 +46,7 @@
 #include "mftl_memory.h"
 #include "mftl_object.h"
 #include "mftl_topology.h"
+#include "remesh_comm.h"
 #include "remesh_internal.h"
 #include "remesh_fields.h"
 
@@ -318,11 +319,12 @@ int MFTLDetectFeatures(MFTL_Object *obj, double angle_degrees, double corner_ang
  * @param      fan         Outgoing half-edges of @p v, from fan_halfedges().
  * @param      n_fan       Their count.
  * @param      open        `true` when the fan is open.
+ * @param      sized       Curvature sizing: the 1D form of Dunyach's rule.
  * @param[out] disp        The displacement, projected onto the ridge TANGENT.
  * @param[out] min_edge_sq Shortest incident squared edge length, for the step clamp.
  * @return `true` if a displacement was produced.
  */
-static bool ridge_displacement(const MFTL_Object *obj, int v, const int *fan, int n_fan, bool open, double disp[3], double *min_edge_sq)
+static bool ridge_displacement(const MFTL_Object *obj, int v, const int *fan, int n_fan, bool open, bool sized, double disp[3], double *min_edge_sq)
 {
   const double *const p = MFTLVertexPos(obj, v);
 
@@ -365,7 +367,24 @@ static bool ridge_displacement(const MFTL_Object *obj, int v, const int *fan, in
    * coincide" at a millimetre as much as at a metre. */
   if (!(tau_len_sq > MFTL_VERYVERYSMALL * (l1 + l2))) return MFTL_FALSE;
 
-  const double delta[3] = {0.5 * (d1[0] + d2[0]), 0.5 * (d1[1] + d2[1]), 0.5 * (d1[2] + d2[2])};
+  double delta[3] = {0.5 * (d1[0] + d2[0]), 0.5 * (d1[1] + d2[1]), 0.5 * (d1[2] + d2[2])};
+
+  if (sized)
+  {
+    /* Dunyach et al., Sect. 3, item 2: the triangle rule along the feature
+     * line, with the two feature EDGES for the triangles -- their midpoints
+     * weighted by length times density 1/L^2. The fixed point is
+     * l1 / L1 = l2 / L2, i.e. the vertex splits the curve in proportion to the
+     * targets; with equal targets it is the midpoint rule above. */
+    const double *const size = obj->verts.sizing;
+    const double s1 = 0.5 * (size[v] + size[nbr[0]]);
+    const double s2 = 0.5 * (size[v] + size[nbr[1]]);
+    const double w1 = MFTL_SQRT(l1) / (s1 * s1);
+    const double w2 = MFTL_SQRT(l2) / (s2 * s2);
+    const double inv = 0.5 / (w1 + w2);
+    for (int k = 0; k < 3; ++k) delta[k] = (w1 * d1[k] + w2 * d2[k]) * inv;
+  }
+
   const double s = (delta[0] * tau[0] + delta[1] * tau[1] + delta[2] * tau[2]) / tau_len_sq;
 
   disp[0] = s * tau[0];
@@ -421,6 +440,19 @@ static bool rim_smooth_position(const MFTL_Object *obj, int v, const int *fan, i
   /* Arc length to move towards the successor (negative: the predecessor). */
   const double limit = params->smooth_max_step_fraction * MFTL_MIN(l1, l2);
   double shift = params->smooth_relaxation * 0.5 * (l2 - l1);
+  if (params->sizing == MFTL_REMESH_SIZING_CURVATURE && obj->verts.has_sizing)
+  {
+    /* The sized 1D rule of ridge_displacement(): edge midpoints weighted by
+     * length over squared target. Along the curve that step is
+     * (l2^2 rho2 - l1^2 rho1) / (2 (l1 rho1 + l2 rho2)), which is the plain
+     * (l2 - l1) / 2 when rho1 = rho2. */
+    const double *const size = obj->verts.sizing;
+    const double s1 = 0.5 * (size[v] + size[MFTLHeOrigin(obj, h_in)]);
+    const double s2 = 0.5 * (size[v] + size[MFTLHeTarget(obj, h_out)]);
+    const double rho1 = 1.0 / (s1 * s1);
+    const double rho2 = 1.0 / (s2 * s2);
+    shift = params->smooth_relaxation * (l2 * l2 * rho2 - l1 * l1 * rho1) / (2.0 * (l1 * rho1 + l2 * rho2));
+  }
   if (shift > limit) shift = limit;
   if (shift < -limit) shift = -limit;
 
@@ -450,11 +482,13 @@ static bool rim_smooth_position(const MFTL_Object *obj, int v, const int *fan, i
  * @param      n_fan       Their count.
  * @param      open        `true` when the fan is open.
  * @param      mode        Which neighbourhood the target point is built from.
+ * @param      sizing      The sizing mode; picks the triangle weights.
  * @param[out] disp        The displacement, projected onto the tangent plane.
  * @param[out] min_edge_sq Shortest incident squared edge length, for the step clamp.
  * @return `true` if a displacement was produced.
  */
-static bool free_displacement(const MFTL_Object *obj, int v, const int *fan, int n_fan, bool open, MFTL_SmoothMode mode, double disp[3], double *min_edge_sq)
+static bool free_displacement(const MFTL_Object *obj, int v, const int *fan, int n_fan, bool open, MFTL_SmoothMode mode, MFTL_RemeshSizing sizing,
+                              double disp[3], double *min_edge_sq)
 {
   const double *const p = MFTLVertexPos(obj, v);
 
@@ -485,6 +519,46 @@ static bool free_displacement(const MFTL_Object *obj, int v, const int *fan, int
       target[1] += d[1];
       target[2] += d[2];
       weight_sum += 1.0;
+      min_sq = MFTL_MIN(min_sq, d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    }
+  }
+  else if (sizing == MFTL_REMESH_SIZING_CURVATURE)
+  {
+    /* Dunyach et al., Eq. 6, with the ODT DENSITY 1/L^2 for the sizing weight:
+     * c = SUM |t| rho(b) b / SUM |t| rho(b), rho = 1 / Lbar^2, Lbar the mean of
+     * the triangle's three targets. The paper prints |t| L(b), which pulls a
+     * vertex towards the COARSE side and fights the sizing field; the density
+     * of the Optimal Delaunay Triangulation it cites (and pmp-library's
+     * implementation) decreases with the target. With one target everywhere it
+     * is the area-weighted centroid below. */
+    const double *const size = obj->verts.sizing;
+    for (int i = 0; i < n_fan; ++i)
+    {
+      const int o = fan[i];
+      const int w1 = MFTLHeTarget(obj, o);
+      const int w2 = MFTLHeTarget(obj, MFTLHeNextIdx(o));
+
+      double d1[3];
+      double d2[3];
+      MFTLGetMinimumImageVector(obj->domain, d1, p, MFTLVertexPos(obj, w1));
+      MFTLGetMinimumImageVector(obj->domain, d2, p, MFTLVertexPos(obj, w2));
+
+      const double cr[3] = {d1[1] * d2[2] - d1[2] * d2[1], d1[2] * d2[0] - d1[0] * d2[2], d1[0] * d2[1] - d1[1] * d2[0]};
+      const double lbar = MFTL_ONE_THIRD * (size[v] + size[w1] + size[w2]);
+      const double w = MFTL_SQRT(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]) / (lbar * lbar);
+
+      target[0] += w * (d1[0] + d2[0]) * MFTL_ONE_THIRD;
+      target[1] += w * (d1[1] + d2[1]) * MFTL_ONE_THIRD;
+      target[2] += w * (d1[2] + d2[2]) * MFTL_ONE_THIRD;
+      weight_sum += w;
+
+      min_sq = MFTL_MIN(min_sq, d1[0] * d1[0] + d1[1] * d1[1] + d1[2] * d1[2]);
+    }
+
+    if (open && n_fan > 0)
+    {
+      double d[3];
+      MFTLGetMinimumImageVector(obj->domain, d, p, MFTLVertexPos(obj, open_fan_last_neighbour(obj, fan[0])));
       min_sq = MFTL_MIN(min_sq, d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
     }
   }
@@ -554,6 +628,23 @@ void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params,
   MFTL_ASSERT(obj != MFTL_NULL && params != MFTL_NULL);
   MFTL_ASSERT(MFTLObjectHasTopology(obj) && "MFTLSmoothTangential: derived topology is stale -- MFTLObjectBuildDerived first");
 
+  /* Called on its own, the reference is the mesh as handed to THIS call. */
+  if (params->projection == MFTL_REMESH_PROJECT_PHONG && obj->verts.n > 0 && obj->tris.n > 0 && iterations > 0)
+  {
+    MFTL_RemeshReference ref;
+    MFTLRemeshReferenceBuild(&ref, obj);
+    MFTLRemeshSmooth(obj, params, iterations, &ref, MFTL_NULL);
+    MFTLRemeshReferenceFree(&ref);
+    return;
+  }
+  MFTLRemeshSmooth(obj, params, iterations, MFTL_NULL, MFTL_NULL);
+}
+
+void MFTLRemeshSmooth(MFTL_Object *obj, const MFTL_RemeshParameters *params, int iterations, const MFTL_RemeshReference *ref, MFTL_RemeshStats *st)
+{
+  MFTL_ASSERT(obj != MFTL_NULL && params != MFTL_NULL);
+  MFTL_ASSERT(MFTLObjectHasTopology(obj) && "MFTLRemeshSmooth: derived topology is stale -- MFTLObjectBuildDerived first");
+
   const int n_v = obj->verts.n;
   if (n_v == 0 || obj->tris.n == 0 || iterations <= 0) return;
   obj->derived &= ~MFTL_DERIVED_GEOMETRY;
@@ -569,12 +660,29 @@ void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params,
   const double relax = params->smooth_relaxation;
   const double step_frac = params->smooth_max_step_fraction;
 
+  /* The sizing mode picks the smoother's weights. A curvature mode without its
+   * field (operators used directly, MFTLRemeshPrepareSizing() not called) falls
+   * back to the uniform weights rather than reading nothing. */
+  MFTL_RemeshSizing sizing = params->sizing;
+  if (sizing == MFTL_REMESH_SIZING_CURVATURE && !obj->verts.has_sizing) sizing = MFTL_REMESH_SIZING_UNIFORM;
+  const bool sized = (sizing == MFTL_REMESH_SIZING_CURVATURE);
+
+  /* The projection's per-vertex state: a reference triangle to start the walk
+   * from (none yet), and the free vertices the last sweep moved, with the
+   * largest distance to the reference a projection may bridge. */
+  int *const hint = ref ? (int *) MFTLMallocOrDie((size_t) n_v * sizeof(int), "remesh projection hints") : MFTL_NULL;
+  int *const moved_v = ref ? (int *) MFTLMallocOrDie((size_t) n_v * sizeof(int), "remesh projection list") : MFTL_NULL;
+  double *const moved_lim = ref ? (double *) MFTLMallocOrDie((size_t) n_v * sizeof(double), "remesh projection limits") : MFTL_NULL;
+  if (hint)
+    for (int v = 0; v < n_v; ++v) hint[v] = -1;
+
   for (int sweep = 0; sweep < iterations; ++sweep)
   {
     /* Normals are refreshed from current positions every sweep. */
     MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
 
     memcpy(new_pos, obj->verts.pos, (size_t) n_v * 3 * sizeof(double));
+    int n_moved = 0;
 
     for (int v = 0; v < n_v; ++v)  // why also over ghosts? Dont I want to smooth only locals?
     {
@@ -615,8 +723,9 @@ void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params,
       double disp[3];
       double min_edge_sq = MFTL_DBL_MAX;
 
-      const bool moved = (rec->flags & MFTL_FLAG_FEATURE) ? ridge_displacement(obj, v, fan, n_fan, open, disp, &min_edge_sq)
-                                                          : free_displacement(obj, v, fan, n_fan, open, params->smooth_mode, disp, &min_edge_sq);
+      const bool moved = (rec->flags & MFTL_FLAG_FEATURE)
+                             ? ridge_displacement(obj, v, fan, n_fan, open, sized, disp, &min_edge_sq)
+                             : free_displacement(obj, v, fan, n_fan, open, params->smooth_mode, sizing, disp, &min_edge_sq);
       if (!moved) continue;
 
       double scale = relax;
@@ -638,6 +747,39 @@ void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params,
       new_pos[3 * v + 0] = p[0];
       new_pos[3 * v + 1] = p[1];
       new_pos[3 * v + 2] = p[2];
+
+      /* Free vertices only: a ridge moves along its curve and a rim along the
+       * rim curve, neither of which a surface projection may undo. The bridge
+       * is half the shortest incident edge -- the step itself is capped at
+       * `smooth_max_step_fraction` of it and the surface is within a sagitta. */
+      if (ref && !(rec->flags & MFTL_FLAG_FEATURE))
+      {
+        moved_v[n_moved] = v;
+        moved_lim[n_moved] = 0.25 * min_edge_sq;
+        n_moved++;
+      }
+    }
+
+    /* ONCE, after the last sweep's Jacobi loop: the smoother redistributes the
+     * vertices over all its sweeps and the projection then puts every moved one
+     * back on the reference surface. Projecting after every sweep measured the
+     * same within the run-to-run spread (except under-resolved uniform sizing,
+     * slightly better) at three times the cost (docs/analysis.md §14.10). */
+    if (ref && n_moved > 0 && sweep == iterations - 1)
+    {
+      const double t0 = MFTLRemeshWallTime();
+      int n_ok = 0;
+      for (int i = 0; i < n_moved; ++i)
+      {
+        const int v = moved_v[i];
+        if (MFTLRemeshReferenceProject(ref, obj, v, &hint[v], moved_lim[i], &new_pos[3 * v]) == MFTL_SUCCESS) n_ok++;
+      }
+      if (st)
+      {
+        st->t_projection += MFTLRemeshWallTime() - t0;
+        st->n_projected += n_ok;
+        st->n_projection_missed += n_moved - n_ok;
+      }
     }
 
     if ((MFTLFieldsStride(obj, 0) || MFTLFieldsStride(obj, 1)) && !MFTLRemeshFieldSmooth(obj, new_pos)) continue;
@@ -645,4 +787,7 @@ void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params,
   }
 
   free(new_pos);
+  free(hint);
+  free(moved_v);
+  free(moved_lim);
 }

@@ -356,13 +356,15 @@ static void count_hidden_edges(const MFTL_Object *obj, const MFTL_RemeshParamete
   {
     if (!owns_edge_count(obj, h)) continue;
 
-    const double l2 = MFTLGetEdgeLengthSquared(obj, h);
-
-    if (l2 > params->max_edge_length_sq)
+    /* The operators' own predicates, so "long" here is exactly what the split
+     * sweep would split -- the property the exactness of hidden_long rests on.
+     * Under curvature sizing they read ghost targets, which is why the phase
+     * synchronises them first (MFTLRemeshSyncGhostSizing()). */
+    if (MFTLRemeshEdgeWantsSplit(obj, h, params))
     {
       if (freeze_blocks_pair(obj, h)) (*hidden_long)++;
     }
-    else if (l2 < params->min_edge_length_sq)
+    else if (MFTLRemeshEdgeWantsCollapse(obj, h, params))
     {
       if (freeze_blocks_collapse(obj, h)) (*hidden_short)++;
     }
@@ -1408,6 +1410,20 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
       st->n_migrations++;
     else
       st->n_migrations_skipped++;
+
+    /* ── 1b. The curvature sizing field of this placement ───────────────────
+     * Computed on the mesh the migration produced, because a redistribution
+     * does not carry it. Exact on owned vertices (one-ring, vertex-complete
+     * halo); the ghost copies are then made the owners' values, because the
+     * certificate below judges frozen edges, whose ends may be ghosts. Two
+     * exchanges: the neighbour average of feature vertices reads neighbours.
+     * The mode is agreed, so every rank takes this branch or none does. */
+    if (params->sizing == MFTL_REMESH_SIZING_CURVATURE)
+    {
+      t_mark = MFTLRemeshWallTime();
+      if (MFTLRemeshEnsemblePrepareSizing(ens, params) != MFTL_SUCCESS) status = MFTL_ERROR;
+      st->t_freeze += MFTLRemeshWallTime() - t_mark;
+    }
 
     /* ── 2. Who may this rank touch? ────────────────────────────────────────
      * Local, exact, and read straight off the partition the migration produced.

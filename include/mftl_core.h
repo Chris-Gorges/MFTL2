@@ -39,6 +39,7 @@
 
 #include "mftl_bvh.h"
 #include "mftl_communication.h"
+#include "mftl_correction.h"
 #include "mftl_coupling.h"
 #include "mftl_ensemble.h"
 #include "mftl_io.h"

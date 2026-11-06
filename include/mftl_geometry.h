@@ -1043,4 +1043,131 @@ void MFTLBodyFluxVolume(const MFTL_Object *obj, int k, double ref, const double 
  */
 void MFTLBodyFluxMoments(const MFTL_Object *obj, int k, double ref, const double centre[3], double out[MFTL_BODY_MOMENT_SLOTS]);
 
+/**
+ * @brief The displacement field of a volume correction, left in `verts.normal`,
+ *        and this rank's share of the derivative of the enclosed volume along it.
+ *
+ * The field \f$\vect{u}\f$ is the area-weighted unit vertex normal; a vertex
+ * flagged #MFTL_FLAG_BOUNDARY loses the component normal to every wall it lies
+ * on (within #MFTL_BODY_WALL_TOL), so it slides in the wall and the rim stays
+ * there. Moving every OWNED vertex by \f$d\,\vect{u}\f$ changes the enclosed
+ * volume by \f$d\,\sum_t \vect{S}_t\cdot(\vect{u}_0+\vect{u}_1+\vect{u}_2)/3
+ * + O(d^2)\f$ (\f$\vect{S}_t\f$ the area vector), and the return value is
+ * that sum over the (triangle, corner) pairs whose corner this rank OWNS: with a
+ * vertex-complete halo every such pair is present exactly once in the job, so
+ * the per-body SUM over holders is the exact first variation. Corners are
+ * gathered seam-consistently. It holds for a closed body and for one closed by
+ * the walls alike, because the walls do not move. Dividing by it rather than by
+ * the area is what makes a correction Newton's method.
+ *
+ * @param obj The mesh; `verts.normal` is overwritten for every vertex (ghost
+ *            entries hold partial sums, see MFTLComputeVertexNormals()).
+ * @return The owned share of \f$dV/dd\f$.
+ * @rank_local The arithmetic of MFTLEnsembleCorrectVolumes() and of the
+ *             topology change's correction, which both call it.
+ */
+double MFTLBodyVolumeDisplacement(MFTL_Object *obj);
+
+// -----------------------------------------------------------------------------
+// 10. CURVATURE  (see src/geometry/vertex_curvature.c)
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief Discrete mean and Gaussian curvature of every vertex (Meyer, Desbrun,
+ *        Schröder & Barr 2003).
+ *
+ * With \f$A_i\f$ the MIXED area (the Voronoi area where no incident triangle
+ * is obtuse; half or a quarter of an obtuse triangle's area otherwise):
+ * \f[
+ *   H_i = \tfrac12 \Big\lVert \tfrac{1}{2A_i} \sum_j (\cot\alpha_{ij} + \cot\beta_{ij})(\vect{x}_i - \vect{x}_j) \Big\rVert,
+ *   \qquad K_i = \frac{2\pi - \sum_f \theta_f}{A_i},
+ * \f]
+ * so a sphere of radius \f$R\f$ gives \f$H = 1/R\f$ and \f$K = 1/R^2\f$. \f$H\f$
+ * is UNSIGNED. One scatter over all triangles; degenerate faces contribute
+ * nothing and a vertex without area gets zeros. The values are meaningful only
+ * on a closed fan: on the rim of an open surface, and on a ghost vertex of a
+ * distributed mesh (whose fan is partial), they are not curvatures.
+ *
+ * @param      obj             The mesh; needs current `tris.verts`.
+ * @param[out] mean_curvature  `[verts.n]` \f$H_i \ge 0\f$.
+ * @param[out] gauss_curvature `[verts.n]` \f$K_i\f$.
+ * @rank_local
+ */
+void MFTLComputeVertexCurvatures(const MFTL_Object *obj, double *mean_curvature, double *gauss_curvature);
+
+// -----------------------------------------------------------------------------
+// 11. LEAST SQUARES AND LOCAL HEIGHT FITS  (see src/geometry/surface_fit.c)
+// -----------------------------------------------------------------------------
+
+/** @brief Most unknowns MFTLLeastSquaresQRCP() solves for (a quadratic in two variables). */
+#define MFTL_LSQ_MAX_COLS 6
+
+/**
+ * @brief \f$\min_x \lVert A x - b\rVert_2\f$ by Householder QR with column
+ *        pivoting inside two GROUPS of columns; the library's replacement for
+ *        LAPACK's `dgelsy` at the sizes a local fit has.
+ *
+ * Columns `[0, n_lead)` are factored first and pivot only among themselves,
+ * then columns `[n_lead, n)`. Within a group the column of largest remaining
+ * norm goes next (Businger & Golub 1965); a group stops at the first pivot with
+ * \f$|R_{kk}| \le \tau |R_{00}|\f$, and its remaining columns are DROPPED: their
+ * coefficients are set to zero and the solution is the basic solution of the
+ * accepted columns. With the lead group the constant and linear terms of a
+ * height fit and the trailing group its curvature terms, a stencil that
+ * cannot determine a curvature component gets that component zero -- a lower
+ * degree in that direction -- instead of the minimum-norm solution `dgelsy`
+ * returns, which trades the height against the curvature terms whenever the
+ * null space couples them.
+ *
+ * The test is relative, so @p tau is dimensionless only if the columns are of
+ * comparable magnitude: scale the data first (MFTLFitHeightParaboloid() takes
+ * coordinates in units of the local edge length). A uniform scaling of @p A and
+ * @p b by a power of two changes no pivot decision and no bit of @p x.
+ *
+ * @param         m      Rows (any; fewer rows than columns limits the rank).
+ * @param         n      Columns, at most #MFTL_LSQ_MAX_COLS.
+ * @param         n_lead Size of the first group, in [0, n].
+ * @param[in,out] A      Column-major `m x n`, leading dimension @p m; destroyed
+ *                       (the Householder vectors and R are left in it).
+ * @param[in,out] b      `[m]` right-hand side; destroyed (becomes Q^T b).
+ * @param         tau    Relative rank tolerance, e.g. 1e-3.
+ * @param[out]    x      `[n]` the solution, zeros on dropped columns.
+ * @param[out]    kept   `[n]` or #MFTL_NULL: 1 where the column was accepted.
+ * @return The numerical rank (the number of accepted columns).
+ * @rank_local Pure function, no allocation.
+ */
+int MFTLLeastSquaresQRCP(int m, int n, int n_lead, double *A, double *b, double tau, double *x, unsigned char *kept);
+
+/**
+ * @brief Weighted least-squares height paraboloid
+ *        \f$z = c_0 + c_1x + c_2y + c_3x^2 + c_4xy + c_5y^2\f$ through samples
+ *        given in a LOCAL frame, optionally with their slopes.
+ *
+ * Each sample \f$j\f$ contributes the row
+ * \f$\sqrt{w_j}\,(1, x_j, y_j, x_j^2, x_jy_j, y_j^2)\,c = \sqrt{w_j}\,z_j\f$ and,
+ * where its slopes are given, the two rows
+ * \f$\sqrt{w_j}\,(0, 1, 0, 2x_j, y_j, 0)\,c = \sqrt{w_j}\,\partial_x z\f$ and
+ * \f$\sqrt{w_j}\,(0, 0, 1, 0, x_j, 2y_j)\,c = \sqrt{w_j}\,\partial_y z\f$ -- a
+ * unit normal \f$(n_x, n_y, n_z)\f$ gives
+ * \f$\partial_x z = -n_x/n_z\f$, \f$\partial_y z = -n_y/n_z\f$. Solved by
+ * MFTLLeastSquaresQRCP() with {1, x, y} as the lead group and the curvature
+ * terms as the trailing one, never through the normal equations. Pass
+ * coordinates scaled to O(1) (in units of the local edge length): heights and
+ * slopes are then both O(1) and one weight serves both kinds of row.
+ *
+ * @param      n         Samples, at most 64.
+ * @param      pts       `[3n]` local (x, y, z).
+ * @param      slopes    `[2n]` (dz/dx, dz/dy), or #MFTL_NULL for positions only.
+ * @param      use_slope `[n]` nonzero where sample j's slopes enter, or
+ *                       #MFTL_NULL for every sample (ignored without @p slopes).
+ * @param      w         `[n]` non-negative weights.
+ * @param      tau       Relative rank tolerance (MFTLLeastSquaresQRCP()).
+ * @param[out] c         `[6]` the coefficients; zero where undetermined.
+ * @param[out] kept      `[6]` or #MFTL_NULL: which coefficients were determined.
+ * @return The rank. \f$c_0\f$ is meaningful only if `kept[0]`.
+ * @rank_local Pure function, no allocation.
+ */
+int MFTLFitHeightParaboloid(int n, const double *pts, const double *slopes, const unsigned char *use_slope, const double *w, double tau, double c[6],
+                            unsigned char kept[6]);
+
 #endif  // MFTL_GEOMETRY_H

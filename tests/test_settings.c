@@ -101,6 +101,8 @@ static bool is_module_block_key(const MFTL_SettingInfo *k)
   } blocks[] = {
       {offsetof(MFTL_Settings, remesh.params), sizeof(MFTL_RemeshParameters)},
       {offsetof(MFTL_Settings, topology.options), sizeof(MFTL_TopologyOptions)},
+      {offsetof(MFTL_Settings, volume.params), sizeof(MFTL_VolumeCorrectionParameters)},
+      {offsetof(MFTL_Settings, undulation.params), sizeof(MFTL_UndulationParameters)},
       {offsetof(MFTL_Settings, contact.params), sizeof(MFTL_BVHBuildParams)},
       {offsetof(MFTL_Settings, coupling.params), sizeof(MFTL_CouplerParams)},
       {offsetof(MFTL_Settings, output.vtk), sizeof(MFTL_VtkOptions)},
@@ -222,6 +224,8 @@ static int test_defaults_follow_the_modules(void)
   MFTLSettingsDefaults(&m);
   MFTLInitRemeshParams(&m.remesh.params, MFTL_REMESH_ISOTROPIC, 0.0, 3, MFTL_SMOOTH_TRIANGLE_BASED, 180.0);
   m.topology.options = MFTLTopologyDefaultOptions();
+  m.volume.params = MFTLVolumeCorrectionDefaultParameters();
+  m.undulation.params = MFTLUndulationDefaultParameters();
   m.contact.params = MFTL_BVHDefaultParams();
   MFTLCouplerDefaultParams(&m.coupling.params);
   m.output.vtk = MFTLVtkDefaults();
@@ -727,6 +731,49 @@ static int test_resolve_derives_the_lengths(void)
   return 0;
 }
 
+/**
+ * @brief Curvature sizing derives its own lengths: the tolerance and floor from
+ *        their factors, and its envelope -- and the resolved block remeshes.
+ */
+static int test_resolve_derives_the_sizing_lengths(void)
+{
+  MFTL_Settings s;
+  char msg[1024];
+  MFTLSettingsDefaults(&s);
+  const char *text = "[sphere]\nrefinements = 2\nradius = 0.3\n[remesh]\nsizing = \"curvature\"\ncurvature_tolerance_factor = 0.05\n";
+  TEST_ASSERT(MFTLSettingsParse(&s, text, "t", msg, sizeof msg) == MFTL_SUCCESS);
+
+  MFTL_Ensemble *ens = MFTLSettingsCreateEnsemble(&s, MPI_COMM_WORLD);
+  TEST_ASSERT(agreed(ens != NULL, MPI_COMM_WORLD));
+  MFTL_Object *obj = MFTLObjectCreate(0);
+  MFTLEnsembleAddObject(ens, obj);
+  MFTLGenerateSphere(obj, s.sphere.center, s.sphere.radius, s.sphere.refinements);
+  MFTLComputeTriangleGeometry(obj, obj->tris.n);
+  const double L = MFTLEnsembleMeanEdgeLength(ens);
+  TEST_ASSERT(agreed(MFTLSettingsResolve(&s, ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+
+  const MFTL_RemeshParameters *p = &s.remesh.params;
+  bool ok = p->target_length == L;
+  ok = ok && p->sizing == MFTL_REMESH_SIZING_CURVATURE && p->curvature_tolerance == 0.05 * L && p->min_target_length == 0.25 * L;
+  ok = ok && p->min_edge_length == MFTL_REMESH_COLLAPSE_RATIO * 0.25 * L && p->max_edge_length == MFTL_REMESH_SPLIT_RATIO * L;
+  ok = ok && p->max_edge_length_sq == p->max_edge_length * p->max_edge_length;
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+
+  MFTL_Settings again = s;
+  TEST_ASSERT(agreed(MFTLSettingsResolve(&again, ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(same_settings(&s, &again), MPI_COMM_WORLD));
+
+  MFTLRedistribute(ens);
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
+  MFTL_RemeshStats st;
+  TEST_ASSERT(agreed(MFTLRemeshEnsemble(ens, &s.remesh.params, &st) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  bool sound = true;
+  for (int o = 0; o < ens->n_local_objects; ++o) sound = sound && inv_partition_is_sound(ens->local_objects[o], g_rank);
+  TEST_ASSERT(agreed(sound, MPI_COMM_WORLD));
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
 /** @brief Nothing to measure is an error exactly when something scheduled needs the length. */
 static int test_resolve_on_an_empty_ensemble(void)
 {
@@ -800,6 +847,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_command_line_overrides);
   RUN_TEST(test_the_ensemble_is_the_one_described);
   RUN_TEST(test_resolve_derives_the_lengths);
+  RUN_TEST(test_resolve_derives_the_sizing_lengths);
   RUN_TEST(test_resolve_on_an_empty_ensemble);
   RUN_TEST(test_disagreeing_ranks_are_caught);
 

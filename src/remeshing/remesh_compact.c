@@ -273,6 +273,7 @@ int MFTLRemeshCompactObject(MFTL_Object *obj, MFTL_RemeshStats *stats)
       vp->pos[3 * nv + k] = vp->pos[3 * v + k];
       vp->normal[3 * nv + k] = vp->normal[3 * v + k];
     }
+    if (vp->has_sizing) vp->sizing[nv] = vp->sizing[v];
   }
 
   MFTL_TrianglePool *const tp = &obj->tris;
@@ -327,6 +328,7 @@ int MFTLRemeshCompactObject(MFTL_Object *obj, MFTL_RemeshStats *stats)
       swap_adjacent_blocks(vp->rec, sizeof(MFTL_Vertex), f, a, b, tmp);
       swap_adjacent_blocks(vp->pos, 3 * sizeof(double), f, a, b, tmp);
       swap_adjacent_blocks(vp->normal, 3 * sizeof(double), f, a, b, tmp);
+      if (vp->has_sizing) swap_adjacent_blocks(vp->sizing, sizeof(double), f, a, b, tmp);
     }
 
     if (swap_t)

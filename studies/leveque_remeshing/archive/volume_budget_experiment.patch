@@ -1,0 +1,401 @@
+diff --git a/src/remeshing/remesh_driver.c b/src/remeshing/remesh_driver.c
+--- a/src/remeshing/remesh_driver.c
++++ b/src/remeshing/remesh_driver.c
+@@ -269,16 +269,30 @@
+       st->reference_bytes = MFTL_MAX(st->reference_bytes, ref.bytes);
+     }
+ 
++    MFTL_ExpVolume *const exv = MFTLExpVolume();  // EXPERIMENT
++    double exv_v[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
++    if (exv->on)
++    {
++      exv_v[0] = MFTLExpObjectVolume(obj);
++      if (!exv->have_start)
++      {
++        exv->have_start = 1;
++        exv->v_start = exv_v[0];
++      }
++    }
+     const int n_split = sweep_split(obj, params);
++    if (exv->on) exv_v[1] = MFTLExpObjectVolume(obj);
+     const int n_collapse = sweep_collapse(obj, params, st);
+ 
+     /* Unconditional, not "if anything died": the split sweep left the derived
+      * arrays invalid too, and MFTLRemeshCompactObject rebuilds them on the way
+      * out whether or not it moved anything. */
+     MFTLRemeshCompactObject(obj, st);
++    if (exv->on) exv_v[2] = MFTLExpObjectVolume(obj);
+ 
+     const int n_flip = sweep_flip(obj, params, st);
+     if (n_flip > 0) MFTLObjectBuildDerived(obj);
++    if (exv->on) exv_v[3] = MFTLExpObjectVolume(obj);
+ 
+     clear_visited(obj);
+ 
+@@ -302,6 +316,11 @@
+      * convergence test below reads counts that are final already. */
+     const bool last_iteration = (iter == iterations - 1) || (n_split + n_collapse + n_flip <= params->min_convergence_ops);
+     MFTLRemeshSmooth(obj, params, params->smooth_iterations, (have_ref && last_iteration) ? &ref : MFTL_NULL, st);
++    if (exv->on)
++    {
++      exv_v[4] = MFTLExpObjectVolume(obj);
++      for (int k = 0; k < 4; ++k) exv->sweep[k] += exv_v[k + 1] - exv_v[k];
++    }
+ 
+     st->n_split += n_split;
+     st->n_collapse += n_collapse;
+diff --git a/src/remeshing/remesh_internal.h b/src/remeshing/remesh_internal.h
+--- a/src/remeshing/remesh_internal.h	2026-11-05 21:54:39
++++ b/src/remeshing/remesh_internal.h	2026-11-05 21:54:56
+@@ -846,4 +846,24 @@
+  */
+ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats, const MFTL_RemeshMeasurement *m);
+ 
++/* ── EXPERIMENT (archive/volume_budget_experiment.patch) ────────────────────
++ * Switches: MFTL_EXP_VBUDGET=1 per-sweep and per-operation volume budget,
++ * printed at exit (the volume-preserving collapse is the library's
++ * collapse_preserves_volume); MFTL_EXP_FLIPGUARD=tau refuse a flip whose volume change exceeds
++ * tau * A_quad * |edge| / 3; MFTL_EXP_FLIPCOMP=1 restore a flip's volume by a
++ * common shift of its four vertices along the quad normal. */
++typedef struct
++{
++  int on, flipcomp;
++  double flipguard;
++  double sweep[4];  // split, collapse, flip, smooth: summed volume change
++  double v_start;  // volume at the first call
++  int have_start;
++  double col_dv[6], flip_dv[6];  // by bin of the local bending angle
++  long long col_n[6], flip_n[6], flip_refused, flip_comp;
++  double comp_max;  // largest |shift| / edge of a compensated flip
++} MFTL_ExpVolume;
++MFTL_ExpVolume *MFTLExpVolume(void);
++double MFTLExpObjectVolume(const MFTL_Object *obj);
++
+ #endif  // MFTL_REMESH_INTERNAL_H
+diff --git a/src/remeshing/remesh_ops.c b/src/remeshing/remesh_ops.c
+--- a/src/remeshing/remesh_ops.c
++++ b/src/remeshing/remesh_ops.c
+@@ -38,7 +38,10 @@
+ 
+ #include "mftl_remeshing.h"
+ 
++#include <math.h>
++#include <stdio.h>
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #include "mftl_constants.h"
+ #include "mftl_geometry.h"
+@@ -120,6 +123,159 @@
+   return (n >= MFTL_REMESH_RING_MAX) ? MFTL_ERROR : n;
+ }
+ 
++/* ── EXPERIMENT (archive/volume_budget_experiment.patch) ──────────────────── */
++
++static void exp_volume_report(void)
++{
++  MFTL_ExpVolume *e = MFTLExpVolume();
++  if (!e->on) return;
++  const double v0 = e->have_start ? e->v_start : 1.0;
++  fprintf(stderr, "EXPVOL sweeps (%% of V0): split %+.5f collapse %+.5f flip %+.5f smooth %+.5f\n", 100.0 * e->sweep[0] / v0, 100.0 * e->sweep[1] / v0,
++          100.0 * e->sweep[2] / v0, 100.0 * e->sweep[3] / v0);
++  static const char *bins[6] = {"<5", "5-10", "10-20", "20-40", "40-80", ">80"};
++  for (int i = 0; i < 6; ++i)
++    fprintf(stderr, "EXPVOL bin %-6s collapses %9lld dV %+.5f %%   flips %9lld dV %+.5f %%\n", bins[i], e->col_n[i], 100.0 * e->col_dv[i] / v0, e->flip_n[i],
++            100.0 * e->flip_dv[i] / v0);
++  fprintf(stderr, "EXPVOL flips refused by the guard %lld, compensated %lld (largest shift %.3e of an edge)\n", e->flip_refused, e->flip_comp, e->comp_max);
++}
++
++MFTL_ExpVolume *MFTLExpVolume(void)
++{
++  static MFTL_ExpVolume e;
++  static int init = 0;
++  if (!init)
++  {
++    init = 1;
++    memset(&e, 0, sizeof(e));
++    e.on = getenv("MFTL_EXP_VBUDGET") != MFTL_NULL;
++    e.flipcomp = getenv("MFTL_EXP_FLIPCOMP") != MFTL_NULL;
++    e.flipguard = getenv("MFTL_EXP_FLIPGUARD") ? atof(getenv("MFTL_EXP_FLIPGUARD")) : 0.0;
++    if (e.on) atexit(exp_volume_report);
++  }
++  return &e;
++}
++
++/* Six times the signed tetrahedron volume of (o, x, y, z). */
++static inline double exp_det(const double *o, const double *x, const double *y, const double *z)
++{
++  const double u[3] = {x[0] - o[0], x[1] - o[1], x[2] - o[2]}, v[3] = {y[0] - o[0], y[1] - o[1], y[2] - o[2]},
++               w[3] = {z[0] - o[0], z[1] - o[1], z[2] - o[2]};
++  return u[0] * (v[1] * w[2] - v[2] * w[1]) - u[1] * (v[0] * w[2] - v[2] * w[0]) + u[2] * (v[0] * w[1] - v[1] * w[0]);
++}
++
++double MFTLExpObjectVolume(const MFTL_Object *obj)
++{
++  if (obj->tris.n_local == 0) return 0.0;
++  double T[3][3], o[3];
++  MFTLGetTriangleCorners(obj, 0, T);
++  for (int k = 0; k < 3; ++k) o[k] = T[0][k];
++  double v = 0.0;
++  for (int t = 0; t < obj->tris.n_local; ++t)
++  {
++    if (obj->tris.rec[t].flags & MFTL_FLAG_DEAD) continue;
++    MFTLGetTriangleCorners(obj, t, T);
++    v += exp_det(o, T[0], T[1], T[2]);
++  }
++  return v / 6.0;
++}
++
++static int exp_bin(double deg) { return deg < 5 ? 0 : deg < 10 ? 1 : deg < 20 ? 2 : deg < 40 ? 3 : deg < 80 ? 4 : 5; }
++
++/* Corners of t relative to o (minimum image), a and b replaced by p when p != NULL. */
++static void exp_corners(const MFTL_Object *obj, int t, int a, int b, const double *p, const double *o, double X[3][3])
++{
++  int v[3];
++  MFTLGetTriangleVertices(obj, t, v);
++  for (int k = 0; k < 3; ++k)
++  {
++    const double *x = (p && (v[k] == a || v[k] == b)) ? p : MFTLVertexPos(obj, v[k]);
++    MFTLGetMinimumImageVector(obj->domain, X[k], o, x);
++  }
++}
++
++/* The exact volume change of collapsing a, b into p, its gradient in p, and the
++ * patch's largest angle between a triangle normal and the patch normal. */
++static int exp_collapse_volume(const MFTL_Object *obj, int a, int b, const double p[3], double *dv, double grad[3], double *bend_deg)
++{
++  int fa[MFTL_REMESH_RING_MAX], fb[MFTL_REMESH_RING_MAX];
++  const int na = ring_triangles(obj, a, fa), nb = ring_triangles(obj, b, fb);
++  if (na == MFTL_ERROR || nb == MFTL_ERROR) return MFTL_ERROR;
++  const double zero[3] = {0.0, 0.0, 0.0};
++  double sum = 0.0, S[3] = {0.0, 0.0, 0.0}, nsum[3] = {0.0, 0.0, 0.0};
++  double nt[2 * MFTL_REMESH_RING_MAX][3];
++  int m = 0;
++  grad[0] = grad[1] = grad[2] = 0.0;
++  for (int pass = 0; pass < 2; ++pass)
++  {
++    const int *f = pass ? fb : fa;
++    const int n = pass ? nb : na;
++    for (int i = 0; i < n; ++i)
++    {
++      const int t = f[i];
++      int v[3];
++      MFTLGetTriangleVertices(obj, t, v);
++      const bool has_a = v[0] == a || v[1] == a || v[2] == a, has_b = v[0] == b || v[1] == b || v[2] == b;
++      if (pass == 1 && has_a) continue;  // counted in pass 0
++      double X[3][3];
++      exp_corners(obj, t, a, b, MFTL_NULL, p, X);
++      const double old = exp_det(zero, X[0], X[1], X[2]);
++      double e1[3], e2[3], c[3];
++      for (int k = 0; k < 3; ++k)
++      {
++        e1[k] = X[1][k] - X[0][k];
++        e2[k] = X[2][k] - X[0][k];
++      }
++      c[0] = e1[1] * e2[2] - e1[2] * e2[1];
++      c[1] = e1[2] * e2[0] - e1[0] * e2[2];
++      c[2] = e1[0] * e2[1] - e1[1] * e2[0];
++      for (int k = 0; k < 3; ++k) nsum[k] += c[k];
++      if (m < 2 * MFTL_REMESH_RING_MAX) memcpy(nt[m++], c, sizeof(c));
++      if (has_a && has_b)
++      {
++        sum -= old;  // removed by the collapse
++        continue;
++      }
++      /* With the moved corner at the origin p the new determinant is zero; the
++       * gradient in p is the cross product of the other two, in cyclic order. */
++      int k0 = 0;
++      for (int k = 0; k < 3; ++k)
++        if (v[k] == a || v[k] == b) k0 = k;
++      const double *y = X[(k0 + 1) % 3], *z = X[(k0 + 2) % 3];
++      const double g[3] = {y[1] * z[2] - y[2] * z[1], y[2] * z[0] - y[0] * z[2], y[0] * z[1] - y[1] * z[0]};
++      for (int k = 0; k < 3; ++k) S[k] += g[k];
++      sum -= old;  // new determinant with p at the origin is 0
++    }
++  }
++  *dv = sum / 6.0;
++  for (int k = 0; k < 3; ++k) grad[k] = S[k] / 6.0;
++  double worst = 1.0;
++  const double ln = sqrt(nsum[0] * nsum[0] + nsum[1] * nsum[1] + nsum[2] * nsum[2]);
++  for (int i = 0; i < m && ln > 0.0; ++i)
++  {
++    const double l = sqrt(nt[i][0] * nt[i][0] + nt[i][1] * nt[i][1] + nt[i][2] * nt[i][2]);
++    if (l > 0.0) worst = fmin(worst, (nt[i][0] * nsum[0] + nt[i][1] * nsum[1] + nt[i][2] * nsum[2]) / (l * ln));
++  }
++  *bend_deg = acos(fmax(-1.0, fmin(1.0, worst))) * 180.0 / MFTL_PI;
++  return MFTL_SUCCESS;
++}
++
++/* The exact volume change of flipping the quad (a,b,c),(b,a,d) to (a,d,c),(d,b,c). */
++static double exp_flip_volume(const MFTL_Object *obj, int va, int vb, int vc, int vd)
++{
++  const double *o = MFTLVertexPos(obj, va);
++  double B[3], C[3], D[3];
++  const double A[3] = {0.0, 0.0, 0.0};
++  MFTLGetMinimumImageVector(obj->domain, B, o, MFTLVertexPos(obj, vb));
++  MFTLGetMinimumImageVector(obj->domain, C, o, MFTLVertexPos(obj, vc));
++  MFTLGetMinimumImageVector(obj->domain, D, o, MFTLVertexPos(obj, vd));
++  const double z[3] = {0.0, 0.0, 0.0};
++  (void) z;
++  /* relative to A: det(A..) terms with A = 0 vanish */
++  const double neu = exp_det(A, A, D, C) + exp_det(A, D, B, C);
++  const double alt = exp_det(A, A, B, C) + exp_det(A, B, A, D);
++  return (neu - alt) / 6.0;
++}
++
+ /**
+  * @brief Number of entries of @p a that also appear in @p b.
+  *
+@@ -906,6 +1062,18 @@
+ 
+   double pm[3];
+   if (collapse_target_position(obj, h, a, b, params, MFTL_TRUE, judged, pm) != MFTL_SUCCESS) return MFTL_ERROR;
++  {
++    MFTL_ExpVolume *const e = MFTLExpVolume();
++    if (e->on)
++    {
++      double dv = 0.0, g[3], bend = 0.0;
++      if (exp_collapse_volume(obj, a, b, pm, &dv, g, &bend) == MFTL_SUCCESS)
++      {
++        e->col_dv[exp_bin(bend)] += dv;
++        e->col_n[exp_bin(bend)]++;
++      }
++    }
++  }
+ 
+   const bool triangle_fields = MFTLFieldsStride(obj, 1) != 0;
+   const bool vertex_fields = MFTLFieldsStride(obj, 0) != 0;
+@@ -1148,6 +1316,24 @@
+     return MFTL_FALSE;
+   }
+ 
++  /* EXPERIMENT: refuse a flip whose volume change, spread over the quad, is a
++   * height above tau times the flipped edge: 3|dV| > tau * A_quad * |ab|. */
++  {
++    MFTL_ExpVolume *const e = MFTLExpVolume();
++    if (e->flipguard > 0.0)
++    {
++      const double dv = exp_flip_volume(obj, va, vb, vc, vd);
++      double ab[3];
++      MFTLGetMinimumImageVector(obj->domain, ab, pa, pb);
++      const double area = 0.5 * (sqrt(n1[0] * n1[0] + n1[1] * n1[1] + n1[2] * n1[2]) + sqrt(n2[0] * n2[0] + n2[1] * n2[1] + n2[2] * n2[2]));
++      if (3.0 * fabs(dv) > e->flipguard * area * sqrt(ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2]))
++      {
++        e->flip_refused++;
++        return MFTL_FALSE;
++      }
++    }
++  }
++
+   return MFTL_TRUE;
+ }
+ 
+@@ -1205,6 +1391,38 @@
+     if (!field_values) return MFTL_ERROR;
+   }
+ 
++  /* EXPERIMENT: the flip's exact volume change, and the quad's normal. */
++  MFTL_ExpVolume *const exp = MFTLExpVolume();
++  double exp_dv = 0.0, exp_n[3] = {0.0, 0.0, 0.0};
++  if (exp->on || exp->flipcomp)
++  {
++    exp_dv = exp_flip_volume(obj, va, vb, vc, vd);
++    double n1[3], n2[3];
++    {
++      double X[3][3];
++      const double *o = MFTLVertexPos(obj, va);
++      exp_corners(obj, t1, -1, -1, MFTL_NULL, o, X);
++      const double e1[3] = {X[1][0] - X[0][0], X[1][1] - X[0][1], X[1][2] - X[0][2]}, e2[3] = {X[2][0] - X[0][0], X[2][1] - X[0][1], X[2][2] - X[0][2]};
++      n1[0] = e1[1] * e2[2] - e1[2] * e2[1];
++      n1[1] = e1[2] * e2[0] - e1[0] * e2[2];
++      n1[2] = e1[0] * e2[1] - e1[1] * e2[0];
++      exp_corners(obj, t2, -1, -1, MFTL_NULL, o, X);
++      const double f1[3] = {X[1][0] - X[0][0], X[1][1] - X[0][1], X[1][2] - X[0][2]}, f2[3] = {X[2][0] - X[0][0], X[2][1] - X[0][1], X[2][2] - X[0][2]};
++      n2[0] = f1[1] * f2[2] - f1[2] * f2[1];
++      n2[1] = f1[2] * f2[0] - f1[0] * f2[2];
++      n2[2] = f1[0] * f2[1] - f1[1] * f2[0];
++    }
++    const double l1 = sqrt(n1[0] * n1[0] + n1[1] * n1[1] + n1[2] * n1[2]), l2 = sqrt(n2[0] * n2[0] + n2[1] * n2[1] + n2[2] * n2[2]);
++    const double c = (l1 > 0.0 && l2 > 0.0) ? (n1[0] * n2[0] + n1[1] * n2[1] + n1[2] * n2[2]) / (l1 * l2) : 1.0;
++    for (int k = 0; k < 3; ++k) exp_n[k] = n1[k] + n2[k];
++    if (exp->on)
++    {
++      const int bin = exp_bin(acos(fmax(-1.0, fmin(1.0, c))) * 180.0 / MFTL_PI);
++      exp->flip_dv[bin] += exp_dv;
++      exp->flip_n[bin]++;
++    }
++  }
++
+   /* The quad is A -> D -> B -> C. Cutting it along the other diagonal gives
+    * (A, D, C) and (D, B, C), both still counter-clockwise. */
+   tri_write(obj, t1, va, vd, vc);
+@@ -1240,5 +1458,69 @@
+ 
+   if (triangle_fields) MFTLRemeshFieldCommit(obj, patch, new_area, 2, field_values);
+   MFTLObjectInvalidateDerived(obj);
++
++  /* EXPERIMENT: give the volume back by moving the quad's four vertices by ONE
++   * vector along its normal. A common shift changes every determinant linearly
++   * (no term holds it twice), so the step is exact. */
++  if (exp->flipcomp && exp_dv != 0.0)
++  {
++    const int q[4] = {va, vb, vc, vd};
++    const unsigned busy = MFTL_FLAG_FROZEN | MFTL_FLAG_FEATURE | MFTL_FLAG_CORNER | MFTL_FLAG_BOUNDARY | MFTL_FLAG_DEAD;
++    bool free4 = MFTL_TRUE;
++    for (int i = 0; i < 4; ++i) free4 = free4 && !(obj->verts.rec[q[i]].flags & busy) && q[i] < obj->verts.n_local;
++    const double ln = sqrt(exp_n[0] * exp_n[0] + exp_n[1] * exp_n[1] + exp_n[2] * exp_n[2]);
++    if (free4 && ln > 0.0)
++    {
++      const double nh[3] = {exp_n[0] / ln, exp_n[1] / ln, exp_n[2] / ln};
++      int tris[4 * MFTL_REMESH_RING_MAX], nt = 0;
++      bool ok = MFTL_TRUE;
++      for (int i = 0; i < 4 && ok; ++i)
++      {
++        int f[MFTL_REMESH_RING_MAX];
++        const int n = ring_triangles(obj, q[i], f);
++        if (n == MFTL_ERROR)
++          ok = MFTL_FALSE;
++        else
++          for (int j = 0; j < n; ++j)
++          {
++            bool seen = MFTL_FALSE;
++            for (int k = 0; k < nt && !seen; ++k) seen = tris[k] == f[j];
++            if (!seen) tris[nt++] = f[j];
++          }
++      }
++      double G = 0.0;
++      const double *o = MFTLVertexPos(obj, va);
++      double oc[3] = {o[0], o[1], o[2]};
++      for (int i = 0; i < nt && ok; ++i)
++      {
++        int v[3];
++        MFTLGetTriangleVertices(obj, tris[i], v);
++        double X[3][3];
++        exp_corners(obj, tris[i], -1, -1, MFTL_NULL, oc, X);
++        for (int k = 0; k < 3; ++k)
++        {
++          if (v[k] != va && v[k] != vb && v[k] != vc && v[k] != vd) continue;
++          const double *y = X[(k + 1) % 3], *z = X[(k + 2) % 3];
++          G += nh[0] * (y[1] * z[2] - y[2] * z[1]) + nh[1] * (y[2] * z[0] - y[0] * z[2]) + nh[2] * (y[0] * z[1] - y[1] * z[0]);
++        }
++      }
++      G /= 6.0;
++      if (ok && G != 0.0)
++      {
++        const double d = -exp_dv / G;
++        for (int i = 0; i < 4; ++i)
++        {
++          double *x = &obj->verts.pos[3 * q[i]];
++          for (int k = 0; k < 3; ++k) x[k] += d * nh[k];
++          MFTLApplyPeriodicity(obj->domain, x);
++        }
++        double cd[3];
++        MFTLGetMinimumImageVector(obj->domain, cd, MFTLVertexPos(obj, vc), MFTLVertexPos(obj, vd));
++        const double rel = fabs(d) / sqrt(cd[0] * cd[0] + cd[1] * cd[1] + cd[2] * cd[2]);
++        if (rel > exp->comp_max) exp->comp_max = rel;
++        exp->flip_comp++;
++      }
++    }
++  }
+   return MFTL_SUCCESS;
+ }

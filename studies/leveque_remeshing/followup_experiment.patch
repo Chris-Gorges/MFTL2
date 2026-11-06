@@ -1,0 +1,425 @@
+--- a/src/remeshing/remesh_driver.c
++++ b/src/remeshing/remesh_driver.c
+@@ -160,6 +160,27 @@
+ /* ═══════════════════════════════════════════════════════════════════════════
+  * Public
+  * ═══════════════════════════════════════════════════════════════════════════ */
++
++/* EXPERIMENT (temporary): enclosed volume per sweep. */
++static double g_vb[4];
++static int exp_flag(const char *name)
++{
++  const char *e = getenv(name);
++  return (e && e[0] != '0' && e[0] != 0);
++}
++static double exp_volume(const MFTL_Object *obj)
++{
++  double v = 0.0;
++  for (int t = 0; t < obj->tris.n; ++t)
++  {
++    if (tri_is_dead(obj, t)) continue;
++    const double *a = MFTLVertexPos(obj, MFTLHeOrigin(obj, 3 * t));
++    const double *b = MFTLVertexPos(obj, MFTLHeOrigin(obj, 3 * t + 1));
++    const double *c = MFTLVertexPos(obj, MFTLHeOrigin(obj, 3 * t + 2));
++    v += a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2]) + a[2] * (b[0] * c[1] - b[1] * c[0]);
++  }
++  return v / 6.0;
++}
+ 
+ double MFTLMeanEdgeLength(const MFTL_Object *obj)
+ {
+@@ -252,16 +273,21 @@
+ 
+     MFTLDetectFeatures(obj, params->feature_angle_threshold, params->feature_corner_angle, st);
+ 
++    const int budget = exp_flag("MFTL_EXP_BUDGET");
++    const double vb0 = budget ? exp_volume(obj) : 0.0;
+     const int n_split = sweep_split(obj, params);
++    const double vb1 = budget ? exp_volume(obj) : 0.0;
+     const int n_collapse = sweep_collapse(obj, params, st);
+ 
+     /* Unconditional, not "if anything died": the split sweep left the derived
+      * arrays invalid too, and MFTLRemeshCompactObject rebuilds them on the way
+      * out whether or not it moved anything. */
+     MFTLRemeshCompactObject(obj, st);
++    const double vb2 = budget ? exp_volume(obj) : 0.0;
+ 
+     const int n_flip = sweep_flip(obj, params, st);
+     if (n_flip > 0) MFTLObjectBuildDerived(obj);
++    const double vb3 = budget ? exp_volume(obj) : 0.0;
+ 
+     clear_visited(obj);
+ 
+@@ -281,6 +307,14 @@
+     MFTLDetectFeatures(obj, params->feature_angle_threshold, params->feature_corner_angle, st);
+ 
+     MFTLSmoothTangential(obj, params, params->smooth_iterations);
++    if (budget)
++    {
++      const double vb4 = exp_volume(obj);
++      g_vb[0] += vb1 - vb0;
++      g_vb[1] += vb2 - vb1;
++      g_vb[2] += vb3 - vb2;
++      g_vb[3] += vb4 - vb3;
++    }
+ 
+     st->n_split += n_split;
+     st->n_collapse += n_collapse;
+@@ -314,7 +348,17 @@
+    * operators carry it from here (remesh_sizing.c). A no-op otherwise. */
+   if (MFTLRemeshPrepareSizing(obj, params) != MFTL_SUCCESS) return MFTL_ERROR;
+ 
++  /* PROJECT=3 is purely local: no stored input, no flat pre-projection. */
++  const char *exp_pe = getenv("MFTL_EXP_PROJECT");
++  const int project = exp_pe && (exp_pe[0] == '1' || exp_pe[0] == '2');
++  if (project) MFTLRemeshExpReference(obj, 1);
+   MFTLRemeshIterate(obj, params, st, params->iterations);
++  if (project) MFTLRemeshExpReference(obj, 0);
++  if (exp_flag("MFTL_EXP_BUDGET"))
++  {
++    fprintf(stderr, "#VB %.17g %.17g %.17g %.17g %d %d %d\n", g_vb[0], g_vb[1], g_vb[2], g_vb[3], st->n_split, st->n_collapse, st->n_flip);
++    g_vb[0] = g_vb[1] = g_vb[2] = g_vb[3] = 0.0;
++  }
+ 
+   if (params->renumber_global_ids) MFTLRemeshRenumberGlobalIds(obj);
+ 
+--- a/src/remeshing/remesh_smooth.c
++++ b/src/remeshing/remesh_smooth.c
+@@ -756,7 +756,210 @@
+   free(q);
+   return out;
+ }
++
++/* EXPERIMENT (temporary): the remesher's input surface, triangles binned in a
++ * uniform grid whose cell is at least the largest triangle extent. */
++static struct
++{
++  int on, n, dims[3];
++  double lo[3], cell;
++  double *tri;  // 9 per triangle
++  double *nrm;  // 9 per triangle: the corners' vertex normals (Phong mode)
++  int *start, *items;
++} g_ref;
+ 
++void MFTLRemeshExpReference(const MFTL_Object *obj, int build)
++{
++  if (!build)
++  {
++    free(g_ref.tri);
++    free(g_ref.nrm);
++    free(g_ref.start);
++    free(g_ref.items);
++    memset(&g_ref, 0, sizeof(g_ref));
++    return;
++  }
++  const int n_t = obj->tris.n;
++  g_ref.tri = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(n_t, 1) * 9 * sizeof(double), "exp ref");
++  g_ref.nrm = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(n_t, 1) * 9 * sizeof(double), "exp ref normals");
++  MFTLComputeVertexNormals((MFTL_Object *) obj, MFTL_NORMAL_WEIGHT_ANGLE);
++  {
++    const char *e = getenv("MFTL_EXP_PROJECT");
++    g_ref.on = (e && e[0] == '2') ? 2 : 1;
++  }
++  double lo[3] = {MFTL_DBL_MAX, MFTL_DBL_MAX, MFTL_DBL_MAX}, hi[3] = {-MFTL_DBL_MAX, -MFTL_DBL_MAX, -MFTL_DBL_MAX}, ext = 0.0;
++  int n = 0;
++  for (int t = 0; t < n_t; ++t)
++  {
++    if (obj->tris.rec[t].flags & MFTL_FLAG_DEAD) continue;
++    double tlo[3] = {MFTL_DBL_MAX, MFTL_DBL_MAX, MFTL_DBL_MAX}, thi[3] = {-MFTL_DBL_MAX, -MFTL_DBL_MAX, -MFTL_DBL_MAX};
++    for (int k = 0; k < 3; ++k)
++    {
++      const int vk = MFTLHeOrigin(obj, 3 * t + k);
++      const double *p = MFTLVertexPos(obj, vk);
++      for (int c = 0; c < 3; ++c)
++      {
++        g_ref.tri[9 * n + 3 * k + c] = p[c];
++        g_ref.nrm[9 * n + 3 * k + c] = obj->verts.normal[3 * vk + c];
++        tlo[c] = MFTL_MIN(tlo[c], p[c]);
++        thi[c] = MFTL_MAX(thi[c], p[c]);
++      }
++    }
++    for (int c = 0; c < 3; ++c)
++    {
++      lo[c] = MFTL_MIN(lo[c], tlo[c]);
++      hi[c] = MFTL_MAX(hi[c], thi[c]);
++      ext = MFTL_MAX(ext, thi[c] - tlo[c]);
++    }
++    n++;
++  }
++  g_ref.n = n;
++  double cell = MFTL_MAX(ext, 1e-12);
++  for (;;)
++  {
++    long cells = 1;
++    for (int c = 0; c < 3; ++c)
++    {
++      g_ref.dims[c] = (int) ((hi[c] - lo[c]) / cell) + 1;
++      cells *= g_ref.dims[c];
++    }
++    if (cells <= 4000000) break;
++    cell *= 1.5;
++  }
++  g_ref.cell = cell;
++  for (int c = 0; c < 3; ++c) g_ref.lo[c] = lo[c];
++  const int n_cells = g_ref.dims[0] * g_ref.dims[1] * g_ref.dims[2];
++  g_ref.start = (int *) calloc((size_t) n_cells + 1, sizeof(int));
++  for (int pass = 0; pass < 2; ++pass)
++  {
++    int *fill = MFTL_NULL;
++    if (pass == 1)
++    {
++      for (int i = 0; i < n_cells; ++i) g_ref.start[i + 1] += g_ref.start[i];
++      g_ref.items = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(g_ref.start[n_cells], 1) * sizeof(int), "exp ref items");
++      fill = (int *) calloc((size_t) n_cells, sizeof(int));
++    }
++    for (int t = 0; t < n; ++t)
++    {
++      int a[3], b[3];
++      for (int c = 0; c < 3; ++c)
++      {
++        const double *x = &g_ref.tri[9 * t];
++        const double mn = MFTL_MIN(x[c], MFTL_MIN(x[3 + c], x[6 + c])), mx = MFTL_MAX(x[c], MFTL_MAX(x[3 + c], x[6 + c]));
++        a[c] = MFTL_MIN((int) ((mn - lo[c]) / cell), g_ref.dims[c] - 1);
++        b[c] = MFTL_MIN((int) ((mx - lo[c]) / cell), g_ref.dims[c] - 1);
++      }
++      for (int i = a[0]; i <= b[0]; ++i)
++        for (int j = a[1]; j <= b[1]; ++j)
++          for (int k = a[2]; k <= b[2]; ++k)
++          {
++            const int id = (i * g_ref.dims[1] + j) * g_ref.dims[2] + k;
++            if (pass == 0)
++              g_ref.start[id + 1]++;
++            else
++              g_ref.items[g_ref.start[id] + fill[id]++] = t;
++          }
++    }
++    free(fill);
++  }
++}
++
++static void exp_project(double q[3])
++{
++  if (!g_ref.on) return;
++  int c0[3];
++  for (int c = 0; c < 3; ++c) c0[c] = (int) floor((q[c] - g_ref.lo[c]) / g_ref.cell);
++  double best = MFTL_DBL_MAX, bq[3] = {q[0], q[1], q[2]};
++  int bt = -1;
++  for (int i = c0[0] - 1; i <= c0[0] + 1; ++i)
++    for (int j = c0[1] - 1; j <= c0[1] + 1; ++j)
++      for (int k = c0[2] - 1; k <= c0[2] + 1; ++k)
++      {
++        if (i < 0 || j < 0 || k < 0 || i >= g_ref.dims[0] || j >= g_ref.dims[1] || k >= g_ref.dims[2]) continue;
++        const int id = (i * g_ref.dims[1] + j) * g_ref.dims[2] + k;
++        for (int s = g_ref.start[id]; s < g_ref.start[id + 1]; ++s)
++        {
++          const double *x = &g_ref.tri[9 * g_ref.items[s]];
++          const double tri[3][3] = {{x[0], x[1], x[2]}, {x[3], x[4], x[5]}, {x[6], x[7], x[8]}};
++          double cp[3];
++          MFTL_TriangleFeature f;
++          MFTLClosestPointOnTriangle(q, tri, cp, &f);
++          const double d = (cp[0] - q[0]) * (cp[0] - q[0]) + (cp[1] - q[1]) * (cp[1] - q[1]) + (cp[2] - q[2]) * (cp[2] - q[2]);
++          if (d < best) best = d, bq[0] = cp[0], bq[1] = cp[1], bq[2] = cp[2], bt = g_ref.items[s];
++        }
++      }
++  if (g_ref.on == 2 && bt >= 0)
++  {
++    /* Phong tessellation, alpha = 1/2: bq + 1/2 SUM u_i (pi_i(bq) - bq). */
++    const double *x = &g_ref.tri[9 * bt];
++    const double *nn = &g_ref.nrm[9 * bt];
++    double e1[3], e2[3], r[3];
++    for (int c = 0; c < 3; ++c) e1[c] = x[3 + c] - x[c], e2[c] = x[6 + c] - x[c], r[c] = bq[c] - x[c];
++    const double d11 = e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2], d12 = e1[0] * e2[0] + e1[1] * e2[1] + e1[2] * e2[2];
++    const double d22 = e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2];
++    const double r1 = r[0] * e1[0] + r[1] * e1[1] + r[2] * e1[2], r2 = r[0] * e2[0] + r[1] * e2[1] + r[2] * e2[2];
++    const double den = d11 * d22 - d12 * d12;
++    if (den > 0.0)
++    {
++      const double u1 = (d22 * r1 - d12 * r2) / den, u2 = (d11 * r2 - d12 * r1) / den;
++      const double u[3] = {1.0 - u1 - u2, u1, u2};
++      double off[3] = {0.0, 0.0, 0.0};
++      for (int i = 0; i < 3; ++i)
++      {
++        const double *ni = &nn[3 * i];
++        const double h = (bq[0] - x[3 * i]) * ni[0] + (bq[1] - x[3 * i + 1]) * ni[1] + (bq[2] - x[3 * i + 2]) * ni[2];
++        for (int c = 0; c < 3; ++c) off[c] -= u[i] * h * ni[c];
++      }
++      for (int c = 0; c < 3; ++c) bq[c] += 0.5 * off[c];
++    }
++  }
++  q[0] = bq[0];
++  q[1] = bq[1];
++  q[2] = bq[2];
++}
++
++/* EXPERIMENT (temporary): q onto the Phong (alpha = 1/2) patch of v's current fan,
++ * with the sweep's vertex normals. */
++static void exp_project_fan(const MFTL_Object *obj, int v, const int *fan, int n_fan, double q[3])
++{
++  double best = MFTL_DBL_MAX, bq[3] = {q[0], q[1], q[2]};
++  int bw[3] = {-1, -1, -1};
++  for (int i = 0; i < n_fan; ++i)
++  {
++    const int w1 = MFTLHeTarget(obj, fan[i]), w2 = MFTLHeTarget(obj, MFTLHeNextIdx(fan[i]));
++    const double *p0 = MFTLVertexPos(obj, v), *p1 = MFTLVertexPos(obj, w1), *p2 = MFTLVertexPos(obj, w2);
++    const double tri[3][3] = {{p0[0], p0[1], p0[2]}, {p1[0], p1[1], p1[2]}, {p2[0], p2[1], p2[2]}};
++    double cp[3];
++    MFTL_TriangleFeature f;
++    MFTLClosestPointOnTriangle(q, tri, cp, &f);
++    const double d = (cp[0] - q[0]) * (cp[0] - q[0]) + (cp[1] - q[1]) * (cp[1] - q[1]) + (cp[2] - q[2]) * (cp[2] - q[2]);
++    if (d < best) best = d, bq[0] = cp[0], bq[1] = cp[1], bq[2] = cp[2], bw[0] = v, bw[1] = w1, bw[2] = w2;
++  }
++  if (bw[0] < 0) return;
++  const double *x0 = MFTLVertexPos(obj, bw[0]), *x1 = MFTLVertexPos(obj, bw[1]), *x2 = MFTLVertexPos(obj, bw[2]);
++  double e1[3], e2[3], r[3];
++  for (int c = 0; c < 3; ++c) e1[c] = x1[c] - x0[c], e2[c] = x2[c] - x0[c], r[c] = bq[c] - x0[c];
++  const double d11 = e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2], d12 = e1[0] * e2[0] + e1[1] * e2[1] + e1[2] * e2[2];
++  const double d22 = e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2];
++  const double r1 = r[0] * e1[0] + r[1] * e1[1] + r[2] * e1[2], r2 = r[0] * e2[0] + r[1] * e2[1] + r[2] * e2[2];
++  const double den = d11 * d22 - d12 * d12;
++  if (den > 0.0)
++  {
++    const double u1 = (d22 * r1 - d12 * r2) / den, u2 = (d11 * r2 - d12 * r1) / den;
++    const double u[3] = {1.0 - u1 - u2, u1, u2};
++    const double *xs[3] = {x0, x1, x2};
++    for (int i = 0; i < 3; ++i)
++    {
++      const double *ni = &obj->verts.normal[3 * bw[i]];
++      const double h = (bq[0] - xs[i][0]) * ni[0] + (bq[1] - xs[i][1]) * ni[1] + (bq[2] - xs[i][2]) * ni[2];
++      for (int c = 0; c < 3; ++c) bq[c] -= 0.5 * u[i] * h * ni[c];
++    }
++  }
++  q[0] = bq[0];
++  q[1] = bq[1];
++  q[2] = bq[2];
++}
++
+ void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params, int iterations)
+ {
+   MFTL_ASSERT(obj != MFTL_NULL && params != MFTL_NULL);
+@@ -861,6 +1064,8 @@
+       }
+ 
+       double p[3] = {obj->verts.pos[3 * v + 0] + scale * disp[0], obj->verts.pos[3 * v + 1] + scale * disp[1], obj->verts.pos[3 * v + 2] + scale * disp[2]};
++      exp_project(p);
++      if (exp_env("MFTL_EXP_PROJECT", '3') && !(rec->flags & MFTL_FLAG_FEATURE)) exp_project_fan(obj, v, fan, n_fan, p);
+       MFTLApplyPeriodicity(obj->domain, p);
+ 
+       new_pos[3 * v + 0] = p[0];
+--- a/src/remeshing/remesh_internal.h
++++ b/src/remeshing/remesh_internal.h
+@@ -55,7 +55,55 @@
+  *         ever observes it.
+  */
+ static inline bool tri_is_dead(const MFTL_Object *obj, int t) { return (obj->tris.rec[t].flags & MFTL_FLAG_DEAD) != 0; }
++
++#include <stdlib.h> /* EXPERIMENT (temporary) */
++/* EXPERIMENT (temporary): reference surface for back-projection after smoothing. */
++void MFTLRemeshExpReference(const MFTL_Object *obj, int build);
++
++/* EXPERIMENT (temporary): area-weighted normal of v's fan from current positions. */
++static inline void exp_fan_normal(const MFTL_Object *obj, int v, double n[3])
++{
++  n[0] = n[1] = n[2] = 0.0;
++  const int start = obj->verts.rec[v].out_he_idx;
++  if (start == MFTL_ERROR) return;
++  int h = start, guard = 0;
++  do
++  {
++    const double *p = MFTLVertexPos(obj, v);
++    double d1[3], d2[3];
++    MFTLGetMinimumImageVector(obj->domain, d1, p, MFTLVertexPos(obj, MFTLHeTarget(obj, h)));
++    MFTLGetMinimumImageVector(obj->domain, d2, p, MFTLVertexPos(obj, MFTLHeTarget(obj, MFTLHeNextIdx(h))));
++    n[0] += d1[1] * d2[2] - d1[2] * d2[1];
++    n[1] += d1[2] * d2[0] - d1[0] * d2[2];
++    n[2] += d1[0] * d2[1] - d1[1] * d2[0];
++    h = obj->tris.he[MFTLHePrevIdx(h)].twin_idx;
++  } while (h != MFTL_ERROR && h != start && ++guard < 64);
++  const double l = MFTL_SQRT(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
++  if (l > 0.0) n[0] /= l, n[1] /= l, n[2] /= l;
++}
+ 
++/* EXPERIMENT (temporary): the Phong (alpha = 1/2) point over the midpoint of a-b. */
++static inline void exp_phong_midpoint(const MFTL_Object *obj, int a, int b, double pm[3])
++{
++  double na[3], nb[3];
++  exp_fan_normal(obj, a, na);
++  exp_fan_normal(obj, b, nb);
++  const double *xa = MFTLVertexPos(obj, a);
++  double ab[3];
++  MFTLGetMinimumImageVector(obj->domain, ab, xa, MFTLVertexPos(obj, b));
++  /* m - a = ab/2, m - b = -ab/2 */
++  const double ha = 0.5 * (ab[0] * na[0] + ab[1] * na[1] + ab[2] * na[2]);
++  const double hb = -0.5 * (ab[0] * nb[0] + ab[1] * nb[1] + ab[2] * nb[2]);
++  for (int k = 0; k < 3; ++k) pm[k] = xa[k] + 0.5 * ab[k] - 0.25 * (ha * na[k] + hb * nb[k]);
++  MFTLApplyPeriodicity(obj->domain, pm);
++}
++
++static inline int exp_env(const char *name, char value)
++{
++  const char *e = getenv(name);
++  return e && e[0] == value;
++}
++
+ /**
+  * @brief Has vertex @p v been retired by a collapse?
+  * @param obj The mesh.
+--- a/src/remeshing/remesh_ops.c
++++ b/src/remeshing/remesh_ops.c
+@@ -282,6 +282,15 @@
+   {
+     midpoint_periodic(obj->domain, MFTLVertexPos(obj, MFTLHeOrigin(obj, h)), MFTLVertexPos(obj, MFTLHeTarget(obj, h)), pm);
+     if (params != MFTL_NULL && params->qem_placement) qem_split_position(obj, h, params, pm);
++    if (params != MFTL_NULL && exp_env("MFTL_EXP_PHONG", '1') && !(obj->tris.he[h].flags & MFTL_FLAG_FEATURE))
++    {
++      double q[3];
++      exp_phong_midpoint(obj, MFTLHeOrigin(obj, h), MFTLHeTarget(obj, h), q);
++      const int ht = obj->tris.he[h].twin_idx;
++      if (!rim_split_folds(obj, h, q, params->max_normal_deviation_cos) &&
++          !(ht != MFTL_ERROR && rim_split_folds(obj, ht, q, params->max_normal_deviation_cos)))
++        pm[0] = q[0], pm[1] = q[1], pm[2] = q[2];
++    }
+   }
+   obj->derived &= ~MFTL_DERIVED_GEOMETRY;
+ 
+@@ -497,6 +506,7 @@
+    * (Jiao et al., Sect. 5.2: same feature rank -> average, then project along
+    * the normal). The fold-over clause judges the result. */
+   if (params != MFTL_NULL && params->qem_placement && !a_is_pinned && !b_is_pinned) MFTLRemeshQemPosition(obj, h, out);
++  if (params != MFTL_NULL && exp_env("MFTL_EXP_PHONG", '1') && !a_is_pinned && !b_is_pinned) exp_phong_midpoint(obj, a, b, out);
+   return MFTL_SUCCESS;
+ }
+ 
+@@ -990,7 +1000,33 @@
+      * round a vertex) and would undo every stretched triangle the metric asks
+      * for. The guards above and the fold test below are kept. */
+     if (!MFTLRemeshAnisotropicFlipWanted(obj, va, vb, vc, vd, params)) return MFTL_FALSE;
++  }
++  else if (getenv("MFTL_EXP_FLIP") && getenv("MFTL_EXP_FLIP")[0] == '2')
++  {
++    /* EXPERIMENT (temporary): Delaunay with the 3D angles at C and D opposite
++     * the edge: flip when they sum to more than pi, sin(a + b) < 0. */
++    const double *pa = MFTLVertexPos(obj, va), *pb = MFTLVertexPos(obj, vb), *pc = MFTLVertexPos(obj, vc), *pd = MFTLVertexPos(obj, vd);
++    double ca[3], cb[3], da[3], db[3];
++    MFTLGetMinimumImageVector(obj->domain, ca, pc, pa);
++    MFTLGetMinimumImageVector(obj->domain, cb, pc, pb);
++    MFTLGetMinimumImageVector(obj->domain, da, pd, pa);
++    MFTLGetMinimumImageVector(obj->domain, db, pd, pb);
++    const double xc[3] = {ca[1] * cb[2] - ca[2] * cb[1], ca[2] * cb[0] - ca[0] * cb[2], ca[0] * cb[1] - ca[1] * cb[0]};
++    const double xd[3] = {da[1] * db[2] - da[2] * db[1], da[2] * db[0] - da[0] * db[2], da[0] * db[1] - da[1] * db[0]};
++    const double sin_c = MFTL_SQRT(xc[0] * xc[0] + xc[1] * xc[1] + xc[2] * xc[2]), cos_c = ca[0] * cb[0] + ca[1] * cb[1] + ca[2] * cb[2];
++    const double sin_d = MFTL_SQRT(xd[0] * xd[0] + xd[1] * xd[1] + xd[2] * xd[2]), cos_d = da[0] * db[0] + da[1] * db[1] + da[2] * db[2];
++    const double norms = MFTL_SQRT((ca[0] * ca[0] + ca[1] * ca[1] + ca[2] * ca[2]) * (cb[0] * cb[0] + cb[1] * cb[1] + cb[2] * cb[2])) *
++                         MFTL_SQRT((da[0] * da[0] + da[1] * da[1] + da[2] * da[2]) * (db[0] * db[0] + db[1] * db[1] + db[2] * db[2]));
++    if (!(norms > 0.0) || !(sin_c * cos_d + cos_c * sin_d < -1e-4 * norms)) return MFTL_FALSE;
+   }
++  else if (getenv("MFTL_EXP_FLIP") && getenv("MFTL_EXP_FLIP")[0] == '1')
++  {
++    /* EXPERIMENT (temporary): Delaunay in the quad's tangent plane, i.e. Jiao's
++     * criterion under an isotropic metric (psi_lower == psi_upper). */
++    MFTL_RemeshParameters iso = *params;
++    iso.anisotropy.psi_lower = iso.anisotropy.psi_upper;
++    if (!MFTLRemeshAnisotropicFlipWanted(obj, va, vb, vc, vd, &iso)) return MFTL_FALSE;
++  }
+   else
+   {
+     const int opt_a = optimal_valence(obj, va);

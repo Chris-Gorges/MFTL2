@@ -216,6 +216,9 @@ int main(int argc, char **argv)
 
   if (MFTLRedistribute(ens) != MFTL_SUCCESS) MPI_Abort(MPI_COMM_WORLD, 1);
   geometry(ens);
+  /* What the volume correction restores: the volume each body has now. It
+   * travels with the body and a topology change hands it on. */
+  if (cfg.volume.every > 0 && MFTLEnsembleSetReferenceVolumes(ens) != MFTL_SUCCESS) MPI_Abort(MPI_COMM_WORLD, 1);
 
   report r0;
   measure(ens, &r0);
@@ -233,6 +236,10 @@ int main(int argc, char **argv)
     /* Re-read the list every step: a redistribution may destroy or create objects. */
     for (int o = 0; o < ens->n_local_objects; ++o) advect(ens->local_objects[o], t, dt, T);
     MFTLUpdateGhostPositions(ens);
+    /* Undulations come from the advection: removed before the remesh, whose
+     * Phong projection (onto its own input) then keeps the smoothing. */
+    if (MFTLSettingsDue(cfg.undulation.every, step) && MFTLEnsembleRemoveUndulations(ens, &cfg.undulation.params, MFTL_NULL) != MFTL_SUCCESS)
+      MPI_Abort(MPI_COMM_WORLD, 1);
     geometry(ens);
 
     if (MFTLSettingsDue(cfg.remesh.every, step))
@@ -249,6 +256,14 @@ int main(int argc, char **argv)
       MFTL_TopologyStats ts;
       if (MFTLEnsembleApplyTopologyChanges(ens, &cfg.topology.options, &ts) != MFTL_SUCCESS) MPI_Abort(MPI_COMM_WORLD, 1);
       topo_events += ts.n_events;
+      geometry(ens);
+    }
+
+    /* Last of the mesh operations, so it restores what the advection, the
+     * remesh and any topology change moved. */
+    if (MFTLSettingsDue(cfg.volume.every, step))
+    {
+      if (MFTLEnsembleCorrectVolumes(ens, &cfg.volume.params, MFTL_NULL) != MFTL_SUCCESS) MPI_Abort(MPI_COMM_WORLD, 1);
       geometry(ens);
     }
 

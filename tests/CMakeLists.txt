@@ -190,6 +190,38 @@ mftl_add_mpi_test_at(test_remeshing_dispersed_np2 test_remeshing_dispersed 2)
 mftl_add_mpi_test_at(test_remeshing_dispersed_np4 test_remeshing_dispersed 4)
 mftl_add_mpi_test_at(test_remeshing_dispersed_np8 test_remeshing_dispersed 8)
 
+# Curvature-adaptive sizing (Dunyach et al. 2013) against closed-form
+# curvatures and with the uniform mode as the control of every claim. Serial:
+# one rank holds every fixture.
+mftl_add_mpi_test(test_remeshing_sizing 1)
+
+# The least-squares solver, paraboloid placement of new vertices and the Phong
+# back-projection of smoothed vertices, against exact paraboloids and the unit
+# sphere, with the bit-for-bit length-unit check. Serial.
+mftl_add_mpi_test(test_remeshing_placement 1)
+
+# The same mode on a partitioned mesh: the curvature field on ghost copies
+# (against a one-rank reference, by global id), the spanning driver against
+# MFTLRemeshObject() on one rank, and the dispersed driver against the spanning
+# one. Every fixture straddles the cut planes of every grid below, measured.
+mftl_add_mpi_test(test_remeshing_sizing_parallel 1)
+mftl_add_mpi_test_at(test_remeshing_sizing_parallel_np2 test_remeshing_sizing_parallel 2)
+mftl_add_mpi_test_at(test_remeshing_sizing_parallel_np4 test_remeshing_sizing_parallel 4)
+mftl_add_mpi_test_at(test_remeshing_sizing_parallel_np8 test_remeshing_sizing_parallel 8)
+mftl_add_mpi_test_oversub(test_remeshing_sizing_parallel_np27 test_remeshing_sizing_parallel 27)
+
+# Front corrections: TSUR3D undulation removal and the volume correction. The
+# edge operation is checked in isolation, the smoothing against a jittered
+# sphere and sheet, the distributed schedule against the same sweeps on one
+# rank (ghosts to the bit, the colour rounds non-vacuous), the correction
+# against shrunken bodies, and the reference volume through a redistribution
+# onto new holders and through a coalescence.
+mftl_add_mpi_test(test_correction 1)
+mftl_add_mpi_test_at(test_correction_np2 test_correction 2)
+mftl_add_mpi_test_at(test_correction_np4 test_correction 4)
+mftl_add_mpi_test_at(test_correction_np8 test_correction 8)
+mftl_add_mpi_test_oversub(test_correction_np27 test_correction 27)
+
 # --- Coupling to a flow solver ------------------------------------------------
 #
 # The kernel table and the row core are local, so they run without MPI. The
@@ -295,6 +327,14 @@ add_test(NAME test_coupling_mpi_is_confined
          COMMAND ${CMAKE_COMMAND}
                  -DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../src/coupling
                  -DALLOWED=coupling_comm.c
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/check_mpi_confinement.cmake)
+
+# And for the front corrections: the only MPI of their own is a few statistics
+# and the colour flags of the undulation schedule.
+add_test(NAME test_correction_mpi_is_confined
+         COMMAND ${CMAKE_COMMAND}
+                 -DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../src/correction
+                 -DALLOWED=correction_comm.c
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/check_mpi_confinement.cmake)
 
 # --- Genuine multi-rank coverage ------------------------------------------
@@ -420,6 +460,30 @@ if(BUILD_EXAMPLES)
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
                    $<TARGET_FILE:leveque_remeshing_parallel>
                    -steps 12 -budget 4 -quiet -verify ${MPIEXEC_POSTFLAGS})
+
+  # The same physical check under curvature sizing, which reaches the driver
+  # through different decision makers and a field recomputed and exchanged
+  # every phase, but must conserve just the same.
+  add_test(NAME test_leveque_parallel_conserves_curvature
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:leveque_remeshing_parallel>
+                   -steps 12 -budget 4 -quiet -verify -sizing curvature ${MPIEXEC_POSTFLAGS})
+
+  # The same physical check with paraboloid placement and the Phong projection:
+  # the fit's two-ring and the projection's reference walk reach ghost
+  # vertices near the band, which only a partitioned run exercises.
+  add_test(NAME test_leveque_parallel_conserves_projected
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:leveque_remeshing_parallel>
+                   -steps 12 -budget 4 -quiet -verify -sizing curvature -placement paraboloid_normals -projection phong ${MPIEXEC_POSTFLAGS})
+
+  # The same with the volume-preserving collapse on a fitted collapse point and
+  # midpoint splits: its patch walk reads only unfrozen fans, which only a
+  # partitioned run can get wrong.
+  add_test(NAME test_leveque_parallel_conserves_vpcollapse
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:leveque_remeshing_parallel>
+                   -steps 12 -budget 4 -quiet -verify -collapse_placement paraboloid -vpcollapse 1 -projection phong ${MPIEXEC_POSTFLAGS})
 
   # The same flow driven entirely by a settings file, the way a solver would
   # integrate the library: every call takes its block from MFTL_Settings. The

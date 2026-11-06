@@ -13,6 +13,8 @@ Everything in this directory is **local** — no MPI:
 | `signed_distance.c` | signed distance to a mesh on a (periodic) lattice window, at one cutoff or two |
 | `periodic_extent.c` | a body's extent on a periodic axis, and whether it covers the axis |
 | `body_integrals.c` | a body's flux integrals (volume, first moments) and where its rims lie, per rank |
+| `vertex_curvature.c` | discrete mean and Gaussian curvature per vertex (Meyer et al.) |
+| `surface_fit.c` | small dense least squares (QR with grouped column pivoting) and the weighted height-paraboloid fit |
 
 The collective wrappers (`MFTLEnsembleUpdate`, `MFTLEnsembleUpdateVertexNormals`)
 live in @ref mftl_mod_ensemble; the split is by *scope*, not by entity
@@ -367,3 +369,52 @@ the owned triangles: 23 ns per triangle on a periodic domain against 5.7 for
 extent (12 ns) and the lifted moments (10 ns) are the bulk; the extent's frames
 keep the arithmetic the topology change is bit-identical with. A call for output
 intervals and diagnostics, not for every timestep.
+
+---
+
+## Least squares and local height fits {#geom_surface_fit}
+
+`MFTLLeastSquaresQRCP` solves $\min_x\lVert Ax-b\rVert_2$ for at most six unknowns
+by Householder QR with column pivoting, and `MFTLFitHeightParaboloid` builds the
+weighted system of a height paraboloid
+$z = c_0 + c_1x + c_2y + c_3x^2 + c_4xy + c_5y^2$ on top of it. The remesher's
+paraboloid placement is their only user (`src/remeshing/README.md`, "Vertex
+placement").
+
+**Never the normal equations.** $A^\top A$ squares the condition number. The
+solver triangularises the weighted rows $\sqrt{w_j}\,(1, x, y, x^2, xy, y^2)$
+directly: one reflector per column, applied to the remaining columns and to $b$,
+then back substitution on $R$. Column norms are downdated and recomputed once
+they have lost 90 % to cancellation, as LAPACK's `dlaqp2` does.
+
+**Grouped pivoting, and what "rank-deficient" then means.** Columns form two
+groups, factored in order: the lead group $\{1, x, y\}$ (height and slope) and
+the trailing group $\{x^2, xy, y^2\}$ (curvature). Within a group the column of
+largest remaining norm goes next. A group stops at the first pivot with
+$|R_{kk}| \le \tau |R_{00}|$ ($\tau = 10^{-3}$ for the placement), and its
+remaining columns get coefficient zero: the basic solution. In words: a
+curvature component the samples cannot determine is set to zero, which is a
+fit of lower degree in that direction, and the height is never traded for it.
+
+LAPACK's `dgelsy` returns the MINIMUM-NORM solution instead, which spreads the
+coefficients over the null space. When the null space couples the height with
+the curvature, the height it returns depends on that choice rather than on the
+data. Eight samples on the unit circle at height 1 are the clean case:
+$x^2+y^2=1$ makes 1, $x^2$, $y^2$ dependent, and `dgelsy` returns
+$c_0 = 0.667$ with $c_3 = c_5 = 0.333$; the grouped basic solution returns
+$c_0 = 1$, the plane through the data. On a full-rank system both solve the same
+problem and agree to $2\cdot10^{-15}$ (`studies/surface_fit/`).
+
+**Scale.** The rank test is relative, so the columns must be of comparable size.
+The caller passes coordinates in units of the local edge length; a uniform
+scaling of $A$ and $b$ by a power of two then changes no pivot and no bit of
+$x$ (`test_qrcp_is_independent_of_the_scale`). Unscaled coordinates give the
+columns norms of order 1, $h$ and $h^2$, and a fixed relative tolerance then
+drops the curvature columns as soon as $h^2$ falls below it. That was mftl's
+fit, at `rcond` = 1e-10: on a sphere of radius $10^{-4}$ every edge lost its
+curvature terms and the placed height was off by 4.5 sagittas.
+
+**Cost**, Apple M4, per solve of the placement's systems (24 rows from
+positions, 72 with normals): 0.39–0.53 µs and 1.2–1.3 µs, against 1.3–1.5 µs and
+2.4–2.5 µs for `dgelsy` with a precomputed workspace: 1.9 to 3.4 times faster at
+these sizes, where LAPACK's blocking and workspace logic is pure overhead.

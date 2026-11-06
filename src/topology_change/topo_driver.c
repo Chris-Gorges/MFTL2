@@ -222,55 +222,6 @@ static void project_rim(MFTL_Object *obj, const MFTL_TopologyOptions *opts)
   MFTLObjectMarkChanged(obj);
 }
 
-/**
- * @brief The volume correction's displacement field, left in `verts.normal`,
- *        and the derivative of the enclosed volume along it.
- *
- * u is the area-weighted vertex normal; a rim vertex loses the component normal
- * to the wall it is on, so it slides in the wall and the rim stays there. The
- * return value is this rank's share of dV/dd = sum_t S_t . (u_0 + u_1 + u_2)/3
- * (S_t the triangle's area vector), taken over the (triangle, corner) pairs whose
- * corner this rank OWNS: the halo is vertex-complete, so every such pair is
- * present exactly once in the job. Corners are gathered seam-consistently, so
- * it holds on a periodic domain. It is the first variation of the volume for a
- * closed body and for one closed by the walls alike, because the walls do not
- * move.
- */
-static double displacement_field(MFTL_Object *obj)
-{
-  const MFTL_Domain *const dom = obj->domain;
-  MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
-  for (int v = 0; v < obj->verts.n_local; ++v)
-  {
-    if (!(obj->verts.rec[v].flags & MFTL_FLAG_BOUNDARY)) continue;
-    const double *const p = &obj->verts.pos[3 * v];
-    for (int k = 0; k < 3; ++k)
-    {
-      if (dom->is_periodic[k]) continue;
-      const double tol = 1e-8 * dom->domain_size[k];
-      if (fabs(p[k] - dom->global_min[k]) <= tol || fabs(p[k] - dom->global_max[k]) <= tol) obj->verts.normal[3 * v + k] = 0.0;
-    }
-  }
-
-  double dvdd = 0.0;
-  for (int t = 0; t < obj->tris.n; ++t)
-  {
-    double T[3][3];
-    MFTLGetTriangleCorners(obj, t, T);
-    const double e1[3] = {T[1][0] - T[0][0], T[1][1] - T[0][1], T[1][2] - T[0][2]};
-    const double e2[3] = {T[2][0] - T[0][0], T[2][1] - T[0][1], T[2][2] - T[0][2]};
-    const double S[3] = {0.5 * (e1[1] * e2[2] - e1[2] * e2[1]), 0.5 * (e1[2] * e2[0] - e1[0] * e2[2]), 0.5 * (e1[0] * e2[1] - e1[1] * e2[0])};
-    for (int k = 0; k < 3; ++k)
-    {
-      const int v = obj->tris.verts[3 * t + k];
-      if (v >= obj->verts.n_local) continue;
-      const double *const u = &obj->verts.normal[3 * v];
-      dvdd += (S[0] * u[0] + S[1] * u[1] + S[2] * u[2]) / 3.0;
-    }
-  }
-  return dvdd;
-}
-
 int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int n_bodies_in, const MFTL_TopologyEvent *events, int n_events,
                                   const MFTL_TopologyOptions *opts, MFTL_TopologyStats *stats)
 {
@@ -397,6 +348,38 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
       if (!cl[c].refused) st->volume_before += vol[c];
     }
     free(vol);
+  }
+
+  /* What the cluster's bodies SHOULD enclose, if the application said so: each
+   * body's reference volume (its holders all agree; MAX over every rank, -inf
+   * from a rank not holding it, +inf for "none"), summed per cluster in body
+   * order. Handed on to the bodies the cluster becomes, at the end. */
+  bool any_reference = MFTL_FALSE;
+  {
+    double *const ref = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(nb, 1) * sizeof(double), "topology reference volumes");
+    for (int i = 0; i < nb; ++i)
+    {
+      const MFTL_Object *const obj = MFTLEnsembleFindLocalObject(ens, bodies[i]);
+      ref[i] = (obj == MFTL_NULL) ? -HUGE_VAL : (isfinite(obj->reference_volume) ? obj->reference_volume : HUGE_VAL);
+    }
+    MFTLTopoCommAllreduceDouble(dom, ref, nb, 1);
+    for (int c = 0; c < n_cl; ++c) cl[c].reference_old = 0.0;
+    for (int i = 0; i < nb; ++i)
+    {
+      const int c = MFTLTopoClusterOf(cl, n_cl, bodies[i]);
+      if (c < 0) continue;
+      cl[c].reference_old = isfinite(ref[i]) ? cl[c].reference_old + ref[i] : NAN;
+    }
+    for (int c = 0; c < n_cl; ++c)
+      if (!cl[c].refused && cl[c].flux_axis >= 0 && isfinite(cl[c].reference_old)) any_reference = MFTL_TRUE;
+    free(ref);
+    /* Read; until handed on, every holder of a reconstructed body says "none",
+     * so the redistributions in between see one value per body. */
+    for (int o = 0; o < ens->n_local_objects; ++o)
+    {
+      const int c = MFTLTopoClusterOf(cl, n_cl, ens->local_objects[o]->global_id);
+      if (c >= 0 && !cl[c].refused) ens->local_objects[o]->reference_volume = NAN;
+    }
   }
 
   const double dx_max = fmax(lat.spacing[0], fmax(lat.spacing[1], lat.spacing[2]));
@@ -601,7 +584,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
         double v = 0.0, a = 0.0;
         MFTLBodyFluxVolume(obj, cl[c].flux_axis, cl[c].flux_ref, cl[c].centre, &v, &a);
         va[2 * c] += v;
-        if (iter < n_iter) va[2 * c + 1] += displacement_field(obj);
+        if (iter < n_iter) va[2 * c + 1] += MFTLBodyVolumeDisplacement(obj);
       }
       MFTLTopoCommAllreduceDouble(dom, va, 2 * n_cl, 2);
 
@@ -630,6 +613,43 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
         project_rim(obj, opts);
       }
       MFTLUpdateGhostPositions(ens);
+    }
+
+    /* Reference volumes handed on: each body out of a cluster gets the
+     * cluster's reference total in proportion to its volume now, so the total
+     * survives a merger or a breakup and a body that kept an input id does not
+     * keep that body's old share. Without a reference, or without an exact
+     * volume measure, NaN. The per-body volumes are one holder reduction, taken
+     * only when some cluster carries a reference (agreed: the totals are). */
+    if (any_reference)
+    {
+      const int nl = ens->n_local_objects;
+      double *const vb = (double *) MFTLCallocOrDie((size_t) MFTL_MAX(nl, 1), sizeof(double), "topology body volumes");
+      for (int o = 0; o < nl; ++o)
+      {
+        MFTL_Object *const obj = ens->local_objects[o];
+        const int c = came_from(comps, n_comps, obj->global_id);
+        if (c < 0 || cl[c].flux_axis < 0) continue;
+        double v = 0.0, a = 0.0;
+        MFTLBodyFluxVolume(obj, cl[c].flux_axis, cl[c].flux_ref, cl[c].centre, &v, &a);
+        vb[o] = v;
+      }
+      const MFTL_BodyReduceOp sum = MFTL_BODY_REDUCE_SUM;
+      MFTLEnsembleReduceBodies(ens, vb, 1, &sum, MFTL_BODY_REDUCE_SCOPE_AUTO);
+      for (int o = 0; o < nl; ++o)
+      {
+        MFTL_Object *const obj = ens->local_objects[o];
+        const int c = came_from(comps, n_comps, obj->global_id);
+        if (c < 0) continue;
+        const bool ok = cl[c].flux_axis >= 0 && isfinite(cl[c].reference_old) && va[2 * c] != 0.0;
+        obj->reference_volume = ok ? cl[c].reference_old * (vb[o] / va[2 * c]) : NAN;
+      }
+      free(vb);
+    }
+    else
+    {
+      for (int o = 0; o < ens->n_local_objects; ++o)
+        if (came_from(comps, n_comps, ens->local_objects[o]->global_id) >= 0) ens->local_objects[o]->reference_volume = NAN;
     }
     free(va);
     MFTLEnsembleComputeTriangleGeometry(ens);

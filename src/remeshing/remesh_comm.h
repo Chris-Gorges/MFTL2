@@ -30,6 +30,8 @@
  *                               vertex, once per pass; global fallback when a
  *                               ghost's owner is not a graph neighbour (normal
  *                               under coarsening).
+ *   MFTLRemeshSyncGhostSizing   the same route, 8 bytes per ghost vertex, twice
+ *                               per phase -- only under curvature sizing.
  *   MFTLRemeshMeasureBodies     per-body holder reductions (9 values, then 1)
  *                               plus one scalar MPI_MAX; once per pass.
  *   MFTLRemeshAgree*            small fixed-size Allreduces (the parameter block
@@ -517,6 +519,25 @@ double MFTLRemeshWallTime(void);
  * @return #MFTL_SUCCESS, or #MFTL_ERROR if the exchange failed.
  */
 int MFTLRemeshSyncGhostIds(MFTL_Ensemble *ens, const int *vertex_gid_base);
+
+/**
+ * @brief Gives every ghost vertex its owner's curvature target length
+ *        (`verts.sizing`, #MFTL_REMESH_SIZING_CURVATURE).
+ *
+ * The sizing is a one-ring quantity, so an owned vertex computes it exactly
+ * (the halo is vertex-complete) and a ghost does not. No admitted operation
+ * ever reads a ghost's value -- every vertex a split, collapse, flip or smooth
+ * of an unfrozen entity reads is owned -- but the convergence certificate does:
+ * `count_hidden_edges` judges FROZEN edges, whose endpoints may be ghosts, and
+ * `hidden_long` is exact only if every copy of a vertex holds the same target.
+ * Same route as MFTLRemeshSyncGhostIds(), including its global fallback for a
+ * coarsened placement; 8 bytes per ghost vertex.
+ *
+ * @param ens The ensemble; every local body must have `verts.sizing` enabled.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR if some ghost could not be served.
+ * @collective
+ */
+int MFTLRemeshSyncGhostSizing(MFTL_Ensemble *ens);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 4. Neighbourhood exchange -- the three shapes the dispersed balancer needs

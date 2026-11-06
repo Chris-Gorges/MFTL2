@@ -1580,10 +1580,12 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
  *
  * `{gid, n_tris, n_verts}` name and delimit the run; the four global fields
  * (`next_*_gid`, `global_n_*`) let a rank that held nothing of a body create it
- * with correct id counters (arrival tables are sized from them). They are the
- * same on every holder, so a receiver that already has the body asserts them.
+ * with correct id counters (arrival tables are sized from them), and the last
+ * two carry the bits of #MFTL_Object::reference_volume, so a new holder knows
+ * what the body should enclose. They are the same on every holder, so a
+ * receiver that already has the body asserts them.
  */
-#define MFTL_BODY_COUNT_INTS 7
+#define MFTL_BODY_COUNT_INTS 9
 
 /** @brief Body header slot: which body the run belongs to. */
 #define MFTL_BODY_HDR_GID 0
@@ -1599,6 +1601,8 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
 #define MFTL_BODY_HDR_GLOBAL_V 5
 /** @brief Body header slot: the body's global triangle count. */
 #define MFTL_BODY_HDR_GLOBAL_T 6
+/** @brief Body header slots 7 and 8: the bits of the body's reference volume. */
+#define MFTL_BODY_HDR_REF_VOLUME 7
 
 /**
  * @brief Groups the arrival runs by object with a counting sort (no comparisons);
@@ -1768,6 +1772,7 @@ static int analyze_and_pack_body(comm_workspace *ws, MFTL_Object *obj, int my_ra
     c[MFTL_BODY_HDR_NEXT_TGID] = obj->next_triangle_gid;
     c[MFTL_BODY_HDR_GLOBAL_V] = obj->global_n_vertices;
     c[MFTL_BODY_HDR_GLOBAL_T] = obj->global_n_triangles;
+    memcpy(&c[MFTL_BODY_HDR_REF_VOLUME], &obj->reference_volume, sizeof(double));
     ws->send_counts[r].count += MFTL_BODY_COUNT_INTS;
 
     ib_reset(&ws->tri_ids[r]);
@@ -2114,14 +2119,16 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
     MFTL_Object *const target = ws->work[slot];
     MFTL_ASSERT((target->verts.n == 0 && target->tris.n == 0) ||
                 (target->next_vertex_gid == tp[MFTL_BODY_HDR_NEXT_VGID] && target->next_triangle_gid == tp[MFTL_BODY_HDR_NEXT_TGID] &&
-                 target->global_n_vertices == tp[MFTL_BODY_HDR_GLOBAL_V] && target->global_n_triangles == tp[MFTL_BODY_HDR_GLOBAL_T]) &&
-                    "redistribute: two ranks disagree about a body's global counters");
+                 target->global_n_vertices == tp[MFTL_BODY_HDR_GLOBAL_V] && target->global_n_triangles == tp[MFTL_BODY_HDR_GLOBAL_T] &&
+                 memcmp(&target->reference_volume, &tp[MFTL_BODY_HDR_REF_VOLUME], sizeof(double)) == 0) &&
+                    "redistribute: two ranks disagree about a body's global counters or its reference volume");
 
     target->next_vertex_gid = tp[MFTL_BODY_HDR_NEXT_VGID];
     target->next_triangle_gid = tp[MFTL_BODY_HDR_NEXT_TGID];
     target->next_halfedge_gid = 3 * target->next_triangle_gid;
     target->global_n_vertices = tp[MFTL_BODY_HDR_GLOBAL_V];
     target->global_n_triangles = tp[MFTL_BODY_HDR_GLOBAL_T];
+    memcpy(&target->reference_volume, &tp[MFTL_BODY_HDR_REF_VOLUME], sizeof(double));
 
     runs[k].obj_idx = slot;
     runs[k].tri_start = t_off;

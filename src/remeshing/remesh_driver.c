@@ -240,11 +240,34 @@ int MFTLRemeshIterate(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFT
    * makes the object valid for the very first MFTLDetectFeatures. */
   if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
 
+  /* Curvature sizing is computed by the CALLER (MFTLRemeshPrepareSizing()),
+   * because the spanning driver has to synchronise ghost copies before its
+   * convergence certificate reads them. */
+  MFTL_ASSERT((params->sizing != MFTL_REMESH_SIZING_CURVATURE || obj->verts.has_sizing) &&
+              "MFTLRemeshIterate: curvature sizing without verts.sizing -- MFTLRemeshPrepareSizing first");
+
+  /* The projection's reference: the mesh as THIS call received it, copied once
+   * and kept for every iteration -- re-copying it per iteration would make the
+   * call's own collapses part of the surface the smoother projects onto
+   * (remesh_project.c). Taken after the first feature detection, which decides
+   * which corners may lift; used by the last iteration's smoothing. */
+  MFTL_RemeshReference ref;
+  bool have_ref = MFTL_FALSE;
+
   for (int iter = 0; iter < iterations; ++iter)
   {
     st->iterations = iter + 1;
 
     MFTLDetectFeatures(obj, params->feature_angle_threshold, params->feature_corner_angle, st);
+
+    if (iter == 0 && params->projection == MFTL_REMESH_PROJECT_PHONG)
+    {
+      const double t0 = MFTLRemeshWallTime();
+      MFTLRemeshReferenceBuild(&ref, obj);
+      have_ref = MFTL_TRUE;
+      st->t_reference += MFTLRemeshWallTime() - t0;
+      st->reference_bytes = MFTL_MAX(st->reference_bytes, ref.bytes);
+    }
 
     const int n_split = sweep_split(obj, params);
     const int n_collapse = sweep_collapse(obj, params, st);
@@ -274,7 +297,11 @@ int MFTLRemeshIterate(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFT
      * a smoother three sweeps out of date. */
     MFTLDetectFeatures(obj, params->feature_angle_threshold, params->feature_corner_angle, st);
 
-    MFTLSmoothTangential(obj, params, params->smooth_iterations);
+    /* The projection runs once per call: in the last smoothing sweep of the
+     * last iteration. Which iteration is the last is known here, because the
+     * convergence test below reads counts that are final already. */
+    const bool last_iteration = (iter == iterations - 1) || (n_split + n_collapse + n_flip <= params->min_convergence_ops);
+    MFTLRemeshSmooth(obj, params, params->smooth_iterations, (have_ref && last_iteration) ? &ref : MFTL_NULL, st);
 
     st->n_split += n_split;
     st->n_collapse += n_collapse;
@@ -284,6 +311,7 @@ int MFTLRemeshIterate(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFT
     if (n_split + n_collapse + n_flip <= params->min_convergence_ops) break;
   }
 
+  if (have_ref) MFTLRemeshReferenceFree(&ref);
   return total_ops;
 }
 
@@ -303,6 +331,10 @@ int MFTLRemeshObject(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL
   memset(st, 0, sizeof(*st));
 
   if (obj->tris.n == 0) return MFTL_SUCCESS;
+
+  /* The curvature sizing field, ONCE per call, on the mesh as handed in; the
+   * operators carry it from here (remesh_sizing.c). A no-op otherwise. */
+  if (MFTLRemeshPrepareSizing(obj, params) != MFTL_SUCCESS) return MFTL_ERROR;
 
   MFTLRemeshIterate(obj, params, st, params->iterations);
 

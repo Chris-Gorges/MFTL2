@@ -17,6 +17,7 @@
 #include "mftl_object.h"
 #include "fields_internal.h"
 #include <limits.h>
+#include <math.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -80,24 +81,30 @@ typedef struct
   size_t rec;  ///< [capacity]   MFTL_Vertex records.
   size_t pos;  ///< [3*capacity] AUTHORITATIVE positions, xyz interleaved.
   size_t normal;  ///< [3*capacity] vertex normals, xyz interleaved.
+  size_t sizing;  ///< [capacity]   optional remeshing target lengths; 0 when absent.
 } vertex_layout;
 
 /**
- * @brief Lays out a vertex block for @p cap vertices: `rec`, `pos`, `normal`.
+ * @brief Lays out a vertex block for @p cap vertices: `rec`, `pos`, `normal`,
+ *        and `sizing` when @p sizing is set.
  *
- * `rec` and `pos`, which every pass touches, come first.
+ * `rec` and `pos`, which every pass touches, come first. The optional array
+ * comes last among the built-in ones, so a pool without it is laid out exactly
+ * as before it existed.
  *
- * @param[out] l   Receives one byte offset per field.
- * @param      cap Vertices the block must hold.
+ * @param[out] l      Receives one byte offset per field.
+ * @param      cap    Vertices the block must hold.
+ * @param      sizing Whether the block carries `sizing` (MFTL_VertexPool::has_sizing).
  * @return Total block size in bytes.
  */
-static size_t vertex_layout_compute(vertex_layout *l, int cap)
+static size_t vertex_layout_compute(vertex_layout *l, int cap, bool sizing)
 {
   const size_t n = (size_t) cap;
   size_t cursor = 0;
   l->rec = MFTLLayoutAdd(&cursor, n, sizeof(MFTL_Vertex));
   l->pos = MFTLLayoutAdd(&cursor, 3 * n, sizeof(double));
   l->normal = MFTLLayoutAdd(&cursor, 3 * n, sizeof(double));
+  l->sizing = sizing ? MFTLLayoutAdd(&cursor, n, sizeof(double)) : 0;
   return cursor;
 }
 
@@ -113,6 +120,7 @@ static void vertex_pool_bind(MFTL_VertexPool *p, unsigned char *blk, const verte
   p->rec = (MFTL_Vertex *) (void *) (blk + l->rec);
   p->pos = (double *) (void *) (blk + l->pos);
   p->normal = (double *) (void *) (blk + l->normal);
+  p->sizing = p->has_sizing ? (double *) (void *) (blk + l->sizing) : MFTL_NULL;
 }
 
 /**
@@ -146,7 +154,7 @@ static void vertex_pool_resize(MFTL_Object *obj, int capacity, bool force)
   }
 
   vertex_layout l;
-  const size_t bytes = field_layout(obj, MFTL_FIELD_VERTEX, capacity, vertex_layout_compute(&l, capacity), NULL, 0);
+  const size_t bytes = field_layout(obj, MFTL_FIELD_VERTEX, capacity, vertex_layout_compute(&l, capacity, p->has_sizing), NULL, 0);
   unsigned char *blk = (unsigned char *) MFTLAlignedAllocOrDie(bytes, "MFTL vertex pool");
 
   /* Zeroed so never-written fields (flags in particular) start defined. */
@@ -158,9 +166,12 @@ static void vertex_pool_resize(MFTL_Object *obj, int capacity, bool force)
     memcpy(blk + l.rec, p->rec, n * sizeof(MFTL_Vertex));
     memcpy(blk + l.pos, p->pos, 3 * n * sizeof(double));
     memcpy(blk + l.normal, p->normal, 3 * n * sizeof(double));
+    /* NULL while MFTLObjectEnableSizing() lays the array out for the first time:
+     * there is nothing to carry over, and the zeroed block is what it starts as. */
+    if (p->has_sizing && p->sizing != MFTL_NULL) memcpy(blk + l.sizing, p->sizing, n * sizeof(double));
   }
 
-  field_layout(obj, MFTL_FIELD_VERTEX, capacity, vertex_layout_compute(&l, capacity), blk, p->n);
+  field_layout(obj, MFTL_FIELD_VERTEX, capacity, vertex_layout_compute(&l, capacity, p->has_sizing), blk, p->n);
   free(p->block);
   p->block = blk;
   vertex_pool_bind(p, blk, &l);
@@ -330,6 +341,7 @@ MFTL_Object *MFTLObjectCreate(int global_id)
   /* Never partitioned, so no current partition: the first redistribution must
    * rebuild it. */
   object->partition_dirty = MFTL_TRUE;
+  object->reference_volume = NAN;  // nobody has said what it should enclose
   MFTLObjectMarkChanged(object);
 
   return object;
@@ -436,7 +448,8 @@ size_t MFTLObjectPoolBytes(const MFTL_Object *obj)
   if (obj->verts.capacity > 0)
   {
     vertex_layout vl;
-    bytes += field_layout((MFTL_Object *) obj, MFTL_FIELD_VERTEX, obj->verts.capacity, vertex_layout_compute(&vl, obj->verts.capacity), NULL, 0);
+    const size_t built_in = vertex_layout_compute(&vl, obj->verts.capacity, obj->verts.has_sizing);
+    bytes += field_layout((MFTL_Object *) obj, MFTL_FIELD_VERTEX, obj->verts.capacity, built_in, NULL, 0);
   }
   if (obj->tris.capacity > 0)
   {
@@ -513,12 +526,13 @@ bool MFTLObjectPoolsAreConsistent(const MFTL_Object *obj)
     /* Every pointer must sit exactly where the layout for this capacity puts
      * it -- the strongest form of "all arrays were sized by the same call". */
     vertex_layout l;
-    (void) vertex_layout_compute(&l, vp->capacity);
+    (void) vertex_layout_compute(&l, vp->capacity, vp->has_sizing);
     const unsigned char *blk = (const unsigned char *) vp->block;
     if (blk == MFTL_NULL) return MFTL_FALSE;
     if ((const unsigned char *) vp->rec != blk + l.rec) return MFTL_FALSE;
     if ((const unsigned char *) vp->pos != blk + l.pos) return MFTL_FALSE;
     if ((const unsigned char *) vp->normal != blk + l.normal) return MFTL_FALSE;
+    if (vp->has_sizing ? (const unsigned char *) vp->sizing != blk + l.sizing : vp->sizing != MFTL_NULL) return MFTL_FALSE;
   }
 
   if (tp->capacity == 0)
@@ -545,7 +559,7 @@ bool MFTLObjectPoolsAreConsistent(const MFTL_Object *obj)
     if (!obj->field_data) return MFTL_FALSE;
     vertex_layout vl;
     triangle_layout tl;
-    size_t cursor[2] = {vertex_layout_compute(&vl, vp->capacity), triangle_layout_compute(&tl, tp->capacity)};
+    size_t cursor[2] = {vertex_layout_compute(&vl, vp->capacity, vp->has_sizing), triangle_layout_compute(&tl, tp->capacity)};
     for (int f = 0; f < obj->fields->n; ++f)
     {
       const MFTL_FieldDescriptor *d = &obj->fields->entries[f];
@@ -556,6 +570,18 @@ bool MFTLObjectPoolsAreConsistent(const MFTL_Object *obj)
     }
   }
   return MFTL_TRUE;
+}
+
+void MFTLObjectEnableSizing(MFTL_Object *obj)
+{
+  MFTL_ASSERT(obj != MFTL_NULL);
+  if (obj->verts.has_sizing) return;
+
+  /* Through the one resize path, so the new array is cut from the same block as
+   * every other vertex array and grows with it from here on. An empty pool only
+   * records the flag; its first reserve lays the array out. */
+  obj->verts.has_sizing = MFTL_TRUE;
+  if (obj->verts.capacity > 0) vertex_pool_resize(obj, obj->verts.capacity, true);
 }
 
 void MFTLObjectAttachFields(MFTL_Object *obj, MFTL_FieldRegistry *fields)

@@ -44,6 +44,7 @@
 #include "mftl_geometry.h"
 #include "mftl_object.h"
 #include "mftl_topology.h"
+#include "mftl_vectoroperations.h"
 #include "remesh_internal.h"
 #include "remesh_fields.h"
 
@@ -171,7 +172,7 @@ bool MFTLSplitApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParameter
   if (!edge_is_operable(obj, h)) return MFTL_FALSE;
   if (!he_is_canonical(obj, h)) return MFTL_FALSE;
 
-  return MFTLGetEdgeLengthSquared(obj, h) > params->max_edge_length_sq;
+  return MFTLRemeshEdgeWantsSplit(obj, h, params);
 }
 
 /**
@@ -247,6 +248,33 @@ int MFTLSplitEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *params)
   else
   {
     midpoint_periodic(obj->domain, MFTLVertexPos(obj, MFTLHeOrigin(obj, h)), MFTLVertexPos(obj, MFTLHeTarget(obj, h)), pm);
+
+    /* A fitted point is off the chord by the local sagitta, which can turn a new
+     * triangle over next to a near-flat apex; the midpoint cannot (it lies on
+     * the edge). Falling back rather than refusing keeps "an offered long edge
+     * is always split", which the spanning certificate's exactness rests on.
+     * Feature edges keep the midpoint: the normal of a crease is not a
+     * direction. */
+    if (params != MFTL_NULL && params->split_placement != MFTL_REMESH_PLACE_MIDPOINT && !(obj->tris.he[h].flags & MFTL_FLAG_FEATURE) &&
+        !vertex_on_feature(obj, MFTLHeOrigin(obj, h)) && !vertex_on_feature(obj, MFTLHeTarget(obj, h)))
+    {
+      double q[3];
+      if (MFTLRemeshFitEdgePoint(obj, h, params, params->split_placement, q) == MFTL_SUCCESS)
+      {
+        const int ht = obj->tris.he[h].twin_idx;
+        if (!rim_split_folds(obj, h, q, params->max_normal_deviation_cos) &&
+            !(ht != MFTL_ERROR && rim_split_folds(obj, ht, q, params->max_normal_deviation_cos)))
+        {
+          pm[0] = q[0];
+          pm[1] = q[1];
+          pm[2] = q[2];
+        }
+        else
+        {
+          MFTLRemeshFitNoteFallback();
+        }
+      }
+    }
   }
   obj->derived &= ~MFTL_DERIVED_GEOMETRY;
 
@@ -402,6 +430,9 @@ int MFTLSplitEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *params)
 
   if (triangle_fields) MFTLRemeshFieldCommit(obj, new_ids, new_area, 2 * nparent, field_values);
   if (MFTLFieldsStride(obj, 0)) MFTLRemeshFieldVertex(obj, va, vb, vm, MFTLRemeshFieldEdgeParameter(obj, va, vb, pm));
+  /* The curvature target is CARRIED, not recomputed: M lies on the chord, so
+   * its own discrete curvature would describe the polyline. */
+  if (obj->verts.has_sizing) MFTLRemeshSizingCarry(obj, va, vb, vm, MFTLRemeshFieldEdgeParameter(obj, va, vb, pm));
   MFTLObjectInvalidateDerived(obj);
   return vm;
 }
@@ -409,6 +440,74 @@ int MFTLSplitEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *params)
 /* ═══════════════════════════════════════════════════════════════════════════
  * COLLAPSE
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Moves the merged position @p p of collapsing a into b so that the
+ *        collapse keeps the enclosed volume.
+ *
+ * Measured from p, a triangle of the patch (the triangles at a or b) that
+ * survives holds p as a corner after the collapse and so contributes nothing;
+ * before it, every patch triangle contributed \f$\det(\vect{x}_0-\vect{p},
+ * \vect{x}_1-\vect{p}, \vect{x}_2-\vect{p})/6\f$. The patch's rim is the same
+ * closed loop before and after, so the difference does not depend on the origin:
+ * \f$\Delta V(\vect{p}) = -\tfrac16\sum_\text{patch}\det(\ldots)\f$. Each
+ * surviving triangle holds p once, so \f$\Delta V\f$ is LINEAR in p with
+ * gradient \f$\vect{g} = \tfrac16\sum_\text{surviving}(\vect{y}-\vect{p})
+ * \times(\vect{z}-\vect{p})\f$ over its other two corners in cyclic order, and
+ * one step \f$\vect{p} \leftarrow \vect{p} - \Delta V\,\vect{g}/|\vect{g}|^2\f$
+ * lands on the plane \f$\Delta V = 0\f$ at the point nearest the chosen one
+ * (Lindstrom & Turk 1998). Corners are taken by minimum image from p.
+ *
+ * Only for an interior edge between two free vertices: their link is a closed
+ * loop. A truncated fan or a zero gradient leaves p as it is.
+ *
+ * @param         obj The mesh.
+ * @param         a   The vertex that would be retired.
+ * @param         b   The vertex that would survive.
+ * @param[in,out] p   The chosen position; moved and wrapped.
+ */
+static void keep_collapse_volume(const MFTL_Object *obj, int a, int b, double p[3])
+{
+  int fa[MFTL_REMESH_RING_MAX], fb[MFTL_REMESH_RING_MAX];
+  const int na = ring_triangles(obj, a, fa);
+  const int nb = ring_triangles(obj, b, fb);
+  if (na == MFTL_ERROR || nb == MFTL_ERROR) return;
+
+  double six_dv = 0.0, six_g[3] = {0.0, 0.0, 0.0};
+  for (int pass = 0; pass < 2; ++pass)
+  {
+    const int *const fan = pass ? fb : fa;
+    const int n = pass ? nb : na;
+    for (int i = 0; i < n; ++i)
+    {
+      int v[3];
+      MFTLGetTriangleVertices(obj, fan[i], v);
+      const bool has_a = (v[0] == a || v[1] == a || v[2] == a);
+      const bool has_b = (v[0] == b || v[1] == b || v[2] == b);
+      if (pass == 1 && has_a) continue;  // already counted from a's fan
+
+      double x[3][3];
+      for (int k = 0; k < 3; ++k) MFTLGetMinimumImageVector(obj->domain, x[k], p, MFTLVertexPos(obj, v[k]));
+      double c[3];
+      MFTLVectorCrossVector(c, x[1], x[2]);
+      six_dv -= MFTLVectorInProd(x[0], c);
+      if (has_a && has_b) continue;  // removed by the collapse
+
+      /* The moved corner and the two after it, in the triangle's own order. */
+      const int k0 = (v[0] == a || v[0] == b) ? 0 : (v[1] == a || v[1] == b) ? 1 : 2;
+      double g[3];
+      MFTLVectorCrossVector(g, x[(k0 + 1) % 3], x[(k0 + 2) % 3]);
+      for (int k = 0; k < 3; ++k) six_g[k] += g[k];
+    }
+  }
+
+  /* dV / |g|^2 * g with the common factor 1/6 cancelled once. */
+  const double g2 = MFTLVectorNormSq(six_g);
+  if (!(g2 > 0.0)) return;
+  const double s = six_dv / g2;
+  for (int k = 0; k < 3; ++k) p[k] -= s * six_g[k];
+  MFTLApplyPeriodicity(obj->domain, p);
+}
 
 /**
  * @brief Where the surviving vertex of a collapse ends up.
@@ -422,15 +521,27 @@ int MFTLSplitEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *params)
  * midpoint -- exact on a straight feature and \f$O(h^2)\f$ off a curved one,
  * acceptable because the edge is short by construction.
  *
+ * Under a paraboloid `collapse_placement`, with @p fit, two free vertices go to
+ * the fitted point above the midpoint (MFTLRemeshFitEdgePoint()). The fit of
+ * the last (object, generation, edge) is cached: an execution runs on the mesh
+ * its approval judged, so it reuses that fit instead of repeating it -- the
+ * same bits, because nothing changed in between. Under
+ * `collapse_preserves_volume` the point -- fitted or not -- is then moved to keep
+ * the enclosed volume (keep_collapse_volume()).
+ *
  * @param      obj    The mesh.
  * @param      h      The half-edge a->b.
  * @param      a      The vertex that would be retired.
  * @param      b      The vertex that would survive.
- * @param      params Corner angle and rim projector, or #MFTL_NULL.
+ * @param      params Corner angle, rim projector and placement, or #MFTL_NULL.
+ * @param      fit    Apply the paraboloid placement (when `params` asks for it);
+ *                    `false` gives the approval's cheap first candidate.
+ * @param      gen    The mesh's generation stamp for this evaluation.
  * @param[out] out    The survivor's new position.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR when the projector refused.
  */
-static int collapse_target_position(const MFTL_Object *obj, int h, int a, int b, const MFTL_RemeshParameters *params, double out[3])
+static int collapse_target_position(const MFTL_Object *obj, int h, int a, int b, const MFTL_RemeshParameters *params, bool fit, uint64_t gen,
+                                    double out[3])
 {
   const bool a_is_pinned = vertex_on_feature(obj, a) || MFTLVertexIsMeshBoundary(obj, a);
   const bool b_is_pinned = vertex_on_feature(obj, b) || MFTLVertexIsMeshBoundary(obj, b);
@@ -454,7 +565,131 @@ static int collapse_target_position(const MFTL_Object *obj, int h, int a, int b,
   }
 
   midpoint_periodic(obj->domain, MFTLVertexPos(obj, a), MFTLVertexPos(obj, b), out);
+
+  /* Two free vertices: optionally on the fitted surface above the midpoint. The
+   * approval's stretch and fold clauses judge the result. */
+  if (fit && params != MFTL_NULL && params->collapse_placement != MFTL_REMESH_PLACE_MIDPOINT && !a_is_pinned && !b_is_pinned)
+  {
+    static struct
+    {
+      const MFTL_Object *obj;
+      uint64_t gen;
+      int h;
+      int rc;
+      double q[3];
+    } cache = {MFTL_NULL, 0, -1, MFTL_ERROR, {0.0, 0.0, 0.0}};
+
+    if (!(cache.obj == obj && cache.gen == gen && cache.h == h))
+    {
+      cache.obj = obj;
+      cache.gen = gen;
+      cache.h = h;
+      cache.rc = MFTLRemeshFitEdgePoint(obj, h, params, params->collapse_placement, cache.q);
+    }
+    if (cache.rc == MFTL_SUCCESS)
+    {
+      out[0] = cache.q[0];
+      out[1] = cache.q[1];
+      out[2] = cache.q[2];
+    }
+  }
+
+  if (params != MFTL_NULL && params->collapse_preserves_volume && !a_is_pinned && !b_is_pinned && obj->tris.he[h].twin_idx != MFTL_ERROR)
+    keep_collapse_volume(obj, a, b, out);
   return MFTL_SUCCESS;
+}
+
+/**
+ * @brief The collapse's geometric clauses for one candidate position of the
+ *        survivor: stretch (no new edge the split sweep would split) and
+ *        fold-over (no surviving triangle turns past the threshold).
+ *
+ * @param      obj           The mesh.
+ * @param      h             The half-edge a->b.
+ * @param      a             Retired vertex.
+ * @param      b             Survivor.
+ * @param      ring_a        One-ring of @p a.
+ * @param      na            Its size.
+ * @param      ring_b        One-ring of @p b.
+ * @param      nb            Its size.
+ * @param      boundary_edge `true` if @p h has no twin.
+ * @param      pm            The candidate position.
+ * @param      params        The parameter block.
+ * @param[out] reason        Set to the refusing clause.
+ * @return `true` if the position is refused.
+ */
+static bool collapse_geometry_refused(const MFTL_Object *obj, int h, int a, int b, const int *ring_a, int na, const int *ring_b, int nb, bool boundary_edge,
+                                      const double pm[3], const MFTL_RemeshParameters *params, int *reason)
+{
+  /* ── Stretch ──────────────────────────────────────────────────────────────
+   *
+   * Every edge of the merged vertex must stay inside the band, or the next split
+   * sweep undoes this collapse and the two sweeps oscillate for as long as the
+   * caller is willing to iterate. */
+  *reason = MFTL_REMESH_REJECT_OTHER;
+
+  /* The survivor's curvature target, as MFTLCollapseEdge() will store it. */
+  const double merged_target = (params->sizing == MFTL_REMESH_SIZING_CURVATURE && obj->verts.has_sizing) ? MFTLRemeshMergedTarget(obj, a, b, pm) : 0.0;
+
+  for (int pass = 0; pass < 2; ++pass)
+  {
+    const int *ring = pass ? ring_b : ring_a;
+    const int n = pass ? nb : na;
+
+    for (int i = 0; i < n; ++i)
+    {
+      if (ring[i] == a || ring[i] == b) continue;
+
+      double d[3];
+      MFTLGetMinimumImageVector(obj->domain, d, pm, MFTLVertexPos(obj, ring[i]));
+      if (MFTLRemeshCollapseStretches(obj, d[0] * d[0] + d[1] * d[1] + d[2] * d[2], merged_target, ring[i], params)) return MFTL_TRUE;
+    }
+  }
+
+  /* ── Fold-over ────────────────────────────────────────────────────────────
+   *
+   * Every triangle that SURVIVES the collapse is re-evaluated with both endpoints
+   * moved to the merge point, and its normal must not turn by more than the
+   * threshold. The two triangles being removed are skipped -- they degenerate to
+   * a line by construction, which is the point of removing them.
+   *
+   * Omitting this clause is not a missing nicety, it is the head of a feedback
+   * loop: the inverted
+   * triangle a collapse produces presents a ~180 degree dihedral angle, the
+   * feature detector reads that as a sharp edge, and the smoother then LOCKS
+   * every vertex of it. The inversion becomes permanent, and it seeds more of
+   * them on the next pass. */
+  *reason = MFTL_REMESH_REJECT_FOLD;
+
+  const int t_keep_1 = MFTLHeTriIdx(h);
+  const int t_keep_2 = boundary_edge ? MFTL_ERROR : MFTLHeTriIdx(obj->tris.he[h].twin_idx);
+
+  for (int pass = 0; pass < 2; ++pass)
+  {
+    int fan[MFTL_REMESH_RING_MAX];
+    const int nf = ring_triangles(obj, pass ? b : a, fan);
+    if (nf == MFTL_ERROR)
+    {
+      *reason = MFTL_REMESH_REJECT_OTHER;
+      return MFTL_TRUE;
+    }
+
+    for (int i = 0; i < nf; ++i)
+    {
+      const int t = fan[i];
+      if (t == t_keep_1 || t == t_keep_2) continue;
+
+      double n_old[3];
+      double n_new[3];
+      tri_area_vector_substituted(obj, t, MFTL_ERROR, MFTL_ERROR, MFTL_NULL, n_old);
+      tri_area_vector_substituted(obj, t, a, b, pm, n_new);
+
+      if (area_vector_cos(n_old, n_new) < params->max_normal_deviation_cos) return MFTL_TRUE;
+    }
+  }
+
+  *reason = MFTL_REMESH_REJECT_NONE;
+  return MFTL_FALSE;
 }
 
 bool MFTLCollapseApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParameters *params, int *reject_reason)
@@ -470,7 +705,7 @@ bool MFTLCollapseApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParame
   const int b = MFTLHeTarget(obj, h);  // survives
 
   /* ── Wanted? ─────────────────────────────────────────────────────────────── */
-  if (MFTLGetEdgeLengthSquared(obj, h) >= params->min_edge_length_sq) goto done;
+  if (!MFTLRemeshEdgeWantsCollapse(obj, h, params)) goto done;
 
   /* ── Features and boundaries ──────────────────────────────────────────────
    *
@@ -551,75 +786,33 @@ bool MFTLCollapseApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParame
     }
   }
 
-  /* ── Stretch ──────────────────────────────────────────────────────────────
+  /* ── Stretch and fold-over, at the midpoint first ────────────────────────
    *
-   * Every edge of the merged vertex must stay inside the band, or the next split
-   * sweep undoes this collapse and the two sweeps oscillate for as long as the
-   * caller is willing to iterate. */
-  reason = MFTL_REMESH_REJECT_OTHER;
-
+   * A paraboloid placement is evaluated only for candidates the midpoint
+   * passes, then judged again at the fitted point: most candidates that reach
+   * these clauses fail them, and the fitted point is within a sagitta of the
+   * midpoint, so fitting them first would buy nothing but cost. Under
+   * `collapse_preserves_volume` both candidates are the volume-keeping ones,
+   * which cost one pass over the two fans. */
   double pm[3];
-  if (collapse_target_position(obj, h, a, b, params, pm) != MFTL_SUCCESS)
+  if (collapse_target_position(obj, h, a, b, params, MFTL_FALSE, obj->generation, pm) != MFTL_SUCCESS)
   {
     reason = MFTL_REMESH_REJECT_FEATURE;
     goto done;
   }
+  if (collapse_geometry_refused(obj, h, a, b, ring_a, na, ring_b, nb, boundary_edge, pm, params, &reason)) goto done;
 
-  for (int pass = 0; pass < 2; ++pass)
+  if (params->collapse_placement != MFTL_REMESH_PLACE_MIDPOINT)
   {
-    const int *ring = pass ? ring_b : ring_a;
-    const int n = pass ? nb : na;
-
-    for (int i = 0; i < n; ++i)
+    double pf[3];
+    if (collapse_target_position(obj, h, a, b, params, MFTL_TRUE, obj->generation, pf) != MFTL_SUCCESS)
     {
-      if (ring[i] == a || ring[i] == b) continue;
-
-      double d[3];
-      MFTLGetMinimumImageVector(obj->domain, d, pm, MFTLVertexPos(obj, ring[i]));
-      if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] > params->max_edge_length_sq) goto done;
-    }
-  }
-
-  /* ── Fold-over ────────────────────────────────────────────────────────────
-   *
-   * Every triangle that SURVIVES the collapse is re-evaluated with both endpoints
-   * moved to the merge point, and its normal must not turn by more than the
-   * threshold. The two triangles being removed are skipped -- they degenerate to
-   * a line by construction, which is the point of removing them.
-   *
-   * Omitting this clause is not a missing nicety, it is the head of a feedback
-   * loop: the inverted
-   * triangle a collapse produces presents a ~180 degree dihedral angle, the
-   * feature detector reads that as a sharp edge, and the smoother then LOCKS
-   * every vertex of it. The inversion becomes permanent, and it seeds more of
-   * them on the next pass. */
-  reason = MFTL_REMESH_REJECT_FOLD;
-
-  const int t_keep_1 = MFTLHeTriIdx(h);
-  const int t_keep_2 = boundary_edge ? MFTL_ERROR : MFTLHeTriIdx(obj->tris.he[h].twin_idx);
-
-  for (int pass = 0; pass < 2; ++pass)
-  {
-    int fan[MFTL_REMESH_RING_MAX];
-    const int nf = ring_triangles(obj, pass ? b : a, fan);
-    if (nf == MFTL_ERROR)
-    {
-      reason = MFTL_REMESH_REJECT_OTHER;
+      reason = MFTL_REMESH_REJECT_FEATURE;
       goto done;
     }
-
-    for (int i = 0; i < nf; ++i)
-    {
-      const int t = fan[i];
-      if (t == t_keep_1 || t == t_keep_2) continue;
-
-      double n_old[3];
-      double n_new[3];
-      tri_area_vector_substituted(obj, t, MFTL_ERROR, MFTL_ERROR, MFTL_NULL, n_old);
-      tri_area_vector_substituted(obj, t, a, b, pm, n_new);
-
-      if (area_vector_cos(n_old, n_new) < params->max_normal_deviation_cos) goto done;
-    }
+    if ((pf[0] != pm[0] || pf[1] != pm[1] || pf[2] != pm[2]) &&
+        collapse_geometry_refused(obj, h, a, b, ring_a, na, ring_b, nb, boundary_edge, pf, params, &reason))
+      goto done;
   }
 
   reason = MFTL_REMESH_REJECT_NONE;
@@ -686,6 +879,7 @@ int MFTLCollapseEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *param
   MFTL_ASSERT(obj != MFTL_NULL);
   if (h < 0 || h >= 3 * obj->tris.n) return MFTL_ERROR;
   if (tri_is_dead(obj, MFTLHeTriIdx(h))) return MFTL_ERROR;
+  const uint64_t judged = obj->generation;  // the state MFTLCollapseApproved() saw, for its cached fit
   obj->derived &= ~MFTL_DERIVED_GEOMETRY;
   MFTLObjectMarkChanged(obj);
 
@@ -711,12 +905,13 @@ int MFTLCollapseEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *param
   if (n_fan_b <= 0 || n_fan_b >= MFTL_REMESH_RING_MAX) return MFTL_ERROR;
 
   double pm[3];
-  if (collapse_target_position(obj, h, a, b, params, pm) != MFTL_SUCCESS) return MFTL_ERROR;
+  if (collapse_target_position(obj, h, a, b, params, MFTL_TRUE, judged, pm) != MFTL_SUCCESS) return MFTL_ERROR;
 
   const bool triangle_fields = MFTLFieldsStride(obj, 1) != 0;
   const bool vertex_fields = MFTLFieldsStride(obj, 0) != 0;
   if ((triangle_fields || vertex_fields) && freeze_blocks_collapse(obj, h)) return MFTL_ERROR;
   const double fraction = vertex_fields ? MFTLRemeshFieldEdgeParameter(obj, a, b, pm) : 0.0;
+  const double size_fraction = obj->verts.has_sizing ? MFTLRemeshFieldEdgeParameter(obj, a, b, pm) : 0.0;
   int patch[2 * MFTL_REMESH_RING_MAX], npatch = 0;
   double old_area[2 * MFTL_REMESH_RING_MAX], new_area[2 * MFTL_REMESH_RING_MAX];
   double *field_values = NULL;
@@ -808,6 +1003,7 @@ int MFTLCollapseEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *param
 
   if (triangle_fields) MFTLRemeshFieldCommit(obj, patch, new_area, npatch, field_values);
   if (vertex_fields) MFTLRemeshFieldVertex(obj, a, b, b, fraction);
+  MFTLRemeshSizingCarry(obj, a, b, b, size_fraction);
   MFTLObjectInvalidateDerived(obj);
   return MFTL_SUCCESS;
 }

@@ -57,6 +57,9 @@
 /* Keywords are stored through an int; every enum a keyword key points at must be one. */
 _Static_assert(sizeof(MFTL_RemeshParallelStrategy) == sizeof(int), "keyword storage");
 _Static_assert(sizeof(MFTL_SmoothMode) == sizeof(int), "keyword storage");
+_Static_assert(sizeof(MFTL_RemeshSizing) == sizeof(int), "keyword storage");
+_Static_assert(sizeof(MFTL_RemeshPlacement) == sizeof(int), "keyword storage");
+_Static_assert(sizeof(MFTL_RemeshProjection) == sizeof(int), "keyword storage");
 _Static_assert(sizeof(MFTL_NormalWeighting) == sizeof(int), "keyword storage");
 _Static_assert(sizeof(MFTL_IoLayout) == sizeof(int), "keyword storage");
 _Static_assert(sizeof(MFTL_VtkEncoding) == sizeof(int), "keyword storage");
@@ -79,6 +82,12 @@ static const MFTL_SettingSection g_sections[] = {
     SECTION("topology", "Topology changes",
             "Breakup and coalescence: `MFTLEnsembleApplyTopologyChanges(ens, &cfg.topology.options, &stats)`. Lengths left at 0 are "
             "derived from the remesh target length by MFTLSettingsResolve()."),
+    SECTION("volume", "Volume restoration",
+            "Restores every body's reference volume, set once with MFTLEnsembleSetReferenceVolumes(): `MFTLEnsembleCorrectVolumes(ens, "
+            "&cfg.volume.params, &stats)`. Outside the remesher, so its Phong projection keeps the correction."),
+    SECTION("undulation", "Undulation removal (TSUR3D)",
+            "Volume-conserving removal of grid-scale undulations: `MFTLEnsembleRemoveUndulations(ens, &cfg.undulation.params, &stats)`. "
+            "Outside the remesher, so its Phong projection keeps the smoothing."),
     SECTION("contact", "Contact detection",
             "Triangle contact between and within bodies: `MFTLEnsembleIntersectObjects(ens, &cfg.contact.params, callback, user_data)`."),
     SECTION("coupling", "Coupling to a flow solver",
@@ -104,6 +113,25 @@ static const MFTL_SettingChoice g_parallel_strategy[] = {
 static const MFTL_SettingChoice g_smooth_mode[] = {
     CHOICE("triangle", MFTL_SMOOTH_TRIANGLE_BASED, "area-weighted mean of the incident triangle centroids; equalises areas"),
     CHOICE("vertex", MFTL_SMOOTH_VERTEX_BASED, "umbrella operator, the plain mean of the one-ring; equalises edge lengths"),
+    END_CHOICES,
+};
+
+static const MFTL_SettingChoice g_sizing[] = {
+    CHOICE("uniform", MFTL_REMESH_SIZING_UNIFORM, "one target length everywhere (Botsch & Kobbelt)"),
+    CHOICE("curvature", MFTL_REMESH_SIZING_CURVATURE, "isotropic, finer where curved: a target from the curvature (Dunyach et al. 2013)"),
+    END_CHOICES,
+};
+
+static const MFTL_SettingChoice g_placement[] = {
+    CHOICE("midpoint", MFTL_REMESH_PLACE_MIDPOINT, "new vertices at the chord midpoint"),
+    CHOICE("paraboloid", MFTL_REMESH_PLACE_PARABOLOID, "on a weighted least-squares paraboloid through the edge's two-ring vertices"),
+    CHOICE("paraboloid_normals", MFTL_REMESH_PLACE_PARABOLOID_NORMALS, "the same, fitted to the vertex normals' slopes as well"),
+    END_CHOICES,
+};
+
+static const MFTL_SettingChoice g_projection[] = {
+    CHOICE("none", MFTL_REMESH_PROJECT_NONE, "the smoother's tangential move stands"),
+    CHOICE("phong", MFTL_REMESH_PROJECT_PHONG, "onto the Phong surface of the mesh the remesh call received"),
     END_CHOICES,
 };
 
@@ -189,6 +217,30 @@ static const MFTL_SettingInfo g_keys[] = {
         "Edges shorter than this are collapsed. 0: 4/5 of the target length (Botsch & Kobbelt)."),
     KEY("remesh", "max_edge_length", REAL, remesh.params.max_edge_length, "0.0", "[0, inf)", NO_CHOICES, "length", 1,
         "Edges longer than this are split. 0: 4/3 of the target length."),
+    KEY("remesh", "sizing", KEYWORD, remesh.params.sizing, "\"uniform\"", "", g_sizing, "", 0,
+        "How the remesher judges an edge: one target length, or a per-vertex target from the curvature. "
+        "The curvature mode needs `smooth_mode` = triangle."),
+    KEY("remesh", "curvature_tolerance", REAL, remesh.params.curvature_tolerance, "0.0", "[0, inf)", NO_CHOICES, "length", 0,
+        "Curvature sizing: the largest admitted gap between an edge and the surface it cuts. 0: `curvature_tolerance_factor` times the "
+        "target length."),
+    KEY("remesh", "curvature_tolerance_factor", REAL, remesh.curvature_tolerance_factor, "0.02", "(0, inf)", NO_CHOICES, "", 0,
+        "Curvature sizing: the tolerance in units of the target length. 0.02 refines below the target wherever the radius of curvature "
+        "is under about 8 target lengths."),
+    KEY("remesh", "min_target_length", REAL, remesh.params.min_target_length, "0.0", "[0, inf)", NO_CHOICES, "length", 0,
+        "Curvature sizing: the finest target; `target_length` is the coarsest. 0: `min_target_factor` times the target length."),
+    KEY("remesh", "min_target_factor", REAL, remesh.min_target_factor, "0.25", "(0, 1]", NO_CHOICES, "", 1,
+        "Curvature sizing: the finest target in units of the target length."),
+    KEY("remesh", "split_placement", KEYWORD, remesh.params.split_placement, "\"midpoint\"", "", g_placement, "", 0,
+        "Where a split of an edge between two free vertices puts the new vertex."),
+    KEY("remesh", "collapse_placement", KEYWORD, remesh.params.collapse_placement, "\"midpoint\"", "", g_placement, "", 0,
+        "Where a collapse of two free vertices puts the merged vertex, before `collapse_preserves_volume` moves it."),
+    KEY("remesh", "collapse_preserves_volume", BOOL, remesh.params.collapse_preserves_volume, "false", "", NO_CHOICES, "", 0,
+        "Move the merged vertex of a collapse of two free vertices, from the point `collapse_placement` chose, so the collapse keeps "
+        "the enclosed volume exactly."),
+    KEY("remesh", "fit_radius", REAL, remesh.params.fit_radius, "3.0", "(1, inf)", NO_CHOICES, "", 1,
+        "Paraboloid placement: support of the Wendland weights, in local edge lengths."),
+    KEY("remesh", "projection", KEYWORD, remesh.params.projection, "\"none\"", "", g_projection, "", 0,
+        "What the smoother does after each tangential move of a free vertex."),
     KEY("remesh", "iterations", INT, remesh.params.iterations, "3", "[1, inf)", NO_CHOICES, "", 0,
         "Outer iterations of split, collapse, flip and smooth per pass."),
     KEY("remesh", "min_convergence_ops", INT, remesh.params.min_convergence_ops, "0", "[0, inf)", NO_CHOICES, "", 1,
@@ -261,6 +313,26 @@ static const MFTL_SettingInfo g_keys[] = {
         "Radius of the bias bump around each event, in units of max(delta, dx)."),
     KEY("topology", "mc_snap", REAL, topology.options.mc_snap, "0.02", "[0, 0.5)", NO_CHOICES, "", 1,
         "Marching-cubes snap distance relative to the lattice spacing; 0 disables snapping."),
+
+    /* ── volume ─────────────────────────────────────────────────────────── */
+    KEY("volume", "every", INT, volume.every, "0", "[0, inf)", NO_CHOICES, "", 0,
+        "Restore every body's reference volume every this many timesteps; 0 never. Read by the caller's loop: once per step, after the "
+        "remesh, is enough -- correcting after the advection as well changes the shape at second order only."),
+    KEY("volume", "iterations", INT, volume.params.iterations, "3", "[0, inf)", NO_CHOICES, "", 1,
+        "Newton steps on the exact first variation of the volume. One already reaches round-off from the per-step error of an advected "
+        "front; three from a deficit of percents."),
+
+    /* ── undulation ─────────────────────────────────────────────────────── */
+    KEY("undulation", "every", INT, undulation.every, "0", "[0, inf)", NO_CHOICES, "", 0,
+        "Remove undulations (TSUR3D) every this many timesteps; 0 never. Read by the caller's loop. It removes grid-scale noise and "
+        "smooths under-resolved geometry alike: see `min_angle`."),
+    KEY("undulation", "sweeps", INT, undulation.params.sweeps, "1", "[0, inf)", NO_CHOICES, "", 1, "Passes over the edges per call."),
+    KEY("undulation", "min_angle", REAL, undulation.params.min_angle, "15.0", "[0, 90)", NO_CHOICES, "degrees", 0,
+        "Leave edges whose kink -- their angle out of the plane normal to their smoothed normal -- is at most this. 0 treats every edge "
+        "(the published method), which also smooths away geometry the mesh under-resolves; 15 was neutral on a resolved shape and still "
+        "removed most velocity noise (docs/analysis.md §15.2)."),
+    KEY("undulation", "relaxation", REAL, undulation.params.relaxation, "1.0", "(0, 1]", NO_CHOICES, "", 1,
+        "Fraction of the way to the common height each end of an edge moves; any value conserves the volume exactly."),
 
     /* ── contact ────────────────────────────────────────────────────────── */
     KEY("contact", "every", INT, contact.every, "0", "[0, inf)", NO_CHOICES, "", 0,

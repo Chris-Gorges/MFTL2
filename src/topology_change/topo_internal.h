@@ -88,6 +88,7 @@ typedef struct MFTL_TopoCluster
   double flux_ref;  ///< ref.
   int rim_walls;  ///< Walls any rim of the cluster lies on, as bits 2 * axis + side.
   double volume_old;  ///< Volume before the reconstruction.
+  double reference_old;  ///< Sum of the bodies' MFTL_Object::reference_volume, NaN when one has none.
 
   bool has_window;  ///< This rank's window is non-empty.
   MFTL_SdfGrid grid;  ///< This rank's window of the field.
