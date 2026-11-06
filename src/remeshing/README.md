@@ -725,6 +725,7 @@ exact strategies avoid negotiation altogether:
 | migrations | one per placement (identity skipped), plus one | exactly 2 |
 | frozen | $O(\delta/h)$ of the mesh | nothing |
 | id cost | per-body prefix sums over the holders, per placement | one per-body MAX |
+| against serial | the same statistics, not the same mesh | **the serial mesh, to the bit** |
 | weakness | placements, band precondition | idle ranks when $B < P$ |
 
 They share no code past `MFTLRemeshIterate` (different migrations, id schemes
@@ -1070,6 +1071,26 @@ memory, with a migration that leaves the stencil. Deciding before anything moves
 also means the spanning fallback never sees a half-remeshed ensemble. The count
 uses `lowest_holder` so that a body held by four ranks is counted once (without it
 the driver printed "4 of 1 bodies are wider than a rank box").
+
+**One pass is the serial pass, to the bit.** The centering migration changes
+nothing about a body except its POOL ORDER: redistribution assembles it as the
+kept entities followed by the arrivals in source-rank order. That alone used to
+make every step differ from serial at every $P > 1$, because the sweeps are greedy
+in pool order and every fan sum is rounded in the order its walk takes from
+`out_he_idx`. `MFTLRemeshObject` therefore starts with `MFTLObjectCanonicalOrder`:
+both pools sorted by global id (owned and ghost runs separately), `out_he_idx`
+re-derived as the last outgoing half-edge, the rule compaction and the rebuild
+already use. Both halves are needed — sorting alone still diverged from the
+second pass. With them, 27 droplets over a 200-step period, with curvature
+sizing, Phong projection, the volume-preserving collapse and velocity noise, are
+bit-identical to the serial run at $P$ = 2, 4, 8 in positions, triangulation and
+global ids (`docs/analysis.md` §5.8). Cost: 2–3 % of a dispersed run, about
+0.5 % of a serial one, where the pools are already sorted after the first call.
+`test_a_dispersed_remesh_is_the_serial_remesh_to_the_bit` compares against an
+`MPI_COMM_SELF` rerun on rank 0; `test_the_pool_order_does_not_reach_the_remesh`
+is its serial half. A solver loop is bit-identical only as far as everything
+else in it is: a per-body reduction (volume correction, a re-measured target
+length) sums in partition order.
 
 **Ids need almost nothing.** After centering exactly one rank holds any entity of
 a body, and ids live in a per-body space, so the owner's counter is unique. The

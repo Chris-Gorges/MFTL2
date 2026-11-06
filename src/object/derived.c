@@ -4,7 +4,8 @@
  * @date 2026-08-14
  * @ingroup mftl_object
  *
- * @brief The derived connectivity arrays, and the Morton renumbering of the pools.
+ * @brief The derived connectivity arrays, the Morton renumbering of the pools,
+ *        and their canonical (global-id) order.
  *
  * Only two derived arrays exist, `tris.verts` and `tris.neighbors`. Everything
  * else a "flattened" half-edge mesh is often given was removed after counting
@@ -352,4 +353,177 @@ void MFTLObjectReorderMorton(MFTL_Object *obj)
   /* The derived arrays were deliberately not permuted; rebuild them instead. */
   MFTLObjectBuildDerived(obj);
   MFTLObjectMarkChanged(obj);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 3. Canonical order: global-id order, re-derived out_he_idx
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Are the vertex global ids strictly increasing over `[lo, hi)`?
+ * @param rec The vertex records.
+ * @param lo  First index.
+ * @param hi  One past the last index.
+ * @return `true` if sorted (an empty or one-element run is).
+ */
+static bool vertex_ids_increase(const MFTL_Vertex *rec, int lo, int hi)
+{
+  for (int i = lo + 1; i < hi; ++i)
+    if (rec[i - 1].global_id >= rec[i].global_id) return MFTL_FALSE;
+  return MFTL_TRUE;
+}
+
+/**
+ * @brief Are the triangle global ids strictly increasing over `[lo, hi)`?
+ * @param rec The triangle records.
+ * @param lo  First index.
+ * @param hi  One past the last index.
+ * @return `true` if sorted.
+ */
+static bool triangle_ids_increase(const MFTL_Triangle *rec, int lo, int hi)
+{
+  for (int i = lo + 1; i < hi; ++i)
+    if (rec[i - 1].global_id >= rec[i].global_id) return MFTL_FALSE;
+  return MFTL_TRUE;
+}
+
+/**
+ * @brief Sorts the vertex pool by global id and remaps every reference into it.
+ * @param      obj        The mesh.
+ * @param[out] old_of_new `[verts.n]` old index per new position.
+ * @param[out] new_of_old `[verts.n]` new index per old position.
+ * @param      keys       `[verts.n]` scratch.
+ * @param      scratch    Buffer large enough for the widest per-vertex array.
+ */
+static void sort_vertices_by_id(MFTL_Object *obj, int *old_of_new, int *new_of_old, int *keys, void *scratch)
+{
+  const int nv = obj->verts.n;
+  const int n_local = obj->verts.n_local;
+
+  for (int v = 0; v < nv; ++v)
+  {
+    keys[v] = obj->verts.rec[v].global_id;
+    old_of_new[v] = v;
+  }
+  MFTLSortPairs32(keys, old_of_new, n_local);
+  MFTLSortPairs32(keys + n_local, old_of_new + n_local, nv - n_local);
+  for (int i = 0; i < nv; ++i) new_of_old[old_of_new[i]] = i;
+
+  permute_vertex_recs(obj->verts.rec, (MFTL_Vertex *) scratch, old_of_new, nv);
+  permute_doubles(obj->verts.pos, (double *) scratch, old_of_new, nv, 3);
+  permute_doubles(obj->verts.normal, (double *) scratch, old_of_new, nv, 3);
+  if (obj->verts.has_sizing) permute_doubles(obj->verts.sizing, (double *) scratch, old_of_new, nv, 1);
+  if (MFTLFieldsStride(obj, MFTL_FIELD_VERTEX))
+    for (int f = 0; f < obj->fields->n; ++f)
+    {
+      const MFTL_FieldDescriptor *d = &obj->fields->entries[f];
+      if (d->entity == MFTL_FIELD_VERTEX && d->mode != MFTL_FIELD_RECOMPUTED) permute_doubles(obj->field_data[f], (double *) scratch, old_of_new, nv, d->ncomp);
+    }
+
+  MFTL_HalfEdge *restrict he = obj->tris.he;
+  const int n_he = 3 * obj->tris.n;
+  for (int h = 0; h < n_he; ++h) he[h].vertex_idx = new_of_old[he[h].vertex_idx];
+}
+
+/**
+ * @brief Sorts the triangle pool by global id and remaps `twin_idx`.
+ *
+ * `out_he_idx` is not remapped: the caller re-derives it.
+ *
+ * @param      obj        The mesh.
+ * @param[out] old_of_new `[tris.n]` old index per new position.
+ * @param[out] new_of_old `[tris.n]` new index per old position.
+ * @param      keys       `[tris.n]` scratch.
+ * @param      scratch    Buffer large enough for the widest per-triangle array.
+ */
+static void sort_triangles_by_id(MFTL_Object *obj, int *old_of_new, int *new_of_old, int *keys, void *scratch)
+{
+  const int nt = obj->tris.n;
+  const int n_local = obj->tris.n_local;
+
+  for (int t = 0; t < nt; ++t)
+  {
+    keys[t] = obj->tris.rec[t].global_id;
+    old_of_new[t] = t;
+  }
+  MFTLSortPairs32(keys, old_of_new, n_local);
+  MFTLSortPairs32(keys + n_local, old_of_new + n_local, nt - n_local);
+  for (int i = 0; i < nt; ++i) new_of_old[old_of_new[i]] = i;
+
+  permute_triangle_recs(obj->tris.rec, (MFTL_Triangle *) scratch, old_of_new, nt);
+  permute_he_triples(obj->tris.he, (MFTL_HalfEdge *) scratch, old_of_new, nt);
+  permute_doubles(obj->tris.area, (double *) scratch, old_of_new, nt, 1);
+  permute_doubles(obj->tris.normal, (double *) scratch, old_of_new, nt, 3);
+  permute_doubles(obj->tris.center, (double *) scratch, old_of_new, nt, 3);
+  if (MFTLFieldsStride(obj, MFTL_FIELD_TRIANGLE))
+    for (int f = 0; f < obj->fields->n; ++f)
+    {
+      const MFTL_FieldDescriptor *d = &obj->fields->entries[f];
+      if (d->entity == MFTL_FIELD_TRIANGLE && d->mode != MFTL_FIELD_RECOMPUTED)
+        permute_doubles(obj->field_data[f], (double *) scratch, old_of_new, nt, d->ncomp);
+    }
+
+  /* Keep the corner h % 3, remap the triangle h / 3 (implicit indexing). */
+  MFTL_HalfEdge *restrict he = obj->tris.he;
+  const int n_he = 3 * nt;
+  for (int h = 0; h < n_he; ++h)
+  {
+    const int tw = he[h].twin_idx;
+    if (tw != MFTL_ERROR) he[h].twin_idx = 3 * new_of_old[tw / 3] + tw % 3;
+  }
+}
+
+bool MFTLObjectCanonicalOrder(MFTL_Object *obj)
+{
+  MFTL_ASSERT(obj != MFTL_NULL);
+
+  const int nv = obj->verts.n;
+  const int nt = obj->tris.n;
+
+  const bool sort_v = !(vertex_ids_increase(obj->verts.rec, 0, obj->verts.n_local) && vertex_ids_increase(obj->verts.rec, obj->verts.n_local, nv));
+  const bool sort_t = !(triangle_ids_increase(obj->tris.rec, 0, obj->tris.n_local) && triangle_ids_increase(obj->tris.rec, obj->tris.n_local, nt));
+
+  if (sort_v || sort_t)
+  {
+    const int n_max = (nv > nt) ? nv : nt;
+    void *scratch = MFTLMallocOrDie((size_t) n_max * MFTLFieldsWidth(obj, 48), "MFTLObjectCanonicalOrder scratch");
+    int *maps = (int *) MFTLMallocOrDie(3 * (size_t) n_max * sizeof(int), "MFTLObjectCanonicalOrder maps");
+
+    if (sort_v) sort_vertices_by_id(obj, maps, maps + n_max, maps + 2 * n_max, scratch);
+    if (sort_t) sort_triangles_by_id(obj, maps, maps + n_max, maps + 2 * n_max, scratch);
+
+    free(maps);
+    free(scratch);
+  }
+
+  /* The LAST outgoing half-edge in pool order, whether or not anything moved:
+   * a flip leaves `out_he_idx` on whichever half-edge it rewrote, and a fan's
+   * sums are rounded in the order its walk takes from there. */
+  bool out_he_changed = MFTL_FALSE;
+  MFTL_Vertex *restrict vr = obj->verts.rec;
+  const MFTL_HalfEdge *restrict he = obj->tris.he;
+  int *const last = (int *) MFTLMallocOrDie((size_t) (nv > 0 ? nv : 1) * sizeof(int), "MFTLObjectCanonicalOrder out_he");
+  for (int v = 0; v < nv; ++v) last[v] = MFTL_ERROR;
+  for (int t = 0; t < nt; ++t)
+  {
+    /* Half-edge 3t+k starts at the target of 3t+(k+2)%3. */
+    last[he[3 * t + 2].vertex_idx] = 3 * t + 0;
+    last[he[3 * t + 0].vertex_idx] = 3 * t + 1;
+    last[he[3 * t + 1].vertex_idx] = 3 * t + 2;
+  }
+  for (int v = 0; v < nv; ++v)
+  {
+    out_he_changed |= (vr[v].out_he_idx != last[v]);
+    vr[v].out_he_idx = last[v];
+  }
+  free(last);
+
+  const bool permuted = sort_v || sort_t;
+  if (permuted) MFTLObjectBuildDerived(obj);
+  if (permuted || out_he_changed)
+  {
+    MFTLObjectMarkChanged(obj);
+    MFTLObjectMarkPartitionDirty(obj);
+  }
+  return permuted;
 }

@@ -370,6 +370,39 @@ static inline uint64_t MFTLMorton3D(uint64_t x, uint64_t y, uint64_t z)
  */
 void MFTLObjectReorderMorton(MFTL_Object *obj);
 
+/**
+ * @brief Puts both pools into GLOBAL-ID order and re-derives `out_he_idx`, so
+ *        that the pool layout becomes a function of the mesh alone.
+ *
+ * The remesher's sweeps are greedy and visit edges in pool order, and every fan
+ * sum is rounded in the order its walk takes from `out_he_idx`. Two pools that
+ * hold the same mesh in different orders therefore remesh to different meshes.
+ * A dispersed migration is exactly that case: it hands a body over as kept
+ * entities followed by arrivals in source-rank order, so before this call
+ * existed the dispersed driver never reproduced the serial remesh.
+ * MFTLRemeshObject() calls it first, which makes its result independent of the
+ * pool order it is handed (`test_the_pool_order_does_not_reach_the_remesh`,
+ * `test_a_dispersed_remesh_is_the_serial_remesh_to_the_bit`).
+ *
+ * 1. Vertices are sorted by global id, `[0, n_local)` and `[n_local, n)`
+ *    separately, so the ownership prefix survives; `he.vertex_idx` is remapped.
+ * 2. Triangles likewise, with their half-edge triples, geometry and attached
+ *    fields; `twin_idx` is remapped and the corner rotation is kept.
+ * 3. `out_he_idx` becomes the LAST outgoing half-edge in pool order -- the rule
+ *    compaction and redistribution's rebuild already follow, and the one a flip
+ *    does not, which is why it is re-derived even when nothing moved.
+ *
+ * An already sorted pool costs two read-only passes and the `out_he_idx` pass,
+ * which is the serial remesher's case at every call after its first.
+ *
+ * @param obj The mesh, permuted in place. Derived topology is rebuilt when a
+ *            pool moved; cached geometry follows its entity.
+ * @return `true` if either pool was permuted.
+ *
+ * @rank_local No MPI. On a partitioned object each rank orders its own share.
+ */
+bool MFTLObjectCanonicalOrder(MFTL_Object *obj);
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * 5. HOT-LOOP ITERATORS
  *

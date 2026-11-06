@@ -39,6 +39,7 @@
  */
 
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1027,6 +1028,179 @@ static int test_the_balancer_is_deterministic(void)
   return 0;
 }
 
+/* ═════════════════════════════════════════════════════════════════════════════
+ * Exactness against the serial remesher
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/** @brief splitmix64's finaliser: a cheap, well-mixed 64-bit hash step. */
+static uint64_t mix64(uint64_t z)
+{
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+  return z ^ (z >> 31);
+}
+
+/**
+ * @brief One order-independent digest per body over OWNED entities, XOR-reduced over @p comm.
+ *
+ * A vertex contributes its global id and the raw bits of its position, a
+ * triangle its global id and its corners' global ids in rotation order, so
+ * equal digests mean the same surface, the same triangulation AND the same
+ * numbering. XOR is exact and associative, so the partition cannot reach it.
+ */
+static void body_digests(const MFTL_Ensemble *ens, int n_bodies, uint64_t *out, MPI_Comm comm)
+{
+  uint64_t *local = (uint64_t *) calloc((size_t) n_bodies, sizeof(uint64_t));
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    const MFTL_Object *const obj = ens->local_objects[o];
+    uint64_t d = 0;
+    for (int v = 0; v < obj->verts.n_local; ++v)
+    {
+      uint64_t h = mix64((uint64_t) (uint32_t) obj->verts.rec[v].global_id + 0x9E3779B97F4A7C15ull);
+      for (int k = 0; k < 3; ++k)
+      {
+        uint64_t bits;
+        memcpy(&bits, &obj->verts.pos[3 * v + k], sizeof bits);
+        h = mix64(h ^ bits);
+      }
+      d ^= h;
+    }
+    for (int t = 0; t < obj->tris.n_local; ++t)
+    {
+      int c[3];
+      MFTLGetTriangleVertices(obj, t, c);
+      uint64_t h = mix64((uint64_t) (uint32_t) obj->tris.rec[t].global_id + 0xD1B54A32D192ED03ull);
+      for (int k = 0; k < 3; ++k) h = mix64(h ^ (uint64_t) (uint32_t) obj->verts.rec[c[k]].global_id);
+      d ^= h;
+    }
+    local[obj->global_id] ^= d;
+  }
+  MPI_Allreduce(local, out, n_bodies, MPI_UINT64_T, MPI_BXOR, comm);
+  free(local);
+}
+
+/** @brief A smooth, position-only displacement of the owned vertices: the same bits on every rank. */
+static void deform(MFTL_Ensemble *ens)
+{
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    MFTL_Object *const obj = ens->local_objects[o];
+    for (int v = 0; v < obj->verts.n_local; ++v)
+    {
+      double *p = MFTLVertexPosMut(obj, v);
+      const double d[3] = {0.02 * sin(9.0 * p[1] + 1.0), 0.02 * sin(9.0 * p[2] + 2.0), 0.02 * sin(9.0 * p[0])};
+      for (int k = 0; k < 3; ++k) p[k] += d[k];
+      MFTLApplyPeriodicity(obj->domain, p);
+    }
+    MFTLObjectMarkChanged(obj);
+  }
+}
+
+/**
+ * @brief A dispersed remesh is the serial remesh, bit for bit, pass after pass.
+ *
+ * ═══════════════════════════════════════════════════════════════════════════
+ * WHY THIS CAN BE AN EQUALITY WHEN THE SPANNING TEST CANNOT
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * The dispersed driver moves each body whole to one rank and runs the serial
+ * kernel on it, so the only thing the partition can change is the POOL ORDER
+ * the kernel is handed -- redistribution assembles a body as kept entities
+ * followed by arrivals in source-rank order. MFTLRemeshObject() puts the body in
+ * global-id order before it sweeps, so that order cannot reach the result. The
+ * spanning driver decides band edges against a different state and can only be
+ * compared statistically (test_the_two_strategies_reach_the_same_mesh).
+ *
+ * The reference is the same four droplets on rank 0 alone, in an
+ * MPI_COMM_SELF ensemble, through the serial path. Three passes, the last two
+ * after a deformation, so the second and third pass start from a body the
+ * closing redistribution has split again and the next centering reassembles.
+ *
+ * Non-vacuous by `count_split_bodies() > 0` at np > 1: bodies straddling a cut
+ * plane arrive from two or more ranks. Mutation-checked: without the canonical
+ * order the digests differ at np = 2, 4 and 8, and so do the counts after three
+ * passes (678 / 674 / 664 triangles against 670).
+ */
+static int test_a_dispersed_remesh_is_the_serial_remesh_to_the_bit(void)
+{
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE);
+  TEST_ASSERT(ens != MFTL_NULL);
+  add_four_droplets(ens);
+  TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+  const int n_bodies = ens->n_bodies_global;
+  if (g_nproc > 1) TEST_ASSERT(agreed(count_split_bodies(ens) > 0, MPI_COMM_WORLD));
+
+  /* The serial reference, on rank 0 only. */
+  MFTL_Ensemble *ser = MFTL_NULL;
+  if (g_rank == 0)
+  {
+    int cuts[3] = {1, 1, 1};
+    double lo[3] = {-1.0, -1.0, -1.0};
+    double hi[3] = {1.0, 1.0, 1.0};
+    bool per[3] = {MFTL_TRUE, MFTL_TRUE, MFTL_TRUE};
+    ser = MFTLEnsembleCreate(MPI_COMM_SELF, cuts, lo, hi, per, 4);
+    add_four_droplets(ser);
+  }
+
+  MFTL_RemeshParameters params;
+  standard_params(&params, 0.05);
+  params.parallel_strategy = MFTL_REMESH_PARALLEL_DISPERSED;
+
+  uint64_t *dist = (uint64_t *) calloc((size_t) n_bodies, sizeof(uint64_t));
+  uint64_t *ref = (uint64_t *) calloc((size_t) n_bodies, sizeof(uint64_t));
+  int all_equal = 1, all_dispersed = 1;
+  double tri[2] = {0.0, 0.0};
+
+  for (int pass = 0; pass < 3; ++pass)
+  {
+    if (pass > 0)
+    {
+      deform(ens);
+      MFTLUpdateGhostPositions(ens);
+      if (ser) deform(ser);
+    }
+    for (int o = 0; o < ens->n_local_objects; ++o) MFTLComputeTriangleGeometry(ens->local_objects[o], ens->local_objects[o]->tris.n);
+
+    MFTL_RemeshStats st;
+    const int ok = MFTLRemeshEnsemble(ens, &params, &st) == MFTL_SUCCESS;
+    all_dispersed &= (g_nproc == 1 || st.strategy == MFTL_REMESH_PARALLEL_DISPERSED);  // one rank takes the serial path
+    if (ser)
+    {
+      for (int o = 0; o < ser->n_local_objects; ++o) MFTLComputeTriangleGeometry(ser->local_objects[o], ser->local_objects[o]->tris.n);
+      if (MFTLRemeshEnsemble(ser, &params, MFTL_NULL) != MFTL_SUCCESS) all_equal = 0;
+      body_digests(ser, n_bodies, ref, MPI_COMM_SELF);
+    }
+    TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+
+    body_digests(ens, n_bodies, dist, MPI_COMM_WORLD);
+    MPI_Bcast(ref, n_bodies, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+    for (int b = 0; b < n_bodies; ++b) all_equal &= (dist[b] == ref[b]);
+  }
+
+  mesh_measure m;
+  measure(ens, &params, &m);
+  tri[0] = m.n_triangles;
+  if (ser)
+    for (int o = 0; o < ser->n_local_objects; ++o) tri[1] += ser->local_objects[o]->tris.n;
+  MPI_Bcast(&tri[1], 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+
+  if (g_rank == 0)
+    printf("\n    np=%d: %d bodies, 3 passes, %.0f triangles distributed vs %.0f serial, digests %s\n    ", g_nproc, n_bodies, tri[0], tri[1],
+           all_equal ? "equal" : "DIFFER");
+
+  TEST_ASSERT(agreed(all_dispersed, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(tri[0] == tri[1], MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(all_equal, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+
+  free(dist);
+  free(ref);
+  if (ser) MFTLEnsembleDestroy(&ser);
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
 /**
  * @brief Small bodies on a fine grid stay DISPERSED instead of falling to spanning.
  *
@@ -1156,6 +1330,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_the_balancer_payload_ignores_bodies_a_rank_does_not_hold);
   RUN_TEST(test_the_balancer_is_deterministic);
   RUN_TEST(test_small_bodies_at_a_fine_grid_stay_dispersed);
+  RUN_TEST(test_a_dispersed_remesh_is_the_serial_remesh_to_the_bit);
 
   if (g_rank == 0) TEST_REPORT();
 

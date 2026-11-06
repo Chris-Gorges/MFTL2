@@ -1368,6 +1368,13 @@ int MFTLRemeshEnsemblePrepareSizing(MFTL_Ensemble *ens, const MFTL_RemeshParamet
  * smoothing sweep, not of the final positions; call MFTLComputeVertexNormals()
  * if needed.
  *
+ * The result does not depend on the POOL ORDER it is handed: the call first
+ * puts the object in global-id order (MFTLObjectCanonicalOrder()). Given the
+ * same global ids, connectivity (corner rotation included), positions and flags,
+ * it returns the same mesh to the bit -- which is why the dispersed driver,
+ * which runs this call on bodies a migration has reassembled, reproduces the
+ * serial remesh exactly.
+ *
  * @param      obj    The mesh, remeshed in place.
  * @param      params The parameter block (MFTLInitRemeshParams()).
  * @param[out] stats  May be #MFTL_NULL.

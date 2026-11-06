@@ -332,6 +332,15 @@ int MFTLRemeshObject(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL
 
   if (obj->tris.n == 0) return MFTL_SUCCESS;
 
+  /* The sweeps are greedy in pool order and every fan sum is rounded in the
+   * order its walk takes from `out_he_idx`, so the same mesh in two pool orders
+   * remeshes to two meshes. Ordering by global id first makes the result a
+   * function of the mesh alone -- which is what lets the dispersed driver, whose
+   * migration hands a body over in arrival order, reproduce this call to the bit.
+   * After the first call the pools are already sorted (the renumbering below
+   * sets id == slot), and this is two read-only scans and one `out_he_idx` pass. */
+  MFTLObjectCanonicalOrder(obj);
+
   /* The curvature sizing field, ONCE per call, on the mesh as handed in; the
    * operators carry it from here (remesh_sizing.c). A no-op otherwise. */
   if (MFTLRemeshPrepareSizing(obj, params) != MFTL_SUCCESS) return MFTL_ERROR;

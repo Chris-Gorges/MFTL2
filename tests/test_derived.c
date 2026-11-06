@@ -2,7 +2,8 @@
  * @Author: Christian Gorges
  * @Date: 2026-08-14
  *
- * @brief Unit tests for the derived per-triangle arrays and the Morton reorder.
+ * @brief Unit tests for the derived per-triangle arrays, the Morton reorder and
+ *        the canonical (global-id) order.
  *
  * These two are what a "flatten" module would otherwise grow into, and the
  * properties worth pinning are the ones such a module gets wrong or makes hard:
@@ -432,6 +433,99 @@ static int test_reorder_of_a_trivial_mesh_is_safe(void)
   return 0;
 }
 
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Canonical (global-id) order
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/** @brief Are two objects the same mesh slot for slot, records and positions to the bit? */
+static int same_pools(const MFTL_Object *a, const MFTL_Object *b)
+{
+  if (a->verts.n != b->verts.n || a->tris.n != b->tris.n) return 0;
+  const int nv = a->verts.n, nt = a->tris.n;
+  return memcmp(a->verts.rec, b->verts.rec, (size_t) nv * sizeof(MFTL_Vertex)) == 0 &&
+         memcmp(a->verts.pos, b->verts.pos, 3 * (size_t) nv * sizeof(double)) == 0 &&
+         memcmp(a->tris.rec, b->tris.rec, (size_t) nt * sizeof(MFTL_Triangle)) == 0 &&
+         memcmp(a->tris.he, b->tris.he, 3 * (size_t) nt * sizeof(MFTL_HalfEdge)) == 0 &&
+         memcmp(a->tris.verts, b->tris.verts, 3 * (size_t) nt * sizeof(int)) == 0 &&
+         memcmp(a->tris.neighbors, b->tris.neighbors, 3 * (size_t) nt * sizeof(int)) == 0;
+}
+
+/**
+ * @brief A reordered copy comes back to the original, slot for slot.
+ *
+ * Global ids survive a Morton reorder, so ordering by them must restore the
+ * original pools exactly -- including `out_he_idx`, which the reorder remaps
+ * (keeping the same half-edge) and the canonical order re-derives by one rule.
+ * Non-vacuous: the reorder is checked to have moved something first.
+ */
+static int test_canonical_order_undoes_a_reordering(void)
+{
+  MFTL_Object *a = make_sphere(g_ens, 3);
+  MFTL_Object *b = make_sphere(g_ens, 3);
+  MFTLComputeTriangleGeometry(a, a->tris.n);
+  MFTLComputeTriangleGeometry(b, b->tris.n);
+
+  /* A generated mesh is numbered by slot already: nothing to sort. */
+  TEST_ASSERT(!MFTLObjectCanonicalOrder(a));
+
+  MFTLObjectReorderMorton(b);
+  int moved = 0;
+  for (int v = 0; v < b->verts.n; ++v) moved += (b->verts.rec[v].global_id != v);
+  for (int t = 0; t < b->tris.n; ++t) moved += (b->tris.rec[t].global_id != t);
+  TEST_ASSERT(moved > 0);
+
+  TEST_ASSERT(MFTLObjectCanonicalOrder(b));
+  TEST_ASSERT(same_pools(a, b));
+  TEST_ASSERT(memcmp(a->tris.area, b->tris.area, (size_t) a->tris.n * sizeof(double)) == 0);
+  TEST_ASSERT(inv_mesh_is_sound(b, g_ens->domain.rank));
+
+  /* Idempotent: a second call sorts nothing and changes nothing. */
+  TEST_ASSERT(!MFTLObjectCanonicalOrder(b));
+  TEST_ASSERT(same_pools(a, b));
+  return 0;
+}
+
+/**
+ * @brief Owned and ghost runs are each sorted, and neither loses a member.
+ *
+ * Sorting the whole pool would interleave the two runs and destroy the
+ * ownership prefix every ownership test in the library relies on.
+ */
+static int test_canonical_order_keeps_the_ownership_prefix(void)
+{
+  MFTL_Object *obj = make_sphere(g_ens, 2);
+  const int nv = obj->verts.n, nt = obj->tris.n;
+  const int nv_local = nv / 2, nt_local = nt / 2;
+
+  obj->verts.n_local = nv_local;
+  obj->tris.n_local = nt_local;
+  for (int v = nv_local; v < nv; ++v) obj->verts.rec[v].owner_proc = 12345;
+  for (int t = nt_local; t < nt; ++t) obj->tris.rec[t].owner_proc = 12345;
+
+  MFTLObjectReorderMorton(obj);
+  TEST_ASSERT(MFTLObjectCanonicalOrder(obj));
+
+  TEST_ASSERT_EQUAL_INT(nv_local, obj->verts.n_local);
+  TEST_ASSERT_EQUAL_INT(nt_local, obj->tris.n_local);
+
+  /* The original runs were [0, n/2) and [n/2, n) by slot, which was id order,
+   * so each run must hold exactly its old ids, ascending. */
+  for (int v = 0; v < nv; ++v)
+  {
+    TEST_ASSERT_EQUAL_INT(v, obj->verts.rec[v].global_id);
+    TEST_ASSERT((v < nv_local) == (obj->verts.rec[v].owner_proc != 12345));
+  }
+  for (int t = 0; t < nt; ++t)
+  {
+    TEST_ASSERT_EQUAL_INT(t, obj->tris.rec[t].global_id);
+    TEST_ASSERT((t < nt_local) == (obj->tris.rec[t].owner_proc != 12345));
+  }
+
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLCheckMeshIntegrity(obj));
+  TEST_ASSERT(inv_derived_matches_topology(obj));
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
@@ -459,6 +553,8 @@ int main(int argc, char **argv)
   RUN_TEST(test_reorder_preserves_the_ownership_prefix);
   RUN_TEST(test_reorder_carries_cached_geometry_along);
   RUN_TEST(test_reorder_of_a_trivial_mesh_is_safe);
+  RUN_TEST(test_canonical_order_undoes_a_reordering);
+  RUN_TEST(test_canonical_order_keeps_the_ownership_prefix);
 
   TEST_REPORT();
 

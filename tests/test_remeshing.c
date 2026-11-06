@@ -1429,6 +1429,60 @@ static int test_remeshing_is_independent_of_the_length_unit(void)
   return 0;
 }
 
+/**
+ * @brief The same mesh in two pool orders remeshes to the same mesh, to the bit.
+ *
+ * The sweeps are greedy in pool order and every fan sum is rounded in walk
+ * order, so without MFTLObjectCanonicalOrder() at the top of MFTLRemeshObject()
+ * a Morton-reordered copy diverges from the first sweep. This is the serial half
+ * of the dispersed driver's exactness: a migration reassembles a body in arrival
+ * order, and the remesh must not see that. Mutation-checked: with the call
+ * removed, the reordered copy ends with 414 vertices against 417.
+ */
+static int test_the_pool_order_does_not_reach_the_remesh(void)
+{
+  MFTL_Object *a = make_sphere(3);
+  MFTL_Object *b = make_sphere(3);
+  unsigned seed = 13579u;
+  for (int v = 0; v < a->verts.n; ++v)
+  {
+    double *p = MFTLVertexPosMut(a, v);
+    for (int k = 0; k < 3; ++k)
+    {
+      seed = seed * 1103515245u + 12345u;
+      p[k] += 0.2 * ((double) ((seed >> 16) & 0x7fff) / 32767.0 - 0.5);
+    }
+  }
+  memcpy(b->verts.pos, a->verts.pos, 3 * (size_t) a->verts.n * sizeof(double));
+  MFTLComputeTriangleGeometry(a, a->tris.n);
+
+  MFTLObjectReorderMorton(b);
+  MFTLComputeTriangleGeometry(b, b->tris.n);
+  int moved = 0;
+  for (int v = 0; v < b->verts.n; ++v) moved += (b->verts.rec[v].global_id != a->verts.rec[v].global_id);
+  TEST_ASSERT(moved > 0);  // non-vacuous: the two pools really are in different orders
+
+  MFTL_RemeshParameters params;
+  MFTLInitRemeshParams(&params, MFTL_REMESH_ISOTROPIC, MFTLMeanEdgeLength(a), 5, MFTL_SMOOTH_TRIANGLE_BASED, 180.0);
+  params.smooth_iterations = 3;
+
+  MFTL_RemeshStats sa, sb;
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLRemeshObject(a, &params, &sa));
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLRemeshObject(b, &params, &sb));
+  TEST_ASSERT(sa.n_split > 0 && sa.n_collapse > 0 && sa.n_flip > 0);
+
+  TEST_ASSERT_EQUAL_INT(a->verts.n, b->verts.n);
+  TEST_ASSERT_EQUAL_INT(a->tris.n, b->tris.n);
+  TEST_ASSERT(memcmp(a->verts.pos, b->verts.pos, 3 * (size_t) a->verts.n * sizeof(double)) == 0);
+  TEST_ASSERT(memcmp(a->tris.verts, b->tris.verts, 3 * (size_t) a->tris.n * sizeof(int)) == 0);
+  for (int v = 0; v < a->verts.n; ++v) TEST_ASSERT_EQUAL_INT(a->verts.rec[v].global_id, b->verts.rec[v].global_id);
+  TEST_ASSERT(inv_mesh_is_sound(b, 0));
+
+  fixture_free(a);
+  fixture_free(b);
+  return 0;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════ */
 
 int main(int argc, char **argv)
@@ -1482,6 +1536,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_remesh_preserves_a_cube);
   RUN_TEST(test_remesh_of_an_open_patch_keeps_its_rim);
   RUN_TEST(test_remeshing_is_independent_of_the_length_unit);
+  RUN_TEST(test_the_pool_order_does_not_reach_the_remesh);
   RUN_TEST(test_compaction_removes_orphans);
 
   TEST_REPORT();

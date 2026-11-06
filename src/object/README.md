@@ -7,7 +7,7 @@
 | File | Owns |
 |---|---|
 | `object.c` | the pool lifecycle — **the only file allowed to write a pool pointer, a `capacity` or a `block`** |
-| `derived.c` | the derived connectivity arrays and the Morton renumbering of both pools |
+| `derived.c` | the derived connectivity arrays, the Morton renumbering and the canonical (global-id) order of both pools |
 
 ---
 
@@ -217,6 +217,21 @@ The call is local (no MPI).
       development machine (Apple silicon), although it reduces the mean edge
       index distance 160×. It is kept for the single index space and as the LBVH
       prerequisite; re-measure on an x86 node with 1–2 MiB L2 per core.
+
+### Canonical order {#object_canonical}
+
+`MFTLObjectCanonicalOrder` is the opposite request: a pool layout that is a
+function of the mesh alone, so that a consumer whose result depends on the
+order — the remesher's greedy sweeps and every fan sum rounded in walk order —
+gives the same answer for the same mesh however it was assembled. Both pools are
+sorted by global id, owned and ghost runs separately, with the same permutation
+helpers as above; `twin_idx` is remapped, the corner rotation kept, and
+`out_he_idx` re-derived as the LAST outgoing half-edge in pool order, the rule
+compaction and redistribution's rebuild already follow (a flip leaves it on
+whichever half-edge it rewrote). A sorted pool costs two read-only scans and the
+`out_he_idx` pass. `MFTLRemeshObject` calls it first, which is what makes a
+dispersed remesh the serial one to the bit (`src/remeshing/README.md`). It undoes
+a Morton reorder exactly (`test_canonical_order_undoes_a_reordering`).
 
 ---
 

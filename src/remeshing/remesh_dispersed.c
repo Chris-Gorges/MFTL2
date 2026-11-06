@@ -1145,7 +1145,9 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
   /* ── 4. The untouched serial kernel, on whole bodies ─────────────────────
    *
    * MFTLRemeshObject, not MFTLRemeshIterate: a body with no ghosts is exactly
-   * what the serial entry point is specified for, down to its assertion. A rank
+   * what the serial entry point is specified for, down to its assertion, and
+   * its canonical ordering is what undoes the arrival order of the migration
+   * (kept entities first, then arrivals by source rank). A rank
    * holding nothing of a body enters with tris.n == 0 and returns immediately,
    * which is why this loop needs no ownership test of its own. */
   t_mark = MFTLRemeshWallTime();
@@ -1218,9 +1220,12 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
   st->n_ops_busiest_rank = busiest;
   free(counters);
 
-  /* One pass over whole bodies IS the serial answer, so there is nothing left
-   * for a second placement to reveal. Unlike the shift schedule, this driver has
-   * no notion of an entity it was not allowed to touch. */
+  /* One pass over whole bodies IS the serial answer -- to the bit, because
+   * MFTLRemeshObject() puts the body it is handed into global-id order before it
+   * sweeps, and the migration above changes the pool order and nothing else
+   * (test_a_dispersed_remesh_is_the_serial_remesh_to_the_bit). So there is
+   * nothing left for a second placement to reveal. Unlike the shift schedule,
+   * this driver has no notion of an entity it was not allowed to touch. */
   st->n_phases = 1;
   st->converged = MFTL_TRUE;
   st->n_edges_hidden = 0;
