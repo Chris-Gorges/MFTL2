@@ -10,13 +10,23 @@ The job file (see make_readme_gifs.sh for the ones the README uses):
     size          [width, height] in pixels
     focal, position, up, angle
                   a fixed camera; or "autoframe": {"dir", "k", "sigma",
-                  "periodic"} to follow each frame's bounding box from a fixed
-                  direction, Gaussian-smoothed over sigma frames (wrapping
+                  "periodic", "sigma_centre"} to follow each frame's bounding
+                  box from a fixed direction, the zoom Gaussian-smoothed over
+                  sigma frames and the centre over sigma_centre (wrapping
                   around for a periodic motion, so the loop is seamless)
     color         a cell array to colour by category ("TriangleOwner" for the
                   owning rank, "BodyID"), with "n_colors" and an optional
                   "palette"; null for a plain surface
     edges         draw the mesh edges, with "edge_opacity" and "edge_width"
+    role_from_wall
+                  colour by ROLE instead of by id: the body touching the plane
+                  x = xmin (a jet at its nozzle) is role 0, every other body
+                  1 + (id mod palette); ids change across a topology change,
+                  roles do not. Sets the cell array "Role"
+    area          {"range": [lo, hi], "log": true, "preset": name}: colour every
+                  triangle by its area (ParaView's Cell Size) instead -- what
+                  makes a size field, e.g. curvature-adaptive remeshing, visible
+    label         a caption drawn in the upper left corner
     box           [xmin, xmax, ymin, ymax, zmin, zmax]: draw the domain outline
     ambient, diffuse, specular   lighting
 """
@@ -70,10 +80,9 @@ if frame:
     cen = [[(b[0] + b[1]) / 2, (b[2] + b[3]) / 2, (b[4] + b[5]) / 2] for b in boxes]
     rad = [0.5 * math.sqrt((b[1] - b[0]) ** 2 + (b[3] - b[2]) ** 2 + (b[5] - b[4]) ** 2) for b in boxes]
 
-    sigma = frame.get("sigma", 3.0)
     periodic = frame.get("periodic", False)
 
-    def smooth(xs):
+    def smooth(xs, sigma):
         # Gaussian over neighbouring frames; a periodic motion wraps around so
         # the first and the last frame -- the same state -- are framed alike.
         n = len(xs)
@@ -92,15 +101,49 @@ if frame:
             out.append(num / den)
         return out
 
-    rad = smooth(rad)
-    cen = [list(c) for c in zip(*[smooth([c[k] for c in cen]) for k in range(3)])]
+    # The zoom is smoothed more than the centre: a lagging centre pushes a
+    # fast-moving shape out of the frame, a jittering zoom makes it pump.
+    rad = smooth(rad, frame.get("sigma", 3.0))
+    sc = frame.get("sigma_centre", frame.get("sigma", 3.0))
+    cen = [list(c) for c in zip(*[smooth([c[k] for c in cen], sc) for k in range(3)])]
     dvec = frame["dir"]
     dn = math.sqrt(sum(x * x for x in dvec))
     dvec = [x / dn for x in dvec]
     dist_k = frame.get("k", 2.0) / math.tan(math.radians(job.get("angle", 30)) / 2)
 
+ROLE_SCRIPT = """
+import numpy as np
+from vtk.util.numpy_support import vtk_to_numpy, numpy_to_vtk
+ug = self.GetInputDataObject(0, 0)
+out = self.GetOutputDataObject(0)
+out.ShallowCopy(ug)
+pts = vtk_to_numpy(ug.GetPoints().GetData())
+conn = vtk_to_numpy(ug.GetCells().GetConnectivityArray()).reshape(-1, 3)
+body = vtk_to_numpy(ug.GetCellData().GetArray("BodyID"))
+cminx = pts[conn, 0].min(axis=1)
+role = np.zeros(len(body), dtype=np.int32)
+for b in np.unique(body):
+    sel = body == b
+    role[sel] = 0 if cminx[sel].min() < XMIN + 1e-6 else 1 + (int(b) % (NCOL - 1))
+arr = numpy_to_vtk(role, deep=1)
+arr.SetName("Role")
+out.GetCellData().AddArray(arr)
+"""
+
+if job.get("label"):
+    txt = Text(Text=job["label"])
+    td = Show(txt, view)
+    td.WindowLocation = "Upper Left Corner"
+    td.FontSize = job.get("label_size", 26)
+    td.Color = [0.15, 0.17, 0.20]
+
 for k, f in enumerate(files):
     src = XMLPartitionedUnstructuredGridReader(FileName=[f])
+    if job.get("role_from_wall"):
+        merged = MergeBlocks(Input=src)
+        src = ProgrammableFilter(Input=merged)
+        src.OutputDataSetType = "vtkUnstructuredGrid"
+        src.Script = ROLE_SCRIPT.replace("XMIN", repr(job.get("xmin", 0.0))).replace("NCOL", str(job.get("n_colors", 4)))
     if frame:
         dist = dist_k * max(rad[k], frame.get("min_radius", 0.0))
         view.CameraFocalPoint = cen[k]
@@ -117,13 +160,35 @@ for k, f in enumerate(files):
     d.Specular = job.get("specular", 0.25)
     d.Ambient = job.get("ambient", 0.30)
     d.Diffuse = job.get("diffuse", 0.75)
-    if job.get("color"):
+    if job.get("area"):
+        Hide(src, view)
+        src = CellSize(Input=src)
+        src.ComputeArea = 1
+        src.ComputeVertexCount = src.ComputeLength = src.ComputeVolume = 0
+        d = Show(src, view)
+        d.Specular = job.get("specular", 0.25)
+        d.Ambient = job.get("ambient", 0.30)
+        d.Diffuse = job.get("diffuse", 0.75)
+        ColorBy(d, ("CELLS", "Area"))
+        a = job["area"]
+        lut = GetColorTransferFunction("Area")
+        lut.ApplyPreset(a.get("preset", "Viridis (matplotlib)"), True)
+        lut.UseLogScale = 1 if a.get("log", True) else 0
+        lut.RescaleTransferFunction(a["range"][0], a["range"][1])
+        try:
+            lut.AutomaticRescaleRangeMode = "Never"
+        except AttributeError:
+            pass
+        d.SetScalarBarVisibility(view, False)
+    elif job.get("color"):
         ColorBy(d, ("CELLS", job["color"]))
         lut = GetColorTransferFunction(job["color"])
         n = job.get("n_colors", 4)
         lut.InterpretValuesAsCategories = 1
-        lut.Annotations = sum([[str(i), str(i)] for i in range(n)], [])
-        lut.IndexedColors = sum([pal[i % len(pal)] for i in range(n)], [])
+        # Flattened by hand: a ProgrammableFilter replaces the builtin sum() in
+        # this namespace with numpy_interface's.
+        lut.Annotations = [str(i) for i in range(n) for _ in range(2)]
+        lut.IndexedColors = [c for i in range(n) for c in pal[i % len(pal)]]
         d.SetScalarBarVisibility(view, False)
     else:
         ColorBy(d, None)

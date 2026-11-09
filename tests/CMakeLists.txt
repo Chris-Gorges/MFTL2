@@ -606,6 +606,13 @@ if(BUILD_EXAMPLES)
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
                    $<TARGET_FILE:travelling_waves_open_surface>
                    --nx 64 --ny 16 --steps 100 --vtk 0 --report 25 --require-rim-cut ${MPIEXEC_POSTFLAGS})
+  # Hundreds of bodies in one run: random droplets carried through a periodic
+  # duct, remeshed every step by the dispersed strategy and redistributed as
+  # they cross rank boundaries and the seam. --verify: every droplet still a
+  # closed sphere (Euler 2) with a defined volume, total volume within 1 %.
+  add_test(NAME test_droplets_in_duct_conserves
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:droplets_in_duct_flow> --drops 40 --refine 3 --steps 40 --report 0 --verify ${MPIEXEC_POSTFLAGS})
   add_test(NAME test_liquid_jet_open_remesh
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
                    $<TARGET_FILE:liquid_jet_open_surface>
@@ -688,7 +695,7 @@ if(BUILD_EXAMPLES)
              test_travelling_waves_topology)
     mftl_label_mpi_test(${_t} 2 example)
   endforeach()
-  foreach(_t test_advection_scaling_conserves test_leveque_coupled_unstructured
+  foreach(_t test_advection_scaling_conserves test_leveque_coupled_unstructured test_droplets_in_duct_conserves
              test_open_surface_creation_conserves test_rayleigh_taylor_open_remesh
              test_liquid_jet_open_remesh test_liquid_jet_topology test_rayleigh_taylor_topology)
     mftl_label_mpi_test(${_t} 4 example)
