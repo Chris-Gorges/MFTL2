@@ -10,7 +10,7 @@
 | `remesh_smooth.c` | feature detection, tangential smoothing | no |
 | `remesh_sizing.c` | the decision makers of the two sizing modes: edge predicates, the curvature field | no |
 | `remesh_fit.c` | paraboloid placement of split and collapse vertices | no |
-| `remesh_project.c` | the smoother's back-projection onto the Phong surface of the call's input | no |
+| `remesh_project.c` | the back-projection onto the Phong surface of the call's input: the reference, its grid, the query | no |
 | `remesh_compact.c` | remove dead entities, restore the ownership prefix, re-densify ids | no |
 | `remesh_driver.c` | the sweep loop, the serial driver, the dispatch | no |
 | `remesh_parallel.c` | SPANNING: shift the cut planes | no |
@@ -641,19 +641,55 @@ barycentrics, $\mathbf n_i$ the reference's angle-weighted normals.
   against −1.60 % volume) at about three times the cost; the intermediate
   sweeps and operators work on a slightly perturbed surface and the final
   projection puts every moved vertex back.
-- **The reference** (`MFTL_RemeshReference`) is copied once per kernel call,
-  after the first feature detection, and kept for all its iterations:
-  positions, normals, corners, edge neighbours, and the vertex global ids,
-  sorted. A corner that is a feature, corner, boundary or ghost vertex gets no
-  normal, so the Phong surface degrades to the flat triangle towards it.
-- **Finding the closest triangle without a search structure.** A kernel call does
-  not renumber global ids, so a vertex the call received is found in the copy
-  by binary search on its id, a vertex a split created through a neighbour. A
-  walk over the copy's edge neighbours then reaches the closest triangle, and
-  each later sweep starts from the triangle the previous one found. No grid, no
-  communication: a moved vertex is unfrozen and its fan owned. Since the
-  projection runs once, each lookup starts cold (about 120 ns a vertex). A projection
-  that would bridge more than half the vertex's shortest edge is not made.
+- **The reference** (`MFTL_RemeshReference`) is built once per call. Serially
+  (`MFTLRemeshReferenceFromObject`, after the first feature detection) it is the
+  object itself: positions, angle-weighted normals, corners and triangle ids, in
+  the object's own index space. A corner that is a feature, corner or boundary
+  vertex gets no normal, so the Phong surface degrades to the flat triangle
+  towards it.
+- **Distributed, the reference is GEOMETRIC, and that is a proof.** The spanning
+  driver builds it at the start of the pass, on the partition the call received
+  (`MFTLRemeshEnsembleReferenceBuild`): the triangles this rank owns, plus every
+  input triangle a neighbour owns within the cap $w$ = ½ `max_edge_length` of
+  this rank's canonical cell (`MFTLRemeshReferenceHalo`, one exchange of 23
+  doubles per shipped triangle, along `comm_graph` with a global fallback). The
+  normals are exact on every copy (`MFTLEnsembleUpdateVertexNormals`) and the
+  corner classification is the owner's (`MFTLRemeshSyncGhostClass`). The
+  projection runs after the closing redistribution, on the canonical
+  partition, where every owned vertex lies in its rank's cell: a ball of
+  radius $\le w$ around it lies within $w$ of the cell, so every input triangle
+  that meets the ball is present -- however the call split, collapsed or
+  migrated in between. Then one `MFTLUpdateGhostPositions`. The answer is the
+  serial one to the rounding of the normals' sums
+  (`test_the_distributed_projection_is_the_serial_projection`, np = 1 … 27).
+  The first distributed version, a per-placement copy with a one-ring halo
+  searched by walking from the vertex's own triangle, missed about 1 % of the
+  vertices and lost volume in proportion (`docs/analysis.md` §5.8).
+- **The search** is a uniform grid whose cell is at least the widest triangle box
+  and $2w$, so a triangle is filed under at most eight cells and a query
+  visits at most eight. The occupied cells are a sorted key array searched by
+  bisection -- no hash map -- each with a contiguous run of entries carrying
+  the triangle's corner 0 and its box (floats, rounded outward), so the box
+  test that rejects most candidates streams. Two passes: the cell holding the
+  point at the full radius, then the other cells at the best distance found
+  plus a margin far above rounding; the winner, and every triangle tied with
+  it, is never farther, so the answer does not depend on the first pass. Every
+  rejection (box, orientation, plane) compares against the fixed radius, never
+  against the best so far, and ties are broken by triangle id: the answer is
+  the same in every visiting order, on every rank. A face whose normal points
+  against the vertex's (a thin sheet's other side, a fold) is never the answer.
+  A vertex farther than half its shortest incident edge from every compatible
+  face is left where the smoother put it and counted in
+  `n_projection_missed`.
+- **Cost.** About 235 ns per projected vertex and 125 µs to build the
+  reference of a 1280-triangle body (Apple silicon, the dispersed remeshing
+  scaling run; `scaling/remesh_*_scaling`), against 110–135 ns for the old
+  id-and-walk lookup, which had no distributed proof. The first grid version
+  took 680 ns: a cell's entries gathered from the triangle arrays, a full-radius
+  query everywhere, and `nextafterf` for the outward rounding were most of it.
+- **Jacobi.** Every target is computed from the positions the smoother left, then
+  all are written at once, so no order reaches the answer. Conservative
+  triangle densities are rescaled by the change of area.
 - **Normals.** Angle weights. Max's weights are exact on a sphere and make the
   lift fourth-order on an irregular sphere mesh, where angle weights leave it
   second-order with a three times smaller constant than no projection
@@ -779,38 +815,62 @@ repeated runs, `docs/analysis.md` §5.3).
 
 ### One pass {#rem_spanning_flow}
 
+A pass gives every region exactly ONE serial call's work -- `iterations`
+rounds of split, collapse, flip and `smooth_iterations` sweeps -- and the two
+modes (`MFTL_RemeshParameters::spanning_mode`) differ only in the order. Before
+they existed every placement re-ran the whole kernel call over its interior, so
+a vertex far from every plane was smoothed about 30 times per call instead of 9,
+each placement projected onto the previous placement's output and the
+curvature field was recomputed per migration: a bias visible at $P = 1$ with no
+cut planes at all, not partition noise (`docs/analysis.md` §5.8).
+
 ```
 MFTLRemeshEnsembleParallel(ens, params, stats)                      COLLECTIVE
-├─ 0  guards: band > 0 (else MFTL_ERROR); Debug: params and id counters agree
-├─ 1  COARSENING PRE-PASS   if (parallel_coarsen || serial_gather) and P > 1
-│     freeze + probe band and frozen share        2 small Allreduces
-│     choose group g (GATHER, BAND, FROZEN triggers, cap)     @ref rem_coarsen
-├─ 2  distinct placements: de-duplicate the phase table over active axes
-│     (cuts[k]/g[k] > 1)                         ▸ n_distinct_placements
-├─ 3  PHASE LOOP, at most parallel_phase_budget placements
-│     ├─ MFTLRemeshPhaseShift: shift_k = s_k * g_k h_k / 2          local
-│     ├─ geometry; MFTLRemeshMigrateShifted
-│     │    per entity MFTLRemeshCoarseOwnerProc; 1 LOR: moved anything?
-│     │    no ─▶ skip the migration (always for the first placement)
-│     ├─ MFTLRemeshMarkFrozen, MFTLDilateFrozenBand, count_hidden_edges,
-│     │  band probe; record id watermarks                            local
-│     ├─ MFTLRemeshIterate, FULL iteration count, gated by MFTL_FLAG_FROZEN
-│     ├─ assign_phase_gids: MFTLEnsembleExscanBodies (per body, holders)
-│     │                     + MFTLRemeshSumInts (ops, hidden_long, hidden_short)
-│     └─ converged?  ops == 0 and hidden == 0                   ─▶ done (exact)
-│                    ops == 0, hidden_long == 0, streak == n_distinct ─▶ done
-│                    hidden_long > 0 or ops > 0                 ─▶ streak = 0
-└─ 4  CLOSING (order forced)
-      redensify_global_ids: prefix sum of OWNED counts per body;
-         MFTLRemeshSyncGhostIds (keyed on the OLD id); overwrite gid = base + slot
-      MFTLRedistribute to the canonical planes (replaces stale ghost triangle ids)
-      clear FROZEN, global counts, triangle geometry, profile (1 Allreduce MAX)
-      warn once if h <= 4 delta and no coarsening happened
+├─ 0  guards: band > 0; Debug: params and id counters agree; NESTED + fields ─▶ refuse
+├─ 1  COARSENING PRE-PASS (as before)                                @ref rem_coarsen
+├─ 2  distinct placements over active axes            ▸ n_distinct_placements
+├─ 3  canonical pool order; clear DONE; sizing field once (carried by migrations);
+│     PROJECTION REFERENCE: owned input + halo within w of the canonical cell
+├─ 4a ONCE  (default): for p < budget
+│     ├─ migrate to placement p; MarkFrozen; dilate; band probe; id watermarks
+│     ├─ MFTLRemeshIterateSpanning: the whole serial call, gated by FROZEN; an
+│     │  edge with both ends DONE is not offered, a DONE vertex not smoothed
+│     │  (except corners of what this placement's operations touched)
+│     ├─ mark DONE every owned vertex left unfrozen; ids; certificate
+│     └─ every out-of-band edge offered?                         ─▶ converged
+│     then: the vertices no placement unfroze, smoothed in place, iterations x
+│     smooth_iterations sweeps, a ghost-position exchange after each
+├─ 4b NESTED: for it < iterations
+│     ├─ clear DONE; for each placement (order reversed every other iteration,
+│     │  so the last of one is the first of the next): migrate, freeze, split,
+│     │  collapse, flip with the same DONE gate; stop when covered
+│     └─ every owned vertex smoothed on the current partition, ghosts held,
+│        smooth_iterations sweeps, a ghost-position exchange after each
+└─ 5  CLOSING (order forced)
+      redensify_global_ids; MFTLRedistribute to the canonical planes;
+      clear FROZEN; PROJECTION of every owned free vertex; ghost positions;
+      global counts, triangle geometry, profile (1 Allreduce MAX)
 ```
 
-Per placement: one migration (unless the identity), one LOR, the per-body id
-scan and one 3-int Allreduce. Everything else — the freeze classification and
-every approval predicate — is local.
+**Why the band of ONCE gets its smoothing separately.** ONCE stops as soon as
+every out-of-band edge has been offered, which on a mildly deforming front is
+often after the first placement -- the canonical planes, the same every call.
+Its band was then never smoothed: in a straining flow that the serial call
+restores to the sphere, the minimum quality fell with the rank count (0.935 /
+0.925 / 0.907 at $P$ = 2 / 4 / 8 against 0.932 serially) and the volume loss grew.
+Smoothing those vertices where they are, with the copies kept exact by a ghost
+exchange per sweep, restores 0.933 / 0.931 / 0.932 and the serial volume; it is
+skipped by an agreed count when every vertex is DONE. Rotating the first
+placement instead would have cost a shifted migration (87.5 % of the mesh) per
+call.
+
+**NESTED refuses attached fields**: a sweep that moves a replicated vertex has
+no exact transfer for a field the copies carry.
+
+Per placement: one migration (unless the identity), the per-body id scan and one
+3-int Allreduce; per smoothing sweep outside a placement, one ghost-position
+exchange. Everything else -- the freeze classification and every approval
+predicate -- is local.
 
 ### The geometric guarantee {#rem_covering}
 
@@ -964,26 +1024,34 @@ which is why it comes after.
 
 Counting "approved, then refused by the gate" reported 3 permanently blocked
 operations on a converged $P = 4$ sphere: around a ghost vertex the one-ring is
-incomplete, so a rank approves collapses the owner rejects. The gate therefore
-runs first, and the certificate counts out-of-band edges hidden by it, each edge
-attributed to the owner of the incident triangle with the smaller global id (so
-it is counted once mesh-wide):
+incomplete, so a rank approves collapses the owner rejects. The certificate
+therefore needs no fan walk. After a placement's sweeps every owned vertex it
+left unfrozen and every half-edge both of whose ends it left unfrozen are
+marked `MFTL_FLAG_DONE` (the flag travels with the record). An edge is OFFERED
+when the half-edge and both its ends carry the flag: it was open to split,
+collapse and flip in one placement, and nothing at it has moved since. Both
+halves are needed:
 
-- $\text{hidden}_\text{long}$: $\ell > \ell_{\max}$ and an incident triangle frozen
-  (the split gate);
-- $\text{hidden}_\text{short}$: $\ell < \ell_{\min}$ and an endpoint frozen (the
-  collapse gate).
+- two DONE ends alone are not enough -- they may have been unfrozen in two
+  different placements, and the edge between them was then never offered;
+- the edge's flag alone is not enough -- a vertex reopened for smoothing
+  because an operation touched its fan moves, and every edge at it changes
+  length. With the edge flag alone a one-shot refinement at $P = 4$ ended its
+  second placement with 84 out-of-band edges against 69.
 
-| Exit | Test | Why sound |
-|---|---|---|
-| fast | ops $= 0$ ∧ hidden $= 0$ | every out-of-band edge was offered to a rank allowed to act, and it declined on merit |
-| slow | ops $= 0$ ∧ hidden$_\text{long} = 0$ for `n_distinct` consecutive placements | a covering set: under $h > 4\delta$ every entity was interior in one of them |
+An offered edge is not offered again in the pass (NESTED: in the iteration).
+The certificate counts the out-of-band edges NOT offered, each attributed to
+the owner of the incident triangle with the smaller global id (so it is counted
+once mesh-wide):
 
-$\text{hidden}_\text{long}$ is exact (an offered long edge is always split), so
-non-zero resets the streak; $\text{hidden}_\text{short}$ has false alarms (a
-short edge no collapse may remove, sitting on a band), which the slow exit
-absorbs. The certificate is measured before the sweeps of a phase, so the
-smoothing after the last sweep can still move a few edges out of the band.
+- $\text{hidden}_\text{long}$: $\ell > \ell_{\max}$;
+- $\text{hidden}_\text{short}$: $\ell < \ell_{\min}$.
+
+The pass converges when the sum is zero. An offered edge that was declined on
+merit -- a collapse the link condition refuses -- counts as offered, exactly as
+it would in a serial call, so there are no false alarms and no streak of silent
+placements is needed. Both judgements read `MFTLRemeshEdgeWantsSplit` /
+`MFTLRemeshEdgeWantsCollapse`, like the operators.
 
 ### Coarsening {#rem_coarsen}
 
@@ -1192,6 +1260,10 @@ both directions on a $\{P,1,1\}$ grid.
 | `MFTLRemeshNeighborGather` / `Allgather` / `Alltoall` | `comm_graph` | 3 doubles per body a rank speaks for or moves; 1–2 doubles per neighbour per round |
 | `MFTLRemeshMeasureBodies` | 2 × `MFTLEnsembleReduceBodies` + scalar `MPI_MAX` | 9 + 1 doubles per local body |
 | `MFTLRemeshSyncGhostIds` | request/reply over `comm_graph` (global fallback) | 4 B per ghost vertex |
+| `MFTLRemeshSyncGhostPositions` | the same request/reply | 32 B per ghost vertex, once per smoothing sweep outside a placement (NESTED; ONCE's band) |
+| `MFTLRemeshSyncGhostClass` | the same request/reply | the owner's corner classification, once per pass with projection |
+| `MFTLRemeshReferenceHalo` | `MFTLRemeshExchangeRecords` | 23 doubles per input triangle within $w$ of a neighbour's cell, once per pass with projection |
+| `MFTLRemeshExchangeRecords` | counts + `Neighbor_alltoallv` over `comm_graph`, or `Alltoallv` (agreed by LOR) | fixed-width records to named ranks; also carries the sizing field through migrations (3 doubles per vertex) |
 | `MFTLRemeshAgreeParams` | Allreduce(MIN) | 49 doubles, once per call, at the first collective |
 
 Nothing in `src/remeshing/` allocates or sends a quantity proportional to $B$;
@@ -1212,33 +1284,27 @@ strategy needs anyway.
 
 ## `parallel_phase_budget` {#rem_budget}
 
-The default, 32, runs to a fixed point: right for a one-shot remesh far from its
-target, wrong in a per-timestep loop. LeVeque deformation, 150 remeshed steps
-(`docs/analysis.md` §5.1):
+A CAP on the placements of one pass (ONCE) or of one iteration (NESTED), not
+the amount of remeshing: a pass does one serial call's work whatever the
+budget, and stops as soon as the certificate is zero. The default, 8, is the
+whole phase table; on a slab decomposition two placements suffice, otherwise
+two to eight. A smaller budget leaves the entities near the intersections of
+cut planes to the next call and is reported by `converged == false`. The
+settings file and the API agree on it.
 
-| budget | $P{=}1$ phases | $V/V_0$ | min $q$ | ms/step | $P{=}4$ $V/V_0$ | min $q$ | ms/step |
-|---|---|---|---|---|---|---|---|
-| 2 | 2.0 | 0.769 | 0.856 | 20.4 | 0.745 | 0.897 | 12.9 |
-| **4** | 3.7 | 0.733 | 0.836 | 37.8 | **0.771** | **0.879** | **16.7** |
-| 8 | 5.7 | 0.683 | 0.459 | 52.7 | 0.670 | 0.796 | 35.4 |
-| 32 | 13.3 | 0.682 | 0.278 | 99.0 | 0.639 | 0.621 | 84.7 |
+It used to be the other way round, and the measurement that showed it is the
+reason the modes exist: every placement re-ran the whole kernel call, so the
+budget WAS the amount of remeshing per call, and over 150 LeVeque steps at
+$P = 4$ budget 32 gave $V/V_0$ 0.639 and min $q$ 0.621 at 84.7 ms/step
+against 0.771, 0.879 and 16.7 ms at budget 4 -- re-converging an already good
+mesh every step eroded it (`docs/analysis.md` §5.1). With one serial call per
+pass there is nothing left for a large budget to over-do.
 
-Serial reference: $V/V_0$ 0.751, min $q$ 0.876, 7.1 ms/step. Volume and quality
-get **worse** as the budget grows — re-converging an already good mesh every step
-is split/collapse churn that erodes an under-resolved surface — and the cost is
-linear in the placements. At budget 4 the distributed result at $P = 4$ matches
-or beats the serial one on every measure.
-
-| Use | Setting |
-|---|---|
-| per-timestep loop | 2–8; 4 was the best compromise. `converged == false` is normal: the mesh is maintained, not converged. |
-| one-shot remesh | ≥ 32, and check `converged`. Going 1280 → 3830 triangles took 4 / 6 / 19 / 17 placements at $P$ = 1 / 2 / 4 / 8. |
-
-The default stays at 32 because a too-small budget fails loudly in the one-shot
-case, while a too-large one fails quietly in the loop. At budget 4 the placement
-count saturates (3.83 → 3.96 from $P$ = 2 to 8) and the overhead on a fixed
-problem grows 33 % for 4× the ranks; nothing has been measured above $P = 8$ or
-on a cluster.
+Measured per call over the LeVeque period at refinement 5 with the Phong
+projection: ONCE 1.9 / 2.5 / 2.7 placements and 2.8 / 3.5 / 3.7 migrations at
+$P$ = 2 / 4 / 8, NESTED 5.5 / 6.7 / 7.4 placements and 6.2 / 7.6 / 8.3
+migrations; on a mildly straining bubble flow ONCE needs 1.0–1.2 placements
+(`scaling/remesh_*_scaling`, `docs/analysis.md` §5.8).
 
 ---
 
@@ -1309,8 +1375,9 @@ mutation; recomputed-only ensembles are supported and receive fresh storage.
 
 | Symptom | Read | Likely cause, remedy |
 |---|---|---|
-| `converged == false`, one-shot pass | `n_phases`, `n_edges_hidden_long` | budget too small (raise it), or work hidden (next row) |
+| `converged == false` | `n_phases`, `n_edges_hidden` | out-of-band edges no placement offered: budget below the table (raise it), or work hidden (next row) |
 | `n_edges_hidden_long > 0`, persistent | `band_measured` vs $h/4$, `coarsen_trigger` | $h \le 4\delta$: longer $L$, fewer ranks, or let BAND coarsen |
+| `n_projection_missed > 0` | `t_reference`, `reference_bytes` | vertices with no compatible input face within half their shortest edge: a vertex that moved that far inside one call, or a fold |
 | pass bound by migration | `frozen_fraction`, `t_migrate` vs `t_sweep` | 30–60 % frozen: `coarsen_frozen_fraction` may help; below, the budget |
 | idle ranks, DISPERSED | `n_ranks_idle`, `load_imbalance` | balanced but idle ⟹ $B < P$ (unfixable); imbalanced ⟹ check `n_bodies_unreachable`, slack |
 | DISPERSED became SPANNING | `n_bodies_not_centred`, `strategy` | a body outgrew the admission box (e.g. after coalescence) |
@@ -1320,4 +1387,5 @@ mutation; recomputed-only ensembles are supported and receive fresh storage.
 
 The timers are maxima over ranks (the slowest rank sets the wall clock of a
 synchronised loop) and are reduced unconditionally — a collective gated on the
-caller passing a stats struct would deadlock.
+caller passing a stats struct would deadlock. The projection's `t_reference`
+and `t_projection` are the exception: rank-local, reduce them yourself.

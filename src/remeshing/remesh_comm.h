@@ -281,6 +281,14 @@ typedef struct MFTL_RemeshMigrator
   int *arena;  ///< [cap_entities] all bodies' vertex and triangle destinations, back to back.
   int cap_objects;  ///< LOCAL bodies the `maps` array can describe. Never the id space -- see migrator_reserve().
   int cap_entities;  ///< Total entity slots the arena holds. Grown monotonically.
+  /**
+   * MFTLRemeshMigrateShifted() hands every owned vertex's `verts.sizing` to its
+   * new owner and then the ghosts theirs, so a curvature field computed ONCE per
+   * pass survives the pass's migrations (a redistribution does not keep the
+   * array). Set by the spanning driver under curvature sizing; 12 bytes per
+   * owned vertex of each migration, self-destined records included.
+   */
+  bool carry_sizing;
 } MFTL_RemeshMigrator;
 
 /**
@@ -528,8 +536,8 @@ int MFTLRemeshSyncGhostIds(MFTL_Ensemble *ens, const int *vertex_gid_base);
  * (the halo is vertex-complete) and a ghost does not. No admitted operation
  * ever reads a ghost's value -- every vertex a split, collapse, flip or smooth
  * of an unfrozen entity reads is owned -- but the convergence certificate does:
- * `count_hidden_edges` judges FROZEN edges, whose endpoints may be ghosts, and
- * `hidden_long` is exact only if every copy of a vertex holds the same target.
+ * `count_unoffered_edges` judges edges whose endpoints may be ghosts, and it is
+ * exact only if every copy of a vertex holds the same target.
  * Same route as MFTLRemeshSyncGhostIds(), including its global fallback for a
  * coarsened placement; 8 bytes per ghost vertex.
  *
@@ -605,5 +613,62 @@ void MFTLRemeshNeighborAlltoall(const MFTL_Domain *domain, const double *send, i
  * point here a CALLER has a use for (any ensemble rebalancing is exactly
  * "measure the bodies, then decide"), so it is published rather than internal.
  * Its implementation is in remesh_comm.c with the rest of the module's MPI. */
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6. Routed records, classification, positions and the projection halo
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Delivers @p n_rec records of @p width doubles each to rank `dest[i]`:
+ *        over `comm_graph` when every destination of every rank is itself or a
+ *        graph neighbour, over `comm_world` otherwise (agreed by one LOR).
+ *        Records addressed to the calling rank never touch the wire.
+ * @param      domain The domain.
+ * @param      rec    `[n_rec * width]` records.
+ * @param      dest   `[n_rec]` destination ranks.
+ * @param      n_rec  Records.
+ * @param      width  Doubles per record.
+ * @param[out] n_out  Records received, own ones first.
+ * @return `[*n_out * width]` records to free().
+ * @collective
+ */
+double *MFTLRemeshExchangeRecords(const MFTL_Domain *domain, const double *rec, const int *dest, int n_rec, int width, int *n_out);
+
+/**
+ * @brief Gives every ghost vertex its owner's #MFTL_FLAG_FEATURE / #MFTL_FLAG_CORNER
+ *        bits: a ghost's fan is partial, so its own classification can be wrong.
+ *        Same route as MFTLRemeshSyncGhostIds(); 4 bytes per ghost vertex.
+ * @param ens The ensemble, features detected on every rank.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR if a request went unserved.
+ * @collective
+ */
+int MFTLRemeshSyncGhostClass(MFTL_Ensemble *ens);
+
+/**
+ * @brief Gives every ghost vertex its owner's position, on any partition the
+ *        remesher makes -- unlike MFTLUpdateGhostPositions(), with the global
+ *        fallback a coarsened placement needs. Used by the NESTED mode's
+ *        smoothing sweeps; 24 bytes per ghost vertex.
+ * @param ens The ensemble.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR if a request went unserved.
+ * @collective
+ */
+int MFTLRemeshSyncGhostPositions(MFTL_Ensemble *ens);
+
+/**
+ * @brief The projection reference's halo: every OWNED triangle whose box,
+ *        widened by @p width, meets another rank's canonical cell is sent to that
+ *        rank as one record (MFTLRemeshReferencePackTriangle()). On the canonical
+ *        partition this gives each rank every input triangle within @p width of
+ *        its cell, whatever the stencil (aliased periodic images are sent once).
+ * @param      ens   The ensemble, canonically partitioned, angle normals exact
+ *                   on every copy, ghost classification synchronised.
+ * @param      width The halo width (MFTLRemeshProjectionRadius()).
+ * @param[out] out   Records received, #MFTL_REMESH_REF_HALO_WIDTH doubles each; free().
+ * @param[out] n_out Records received.
+ * @return #MFTL_SUCCESS.
+ * @collective
+ */
+int MFTLRemeshReferenceHalo(MFTL_Ensemble *ens, double width, double **out, int *n_out);
 
 #endif  // MFTL_REMESH_COMM_H

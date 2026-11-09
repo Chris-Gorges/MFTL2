@@ -6,7 +6,7 @@
 # --ntasks-per-node, --time and --output on the sbatch line (#SBATCH lines cannot
 # depend on the rank count) and these variables in the environment:
 #
-#   MFTL_ROOT  repository root            MODE      strong | weak
+#   MFTL_ROOT  repository root            MODE      strong | weak | remesh_strong | remesh_weak
 #   NRANKS     rank count                 OUT_DIR   the sweep directory
 #   TAG        report name (np00064)      RUN_ARGS  driver arguments
 #   GIT        commit, recorded in the report
@@ -32,7 +32,9 @@ finish()
 {
   local rc=$?
   trap - EXIT
-  if [ "$rc" -eq 0 ] && ! grep -q '^@summary .* ok=1$' "$REPORT" 2>/dev/null; then rc=2; fi
+  # Verified: a summary line, and no summary line that failed (a remeshing
+  # report has one per driver mode).
+  if [ "$rc" -eq 0 ] && { ! grep -q '^@summary .* ok=1$' "$REPORT" 2>/dev/null || grep -q '^@summary .* ok=0$' "$REPORT" 2>/dev/null; }; then rc=2; fi
   if [ "$rc" -ne 0 ]; then
     {
       echo "np=$NRANKS exit=$rc job=${SLURM_JOB_ID:-local} elapsed=$(($(date +%s) - start))s"

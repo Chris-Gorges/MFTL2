@@ -1121,8 +1121,11 @@ static void deform(MFTL_Ensemble *ens)
  * plane arrive from two or more ranks. Mutation-checked: without the canonical
  * order the digests differ at np = 2, 4 and 8, and so do the counts after three
  * passes (678 / 674 / 664 triangles against 670).
+ *
+ * @param cfg 0: uniform sizing, no projection; 1: curvature sizing and the Phong projection.
+ * @return 0 on success.
  */
-static int test_a_dispersed_remesh_is_the_serial_remesh_to_the_bit(void)
+static int dispersed_identity(int cfg)
 {
   MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE);
   TEST_ASSERT(ens != MFTL_NULL);
@@ -1146,6 +1149,11 @@ static int test_a_dispersed_remesh_is_the_serial_remesh_to_the_bit(void)
   MFTL_RemeshParameters params;
   standard_params(&params, 0.05);
   params.parallel_strategy = MFTL_REMESH_PARALLEL_DISPERSED;
+  if (cfg == 1)
+  {
+    params.projection = MFTL_REMESH_PROJECT_PHONG;
+    MFTLRemeshUseCurvatureSizing(&params, 0.02 * 0.05, 0.25 * 0.05, 0.05);
+  }
 
   uint64_t *dist = (uint64_t *) calloc((size_t) n_bodies, sizeof(uint64_t));
   uint64_t *ref = (uint64_t *) calloc((size_t) n_bodies, sizeof(uint64_t));
@@ -1186,8 +1194,8 @@ static int test_a_dispersed_remesh_is_the_serial_remesh_to_the_bit(void)
   MPI_Bcast(&tri[1], 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);
 
   if (g_rank == 0)
-    printf("\n    np=%d: %d bodies, 3 passes, %.0f triangles distributed vs %.0f serial, digests %s\n    ", g_nproc, n_bodies, tri[0], tri[1],
-           all_equal ? "equal" : "DIFFER");
+    printf("\n    np=%d %s: %d bodies, 3 passes, %.0f triangles distributed vs %.0f serial, digests %s\n    ", g_nproc, cfg ? "phong + curvature" : "plain",
+           n_bodies, tri[0], tri[1], all_equal ? "equal" : "DIFFER");
 
   TEST_ASSERT(agreed(all_dispersed, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(tri[0] == tri[1], MPI_COMM_WORLD));
@@ -1199,6 +1207,13 @@ static int test_a_dispersed_remesh_is_the_serial_remesh_to_the_bit(void)
   if (ser) MFTLEnsembleDestroy(&ser);
   MFTLEnsembleDestroy(&ens);
   return 0;
+}
+
+/** @brief The dispersed pass is the serial pass to the bit, plain and with the projection and curvature sizing. */
+static int test_a_dispersed_remesh_is_the_serial_remesh_to_the_bit(void)
+{
+  if (dispersed_identity(0)) return 1;
+  return dispersed_identity(1);
 }
 
 /**

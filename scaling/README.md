@@ -1,7 +1,8 @@
 # MFTL scaling on Slurm
 
 Periodic many-sphere advection with ghost synchronization, redistribution,
-triangle geometry and vertex normals. See [QUICKSTART.md](QUICKSTART.md) for
+triangle geometry and vertex normals — and, separately, the same with the
+remesher in the loop ([Remeshing scaling](#remeshing-scaling)). See [QUICKSTART.md](QUICKSTART.md) for
 the colleague's build/submission instructions and [SCALING_PLAN.md](SCALING_PLAN.md)
 for memory estimates and interpretation.
 
@@ -117,18 +118,64 @@ Weak scaling tests growth at this fixed work per rank. Neither one curve maps
 a universal minimum worthwhile problem size; no additional size sweep is
 scheduled. See SCALING_PLAN for the precise formulas and profiling limits.
 
+## Remeshing scaling
+
+The same machinery runs a REMESHED front-tracking timestep: advect (RK4),
+ghost sync, geometry, `MFTLRemeshEnsemble` with its closing redistribution,
+every step. One launcher per curve, `REGIME` picks the remeshing driver:
+
+| Launcher | `REGIME=dispersed` (default problem) | `REGIME=spanning` |
+|---|---|---|
+| `launch_remesh_strong.sh` | 18³ = 5832 droplets, refine 3, 7.5 M triangles; R/h 0.06 → 0.17 | 2³ = 8 bubbles, refine 7, 2.6 M triangles; R/h 0.6 → 1.8 |
+| `launch_remesh_weak.sh` | 27 droplets per rank box (34.6 k triangles/rank), R/h 0.083 | one bubble per 2×2×2 rank boxes on a box corner (41 k triangles/rank), R/h 0.6; **32 ranks/node** (every axis needs an even cut count) |
+
+The flow is a Taylor–Green-type straining cell that travels with a uniform
+drift, both multiplied by cos(πt/T): every body is stretched into a prolate
+ellipsoid and carried (1.5, 1, 0.5) lattice spacings across the cut planes
+and back, and the flow map at T is the identity. So at every P the report can
+check what a remesher can lose — volume, distance of every vertex to the exact
+sphere, triangle quality, edges outside the band, Euler characteristic — with
+no serial reference run. Every body has the same history, and in the weak
+drivers every rank box is a copy of every other.
+
+A **spanning** job runs BOTH spanning modes (`MFTL_RemeshSpanningMode`: once,
+nested) one after the other on the same problem (`SPANNING_MODES=once` or
+`nested` for one); the summary puts them side by side per P. A **dispersed**
+strong sweep must end on the SAME digest at every P — the dispersed driver is
+the serial remesher to the bit and nothing else in the step depends on the
+partition — and the summary says whether it did.
+
+```bash
+REGIME=dispersed scaling/launch_remesh_strong.sh --dry-run
+REGIME=spanning  scaling/launch_remesh_strong.sh
+REGIME=dispersed scaling/launch_remesh_weak.sh
+REGIME=spanning  scaling/launch_remesh_weak.sh
+```
+
+Overrides: `PER_AXIS`, `BOXES`, `REFINE`, `STEPS` (per trajectory, default
+100), `TRAJECTORIES` (timed, default 2), `WARMUP` (default 1), `SIZING`
+(uniform | curvature), `PROJECTION` (phong | none), `SPANNING_MODES`,
+`EXTRA_ARGS` (e.g. `--strain 0.8 --remesh-every 2 --budget 4`). Results go to
+`results/scaling/remesh_<regime>_<strong|weak>_<date>_<unique>/`; `collect.sh`
+hands such a directory to `collect_remesh.sh`. The per-step times are maxima
+over ranks behind a barrier per step; the remesh call's own split (migrate,
+sweep, reference, projection, ids) is in the tables.
+
 ## Files and validation
 
 | File | Purpose |
 |---|---|
 | `site.sh` | site configuration |
 | `launch_strong.sh`, `launch_weak.sh` | the two fixed-size campaigns |
+| `launch_remesh_strong.sh`, `launch_remesh_weak.sh` | the remeshing campaigns, `REGIME=dispersed\|spanning` |
 | `sweep_common.sh` | submission, snapshots and manifest |
 | `job_scaling.sh` | one Slurm job per rank count |
-| `collect.sh` | summary and sample extraction |
+| `collect.sh` | summary and sample extraction (a remeshing sweep goes to `collect_remesh.sh`) |
+| `collect_remesh.sh` | remeshing summary: per-mode tables, once vs nested, the dispersed digest check |
 | `strong_scaling.c`, `weak_scaling.c` | workload placement and size rules |
 | `scaling_common.h` | instrumented timestep, validation and reports |
 | `scaling_init.h` | bounded-memory batch generation/distribution |
+| `remesh_strong_scaling.c`, `remesh_weak_scaling.c`, `remesh_common.h` | the remeshing drivers: problem, flow, remeshed step, accuracy checks, report |
 | `test_scaling.py` | launcher/collector and optional MPI regression checks |
 | `job.sh` | original site template, kept for reference |
 

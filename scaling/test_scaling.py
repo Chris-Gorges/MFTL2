@@ -233,6 +233,94 @@ done
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse(marker.exists())
 
+    def test_remesh_launchers_submit_the_remesh_drivers(self):
+        for mode in ("remesh_strong", "remesh_weak"):
+            executable(self.root / f"build/{mode}_scaling", "#!/bin/bash\nexit 0\n")
+        for launcher, regime, rpn in (("strong", "dispersed", 36), ("strong", "spanning", 36),
+                                      ("weak", "dispersed", 36), ("weak", "spanning", 32)):
+            out = self.root / f"{launcher}-{regime}"
+            env = {**self.env, "RANKS": "", "NODES": "1 2", "MAX_NODES": "2", "OUT_DIR": str(out),
+                   "RANKS_PER_NODE": "", "REGIME": regime}
+            result = run(["bash", str(self.root / f"scaling/launch_remesh_{launcher}.sh"), "--dry-run"], env=env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with (out / "points.tsv").open() as f:
+                points = [p for p in csv.DictReader(f, delimiter="\t") if p["status"] == "dry-run"]
+            self.assertEqual([int(p["np"]) for p in points], [rpn, 2 * rpn], (launcher, regime))
+            self.assertIn(f"--regime {regime}", (out / "sweep.txt").read_text())
+            self.assertIn(f"job-name=mftl-remesh_{regime}_{launcher}-np{rpn}", result.stdout)
+            self.assertIn(f"MODE=remesh_{launcher}", result.stdout)
+            for f in (f"remesh_{launcher}_scaling", "remesh_common.h", "collect_remesh.sh", f"remesh_{launcher}_scaling.c"):
+                self.assertTrue((out / "snapshot" / f).exists(), f)
+        # An explicit density still wins over the spanning default.
+        out = self.root / "weak-spanning-36"
+        env = {**self.env, "RANKS": "", "NODES": "1", "MAX_NODES": "1", "OUT_DIR": str(out),
+               "RANKS_PER_NODE": "24", "REGIME": "spanning"}
+        result = run(["bash", str(self.root / "scaling/launch_remesh_weak.sh"), "--dry-run"], env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--ntasks=24", result.stdout)
+        result = run(["bash", str(self.root / "scaling/launch_remesh_strong.sh"), "--dry-run"],
+                     env={**self.env, "REGIME": "both", "OUT_DIR": str(self.root / "bad")})
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_remesh_collector_compares_modes_and_digests(self):
+        sweep = self.root / "sweep"
+        reports = sweep / "reports"
+        reports.mkdir(parents=True)
+        base = ("mode=remesh_strong regime={r} spanning={m} np={p} nodes=1 rpn={p} cuts=1x1x1 bodies=8 refine=3 "
+                "R_over_h=0.5 tris=1000 tris_rank=500 steps=10 ms_step={t} remesh=1 migrate=0.1 sweep=0.5 "
+                "reference=0.1 projection=0.1 ids=0.1 phases=1.5 migrations=2.5 frozen_pct=4 imbalance=1 "
+                "dv_pct=-0.01 dv_worst_pct=0.02 dist_rms_pct=0.001 dist_max_pct=0.01 qmin=0.9 qmean=0.99 "
+                "oob_pct=0 not_converged=0 missed=0 digest={d} sizing=uniform proj_mode=phong ok={ok}")
+        for p, t in ((1, 8.0), (2, 4.0), (4, 2.5)):
+            (reports / f"np{p:05d}.txt").write_text(
+                "@summary " + base.format(r="spanning", m="once", p=p, t=t, d="aa", ok=1) + "\n" +
+                "@summary " + base.format(r="spanning", m="nested", p=p, t=1.5 * t, d="bb", ok=1) + "\n")
+        (reports / "np00008.txt").write_text(
+            "@summary " + base.format(r="spanning", m="once", p=8, t=1, d="aa", ok=1) + "\n" +
+            "@summary " + base.format(r="spanning", m="nested", p=8, t=1, d="bb", ok=0) + "\n")
+        result = run(["bash", str(self.root / "scaling/collect.sh"), str(sweep)])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        summary = (sweep / "summary.txt").read_text()
+        self.assertIn("== once ==", summary)
+        self.assertIn("== nested ==", summary)
+        self.assertIn("once against nested", summary)
+        self.assertIn("EXCLUDED FROM THE TABLES (failed or incomplete reports): np00008", summary)
+        ratio = [l.split() for l in summary.split("once against nested")[1].splitlines() if l.strip()[:1].isdigit()]
+        self.assertEqual([r[0] for r in ratio], ["1", "2", "4"])
+        self.assertTrue(all(abs(float(r[3]) - 1.5) < 1e-9 for r in ratio))
+        speedup = [l.split() for l in summary.split("== once ==")[1].split("accuracy")[0].splitlines() if l.strip()[:1].isdigit()]
+        self.assertEqual([r[6] for r in speedup], ["1.00", "2.00", "3.20"])
+        with (sweep / "samples.tsv").open() as f:
+            self.assertEqual(len(list(csv.DictReader(f, delimiter="\t"))), 6)
+        # The dispersed digest check, both verdicts.
+        for digests, verdict in ((("ab", "ab"), "IDENTICAL at every P"), (("ab", "cd"), "DIFFERS between rank counts")):
+            sweep = self.root / f"dispersed-{digests[1]}"
+            (sweep / "reports").mkdir(parents=True)
+            for p, d in zip((1, 2), digests):
+                (sweep / "reports" / f"np{p:05d}.txt").write_text(
+                    "@summary " + base.format(r="dispersed", m="dispersed", p=p, t=2.0 / p, d=d, ok=1) + "\n")
+            result = run(["bash", str(self.root / "scaling/collect_remesh.sh"), str(sweep)])
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn(f"DISPERSED DIGEST {verdict}", (sweep / "summary.txt").read_text())
+
+    def test_job_rejects_a_report_with_one_failed_mode(self):
+        sweep = self.root / "sweep"
+        snapshot = sweep / "snapshot"
+        snapshot.mkdir(parents=True)
+        (snapshot / "site.sh").write_text("site_modules() { :; }\nsite_runtime_env() { :; }\n"
+                                         "LAUNCHER=(bash -c 'shift; exec \"$@\"' --)\n")
+        env = {**self.env, "MODE": "remesh_strong", "NRANKS": "1", "MFTL_ROOT": str(self.root)}
+        for lines, rc in ((["ok=1", "ok=0"], 2), (["ok=1", "ok=1"], 0)):
+            body = "\\n".join(f"@summary np=1 ms_step=1 {x}" for x in lines)
+            executable(snapshot / "remesh_strong_scaling", f'''#!/bin/bash
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = --report ]; then printf '{body}\\n' >"$2"; break; fi
+  shift
+done
+''')
+            result = run(["bash", str(self.root / "scaling/job_scaling.sh")], env=env)
+            self.assertEqual(result.returncode, rc, result.stdout + result.stderr)
+
 
 @unittest.skipUnless(RUN_MPI, "pass --mpi to run MPI driver checks")
 class Drivers(unittest.TestCase):
@@ -301,6 +389,42 @@ class Drivers(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("global route           FAILED", report.read_text())
             self.assertIn(" ok=0", report.read_text())
+
+    def test_remesh_drivers(self):
+        """Dispersed: one digest at every P. Spanning: both modes in one job. Weak spanning: grid rule."""
+        with tempfile.TemporaryDirectory(prefix="mftl-scaling-remesh-") as folder:
+            folder = Path(folder)
+            digests = []
+            for p in (1, 2, 4):
+                report = folder / f"dispersed-{p}.txt"
+                result = run(["mpirun", "-n", str(p), str(ROOT / "build/remesh_strong_scaling"),
+                              "--regime", "dispersed", "--per-axis", "2", "--refine", "2", "--steps", "10",
+                              "--trajectories", "1", "--warmup", "0", "--report", str(report)])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                line = next(l for l in report.read_text().splitlines() if l.startswith("@summary"))
+                fields = dict(w.split("=", 1) for w in line.split()[1:])
+                self.assertEqual(fields["ok"], "1")
+                self.assertEqual(fields["euler"], "16")
+                digests.append(fields["digest"])
+            self.assertEqual(len(set(digests)), 1, digests)
+
+            report = folder / "spanning.txt"
+            result = run(["mpirun", "-n", "2", str(ROOT / "build/remesh_strong_scaling"),
+                          "--regime", "spanning", "--refine", "2", "--steps", "10", "--trajectories", "1",
+                          "--warmup", "0", "--report", str(report)])
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            modes = [dict(w.split("=", 1) for w in l.split()[1:])["spanning"]
+                     for l in report.read_text().splitlines() if l.startswith("@summary")]
+            self.assertEqual(modes, ["once", "nested"])
+
+            result = run(["mpirun", "-n", "2", str(ROOT / "build/remesh_weak_scaling"),
+                          "--regime", "spanning", "--refine", "1", "--steps", "4"])
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("divisible by --boxes-per-body 2", result.stderr)
+            for args in (["--regime", "both"], ["--radius", "0.6"], ["--steps", "1"],
+                         ["--spanning-modes", "twice"], ["--sizing", "anisotropic"]):
+                result = run(["mpirun", "-n", "1", str(ROOT / "build/remesh_strong_scaling"), *args])
+                self.assertNotEqual(result.returncode, 0, args)
 
 
 if __name__ == "__main__":

@@ -661,8 +661,9 @@ static int test_a_droplet_remesh_takes_no_global_reduction(void)
   /* Non-vacuity in two directions. The pass must have run more than one phase,
    * or the per-phase scan this is about was taken once; and the fallback must
    * have stayed off, or the partition is coarse and the global route is the
-   * right answer rather than the regression. */
-  TEST_ASSERT(agreed(st.n_phases > 1, MPI_COMM_WORLD));
+   * right answer rather than the regression. At one rank one placement covers
+   * every region, so the pass stops after it, by design. */
+  if (g_nproc > 1) TEST_ASSERT(agreed(st.n_phases > 1, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(st.n_coarse_groups == 1, MPI_COMM_WORLD));
 
   /* At one rank every route is the identity and neither counter moves. */

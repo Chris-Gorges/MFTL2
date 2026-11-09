@@ -628,20 +628,23 @@ void MFTLSmoothTangential(MFTL_Object *obj, const MFTL_RemeshParameters *params,
   MFTL_ASSERT(obj != MFTL_NULL && params != MFTL_NULL);
   MFTL_ASSERT(MFTLObjectHasTopology(obj) && "MFTLSmoothTangential: derived topology is stale -- MFTLObjectBuildDerived first");
 
-  /* Called on its own, the reference is the mesh as handed to THIS call. */
+  /* Called on its own, the reference is the mesh as handed to THIS call, and
+   * the projection follows the last sweep. */
   if (params->projection == MFTL_REMESH_PROJECT_PHONG && obj->verts.n > 0 && obj->tris.n > 0 && iterations > 0)
   {
     MFTL_RemeshReference ref;
-    MFTLRemeshReferenceBuild(&ref, obj);
-    MFTLRemeshSmooth(obj, params, iterations, &ref, MFTL_NULL);
+    MFTLRemeshReferenceFromObject(&ref, obj, params);
+    MFTLRemeshSmooth(obj, params, iterations, MFTL_NULL);
+    MFTLRemeshProjectObject(obj, &ref, params, MFTL_NULL);
     MFTLRemeshReferenceFree(&ref);
     return;
   }
-  MFTLRemeshSmooth(obj, params, iterations, MFTL_NULL, MFTL_NULL);
+  MFTLRemeshSmooth(obj, params, iterations, MFTL_NULL);
 }
 
-void MFTLRemeshSmooth(MFTL_Object *obj, const MFTL_RemeshParameters *params, int iterations, const MFTL_RemeshReference *ref, MFTL_RemeshStats *st)
+void MFTLRemeshSmooth(MFTL_Object *obj, const MFTL_RemeshParameters *params, int iterations, MFTL_RemeshStats *st)
 {
+  (void) st;
   MFTL_ASSERT(obj != MFTL_NULL && params != MFTL_NULL);
   MFTL_ASSERT(MFTLObjectHasTopology(obj) && "MFTLRemeshSmooth: derived topology is stale -- MFTLObjectBuildDerived first");
 
@@ -667,22 +670,12 @@ void MFTLRemeshSmooth(MFTL_Object *obj, const MFTL_RemeshParameters *params, int
   if (sizing == MFTL_REMESH_SIZING_CURVATURE && !obj->verts.has_sizing) sizing = MFTL_REMESH_SIZING_UNIFORM;
   const bool sized = (sizing == MFTL_REMESH_SIZING_CURVATURE);
 
-  /* The projection's per-vertex state: a reference triangle to start the walk
-   * from (none yet), and the free vertices the last sweep moved, with the
-   * largest distance to the reference a projection may bridge. */
-  int *const hint = ref ? (int *) MFTLMallocOrDie((size_t) n_v * sizeof(int), "remesh projection hints") : MFTL_NULL;
-  int *const moved_v = ref ? (int *) MFTLMallocOrDie((size_t) n_v * sizeof(int), "remesh projection list") : MFTL_NULL;
-  double *const moved_lim = ref ? (double *) MFTLMallocOrDie((size_t) n_v * sizeof(double), "remesh projection limits") : MFTL_NULL;
-  if (hint)
-    for (int v = 0; v < n_v; ++v) hint[v] = -1;
-
   for (int sweep = 0; sweep < iterations; ++sweep)
   {
     /* Normals are refreshed from current positions every sweep. */
     MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
 
     memcpy(new_pos, obj->verts.pos, (size_t) n_v * 3 * sizeof(double));
-    int n_moved = 0;
 
     for (int v = 0; v < n_v; ++v)  // why also over ghosts? Dont I want to smooth only locals?
     {
@@ -696,7 +689,9 @@ void MFTLRemeshSmooth(MFTL_Object *obj, const MFTL_RemeshParameters *params, int
        * required. It is what makes this pass exact across a partition boundary
        * with no communication: the one-ring of every unfrozen vertex is complete
        * and current, because its owner was equally forbidden to move it. */
-      if (rec->flags & (MFTL_FLAG_DEAD | MFTL_FLAG_CORNER | MFTL_FLAG_FROZEN)) continue;
+      /* MFTL_FLAG_DONE: the spanning driver's ONCE mode has already given this
+       * vertex its sweeps in an earlier placement (never set outside it). */
+      if (rec->flags & (MFTL_FLAG_DEAD | MFTL_FLAG_CORNER | MFTL_FLAG_FROZEN | MFTL_FLAG_DONE)) continue;
       if (rec->out_he_idx == MFTL_ERROR) continue;
 
       int fan[MFTL_REMESH_RING_MAX];
@@ -747,39 +742,6 @@ void MFTLRemeshSmooth(MFTL_Object *obj, const MFTL_RemeshParameters *params, int
       new_pos[3 * v + 0] = p[0];
       new_pos[3 * v + 1] = p[1];
       new_pos[3 * v + 2] = p[2];
-
-      /* Free vertices only: a ridge moves along its curve and a rim along the
-       * rim curve, neither of which a surface projection may undo. The bridge
-       * is half the shortest incident edge -- the step itself is capped at
-       * `smooth_max_step_fraction` of it and the surface is within a sagitta. */
-      if (ref && !(rec->flags & MFTL_FLAG_FEATURE))
-      {
-        moved_v[n_moved] = v;
-        moved_lim[n_moved] = 0.25 * min_edge_sq;
-        n_moved++;
-      }
-    }
-
-    /* ONCE, after the last sweep's Jacobi loop: the smoother redistributes the
-     * vertices over all its sweeps and the projection then puts every moved one
-     * back on the reference surface. Projecting after every sweep measured the
-     * same within the run-to-run spread (except under-resolved uniform sizing,
-     * slightly better) at three times the cost (docs/analysis.md §14.10). */
-    if (ref && n_moved > 0 && sweep == iterations - 1)
-    {
-      const double t0 = MFTLRemeshWallTime();
-      int n_ok = 0;
-      for (int i = 0; i < n_moved; ++i)
-      {
-        const int v = moved_v[i];
-        if (MFTLRemeshReferenceProject(ref, obj, v, &hint[v], moved_lim[i], &new_pos[3 * v]) == MFTL_SUCCESS) n_ok++;
-      }
-      if (st)
-      {
-        st->t_projection += MFTLRemeshWallTime() - t0;
-        st->n_projected += n_ok;
-        st->n_projection_missed += n_moved - n_ok;
-      }
     }
 
     if ((MFTLFieldsStride(obj, 0) || MFTLFieldsStride(obj, 1)) && !MFTLRemeshFieldSmooth(obj, new_pos)) continue;
@@ -787,7 +749,4 @@ void MFTLRemeshSmooth(MFTL_Object *obj, const MFTL_RemeshParameters *params, int
   }
 
   free(new_pos);
-  free(hint);
-  free(moved_v);
-  free(moved_lim);
 }

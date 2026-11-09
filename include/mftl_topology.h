@@ -61,6 +61,7 @@
  *   FEATURE   0x08  remeshing   re-derived each pass, carried by splits between
  *   CORNER    0x10  remeshing   re-derived each pass, vertices only
  *   FROZEN    0x20  remeshing   transient, one parallel phase; never transmitted
+ *   DONE      0x40  remeshing   transient, one spanning pass; travels (vertices, half-edges)
  *
  * Application code must not use bits 0x02 and 0x04 for its own markers.
  */
@@ -107,6 +108,25 @@
  * this rank's halo.
  */
 #define MFTL_FLAG_FROZEN 0x20
+
+/**
+ * @brief Flag, vertices and half-edges: this spanning pass has already given the
+ *        entity its share of the serial kernel.
+ *
+ * Set, after a placement's sweeps, on every owned vertex the placement left
+ * unfrozen and on every half-edge both of whose ends it left unfrozen, in the
+ * current pass (#MFTL_REMESH_SPANNING_ONCE) or the current iteration
+ * (#MFTL_REMESH_SPANNING_NESTED). A flagged edge with two flagged ends was
+ * offered to split, collapse and flip and nothing at it has moved since, so it
+ * is not offered again (two flagged ends alone are not enough: they may have
+ * been unfrozen in different placements); in the ONCE mode a flagged vertex is
+ * not smoothed again unless an operation touched its fan, and reopening it
+ * reopens every edge at it.
+ * Such entities have no copy on any other rank, so the flag is set where the
+ * record is unique and every later copy inherits it: it travels on the wire and
+ * agrees on every holder. Cleared at the start and at the end of the pass.
+ */
+#define MFTL_FLAG_DONE 0x40
 
 // -----------------------------------------------------------------------------
 // 1. IMPLICIT HALF-EDGE ARITHMETIC

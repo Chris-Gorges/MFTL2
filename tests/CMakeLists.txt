@@ -477,6 +477,15 @@ if(BUILD_EXAMPLES)
                    $<TARGET_FILE:leveque_remeshing_parallel>
                    -steps 12 -budget 4 -quiet -verify -sizing curvature -placement paraboloid_normals -projection phong ${MPIEXEC_POSTFLAGS})
 
+  # The same physical check with the NESTED spanning mode, which smooths every
+  # vertex on a shifted partition with a ghost exchange per sweep, carries the
+  # curvature field through its migrations and projects once at the end -- the
+  # three things a one-rank run cannot get wrong.
+  add_test(NAME test_leveque_parallel_conserves_nested
+           COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
+                   $<TARGET_FILE:leveque_remeshing_parallel>
+                   -steps 12 -budget 4 -quiet -verify -spanning nested -sizing curvature -projection phong ${MPIEXEC_POSTFLAGS})
+
   # The same with the volume-preserving collapse on a fitted collapse point and
   # midpoint splits: its patch walk reads only unfrozen fans, which only a
   # partitioned run can get wrong.

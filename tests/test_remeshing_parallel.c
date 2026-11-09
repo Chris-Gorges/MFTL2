@@ -62,6 +62,8 @@
 #include <mpi.h>
 
 #include "mftl_core.h"
+/* The projection reference is internal; one test below drives it directly. */
+#include "../src/remeshing/remesh_internal.h"
 #include "test_mesh_invariants.h"
 #include "test_utils.h"
 
@@ -143,7 +145,12 @@ static void standard_params(MFTL_RemeshParameters *p, double target)
    * 0.76 with detection off against 0.0002 at 45 degrees. Leaving it on here
    * would make the CONVERGENT tests below measure the detector rather than the
    * parallelisation. */
-  MFTLInitRemeshParams(p, MFTL_REMESH_ISOTROPIC, target, 4, MFTL_SMOOTH_TRIANGLE_BASED, 180.0);
+  /* Twelve iterations, because these are ONE-SHOT remeshes to convergence and a
+   * spanning pass does one serial call's work: the call itself has to be given
+   * enough iterations to get there, exactly as MFTLRemeshObject would. A region
+   * stops early once an iteration performs nothing, so a converged mesh costs
+   * one iteration, not twelve. */
+  MFTLInitRemeshParams(p, MFTL_REMESH_ISOTROPIC, target, 12, MFTL_SMOOTH_TRIANGLE_BASED, 180.0);
   p->smooth_iterations = 3;
   p->smooth_relaxation = 0.5;
 }
@@ -1276,58 +1283,72 @@ static int test_the_edge_length_distribution_matches_the_serial_answer(void)
     MFTLGenerateSphere(sobj, centre, 0.7, 3);
     MFTLComputeTriangleGeometry(sobj, sobj->tris.n);
 
-    /* Remeshed to CONVERGENCE, not once. The comparison is only meaningful
-     * between two converged states, and the two drivers do not do equal amounts
-     * of work per call: MFTLRemeshEnsembleParallel runs the full iteration count
-     * PER PHASE, so a single MFTLRemeshObject call is several times less
-     * iteration and comes out with a visibly looser distribution (measured:
-     * total variation 0.115 against 0.011 once both are converged). That is the
-     * phase driver being thorough rather than either of them being wrong, and
-     * comparing against the un-converged reference would bake it in. */
-    for (int pass = 0; pass < 12; ++pass)
-    {
-      MFTL_RemeshStats one;
-      TEST_ASSERT(MFTLRemeshObject(sobj, &params, &one) == MFTL_SUCCESS);
-      if (one.n_split + one.n_collapse + one.n_flip == 0) break;
-    }
+    /* ONE call against ONE call. A spanning pass gives every region one serial
+     * call's work, so this is now a like-for-like comparison. It used to need
+     * the serial side iterated to convergence, because the phase driver re-ran
+     * the full iteration count in every placement and did several serial calls'
+     * work per call (total variation 0.115 against a single serial call). */
+    MFTL_RemeshStats serial_stats;
+    TEST_ASSERT(MFTLRemeshObject(sobj, &params, &serial_stats) == MFTL_SUCCESS);
     edge_histogram(solo, target, MPI_COMM_SELF, ref);
 
     MFTLEnsembleDestroy(&solo);
   }
 
-  /* -- The run under test --------------------------------------------------- */
-  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE);
-  TEST_ASSERT(ens != MFTL_NULL);
-  add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
-  TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
-
-  mesh_measure before;
-  measure(ens, &params, &before);
-  if (g_nproc > 1) TEST_ASSERT(agreed(before.n_cross_rank_edges > 0.0, MPI_COMM_WORLD));
-
-  MFTL_RemeshStats stats;
-  TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &params, &stats) == MFTL_SUCCESS, MPI_COMM_WORLD));
-
-  double par[HIST_BINS];
-  edge_histogram(ens, target, MPI_COMM_WORLD, par);
-
-  double tv = 0.0;
-  for (int b = 0; b < HIST_BINS; ++b) tv += fabs(par[b] - ref[b]);
-  tv *= 0.5;
-
-  if (g_rank == 0)
+  /* -- The runs under test, one per spanning mode ---------------------------- */
+  double tv_mode[2] = {0.0, 0.0};
+  for (int mode = 0; mode < 2; ++mode)
   {
-    printf("\n    np=%d edge-length histogram vs converged serial: total variation %.4f (par/ref per mille:", g_nproc, tv);
-    for (int b = 0; b < HIST_BINS; ++b)
+    MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE);
+    TEST_ASSERT(ens != MFTL_NULL);
+    add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
+    TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+
+    mesh_measure before;
+    measure(ens, &params, &before);
+    if (g_nproc > 1) TEST_ASSERT(agreed(before.n_cross_rank_edges > 0.0, MPI_COMM_WORLD));
+
+    MFTL_RemeshParameters pm = params;
+    pm.spanning_mode = mode ? MFTL_REMESH_SPANNING_NESTED : MFTL_REMESH_SPANNING_ONCE;
+    MFTL_RemeshStats stats;
+    TEST_ASSERT(agreed(MFTLRemeshEnsembleParallel(ens, &pm, &stats) == MFTL_SUCCESS, MPI_COMM_WORLD));
+
+    double par[HIST_BINS];
+    edge_histogram(ens, target, MPI_COMM_WORLD, par);
+
+    double tv = 0.0;
+    for (int b = 0; b < HIST_BINS; ++b) tv += fabs(par[b] - ref[b]);
+    tv_mode[mode] = 0.5 * tv;
+
+    if (g_rank == 0)
     {
-      if (par[b] > 0.0005 || ref[b] > 0.0005) printf(" %.0f/%.0f", 1000.0 * par[b], 1000.0 * ref[b]);
+      printf("\n    np=%d %s: edge-length histogram vs one serial call: total variation %.4f, %d phases (par/ref per mille:", g_nproc, mode ? "nested" : "once",
+             tv_mode[mode], stats.n_phases);
+      for (int b = 0; b < HIST_BINS; ++b)
+      {
+        if (par[b] > 0.0005 || ref[b] > 0.0005) printf(" %.0f/%.0f", 1000.0 * par[b], 1000.0 * ref[b]);
+      }
+      printf(")");
     }
-    printf(")\n    ");
+    MFTLEnsembleDestroy(&ens);
   }
+  if (g_rank == 0) printf("\n    ");
 
-  TEST_ASSERT(agreed(tv < 0.08, MPI_COMM_WORLD));
-
-  MFTLEnsembleDestroy(&ens);
+  /* np = 1: either mode IS the serial call, to the histogram bin. Above it the
+   * two modes differ in kind, and the thresholds say so. ONCE gives a region its
+   * whole call before its neighbours in the band have had theirs, and does not
+   * smooth it again after them, so on a ONE-SHOT refinement far from the target
+   * (1280 -> 3900 triangles here) the seams keep a wider distribution, growing
+   * with the frozen share: measured 0.034 / 0.086 / 0.058 / 0.114 at
+   * np = 2 / 4 / 8 / 27. NESTED smooths every vertex together once per iteration
+   * and stays at 0.021 / 0.036 / 0.037 / 0.037 -- for 23-75 placements per call
+   * against 2-8 (docs/analysis.md §5.8). */
+  if (g_nproc == 1)
+  {
+    TEST_ASSERT(tv_mode[0] == 0.0 && tv_mode[1] == 0.0);
+  }
+  TEST_ASSERT(agreed(tv_mode[0] < 0.15, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(tv_mode[1] < 0.06, MPI_COMM_WORLD));
   return 0;
 }
 
@@ -2190,6 +2211,287 @@ static int test_a_gathered_pass_matches_the_distributed_answer(void)
   return 0;
 }
 
+/* ═════════════════════════════════════════════════════════════════════════════
+ * One serial call's work, and one projection, whatever the partition
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/** @brief splitmix64's finaliser. */
+static unsigned long long mix64(unsigned long long z)
+{
+  z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
+  z = (z ^ (z >> 27)) * 0x94D049BB133111EBull;
+  return z ^ (z >> 31);
+}
+
+/** @brief A number in [-1, 1] from (id, k): the same on every rank and in every run. */
+static double unit_noise(int id, int k)
+{
+  return 2.0 * ((double) (mix64((unsigned long long) id * 0x9E3779B97F4A7C15ull + (unsigned long long) k) >> 11) / 9007199254740992.0) - 1.0;
+}
+
+/** @brief A rank-local digest of one object: ids, position bits, corner ids. */
+static unsigned long long local_digest(const MFTL_Object *obj)
+{
+  unsigned long long d = 0;
+  for (int v = 0; v < obj->verts.n_local; ++v)
+  {
+    unsigned long long h = mix64((unsigned long long) obj->verts.rec[v].global_id + 1);
+    for (int k = 0; k < 3; ++k)
+    {
+      unsigned long long bits;
+      memcpy(&bits, &obj->verts.pos[3 * v + k], sizeof bits);
+      h = mix64(h ^ bits);
+    }
+    d ^= h;
+  }
+  for (int t = 0; t < obj->tris.n_local; ++t)
+  {
+    unsigned long long h = mix64((unsigned long long) obj->tris.rec[t].global_id + 0x51ull);
+    for (int k = 0; k < 3; ++k) h = mix64(h ^ (unsigned long long) obj->verts.rec[obj->tris.verts[3 * t + k]].global_id);
+    d ^= h;
+  }
+  return d;
+}
+
+/** @brief A radially roughened sphere on @p comm's own one-cell ensemble, the same bits every time. */
+static MFTL_Ensemble *rough_sphere_alone(void)
+{
+  int one[3] = {1, 1, 1};
+  double lo[3] = {-1.0, -1.0, -1.0}, hi[3] = {1.0, 1.0, 1.0};
+  bool per[3] = {MFTL_TRUE, MFTL_TRUE, MFTL_TRUE};
+  MFTL_Ensemble *e = MFTLEnsembleCreate(MPI_COMM_SELF, one, lo, hi, per, 1);
+  MFTL_Object *obj = MFTLObjectCreate(0);
+  MFTLEnsembleAddObject(e, obj);
+  double c[3] = {0.0, 0.0, 0.0};
+  MFTLGenerateSphere(obj, c, 0.7, 3);
+  for (int v = 0; v < obj->verts.n; ++v)
+  {
+    const double f = 1.0 + 0.03 * unit_noise(obj->verts.rec[v].global_id, 7);
+    for (int k = 0; k < 3; ++k) obj->verts.pos[3 * v + k] *= f;
+  }
+  MFTLComputeTriangleGeometry(obj, obj->tris.n);
+  return e;
+}
+
+/**
+ * @brief At one rank the spanning driver IS the serial call, to the bit, in
+ *        both modes, with and without the projection and curvature sizing.
+ *
+ * The statement both modes are built on: a pass gives every region exactly one
+ * serial call's work. At one rank nothing is frozen, so ONCE runs one placement
+ * that is the call, and NESTED interleaves the same sweeps in the same order.
+ * The projection, the carried curvature field and the canonical order are all on
+ * the path, so a stray extra sweep, a second projection or a recomputed field
+ * changes bits. Runs on rank 0 alone, on its own communicator, at every rank
+ * count of the suite. Mutation-checked: restoring the old driver's repetition
+ * (the whole call again in every placement of the budget) fails it.
+ */
+static int test_both_modes_are_the_serial_call_at_one_rank(void)
+{
+  int ok = 1, configs = 0;
+  if (g_rank == 0)
+  {
+    for (int cfg = 0; cfg < 3; ++cfg)
+      for (int mode = 0; mode < 2; ++mode)
+      {
+        MFTL_Ensemble *ser = rough_sphere_alone();
+        MFTL_Ensemble *spn = rough_sphere_alone();
+        MFTL_RemeshParameters p;
+        standard_params(&p, 0.07);
+        if (cfg >= 1) p.projection = MFTL_REMESH_PROJECT_PHONG;
+        if (cfg == 2) MFTLRemeshUseCurvatureSizing(&p, 0.02 * 0.07, 0.25 * 0.07, 0.07);
+        p.spanning_mode = mode ? MFTL_REMESH_SPANNING_NESTED : MFTL_REMESH_SPANNING_ONCE;
+
+        MFTL_RemeshStats a, b;
+        ok &= (MFTLRemeshEnsemble(ser, &p, &a) == MFTL_SUCCESS);  // one rank: the serial path
+        ok &= (MFTLRemeshEnsembleParallel(spn, &p, &b) == MFTL_SUCCESS);
+        ok &= (local_digest(ser->local_objects[0]) == local_digest(spn->local_objects[0]));
+        ok &= (a.n_split > 0 && a.n_collapse > 0) && (a.n_split == b.n_split && a.n_collapse == b.n_collapse && a.n_flip == b.n_flip);
+        if (cfg >= 1) ok &= (a.n_projected > 0 && a.n_projected == b.n_projected);
+        configs++;
+        MFTLEnsembleDestroy(&ser);
+        MFTLEnsembleDestroy(&spn);
+      }
+    printf("\n    %d configurations, serial call == phase driver at one rank: %s\n    ", configs, ok ? "yes" : "NO");
+  }
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  return 0;
+}
+
+/**
+ * @brief The distributed projection lands every vertex exactly where the serial
+ *        projection of the same mesh does, on any partition.
+ *
+ * The reference is built from the same input, then every vertex is displaced
+ * the same way -- tangentially by up to 0.3 of an edge, normally by up to 0.05 --
+ * and projected: distributed with MFTLRemeshEnsembleProject() over each rank's
+ * share plus its geometric halo, and on rank 0 over the whole object. The
+ * closest triangle is an exact search in both and ties break by triangle id, so
+ * every vertex must land on the same point -- to the rounding of the reference
+ * normals, each a sum over the vertex's triangles taken in its owner's pool order
+ * (bit-identical at np = 1, 2, 4, 8; 6 of 642 vertices one ulp apart at
+ * np = 27) -- and the projected and missed counts must be equal. That is the
+ * coverage proof made executable: a missing halo triangle sends a vertex near a
+ * cut plane to a different triangle, or nowhere. Non-vacuous at np > 1 by the
+ * cross-rank edges of the partition. Mutation-checked: with the halo exchange
+ * disabled 22 / 42 / 72 vertices land elsewhere at np = 2 / 4 / 8 and the counts
+ * differ.
+ */
+static int test_the_distributed_projection_is_the_serial_projection(void)
+{
+  MFTL_RemeshParameters params;
+  standard_params(&params, 0.07);
+  params.projection = MFTL_REMESH_PROJECT_PHONG;
+
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE);
+  TEST_ASSERT(ens != MFTL_NULL);
+  add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 3);
+  TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+  mesh_measure before;
+  measure(ens, &params, &before);
+  if (g_nproc > 1) TEST_ASSERT(agreed(before.n_cross_rank_edges > 0.0, MPI_COMM_WORLD));
+
+  MFTL_RemeshReferenceSet set;
+  TEST_ASSERT(agreed(MFTLRemeshEnsembleReferenceBuild(ens, &params, &set, MFTL_NULL) == MFTL_SUCCESS, MPI_COMM_WORLD));
+
+  const double h = 0.12;  // about the edge of a refine-3 sphere of radius 0.7
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    MFTL_Object *obj = ens->local_objects[o];
+    for (int v = 0; v < obj->verts.n_local; ++v)
+    {
+      double *p = &obj->verts.pos[3 * v];
+      const int g = obj->verts.rec[v].global_id;
+      const double r = sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+      double d[3] = {unit_noise(g, 0), unit_noise(g, 1), unit_noise(g, 2)};
+      const double dn = (d[0] * p[0] + d[1] * p[1] + d[2] * p[2]) / r;
+      for (int k = 0; k < 3; ++k) p[k] += 0.3 * h * (d[k] - dn * p[k] / r) + 0.05 * h * unit_noise(g, 3) * p[k] / r;
+    }
+    MFTLObjectMarkChanged(obj);
+  }
+  TEST_ASSERT(agreed(MFTLUpdateGhostPositions(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+
+  /* The pass projects after its closing redistribution, where every vertex is
+   * owned by the rank whose cell holds it -- the premise of the coverage proof.
+   * So does this test: a vertex displaced across a cut plane without it is
+   * projected by a rank whose reference was never meant to reach it (6 of 642
+   * at np = 27 before this line existed). */
+  TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+
+  MFTL_RemeshStats st;
+  memset(&st, 0, sizeof st);
+  TEST_ASSERT(agreed(MFTLRemeshEnsembleProject(ens, &set, &params, &st) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  MFTLRemeshReferenceSetFree(&set);
+
+  /* The distributed answer, by vertex id, on rank 0. */
+  int n_own = 0;
+  for (int o = 0; o < ens->n_local_objects; ++o) n_own += ens->local_objects[o]->verts.n_local;
+  double *mine = (double *) malloc(sizeof(double) * 4 * (size_t) (n_own + 1));
+  int w = 0;
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    const MFTL_Object *obj = ens->local_objects[o];
+    for (int v = 0; v < obj->verts.n_local; ++v, ++w)
+    {
+      mine[4 * w] = (double) obj->verts.rec[v].global_id;
+      for (int k = 0; k < 3; ++k) mine[4 * w + 1 + k] = obj->verts.pos[3 * v + k];
+    }
+  }
+  int cnt = 4 * n_own, *counts = (int *) malloc(sizeof(int) * (size_t) g_nproc), *displ = (int *) malloc(sizeof(int) * (size_t) g_nproc);
+  MPI_Gather(&cnt, 1, MPI_INT, counts, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  int total = 0;
+  if (g_rank == 0)
+    for (int r = 0; r < g_nproc; ++r) displ[r] = total, total += counts[r];
+  double *all = (double *) malloc(sizeof(double) * (size_t) (total + 1));
+  MPI_Gatherv(mine, cnt, MPI_DOUBLE, all, counts, displ, MPI_DOUBLE, 0, MPI_COMM_WORLD);
+  int proj_dist[2] = {st.n_projected, st.n_projection_missed};
+  MPI_Allreduce(MPI_IN_PLACE, proj_dist, 2, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+
+  /* The serial answer, on rank 0: the same input, displaced the same way. */
+  int ok = 1, n_same = 0, n_cmp = 0;
+  double max_diff = 0.0;
+  if (g_rank == 0)
+  {
+    MFTL_Ensemble *solo;
+    {
+      int one[3] = {1, 1, 1};
+      double lo[3] = {-1.0, -1.0, -1.0}, hi[3] = {1.0, 1.0, 1.0};
+      bool per[3] = {MFTL_TRUE, MFTL_TRUE, MFTL_TRUE};
+      solo = MFTLEnsembleCreate(MPI_COMM_SELF, one, lo, hi, per, 1);
+      MFTL_Object *o = MFTLObjectCreate(0);
+      MFTLEnsembleAddObject(solo, o);
+      double c[3] = {0.0, 0.0, 0.0};
+      MFTLGenerateSphere(o, c, 0.7, 3);
+      MFTLComputeTriangleGeometry(o, o->tris.n);
+    }
+    MFTL_Object *sobj = solo->local_objects[0];
+    MFTLDetectFeatures(sobj, params.feature_angle_threshold, params.feature_corner_angle, MFTL_NULL);
+    MFTL_RemeshReference ref;
+    MFTLRemeshReferenceFromObject(&ref, sobj, &params);
+    for (int v = 0; v < sobj->verts.n; ++v)
+    {
+      double *p = &sobj->verts.pos[3 * v];
+      const int g = sobj->verts.rec[v].global_id;
+      const double r = sqrt(p[0] * p[0] + p[1] * p[1] + p[2] * p[2]);
+      double d[3] = {unit_noise(g, 0), unit_noise(g, 1), unit_noise(g, 2)};
+      const double dn = (d[0] * p[0] + d[1] * p[1] + d[2] * p[2]) / r;
+      for (int k = 0; k < 3; ++k) p[k] += 0.3 * h * (d[k] - dn * p[k] / r) + 0.05 * h * unit_noise(g, 3) * p[k] / r;
+    }
+    MFTL_RemeshStats sst;
+    memset(&sst, 0, sizeof sst);
+    MFTLRemeshProjectObject(sobj, &ref, &params, &sst);
+    MFTLRemeshReferenceFree(&ref);
+
+    ok &= (total / 4 == sobj->verts.n);
+    for (int i = 0; i < total / 4; ++i)
+    {
+      const int g = (int) all[4 * i];
+      if (g < 0 || g >= sobj->verts.n || sobj->verts.rec[g].global_id != g)
+      {
+        ok = 0;
+        continue;
+      }
+      int same = 1;
+      for (int k = 0; k < 3; ++k) same &= (all[4 * i + 1 + k] == sobj->verts.pos[3 * g + k]);
+      for (int k = 0; k < 3; ++k) max_diff = fmax(max_diff, fabs(all[4 * i + 1 + k] - sobj->verts.pos[3 * g + k]));
+      n_same += same;
+      n_cmp++;
+    }
+    ok &= (max_diff <= 1e-13) && (proj_dist[0] == sst.n_projected) && (proj_dist[1] == sst.n_projection_missed) && (sst.n_projected > 0);
+    printf("\n    np=%d: %d of %d vertices projected to the same bits as on one rank (largest difference %.3g); projected %d / %d, missed %d / %d\n    ",
+           g_nproc, n_same, n_cmp, max_diff, proj_dist[0], sst.n_projected, proj_dist[1], sst.n_projection_missed);
+    MFTLEnsembleDestroy(&solo);
+  }
+  free(mine);
+  free(counts);
+  free(displ);
+  free(all);
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
+/** @brief NESTED moves replicated vertices when it smooths, so it refuses attached fields -- on every rank. */
+static int test_the_nested_mode_refuses_attached_fields(void)
+{
+  for (int mode = 0; mode < 2; ++mode)
+  {
+    MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE);
+    TEST_ASSERT(ens != MFTL_NULL);
+    TEST_ASSERT(agreed(MFTLEnsembleRegisterField(ens, "surfactant", MFTL_FIELD_TRIANGLE, 1, MFTL_FIELD_CONSERVATIVE_DENSITY) >= 0, MPI_COMM_WORLD));
+    add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 2);
+    TEST_ASSERT(agreed(partition(ens), MPI_COMM_WORLD));
+    MFTL_RemeshParameters params;
+    standard_params(&params, 0.12);
+    params.spanning_mode = mode ? MFTL_REMESH_SPANNING_NESTED : MFTL_REMESH_SPANNING_ONCE;
+    const int rc = MFTLRemeshEnsembleParallel(ens, &params, MFTL_NULL);
+    TEST_ASSERT(agreed(rc == (mode ? MFTL_ERROR : MFTL_SUCCESS), MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+    MFTLEnsembleDestroy(&ens);
+  }
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
@@ -2220,6 +2522,9 @@ int main(int argc, char **argv)
   RUN_TEST(test_only_the_distinct_placements_are_visited);
   RUN_TEST(test_the_budget_is_honoured_exactly);
   RUN_TEST(test_two_passes_are_bit_identical);
+  RUN_TEST(test_both_modes_are_the_serial_call_at_one_rank);
+  RUN_TEST(test_the_distributed_projection_is_the_serial_projection);
+  RUN_TEST(test_the_nested_mode_refuses_attached_fields);
 
   if (g_rank == 0) TEST_REPORT();
 

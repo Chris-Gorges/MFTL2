@@ -110,6 +110,13 @@ static const MFTL_SettingChoice g_parallel_strategy[] = {
     END_CHOICES,
 };
 
+static const MFTL_SettingChoice g_spanning_mode[] = {
+    CHOICE("once", MFTL_REMESH_SPANNING_ONCE, "placements outermost: each region gets the whole serial call in the first placement where it is unfrozen"),
+    CHOICE("nested", MFTL_REMESH_SPANNING_NESTED,
+           "iterations outermost: placements only for split/collapse/flip, then every vertex smoothed with a ghost exchange per sweep"),
+    END_CHOICES,
+};
+
 static const MFTL_SettingChoice g_smooth_mode[] = {
     CHOICE("triangle", MFTL_SMOOTH_TRIANGLE_BASED, "area-weighted mean of the incident triangle centroids; equalises areas"),
     CHOICE("vertex", MFTL_SMOOTH_VERTEX_BASED, "umbrella operator, the plain mean of the one-ring; equalises edge lengths"),
@@ -264,9 +271,12 @@ static const MFTL_SettingInfo g_keys[] = {
         "Serial pass only: make global ids dense again afterwards. The distributed drivers always do."),
     KEY("remesh", "parallel_strategy", KEYWORD, remesh.params.parallel_strategy, "\"auto\"", "", g_parallel_strategy, "", 0,
         "Distributed strategy; ignored on one rank."),
-    KEY("remesh", "parallel_phase_budget", INT, remesh.params.parallel_phase_budget, "4", "[1, inf)", NO_CHOICES, "", 0,
-        "Spanning strategy: cut-plane placements per pass. 4 is the measured best in a timestep loop; use 32 for a one-shot remesh "
-        "that must converge (check `converged`)."),
+    KEY("remesh", "parallel_phase_budget", INT, remesh.params.parallel_phase_budget, "8", "[1, inf)", NO_CHOICES, "", 0,
+        "Spanning strategy: the most cut-plane placements per pass (nested: per iteration). A cap: the pass stops once every "
+        "out-of-band edge was offered, and one pass does one serial call's work whatever the value."),
+    KEY("remesh", "spanning_mode", KEYWORD, remesh.params.spanning_mode, "\"once\"", "", g_spanning_mode, "", 0,
+        "Spanning strategy: how placements and iterations nest. Both give every region one serial call's work; nested refuses "
+        "attached fields."),
     KEY("remesh", "freeze_dilation_rings", INT, remesh.params.freeze_dilation_rings, "0", "[0, inf)", NO_CHOICES, "", 1,
         "Extra triangle rings added to the frozen band. 0 is exact; a positive value exists to test that claim and costs coverage."),
     KEY("remesh", "dispersed_radius_fraction", REAL, remesh.params.dispersed_radius_fraction, "0.4", "(0, inf)", NO_CHOICES, "", 1,

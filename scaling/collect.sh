@@ -28,6 +28,10 @@ fi
 OUT="$DIR/summary.txt"
 
 shopt -s nullglob
+# A remeshing sweep has its own report format and collector.
+for f in "$DIR"/reports/*.txt; do
+  if grep -q '^@summary mode=remesh_' "$f"; then exec "$HERE/collect_remesh.sh" "$DIR"; fi
+done
 reports=("$DIR"/reports/*.txt)
 failed=("$DIR"/reports/*.failed)
 valid_reports=()

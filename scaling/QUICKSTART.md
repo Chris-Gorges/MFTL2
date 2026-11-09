@@ -141,6 +141,33 @@ running. Copy the full result directories back, including logs and snapshots.
 
 Background, memory estimates and interpretation: [SCALING_PLAN.md](SCALING_PLAN.md).
 
+## 6. The remeshing campaigns
+
+Same build, same site configuration. After the redistribution campaign:
+
+```bash
+REGIME=dispersed scaling/launch_remesh_strong.sh --dry-run
+REGIME=dispersed scaling/launch_remesh_strong.sh
+REGIME=spanning  scaling/launch_remesh_strong.sh
+REGIME=dispersed scaling/launch_remesh_weak.sh
+REGIME=spanning  scaling/launch_remesh_weak.sh
+```
+
+A smoke test first, on one or two nodes:
+
+```bash
+REGIME=spanning NODES="1 2" MAX_NODES=2 REFINE=5 STEPS=20 TRAJECTORIES=1 TIME_LIMIT=00:15:00 MAX_SECONDS=600 scaling/launch_remesh_strong.sh
+```
+
+The spanning weak launcher runs 32 ranks per node, because its problem needs
+an even number of cuts on every axis and no multiple of 36 has that; it
+refuses a rank count without such a grid. Each spanning job runs both spanning
+modes, so it takes about twice as long as a dispersed one; the soft budget is
+split between them. Read `results/scaling/remesh_<regime>_<strong|weak>_latest/summary.txt`:
+every row must be `ok` (structure intact, volume within 5 %), the dispersed
+strong sweep must report `DIGEST IDENTICAL at every P`, and `!conv` and
+`missed` should be 0.
+
 ## Submission errors and pending jobs
 
 `CPU count per node can not be satisfied` / `Requested node configuration is

@@ -242,12 +242,13 @@ static int test_defaults_follow_the_modules(void)
     TEST_ASSERT(MFTLSettingsGet(&m, key, vm, sizeof vm) == MFTL_SUCCESS);
     if (strcmp(vd, vm) == 0) continue;
     ++n_different;
-    if (strcmp(key, "remesh.parallel_phase_budget") != 0) printf("\n  %s: table %s, module %s", key, vd, vm);
-    TEST_ASSERT(strcmp(key, "remesh.parallel_phase_budget") == 0);
+    printf("\n  %s: table %s, module %s", key, vd, vm);
   }
   TEST_ASSERT(n_block_keys > 30);
-  TEST_ASSERT(n_different == 1); /* the documented difference is real */
-  TEST_ASSERT(d.remesh.params.parallel_phase_budget == 4 && m.remesh.params.parallel_phase_budget == 32);
+  /* No difference any more: one spanning pass does one serial call's work, so a
+   * timestep loop and a one-shot remesh want the same placement cap. */
+  TEST_ASSERT(n_different == 0);
+  TEST_ASSERT(d.remesh.params.parallel_phase_budget == MFTL_REMESH_NUM_PHASES && m.remesh.params.parallel_phase_budget == MFTL_REMESH_NUM_PHASES);
 
   /* The fields no key covers come from the modules untouched. */
   TEST_ASSERT(d.remesh.params.type == MFTL_REMESH_ISOTROPIC);

@@ -1,9 +1,12 @@
-# Submission logic shared by launch_strong.sh and launch_weak.sh. Sourced, not run.
+# Submission logic shared by the launch_*.sh scripts. Sourced, not run.
 #
-# The caller sets MODE, RANKS, RUN_ARGS, TIME_LIMIT and JOB_REPEATS, sources
-# site.sh, then calls `sweep_main "$@"`. One Slurm job per rank count (x
-# JOB_REPEATS), then one small job that waits for all of them (afterany) and runs
-# collect.sh, which merges every report into <sweep>/summary.txt.
+# The caller sets MODE, RANKS, RUN_ARGS, TIME_LIMIT and JOB_REPEATS (and
+# optionally SWEEP_NAME, which names the results directory and the jobs; default
+# MODE), sources site.sh, then calls `sweep_main "$@"`. The driver is
+# build/${MODE}_scaling. One Slurm job per rank count (x JOB_REPEATS), then one
+# small job that waits for all of them (afterany) and runs collect.sh, which
+# merges every report into <sweep>/summary.txt (a remeshing sweep through
+# collect_remesh.sh).
 # shellcheck shell=bash
 
 sweep_usage()
@@ -81,17 +84,26 @@ sweep_preflight()
     fi
     echo "note: MFTL_COMM_PROFILE is off -- phase timings only (ALLOW_NO_PROFILE=1)."
   fi
-  if [ "$BIN" -ot "$ROOT/scaling/scaling_common.h" ] || [ "$BIN" -ot "$ROOT/scaling/scaling_init.h" ] ||
-     [ "$BIN" -ot "$ROOT/scaling/${MODE}_scaling.c" ]; then
-    echo "error: $BIN is older than its sources in scaling/; rebuild it before submitting." >&2
-    return 1
-  fi
+  local src
+  for src in $(sweep_sources); do
+    if [ "$BIN" -ot "$ROOT/scaling/$src" ]; then
+      echo "error: $BIN is older than its sources in scaling/; rebuild it before submitting." >&2
+      return 1
+    fi
+  done
   return 0
+}
+
+# The driver's sources in scaling/, snapshotted with every sweep.
+sweep_sources()
+{
+  echo scaling_common.h scaling_init.h "${MODE}_scaling.c"
+  case "$MODE" in remesh_*) echo remesh_common.h ;; esac
 }
 
 sweep_main()
 {
-  local dry=0 a
+  local dry=0 a src
   for a in "$@"; do
     case "$a" in
       --dry-run | -n) dry=1 ;;
@@ -110,6 +122,11 @@ sweep_main()
   BUILD_DIR="${BUILD_DIR:-$ROOT/build}"
   BUILD_DIR="$(cd "$BUILD_DIR" && pwd -P)" || return 1
   BIN="$BUILD_DIR/${MODE}_scaling"
+  SWEEP_NAME="${SWEEP_NAME:-$MODE}"
+  if [[ ! "$SWEEP_NAME" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+    echo "error: SWEEP_NAME may contain only letters, digits and _ . -" >&2
+    return 2
+  fi
   sweep_resolve_points || return $?
   local memory=()
   if [ -n "$MEMORY_PER_NODE" ] && [ "$MEMORY_PER_NODE" != default ]; then
@@ -136,20 +153,20 @@ sweep_main()
     mkdir -p "$(dirname "$OUT_DIR")" || return 1
     mkdir "$OUT_DIR" || { echo "error: OUT_DIR must be a new directory (prevents overwriting a sweep)." >&2; return 1; }
   else
-    OUT_DIR="$(mktemp -d "$ROOT/results/scaling/${MODE}_${stamp}_XXXXXX")" || return 1
+    OUT_DIR="$(mktemp -d "$ROOT/results/scaling/${SWEEP_NAME}_${stamp}_XXXXXX")" || return 1
   fi
   OUT_DIR="$(cd "$OUT_DIR" && pwd -P)" || return 1
   mkdir -p "$OUT_DIR/reports" "$OUT_DIR/slurm" "$OUT_DIR/snapshot" || return 1
   # Queued jobs must not change if the checkout is rebuilt or site.sh is edited.
   cp "$BIN" "$OUT_DIR/snapshot/${MODE}_scaling" || return 1
-  cp "$ROOT/scaling/site.sh" "$ROOT/scaling/job_scaling.sh" "$ROOT/scaling/collect.sh" "$OUT_DIR/snapshot/" || return 1
+  cp "$ROOT/scaling/site.sh" "$ROOT/scaling/job_scaling.sh" "$ROOT/scaling/collect.sh" "$ROOT/scaling/collect_remesh.sh" "$OUT_DIR/snapshot/" || return 1
   cp "$BUILD_DIR/CMakeCache.txt" "$OUT_DIR/snapshot/" || return 1
   git -C "$ROOT" diff HEAD -- src include CMakeLists.txt >"$OUT_DIR/snapshot/source.diff"
-  cp "$ROOT/scaling/scaling_common.h" "$ROOT/scaling/scaling_init.h" "$ROOT/scaling/${MODE}_scaling.c" "$OUT_DIR/snapshot/" || return 1
+  for src in $(sweep_sources); do cp "$ROOT/scaling/$src" "$OUT_DIR/snapshot/" || return 1; done
   printf 'tag\tnp\tnodes\trpn\tstatus\tjob_id\n' >"$OUT_DIR/points.tsv"
 
   {
-    echo "MFTL $MODE scaling sweep"
+    echo "MFTL $SWEEP_NAME scaling sweep (driver ${MODE}_scaling)"
     echo "  created       $(date)"
     echo "  commit        $git"
     echo "  binary        $BIN"
@@ -171,7 +188,7 @@ sweep_main()
   [ -n "$SBATCH_EXTRA" ] && read -r -a extra <<< "$SBATCH_EXTRA"
 
   local rpn="${RANKS_PER_NODE:-$CORES_PER_NODE}"
-  echo "campaign: $MODE; eligible ranks: ${RANKS:-none}; ranks/node=$rpn; MAX_NODES=$MAX_NODES; memory/node=${MEMORY_PER_NODE:-default}"
+  echo "campaign: $SWEEP_NAME; eligible ranks: ${RANKS:-none}; ranks/node=$rpn; MAX_NODES=$MAX_NODES; memory/node=${MEMORY_PER_NODE:-default}"
   local ids=() rep nodes tpn tag id submit_errors=0
   # Submit repeats round robin. Slurm still chooses execution order and nodes.
   for rep in $(seq 1 "$JOB_REPEATS"); do
@@ -188,7 +205,7 @@ sweep_main()
       tpn=$(((p + nodes - 1) / nodes))
 
       local cmd=(sbatch --parsable
-        --job-name="mftl-${MODE}-np${p}"
+        --job-name="mftl-${SWEEP_NAME}-np${p}"
         --nodes="$nodes" --ntasks="$p" --ntasks-per-node="$tpn" --cpus-per-task=1
         ${memory[@]+"${memory[@]}"}
         --time="$TIME_LIMIT"
@@ -236,7 +253,7 @@ sweep_main()
     IFS=:
     echo "${ids[*]}"
   )"
-  local ccmd=(sbatch --parsable --job-name="mftl-${MODE}-collect" --dependency="$dep"
+  local ccmd=(sbatch --parsable --job-name="mftl-${SWEEP_NAME}-collect" --dependency="$dep"
     --nodes=1 --ntasks=1 --time=00:15:00 --output="$OUT_DIR/slurm/collect-%j.out"
     ${extra[@]+"${extra[@]}"} "$OUT_DIR/snapshot/collect.sh" "$OUT_DIR")
   if [ $dry = 1 ]; then
@@ -249,10 +266,10 @@ sweep_main()
       echo "warning: collector job not submitted; run scaling/collect.sh $OUT_DIR by hand later." >&2
       submit_errors=1
     fi
-    ln -sfn "$OUT_DIR" "$ROOT/results/scaling/${MODE}_latest"
+    ln -sfn "$OUT_DIR" "$ROOT/results/scaling/${SWEEP_NAME}_latest"
     echo
     echo "results:   $OUT_DIR"
-    echo "           (also $ROOT/results/scaling/${MODE}_latest)"
+    echo "           (also $ROOT/results/scaling/${SWEEP_NAME}_latest)"
     echo "summary:   $OUT_DIR/summary.txt  -- written when the last point has finished"
     echo "watch:     squeue -u \$USER -o '%.18i %.24j %.9P %.2t %.6D %R'"
     echo "queue:     Resources = waiting for nodes; Dependency = collector waiting for benchmark jobs."

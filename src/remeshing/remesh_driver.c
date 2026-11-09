@@ -49,28 +49,53 @@
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
+ * @brief Has the spanning pass already offered this edge, and has nothing moved
+ *        at it since? The half-edge AND both its ends carry #MFTL_FLAG_DONE.
+ *
+ * Only the spanning driver sets the flag, so a serial sweep never takes the
+ * branch; the extra test is three loads of records the sweep reads anyway. Both
+ * halves are needed. The edge's own flag: two DONE ends may have been unfrozen
+ * in two different placements, and the edge between them was then never
+ * offered. The ends' flags: a vertex reopened for smoothing (reopen_touched())
+ * moves, and every edge at it changes length -- with the edge flag alone a
+ * one-shot refinement at np = 4 ended with 84 out-of-band edges after its
+ * second placement against 69.
+ *
+ * @param obj  The mesh.
+ * @param h    Half-edge index.
+ * @param gate Whether the pass applies the rule at all.
+ * @return `true` if the edge must not be offered again.
+ */
+static inline bool done_blocks(const MFTL_Object *obj, int h, bool gate)
+{
+  if (!gate) return MFTL_FALSE;
+  return (obj->tris.he[h].flags & obj->verts.rec[MFTLHeOrigin(obj, h)].flags & obj->verts.rec[obj->tris.he[h].vertex_idx].flags & MFTL_FLAG_DONE) != 0;
+}
+
+/**
  * @brief Splits every approved edge, once per undirected edge.
  *
  * The parallel freeze gate is tested first (two flag tests, against an
  * approval's fan walk). Refusals are NOT counted as blocked work: a rank sees
  * ghosts with incomplete one-rings, approves a collapse the owner would reject,
  * and would report phantom blocked operations (3 on a converged np = 4 sphere).
- * Convergence is instead certified by `count_hidden_edges` in remesh_parallel.c,
+ * Convergence is instead certified by `count_unoffered_edges` in remesh_parallel.c,
  * which needs no fan walk.
  *
  * @param obj    The mesh.
  * @param params Supplies `max_edge_length_sq`.
+ * @param gate   Apply the spanning pass's DONE rule (done_blocks()).
  * @return Splits performed.
  */
 
-static int sweep_split(MFTL_Object *obj, const MFTL_RemeshParameters *params)
+static int sweep_split(MFTL_Object *obj, const MFTL_RemeshParameters *params, bool gate)
 {
   const int n_he = 3 * obj->tris.n;  // snapshot: see the file header
   int count = 0;
 
   for (int h = 0; h < n_he; ++h)
   {
-    if (freeze_blocks_pair(obj, h)) continue;
+    if (freeze_blocks_pair(obj, h) || done_blocks(obj, h, gate)) continue;
     if (!MFTLSplitApproved(obj, h, params)) continue;
     if (MFTLSplitEdge(obj, h, params) != MFTL_ERROR) count++;
   }
@@ -82,16 +107,17 @@ static int sweep_split(MFTL_Object *obj, const MFTL_RemeshParameters *params)
  * @param      obj    The mesh.
  * @param      params Supplies `min_edge_length_sq` and the safety thresholds.
  * @param[out] stats  May be #MFTL_NULL. The rejection counters are accumulated here.
+ * @param      gate   Apply the spanning pass's DONE rule (done_blocks()).
  * @return Collapses performed.
  */
-static int sweep_collapse(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats)
+static int sweep_collapse(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats, bool gate)
 {
   const int n_he = 3 * obj->tris.n;
   int count = 0;
 
   for (int h = 0; h < n_he; ++h)
   {
-    if (freeze_blocks_collapse(obj, h)) continue;
+    if (freeze_blocks_collapse(obj, h) || done_blocks(obj, h, gate)) continue;
 
     int reason = MFTL_REMESH_REJECT_NONE;
 
@@ -119,16 +145,17 @@ static int sweep_collapse(MFTL_Object *obj, const MFTL_RemeshParameters *params,
  * @param      obj    The mesh.
  * @param      params Supplies `max_normal_deviation_cos`.
  * @param[out] stats  May be #MFTL_NULL.
+ * @param      gate   Apply the spanning pass's DONE rule (done_blocks()).
  * @return Flips performed.
  */
-static int sweep_flip(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats)
+static int sweep_flip(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats, bool gate)
 {
   const int n_he = 3 * obj->tris.n;
   int count = 0;
 
   for (int h = 0; h < n_he; ++h)
   {
-    if (freeze_blocks_pair(obj, h)) continue;
+    if (freeze_blocks_pair(obj, h) || done_blocks(obj, h, gate)) continue;
 
     int reason = MFTL_REMESH_REJECT_NONE;
 
@@ -229,7 +256,65 @@ double MFTLEnsembleMeanEdgeLength(MFTL_Ensemble *ens)
   return (acc[1] > 0.0) ? acc[0] / acc[1] : 0.0;
 }
 
-int MFTLRemeshIterate(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *st, int iterations)
+/**
+ * @brief Corners of every triangle an operation of this sweep set touched lose
+ *        #MFTL_FLAG_DONE, so the ONCE pass smooths them again and offers every
+ *        edge at them again (done_blocks() needs both ends DONE).
+ *
+ * The operators mark what they rewrote with #MFTL_FLAG_VISITED (a split its
+ * new vertex and triangles, a collapse its survivor, a flip its two triangles).
+ * Without this, an operation a later placement performs next to finished
+ * vertices would stay unsmoothed until the next call: min q fell to 0.28-0.41
+ * in the identity study.
+ *
+ * @param obj The mesh, derived topology current.
+ */
+static void reopen_touched(MFTL_Object *obj)
+{
+  for (int t = 0; t < obj->tris.n; ++t)
+  {
+    int vv[3];
+    MFTLGetTriangleVertices(obj, t, vv);
+    const int hf = obj->tris.he[3 * t].flags | obj->tris.he[3 * t + 1].flags | obj->tris.he[3 * t + 2].flags;
+    const int vf = obj->verts.rec[vv[0]].flags | obj->verts.rec[vv[1]].flags | obj->verts.rec[vv[2]].flags;
+    if ((hf | vf) & MFTL_FLAG_VISITED)
+      for (int k = 0; k < 3; ++k) obj->verts.rec[vv[k]].flags &= ~MFTL_FLAG_DONE;
+  }
+}
+
+/**
+ * @brief Detect, split, collapse, compact, flip: the edge half of one iteration.
+ * @param         obj    The mesh.
+ * @param         params The parameter block.
+ * @param[in,out] st     Statistics.
+ * @param         gate   The spanning DONE rule.
+ * @param[out]    ops    {splits, collapses, flips}.
+ */
+static void edge_sweeps(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *st, bool gate, int ops[3])
+{
+  ops[0] = sweep_split(obj, params, gate);
+  ops[1] = sweep_collapse(obj, params, st, gate);
+
+  /* Unconditional, not "if anything died": the split sweep left the derived
+   * arrays invalid too, and MFTLRemeshCompactObject rebuilds them on the way
+   * out whether or not it moved anything. */
+  MFTLRemeshCompactObject(obj, st);
+
+  ops[2] = sweep_flip(obj, params, st, gate);
+  if (ops[2] > 0) MFTLObjectBuildDerived(obj);
+}
+
+/**
+ * @brief The iteration loop of MFTLRemeshIterate() and of the spanning ONCE mode.
+ * @param         obj        The mesh.
+ * @param         params     The parameter block.
+ * @param[in,out] st         Statistics.
+ * @param         iterations Outer iterations.
+ * @param         project    Project once after the last smoothing (the serial call).
+ * @param         once       The spanning DONE rules.
+ * @return Operations performed.
+ */
+static int iterate(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *st, int iterations, bool project, bool once)
 {
   int total_ops = 0;
 
@@ -241,18 +326,16 @@ int MFTLRemeshIterate(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFT
   if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
 
   /* Curvature sizing is computed by the CALLER (MFTLRemeshPrepareSizing()),
-   * because the spanning driver has to synchronise ghost copies before its
-   * convergence certificate reads them. */
+   * because the spanning driver computes it once per pass and carries it. */
   MFTL_ASSERT((params->sizing != MFTL_REMESH_SIZING_CURVATURE || obj->verts.has_sizing) &&
               "MFTLRemeshIterate: curvature sizing without verts.sizing -- MFTLRemeshPrepareSizing first");
 
-  /* The projection's reference: the mesh as THIS call received it, copied once
-   * and kept for every iteration -- re-copying it per iteration would make the
-   * call's own collapses part of the surface the smoother projects onto
-   * (remesh_project.c). Taken after the first feature detection, which decides
-   * which corners may lift; used by the last iteration's smoothing. */
+  /* The projection's reference: the mesh as THIS call received it, copied once,
+   * after the first feature detection, which decides which corners may lift;
+   * used once, after the last smoothing sweep (remesh_project.c). */
   MFTL_RemeshReference ref;
   bool have_ref = MFTL_FALSE;
+  project = project && params->projection == MFTL_REMESH_PROJECT_PHONG;
 
   for (int iter = 0; iter < iterations; ++iter)
   {
@@ -260,25 +343,18 @@ int MFTLRemeshIterate(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFT
 
     MFTLDetectFeatures(obj, params->feature_angle_threshold, params->feature_corner_angle, st);
 
-    if (iter == 0 && params->projection == MFTL_REMESH_PROJECT_PHONG)
+    if (iter == 0 && project)
     {
       const double t0 = MFTLRemeshWallTime();
-      MFTLRemeshReferenceBuild(&ref, obj);
+      MFTLRemeshReferenceFromObject(&ref, obj, params);
       have_ref = MFTL_TRUE;
       st->t_reference += MFTLRemeshWallTime() - t0;
       st->reference_bytes = MFTL_MAX(st->reference_bytes, ref.bytes);
     }
 
-    const int n_split = sweep_split(obj, params);
-    const int n_collapse = sweep_collapse(obj, params, st);
-
-    /* Unconditional, not "if anything died": the split sweep left the derived
-     * arrays invalid too, and MFTLRemeshCompactObject rebuilds them on the way
-     * out whether or not it moved anything. */
-    MFTLRemeshCompactObject(obj, st);
-
-    const int n_flip = sweep_flip(obj, params, st);
-    if (n_flip > 0) MFTLObjectBuildDerived(obj);
+    int ops[3];
+    edge_sweeps(obj, params, st, once, ops);
+    if (once) reopen_touched(obj);
 
     clear_visited(obj);
 
@@ -296,23 +372,52 @@ int MFTLRemeshIterate(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFT
      * operator maintaining it incrementally, which is the arrangement that leaves
      * a smoother three sweeps out of date. */
     MFTLDetectFeatures(obj, params->feature_angle_threshold, params->feature_corner_angle, st);
+    MFTLRemeshSmooth(obj, params, params->smooth_iterations, st);
 
-    /* The projection runs once per call: in the last smoothing sweep of the
-     * last iteration. Which iteration is the last is known here, because the
-     * convergence test below reads counts that are final already. */
-    const bool last_iteration = (iter == iterations - 1) || (n_split + n_collapse + n_flip <= params->min_convergence_ops);
-    MFTLRemeshSmooth(obj, params, params->smooth_iterations, (have_ref && last_iteration) ? &ref : MFTL_NULL, st);
+    st->n_split += ops[0];
+    st->n_collapse += ops[1];
+    st->n_flip += ops[2];
+    const int n_ops = ops[0] + ops[1] + ops[2];
+    total_ops += n_ops;
 
-    st->n_split += n_split;
-    st->n_collapse += n_collapse;
-    st->n_flip += n_flip;
-    total_ops += n_split + n_collapse + n_flip;
-
-    if (n_split + n_collapse + n_flip <= params->min_convergence_ops) break;
+    if (n_ops <= params->min_convergence_ops) break;
   }
 
-  if (have_ref) MFTLRemeshReferenceFree(&ref);
+  /* ONCE, after the call's last smoothing sweep: the smoother redistributes the
+   * vertices over all its sweeps and the projection then puts every free one
+   * back on the reference surface. Projecting after every sweep measured the
+   * same within the run-to-run spread at three times the cost
+   * (docs/analysis.md §14.10). */
+  if (have_ref)
+  {
+    MFTLRemeshProjectObject(obj, &ref, params, st);
+    MFTLRemeshReferenceFree(&ref);
+  }
   return total_ops;
+}
+
+int MFTLRemeshIterate(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *st, int iterations)
+{
+  return iterate(obj, params, st, iterations, MFTL_TRUE, MFTL_FALSE);
+}
+
+int MFTLRemeshIterateSpanning(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *st, int iterations, bool once)
+{
+  return iterate(obj, params, st, iterations, MFTL_FALSE, once);
+}
+
+int MFTLRemeshEdgeSweeps(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *st)
+{
+  if (obj->tris.n == 0) return 0;
+  if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
+  MFTLDetectFeatures(obj, params->feature_angle_threshold, params->feature_corner_angle, st);
+  int ops[3];
+  edge_sweeps(obj, params, st, MFTL_TRUE, ops);
+  clear_visited(obj);
+  st->n_split += ops[0];
+  st->n_collapse += ops[1];
+  st->n_flip += ops[2];
+  return ops[0] + ops[1] + ops[2];
 }
 
 int MFTLRemeshObject(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats)

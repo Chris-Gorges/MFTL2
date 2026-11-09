@@ -61,6 +61,8 @@
  *     -dt step      timestep                          (default 0.02)
  *     -steps N      stop after N steps                (default: all of T)
  *     -strategy S   auto | spanning | dispersed       (default spanning)
+ *     -spanning M   once | nested: how the spanning driver nests placements and
+ *                   iterations (default once; MFTL_RemeshSpanningMode)
  *     -sizing M     uniform | curvature (default uniform):
  *                   curvature refines below the start resolution where the
  *                   radius of curvature falls under about 8 edges
@@ -83,10 +85,10 @@
  *     -quiet        final summary only
  *     -digest       print the bitwise mesh digest each step
  *     -smooth N     smoothing sweeps per iteration       (default 3)
- *     -iterations N outer iterations per remesh (per placement in
- *                   the phase driver)                   (default 3)
+ *     -iterations N outer iterations per remesh, whichever driver
+ *                   does it                             (default 3)
  *     -forceparallel  take the phase driver even at nproc == 1
- *     -budget N     cap the phase count per remesh       (default 32)
+ *     -budget N     cap on the placements per remesh (default 8: the table)
  *     -vtu          write leveque_par_%04d.vtu
  *     -noremesh     advect only: the baseline that separates the time
  *                   integration's error from the remesher's
@@ -544,6 +546,7 @@ int main(int argc, char *argv[])
   int smooth_iterations = 3;
   int iterations = 3;
   MFTL_RemeshParallelStrategy strategy = MFTL_REMESH_PARALLEL_SPANNING;
+  MFTL_RemeshSpanningMode spanning_mode = MFTL_REMESH_SPANNING_ONCE;
   MFTL_RemeshSizing sizing = MFTL_REMESH_SIZING_UNIFORM;
   MFTL_RemeshPlacement split_placement = MFTL_REMESH_PLACE_MIDPOINT;
   MFTL_RemeshPlacement collapse_placement = MFTL_REMESH_PLACE_MIDPOINT;
@@ -658,6 +661,19 @@ int main(int argc, char *argv[])
       noise_eps = atof(argv[++i]);
     else if (!strcmp(argv[i], "-field") && i + 1 < argc)
       g_rotation_field = !strcmp(argv[++i], "rotation");
+    else if (!strcmp(argv[i], "-spanning") && i + 1 < argc)
+    {
+      const char *v = argv[++i];
+      if (!strcmp(v, "once"))
+        spanning_mode = MFTL_REMESH_SPANNING_ONCE;
+      else if (!strcmp(v, "nested"))
+        spanning_mode = MFTL_REMESH_SPANNING_NESTED;
+      else
+      {
+        if (rank == 0) fprintf(stderr, "unknown spanning mode: %s\n", v);
+        MPI_Abort(MPI_COMM_WORLD, 1);
+      }
+    }
     else if (!strcmp(argv[i], "-strategy") && i + 1 < argc)
     {
       const char *v = argv[++i];
@@ -751,6 +767,7 @@ int main(int argc, char *argv[])
   MFTLInitRemeshParams(&params, MFTL_REMESH_ISOTROPIC, target, iterations, MFTL_SMOOTH_TRIANGLE_BASED, feature_angle);
   params.smooth_iterations = smooth_iterations;
   params.parallel_strategy = strategy;
+  params.spanning_mode = spanning_mode;
   if (phase_budget > 0) params.parallel_phase_budget = phase_budget;
 
   /* The start resolution is the coarsest target; see the usage block. */
@@ -790,10 +807,10 @@ int main(int argc, char *argv[])
     printf("#   sphere r=0.15 at (0.35,0.35,0.35), %d refinements -> %.0f triangles\n", refinements, r0.n_tri);
     printf("#   target edge %.5f  (band %.5f .. %.5f)   T=%.2f dt=%.3f  remesh every %d step(s)\n", target, params.min_edge_length,
            params.max_edge_length, T, dt, remesh_every);
-    printf("#   strategy %s   feature angle %.1f%s\n", (strategy == MFTL_REMESH_PARALLEL_AUTO)        ? "AUTO"
-                                                       : (strategy == MFTL_REMESH_PARALLEL_SPANNING) ? "SPANNING"
-                                                                                                     : "DISPERSED",
-           feature_angle, (feature_angle >= 180.0) ? " (detection DISABLED)" : "");
+    printf("#   strategy %s (spanning mode %s)   feature angle %.1f%s\n", (strategy == MFTL_REMESH_PARALLEL_AUTO)        ? "AUTO"
+                                                                         : (strategy == MFTL_REMESH_PARALLEL_SPANNING) ? "SPANNING"
+                                                                                                                       : "DISPERSED",
+           (spanning_mode == MFTL_REMESH_SPANNING_NESTED) ? "nested" : "once", feature_angle, (feature_angle >= 180.0) ? " (detection DISABLED)" : "");
     printf("#   band precondition: h_min=%.4f %s 4*delta=%.4f%s\n", h_min, (h_min > 4.0 * delta) ? ">" : "<=", 4.0 * delta,
            (coarsen_g > 1) ? "   *** VIOLATED ***" : "");
     if (coarsen_g > 1)

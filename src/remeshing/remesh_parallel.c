@@ -315,59 +315,115 @@ static bool owns_edge_count(const MFTL_Object *obj, int h)
 }
 
 /**
- * @brief The convergence certificate: out-of-band edges that THIS placement of
- *        the cut planes hides from every rank, split by the operator that
- *        would fix them.
+ * @brief The certificate: out-of-band edges no placement of this pass (NESTED:
+ *        of this iteration) has offered since anything at them last moved --
+ *        those the DONE rule does not block (done_blocks() in remesh_driver.c:
+ *        the half-edge and both ends #MFTL_FLAG_DONE) -- split by the operator
+ *        that would fix them.
  *
- * Needs no fan walk, so a rank's partial view of a neighbour's one-ring cannot
- * give it a wrong answer (unlike counting "approved, then refused by the gate";
- * see sweep_split in remesh_driver.c). An edge is hidden when its operator's
- * gate refuses it: a split is gated by the two incident TRIANGLES
- * (freeze_blocks_pair), a collapse by the two endpoint VERTICES
- * (freeze_blocks_collapse). The vertex-frozen set strictly contains the
- * triangle-frozen one, so testing long edges with the vertex rule would
- * over-report and suppress the fast exit.
+ * Counted after a placement's sweeps and DONE marking. An edge both of whose
+ * endpoints were unfrozen in one placement was offered there, every iteration,
+ * and only such an edge carries the flag (two DONE ends are not enough: they
+ * may have been unfrozen in two different placements),
+ * and an edge declined on merit (a collapse the link condition refuses) counts
+ * as offered, exactly as in a serial call; so zero means every region received
+ * its serial call and no further placement can find work. It needs no fan walk,
+ * so a partial view of a neighbour's one-ring cannot give it a wrong answer, and
+ * each undirected edge is counted by one rank (owns_edge_count()). New entities
+ * carry provisional ids at this point, but an edge between an owned and a ghost
+ * triangle never involves one: an operation creates only unreplicated entities.
  *
- * `hidden_long` is EXACT. If it is zero and no rank performed an operation,
- * every long edge had both incident triangles unfrozen on the rank counting it,
- * hence owned (every ghost is frozen); the split sweep reached it and
- * MFTLSplitApproved() refuses only DEAD, VISITED or non-canonical edges, both
- * flags being clear at measurement time -- so it would have been split,
- * contradiction. `hidden_short` is not exact: a collapse can be refused on
- * merit in both directions (link condition, wing valence, stretch, feature
- * rules), and such an edge stays hidden forever -- the false alarm the silent-streak exit absorbs. An edge no
- * placement ever offers (the \f$h \le 4\delta\f$ failure) is counted in every
- * phase.
- *
- * Called BEFORE the sweeps: in the converged regime, the only one whose value is
- * read, the sweeps change nothing; afterwards, new entities would carry
- * provisional ids that the cross-rank attribution rule cannot compare.
- *
- * @param      obj          The mesh.
- * @param      params       Supplies the length band.
- * @param[out] hidden_long  Out-of-band LONG edges hidden by the split gate.
- * @param[out] hidden_short Out-of-band SHORT edges hidden by the collapse gate.
+ * @param      obj     The mesh.
+ * @param      params  Supplies the length band.
+ * @param[out] n_long  Unoffered edges a split wants.
+ * @param[out] n_short Unoffered edges a collapse wants.
  */
-static void count_hidden_edges(const MFTL_Object *obj, const MFTL_RemeshParameters *params, int *hidden_long, int *hidden_short)
+static void count_unoffered_edges(const MFTL_Object *obj, const MFTL_RemeshParameters *params, int *n_long, int *n_short)
 {
   const int n_he = 3 * obj->tris.n;
+  const MFTL_Vertex *const vr = obj->verts.rec;
 
   for (int h = 0; h < n_he; ++h)
   {
     if (!owns_edge_count(obj, h)) continue;
+    if (obj->tris.he[h].flags & vr[MFTLHeOrigin(obj, h)].flags & vr[obj->tris.he[h].vertex_idx].flags & MFTL_FLAG_DONE) continue;
 
     /* The operators' own predicates, so "long" here is exactly what the split
-     * sweep would split -- the property the exactness of hidden_long rests on.
-     * Under curvature sizing they read ghost targets, which is why the phase
-     * synchronises them first (MFTLRemeshSyncGhostSizing()). */
+     * sweep would split. Under curvature sizing they read ghost targets, which the
+     * carried field keeps equal to their owners'. */
     if (MFTLRemeshEdgeWantsSplit(obj, h, params))
-    {
-      if (freeze_blocks_pair(obj, h)) (*hidden_long)++;
-    }
+      (*n_long)++;
     else if (MFTLRemeshEdgeWantsCollapse(obj, h, params))
+      (*n_short)++;
+  }
+}
+
+/**
+ * @brief Marks DONE every owned live vertex this placement left unfrozen (its
+ *        smoothing is done) and every half-edge both of whose ends it left
+ *        unfrozen (split, collapse and flip were all offered).
+ *
+ * An unfrozen vertex has no copy on any other rank, and an edge between two of
+ * them lies in two owned, unreplicated triangles, so every bit is set where the
+ * record is unique and every later copy inherits it. Called after the sweeps,
+ * so the edges a placement's own operations made are marked too.
+ *
+ * @param ens The ensemble.
+ */
+static void mark_done(MFTL_Ensemble *ens)
+{
+  const int idle = MFTL_FLAG_FROZEN | MFTL_FLAG_DEAD;
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    MFTL_Object *const obj = ens->local_objects[o];
+    MFTL_Vertex *const vr = obj->verts.rec;
+    for (int t = 0; t < obj->tris.n_local; ++t)
     {
-      if (freeze_blocks_collapse(obj, h)) (*hidden_short)++;
+      if (obj->tris.rec[t].flags & MFTL_FLAG_DEAD) continue;
+      for (int k = 0; k < 3; ++k)
+      {
+        const int h = 3 * t + k;
+        if (!((vr[MFTLHeOrigin(obj, h)].flags | vr[obj->tris.he[h].vertex_idx].flags) & idle)) obj->tris.he[h].flags |= MFTL_FLAG_DONE;
+      }
     }
+    for (int v = 0; v < obj->verts.n_local; ++v)
+      if (!(vr[v].flags & idle)) vr[v].flags |= MFTL_FLAG_DONE;
+  }
+}
+
+/**
+ * @brief Clears #MFTL_FLAG_DONE on every copy this rank holds; every rank clears
+ *        its own, so the copies agree.
+ * @param ens The ensemble.
+ */
+static void clear_done(MFTL_Ensemble *ens)
+{
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    MFTL_Object *const obj = ens->local_objects[o];
+    for (int v = 0; v < obj->verts.n; ++v) obj->verts.rec[v].flags &= ~MFTL_FLAG_DONE;
+    for (int h = 0; h < 3 * obj->tris.n; ++h) obj->tris.he[h].flags &= ~MFTL_FLAG_DONE;
+  }
+}
+
+/**
+ * @brief NESTED smoothing: only ghosts are frozen. Every owned vertex may move,
+ *        and a ghost-position exchange after each sweep keeps the copies exact.
+ * @param ens The ensemble.
+ */
+static void freeze_ghosts_only(MFTL_Ensemble *ens)
+{
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    MFTL_Object *const obj = ens->local_objects[o];
+    for (int v = 0; v < obj->verts.n; ++v)
+    {
+      if (v < obj->verts.n_local)
+        obj->verts.rec[v].flags &= ~MFTL_FLAG_FROZEN;
+      else
+        obj->verts.rec[v].flags |= MFTL_FLAG_FROZEN;
+    }
+    MFTLObjectMarkPartitionDirty(obj);
   }
 }
 
@@ -382,8 +438,9 @@ static void clear_frozen(MFTL_Ensemble *ens)
   for (int o = 0; o < ens->n_local_objects; ++o)
   {
     MFTL_Object *const obj = ens->local_objects[o];
-    for (int v = 0; v < obj->verts.n; ++v) obj->verts.rec[v].flags &= ~MFTL_FLAG_FROZEN;
+    for (int v = 0; v < obj->verts.n; ++v) obj->verts.rec[v].flags &= ~(MFTL_FLAG_FROZEN | MFTL_FLAG_DONE);
     for (int t = 0; t < obj->tris.n; ++t) obj->tris.rec[t].flags &= ~MFTL_FLAG_FROZEN;
+    for (int h = 0; h < 3 * obj->tris.n; ++h) obj->tris.he[h].flags &= ~MFTL_FLAG_DONE;
   }
 }
 
@@ -1306,16 +1363,20 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
   }
   st->n_coarse_groups = group[0] * group[1] * group[2];
 
-  gid_scratch gid;
-  /* Indexed by LOCAL SLOT and re-sized per phase, because a migration changes how
-   * many bodies this rank holds. */
-  gid_scratch_init(&gid);
-
-  /* One arena for every migration this pass makes, grown once and reused: a
-   * pass migrates up to `budget` times, and re-allocating a destination array
-   * per entity per phase would pay the first-touch faults every phase. */
-  MFTL_RemeshMigrator mig;
-  MFTLRemeshMigratorInit(&mig);
+  /* ── NESTED moves replicated vertices when it smooths ─────────────────────
+   * A smoothing sweep that moves a vertex another rank holds a copy of cannot
+   * transfer attached fields exactly: the fluxes across the partition boundary
+   * would be computed by two ranks from different positions. The registry is
+   * collective state, so every rank refuses alike. */
+  if (params->spanning_mode == MFTL_REMESH_SPANNING_NESTED && (ens->fields.stride[0] || ens->fields.stride[1]))
+  {
+    if (dom->rank == 0)
+      fprintf(stderr,
+              "[MFTL] MFTLRemeshEnsemble: the NESTED spanning mode cannot transfer attached fields across a partition; use "
+              "MFTL_REMESH_SPANNING_ONCE.\n");
+    clear_frozen(ens);
+    return MFTL_ERROR;
+  }
 
   /* ── How many of the eight placements are actually DIFFERENT? ────────────
    *
@@ -1327,12 +1388,10 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
    * That matters twice, and neither was accounted for before. A repeated
    * placement migrates nothing (which the identity check now catches) but still
    * pays a full set of sweeps and a collective for a phase that cannot discover
-   * anything new -- the frozen set is identical. And the convergence streak
-   * demanded eight consecutive silent placements, i.e. eight proofs of a
-   * statement that two placements already prove on a slab decomposition.
+   * anything new -- the frozen set is identical -- and a budget counted in table
+   * entries would be spent on repeats.
    *
-   * So the table is deduplicated, in its existing order, and the streak length
-   * becomes the number of distinct entries. Keeping first occurrences preserves
+   * So the table is deduplicated, in its existing order. Keeping first occurrences preserves
    * the ordering the table was built with -- slabs first, then the even-parity
    * set, then the rest -- which is what makes a small budget spend itself on the
    * placements that matter most. */
@@ -1360,219 +1419,250 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
   }
   st->n_distinct_placements = n_distinct;
 
-  const int budget = (params->parallel_phase_budget > 0) ? params->parallel_phase_budget : 4 * MFTL_REMESH_NUM_PHASES;
-
-  int clean_streak = 0;
   int status = MFTL_SUCCESS;
+  const int budget = (params->parallel_phase_budget > 0) ? params->parallel_phase_budget : MFTL_REMESH_NUM_PHASES;
 
   /* {widest frozen band seen, longest owned edge seen}, local running maxima.
    * See local_band_probe. */
   double band_probe[2] = {0.0, 0.0};
 
-  for (int p = 0; p < budget; ++p)
+  /* ── What is done ONCE per pass, as in one serial call ────────────────────
+   *
+   * The pool order every rank starts from, so that a pass is a function of the
+   * mesh and not of how a redistribution assembled it. The curvature field,
+   * computed on the input and CARRIED through every migration
+   * (MFTL_RemeshMigrator::carry_sizing) -- recomputing it after each migration
+   * read a part-remeshed mesh. And the projection reference, the input surface,
+   * kept where every vertex can reach it at the end (remesh_project.c). The
+   * kernel calls below never project (MFTLRemeshIterateSpanning()); the pass
+   * does, once, after the closing redistribution. */
+  for (int o = 0; o < ens->n_local_objects; ++o) MFTLObjectCanonicalOrder(ens->local_objects[o]);
+  clear_done(ens);
+
+  gid_scratch gid;
+  /* Indexed by LOCAL SLOT and re-sized per phase, because a migration changes how
+   * many bodies this rank holds. */
+  gid_scratch_init(&gid);
+
+  /* One arena for every migration this pass makes, grown once and reused: a
+   * pass migrates once per placement, and re-allocating a destination array per
+   * entity per phase would pay the first-touch faults every phase. */
+  MFTL_RemeshMigrator mig;
+  MFTLRemeshMigratorInit(&mig);
+  mig.carry_sizing = (params->sizing == MFTL_REMESH_SIZING_CURVATURE);
+
+  if (params->sizing == MFTL_REMESH_SIZING_CURVATURE)
   {
-    st->n_phases = p + 1;
-
-    /* ── 1. Move the planes, then move the mesh to match ────────────────────
-     *
-     * The phase index comes from a compile-time table and the loop counter,
-     * never from geometry -- which is what guarantees every rank places the
-     * planes identically. MFTLRemeshPhaseShift contains no MPI, so nothing could
-     * detect a disagreement, and a disagreement makes ownership ambiguous rather
-     * than merely suboptimal.
-     *
-     * The shift reaches the redistribution as an OWNER MAP and not as a mutated
-     * domain: `MFTL_Domain` is read-only during a redistribution, and the
-     * production ownership rule (MFTLGetOwnerProc) has no idea any of this
-     * exists. See remesh_comm.h. */
-    double shift[3];
-    MFTLRemeshPhaseShift(dom, group, MFTL_REMESH_PHASES[distinct[p % n_distinct]], shift);
-
-    if (p > 0)  // phase 0's was taken before the pre-pass
-    {
-      t_mark = MFTLRemeshWallTime();
-      MFTLEnsembleComputeTriangleGeometry(ens);
-      st->t_geometry += MFTLRemeshWallTime() - t_mark;
-    }
-
     t_mark = MFTLRemeshWallTime();
-    MFTL_RemeshMigrationReport mig_report;
-    if (MFTLRemeshMigrateShifted(&mig, ens, group, shift, &mig_report) != MFTL_SUCCESS)
-    {
-      /* Every later phase would run on a partition nobody agrees about, and the
-       * closing sequence would renumber ids against it. Stop here and report. */
-      status = MFTL_ERROR;
-      break;
-    }
-    st->t_migrate += MFTLRemeshWallTime() - t_mark;
-    st->n_entities_migrated += mig_report.n_moved;
-    if (mig_report.performed)
-      st->n_migrations++;
-    else
-      st->n_migrations_skipped++;
-
-    /* ── 1b. The curvature sizing field of this placement ───────────────────
-     * Computed on the mesh the migration produced, because a redistribution
-     * does not carry it. Exact on owned vertices (one-ring, vertex-complete
-     * halo); the ghost copies are then made the owners' values, because the
-     * certificate below judges frozen edges, whose ends may be ghosts. Two
-     * exchanges: the neighbour average of feature vertices reads neighbours.
-     * The mode is agreed, so every rank takes this branch or none does. */
-    if (params->sizing == MFTL_REMESH_SIZING_CURVATURE)
-    {
-      t_mark = MFTLRemeshWallTime();
-      if (MFTLRemeshEnsemblePrepareSizing(ens, params) != MFTL_SUCCESS) status = MFTL_ERROR;
-      st->t_freeze += MFTLRemeshWallTime() - t_mark;
-    }
-
-    /* ── 2. Who may this rank touch? ────────────────────────────────────────
-     * Local, exact, and read straight off the partition the migration produced.
-     * Nothing here communicates. */
-    t_mark = MFTLRemeshWallTime();
-    int extra[MFTL_REMESH_EXTRA_INTS] = {0};
-    for (int o = 0; o < ens->n_local_objects; ++o)
-    {
-      MFTLRemeshMarkFrozen(ens->local_objects[o]);
-      MFTLDilateFrozenBand(ens->local_objects[o], params->freeze_dilation_rings);
-      count_hidden_edges(ens->local_objects[o], params, &extra[MFTL_REMESH_EXTRA_HIDDEN_LONG], &extra[MFTL_REMESH_EXTRA_HIDDEN_SHORT]);
-    }
-
-    /* A RUNNING MAXIMUM over every phase, accumulated locally and reduced once on
-     * the way out. Measuring only the first phase was the obvious cheap thing and
-     * it is wrong in one direction that matters: a COARSENING pass makes the mesh
-     * longer-edged as it runs, so the band grows, and phase 0 understates it. On
-     * the [-1,1]^3 fixture at target 0.40 the first phase reports 0.216 and the
-     * band actually reaches 0.375 -- which is the difference between "the
-     * precondition holds" and the pass genuinely failing to offer everything.
-     *
-     * Costing nothing extra is what makes the running maximum affordable: the
-     * two doubles ride the profile reduction at the end of the call, so the pass
-     * pays no collective for them at all. */
-    for (int o = 0; o < ens->n_local_objects; ++o) local_band_probe(ens->local_objects[o], dom, shift, band_probe);
+    if (MFTLRemeshEnsemblePrepareSizing(ens, params) != MFTL_SUCCESS) status = MFTL_ERROR;
     st->t_freeze += MFTLRemeshWallTime() - t_mark;
+  }
 
-    /* The id counters BEFORE the sweeps -- everything at or above these was
-     * created by this phase, which is how step 4 finds them without the
-     * operators having to keep a list. */
-    gid_scratch_reserve(&gid, ens->n_local_objects);
-    for (int o = 0; o < ens->n_local_objects; ++o)
+  const bool project = (params->projection == MFTL_REMESH_PROJECT_PHONG);
+  MFTL_RemeshReferenceSet refs;
+  memset(&refs, 0, sizeof refs);
+  if (project && MFTLRemeshEnsembleReferenceBuild(ens, params, &refs, st) != MFTL_SUCCESS) status = MFTL_ERROR;
+
+  /* ── One placement: move the planes, move the mesh, freeze, record ids ──── */
+#define SPANNING_ENTER_PLACEMENT(entry, first)                                                          \
+  do                                                                                                    \
+  {                                                                                                     \
+    double shift_[3];                                                                                   \
+    MFTLRemeshPhaseShift(dom, group, MFTL_REMESH_PHASES[(entry)], shift_);                              \
+    if (!(first))                                                                                       \
+    {                                                                                                   \
+      t_mark = MFTLRemeshWallTime();                                                                    \
+      MFTLEnsembleComputeTriangleGeometry(ens);                                                         \
+      st->t_geometry += MFTLRemeshWallTime() - t_mark;                                                  \
+    }                                                                                                   \
+    t_mark = MFTLRemeshWallTime();                                                                      \
+    MFTL_RemeshMigrationReport rep_;                                                                    \
+    if (MFTLRemeshMigrateShifted(&mig, ens, group, shift_, &rep_) != MFTL_SUCCESS) status = MFTL_ERROR; \
+    st->t_migrate += MFTLRemeshWallTime() - t_mark;                                                     \
+    st->n_entities_migrated += rep_.n_moved;                                                            \
+    if (rep_.performed)                                                                                 \
+      st->n_migrations++;                                                                               \
+    else                                                                                                \
+      st->n_migrations_skipped++;                                                                       \
+    st->n_phases++;                                                                                     \
+    t_mark = MFTLRemeshWallTime();                                                                      \
+    for (int o_ = 0; o_ < ens->n_local_objects; ++o_)                                                   \
+    {                                                                                                   \
+      MFTLRemeshMarkFrozen(ens->local_objects[o_]);                                                     \
+      MFTLDilateFrozenBand(ens->local_objects[o_], params->freeze_dilation_rings);                      \
+      local_band_probe(ens->local_objects[o_], dom, shift_, band_probe);                                \
+    }                                                                                                   \
+    st->t_freeze += MFTLRemeshWallTime() - t_mark;                                                      \
+    gid_scratch_reserve(&gid, ens->n_local_objects);                                                    \
+    for (int o_ = 0; o_ < ens->n_local_objects; ++o_)                                                   \
+    {                                                                                                   \
+      gid.watermark[2 * o_ + 0] = ens->local_objects[o_]->next_vertex_gid;                              \
+      gid.watermark[2 * o_ + 1] = ens->local_objects[o_]->next_triangle_gid;                            \
+    }                                                                                                   \
+  } while (0)
+
+  /* ── One placement's verdict: ids for what it created, and what is left ─── */
+#define SPANNING_LEAVE_PLACEMENT(local_ops, extra)                                                                                              \
+  do                                                                                                                                            \
+  {                                                                                                                                             \
+    mark_done(ens);                                                                                                                             \
+    (extra)[MFTL_REMESH_EXTRA_OPS] = (local_ops);                                                                                               \
+    (extra)[MFTL_REMESH_EXTRA_HIDDEN_LONG] = (extra)[MFTL_REMESH_EXTRA_HIDDEN_SHORT] = 0;                                                       \
+    for (int o_ = 0; o_ < ens->n_local_objects; ++o_)                                                                                           \
+      count_unoffered_edges(ens->local_objects[o_], params, &(extra)[MFTL_REMESH_EXTRA_HIDDEN_LONG], &(extra)[MFTL_REMESH_EXTRA_HIDDEN_SHORT]); \
+    t_mark = MFTLRemeshWallTime();                                                                                                              \
+    assign_phase_gids(ens, &gid, (extra));                                                                                                      \
+    st->t_reduce += MFTLRemeshWallTime() - t_mark;                                                                                              \
+    st->n_edges_hidden_long = (extra)[MFTL_REMESH_EXTRA_HIDDEN_LONG];                                                                           \
+    st->n_edges_hidden_short = (extra)[MFTL_REMESH_EXTRA_HIDDEN_SHORT];                                                                         \
+    st->n_edges_hidden = st->n_edges_hidden_long + st->n_edges_hidden_short;                                                                    \
+  } while (0)
+
+  if (params->spanning_mode != MFTL_REMESH_SPANNING_NESTED)
+  {
+    /* ── ONCE: placements outermost, each region gets the whole serial call ──
+     *
+     * In the first placement in which a region is unfrozen it receives every
+     * iteration -- split, collapse, flip and the smoothing sweeps -- and its
+     * vertices are then DONE: later placements neither offer an edge between two
+     * DONE vertices nor smooth a DONE vertex, except the corners of what one of
+     * their own operations touched. Before this mode existed every placement
+     * re-ran the whole call over its interior, so a vertex far from every plane
+     * was smoothed about 30 times per call instead of 9, and the parallel answer
+     * was biased by as much (docs/analysis.md §5.8). */
+    for (int p = 0; p < budget && status == MFTL_SUCCESS; ++p)
     {
-      const MFTL_Object *const obj = ens->local_objects[o];
-      gid.watermark[2 * o + 0] = obj->next_vertex_gid;
-      gid.watermark[2 * o + 1] = obj->next_triangle_gid;
-    }
+      SPANNING_ENTER_PLACEMENT(distinct[p % n_distinct], MFTL_FALSE);
 
-    /* ── 3. The untouched serial kernel, on the interior ────────────────────
-     *
-     * The FULL iteration count, not one iteration. Within a phase the frozen set
-     * is fixed, so the interior can be converged completely before there is any
-     * reason to pay for another migration -- which is what keeps the migration
-     * count proportional to the number of PHASES rather than to the number of
-     * remeshing iterations. */
-    t_mark = MFTLRemeshWallTime();
-    int local_ops = 0;
-
-    for (int o = 0; o < ens->n_local_objects; ++o)
-    {
-      MFTL_RemeshStats one;
-      memset(&one, 0, sizeof(one));
-
-      local_ops += MFTLRemeshIterate(ens->local_objects[o], params, &one, params->iterations);
-      remesh_stats_accumulate(st, &one);
-    }
-    st->t_sweep += MFTLRemeshWallTime() - t_mark;
-    extra[MFTL_REMESH_EXTRA_OPS] = local_ops;
-
-    /* ── 4. Globally unique ids for what the sweeps created, and the verdict ─
-     *
-     * The per-body id prefix sums over the holders, then the 3-int convergence
-     * Allreduce: the ids because the next migration identifies entities by
-     * them, the counters because the loop cannot end without them. */
-    t_mark = MFTLRemeshWallTime();
-    assign_phase_gids(ens, &gid, extra);
-    st->t_reduce += MFTLRemeshWallTime() - t_mark;
-
-    const int global_ops = extra[MFTL_REMESH_EXTRA_OPS];
-    const int global_hidden_long = extra[MFTL_REMESH_EXTRA_HIDDEN_LONG];
-    const int global_hidden_short = extra[MFTL_REMESH_EXTRA_HIDDEN_SHORT];
-    const int global_hidden = global_hidden_long + global_hidden_short;
-
-    /* Reported as the GLOBAL residual of the last phase, not as a sum over
-     * phases: the useful question is "what is this placement still hiding", and
-     * a sum answers "was anything ever late", which is normal and
-     * uninformative. */
-    st->n_edges_hidden = global_hidden;
-    st->n_edges_hidden_long = global_hidden_long;
-    st->n_edges_hidden_short = global_hidden_short;
-
-    /* ── 5. Converge ────────────────────────────────────────────────────────
-     *
-     * TWO exits, and the second is what makes the first safe to be fast.
-     *
-     * FAST, and a complete proof on its own: nothing was performed anywhere AND
-     * no out-of-band edge had a frozen endpoint. The second half is the
-     * interesting one -- it says every edge outside the length band was OFFERED
-     * to a rank that was allowed to act on it, and the first half says that rank
-     * declined. Declining is the approval predicates doing their job (a short
-     * edge the link condition may not collapse stays short), so there is nothing
-     * left for another placement to reveal.
-     *
-     * SLOW, for when the fast one keeps missing: a full table of consecutive
-     * silent placements. `hidden_short` has false-alarm modes -- an out-of-band
-     * edge that no operator would fix anyway, sitting on this placement's band --
-     * and such an edge would otherwise keep the driver running to its budget and
-     * then report a convergence failure that is not one. `n_distinct` silent
-     * placements is a covering set by construction: with h > 4*delta every
-     * entity is interior in at least one of them, and it was silent there. It is
-     * n_distinct rather than eight because two table entries that differ only on
-     * an uncut axis are the same placement and prove the same thing twice.
-     *
-     * The cost of the slow exit is up to n_distinct quiet phases, and a quiet
-     * phase is cheap by the same token -- MFTLRemeshIterate breaks out after its
-     * first iteration when that iteration performs nothing, and the migration in
-     * front of it is skipped when the placement is the one already in force. */
-    if (global_ops == 0 && global_hidden == 0)
-    {
-      st->converged = MFTL_TRUE;
-      break;
-    }
-
-    if (global_ops == 0)
-    {
-      /* The streak may only certify while the EXACT half of the certificate is
-       * clean. `hidden_long` has no false alarms -- a long edge offered to any
-       * rank is split, unconditionally -- so a non-zero value is a placement
-       * genuinely failing to reach work, and eight silent phases say nothing
-       * about it. `hidden_short` is the one that legitimately never clears, and
-       * it is the one the streak exists to absorb.
-       *
-       * Before this test the streak absorbed both, which is how the driver could
-       * report converged alongside dozens of permanently hidden edges. */
-      if (global_hidden_long != 0)
+      t_mark = MFTLRemeshWallTime();
+      int local_ops = 0;
+      for (int o = 0; o < ens->n_local_objects; ++o)
       {
-        /* Silent, but with work this placement is known to be hiding. Not
-         * evidence, and it RESETS rather than merely failing to count: the
-         * covering argument is about CONSECUTIVE placements, so a streak
-         * assembled from phases either side of a blocked one would not cover. */
-        clean_streak = 0;
+        MFTL_RemeshStats one;
+        memset(&one, 0, sizeof(one));
+        local_ops += MFTLRemeshIterateSpanning(ens->local_objects[o], params, &one, params->iterations, MFTL_TRUE);
+        remesh_stats_accumulate(st, &one);
       }
-      else if (++clean_streak >= n_distinct)
+      st->t_sweep += MFTLRemeshWallTime() - t_mark;
+
+      int extra[MFTL_REMESH_EXTRA_INTS];
+      SPANNING_LEAVE_PLACEMENT(local_ops, extra);
+      if (st->n_edges_hidden == 0)
       {
         st->converged = MFTL_TRUE;
         break;
       }
     }
-    else
+
+    /* The vertices no placement unfroze -- the band of every placement that
+     * ran, i.e. of the FIRST one, around the canonical planes, when it already
+     * offered every out-of-band edge, which on a mildly deforming front is most
+     * calls -- still get the call's smoothing, where they are: every rank
+     * smooths its owned vertices that are not DONE with the ghosts held, and a
+     * ghost-position exchange follows each sweep (the nested mode's machinery).
+     * Without it the same band was never smoothed, and in a straining flow the
+     * serial call restores exactly, the minimum quality fell with the rank
+     * count (0.935 / 0.925 / 0.907 at np = 2 / 4 / 8 against 0.932 serially)
+     * and the volume loss grew. Skipped, by an agreed count, when every vertex
+     * is DONE. */
+    if (status == MFTL_SUCCESS)
     {
-      clean_streak = 0;
+      int left[1] = {0};
+      for (int o = 0; o < ens->n_local_objects; ++o)
+      {
+        const MFTL_Object *const obj = ens->local_objects[o];
+        for (int v = 0; v < obj->verts.n_local; ++v) left[0] += !(obj->verts.rec[v].flags & (MFTL_FLAG_DEAD | MFTL_FLAG_DONE | MFTL_FLAG_CORNER));
+      }
+      t_mark = MFTLRemeshWallTime();
+      MFTLRemeshSumInts(dom, left, 1);
+      st->t_reduce += MFTLRemeshWallTime() - t_mark;
+      if (left[0] > 0)
+      {
+        t_mark = MFTLRemeshWallTime();
+        for (int o = 0; o < ens->n_local_objects; ++o)
+          MFTLDetectFeatures(ens->local_objects[o], params->feature_angle_threshold, params->feature_corner_angle, st);
+        for (int sw = 0; sw < params->iterations * params->smooth_iterations && status == MFTL_SUCCESS; ++sw)
+        {
+          freeze_ghosts_only(ens);
+          for (int o = 0; o < ens->n_local_objects; ++o) MFTLRemeshSmooth(ens->local_objects[o], params, 1, st);
+          if (MFTLRemeshSyncGhostPositions(ens) != MFTL_SUCCESS) status = MFTL_ERROR;
+        }
+        st->t_sweep += MFTLRemeshWallTime() - t_mark;
+      }
     }
   }
+  else
+  {
+    /* ── NESTED: iterations outermost ─────────────────────────────────────
+     *
+     * Per iteration the placements perform only split, collapse and flip, each
+     * edge offered once (DONE is per iteration), and stop as soon as nothing is
+     * left unoffered; then EVERY owned vertex is smoothed on the partition the
+     * last placement left, with a ghost-position exchange after each sweep.
+     * Smoothing is a vertex operation: it needs a complete one-ring, which the
+     * halo guarantees on any partition, and current ghosts -- not a frozen band.
+     * The order of the placements alternates between iterations, so the last of
+     * one is the first of the next and its migration is skipped. */
+    const int per = MFTL_MIN(n_distinct, budget);
+    for (int it = 0; it < params->iterations && status == MFTL_SUCCESS; ++it)
+    {
+      st->iterations = it + 1;
+      clear_done(ens);
+      int it_ops = 0;
+      bool covered = MFTL_FALSE;
 
-  /* ── 6. Hand the mesh back the way the flow solver expects it ─────────────
+      for (int q = 0; q < per && status == MFTL_SUCCESS; ++q)
+      {
+        SPANNING_ENTER_PLACEMENT(distinct[(it % 2 == 0) ? q : per - 1 - q], MFTL_FALSE);
+
+        t_mark = MFTLRemeshWallTime();
+        int local_ops = 0;
+        for (int o = 0; o < ens->n_local_objects; ++o)
+        {
+          MFTL_RemeshStats one;
+          memset(&one, 0, sizeof(one));
+          local_ops += MFTLRemeshEdgeSweeps(ens->local_objects[o], params, &one);
+          remesh_stats_accumulate(st, &one);
+        }
+        st->t_sweep += MFTLRemeshWallTime() - t_mark;
+
+        int extra[MFTL_REMESH_EXTRA_INTS];
+        SPANNING_LEAVE_PLACEMENT(local_ops, extra);
+        it_ops += extra[MFTL_REMESH_EXTRA_OPS];
+        if (st->n_edges_hidden == 0)
+        {
+          covered = MFTL_TRUE;
+          break;
+        }
+      }
+      st->converged = covered;
+
+      /* The smoothing of this iteration, everywhere at once. */
+      t_mark = MFTLRemeshWallTime();
+      clear_done(ens);
+      for (int o = 0; o < ens->n_local_objects; ++o)
+        MFTLDetectFeatures(ens->local_objects[o], params->feature_angle_threshold, params->feature_corner_angle, st);
+      for (int sw = 0; sw < params->smooth_iterations; ++sw)
+      {
+        freeze_ghosts_only(ens);
+        for (int o = 0; o < ens->n_local_objects; ++o) MFTLRemeshSmooth(ens->local_objects[o], params, 1, st);
+        if (MFTLRemeshSyncGhostPositions(ens) != MFTL_SUCCESS) status = MFTL_ERROR;
+      }
+      st->t_sweep += MFTLRemeshWallTime() - t_mark;
+
+      if (it_ops <= params->min_convergence_ops) break;
+    }
+  }
+#undef SPANNING_ENTER_PLACEMENT
+#undef SPANNING_LEAVE_PLACEMENT
+
+  mig.carry_sizing = MFTL_FALSE;
+
+  /* ── Hand the mesh back the way the flow solver expects it ────────────────
    *
-   * Canonical planes, dense ids, one migration, and the geometry the
-   * postcondition promises. The order of the middle two is forced: the
-   * renumbering makes every ghost TRIANGLE id stale, and the migration is
+   * Canonical planes, dense ids, one migration, the projection, and the
+   * geometry the postcondition promises. The order of the first two is forced:
+   * the renumbering makes every ghost TRIANGLE id stale, and the migration is
    * exactly what replaces them -- so it has to come after. Ghost VERTICES are
    * kept by a migration rather than re-received, which is why they need the
    * explicit exchange inside redensify_global_ids and cannot rely on this. */
@@ -1595,6 +1685,16 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
   st->n_migrations++;
 
   clear_frozen(ens);
+
+  /* The one projection of the pass, onto the surface it received: on the
+   * canonical partition every owned vertex lies in its rank's cell, and the
+   * reference holds every input triangle within the bridge distance of it. */
+  if (project)
+  {
+    if (MFTLRemeshEnsembleProject(ens, &refs, params, st) != MFTL_SUCCESS) status = MFTL_ERROR;
+    MFTLRemeshReferenceSetFree(&refs);
+  }
+
   MFTLEnsembleUpdateGlobalCounts(ens);
 
   /* Redistribution leaves `tris.area/normal/center` unspecified by design
@@ -1608,8 +1708,8 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
   /* ── 7. Publish the profile ───────────────────────────────────────────────
    *
    * The MAXIMUM over ranks: the phase loop is synchronised by its per-phase
-   * convergence Allreduce, so the wall clock is set by the slowest rank, and a
-   * mean would hide exactly the imbalance this is read for.
+   * Allreduce, so the wall clock is set by the slowest rank, and a mean would
+   * hide exactly the imbalance this is read for.
    *
    * UNCONDITIONAL, even when the caller passed no stats struct: every rank must
    * enter the collective. */
@@ -1619,17 +1719,11 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
   st->band_measured = band_probe[0];
   st->band_bound = (MFTL_REMESH_BAND_EDGES + (double) MFTL_MAX(params->freeze_dilation_rings, 0)) * band_probe[1];
 
-  /* Warned about AFTER the fact, and that is not a compromise. The band is a
-   * property of the mesh as the pass actually saw it, so the accurate number
-   * only exists now; and the verdict a caller acts on is `converged` plus
-   * `n_edges_hidden_long`, which this call cannot change. Warning early from an
-   * estimate is what produced a message that was wrong two times in three. */
-  /* NOT when the fallback already handled it. check_band_fits compares against
-   * the FINE box, which is by construction still too narrow on a pass that
-   * coarsened precisely because it was -- so leaving it unguarded makes the
-   * successful repair announce itself as the failure it repaired. The band
-   * argument holds against `group[k] * h_k` after coarsening, and
-   * report_fallback has already said so with the factors quoted. */
+  /* Warned about AFTER the fact: the band is a property of the mesh as the pass
+   * actually saw it, so the accurate number only exists now. NOT when the
+   * fallback already handled it: check_band_fits compares against the FINE box,
+   * which is by construction still too narrow on a pass that coarsened
+   * precisely because it was. */
   if (st->n_coarse_groups <= 1) check_band_fits(dom, params, st->band_measured, st->band_bound);
 
   gid_scratch_free(&gid);

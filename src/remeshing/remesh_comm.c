@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "mftl_arrayfunctions.h"
 #include "mftl_ensemble.h"
 #include "mftl_geometry.h"
 #include "mftl_memory.h"
@@ -33,13 +34,16 @@ void MFTLRemeshMigratorInit(MFTL_RemeshMigrator *m)
   m->arena = MFTL_NULL;
   m->cap_objects = 0;
   m->cap_entities = 0;
+  m->carry_sizing = MFTL_FALSE;
 }
 
 void MFTLRemeshMigratorFree(MFTL_RemeshMigrator *m)
 {
   free(m->maps);
   free(m->arena);
+  const bool carry = m->carry_sizing;
   MFTLRemeshMigratorInit(m);
+  m->carry_sizing = carry;
 }
 
 /**
@@ -207,7 +211,87 @@ int MFTLRemeshMigrateShifted(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const i
   if (!anyone_moved) return MFTL_SUCCESS;
 
   if (report) report->performed = MFTL_TRUE;
-  return MFTLRedistributeWithOwners(ens, m->maps);
+  if (!m->carry_sizing) return MFTLRedistributeWithOwners(ens, m->maps);
+
+  /* ── The curvature field rides along ────────────────────────────────────
+   * Computed once per pass (the spanning driver), so it must outlive the pass's
+   * migrations; a redistribution keeps positions and topology, not this array.
+   * Every owned vertex sends (body, id, target) to the rank the owner map names,
+   * itself included, and the ghosts then ask their owners. Ids are unique
+   * during the pass, so the lookup on arrival is exact. */
+  int n_rec = 0;
+  for (int o = 0; o < ens->n_local_objects; ++o)
+    if (ens->local_objects[o]->verts.has_sizing) n_rec += ens->local_objects[o]->verts.n_local;
+  double *rec = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(3 * n_rec, 1) * sizeof(double), "remesh sizing carry");
+  int *dst = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_rec, 1) * sizeof(int), "remesh sizing carry destinations");
+  int r = 0;
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    const MFTL_Object *const obj = ens->local_objects[o];
+    if (!obj->verts.has_sizing) continue;
+    for (int v = 0; v < obj->verts.n_local; ++v, ++r)
+    {
+      rec[3 * r + 0] = (double) obj->global_id;
+      rec[3 * r + 1] = (double) obj->verts.rec[v].global_id;
+      rec[3 * r + 2] = obj->verts.sizing[v];
+      dst[r] = m->maps[o].vert_owner[v];
+    }
+  }
+  int n_in = 0;
+  double *in = MFTLRemeshExchangeRecords(dom, rec, dst, n_rec, 3, &n_in);
+  free(rec);
+  free(dst);
+
+  int status = MFTLRedistributeWithOwners(ens, m->maps);
+
+  /* Owned vertices by id: one sorted id list per held body. */
+  const int b = ens->n_local_objects;
+  int **ids = (int **) MFTLCallocOrDie((size_t) MFTL_MAX(b, 1), sizeof(int *), "remesh sizing carry ids");
+  for (int o = 0; o < b; ++o)
+  {
+    MFTL_Object *const obj = ens->local_objects[o];
+    MFTLObjectEnableSizing(obj);
+    const int nl = obj->verts.n_local;
+    ids[o] = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(2 * nl, 1) * sizeof(int), "remesh sizing carry ids");
+    for (int v = 0; v < nl; ++v) ids[o][v] = obj->verts.rec[v].global_id, ids[o][nl + v] = v;
+    MFTLSortPairs32(ids[o], ids[o] + nl, nl);
+  }
+  int missed = 0;
+  for (int i = 0; i < n_in; ++i)
+  {
+    const int body = (int) in[3 * i], gid = (int) in[3 * i + 1];
+    /* The local list is ordered by body id, so the slot is a bisection. */
+    int o = -1, lo = 0, hi = b - 1;
+    while (lo <= hi)
+    {
+      const int mid = (lo + hi) / 2, g = ens->local_objects[mid]->global_id;
+      if (g == body)
+      {
+        o = mid;
+        break;
+      }
+      if (g < body)
+        lo = mid + 1;
+      else
+        hi = mid - 1;
+    }
+    MFTL_Object *const obj = (o >= 0) ? ens->local_objects[o] : MFTL_NULL;
+    const int k = obj ? MFTLSortedIndexOf(ids[o], obj->verts.n_local, gid) : -1;
+    if (k < 0)
+    {
+      missed++;
+      continue;
+    }
+    obj->verts.sizing[ids[o][obj->verts.n_local + k]] = in[3 * i + 2];
+  }
+  for (int o = 0; o < b; ++o) free(ids[o]);
+  free(ids);
+  free(in);
+  MFTL_ASSERT(missed == 0 && "MFTLRemeshMigrateShifted: a carried target length found no owned vertex on arrival");
+  if (missed) status = MFTL_ERROR;
+
+  if (MFTLRemeshSyncGhostSizing(ens) != MFTL_SUCCESS) status = MFTL_ERROR;
+  return status;
 }
 
 int MFTLRemeshMigrateToRanks(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const int *dest, MFTL_RemeshMigrationReport *report)
@@ -308,13 +392,13 @@ double MFTLRemeshWallTime(void) { return MPI_Wtime(); }
  *        cast to a double: `rim_project` is compared by presence below, and
  *        `rim_project_user` is the caller's own data.
  */
-#define MFTL_REMESH_AGREED_FIELDS(X)                                                                                                    \
-  X(type) X(smooth_mode) X(iterations) X(min_convergence_ops) X(target_length) X(min_edge_length) X(max_edge_length) X(min_edge_length_sq) \
-  X(max_edge_length_sq) X(sizing) X(curvature_tolerance) X(min_target_length) X(split_placement) X(collapse_placement)                \
-  X(collapse_preserves_volume) X(fit_radius) X(projection) X(feature_angle_threshold) X(feature_corner_angle) X(smooth_iterations)    \
-  X(smooth_relaxation) X(smooth_max_step_fraction) X(max_normal_deviation_cos) X(renumber_global_ids) X(parallel_phase_budget) X(freeze_dilation_rings)       \
-  X(parallel_strategy) X(dispersed_radius_fraction) X(parallel_coarsen) X(coarsen_frozen_fraction) X(serial_gather_max_triangles)        \
-  X(dispersed_balance_slack)
+#define MFTL_REMESH_AGREED_FIELDS(X)                                                                                                                           \
+  X(type)                                                                                                                                                      \
+  X(smooth_mode) X(iterations) X(min_convergence_ops) X(target_length) X(min_edge_length) X(max_edge_length) X(min_edge_length_sq) X(max_edge_length_sq)       \
+      X(sizing) X(curvature_tolerance) X(min_target_length) X(split_placement) X(collapse_placement) X(collapse_preserves_volume) X(fit_radius) X(projection)  \
+          X(feature_angle_threshold) X(feature_corner_angle) X(smooth_iterations) X(smooth_relaxation) X(smooth_max_step_fraction) X(max_normal_deviation_cos) \
+              X(renumber_global_ids) X(parallel_phase_budget) X(freeze_dilation_rings) X(parallel_strategy) X(dispersed_radius_fraction) X(parallel_coarsen)   \
+                  X(coarsen_frozen_fraction) X(serial_gather_max_triangles) X(dispersed_balance_slack) X(spanning_mode)
 
 #define MFTL_REMESH_FIELD_NAME(f) #f,
 #define MFTL_REMESH_FIELD_VALUE(f) (double) params->f,
@@ -1101,4 +1185,227 @@ int MFTLRemeshSyncGhostSizing(MFTL_Ensemble *ens)
 {
   MFTL_ASSERT(ens != MFTL_NULL);
   return ghost_vertex_exchange(ens, sizeof(double), answer_ghost_sizing, MFTL_NULL, apply_ghost_sizing, "MFTLRemeshSyncGhostSizing");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 6. Routed records, classification, positions and the projection halo
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+double *MFTLRemeshExchangeRecords(const MFTL_Domain *domain, const double *rec, const int *dest, int n_rec, int width, int *n_out)
+{
+  const int nproc = domain->nproc, me = domain->rank, nn = domain->num_neighbors;
+
+  int n_self = 0;
+  for (int i = 0; i < n_rec; ++i) n_self += (dest[i] == me);
+
+  if (nproc == 1)
+  {
+    double *out = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(n_self * width, 1) * sizeof(double), "remesh records");
+    memcpy(out, rec, (size_t) n_self * width * sizeof(double));
+    *n_out = n_self;
+    return out;
+  }
+
+  /* The route: the graph when every destination is a neighbour, agreed. */
+  int *const rank_to_slot = (int *) MFTLMallocOrDie((size_t) nproc * sizeof(int), "remesh records slot index");
+  for (int r = 0; r < nproc; ++r) rank_to_slot[r] = MFTL_ERROR;
+  for (int i = 0; i < nn; ++i) rank_to_slot[domain->neighbors[i]] = i;
+  int needs_global = 0;
+  for (int i = 0; i < n_rec && !needs_global; ++i)
+    if (dest[i] != me && (dest[i] < 0 || dest[i] >= nproc || rank_to_slot[dest[i]] == MFTL_ERROR)) needs_global = 1;
+  MPI_Allreduce(MPI_IN_PLACE, &needs_global, 1, MPI_INT, MPI_LOR, domain->comm_world);
+
+  const int n_slots = needs_global ? nproc : nn;
+  if (needs_global)
+    for (int r = 0; r < nproc; ++r) rank_to_slot[r] = r;
+
+  int *const cnt = (int *) MFTLCallocOrDie((size_t) 4 * MFTL_MAX(n_slots, 1), sizeof(int), "remesh records counts");
+  int *const rcnt = cnt + n_slots, *const sdis = cnt + 2 * n_slots, *const rdis = cnt + 3 * n_slots;
+  for (int i = 0; i < n_rec; ++i)
+    if (dest[i] != me) cnt[rank_to_slot[dest[i]]] += width;
+  int stot = 0;
+  for (int k = 0; k < n_slots; ++k) sdis[k] = stot, stot += cnt[k];
+  double *const sbuf = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(stot, 1) * sizeof(double), "remesh records send");
+  int *const fill = (int *) MFTLCallocOrDie((size_t) MFTL_MAX(n_slots, 1), sizeof(int), "remesh records fill");
+  for (int i = 0; i < n_rec; ++i)
+  {
+    if (dest[i] == me) continue;
+    const int k = rank_to_slot[dest[i]];
+    memcpy(&sbuf[sdis[k] + fill[k]], &rec[(size_t) i * width], (size_t) width * sizeof(double));
+    fill[k] += width;
+  }
+  free(fill);
+
+  if (needs_global)
+    MPI_Alltoall(cnt, 1, MPI_INT, rcnt, 1, MPI_INT, domain->comm_world);
+  else
+    MPI_Neighbor_alltoall(cnt, 1, MPI_INT, rcnt, 1, MPI_INT, domain->comm_graph);
+  int rtot = 0;
+  for (int k = 0; k < n_slots; ++k) rdis[k] = rtot, rtot += rcnt[k];
+
+  double *const out = (double *) MFTLMallocOrDie((size_t) MFTL_MAX((size_t) n_self * width + rtot, 1) * sizeof(double), "remesh records received");
+  int w = 0;
+  for (int i = 0; i < n_rec; ++i)
+    if (dest[i] == me) memcpy(&out[(size_t) (w++) * width], &rec[(size_t) i * width], (size_t) width * sizeof(double));
+  double *const rbuf = out + (size_t) n_self * width;
+  if (needs_global)
+    MPI_Alltoallv(sbuf, cnt, sdis, MPI_DOUBLE, rbuf, rcnt, rdis, MPI_DOUBLE, domain->comm_world);
+  else
+    MPI_Neighbor_alltoallv(sbuf, cnt, sdis, MPI_DOUBLE, rbuf, rcnt, rdis, MPI_DOUBLE, domain->comm_graph);
+
+  free(sbuf);
+  free(cnt);
+  free(rank_to_slot);
+  *n_out = n_self + rtot / width;
+  return out;
+}
+
+/** @brief Owner side of the classification exchange: its FEATURE/CORNER bits, or -1. */
+static void answer_ghost_class(const MFTL_Object *obj, int slot, int v, void *out, const void *ctx)
+{
+  (void) slot;
+  (void) ctx;
+  const int bits = (v == MFTL_ERROR) ? -1 : (obj->verts.rec[v].flags & (MFTL_FLAG_FEATURE | MFTL_FLAG_CORNER));
+  memcpy(out, &bits, sizeof bits);
+}
+
+/** @brief Requester side of the classification exchange. */
+static void apply_ghost_class(MFTL_Object *obj, int v, const void *in)
+{
+  int bits;
+  memcpy(&bits, in, sizeof bits);
+  if (bits < 0) return;
+  obj->verts.rec[v].flags = (obj->verts.rec[v].flags & ~(MFTL_FLAG_FEATURE | MFTL_FLAG_CORNER)) | bits;
+}
+
+int MFTLRemeshSyncGhostClass(MFTL_Ensemble *ens)
+{
+  MFTL_ASSERT(ens != MFTL_NULL);
+  return ghost_vertex_exchange(ens, sizeof(int), answer_ghost_class, MFTL_NULL, apply_ghost_class, "MFTLRemeshSyncGhostClass");
+}
+
+/** @brief Owner side of the position exchange. */
+static void answer_ghost_position(const MFTL_Object *obj, int slot, int v, void *out, const void *ctx)
+{
+  (void) slot;
+  (void) ctx;
+  double p[4] = {0.0, 0.0, 0.0, -1.0};
+  if (v != MFTL_ERROR)
+  {
+    for (int k = 0; k < 3; ++k) p[k] = obj->verts.pos[3 * v + k];
+    p[3] = 1.0;
+  }
+  memcpy(out, p, sizeof p);
+}
+
+/** @brief Requester side of the position exchange. */
+static void apply_ghost_position(MFTL_Object *obj, int v, const void *in)
+{
+  double p[4];
+  memcpy(p, in, sizeof p);
+  if (p[3] < 0.0) return;
+  for (int k = 0; k < 3; ++k) obj->verts.pos[3 * v + k] = p[k];
+}
+
+int MFTLRemeshSyncGhostPositions(MFTL_Ensemble *ens)
+{
+  MFTL_ASSERT(ens != MFTL_NULL);
+  const int rc = ghost_vertex_exchange(ens, 4 * sizeof(double), answer_ghost_position, MFTL_NULL, apply_ghost_position, "MFTLRemeshSyncGhostPositions");
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    ens->local_objects[o]->derived &= ~MFTL_DERIVED_GEOMETRY;
+    MFTLObjectMarkChanged(ens->local_objects[o]);
+  }
+  return rc;
+}
+
+int MFTLRemeshReferenceHalo(MFTL_Ensemble *ens, double width, double **out, int *n_out)
+{
+  const MFTL_Domain *const dom = &ens->domain;
+  const int me = dom->rank;
+
+  /* This rank's canonical cell. */
+  int my_cell[3] = {0, 0, 0};
+  for (int c = 0; c < dom->nproc; ++c)
+    if (dom->rank_map[c] == me)
+    {
+      my_cell[0] = c % dom->cuts[0];
+      my_cell[1] = (c / dom->cuts[0]) % dom->cuts[1];
+      my_cell[2] = c / (dom->cuts[0] * dom->cuts[1]);
+      break;
+    }
+  double h[3], centre[3];
+  for (int k = 0; k < 3; ++k)
+  {
+    h[k] = dom->domain_size[k] / (double) dom->cuts[k];
+    centre[k] = dom->global_min[k] + ((double) my_cell[k] + 0.5) * h[k];
+  }
+  /* A margin far below any length the mesh resolves, so a cell face that a
+   * box only touches in exact arithmetic still counts. */
+  const double reach = width * (1.0 + 1e-9);
+
+  int n_rec = 0, cap = 0;
+  double *rec = MFTL_NULL;
+  int *dst = MFTL_NULL;
+
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    const MFTL_Object *const obj = ens->local_objects[o];
+    for (int t = 0; t < obj->tris.n_local; ++t)
+    {
+      double c[3][3];
+      MFTLGetTriangleCorners(obj, t, c);
+      /* The image of the triangle nearest this cell. */
+      double g[3], d[3], lo[3], hi[3];
+      for (int k = 0; k < 3; ++k) g[k] = (c[0][k] + c[1][k] + c[2][k]) / 3.0;
+      MFTLGetMinimumImageVector(dom, d, centre, g);
+      for (int k = 0; k < 3; ++k)
+      {
+        const double sh = centre[k] + d[k] - g[k];
+        lo[k] = MFTL_MIN(c[0][k], MFTL_MIN(c[1][k], c[2][k])) + sh - reach;
+        hi[k] = MFTL_MAX(c[0][k], MFTL_MAX(c[1][k], c[2][k])) + sh + reach;
+      }
+      int i0[3], i1[3];
+      for (int k = 0; k < 3; ++k)
+      {
+        i0[k] = (int) floor((lo[k] - dom->global_min[k]) / h[k]);
+        i1[k] = (int) floor((hi[k] - dom->global_min[k]) / h[k]);
+      }
+      int sent[64], n_sent = 0;
+      for (int a = i0[0]; a <= i1[0]; ++a)
+        for (int b = i0[1]; b <= i1[1]; ++b)
+          for (int e = i0[2]; e <= i1[2]; ++e)
+          {
+            int q[3] = {a, b, e};
+            bool inside = MFTL_TRUE;
+            for (int k = 0; k < 3; ++k)
+            {
+              if (dom->is_periodic[k])
+                q[k] = ((q[k] % dom->cuts[k]) + dom->cuts[k]) % dom->cuts[k];
+              else if (q[k] < 0 || q[k] >= dom->cuts[k])
+                inside = MFTL_FALSE;
+            }
+            if (!inside) continue;
+            const int r = dom->rank_map[q[0] + dom->cuts[0] * (q[1] + dom->cuts[1] * q[2])];
+            if (r == me) continue;
+            bool dup = MFTL_FALSE;
+            for (int j = 0; j < n_sent; ++j) dup |= (sent[j] == r);
+            if (dup || n_sent == 64) continue;
+            sent[n_sent++] = r;
+            if (n_rec == cap)
+            {
+              cap = MFTL_MAX(64, 2 * cap);
+              rec = (double *) MFTLReallocOrDie(rec, (size_t) cap * MFTL_REMESH_REF_HALO_WIDTH * sizeof(double), "remesh reference halo");
+              dst = (int *) MFTLReallocOrDie(dst, (size_t) cap * sizeof(int), "remesh reference halo destinations");
+            }
+            MFTLRemeshReferencePackTriangle(obj, t, &rec[(size_t) n_rec * MFTL_REMESH_REF_HALO_WIDTH]);
+            dst[n_rec++] = r;
+          }
+    }
+  }
+
+  *out = MFTLRemeshExchangeRecords(dom, rec, dst, n_rec, MFTL_REMESH_REF_HALO_WIDTH, n_out);
+  free(rec);
+  free(dst);
+  return MFTL_SUCCESS;
 }

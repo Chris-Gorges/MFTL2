@@ -122,6 +122,42 @@ typedef enum
 } MFTL_RemeshParallelStrategy;
 
 /**
+ * @brief How the SPANNING driver gives every region one serial call's work.
+ *
+ * Both modes do exactly what one MFTLRemeshObject() call does to a region --
+ * `iterations` rounds of split, collapse, flip and `smooth_iterations` Jacobi
+ * sweeps -- and differ only in the ORDER (src/remeshing/README.md, "The spanning
+ * driver"). At np = 1 both are the serial call to the bit. Measured against the
+ * serial remesher's own spread under a random pool permutation, both are
+ * statistically the serial answer (docs/analysis.md §5.8).
+ */
+typedef enum
+{
+  /**
+   * Placements outermost. Each region gets the whole serial call, smoothing
+   * included, in the first placement in which it is unfrozen; afterwards its
+   * vertices carry #MFTL_FLAG_DONE and are not remeshed again in this pass.
+   * The placements stop once every out-of-band edge has been offered, often
+   * after the first; the vertices no placement unfroze are then smoothed where
+   * they are, `iterations * smooth_iterations` sweeps with a ghost-position
+   * exchange after each, so that the band around the canonical planes is not
+   * left unsmoothed call after call. About one migration per placement
+   * (default).
+   */
+  MFTL_REMESH_SPANNING_ONCE = 0,
+  /**
+   * Iterations outermost: per iteration, the placements perform only split,
+   * collapse and flip, each edge offered once; then every owned vertex is
+   * smoothed on the current partition with a ghost-position exchange after each
+   * sweep -- smoothing is a vertex operation and needs no frozen band. About one
+   * migration per placement per iteration. Refuses ensembles with attached
+   * fields: a smoothing sweep that moves replicated vertices cannot transfer
+   * them exactly.
+   */
+  MFTL_REMESH_SPANNING_NESTED
+} MFTL_RemeshSpanningMode;
+
+/**
  * @brief Why the spanning driver merged rank boxes; a bitmask, since triggers
  *        can fire together.
  *
@@ -428,31 +464,24 @@ typedef struct MFTL_RemeshParameters
 
   // --- Parallel (ignored when nproc == 1) -----------------------------------
   /**
-   * SPANNING only: maximum cut-plane placements per pass, cycling through
-   * #MFTL_REMESH_PHASES. **A per-timestep solver loop must set it.**
+   * SPANNING only: the most cut-plane placements per pass (#MFTL_REMESH_SPANNING_ONCE)
+   * or per iteration (#MFTL_REMESH_SPANNING_NESTED), visited in the order of
+   * #MFTL_REMESH_PHASES. A cap, not a target: the pass stops as soon as every
+   * out-of-band edge has been offered to a rank allowed to act on it, which
+   * takes 2 placements on a slab decomposition and 2-8 otherwise. The default,
+   * 8, is the whole table. A smaller value leaves the entities near the
+   * intersections of cut planes to the next call and is reported by
+   * `converged == false`.
    *
-   * The default, 32, runs to a fixed point: right for a one-shot remesh far
-   * from its target (check `converged`), wrong for maintaining a mesh every
-   * step, where re-converging an already good mesh is split/collapse churn that
-   * erodes it, at one migration per placement. LeVeque deformation, 150
-   * remeshed steps at np = 4 (examples/leveque_remeshing_parallel.c,
-   * docs/analysis.md §5.1):
-   *
-   * | budget | V/V0 | min q | ms/step |
-   * |---:|---:|---:|---:|
-   * | 2 | 0.745 | 0.897 | 12.9 |
-   * | 4 | 0.771 | 0.879 | 16.7 |
-   * | 8 | 0.670 | 0.796 | 35.4 |
-   * | 32 | 0.639 | 0.621 | 84.7 |
-   *
-   * (serial MFTLRemeshObject(): 0.751, 0.876, 7.1 ms/step). Use 2-8 in a loop
-   * (4 was the best measured compromise; 5 distinct placements cover every
-   * entity near one or two axes' planes, 8 every entity; `converged == false`
-   * is then normal).
-   * The default stays at 32 because a too-small budget fails loudly in the
-   * one-shot case, while a too-large one fails quietly in the loop case.
+   * One pass does one serial call's work whatever the budget. Before the two
+   * modes existed every placement re-ran the whole kernel call, so the budget
+   * was the amount of remeshing per call and 32 eroded a mesh that a loop only
+   * had to maintain (docs/analysis.md §5.1, §5.8).
    */
   int parallel_phase_budget;
+
+  /** SPANNING only: how the placements and the iterations are nested (default #MFTL_REMESH_SPANNING_ONCE). */
+  MFTL_RemeshSpanningMode spanning_mode;
 
   /**
    * Extra triangle rings added to the frozen band. 0 (default) is correct: the
@@ -615,8 +644,8 @@ typedef struct
   /**
    * Distinct placements of #MFTL_REMESH_PHASES on this grid: 2, 4 or 8. An axis
    * with fewer than two (coarse) cells has no interior plane, so entries
-   * differing only there coincide (2 on a 2x1x1 grid, 4 on 2x2x1). It is the
-   * length of the silent streak that certifies convergence.
+   * differing only there coincide (2 on a 2x1x1 grid, 4 on 2x2x1). A pass
+   * visits each at most once (NESTED: once per iteration).
    */
   int n_distinct_placements;
 
@@ -648,34 +677,26 @@ typedef struct
   double frozen_fraction;
 
   /**
-   * The verdict of a distributed pass. True when a phase saw no operation
-   * performed anywhere and no out-of-band edge hidden by the freeze, or a full
-   * streak of `n_distinct_placements` silent placements with no hidden LONG
-   * edge. False means the budget ran out first and bands along the cut planes
-   * may be un-remeshed -- invisible to any structural check. Causes: too small a
-   * `parallel_phase_budget`, or \f$h \le 4\delta\f$ (warned on rank 0).
-   *
-   * Measured before the sweeps of the certifying phase; the smoothing after
-   * them may still move a few edges out of the band. True for serial passes.
+   * The verdict of a distributed pass: every region received its serial call.
+   * SPANNING: after the last placement no out-of-band edge was left that had
+   * not been offered, i.e. that did not have both endpoints #MFTL_FLAG_DONE
+   * (NESTED: in the last iteration). An edge that was offered and declined on
+   * merit -- a collapse the link condition refuses -- counts as offered, exactly
+   * as it would in a serial call. False means the budget ran out first, or
+   * \f$h \le 4\delta\f$ (warned on rank 0), and bands along the cut planes kept
+   * their input triangulation for this call -- invisible to any structural
+   * check. True for serial and dispersed passes.
    */
   bool converged;
 
   /**
-   * Out-of-band edges the LAST placement hid from every rank (a residual, not a
-   * total). A diagnostic of the affected region; `converged` is the verdict.
+   * Out-of-band edges no placement offered (SPANNING; NESTED: in the last
+   * iteration). Zero exactly when `converged`.
    */
   int n_edges_hidden;
 
-  /*
-   * `n_edges_hidden` by the operator that would fix the edge. LONG is exact: an
-   * offered long edge is always split (MFTLSplitApproved() has no merit test),
-   * so non-zero means work no placement reached. SHORT includes false alarms: a
-   * collapse can be refused on merit in both directions (link condition,
-   * valence, stretch, feature rules), so a small non-zero value is normal on a
-   * converged mesh.
-   */
-  int n_edges_hidden_long;  ///< Hidden edges longer than `max_edge_length`; exact (an offered long edge is always split).
-  int n_edges_hidden_short;  ///< Hidden edges shorter than `min_edge_length`; includes collapses refused on merit.
+  int n_edges_hidden_long;  ///< Of `n_edges_hidden`, the edges a split wants.
+  int n_edges_hidden_short;  ///< Of `n_edges_hidden`, the edges a collapse wants.
 
   /*
    * SPANNING only. `band_measured`: largest distance from a cut plane (of the
@@ -737,19 +758,19 @@ typedef struct
   double t_total;  ///< The whole call.
   double t_migrate;  ///< Migrations, including the closing MFTLRedistribute.
   double t_geometry;  ///< The pre-migration geometry passes. Invariant to how much moves.
-  double t_freeze;  ///< Freeze marking, band dilation, the hidden-edge scan and, under curvature sizing, the sizing field and its ghost exchange.
+  double t_freeze;  ///< Freeze marking, band dilation, the unoffered-edge count and, under curvature sizing, the sizing field and its ghost exchange.
   double t_sweep;  ///< MFTLRemeshIterate, i.e. the actual remeshing.
   double t_reduce;  ///< The id and convergence collectives.
 
-  /** RANK-LOCAL, #MFTL_REMESH_PROJECT_PHONG: building the reference copies, summed over kernel calls. */
+  /** RANK-LOCAL, #MFTL_REMESH_PROJECT_PHONG: building the reference (copy, halo, index). */
   double t_reference;
-  /** RANK-LOCAL, #MFTL_REMESH_PROJECT_PHONG: the projection loops of the smoother. */
+  /** RANK-LOCAL, #MFTL_REMESH_PROJECT_PHONG: the projection pass. */
   double t_projection;
-  /** RANK-LOCAL, #MFTL_REMESH_PROJECT_PHONG: largest reference held by one kernel call, in bytes. */
+  /** RANK-LOCAL, #MFTL_REMESH_PROJECT_PHONG: largest reference this rank held, in bytes, its halo and index included. */
   double reference_bytes;
-  /** RANK-LOCAL, #MFTL_REMESH_PROJECT_PHONG: vertex moves projected. */
+  /** RANK-LOCAL, #MFTL_REMESH_PROJECT_PHONG: vertices projected. */
   int n_projected;
-  /** RANK-LOCAL, #MFTL_REMESH_PROJECT_PHONG: vertex moves left unprojected (no reference triangle found). */
+  /** RANK-LOCAL, #MFTL_REMESH_PROJECT_PHONG: free vertices left where the smoother put them: no reference triangle with a compatible normal within the bridge distance. */
   int n_projection_missed;
 
   /**
@@ -818,7 +839,8 @@ static inline void MFTLInitRemeshParams(MFTL_RemeshParameters *params, MFTL_Reme
   params->max_normal_deviation_cos = 0.2;  /* about 78 degrees */
   params->renumber_global_ids = MFTL_TRUE;
 
-  params->parallel_phase_budget = 4 * MFTL_REMESH_NUM_PHASES;
+  params->parallel_phase_budget = MFTL_REMESH_NUM_PHASES;
+  params->spanning_mode = MFTL_REMESH_SPANNING_ONCE;
   params->freeze_dilation_rings = 0;  /* the classification is exact; see the field */
   params->parallel_strategy = MFTL_REMESH_PARALLEL_AUTO;
   params->dispersed_radius_fraction = 0.4;
@@ -1430,16 +1452,25 @@ int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, 
  * run at `nproc == 1` against the serial answer.
  *
  *     [optional pre-pass: measure band and frozen share, choose coarsening]
- *     per placement: migrate (skipped if identity) -> MFTLRemeshMarkFrozen
- *                    -> count hidden edges -> MFTLRemeshIterate on the interior
+ *     canonical order; sizing field once; projection reference (owned input
+ *                    plus every input triangle within half max_edge_length of
+ *                    the rank's cell)
+ *     ONCE, per placement: migrate (skipped if identity) -> MFTLRemeshMarkFrozen
+ *                    -> the serial call on the interior, DONE-gated -> mark DONE
  *                    -> per-body id prefix sums over the holders
- *                    -> 3-int Allreduce (operations, hidden long, hidden short)
- *                    -> converged?
+ *                    -> 3-int Allreduce (operations, unoffered long, short)
+ *                    -> every out-of-band edge offered? done
+ *                    then the vertices no placement unfroze, smoothed in place
+ *     NESTED, per iteration: the placements with split, collapse and flip only,
+ *                    then every owned vertex smoothed, ghosts exchanged per sweep
  *     at the end:    re-densify ids (ghost vertex ids exchanged)
- *                    -> MFTLRedistribute to the canonical partition -> geometry
+ *                    -> MFTLRedistribute to the canonical partition
+ *                    -> projection, ghost positions -> geometry
  *
- * No ghost position sync is needed inside the loop: every ghost in a rank's
+ * No ghost position sync is needed inside a placement: every ghost in a rank's
  * pool is frozen on its owner, so the copies are still exact after the sweeps.
+ * Smoothing outside a placement (NESTED, ONCE's band) moves replicated
+ * vertices and is followed by an exchange after every sweep.
  *
  * Preconditions: MFTLRegisterMpiTypes() called; the same bodies on every rank
  * in the same order with agreeing `next_*_gid` (checked in Debug); the same

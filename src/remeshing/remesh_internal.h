@@ -23,6 +23,8 @@
 #ifndef MFTL_REMESH_INTERNAL_H
 #define MFTL_REMESH_INTERNAL_H
 
+#include <stdint.h>
+
 #include "mftl_remeshing.h"
 
 #include "mftl_constants.h"
@@ -537,78 +539,243 @@ void MFTLRemeshFitNoteFallback(void);
  * The projection reference (remesh_project.c)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/** @brief Doubles per halo triangle record: body id, triangle id, then per corner its id, position and normal. */
+#define MFTL_REMESH_REF_HALO_WIDTH 23
+
 /**
  * @struct MFTL_RemeshReference
- * @brief A copy of the mesh as a remeshing kernel call received it, enough to
- *        evaluate its Phong surface (#MFTL_REMESH_PROJECT_PHONG).
+ * @brief The surface a remeshing call received, kept to project the smoothed
+ *        vertices onto its Phong surface (#MFTL_REMESH_PROJECT_PHONG).
  *
- * Index space of the INPUT: vertex r, triangle t. Found again from the current
- * mesh through vertex global ids, which a kernel call does not renumber
- * (`gid` sorted, `gid_v` the vertex it names); from there a walk over `tn`
- * reaches the triangle closest to a query point.
+ * Its own index space, read-only once finished. Serially it holds the whole
+ * object; distributed, the triangles this rank owned when the call started plus
+ * every input triangle within MFTLRemeshProjectionRadius() of its canonical cell
+ * (MFTLRemeshEnsembleReferenceBuild()). A uniform grid indexes the triangles by
+ * the cells their boxes overlap: the occupied cells as a sorted key array, each
+ * with a contiguous run of entries.
  */
 typedef struct MFTL_RemeshReference
 {
-  const MFTL_Domain *domain;  ///< For minimum-image differences.
+  const MFTL_Domain *domain;  ///< For minimum-image differences and periodic cells.
   int n_v;  ///< Vertices.
   int n_t;  ///< Triangles.
   double *pos;  ///< [3 n_v] positions.
   double *nrm;  ///< [3 n_v] angle-weighted unit normals; zero where a corner contributes no lift.
-  int *tv;  ///< [3 n_t] corners, -1 for a dead triangle.
-  int *tn;  ///< [3 n_t] triangle across edge k (corner k to k+1), MFTL_ERROR at a rim.
-  int *vtri;  ///< [n_v] one incident triangle, -1 if none.
-  int *gid;  ///< [n_v] vertex global ids, ascending.
-  int *gid_v;  ///< [n_v] the vertex of `gid[i]`.
-  double bytes;  ///< Heap held by the arrays above.
+  int *vgid;  ///< [n_v] vertex global ids, ascending; MFTL_NULL in a reference of one object (MFTLRemeshReferenceFromObject()).
+  int *tv;  ///< [3 n_t] corners.
+  int *tgid;  ///< [n_t] triangle global ids, ascending: the tie-break.
+  double *frame;  ///< [9 n_t] corner 0, then the seam-corrected edges to corners 1 and 2: one minimum image per query.
+  double *sv;  ///< Staged vertex records before MFTLRemeshReferenceFinish(), then NULL.
+  int sv_n;  ///< Staged vertex records.
+  int sv_cap;  ///< Their capacity.
+  int *st;  ///< Staged triangle records (id, three corner ids) before MFTLRemeshReferenceFinish(), then NULL.
+  int st_n;  ///< Staged triangle records.
+  int st_cap;  ///< Their capacity.
+  double origin[3];  ///< Grid origin.
+  double cell[3];  ///< Grid cell per axis.
+  int ncell[3];  ///< Grid cells per axis.
+  bool wrap[3];  ///< Periodic axis: indices wrap.
+  uint64_t *cell_key;  ///< [n_cells] keys of the occupied cells, ascending.
+  int *cell_start;  ///< [n_cells + 1] each cell's run of entries.
+  int n_cells;  ///< Occupied cells.
+  int *ent_tri;  ///< [n_ent] the triangle of each entry; ascending within a cell.
+  double *ent_c0;  ///< [3 n_ent] its corner 0, copied beside the box so a cell's box tests stream.
+  float *ent_box;  ///< [6 n_ent] its box relative to corner 0 (low corner, high corner), rounded outward.
+  int n_ent;  ///< Entries: a triangle is filed under every cell its box overlaps.
+  double bytes;  ///< Heap held after MFTLRemeshReferenceFinish().
 } MFTL_RemeshReference;
 
-/**
- * @brief Copies @p obj into @p ref: positions, angle-weighted normals (zeroed on
- *        feature, corner, boundary and ghost vertices), corners, edge
- *        neighbours, and the sorted global ids.
- *
- * Overwrites `verts.normal` (with angle-weighted normals). Needs a current
- * feature classification.
- *
- * @param[out] ref The reference; free with MFTLRemeshReferenceFree().
- * @param      obj The mesh, with no dead entities.
- */
-void MFTLRemeshReferenceBuild(MFTL_RemeshReference *ref, MFTL_Object *obj);
+/** @brief The references of one distributed call, one per body id, ascending. */
+typedef struct
+{
+  int n;  ///< Bodies.
+  int cap;  ///< Capacity.
+  int *body;  ///< [n] body ids, ascending.
+  MFTL_RemeshReference *ref;  ///< [n] their references.
+} MFTL_RemeshReferenceSet;
 
 /**
- * @brief Releases what MFTLRemeshReferenceBuild() allocated.
+ * @brief The largest distance a projection may bridge: half of `max_edge_length`,
+ *        and the width of the distributed reference's halo.
+ * @param params The parameter block.
+ * @return The cap.
+ */
+double MFTLRemeshProjectionRadius(const MFTL_RemeshParameters *params);
+
+/**
+ * @brief An empty reference.
+ * @param[out] ref    The reference.
+ * @param      domain For minimum images.
+ */
+void MFTLRemeshReferenceInit(MFTL_RemeshReference *ref, const MFTL_Domain *domain);
+
+/**
+ * @brief Stages @p obj's triangles (owned only, or all) and every vertex, with
+ *        the normals in `verts.normal` (zero on feature, corner and boundary
+ *        vertices). The caller computes angle-weighted normals first.
+ * @param ref        The reference, not finished.
+ * @param obj        The mesh.
+ * @param owned_only Stage `[0, tris.n_local)` only.
+ */
+void MFTLRemeshReferenceAddObject(MFTL_RemeshReference *ref, const MFTL_Object *obj, bool owned_only);
+
+/**
+ * @brief Packs triangle @p t of @p obj as one halo record of #MFTL_REMESH_REF_HALO_WIDTH doubles.
+ * @param      obj The mesh, normals in `verts.normal`.
+ * @param      t   The triangle.
+ * @param[out] rec The record.
+ */
+void MFTLRemeshReferencePackTriangle(const MFTL_Object *obj, int t, double *rec);
+
+/**
+ * @brief Stages one halo record.
+ * @param ref The reference, not finished.
+ * @param rec The record (MFTLRemeshReferencePackTriangle()).
+ */
+void MFTLRemeshReferenceAddRecord(MFTL_RemeshReference *ref, const double *rec);
+
+/**
+ * @brief Removes duplicate vertices by id, orders the triangles by id and
+ *        builds the grid for queries of radius up to @p radius.
+ * @param ref    The reference.
+ * @param radius The largest query radius.
+ */
+void MFTLRemeshReferenceFinish(MFTL_RemeshReference *ref, double radius);
+
+/**
+ * @brief Releases a reference.
  * @param ref The reference.
  */
 void MFTLRemeshReferenceFree(MFTL_RemeshReference *ref);
 
 /**
- * @brief Moves @p p onto the reference's Phong surface: the closest point on its
- *        flat triangles, found by a walk from @p hint (or from the reference copy
- *        of vertex @p v or of one of its neighbours), then the Phong lift.
- *
- * @param         ref      The reference.
- * @param         obj      The current mesh (for @p v's global id and neighbours).
- * @param         v        The vertex being moved.
- * @param[in,out] hint     Reference triangle to start from (-1: none); the
- *                         triangle found on success.
- * @param         max_d_sq Largest admissible squared distance from @p p to the
- *                         flat reference; beyond it nothing is moved.
- * @param[in,out] p        The position, projected and wrapped on success.
- * @return #MFTL_SUCCESS, or #MFTL_ERROR with @p p unchanged.
+ * @brief The Phong-lifted closest point to @p p among the reference triangles
+ *        within @p radius whose normal does not point against @p n_v.
+ * @param      ref    A finished reference.
+ * @param      p      The query point.
+ * @param      n_v    The vertex's unit normal.
+ * @param      radius The bridge distance.
+ * @param[out] out    The projected point, wrapped.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR if no triangle qualifies (@p out untouched).
  */
-int MFTLRemeshReferenceProject(const MFTL_RemeshReference *ref, const MFTL_Object *obj, int v, int *hint, double max_d_sq, double p[3]);
+int MFTLRemeshReferenceProjectPoint(const MFTL_RemeshReference *ref, const double p[3], const double n_v[3], double radius, double out[3]);
 
 /**
- * @brief MFTLSmoothTangential() with the projection reference supplied by the
- *        caller (or #MFTL_NULL: no projection), applied after the LAST of the
- *        @p iterations sweeps, and its cost recorded.
+ * @brief Projects every owned free vertex of @p obj (Jacobi), with the bridge
+ *        distance half its shortest incident edge, capped. Local.
+ * @param         obj    The mesh.
+ * @param         ref    The reference.
+ * @param         params Supplies the cap.
+ * @param[in,out] st     Accumulates `n_projected`, `n_projection_missed`, `t_projection`; may be #MFTL_NULL.
+ */
+void MFTLRemeshProjectOwned(MFTL_Object *obj, const MFTL_RemeshReference *ref, const MFTL_RemeshParameters *params, MFTL_RemeshStats *st);
+
+/**
+ * @brief The reference of a whole serial object: angle normals, every triangle, the grid.
+ * @param[out] ref    The reference.
+ * @param      obj    The mesh, features classified (`verts.normal` is overwritten).
+ * @param      params Supplies the cap.
+ */
+void MFTLRemeshReferenceFromObject(MFTL_RemeshReference *ref, MFTL_Object *obj, const MFTL_RemeshParameters *params);
+
+/**
+ * @brief MFTLRemeshProjectOwned() on a whole object, keeping every conservative
+ *        density's amount per triangle.
+ * @param         obj    The mesh, no ghosts.
+ * @param         ref    The reference.
+ * @param         params The parameter block.
+ * @param[in,out] st     Statistics; may be #MFTL_NULL.
+ */
+void MFTLRemeshProjectObject(MFTL_Object *obj, const MFTL_RemeshReference *ref, const MFTL_RemeshParameters *params, MFTL_RemeshStats *st);
+
+/**
+ * @brief Areas of every triangle, if @p obj carries a conservative density.
+ * @param obj The mesh.
+ * @return `[tris.n]` areas to free, or #MFTL_NULL when there is no density.
+ */
+double *MFTLRemeshSnapshotDensityAreas(const MFTL_Object *obj);
+
+/**
+ * @brief Rescales every conservative density by old area over new area, so each
+ *        triangle keeps its amount. A no-op for #MFTL_NULL.
+ * @param obj         The mesh.
+ * @param area_before From MFTLRemeshSnapshotDensityAreas().
+ */
+void MFTLRemeshRescaleDensities(MFTL_Object *obj, const double *area_before);
+
+/**
+ * @brief The distributed reference of one spanning call, on the canonical
+ *        partition it starts on: owner classification and exact angle normals on
+ *        every copy, each rank's owned triangles, and the neighbours' triangles
+ *        within MFTLRemeshProjectionRadius() of its cell. Collective.
+ * @param         ens    The ensemble.
+ * @param         params The parameter block.
+ * @param[out]    set    The references; free with MFTLRemeshReferenceSetFree().
+ * @param[in,out] st     `t_reference`, `reference_bytes`; may be #MFTL_NULL.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on every rank if an exchange failed.
+ */
+int MFTLRemeshEnsembleReferenceBuild(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshReferenceSet *set, MFTL_RemeshStats *st);
+
+/**
+ * @brief Projects every owned free vertex on the canonical partition, gives the
+ *        ghosts their owners' places, and keeps every density's amounts. Collective.
+ * @param         ens    The ensemble, canonically partitioned.
+ * @param         set    From MFTLRemeshEnsembleReferenceBuild().
+ * @param         params The parameter block.
+ * @param[in,out] st     Statistics; may be #MFTL_NULL.
+ * @return As MFTLUpdateGhostPositions().
+ */
+int MFTLRemeshEnsembleProject(MFTL_Ensemble *ens, const MFTL_RemeshReferenceSet *set, const MFTL_RemeshParameters *params, MFTL_RemeshStats *st);
+
+/**
+ * @brief The reference of body @p body, or #MFTL_NULL.
+ * @param set  The references.
+ * @param body A body id.
+ * @return Its reference.
+ */
+const MFTL_RemeshReference *MFTLRemeshReferenceSetFind(const MFTL_RemeshReferenceSet *set, int body);
+
+/**
+ * @brief Releases a set.
+ * @param set The references.
+ */
+void MFTLRemeshReferenceSetFree(MFTL_RemeshReferenceSet *set);
+
+/**
+ * @brief MFTLSmoothTangential() without the projection: @p iterations Jacobi
+ *        sweeps. #MFTL_FLAG_FROZEN and #MFTL_FLAG_DONE vertices stay put.
  * @param         obj        The mesh.
  * @param         params     The parameter block.
  * @param         iterations Sweeps.
- * @param         ref        The reference, or #MFTL_NULL.
- * @param[in,out] st         Accumulates `t_projection`, `n_projected`, `n_projection_missed`; may be #MFTL_NULL.
+ * @param[in,out] st         May be #MFTL_NULL.
  */
-void MFTLRemeshSmooth(MFTL_Object *obj, const MFTL_RemeshParameters *params, int iterations, const MFTL_RemeshReference *ref, MFTL_RemeshStats *st);
+void MFTLRemeshSmooth(MFTL_Object *obj, const MFTL_RemeshParameters *params, int iterations, MFTL_RemeshStats *st);
+
+/**
+ * @brief MFTLRemeshIterate() for the spanning driver: no projection (the pass
+ *        projects once, at its end), and with @p once set the #MFTL_FLAG_DONE
+ *        rules of #MFTL_REMESH_SPANNING_ONCE -- an edge with both ends DONE is not
+ *        offered, and the corners of every triangle an operation touched are
+ *        smoothed again.
+ * @param         obj        The mesh.
+ * @param         params     The parameter block.
+ * @param[in,out] st         Statistics.
+ * @param         iterations Outer iterations.
+ * @param         once       Apply the DONE rules.
+ * @return Operations performed.
+ */
+int MFTLRemeshIterateSpanning(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *st, int iterations, bool once);
+
+/**
+ * @brief One iteration's edge operations for #MFTL_REMESH_SPANNING_NESTED:
+ *        detect, split, collapse, compact, flip, each edge whose ends are not
+ *        both DONE offered once. No smoothing.
+ * @param         obj    The mesh.
+ * @param         params The parameter block.
+ * @param[in,out] st     Statistics.
+ * @return Operations performed.
+ */
+int MFTLRemeshEdgeSweeps(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *st);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * The parallel gate

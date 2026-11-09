@@ -25,7 +25,8 @@ target_length         = 0.0     # hold the starting resolution
 iterations            = 3
 smooth_iterations     = 3
 parallel_strategy     = "auto"
-parallel_phase_budget = 4       # the measured best in a timestep loop
+parallel_phase_budget = 8       # a cap: a pass stops once every out-of-band edge was offered
+spanning_mode         = "once"  # or "nested"; both do one serial call per pass
 
 [topology]
 every = 0                       # the LeVeque sheet thins but must not tear here
