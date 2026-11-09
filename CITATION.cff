@@ -15,6 +15,9 @@ authors:
   - given-names: Berend
     name-particle: van
     family-names: Wachem
+contact:
+  - given-names: Christian
+    family-names: Gorges
 version: 2.0.0-alpha.1
 license: Apache-2.0
 repository-code: "https://github.com/Chris-Gorges/MFTL2"

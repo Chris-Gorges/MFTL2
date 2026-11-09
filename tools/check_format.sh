@@ -10,8 +10,8 @@
 # releases format the same lines differently:
 #
 #   pip install -r tools/requirements-format.txt
-#   tools/check_format.sh                 # lines changed since origin/main, working tree included
-#   tools/check_format.sh <base>          # ... since <base>
+#   tools/check_format.sh                 # uncommitted changes (working tree against HEAD)
+#   tools/check_format.sh <base>          # everything changed since <base>, working tree included
 #   tools/check_format.sh <base> <head>   # between two commits (CI)
 #   tools/check_format.sh --fix [<base>]  # reformat those lines in place
 set -euo pipefail
@@ -36,7 +36,7 @@ if [ "${1:-}" = "--fix" ]; then
   fix=1
   shift
 fi
-base="${1:-origin/main}"
+base="${1:-HEAD}"
 head="${2:-}"
 
 if [ "$fix" -eq 1 ]; then

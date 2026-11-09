@@ -25,8 +25,8 @@ MPI test declares its rank count as `PROCESSORS`, so `ctest -j N` schedules rank
 ## Code conventions
 
 - C11, no compiler extensions. Lines you add or change follow `.clang-format`; CI checks exactly those lines with
-  a pinned clang-format (`pip install -r tools/requirements-format.txt`, then `tools/check_format.sh`, or
-  `tools/check_format.sh --fix` to reformat them). Existing code is not reformatted wholesale.
+  a pinned clang-format (`pip install -r tools/requirements-format.txt`, then `tools/check_format.sh` before a
+  commit, or `tools/check_format.sh --fix` to reformat those lines). Existing code is not reformatted wholesale.
 - One module = one `src/<module>/` directory = one `include/mftl_<module>.h`. Every `.c` includes its own header
   first, and a header includes only headers from a strictly lower layer. `tools/check_headers.sh` verifies that
   every header compiles alone, as C and as C++.
