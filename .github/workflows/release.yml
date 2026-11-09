@@ -19,15 +19,15 @@ concurrency:
 
 jobs:
   test:
-    name: ${{ matrix.compiler }} + ${{ matrix.mpi }}
-    runs-on: ubuntu-24.04
+    name: ${{ matrix.compiler }} + ${{ matrix.mpi }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { compiler: gcc, mpi: mpich }
-          - { compiler: clang, mpi: openmpi }
+          - { os: ubuntu-24.04, compiler: gcc, mpi: openmpi }
+          - { os: ubuntu-22.04, compiler: clang, mpi: mpich }
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup

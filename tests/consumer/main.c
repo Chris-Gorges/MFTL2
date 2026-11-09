@@ -4,6 +4,11 @@
  * checked against the sphere's area and volume. It is compiled as C (main.c)
  * and as C++ (main.cpp includes this file), so it checks that the installed
  * headers and package work from both languages.
+ *
+ * The one argument is the rank count the launcher was asked for. A launcher
+ * that does not match the MPI library starts every process as a singleton of
+ * size 1, and each of them passes the geometric checks on its own; comparing
+ * the size against the request is what makes the test fail then.
  */
 #include <math.h>
 #include <stdio.h>
@@ -17,6 +22,7 @@ int main(int argc, char **argv)
   int rank = 0, nproc = 1;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &nproc);
+  const int expected = argc > 1 ? atoi(argv[1]) : nproc;
   MFTLRegisterMpiTypes(); /* the wire datatypes every exchange uses */
 
   int cuts[3] = {0, 0, 0};
@@ -57,11 +63,11 @@ int main(int argc, char **argv)
   const double volume_exact = 4.0 / 3.0 * MFTL_PI * radius * radius * radius;
   const double area_err = fabs(sums[0] - area_exact) / area_exact;
   const double volume_err = fabs(sums[1] - volume_exact) / volume_exact;
-  const int pass = all_ok && area_err < 1e-2 && volume_err < 1e-2;
+  const int pass = all_ok && nproc == expected && area_err < 1e-2 && volume_err < 1e-2;
 
   if (rank == 0)
-    printf("%s: %d rank(s), grid %dx%dx%d, area %.6f (rel. err %.2e), volume %.6f (rel. err %.2e)\n", pass ? "PASS" : "FAIL", nproc, cuts[0], cuts[1], cuts[2],
-           sums[0], area_err, sums[1], volume_err);
+    printf("%s: %d of %d rank(s), grid %dx%dx%d, area %.6f (rel. err %.2e), volume %.6f (rel. err %.2e)\n", pass ? "PASS" : "FAIL", nproc, expected, cuts[0],
+           cuts[1], cuts[2], sums[0], area_err, sums[1], volume_err);
 
   MFTLEnsembleDestroy(&ens);
   MFTLFreeMpiTypes();

@@ -19,11 +19,23 @@
 # rank count as PROCESSORS, so `ctest -j N` schedules RANKS rather than tests and
 # does not start four 8-rank tests at once on a 4-core machine.
 
-# Labels and reserves cores for a test that runs `nranks` processes.
+# Labels and reserves cores for a test that runs `nranks` processes, and makes
+# it depend on the launcher check below.
 function(mftl_label_mpi_test name nranks)
   set_property(TEST ${name} APPEND PROPERTY LABELS mpi np${nranks} ${ARGN})
   set_property(TEST ${name} PROPERTY PROCESSORS ${nranks})
+  set_property(TEST ${name} APPEND PROPERTY FIXTURES_REQUIRED mftl_mpi_launcher)
 endfunction()
+
+# Before any distributed test: does `mpiexec -n 2` start one job of two ranks?
+# A mismatched launcher starts singletons, and most distributed tests then pass
+# while testing nothing distributed (test_mpi_launcher.c). As a fixture it runs
+# first, also under `ctest -R`, and a failure skips every MPI test.
+add_executable(test_mpi_launcher test_mpi_launcher.c)
+target_link_libraries(test_mpi_launcher PRIVATE MPI::MPI_C)
+add_test(NAME test_mpi_launcher
+         COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS} $<TARGET_FILE:test_mpi_launcher> 2 ${MPIEXEC_POSTFLAGS})
+set_tests_properties(test_mpi_launcher PROPERTIES LABELS "mpi;np2" PROCESSORS 2 FIXTURES_SETUP mftl_mpi_launcher)
 
 function(mftl_add_test name)
   add_executable(${name} ${name}.c)

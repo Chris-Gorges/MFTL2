@@ -4060,12 +4060,17 @@ static int bind_stage_core(MFTL_Coupler *c, const MFTL_CouplingBinding *base, co
     b->q_level = base->q_level;
     b->q_max = base->q_max;
     b->q_ratio = base->q_ratio;
-    memcpy(b->loc_band, base->loc_band, (size_t) base->n_loc * sizeof(int));
-    memcpy(b->ref, base->ref, (size_t) base->n_markers * sizeof(MFTL_MarkerRef));
-    memcpy(b->base_pos, base->base_pos, 3 * (size_t) base->n_markers * sizeof(double));
+    /* memcpy from a NULL source is undefined even for zero bytes, and an empty
+     * binding's arrays may be NULL: copy only what exists. */
+    if (base->n_loc > 0) memcpy(b->loc_band, base->loc_band, (size_t) base->n_loc * sizeof(int));
+    if (base->n_markers > 0)
+    {
+      memcpy(b->ref, base->ref, (size_t) base->n_markers * sizeof(MFTL_MarkerRef));
+      memcpy(b->base_pos, base->base_pos, 3 * (size_t) base->n_markers * sizeof(double));
+    }
     b->n_bodies = base->n_bodies;
     b->bodies = (cpl_body_snap *) MFTLCplAlloc((size_t) MFTL_MAX(base->n_bodies, 1) * sizeof(cpl_body_snap), "binding bodies");
-    memcpy(b->bodies, base->bodies, (size_t) base->n_bodies * sizeof(cpl_body_snap));
+    if (base->n_bodies > 0) memcpy(b->bodies, base->bodies, (size_t) base->n_bodies * sizeof(cpl_body_snap));
     b->pos_checksum = base->pos_checksum;
     for (int64_t i = 0; i < base->n_markers && local == MFTL_COUPLING_OK; ++i)
     {

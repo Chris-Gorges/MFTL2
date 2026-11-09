@@ -36,5 +36,5 @@ find_package(MPI REQUIRED COMPONENTS C)
 foreach(_exe consumer_c consumer_cxx)
     add_test(NAME ${_exe}
              COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
-                     $<TARGET_FILE:${_exe}> ${MPIEXEC_POSTFLAGS})
+                     $<TARGET_FILE:${_exe}> 2 ${MPIEXEC_POSTFLAGS})
 endforeach()

@@ -419,8 +419,9 @@ static void emit_points(const MFTL_Object *obj, const piece *p, const dbuf *wpos
 
   if (p->n_marked == nv)
   {
-    /* Every vertex referenced (the common case): the compaction is the identity. */
-    memcpy(out, pos, (size_t) (3 * nv) * sizeof(double));
+    /* Every vertex referenced (the common case): the compaction is the identity.
+     * An empty pool has no array to copy from, and memcpy(NULL, 0) is undefined. */
+    if (nv > 0) memcpy(out, pos, (size_t) (3 * nv) * sizeof(double));
     out += 3 * nv;
   }
   else

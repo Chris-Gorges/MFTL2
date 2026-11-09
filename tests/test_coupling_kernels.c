@@ -272,10 +272,16 @@ static int test_regular_peskin_row_is_untouched(void)
   TEST_ASSERT(MFTLCouplingAssembleRow(&p, x, H, n, X, q, w, &rq) == MFTL_COUPLING_OK);
   TEST_ASSERT(!rq.corrected && rq.order == 1 && rq.condition == 1.0);
   TEST_ASSERT(rq.n_support == 64);
+  /* The kernel argument is formed as the library forms it, (X - x) * (1/h).
+   * Dividing by h instead differs in the last bit of r, and near the edge of
+   * the support phi turns that into ~15 ulp of the weight (|r phi'/phi| ~ 15
+   * at r = 1.8): within 4 ulp WITH fused multiply-add on arm64, 18 ulp without
+   * it on x86-64. What is tested is that no solve touched the row. */
+  const double ih = 1.0 / h;
   for (int j = 0; j < n; ++j)
   {
-    const double base = (q[j] / (h * h * h)) * phi1(MFTL_KERNEL_PESKIN4, (X[3 * j] - x[0]) / h) * phi1(MFTL_KERNEL_PESKIN4, (X[3 * j + 1] - x[1]) / h) *
-                        phi1(MFTL_KERNEL_PESKIN4, (X[3 * j + 2] - x[2]) / h);
+    const double base = (q[j] / (h * h * h)) * phi1(MFTL_KERNEL_PESKIN4, (X[3 * j] - x[0]) * ih) * phi1(MFTL_KERNEL_PESKIN4, (X[3 * j + 1] - x[1]) * ih) *
+                        phi1(MFTL_KERNEL_PESKIN4, (X[3 * j + 2] - x[2]) * ih);
     /* the kernel's product to the ulp (the library multiplies q by (1/h)^3, this by 1/h^3) */
     TEST_ASSERT(fabs(w[j] - base) <= 4.0 * DBL_EPSILON * base);
   }

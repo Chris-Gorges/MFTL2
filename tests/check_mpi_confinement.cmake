@@ -20,6 +20,12 @@
 # fine but a call is not. The allowed file is named rather than pattern-matched,
 # so adding a second networking file is a deliberate edit here.
 
+# A `cmake -P` script starts with every policy unset, so under CMake 3.x the
+# IN_LIST operator below is not an operator at all and the script errors out;
+# CMake 4 dropped the old behaviour, which is why this only failed off the
+# development machine. Pin the policies to the version the project requires.
+cmake_policy(VERSION 3.13)
+
 if(NOT DEFINED SRC_DIR)
   message(FATAL_ERROR "check_mpi_confinement: SRC_DIR not set")
 endif()

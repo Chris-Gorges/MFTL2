@@ -31,7 +31,7 @@ jobs:
       - uses: ./.github/actions/setup
         with:
           compiler: ${{ matrix.compiler }}
-          mpi: mpich
+          mpi: openmpi
       - name: Configure
         # No LTO: the symbol audit reads the archive with plain nm.
         run: >

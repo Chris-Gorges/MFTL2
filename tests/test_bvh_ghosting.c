@@ -176,7 +176,10 @@ static int cmp_ll(const void *a, const void *b)
   return (x > y) - (x < y);
 }
 
-static void ks_sort(keyset *s) { qsort(s->k, (size_t) s->n, sizeof(long long), cmp_ll); }
+static void ks_sort(keyset *s)
+{
+  if (s->n > 1) qsort(s->k, (size_t) s->n, sizeof(long long), cmp_ll); /* an empty set may have k == NULL */
+}
 
 /**
  * @brief Multiset equality, with the first difference printed.

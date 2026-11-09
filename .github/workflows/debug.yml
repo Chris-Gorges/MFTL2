@@ -24,7 +24,7 @@ concurrency:
 jobs:
   sanitizers:
     name: gcc + mpich, ASan/UBSan
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04   # MPICH; see .github/actions/setup
     timeout-minutes: 180
     env:
       # MPI implementations keep allocations alive until exit by design; leak
@@ -38,7 +38,7 @@ jobs:
           compiler: gcc
           mpi: mpich
       - name: Allow ASan's shadow memory layout
-        # Ubuntu 24.04 runners randomise mmap with 32 bits, which ASan cannot map around.
+        # Current runner kernels randomise mmap with 32 bits, which ASan cannot map around.
         run: sudo sysctl vm.mmap_rnd_bits=28
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON

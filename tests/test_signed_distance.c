@@ -621,7 +621,13 @@ static int test_edge_crossings_are_order_free_and_on_the_mesh(void)
   MFTL_Object *obj = mesh_from_field(g_ens, lo, hi, 0.05, star_field, MFTL_NULL);
   prepare(obj);
   const int nt = obj->tris.n, dim = 49;
-  const double glo[3] = {-1.7, -1.7, -1.7}, dx = 0.07;
+  /* The lattice is put in GENERAL position against the mesh. At glo = -1.7 the
+   * mesh's own lattice (dx 0.05 from -1.8) and this one (dx 0.07) share every
+   * line with 5k - 7m = 10, so lattice edges run exactly through mesh vertices
+   * and edges, and whether one triangle or two claim such a crossing is decided
+   * by the last rounding bit: 1644 of 2098 vertices on the mesh without fused
+   * multiply-add (x86-64), 2051 with it (arm64). Offset, both give 2049 of 2094. */
+  const double glo[3] = {-1.7 + 0.0137, -1.7 + 0.0071, -1.7 + 0.0213}, dx = 0.07;
   const size_t n = (size_t) dim * dim * dim;
 
   MFTL_SdfGrid a, p;

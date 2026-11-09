@@ -1201,7 +1201,7 @@ double *MFTLRemeshExchangeRecords(const MFTL_Domain *domain, const double *rec, 
   if (nproc == 1)
   {
     double *out = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(n_self * width, 1) * sizeof(double), "remesh records");
-    memcpy(out, rec, (size_t) n_self * width * sizeof(double));
+    if (n_self > 0) memcpy(out, rec, (size_t) n_self * width * sizeof(double)); /* rec may be NULL when empty */
     *n_out = n_self;
     return out;
   }

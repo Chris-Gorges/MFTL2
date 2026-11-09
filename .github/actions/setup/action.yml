@@ -6,8 +6,11 @@ inputs:
     description: gcc or clang
     default: gcc
   mpi:
-    description: mpich or openmpi
-    default: mpich
+    description: >-
+      mpich or openmpi. MPICH only on ubuntu-22.04: the package Ubuntu 24.04
+      ships (4.2.0-5build3) starts every process of `mpiexec -n N` as a
+      singleton of size 1, so each rank runs the whole test alone.
+    default: openmpi
 
 runs:
   using: composite
