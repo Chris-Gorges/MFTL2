@@ -26,7 +26,9 @@ The job file (see make_readme_gifs.sh for the ones the README uses):
     area          {"range": [lo, hi], "log": true, "preset": name}: colour every
                   triangle by its area (ParaView's Cell Size) instead -- what
                   makes a size field, e.g. curvature-adaptive remeshing, visible
-    label         a caption drawn in the upper left corner
+    label         a caption drawn in the upper left corner, in "label_color"
+    transparent   save RGBA frames with a transparent background, for an
+                  animation that sits on any page colour
     box           [xmin, xmax, ymin, ymax, zmin, zmax]: draw the domain outline
     ambient, diffuse, specular   lighting
 """
@@ -61,8 +63,8 @@ if job.get("box"):
     box = Box(XLength=b[1] - b[0], YLength=b[3] - b[2], ZLength=b[5] - b[4], Center=[(b[0] + b[1]) / 2, (b[2] + b[3]) / 2, (b[4] + b[5]) / 2])
     bd = Show(box, view)
     bd.Representation = "Outline"
-    bd.AmbientColor = bd.DiffuseColor = [0.55, 0.58, 0.62]
-    bd.LineWidth = 1.5
+    bd.AmbientColor = bd.DiffuseColor = job.get("box_color", [0.55, 0.58, 0.62])
+    bd.LineWidth = job.get("box_width", 1.5)  # thicker for a transparent background, whose 1-bit GIF alpha cuts thin lines
 
 pal = job.get("palette", [[0.42, 0.64, 0.90], [0.98, 0.68, 0.38], [0.52, 0.80, 0.54], [0.93, 0.50, 0.55], [0.70, 0.58, 0.88],
                           [0.75, 0.60, 0.48], [0.95, 0.66, 0.84], [0.55, 0.82, 0.85]])
@@ -135,7 +137,7 @@ if job.get("label"):
     td = Show(txt, view)
     td.WindowLocation = "Upper Left Corner"
     td.FontSize = job.get("label_size", 26)
-    td.Color = [0.15, 0.17, 0.20]
+    td.Color = job.get("label_color", [0.15, 0.17, 0.20])
 
 for k, f in enumerate(files):
     src = XMLPartitionedUnstructuredGridReader(FileName=[f])
@@ -202,7 +204,7 @@ for k, f in enumerate(files):
             pass
         d.LineWidth = job.get("edge_width", 1.0)
     Render(view)
-    SaveScreenshot(os.path.join(job["out"], "frame_%04d.png" % k), view, ImageResolution=[w, h], TransparentBackground=0)
+    SaveScreenshot(os.path.join(job["out"], "frame_%04d.png" % k), view, ImageResolution=[w, h], TransparentBackground=1 if job.get("transparent") else 0)
     Delete(src)
     del src
 print("rendered", len(files), "frames")

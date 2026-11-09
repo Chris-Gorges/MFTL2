@@ -20,18 +20,27 @@ Doxygen manual with call graphs, rebuilt from `main` on every push.
 
 <table>
   <tr>
-    <td width="33%"><img src=".github/images/leveque.gif" alt="A sphere stretched into a thin sheet and back, remeshed on four ranks"></td>
-    <td width="33%"><img src=".github/images/rayleigh_taylor.gif" alt="A Rayleigh-Taylor cap rolling up until a blob pinches off"></td>
-    <td width="33%"><img src=".github/images/droplets.gif" alt="216 droplets deforming in a periodic box, coloured by owning rank"></td>
+    <td width="40%"><img src=".github/images/leveque.gif" alt="A sphere stretched into a thin spiral sheet and back, remeshed on four ranks"></td>
+    <td width="60%"><img src=".github/images/leveque_sizing.gif" alt="The same run with uniform and with curvature-adaptive sizing, coloured by triangle area"></td>
   </tr>
   <tr>
-    <td valign="top"><b>Distributed remeshing.</b> LeVeque's deformation test: a sphere is stretched into a thin sheet and
-      returns, remeshed every step on 4 MPI ranks (colour: owning rank). After the full period the volume is off by
-      0.08 %, the worst triangle quality is 0.83, no triangle is inverted.</td>
-    <td valign="top"><b>Topology change.</b> A kinematic Rayleigh–Taylor emulation (prescribed velocity field): the
-      cap rolls up until a blob pinches off and becomes a closed body of its own (orange), reconstructed on 4 ranks.</td>
-    <td valign="top"><b>Many bodies.</b> 216 droplets in a periodic box, strained, remeshed every step and redistributed
-      across 8 ranks as they move (colour: owning rank) — 270 k triangles, about 55 ms per step on a laptop.</td>
+    <td valign="top"><b>Distributed remeshing.</b> LeVeque's deformation test, face-on: a sphere is stretched into a thin
+      spiral sheet and returns, remeshed every step on 4 MPI ranks (colour: owning rank, the 2&times;2 decomposition).
+      After the full period the volume is off by 0.08 %, the worst triangle quality is 0.83, no triangle is inverted.</td>
+    <td valign="top"><b>Curvature-adaptive sizing.</b> The same run with uniform (left) and curvature-adaptive sizing
+      (right), coloured by triangle area (dark: small). Refining where the sheet bends keeps the volume error at 0.08 %
+      instead of 1.42 %, with up to twice the triangles.</td>
+  </tr>
+  <tr>
+    <td colspan="2"><img src=".github/images/duct.gif" width="49%" alt="800 droplets carried through a periodic duct, coloured by owning rank">
+      <img src=".github/images/liquid_jet.gif" width="49%" alt="A liquid jet whose necks pinch off into drops"></td>
+  </tr>
+  <tr>
+    <td colspan="2" valign="top"><b>Many bodies</b> (left). 800 droplets of random size carried through a periodic duct by a
+      swirling flow, remeshed every step and redistributed across 8 ranks as they move (colour: owning rank): 1.0 &rarr; 1.7 M
+      triangles, volume +0.3 % over one pass, about 0.36 s per step on a laptop. <b>Topology change</b> (right). A jet
+      grows through a nozzle; its necks pinch off and every drop becomes a closed body of its own (blue: the jet), on 4
+      ranks. Both flows are prescribed velocity fields, not flow solutions.</td>
   </tr>
 </table>
 
@@ -56,7 +65,7 @@ Doxygen manual with call graphs, rebuilt from `main` on every push.
   assumed; a missing sample is reported, not renormalised away.
 - **Communication that scales with what a rank holds.** Per-body reductions and prefix sums go to each body's
   holders over a 26-neighbour graph communicator, certified after the exchange, with an exact global fallback.
-- **Tests that check the answer.** 149 CTest entries at 1, 2, 3, 4, 8 and 27 ranks. Distributed results are compared
+- **Tests that check the answer.** 150 CTest entries at 1, 2, 3, 4, 8 and 27 ranks. Distributed results are compared
   with the same call on one rank, contact queries as multisets against an exhaustive sweep, coupling rows against
   brute-force references written without the library's machinery; several suites were mutation-checked.
 
