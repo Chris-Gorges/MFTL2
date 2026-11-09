@@ -1,0 +1,29 @@
+cff-version: 1.2.0
+message: "If you use MFTL in your work, please cite it using the metadata below."
+type: software
+title: "MFTL: MultiFlow Triangulation Library"
+abstract: >-
+  A C11/MPI library for the distributed-memory manipulation of closed and open
+  triangulated surface meshes, for front-tracking and immersed-boundary CFD:
+  half-edge topology with implicit indexing, redistribution and ghost
+  synchronisation, serial and distributed isotropic and curvature-adaptive
+  remeshing, LBVH contact detection with exact predicates, breakup and
+  coalescence by signed-distance reconstruction, and coupling to flow solvers.
+authors:
+  - given-names: Christian
+    family-names: Gorges
+  - given-names: Berend
+    name-particle: van
+    family-names: Wachem
+version: 2.0.0-alpha.1
+license: Apache-2.0
+repository-code: "https://github.com/Chris-Gorges/MFTL2"
+keywords:
+  - front tracking
+  - surface mesh
+  - remeshing
+  - computational geometry
+  - MPI
+  - HPC
+  - multiphase flow
+  - immersed boundary method

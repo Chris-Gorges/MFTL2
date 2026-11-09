@@ -1,0 +1,8 @@
+MFTL - MultiFlow Triangulation Library
+Copyright 2025-2026 Christian Gorges and Berend van Wachem
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes a radix sort derived from work by Cameron Hart,
+Copyright (c) 2014 Cameron Hart, distributed under the zlib license.
+The original license notice is reproduced in src/arrayfunctions/radixsort.c.
