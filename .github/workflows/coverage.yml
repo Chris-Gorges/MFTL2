@@ -1,0 +1,63 @@
+name: Coverage
+
+# Line and branch coverage of the library (src/) by the test suite, everything
+# but the oversubscribed 27-rank runs, measured with gcov in an unoptimised GCC
+# build and summarised by gcovr. Several MPI ranks of one test update the same
+# .gcda files at exit; libgcov locks and adds the counters, so the ranks'
+# coverage is merged, not overwritten. The summary is in the job summary and the
+# annotated sources are an artifact; Codecov receives the report when the
+# repository is connected there, and its absence does not fail the job.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  coverage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+      id-token: write # Codecov's tokenless upload (OIDC)
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup
+        with:
+          compiler: gcc
+          mpi: openmpi
+      - name: Install gcovr
+        run: pip install gcovr==8.8
+      - name: Configure
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=OFF
+          -DCMAKE_C_FLAGS=--coverage -DCMAKE_EXE_LINKER_FLAGS=--coverage
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j 4 --timeout 1800 -LE np27
+      - name: Report
+        run: |
+          mkdir -p coverage
+          gcovr --root . --filter 'src/' --exclude-throw-branches \
+                --cobertura coverage.xml --html-details coverage/index.html \
+                --markdown-summary coverage-summary.md --print-summary build
+          cat coverage-summary.md >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v6
+        with:
+          name: coverage-report
+          path: coverage
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v6
+        with:
+          files: coverage.xml
+          use_oidc: true
+          fail_ci_if_error: false

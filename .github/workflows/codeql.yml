@@ -1,0 +1,57 @@
+name: CodeQL
+
+# GitHub's semantic code analysis over the library (not the tests or examples),
+# with the default, high-precision security query suite. Results go to the
+# Security tab -- once the repository is public: code scanning on a private
+# repository needs a paid plan, so until then the run analyses everything and
+# keeps the results as a SARIF artifact instead of uploading them.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "23 4 * * 1" # weekly: new queries find old code
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup
+        with:
+          compiler: gcc
+          mpi: openmpi
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: c-cpp
+          build-mode: manual
+      - name: Build the library
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF -DMFTL_ENABLE_LTO=OFF \
+                -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF
+          cmake --build build
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: /language:c-cpp
+          output: sarif
+          upload: ${{ github.event.repository.private && 'never' || 'always' }}
+      - name: Keep the results (private repository)
+        if: github.event.repository.private
+        uses: actions/upload-artifact@v6
+        with:
+          name: codeql-sarif
+          path: sarif
