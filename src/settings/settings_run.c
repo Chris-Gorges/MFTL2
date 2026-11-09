@@ -172,7 +172,12 @@ int MFTLSettingsLoadArgs(MFTL_Settings *s, int argc, char **argv, MPI_Comm comm)
       while (*a == '-') ++a;
       const char *eq = strchr(a, '=');
       if (strpbrk(eq + 1, "\r\n")) continue; /* cannot happen from a shell; refuse rather than split */
-      len += (size_t) snprintf(text + len, cap - len, "%.*s = %s\n", (int) (eq - a), a, eq + 1);
+      /* A line is strlen(a) + 3 characters and cap reserved strlen(argv[i]) + 4
+       * for it, so it always fits; say so rather than let a truncation push
+       * len past cap, where cap - len would wrap around. */
+      const int w = snprintf(text + len, cap - len, "%.*s = %s\n", (int) (eq - a), a, eq + 1);
+      if (w < 0 || (size_t) w >= cap - len) abort();
+      len += (size_t) w;
     }
   }
 
