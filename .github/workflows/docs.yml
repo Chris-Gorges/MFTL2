@@ -42,7 +42,7 @@ jobs:
         with:
           repository: Chris-Gorges/MFTL2_Documentation
           path: MFTL2_Documentation
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.14" # what requirements-docs.lock was resolved with
       - name: Graphviz and the pinned Doxygen
