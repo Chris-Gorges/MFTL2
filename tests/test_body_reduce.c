@@ -284,13 +284,16 @@ static int test_every_holder_gets_the_same_bits(void)
   MFTLEnsembleReduceBodies(ens, rows, N_SLOTS, g_ops, MFTL_BODY_REDUCE_SCOPE_AUTO);
 
   /* One 64-bit digest per body, reduced twice. A holder contributes its digest,
-   * a non-holder the identity, so MIN == MAX exactly when every holder agreed. */
+   * a non-holder the identity, so AND == OR exactly when every holder agreed.
+   * Bitwise, not MIN/MAX: MPICH 4.0 (Ubuntu 22.04) orders MPI_UINT64_T as
+   * SIGNED in MIN and MAX, so UINT64_MAX and 0 stop being the identities and
+   * every body some rank does not hold was reported as a disagreement. */
   uint64_t *lo = (uint64_t *) malloc((size_t) nb * sizeof(uint64_t));
   uint64_t *hi = (uint64_t *) malloc((size_t) nb * sizeof(uint64_t));
   for (int g = 0; g < nb; ++g)
   {
-    lo[g] = UINT64_MAX;
-    hi[g] = 0;
+    lo[g] = UINT64_MAX;  // AND identity
+    hi[g] = 0;  // OR identity
   }
 
   for (int o = 0; o < n; ++o)
@@ -307,13 +310,13 @@ static int test_every_holder_gets_the_same_bits(void)
     hi[g] = h;
   }
 
-  MPI_Allreduce(MPI_IN_PLACE, lo, nb, MPI_UINT64_T, MPI_MIN, MPI_COMM_WORLD);
-  MPI_Allreduce(MPI_IN_PLACE, hi, nb, MPI_UINT64_T, MPI_MAX, MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, lo, nb, MPI_UINT64_T, MPI_BAND, MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, hi, nb, MPI_UINT64_T, MPI_BOR, MPI_COMM_WORLD);
 
   int ok = 1;
   for (int g = 0; g < nb; ++g)
   {
-    if (hi[g] == 0) continue;  // held by nobody, which cannot happen here but says so
+    if (lo[g] == UINT64_MAX && hi[g] == 0) continue;  // held by nobody, which cannot happen here but says so
     if (lo[g] != hi[g]) ok = 0;
   }
 

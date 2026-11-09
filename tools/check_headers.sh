@@ -20,6 +20,10 @@ CXX="${MFTL_CXX:-mpicxx}"
 # The wrappers append their link flags even to a syntax-only run, which clang
 # reports as unused arguments; GCC ignores the unknown -Wno- switch.
 quiet=-Wno-unused-command-line-argument
+# What MFTL::MFTL hands every C++ consumer (CMakeLists.txt): without it Open MPI
+# 4 and MPICH declare the removed MPI C++ bindings, whose own headers do not
+# compile cleanly under -Wextra -Werror with GCC.
+cxx_defs="-DOMPI_SKIP_MPICXX=1 -DMPICH_SKIP_MPICXX=1"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -32,7 +36,7 @@ for h in "$root"/include/*.h; do
     echo "NOT SELF-CONTAINED AS C11: $name"
     failed=1
   fi
-  if ! "$CXX" -std=c++17 -Wall -Wextra -Werror -fsyntax-only $quiet -I"$root/include" "$tmp/cxx.cpp"; then
+  if ! "$CXX" -std=c++17 -Wall -Wextra -Werror -fsyntax-only $quiet $cxx_defs -I"$root/include" "$tmp/cxx.cpp"; then
     echo "DOES NOT COMPILE AS C++17: $name"
     failed=1
   fi
