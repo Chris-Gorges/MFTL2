@@ -35,7 +35,7 @@ jobs:
           - { os: ubuntu-22.04, compiler: gcc, mpi: mpich }
           - { os: ubuntu-24.04, compiler: clang, mpi: openmpi }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
         with:
           compiler: ${{ matrix.compiler }}
@@ -63,7 +63,7 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/setup
         with:
           compiler: clang
