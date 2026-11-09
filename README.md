@@ -18,6 +18,23 @@ front-tracking and immersed-boundary CFD simulations.
 **[Manual](https://chris-gorges.github.io/MFTL2/)** — guides, the theory of every module, the API reference and the
 Doxygen manual with call graphs, rebuilt from `main` on every push.
 
+<table>
+  <tr>
+    <td width="33%"><img src=".github/images/leveque.gif" alt="A sphere stretched into a thin sheet and back, remeshed on four ranks"></td>
+    <td width="33%"><img src=".github/images/rayleigh_taylor.gif" alt="A Rayleigh-Taylor cap rolling up until a blob pinches off"></td>
+    <td width="33%"><img src=".github/images/droplets.gif" alt="216 droplets deforming in a periodic box, coloured by owning rank"></td>
+  </tr>
+  <tr>
+    <td valign="top"><b>Distributed remeshing.</b> LeVeque's deformation test: a sphere is stretched into a thin sheet and
+      returns, remeshed every step on 4 MPI ranks (colour: owning rank). After the full period the volume is off by
+      0.08 %, the worst triangle quality is 0.83, no triangle is inverted.</td>
+    <td valign="top"><b>Topology change.</b> A kinematic Rayleigh–Taylor emulation (prescribed velocity field): the
+      cap rolls up until a blob pinches off and becomes a closed body of its own (orange), reconstructed on 4 ranks.</td>
+    <td valign="top"><b>Many bodies.</b> 216 droplets in a periodic box, strained, remeshed every step and redistributed
+      across 8 ranks as they move (colour: owning rank) — 270 k triangles, about 55 ms per step on a laptop.</td>
+  </tr>
+</table>
+
 > **Status:** under active development (2.0.0-alpha). Everything listed below is implemented and tested; the API can
 > still change between releases.
 
@@ -42,6 +59,19 @@ Doxygen manual with call graphs, rebuilt from `main` on every push.
 - **Tests that check the answer.** 149 CTest entries at 1, 2, 3, 4, 8 and 27 ranks. Distributed results are compared
   with the same call on one rank, contact queries as multisets against an exhaustive sweep, coupling rows against
   brute-force references written without the library's machinery; several suites were mutation-checked.
+
+## Performance
+
+The per-timestep loop of a front-tracking solver — move the owned vertices, synchronise the ghosts, recompute the
+geometry, redistribute, vertex normals — for droplets of 1280 triangles each in a periodic box, measured on an HPC
+cluster with 36 cores per node ([`scaling/`](scaling/README.md)):
+
+| | Problem | 36 → 288 ranks (1 → 8 nodes) |
+|---|---|---|
+| Weak scaling | 1 000 droplets (1.28 M triangles) per rank, up to 288 000 droplets and 369 M triangles | 90 % efficiency; 162 ms per step at 288 ranks |
+| Strong scaling | 110 592 droplets, 142 M triangles | 6.6× faster (82 % efficiency); 393 → 60 ms per step |
+
+Remeshing and topology changes are not part of these numbers; the remeshing sweeps in `scaling/` measure them.
 
 ## The idea
 

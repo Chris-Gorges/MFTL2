@@ -138,6 +138,7 @@ typedef struct
   int modes[2];  ///< Spanning modes to run, in order.
   int n_modes;
   double max_dv;  ///< A run whose volume moved by more than this fraction fails.
+  int vtk_every;  ///< Write the first trajectory as .pvtu every this many steps; 0 = never.
 } rm_options;
 
 /**
@@ -186,6 +187,8 @@ static const char *const RM_COMMON_USAGE =
     "  --spanning-modes M  once,nested | nested,once | once | nested: the spanning modes this\n"
     "                      job runs, one after the other on the same problem  (default once,nested)\n"
     "  --max-dv X          fail a run whose volume moved by more than X          (default 0.05)\n"
+    "  --vtk N             write the first trajectory every N steps as <label>_<mode>_NNNN.pvtu,\n"
+    "                      outside the step's clock -- for looking at it, not for timing (default 0)\n"
     "  --cuts X Y Z        process grid\n"
     "  --init-batch N      spheres per initialisation redistribution    (default 64 dispersed, 4 spanning)\n"
     "  --max-gen-mb X      limit the mesh storage of ONE initialisation batch on rank 0\n"
@@ -227,6 +230,7 @@ static int rm_parse_common(int argc, char **argv, int *i, rm_options *o)
   RM_INT("--smooth", smooth)
   RM_INT("--budget", budget)
   RM_DBL("--max-dv", max_dv)
+  RM_INT("--vtk", vtk_every)
 #undef RM_INT
 #undef RM_DBL
 
@@ -752,6 +756,13 @@ static int rm_run_mode(const rm_problem *prob, const rm_options *opt, int mode, 
     }
     rm_traj tr;
     memset(&tr, 0, sizeof tr);
+    char vtk_name[160];
+    const bool vtk = (opt->vtk_every > 0 && traj == 0);
+    if (vtk)
+    {
+      snprintf(vtk_name, sizeof vtk_name, "%s_%s_%04d", opt->sc.label, mode_name, 0);
+      sc_require(MFTLWriteVtu(ens, vtk_name, MFTL_NULL), "vtu output");
+    }
     for (int st = 0; st < ns; ++st)
     {
       const double t = st * dt;
@@ -820,6 +831,12 @@ static int rm_run_mode(const rm_problem *prob, const rm_options *opt, int mode, 
         tr.ops += gcnt[0];
         tr.missed += gcnt[1];
         tr.calls += 1.0;
+      }
+
+      if (vtk && (st + 1) % opt->vtk_every == 0)
+      {
+        snprintf(vtk_name, sizeof vtk_name, "%s_%s_%04d", opt->sc.label, mode_name, st + 1);
+        sc_require(MFTLWriteVtu(ens, vtk_name, MFTL_NULL), "vtu output");
       }
 
       if (st == ns / 2 - 1)  // the step that ends at T/2
