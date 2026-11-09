@@ -40,7 +40,9 @@ base="${1:-HEAD}"
 head="${2:-}"
 
 if [ "$fix" -eq 1 ]; then
-  git clang-format --binary "$CLANG_FORMAT" "$base"
+  # --force: rewrite the working tree even where the changes are not staged,
+  # which is the normal state of work about to be committed.
+  git clang-format --force --binary "$CLANG_FORMAT" "$base"
   exit 0
 fi
 

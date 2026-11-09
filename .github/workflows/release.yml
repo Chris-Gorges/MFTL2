@@ -9,6 +9,11 @@ on:
     branches: [main]
   pull_request:
   workflow_dispatch:
+    inputs:
+      tests:
+        description: "Run only the tests matching this ctest -R regex (empty: the usual selection)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -26,8 +31,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-24.04, compiler: gcc, mpi: openmpi }
-          - { os: ubuntu-22.04, compiler: clang, mpi: mpich }
+          # Debian's mpicc carries GCC-only LTO flags, so MPICH is paired with gcc.
+          - { os: ubuntu-22.04, compiler: gcc, mpi: mpich }
+          - { os: ubuntu-24.04, compiler: clang, mpi: openmpi }
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/setup
@@ -39,4 +45,11 @@ jobs:
       - name: Build
         run: cmake --build build
       - name: Test
-        run: ctest --test-dir build --output-on-failure -j 4 --timeout 900 -LE np27
+        env:
+          TESTS: ${{ inputs.tests }}
+        run: |
+          if [ -n "$TESTS" ]; then
+            ctest --test-dir build --output-on-failure -j 4 --timeout 900 -R "$TESTS"
+          else
+            ctest --test-dir build --output-on-failure -j 4 --timeout 900 -LE np27
+          fi

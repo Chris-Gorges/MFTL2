@@ -317,6 +317,18 @@ static int test_every_holder_gets_the_same_bits(void)
     if (lo[g] != hi[g]) ok = 0;
   }
 
+  /* On a disagreement every holder of an affected body prints what it got, so
+   * the log says WHICH slot differs -- a lost or doubled contribution, or bits. */
+  if (!ok)
+    for (int o = 0; o < n; ++o)
+    {
+      const int g = ens->local_objects[o]->global_id;
+      if (lo[g] == hi[g]) continue;
+      const double *r = &rows[(size_t) o * N_SLOTS];
+      printf("\n    rank %d, body %d: min rank %.17g, max rank %.17g, min share %.17g, holders %.17g, triangles %.17g", g_rank, g, r[0], r[1], r[2], r[3],
+             r[4]);
+    }
+
   TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
 
   free(hi);

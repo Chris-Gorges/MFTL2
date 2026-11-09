@@ -143,6 +143,16 @@ static int domain_init_comm(MFTL_Domain *domain)
   // --- 4. Distributed graph communicator ---
   // For an adjacent graph the sources of incoming messages are the same as the
   // destinations of outgoing messages.
+  //
+  // Open MPI spells the standard's MPI_UNWEIGHTED sentinel as the address
+  // (int *) 2, which GCC's access analysis reads as an array of size 0 and
+  // reports in both graph calls below (-Wstringop-overread/-overflow). The
+  // warning is about the spelling of a sentinel, not about this code.
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wstringop-overread"
+#pragma GCC diagnostic ignored "-Wstringop-overflow"
+#endif
   if (MPI_Dist_graph_create_adjacent(domain->comm_world, num_unique, unique_neighbors, MPI_UNWEIGHTED, num_unique, unique_neighbors, MPI_UNWEIGHTED,
                                      MPI_INFO_NULL, reorder, &domain->comm_graph) != MPI_SUCCESS)
   {
@@ -161,6 +171,9 @@ static int domain_init_comm(MFTL_Domain *domain)
   int *dest = (int *) MFTLMallocOrDie((size_t) (outdegree > 0 ? outdegree : 1) * sizeof(int), "MFTL domain neighbours (dest)");
 
   MPI_Dist_graph_neighbors(domain->comm_graph, indegree, domain->neighbors, MPI_UNWEIGHTED, outdegree, dest, MPI_UNWEIGHTED);
+#if defined(__GNUC__) && !defined(__clang__) && __GNUC__ >= 11
+#pragma GCC diagnostic pop
+#endif
   free(dest);
 
   /* MPI may report the neighbours in its own order: match offsets by RANK. */

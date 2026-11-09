@@ -13,6 +13,11 @@ on:
   schedule:
     - cron: "17 2 * * *"
   workflow_dispatch:
+    inputs:
+      tests:
+        description: "Run only the tests matching this ctest -R regex (empty: the usual selection)"
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -45,8 +50,12 @@ jobs:
       - name: Build
         run: cmake --build build
       - name: Test
+        env:
+          TESTS: ${{ inputs.tests }}
         run: |
-          if [ "${{ github.event_name }}" = schedule ] || [ "${{ github.event_name }}" = workflow_dispatch ]; then
+          if [ -n "$TESTS" ]; then
+            ctest --test-dir build --output-on-failure -j 4 --timeout 3600 -R "$TESTS"
+          elif [ "${{ github.event_name }}" = schedule ] || [ "${{ github.event_name }}" = workflow_dispatch ]; then
             ctest --test-dir build --output-on-failure -j 4 --timeout 3600
           else
             ctest --test-dir build --output-on-failure -j 4 --timeout 1800 -LE "np27|long"

@@ -94,6 +94,14 @@ target_include_directories(MFTL PUBLIC
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 target_link_libraries(MFTL PUBLIC MPI::MPI_C)
+# A C++ solver includes mpi.h through MFTL's headers, and Open MPI 4 and MPICH
+# then also declare the MPI C++ bindings (deprecated in MPI-2.2, removed in
+# MPI-3), which live in a library nothing here links: the C++ consumer failed
+# to link with undefined MPI::Comm symbols. MFTL uses the C API only.
+target_compile_definitions(MFTL INTERFACE
+    $<$<COMPILE_LANGUAGE:CXX>:OMPI_SKIP_MPICXX=1>
+    $<$<COMPILE_LANGUAGE:CXX>:MPICH_SKIP_MPICXX=1>
+)
 target_link_libraries(MFTL PUBLIC m)
 
 set_target_properties(MFTL PROPERTIES
