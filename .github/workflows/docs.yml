@@ -1,0 +1,83 @@
+name: Docs
+
+# The manual -- guides, the module theory chapters with their figures, the API
+# reference and the Doxygen manual with its call graphs -- built from this
+# repository and MFTL2_Documentation with --strict, so any Doxygen or MkDocs
+# warning (a new function without @param, a dead link) fails the build. From
+# main it is published to GitHub Pages: https://chris-gorges.github.io/MFTL2/
+#
+# Doxygen is pinned to the version the manual is written against: two releases
+# warn about different things, and a strict build that depends on the runner's
+# package is not a check. The measurement document docs/analysis.md is not in
+# the repository, so the published manual has no Analysis section.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "41 3 * * *" # picks up changes to MFTL2_Documentation
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DOXYGEN_VERSION: "1.18.0"
+  DOXYGEN_SHA256: "14fa81bdc34171edb5f1f02b1d60e74802f0439b77fa44e592565d517d72df90"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          path: MFTL2
+      - uses: actions/checkout@v6
+        with:
+          repository: Chris-Gorges/MFTL2_Documentation
+          path: MFTL2_Documentation
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14" # what requirements-docs.lock was resolved with
+      - name: Graphviz and the pinned Doxygen
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends graphviz
+          curl -sSfL -o doxygen.tgz \
+            "https://github.com/doxygen/doxygen/releases/download/Release_${DOXYGEN_VERSION//./_}/doxygen-${DOXYGEN_VERSION}.linux.bin.tar.gz"
+          echo "${DOXYGEN_SHA256}  doxygen.tgz" | sha256sum -c -
+          tar -xzf doxygen.tgz
+          echo "$PWD/doxygen-${DOXYGEN_VERSION}/bin" >> "$GITHUB_PATH"
+      - name: Build the manual with --strict
+        working-directory: MFTL2_Documentation
+        run: |
+          doxygen --version
+          python3 build_mkdocs.py --strict --source-dir "$GITHUB_WORKSPACE/MFTL2" --site-dir "$GITHUB_WORKSPACE/site"
+      - name: Upload for Pages
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+  deploy:
+    # GitHub Pages is available to a private repository only on a paid plan, so
+    # the manual is published once the repository is public.
+    needs: build
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && !github.event.repository.private
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

@@ -5,12 +5,16 @@
 [![CI-Warnings](https://github.com/Chris-Gorges/MFTL2/actions/workflows/warnings.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/warnings.yml)
 [![CI-Format](https://github.com/Chris-Gorges/MFTL2/actions/workflows/format.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/format.yml)
 [![CI-Consumers](https://github.com/Chris-Gorges/MFTL2/actions/workflows/consumers.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/consumers.yml)
+[![Docs](https://github.com/Chris-Gorges/MFTL2/actions/workflows/docs.yml/badge.svg)](https://chris-gorges.github.io/MFTL2/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![C11](https://img.shields.io/badge/C-11-informational)
 ![MPI](https://img.shields.io/badge/MPI-3.0%2B-informational)
 
 A C11/MPI library for the distributed-memory manipulation of closed and open triangulated surface meshes, for
 front-tracking and immersed-boundary CFD simulations.
+
+**[Manual](https://chris-gorges.github.io/MFTL2/)** — guides, the theory of every module, the API reference and the
+Doxygen manual with call graphs, rebuilt from `main` on every push.
 
 > **Status:** under active development (2.0.0-alpha). Everything listed below is implemented and tested; the API can
 > still change between releases.
@@ -246,9 +250,11 @@ Every public function is documented in its header (`include/`), and each module 
 | Mesh output | [`src/io`](src/io/README.md) |
 | Sorting and duplicate removal | [`src/arrayfunctions`](src/arrayfunctions/README.md) |
 
-A full manual (guides, these chapters with their figures, and the Doxygen API reference with call graphs) is built
-from the same sources in a separate repository that is not public yet. Source comments that cite
-`docs/analysis.md §N` refer to the project's measurement record, which is not public yet either.
+The **[online manual](https://chris-gorges.github.io/MFTL2/)** renders all of it — guides, these chapters with their
+figures, the API reference and the Doxygen manual with call and include graphs. The `Docs` workflow builds it from
+this repository and [MFTL2_Documentation](https://github.com/Chris-Gorges/MFTL2_Documentation) with `--strict`, so an
+undocumented parameter or a dead link fails the build, and publishes it from `main`. Source comments that cite
+`docs/analysis.md §N` refer to the project's measurement record, which is not public yet.
 
 ## Status and roadmap
 
