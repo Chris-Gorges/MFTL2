@@ -37,8 +37,10 @@
 /* The exact arithmetic requires a*b and x - a*b to be rounded SEPARATELY: a
  * fused multiply-add makes Two_Product's residue zero and silently voids every
  * guarantee. Hence the pragma, and -ffp-contract=off in CMakeLists.txt for
- * compilers that ignore it. */
-#if defined(__clang__) || (defined(__GNUC__) && __GNUC__ >= 12)
+ * compilers that ignore it. GCC is one of them, up to at least GCC 15: it
+ * warns that it ignores the pragma (-Wunknown-pragmas), so it is not given it
+ * and relies on the flag alone. */
+#if defined(__clang__)
 #pragma STDC FP_CONTRACT OFF
 #endif
 

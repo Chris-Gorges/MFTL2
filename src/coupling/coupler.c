@@ -1272,7 +1272,7 @@ static void serve(MFTL_Coupler *c, MFTL_SupportRequest *R, int requester, const 
   int *hloc = (int *) MFTLCplAlloc((size_t) MFTL_MAX(n_halo, 1) * sizeof(int), "halo boxes");
   for (int i = 0; i < n_halo; ++i)
   {
-    int32_t l;
+    int32_t l = 0;
     GET(msg, bytes, &off, l);
     hloc[i] = l;
     for (int k = 0; k < 6; ++k) GET(msg, bytes, &off, hbox[6 * i + k]);
@@ -3561,7 +3561,7 @@ static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_Co
         Q->max_moment_residual = fmax(Q->max_moment_residual, residual);
         continue;
       }
-      double H[3], Hm[9];
+      double H[3], Hm[9] = {0.0}; /* Hm is read only when aniso set it; GCC cannot see that */
       bool ok = true;
       const bool aniso = (B->cell != MFTL_NULL);
       /* At most two gathers per row: the pilot neighbourhood (a variable
