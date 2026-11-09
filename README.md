@@ -6,6 +6,8 @@
 [![CI-Format](https://github.com/Chris-Gorges/MFTL2/actions/workflows/format.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/format.yml)
 [![CI-Consumers](https://github.com/Chris-Gorges/MFTL2/actions/workflows/consumers.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/consumers.yml)
 [![Docs](https://github.com/Chris-Gorges/MFTL2/actions/workflows/docs.yml/badge.svg)](https://chris-gorges.github.io/MFTL2/)
+[![CodeQL](https://github.com/Chris-Gorges/MFTL2/actions/workflows/codeql.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/codeql.yml)
+[![codecov](https://codecov.io/gh/Chris-Gorges/MFTL2/graph/badge.svg)](https://codecov.io/gh/Chris-Gorges/MFTL2)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 ![C11](https://img.shields.io/badge/C-11-informational)
 ![MPI](https://img.shields.io/badge/MPI-3.0%2B-informational)
