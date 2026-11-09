@@ -208,6 +208,7 @@
  *                       the axis
  */
 
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -748,11 +749,51 @@ static void clamp_to_domain(const MFTL_Domain *dom, double pos[3])
 }
 
 /**
+ * @brief The jet's body id: the one body with a rim, the nozzle lip.
+ *
+ * Every drop is closed, so the body holding a mesh-boundary vertex is the jet.
+ * Collective: each rank names the body whose rim vertices it owns, and the MIN
+ * and the MAX over the job must agree -- two open bodies would be a broken run.
+ *
+ * @param ens The ensemble.
+ * @return The jet's global id, identical on every rank.
+ */
+static int find_jet_id(const MFTL_Ensemble *ens)
+{
+  int lo = INT_MAX, hi = -1;
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    const MFTL_Object *obj = ens->local_objects[o];
+    for (int v = 0; v < obj->verts.n_local; ++v)
+      if (MFTLVertexIsMeshBoundary(obj, v))
+      {
+        lo = MFTL_MIN(lo, obj->global_id);
+        hi = MFTL_MAX(hi, obj->global_id);
+        break;
+      }
+  }
+  MPI_Allreduce(MPI_IN_PLACE, &lo, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+  MPI_Allreduce(MPI_IN_PLACE, &hi, 1, MPI_INT, MPI_MAX, MPI_COMM_WORLD);
+  if (lo != hi)
+  {
+    if (ens->domain.rank == 0) fprintf(stderr, "the jet is not one body: open bodies %d .. %d\n", lo, hi);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+  return lo;
+}
+
+/**
  * @brief RK2 (midpoint) over the vertices this rank owns; the lip does not move.
  *
  * Pinning the lip is the whole inflow mechanism: every other vertex leaves at U,
  * so the band of triangles attached to the lip stretches at rate U and the
  * remesher refills it.
+ *
+ * The jet is the body with id @p jet (find_jet_id), not body 0: a topology change
+ * does not promise that the piece at the nozzle keeps its id. Assuming it did
+ * translated the jet as a drop once the pinch handed the lip a new id -- the lip
+ * left the wall by U dt, and the next volume measurement found a rim off the
+ * walls and aborted (a second pinch-off in a domain of 32 R0).
  *
  * A DROP -- any body but the jet -- translates rigidly at U. The Rayleigh-Plateau
  * field is the jet's sausage mode and says nothing about a detached drop; kept
@@ -763,7 +804,7 @@ static void clamp_to_domain(const MFTL_Domain *dom, double pos[3])
  * relaxes towards a sphere under surface tension; a rigid translation is the
  * kinematic stand-in for that.
  */
-static void advect(MFTL_Ensemble *ens, const jet_field *f, double t, double dt)
+static void advect(MFTL_Ensemble *ens, const jet_field *f, double t, double dt, int jet)
 {
   const MFTL_Domain *dom = &ens->domain;
 
@@ -771,7 +812,7 @@ static void advect(MFTL_Ensemble *ens, const jet_field *f, double t, double dt)
   {
     MFTL_Object *obj = ens->local_objects[o];
 
-    if (obj->global_id != 0)
+    if (obj->global_id != jet)
     {
       MFTL_FOREACH_OWNED_VERTEX(obj, {
         pos[0] += U0 * dt;
@@ -896,7 +937,7 @@ typedef struct
  *
  * @return The neck radius, R0 if there is no neck (an unperturbed jet).
  */
-static double find_neck(MFTL_Ensemble *ens, double slab, int n_slabs, double *profile, double *scratch, double *neck_x)
+static double find_neck(MFTL_Ensemble *ens, int jet, double slab, int n_slabs, double *profile, double *scratch, double *neck_x)
 {
   const double x0 = ens->domain.global_min[0];
 
@@ -905,7 +946,7 @@ static double find_neck(MFTL_Ensemble *ens, double slab, int n_slabs, double *pr
   for (int o = 0; o < ens->n_local_objects; ++o)
   {
     const MFTL_Object *obj = ens->local_objects[o];
-    if (obj->global_id != 0) continue;
+    if (obj->global_id != jet) continue;
     MFTL_FOREACH_VERTEX_POS(obj, obj->verts.n_local, {
       int s = (int) ((px - x0) / slab);
       s = MFTL_MIN(MFTL_MAX(s, 0), n_slabs - 1);
@@ -1298,7 +1339,8 @@ int main(int argc, char **argv)
 
   jet_stats g0;
   measure(ens, &g0);
-  g0.neck_radius = find_neck(ens, slab, n_slabs, profile, scratch, &g0.neck_x);
+  int jet_id = find_jet_id(ens);  // 0 as generated; re-found after every topology change
+  g0.neck_radius = find_neck(ens, jet_id, slab, n_slabs, profile, scratch, &g0.neck_x);
   const double v0 = g0.sum[S_VOLUME];
   const double lip_area0 = g0.sum[S_LIP_AREA];
 
@@ -1360,7 +1402,7 @@ int main(int argc, char **argv)
 
   for (step = 1; step <= max_steps; ++step)
   {
-    advect(ens, &field, t, cfg.dt);
+    advect(ens, &field, t, cfg.dt, jet_id);
     t += cfg.dt;
 
     MFTLUpdateGhostPositions(ens);
@@ -1431,6 +1473,7 @@ int main(int argc, char **argv)
         }
         free(bodies);
         if (!remeshing) project_lip(ens);  // otherwise topt.remesh carried lip_project
+        jet_id = find_jet_id(ens);
 
         measure(ens, &after);
         v_surgery += after.sum[S_VOLUME] - before.sum[S_VOLUME];
@@ -1461,7 +1504,7 @@ int main(int argc, char **argv)
     MPI_Allreduce(&tip_local, &tip, 1, MPI_DOUBLE, MPI_MAX, MPI_COMM_WORLD);
 
     double neck_x = 0.0;
-    const double neck = find_neck(ens, slab, n_slabs, profile, scratch, &neck_x);
+    const double neck = find_neck(ens, jet_id, slab, n_slabs, profile, scratch, &neck_x);
 
     /* With topology changes on, a thin neck is what the next call cuts, so it
      * no longer ends the run: the drops travel on until one reaches the outlet. */
