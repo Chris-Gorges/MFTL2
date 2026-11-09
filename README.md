@@ -33,7 +33,7 @@ front-tracking and immersed-boundary CFD simulations.
   assumed; a missing sample is reported, not renormalised away.
 - **Communication that scales with what a rank holds.** Per-body reductions and prefix sums go to each body's
   holders over a 26-neighbour graph communicator, certified after the exchange, with an exact global fallback.
-- **Tests that check the answer.** 148 CTest entries at 1, 2, 3, 4, 8 and 27 ranks. Distributed results are compared
+- **Tests that check the answer.** 149 CTest entries at 1, 2, 3, 4, 8 and 27 ranks. Distributed results are compared
   with the same call on one rank, contact queries as multisets against an exhaustive sweep, coupling rows against
   brute-force references written without the library's machinery; several suites were mutation-checked.
 
