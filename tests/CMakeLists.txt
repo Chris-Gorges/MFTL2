@@ -6,12 +6,31 @@
 #
 # Every test binary returns non-zero when any assertion fails (see test_utils.h),
 # which is what CTest keys off.
+#
+# Every test carries LABELS, so a CI job or a developer can select a subset:
+#
+#   serial    no MPI launcher             mpi      launched through mpiexec
+#   np<N>     the rank count              oversub  more ranks than a laptop has
+#   example   a physical run of an example program, checked by its --verify mode
+#   static    a source check run by CMake, no binary
+#   long      over a minute in a Debug + sanitizer build (see the end of file)
+#
+# e.g. `ctest -LE "np27|long"` for a quick run. An MPI test also declares its
+# rank count as PROCESSORS, so `ctest -j N` schedules RANKS rather than tests and
+# does not start four 8-rank tests at once on a 4-core machine.
+
+# Labels and reserves cores for a test that runs `nranks` processes.
+function(mftl_label_mpi_test name nranks)
+  set_property(TEST ${name} APPEND PROPERTY LABELS mpi np${nranks} ${ARGN})
+  set_property(TEST ${name} PROPERTY PROCESSORS ${nranks})
+endfunction()
 
 function(mftl_add_test name)
   add_executable(${name} ${name}.c)
   target_link_libraries(${name} PRIVATE MFTL m)
   target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   add_test(NAME ${name} COMMAND ${name})
+  set_property(TEST ${name} APPEND PROPERTY LABELS serial)
 endfunction()
 
 function(mftl_add_mpi_test name nranks)
@@ -21,6 +40,7 @@ function(mftl_add_mpi_test name nranks)
   add_test(NAME ${name}
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${nranks}
                    ${MPIEXEC_PREFLAGS} $<TARGET_FILE:${name}> ${MPIEXEC_POSTFLAGS})
+  mftl_label_mpi_test(${name} ${nranks})
 endfunction()
 
 # Registers an ALREADY-DEFINED test target under a second name and rank count.
@@ -31,6 +51,7 @@ function(mftl_add_mpi_test_at name target nranks)
   add_test(NAME ${name}
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${nranks}
                    ${MPIEXEC_PREFLAGS} $<TARGET_FILE:${target}> ${MPIEXEC_POSTFLAGS})
+  mftl_label_mpi_test(${name} ${nranks})
 endfunction()
 
 # As above, but for rank counts that exceed the cores of a development machine.
@@ -52,6 +73,7 @@ function(mftl_add_mpi_test_oversub name target nranks)
   add_test(NAME ${name}
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${nranks} ${_extra}
                    ${MPIEXEC_PREFLAGS} $<TARGET_FILE:${target}> ${MPIEXEC_POSTFLAGS})
+  mftl_label_mpi_test(${name} ${nranks} oversub)
 endfunction()
 
 # --- Layer 0: standalone utilities (no MPI) ---
@@ -270,6 +292,7 @@ add_test(NAME test_coupling_memory_limit
                  "-DPREFLAGS=${MPIEXEC_PREFLAGS}" "-DPOSTFLAGS=${MPIEXEC_POSTFLAGS}"
                  -DTEST_BINARY=$<TARGET_FILE:test_coupling_lifecycle>
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/check_coupling_budget.cmake)
+mftl_label_mpi_test(test_coupling_memory_limit 2)
 # Surface quadrature: the points against the triangles, the level against the
 # fluid, and the vertex <-> point conversions as an exact adjoint pair across
 # the ghost schedule (compared with the same surface on one rank alone).
@@ -517,6 +540,7 @@ if(BUILD_EXAMPLES)
     get_filename_component(_name "${_file}" NAME_WE)
     add_test(NAME test_shipped_settings_${_name}
              COMMAND $<TARGET_FILE:mftl_settings> check ${_file} --np 4)
+    set_property(TEST test_shipped_settings_${_name} APPEND PROPERTY LABELS serial example)
   endforeach()
 
   # COUPLING, measured on a flow: LeVeque's vortex with the velocity known only
@@ -637,3 +661,38 @@ mftl_add_mpi_test_at(test_fields_np2 test_fields 2)
 mftl_add_mpi_test_at(test_fields_np4 test_fields 4)
 mftl_add_mpi_test_oversub(test_fields_np8 test_fields 8)
 mftl_add_mpi_test_oversub(test_fields_np27 test_fields 27)
+
+# --- Labels of the tests registered directly with add_test ---------------------
+
+set_property(TEST test_remeshing_mpi_is_confined test_topology_change_mpi_is_confined
+                  test_coupling_mpi_is_confined test_correction_mpi_is_confined
+             APPEND PROPERTY LABELS serial static)
+
+if(BUILD_EXAMPLES)
+  foreach(_t test_leveque_parallel_conserves test_leveque_parallel_conserves_curvature
+             test_leveque_parallel_conserves_projected test_leveque_parallel_conserves_nested
+             test_leveque_parallel_conserves_vpcollapse test_settings_driven_run_conserves
+             test_leveque_coupled_cartesian test_travelling_waves_open_remesh
+             test_travelling_waves_topology)
+    mftl_label_mpi_test(${_t} 2 example)
+  endforeach()
+  foreach(_t test_advection_scaling_conserves test_leveque_coupled_unstructured
+             test_open_surface_creation_conserves test_rayleigh_taylor_open_remesh
+             test_liquid_jet_open_remesh test_liquid_jet_topology test_rayleigh_taylor_topology)
+    mftl_label_mpi_test(${_t} 4 example)
+  endforeach()
+endif()
+
+# Over a minute each in a Debug + ASan/UBSan build on an Apple M4, from
+# Testing/Temporary/CTestCostData.txt (read it with LC_ALL=C: a German locale
+# parses the decimal point as a separator and sorts the list wrongly). Together
+# they are about half of the suite's serial time.
+set_property(TEST test_signed_distance
+                  test_topology_change test_topology_change_np2 test_topology_change_np4
+                  test_topology_change_np8 test_topology_change_np27
+                  test_remeshing_parallel_np8
+             APPEND PROPERTY LABELS long)
+if(BUILD_EXAMPLES)
+  set_property(TEST test_leveque_coupled_unstructured test_rayleigh_taylor_topology
+               APPEND PROPERTY LABELS long)
+endif()
