@@ -72,6 +72,11 @@
 #include "mftl_constants.h"
 #include "mftl_types.h"
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * 1. Wire format
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -132,9 +137,9 @@ typedef struct
 
 /* The layouts are part of the contract with MFTLRegisterMpiTypes: the datatypes
  * describe contiguous runs, which is only valid while these hold. */
-_Static_assert(sizeof(MFTL_PackedVertex) == 40, "MFTL_PackedVertex layout changed");
-_Static_assert(sizeof(MFTL_PackedTriangleComplex) == 40, "MFTL_PackedTriangleComplex layout changed");
-_Static_assert(sizeof(MFTL_GhostUpdatePayload) == 32, "MFTL_GhostUpdatePayload layout changed");
+MFTL_STATIC_ASSERT(sizeof(MFTL_PackedVertex) == 40, "MFTL_PackedVertex layout changed");
+MFTL_STATIC_ASSERT(sizeof(MFTL_PackedTriangleComplex) == 40, "MFTL_PackedTriangleComplex layout changed");
+MFTL_STATIC_ASSERT(sizeof(MFTL_GhostUpdatePayload) == 32, "MFTL_GhostUpdatePayload layout changed");
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 2. MPI datatypes
@@ -955,5 +960,9 @@ void MFTLRedistributeGetStats(MFTL_RedistributeStats *out);
  * be explicitly exchanged. All ranks must agree the selection and call order.
  */
 int MFTLUpdateGhostFields(MFTL_Ensemble *ens, const int *ids, int nfields, bool with_positions);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // MFTL_COMMUNICATION_H

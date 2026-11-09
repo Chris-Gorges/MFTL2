@@ -18,6 +18,11 @@
 
 #include "mftl_constants.h"
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 /**
  * @brief Normalises a 3-vector in place: the result has unit length, or is zero.
  *
@@ -89,5 +94,9 @@ static inline void MFTLVectorCrossVector(double out[3], const double v1[3], cons
   out[1] = v1[2] * v2[0] - v1[0] * v2[2];
   out[2] = v1[0] * v2[1] - v1[1] * v2[0];
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // MFTL_VECTOROPERATIONS_H

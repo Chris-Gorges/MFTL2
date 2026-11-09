@@ -70,6 +70,11 @@
 
 #include "mftl_types.h"
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * 1. Handles and status
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -1446,5 +1451,9 @@ void MFTLCouplerGetMemoryStats(MFTL_CouplingMemoryStats *stats);
 /** @brief Reset the peak to current usage; does not free memory or change the limit.
  * @rank_local */
 void MFTLCouplerResetMemoryPeak(void);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // MFTL_COUPLING_H

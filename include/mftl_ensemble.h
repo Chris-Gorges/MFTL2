@@ -25,6 +25,11 @@
 #include "mftl_geometry.h"
 #include "mftl_types.h"
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 /**
  * @brief Creates an ensemble: the global domain and its MPI topology.
  *
@@ -619,5 +624,9 @@ int MFTLEnsembleRegisterField(MFTL_Ensemble *ens, const char *name, MFTL_FieldEn
  * @return Field id, or MFTL_ERROR if absent.
  */
 int MFTLEnsembleFindField(const MFTL_Ensemble *ens, const char *name);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // MFTL_ENSEMBLE_H

@@ -76,6 +76,11 @@
 #include "mftl_topology.h"
 #include "mftl_types.h"
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 // -----------------------------------------------------------------------------
 // 0. THE PHASE SCHEDULE  (src/remeshing/remesh_parallel.c)
 // -----------------------------------------------------------------------------
@@ -1662,5 +1667,9 @@ double MFTLMeanEdgeLength(const MFTL_Object *obj);
  * @collective One `MPI_Allreduce` of two doubles.
  */
 double MFTLEnsembleMeanEdgeLength(MFTL_Ensemble *ens);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // MFTL_REMESHING_H

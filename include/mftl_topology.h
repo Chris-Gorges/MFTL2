@@ -33,6 +33,11 @@
 #include "mftl_constants.h"
 #include "mftl_types.h"
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 // -----------------------------------------------------------------------------
 // 0. ENTITY FLAGS
 // -----------------------------------------------------------------------------
@@ -693,5 +698,9 @@ int MFTLCheckMeshIntegrity(const MFTL_Object *obj);
  * @rank_local No MPI.
  */
 int MFTLLabelConnectedComponents(const MFTL_Object *obj, int *labels);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // MFTL_TOPOLOGY_H

@@ -23,6 +23,11 @@
 #include "mftl_topology.h"
 #include "mftl_types.h"
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 // -----------------------------------------------------------------------------
 // 1. POSITION ACCESS
 // -----------------------------------------------------------------------------
@@ -1169,5 +1174,9 @@ int MFTLLeastSquaresQRCP(int m, int n, int n_lead, double *A, double *b, double 
  */
 int MFTLFitHeightParaboloid(int n, const double *pts, const double *slopes, const unsigned char *use_slope, const double *w, double tau, double c[6],
                             unsigned char kept[6]);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // MFTL_GEOMETRY_H

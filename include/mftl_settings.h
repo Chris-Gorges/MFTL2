@@ -91,6 +91,11 @@
 #include "mftl_topology_change.h"
 #include "mftl_types.h"
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 /** @brief Capacity of a string setting, terminating NUL included. */
 #define MFTL_SETTINGS_STRING_MAX 256
 
@@ -625,5 +630,9 @@ MFTL_Ensemble *MFTLSettingsCreateEnsemble(const MFTL_Settings *s, MPI_Comm comm)
  *             when it is derived.
  */
 int MFTLSettingsResolve(MFTL_Settings *s, MFTL_Ensemble *ens);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // MFTL_SETTINGS_H

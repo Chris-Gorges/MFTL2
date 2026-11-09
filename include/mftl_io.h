@@ -34,6 +34,11 @@
 
 #include "mftl_types.h"
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 // -----------------------------------------------------------------------------
 // 1. OPTIONS
 // -----------------------------------------------------------------------------
@@ -157,5 +162,9 @@ int MFTLWriteVtk(const MFTL_Object *object, const char *base_filename);
  * @collective In both layouts (the return code is reduced).
  */
 int MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix, const MFTL_VtkOptions *options);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // MFTL_IO_H

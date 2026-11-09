@@ -25,6 +25,11 @@
 #include <stdint.h>
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Typed entry points. The generic macros MFTLRadixSort / MFTLSortPairs below
  * dispatch to them on the key type.
@@ -249,5 +254,9 @@ static inline int MFTLUniquePairs(int *keys, int *values, int n)
   }
   return dest + 1;
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* MFTL_ARRAYFUNCTIONS_H */

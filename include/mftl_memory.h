@@ -30,6 +30,11 @@
 
 #include "mftl_constants.h"
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * Fail-fast allocation
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -273,5 +278,9 @@ static inline int MFTLGrowCapacity(int current, int needed)
       _MFTL_REALLOC_CORE(ptr, capacity, _new_cap, type);            \
     }                                                               \
   } while (0)
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // MFTL_MEMORY_H

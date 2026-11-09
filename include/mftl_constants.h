@@ -42,6 +42,26 @@
 #define MFTL_ASSERT(condition) assert(condition)
 #endif
 
+#ifdef __cplusplus
+/**
+ * @brief Compile-time assertion that a header can state in C11 and in C++.
+ *
+ * `_Static_assert` is a C11 keyword that C++ does not have, so a public header
+ * that used it directly could not be included by a C++ flow solver.
+ *
+ * @param condition Integral constant expression that must be true.
+ * @param message   String literal reported when it is not.
+ */
+#define MFTL_STATIC_ASSERT(condition, message) static_assert(condition, message)
+#else
+/**
+ * @brief Compile-time assertion that a header can state in C11 and in C++.
+ * @param condition Integral constant expression that must be true.
+ * @param message   String literal reported when it is not.
+ */
+#define MFTL_STATIC_ASSERT(condition, message) _Static_assert(condition, message)
+#endif
+
 /** @} */
 
 /**

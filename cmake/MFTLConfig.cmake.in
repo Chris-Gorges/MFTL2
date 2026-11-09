@@ -1,0 +1,13 @@
+# CMake package configuration for MFTL, generated at install time.
+#
+#   find_package(MFTL 2.0 REQUIRED)
+#   target_link_libraries(solver PRIVATE MFTL::MFTL)
+
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(MPI COMPONENTS C)
+
+include("${CMAKE_CURRENT_LIST_DIR}/MFTLTargets.cmake")
+
+check_required_components(MFTL)

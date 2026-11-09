@@ -42,6 +42,11 @@
 #include "mftl_constants.h"
 #include "mftl_types.h"
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * 1. The node
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -65,7 +70,7 @@ typedef struct MFTL_BVHNode
   uint64_t payload;  ///< 8 B, see above.
 } MFTL_BVHNode;
 
-_Static_assert(sizeof(MFTL_BVHNode) == 32, "MFTL_BVHNode must be exactly 32 bytes for cache alignment!");
+MFTL_STATIC_ASSERT(sizeof(MFTL_BVHNode) == 32, "MFTL_BVHNode must be exactly 32 bytes for cache alignment!");
 
 /**
  * @brief True if @p n is a leaf.
@@ -542,5 +547,9 @@ double MFTL_Orient3D(const double pa[3], const double pb[3], const double pc[3],
  * @return \f$6V\f$ from the plain \f$3\times3\f$ determinant.
  */
 double MFTL_Orient3DFast(const double pa[3], const double pb[3], const double pc[3], const double pd[3]);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // MFTL_BVH_H

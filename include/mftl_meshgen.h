@@ -28,6 +28,11 @@
 #include "mftl_geometry.h"
 #include "mftl_types.h"
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 /**
  * @brief Builds a half-edge mesh from positions and an indexed triangle list.
  *
@@ -253,5 +258,9 @@ void MFTLLevelSetSurfaceFree(MFTL_LevelSetSurface *s);
  * @rank_local
  */
 int MFTLBuildMeshFromLevelSet(MFTL_Object *obj, const MFTL_SdfGrid *grid, double snap);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // MFTL_MESHGEN_H

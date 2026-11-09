@@ -61,6 +61,11 @@
 
 #include "mftl_types.h"
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 struct MFTL_RemeshParameters;
 
 /** @brief What kind of thin feature an event is. */
@@ -342,5 +347,9 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies, int n_b
  * @collective
  */
 int MFTLEnsembleApplyTopologyChanges(MFTL_Ensemble *ens, const MFTL_TopologyOptions *opts, MFTL_TopologyStats *stats);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // MFTL_TOPOLOGY_CHANGE_H

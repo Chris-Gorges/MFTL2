@@ -34,6 +34,11 @@
 #include "mftl_constants.h"
 #include "mftl_types.h"
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 // -----------------------------------------------------------------------------
 // 1. LIFECYCLE
 // -----------------------------------------------------------------------------
@@ -535,5 +540,9 @@ bool MFTLObjectCanonicalOrder(MFTL_Object *obj);
       __VA_ARGS__;                                                                     \
     }                                                                                  \
   } while (0)
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif  // MFTL_OBJECT_H
