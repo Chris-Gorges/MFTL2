@@ -1,0 +1,46 @@
+name: CI-Format
+
+# The lines a push or pull request changes must follow .clang-format (pinned
+# version). Existing code is not rewritten wholesale; see tools/check_format.sh.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  clang-format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Install the pinned clang-format
+        run: pip install -r tools/requirements-format.txt
+      - name: Check the changed lines
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then
+            base="$PR_BASE"
+          elif [ -n "$PUSH_BEFORE" ] && [ "$PUSH_BEFORE" != 0000000000000000000000000000000000000000 ] \
+               && git cat-file -e "$PUSH_BEFORE^{commit}" 2> /dev/null; then
+            base="$PUSH_BEFORE"
+          else
+            base="HEAD~1"   # first push of a branch, or a manual run: the last commit
+          fi
+          tools/check_format.sh "$base" HEAD

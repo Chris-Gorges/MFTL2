@@ -1,0 +1,46 @@
+name: CI-Warnings
+
+# The library with -Wall -Wextra -Werror under two compilers, plus the two
+# structural checks that no test can express: every public header compiles alone
+# as C11 and as C++17, and the archive exports only MFTL* symbols, once each.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  warnings:
+    name: ${{ matrix.compiler }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup
+        with:
+          compiler: ${{ matrix.compiler }}
+          mpi: mpich
+      - name: Configure
+        # No LTO: the symbol audit reads the archive with plain nm.
+        run: >
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          -DMFTL_WARNINGS_AS_ERRORS=ON -DMFTL_ENABLE_LTO=OFF -DENABLE_SANITIZERS=OFF
+          -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF
+      - name: Build the library
+        run: cmake --build build
+      - name: Exported symbols
+        run: tools/check_symbols.sh build/lib/libMFTL.a
+      - name: Self-contained, C++-compatible headers
+        run: tools/check_headers.sh

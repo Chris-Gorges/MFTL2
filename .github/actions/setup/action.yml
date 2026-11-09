@@ -1,0 +1,53 @@
+name: Set up the toolchain
+description: Compiler, MPI implementation and Ninja on an Ubuntu runner.
+
+inputs:
+  compiler:
+    description: gcc or clang
+    default: gcc
+  mpi:
+    description: mpich or openmpi
+    default: mpich
+
+runs:
+  using: composite
+  steps:
+    - name: Install and select
+      shell: bash
+      env:
+        COMPILER: ${{ inputs.compiler }}
+        MPI: ${{ inputs.mpi }}
+      run: |
+        set -euo pipefail
+        case "$MPI" in
+          mpich)   pkgs="mpich libmpich-dev" ;;
+          openmpi) pkgs="openmpi-bin libopenmpi-dev" ;;
+          *) echo "unknown MPI '$MPI'" >&2; exit 1 ;;
+        esac
+        sudo apt-get update -q
+        sudo apt-get install -y -q --no-install-recommends ninja-build $pkgs
+
+        case "$COMPILER" in
+          gcc)   cc=gcc   cxx=g++ ;;
+          clang) cc=clang cxx=clang++ ;;
+          *) echo "unknown compiler '$COMPILER'" >&2; exit 1 ;;
+        esac
+        {
+          echo "CC=$cc"
+          echo "CXX=$cxx"
+          # The MPI wrappers (used by tools/check_headers.sh) follow the same compiler.
+          echo "MPICH_CC=$cc"
+          echo "MPICH_CXX=$cxx"
+          echo "OMPI_CC=$cc"
+          echo "OMPI_CXX=$cxx"
+        } >> "$GITHUB_ENV"
+
+        if [ "$MPI" = openmpi ]; then
+          # A hosted runner has 4 cores; the suite starts 8-rank jobs, which
+          # Open MPI refuses without oversubscription (MPICH allows it).
+          echo "OMPI_MCA_rmaps_base_oversubscribe=1" >> "$GITHUB_ENV"
+        fi
+
+        "$cc" --version | head -n 1
+        mpiexec --version | head -n 2
+        cmake --version | head -n 1

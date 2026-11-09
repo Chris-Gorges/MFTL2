@@ -1,0 +1,53 @@
+name: CI-Debug
+
+# Debug build with AddressSanitizer and UndefinedBehaviorSanitizer. Several
+# tests write the last addressable element of every pool array on purpose, so a
+# sub-array that was not grown with the rest fails here rather than corrupting
+# memory silently. On push and pull request the long and the 27-rank tests are
+# skipped; the nightly run takes the whole suite.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sanitizers:
+    name: gcc + mpich, ASan/UBSan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    env:
+      # MPI implementations keep allocations alive until exit by design; leak
+      # reports would be theirs, not ours. Everything else is fatal.
+      ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:strict_string_checks=1
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup
+        with:
+          compiler: gcc
+          mpi: mpich
+      - name: Allow ASan's shadow memory layout
+        # Ubuntu 24.04 runners randomise mmap with 32 bits, which ASan cannot map around.
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: |
+          if [ "${{ github.event_name }}" = schedule ] || [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            ctest --test-dir build --output-on-failure -j 4 --timeout 3600
+          else
+            ctest --test-dir build --output-on-failure -j 4 --timeout 1800 -LE "np27|long"
+          fi

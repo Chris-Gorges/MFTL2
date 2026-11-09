@@ -1,0 +1,47 @@
+name: CI-Consumers
+
+# Uses MFTL the way a downstream solver would: from an installed CMake package
+# (find_package) and from a source checkout (add_subdirectory), each from C and
+# from C++, and runs the result on two ranks.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  consumers:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup
+        with:
+          compiler: gcc
+          mpi: mpich
+      - name: Build and install the library
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF \
+                -DBUILD_EXAMPLES=OFF -DBUILD_TESTING=OFF
+          cmake --build build
+          cmake --install build --prefix "$RUNNER_TEMP/mftl"
+      - name: find_package(MFTL)
+        run: |
+          cmake -S tests/consumer -B consumer-package -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_PREFIX_PATH="$RUNNER_TEMP/mftl"
+          cmake --build consumer-package
+          ctest --test-dir consumer-package --output-on-failure
+      - name: add_subdirectory(MFTL)
+        run: |
+          cmake -S tests/consumer -B consumer-subdir -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DMFTL_SOURCE_DIR="$GITHUB_WORKSPACE"
+          cmake --build consumer-subdir
+          ctest --test-dir consumer-subdir --output-on-failure

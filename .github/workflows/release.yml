@@ -1,0 +1,42 @@
+name: CI-Release
+
+# Optimised build and the test suite, with two compilers and two MPI
+# implementations. The oversubscribed 27-rank runs are left to the nightly
+# Debug job; everything else runs on every push.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.compiler }} + ${{ matrix.mpi }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { compiler: gcc, mpi: mpich }
+          - { compiler: clang, mpi: openmpi }
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup
+        with:
+          compiler: ${{ matrix.compiler }}
+          mpi: ${{ matrix.mpi }}
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j 4 --timeout 900 -LE np27

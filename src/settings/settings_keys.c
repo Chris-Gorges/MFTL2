@@ -71,6 +71,7 @@ _Static_assert(sizeof(MFTL_SamplingPolicy) == sizeof(int), "keyword storage");
  * Sections
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+// clang-format off -- the tables below are laid out by hand, one entry per macro
 static const MFTL_SettingSection g_sections[] = {
     SECTION("domain", "Domain and decomposition",
             "The domain box and how it is cut into rank boxes. Read by MFTLSettingsCreateEnsemble()."),
@@ -410,6 +411,7 @@ static const MFTL_SettingInfo g_keys[] = {
     KEY("output", "include_ghosts", BOOL, output.vtk.include_ghosts, "false", "", NO_CHOICES, "", 1,
         "Write ghosts too. Every halo triangle then appears once per holder: for looking at the halo, never for integrating."),
 };
+// clang-format on
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Lookup
