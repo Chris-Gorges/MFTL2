@@ -1,30 +1,53 @@
 # MFTL — MultiFlow Triangulation Library
 
-A HPC C11 library for distributed-memory (MPI) manipulation of closed and open triangulated surface meshes, for
+[![CI-Release](https://github.com/Chris-Gorges/MFTL2/actions/workflows/release.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/release.yml)
+[![CI-Debug](https://github.com/Chris-Gorges/MFTL2/actions/workflows/debug.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/debug.yml)
+[![CI-Warnings](https://github.com/Chris-Gorges/MFTL2/actions/workflows/warnings.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/warnings.yml)
+[![CI-Format](https://github.com/Chris-Gorges/MFTL2/actions/workflows/format.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/format.yml)
+[![CI-Consumers](https://github.com/Chris-Gorges/MFTL2/actions/workflows/consumers.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/consumers.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+![C11](https://img.shields.io/badge/C-11-informational)
+![MPI](https://img.shields.io/badge/MPI-3.0%2B-informational)
+
+A C11/MPI library for the distributed-memory manipulation of closed and open triangulated surface meshes, for
 front-tracking and immersed-boundary CFD simulations.
+
+> **Status:** under active development (2.0.0-alpha). Everything listed below is implemented and tested; the API can
+> still change between releases.
+
+## Highlights
+
+- **Distributed remeshing that reproduces the serial answer.** Isotropic or curvature-adaptive remeshing (split,
+  collapse, flip, tangential smoothing, Phong projection) runs serially or distributed, by one of two strategies
+  chosen per call from the body sizes: bodies smaller than a rank's box are moved to one rank and remeshed there,
+  **bit-identical to the serial remesh** at every tested rank count; larger bodies are remeshed in place while the cut
+  planes move over a shift/freeze schedule.
+- **Breakup and coalescence that do not depend on the process count.** Events are detected from opposing triangles,
+  the affected bodies are reconstructed by marching cubes on a union signed-distance field, and the surface agrees
+  with the single-rank reconstruction to 1e-12 at 1 to 27 ranks.
+- **Exact contact detection.** An LBVH over Morton codes with an explicit-stack dual traversal, Shewchuk's adaptive
+  orientation predicate and an exact Guigue–Devillers triangle test, behind a broad phase derived from body extents
+  rather than all pairs, and a spatial halo that finds contacts across ranks and periodic seams.
+- **Coupling to a flow solver.** Interpolation from, and spreading onto (its exact transpose), a solver's lattice or
+  point cloud with Peskin-type kernels corrected to linear exactness. Coverage is proved by counting indices, never
+  assumed; a missing sample is reported, not renormalised away.
+- **Communication that scales with what a rank holds.** Per-body reductions and prefix sums go to each body's
+  holders over a 26-neighbour graph communicator, certified after the exchange, with an exact global fallback.
+- **Tests that check the answer.** 148 CTest entries at 1, 2, 3, 4, 8 and 27 ranks. Distributed results are compared
+  with the same call on one rank, contact queries as multisets against an exhaustive sweep, coupling rows against
+  brute-force references written without the library's machinery; several suites were mutation-checked.
 
 ## The idea
 
 A surface mesh is two different things that want opposite memory layouts, so MFTL stores each in the layout it
-wants — and stores them in the **same allocation** so they can never disagree about how many entities exist.
+wants — and stores them in the **same allocation**, so they can never disagree about how many entities exist.
 
-```
-MFTL_Object
-├── MFTL_VertexPool          ── ONE malloc, ONE capacity ──
-│   ├── rec[]                AoS   16 B   out_he_idx, global_id, owner_proc, flags
-│   ├── pos[]                SoA   3×     authoritative position
-│   └── normal[]             SoA          derived per-vertex geometry
-│
-└── MFTL_TrianglePool        ── ONE malloc, ONE capacity ──
-    ├── rec[]                AoS   12 B   global_id, owner_proc, flags
-    ├── he[]                 AoS   16 B   vertex_idx, twin_idx, global_id, flags   (3 per triangle)
-    ├── area[] normal[] center[]   SoA    derived per-triangle geometry
-    └── verts[] neighbors[]          SoA   compact hot-loop connectivity
-```
+![One allocation per entity class: AoS records for topology and identity, SoA arrays for geometry](.github/images/pool-layout.svg)
 
 **Topology and identity are AoS** — a remesher edits one entity at a time and touches most of its record when it
 does. **Geometry is SoA** — it is read and written by kernels that touch one component of every entity, every
-timestep, which is the access pattern AoS is worst at.
+timestep, which is the access pattern AoS is worst at. The same split is what makes the geometry arrays usable by an
+accelerator as they are: positions and compact triangle indices are plain contiguous arrays with no repacking.
 
 Three invariants fall out, and every module is allowed to assume them:
 
@@ -34,8 +57,8 @@ Three invariants fall out, and every module is allowed to assume them:
 - **Positions live in the SoA and only there.** The space-filling-curve ordering is applied to the *pool*
   (`MFTLObjectReorderMorton`), not stored as a permutation, so there is exactly one index space.
 
-Lookups are arrays: global IDs are dense per entity class, and "the other side of this edge" is already an index.
-The one hash table is the global-id → slot table redistribution uses for arriving entities.
+Lookups are arrays, not hash maps: global IDs are dense per entity class, and "the other side of this edge" is
+already an index.
 
 ## Quick start
 
@@ -43,10 +66,11 @@ The one hash table is the global-id → slot table redistribution uses for arriv
 #include "mftl_core.h"
 
 MPI_Init(&argc, &argv);
+MFTLRegisterMpiTypes();                       // the wire datatypes every exchange uses
 
-int    cuts[3]  = {1, 1, 1};
-double lo[3]    = {-2, -2, -2}, hi[3] = {2, 2, 2};
-bool   per[3]   = {false, false, false};
+int    cuts[3] = {1, 1, 1};                // one rank; the product must equal the rank count
+double lo[3]   = {-2, -2, -2}, hi[3] = {2, 2, 2};
+bool   per[3]  = {false, false, false};
 
 MFTL_Ensemble *ens = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, lo, hi, per, 10);
 
@@ -64,8 +88,13 @@ printf("mean-ratio quality: %f\n", obj->quality.avg_aspect_ratio);
 MFTLWriteVtu(ens, "surface", MFTL_NULL);      // collective: raw-binary .vtu per rank + .pvtu
 
 MFTLEnsembleDestroy(&ens);                    // cascades to every object
+MFTLFreeMpiTypes();
 MPI_Finalize();
 ```
+
+A redistribution (`MFTLRedistribute`) re-partitions the bodies and may destroy a rank's copy of one, so an
+`MFTL_Object*` does not survive it: the handle that does is the body's global id
+(`MFTLEnsembleFindLocalObject`). [`tests/consumer/main.c`](tests/consumer/main.c) is a complete distributed program.
 
 ## Configuring a run
 
@@ -97,12 +126,13 @@ MFTLRemeshEnsemble(ens, &cfg.remesh.params, &stats);
 ```
 
 A misspelled key, a wrong type or a value out of range is an error naming the file, the line and the key that was
-probably meant. `./build/mftl_settings template` prints every key with its documentation; `./build/mftl_settings
-check run.toml --np 64` validates a file before a job is queued. Every key, default and admissible value is in the
-manual's Settings reference, generated from the one table that declares them (`src/settings/settings_keys.c`).
+probably meant. `mftl_settings template` prints every key with its documentation; `mftl_settings check run.toml
+--np 64` validates a file before a job is queued. Every key, default and admissible value comes from the one table
+that declares them (`src/settings/settings_keys.c`).
 
-A hot loop streams compact triangle indices, gathers current positions and forms
-minimum-image edges in registers:
+## Hot loops
+
+A hot loop streams compact triangle indices, gathers current positions and forms minimum-image edges in registers:
 
 ```c
 MFTL_FOREACH_TRIANGLE_GEOMETRY(obj, obj->tris.n_local,
@@ -113,97 +143,74 @@ MFTL_FOREACH_TRIANGLE_GEOMETRY(obj, obj->tris.n_local,
 );
 ```
 
-The macro unswitches periodicity outside the triangle loop, so the body receives
-seam-consistent edge vectors without managing derived position state.
+The macro unswitches periodicity outside the triangle loop, so the body receives seam-consistent edge vectors
+without managing derived position state.
 
 ## Build and test
 
-Requires CMake ≥ 3.13, MPI, and a C11 compiler.
+Requires CMake ≥ 3.13, an MPI-3 implementation (used with Open MPI, MPICH and MVAPICH2) and a C11 compiler. CI builds
+with GCC and Clang on Linux; development is on macOS.
 
 ```bash
-python3 build_all.py              # Release
-python3 build_all.py --debug      # Debug + ASan/UBSan  (run the tests here too)
-python3 run_local_tests.py        # build + full CTest suite
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+ctest --test-dir build --output-on-failure -j 8 -LE np27
 ```
 
-```bash
-./build/sphere_creation_serial       # full lifecycle, writes sphere.vtk
-./build/layout_benchmark             # interleaved vs padded vs split xyz, four access patterns
-./build/leveque_remeshing_singleproc # what feature detection on a smooth surface costs
+`python3 build_all.py` does the same in a fresh `build/` (`--debug` adds AddressSanitizer and
+UndefinedBehaviorSanitizer, `--valgrind` a Debug build without them, `--lib-only` skips the examples), and
+`python3 run_local_tests.py` builds and runs the whole suite.
 
+Every test carries labels, so a subset is one flag away: `serial`, `mpi`, `np<N>` for the rank count, `example`
+for the physical runs of the example programs, `oversub` and `np27` for runs with more ranks than a laptop has
+cores, and `long`. MPI tests declare their rank count to CTest, so `ctest -j N` schedules ranks rather than tests.
+The full Release suite takes about 45 s with `-j 8` on an Apple M4 laptop.
+
+Some of the examples, each of which checks its own answer before it reports anything:
+
+```bash
 # a solver-shaped run configured entirely by a settings file, plus command-line overrides
-./build/mftl_settings check examples/settings/settings_driven_run.toml --np 4
 mpirun -n 4 ./build/settings_driven_run examples/settings/settings_driven_run.toml remesh.every=2 --steps 50
 
 # the whole timestep, distributed: advection, ghost sync, geometry, redistribution
 mpirun -n 4 ./build/parallel_advection_redistribute_list 2 2 1 1 1 1 --spheres 256 --refine 3 --verify
 
-# distributed remeshing: does it track the serial answer, and what does a phase cost
+# distributed remeshing over the LeVeque test: does it track the serial answer
 mpirun -n 4 ./build/leveque_remeshing_parallel
-mpirun -n 4 ./build/remesh_phase_profile        # where the time goes inside one phase
-mpirun -n 8 ./build/remesh_regime_sweep         # where the spanning/dispersed crossover lies
 
-# strong, weak and granularity scaling: one point by hand, then the whole sweep
-mpirun -n 4 ./build/parallel_advection_scaling --mode strong --spheres 256 --refine 3
-python3 run_scaling.py --preset laptop --all    # sweeps the rank counts, writes plots + report
+# open surfaces with breakup and coalescence
+mpirun -n 4 ./build/liquid_jet_open_surface 2 2 1 --sectors 24 --length 24 --eps 0.1 --weber 2 --require-breakup
+mpirun -n 4 ./build/rayleigh_taylor_open_surface --roll 1.7 --growth 1.4 --require-topology
 
-# ... and dump the surface every 10 steps, as one shared file written with MPI-IO
-mpirun -n 4 ./build/parallel_advection_redistribute_list 2 2 1 1 1 1 --spheres 256 --refine 3 \
-       --vtk 10 --vtk-mode shared
+# interface advected by a solver's velocity field through the coupler
+mpirun -n 2 ./build/leveque_coupled_cartesian -n 16,32 -steps 75 -verify
 ```
 
-Every benchmark checks that its variants produce the same answer before it reports a time, and prints the negative
-results as prominently as the positive ones.
+`scaling/` holds the strong- and weak-scaling drivers and the Slurm scripts used on an HPC cluster.
 
-## Documentation
+## Using MFTL in your project
 
-- **Read without building anything:** the pre-built manual in the `MFTL2_Documentation` repository —
-  `prebuilt/MFTL_Manual.pdf` (the whole manual in one PDF) and `prebuilt/html/index.html` (the web manual for
-  offline use, opened straight from disk, with the Doxygen manual — call graphs, source browser — at
-  `prebuilt/html/doxygen/index.html`).
-- **In this tree:** the Doxygen comments in `include/` and `src/**` and the twelve `src/<module>/README.md` theory
-  chapters (they render on GitHub next to the code). The measurement document the source comments cite as
-  `docs/analysis.md §N` is kept local and is not part of the repository; the manual leaves its Analysis section out
-  when it is absent.
-
-The documentation build lives in [`MFTL2_Documentation`](https://github.com/Chris-Gorges/MFTL2_Documentation)
-(private), checked out beside this one (`../MFTL2` and `../MFTL2_Documentation`). One command checks every prerequisite, builds the whole manual — guides, theory
-chapters with their figures, API reference, and the Doxygen manual with its call and include graphs — and opens
-it in the browser:
+As an installed CMake package:
 
 ```bash
-cd ../MFTL2_Documentation
-python3 view_manual.py                  # everything, one command; the first run takes a few minutes
-python3 view_manual.py --check          # only report what is missing, with the command that installs it
-python3 build_mkdocs.py --serve --open  # live-reload while writing prose
-python3 build_docs.py --open            # the Doxygen manual alone: call graphs, source browser
-python3 export_manual.py                # refresh prebuilt/ (offline HTML + PDF)
+cmake --install build --prefix $HOME/opt/mftl
 ```
 
-It finds this checkout on its own when the two sit side by side; otherwise pass `--source-dir`, set
-`MFTL_SOURCE_DIR`, or write the path into its `mftl-source.txt`. Requirements: Python ≥ 3.9, Doxygen and Graphviz;
-the MkDocs toolchain installs itself into a private virtual environment on first use. Both manuals build
-with **zero warnings**, and that is the acceptance criterion — a new function here without `@param`/`@return`
-fails `build_docs.py --strict` there.
+```cmake
+find_package(MFTL 2.0 REQUIRED)               # configure with -DCMAKE_PREFIX_PATH=$HOME/opt/mftl
+target_link_libraries(solver PRIVATE MFTL::MFTL)
+```
 
-## Status
+or from a source checkout, which builds only the library:
 
-Present: ensemble/domain with sparse per-rank body lists, object pools, half-edge topology, derived arrays and
-hot-loop iterators, Morton renumbering, periodic geometry (area- or angle-weighted vertex normals, closest point on
-a triangle, signed-distance rasterisation), sphere generation and marching cubes, per-body reductions and prefix
-sums over each body's holders, the fused per-timestep geometry + per-body quality pass, radix sort, redistribution
-and ghost synchronisation, VTK output, isotropic remeshing — serial and **distributed, by two strategies**
-(`src/remeshing/`) — the LBVH with exact object–object and self-proximity contact detection (`src/bvh/`), the
-spatial halo that makes contact detection work across ranks, **topology changes** (breakup and coalescence,
-`src/topology_change/`), and the **run configuration** (every runtime option in one struct, from a settings file and
-the command line, `src/settings/`).
+```cmake
+add_subdirectory(external/MFTL2)
+target_link_libraries(solver PRIVATE MFTL::MFTL)
+```
 
-Geometry is split by SCOPE, not by entity: `MFTLCompute*` works on one object and never touches MPI,
-`MFTLEnsembleUpdate*` iterates the object list and owns the collective its result needs — a reduction for the
-triangle quality statistics, an exchange for the vertex normals.
-
-Absent: open-surface generators (other than a level set through `MFTLBuildMeshFromLevelSet`), GTS I/O, topological
-ghost-layer growth, continuous-time (swept) contact or topology detection, and a mesh reader of any format.
+MPI comes with the target as a usage requirement. The headers are valid C++ with C linkage, so a C++ solver
+includes them directly (the `MFTL_FOREACH_*` loop macros are C-only). Both routes, from C and from C++, are built
+and run in CI by [`tests/consumer`](tests/consumer).
 
 ## Output
 
@@ -213,14 +220,55 @@ o.layout = MFTL_IO_SINGLE_FILE;          // ... or ONE .vtu, written collectivel
 MFTLWriteVtu(ens, "surface", &o);
 ```
 
-Triangles that straddle a periodic face are unwrapped at write time from current
-positions and compact connectivity, so they render at their true size without the mesh in memory being touched. Only owned entities are written, so the merged
-dataset contains every triangle exactly once and an integral computed over it in ParaView is right.
+Triangles that straddle a periodic face are unwrapped at write time, so they render at their true size without the
+mesh in memory being touched. Only owned entities are written, so the merged dataset contains every triangle exactly
+once and an integral computed over it in ParaView is right. Raw binary is 23–32× faster to write than ASCII and
+about half the size.
 
-Raw binary is 23–32× faster to write than ASCII and about half the size. The shared file is **not** faster on a
-laptop — it exists because P+1 files per dump is what stops working first on a parallel filesystem. See
-`docs/analysis.md` §3, and re-measure on the target machine before choosing.
+## Documentation
 
-See `docs/analysis.md` for what has actually been measured — the decisions each result supports, the designs that
-were rejected, the silent failures found and how each is guarded, the open issues, and the measurement traps that
-produced plausible wrong answers first.
+Every public function is documented in its header (`include/`), and each module has a theory chapter next to its code:
+
+| Module | Chapter |
+|---|---|
+| Mesh container: pools, layout, derived arrays | [`src/object`](src/object/README.md) |
+| Half-edge connectivity | [`src/topology`](src/topology/README.md) |
+| Periodic-aware geometry, closest point, signed distance, least squares | [`src/geometry`](src/geometry/README.md) |
+| Ensemble handle and per-body collectives | [`src/ensemble`](src/ensemble/README.md) |
+| Mesh construction: icosphere, marching cubes | [`src/mesh_creation`](src/mesh_creation/README.md) |
+| Redistribution, ghost synchronisation, spatial halo | [`src/communication`](src/communication/README.md) |
+| Isotropic and curvature-adaptive remeshing, serial and distributed | [`src/remeshing`](src/remeshing/README.md) |
+| Breakup and coalescence | [`src/topology_change`](src/topology_change/README.md) |
+| Front corrections: undulation removal, volume correction | [`src/correction`](src/correction/README.md) |
+| LBVH and contact detection | [`src/bvh`](src/bvh/README.md) |
+| Coupling to a flow solver | [`src/coupling`](src/coupling/README.md) |
+| Run configuration | [`src/settings`](src/settings/README.md) |
+| Mesh output | [`src/io`](src/io/README.md) |
+| Sorting and duplicate removal | [`src/arrayfunctions`](src/arrayfunctions/README.md) |
+
+A full manual (guides, these chapters with their figures, and the Doxygen API reference with call graphs) is built
+from the same sources in a separate repository that is not public yet. Source comments that cite
+`docs/analysis.md §N` refer to the project's measurement record, which is not public yet either.
+
+## Status and roadmap
+
+Present: everything in the module table above. Absent: open-surface generators other than a level set
+(`MFTLBuildMeshFromLevelSet`), a mesh reader of any format, topological ghost-layer growth, and continuous-time
+(swept) contact or topology detection.
+
+Next: GPU offload of the per-timestep geometry kernels, for which the SoA layout is designed; measurement of the
+distributed remesher at hundreds of ranks; a local (rather than global) volume correction.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Citing
+
+If you use MFTL in your work, please cite it — GitHub's "Cite this repository" button reads
+[CITATION.cff](CITATION.cff).
+
+## License
+
+Copyright 2025–2026 Christian Gorges and Berend van Wachem. Licensed under the [Apache License 2.0](LICENSE);
+see [NOTICE](NOTICE) for third-party attributions.
