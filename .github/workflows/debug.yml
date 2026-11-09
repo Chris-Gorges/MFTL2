@@ -28,13 +28,14 @@ concurrency:
 
 jobs:
   sanitizers:
-    name: gcc + mpich, ASan/UBSan
+    name: gcc + mpich, ASan/UBSan/LSan
     runs-on: ubuntu-22.04   # MPICH; see .github/actions/setup
     timeout-minutes: 180
     env:
-      # MPI implementations keep allocations alive until exit by design; leak
-      # reports would be theirs, not ours. Everything else is fatal.
-      ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:strict_string_checks=1
+      # Leaks are checked at every process exit; the MPI stack's own long-lived
+      # allocations are suppressed in tests/lsan.supp. Everything else is fatal.
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
+      LSAN_OPTIONS: suppressions=${{ github.workspace }}/tests/lsan.supp:print_suppressions=0
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
     steps:
       - uses: actions/checkout@v6

@@ -1,0 +1,21 @@
+# LeakSanitizer suppressions for CI-Debug (.github/workflows/debug.yml).
+#
+# An MPI implementation keeps some allocations alive until the process exits:
+# communicator caches, the process manager's key-value space, topology and
+# fabric state. Those are reported as leaks and are theirs, not ours, so any
+# leak whose allocation stack passes through the MPI stack is suppressed.
+# Everything else -- a leak in libMFTL or in a test -- fails the run.
+#
+# LeakSanitizer is not available on macOS/arm64, so this only runs in CI.
+leak:libmpich
+leak:libmpi
+leak:libopen-pal
+leak:libopen-rte
+leak:libpmix
+leak:libprrte
+leak:libhwloc
+leak:libfabric
+leak:libucp
+leak:libucs
+leak:libuct
+leak:libevent

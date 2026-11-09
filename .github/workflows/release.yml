@@ -53,3 +53,31 @@ jobs:
           else
             ctest --test-dir build --output-on-failure -j 4 --timeout 900 -LE np27
           fi
+
+  macos:
+    # The development platform: Apple clang, Open MPI 5 from Homebrew, arm64.
+    # macOS minutes count tenfold against a private repository's quota, so
+    # until the repository is public this job runs only when started by hand.
+    name: clang + openmpi (macos-15)
+    if: ${{ !github.event.repository.private || github.event_name == 'workflow_dispatch' }}
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup
+        with:
+          compiler: clang
+          mpi: openmpi
+      - name: Configure
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
+      - name: Build
+        run: cmake --build build
+      - name: Test
+        env:
+          TESTS: ${{ inputs.tests }}
+        run: |
+          if [ -n "$TESTS" ]; then
+            ctest --test-dir build --output-on-failure -j 3 --timeout 900 -R "$TESTS"
+          else
+            ctest --test-dir build --output-on-failure -j 3 --timeout 900 -LE np27
+          fi

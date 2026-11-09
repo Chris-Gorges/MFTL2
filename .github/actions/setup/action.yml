@@ -22,13 +22,21 @@ runs:
         MPI: ${{ inputs.mpi }}
       run: |
         set -euo pipefail
-        case "$MPI" in
-          mpich)   pkgs="mpich libmpich-dev" ;;
-          openmpi) pkgs="openmpi-bin libopenmpi-dev" ;;
-          *) echo "unknown MPI '$MPI'" >&2; exit 1 ;;
-        esac
-        sudo apt-get update -q
-        sudo apt-get install -y -q --no-install-recommends ninja-build $pkgs
+        if [ "$RUNNER_OS" = macOS ]; then
+          # Homebrew's open-mpi is Open MPI 5, whose launcher (PRRTE) takes the
+          # oversubscription switch under a different name than Open MPI 4.
+          [ "$MPI" = openmpi ] || { echo "macOS: only openmpi is set up" >&2; exit 1; }
+          brew install --quiet open-mpi ninja
+          echo "PRTE_MCA_rmaps_default_mapping_policy=:oversubscribe" >> "$GITHUB_ENV"
+        else
+          case "$MPI" in
+            mpich)   pkgs="mpich libmpich-dev" ;;
+            openmpi) pkgs="openmpi-bin libopenmpi-dev" ;;
+            *) echo "unknown MPI '$MPI'" >&2; exit 1 ;;
+          esac
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends ninja-build $pkgs
+        fi
 
         case "$COMPILER" in
           gcc)   cc=gcc   cxx=g++ ;;
@@ -45,9 +53,9 @@ runs:
           echo "OMPI_CXX=$cxx"
         } >> "$GITHUB_ENV"
 
-        if [ "$MPI" = openmpi ]; then
+        if [ "$MPI" = openmpi ] && [ "$RUNNER_OS" != macOS ]; then
           # A hosted runner has 4 cores; the suite starts 8-rank jobs, which
-          # Open MPI refuses without oversubscription (MPICH allows it).
+          # Open MPI 4 refuses without oversubscription (MPICH allows it).
           echo "OMPI_MCA_rmaps_base_oversubscribe=1" >> "$GITHUB_ENV"
         fi
 
