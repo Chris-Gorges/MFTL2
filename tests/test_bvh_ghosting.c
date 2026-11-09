@@ -2121,6 +2121,7 @@ int main(int argc, char **argv)
   if (g_ens != MFTL_NULL) MFTLEnsembleDestroy(&g_ens);
   RUN_TEST(test_the_broad_phase_finds_the_pairs_without_enumerating_them);
 
+  if (g_ens != MFTL_NULL) MFTLEnsembleDestroy(&g_ens);
   RUN_TEST(test_refit_matches_rebuild_on_a_partitioned_mesh);
 
   if (g_rank == 0) TEST_REPORT();

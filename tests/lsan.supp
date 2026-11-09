@@ -19,3 +19,8 @@ leak:libucp
 leak:libucs
 leak:libuct
 leak:libevent
+# The RDMA verbs stack MPICH's libfabric loads on a runner (libibverbs and its
+# providers, e.g. libmlx5-rdmav34): 152 bytes per process, every test.
+leak:libibverbs
+leak:librdmacm
+leak:rdmav
