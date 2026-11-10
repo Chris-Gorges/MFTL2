@@ -32,15 +32,23 @@ Doxygen manual with call graphs, rebuilt from `main` on every push.
       instead of 1.42 %, with up to twice the triangles.</td>
   </tr>
   <tr>
-    <td colspan="2"><img src=".github/images/duct.gif" width="49%" alt="800 droplets carried through a periodic duct, coloured by owning rank">
-      <img src=".github/images/liquid_jet.gif" width="49%" alt="A liquid jet whose necks pinch off into drops"></td>
+    <td colspan="2"><img src=".github/images/duct.gif" alt="800 droplets carried through a periodic duct, coloured by owning rank; the camera closes in on one droplet"></td>
   </tr>
   <tr>
-    <td colspan="2" valign="top"><b>Many bodies</b> (left). 800 droplets of random size carried through a periodic duct by a
-      swirling flow, remeshed every step and redistributed across 8 ranks as they move (colour: owning rank): 1.0 &rarr; 1.7 M
-      triangles, volume +0.3 % over one pass, about 0.36 s per step on a laptop. <b>Topology change</b> (right). A jet
-      grows through a nozzle; its necks pinch off and every drop becomes a closed body of its own (blue: the jet), on 4
-      ranks. Both flows are prescribed velocity fields, not flow solutions.</td>
+    <td colspan="2" valign="top"><b>Many bodies.</b> 800 droplets of random size carried through a periodic duct by a
+      prescribed swirling flow, remeshed every step and redistributed across 8 ranks as they move (colour: owning rank; a droplet in
+      two colours is shared by two ranks). Midway the camera follows one droplet to show its mesh and how it deforms.
+      1.0 &rarr; 1.7 M triangles, volume +0.3 % over one pass through the duct.</td>
+  </tr>
+  <tr>
+    <td colspan="2"><img src=".github/images/liquid_jet.gif" alt="A liquid jet whose necks pinch off into drops"></td>
+  </tr>
+  <tr>
+    <td colspan="2" valign="top"><b>Topology change.</b> A jet grows through a nozzle; its necks pinch off and every drop
+      becomes a closed body of its own (blue: the jet), on 4 ranks. A kinematic test case, not a jet simulation: the
+      velocity field is prescribed, its necks growing at the rate of Rayleigh's linear stability theory, and there is
+      no flow solver and no surface tension. What it exercises is the mesh: a surface growing through an inflow boundary, necks
+      thinning down to a few edges, and the pinch-off itself.</td>
   </tr>
 </table>
 

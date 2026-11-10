@@ -29,6 +29,11 @@ The job file (see make_readme_gifs.sh for the ones the README uses):
     label         a caption drawn in the upper left corner, in "label_color"
     transparent   save RGBA frames with a transparent background, for an
                   animation that sits on any page colour
+    zoom          {"in": f0, "out": f1, "ramp": n, "body": id, "distance": d,
+                   "edge_opacity": e}: a close-up between frames f0 and f1,
+                  eased in and out over n frames, that follows one body (the
+                  centre of its bounding box, by BodyID) from distance d along
+                  the fixed camera's direction; mesh edges fade in to opacity e
     box           [xmin, xmax, ymin, ymax, zmin, zmax]: draw the domain outline
     ambient, diffuse, specular   lighting
 """
@@ -132,12 +137,43 @@ arr.SetName("Role")
 out.GetCellData().AddArray(arr)
 """
 
+zoom = job.get("zoom")
+if zoom:
+    # Where the followed body is, frame by frame, lightly smoothed: its box
+    # changes a little with every remesh.
+    track = {}
+    for k in range(zoom["in"], zoom["out"] + 1):
+        r = XMLPartitionedUnstructuredGridReader(FileName=[files[k]])
+        t = Threshold(Input=r, Scalars=["CELLS", "BodyID"], LowerThreshold=zoom["body"], UpperThreshold=zoom["body"], ThresholdMethod="Between")
+        t.UpdatePipeline()
+        b = t.GetDataInformation().GetBounds()
+        track[k] = [(b[0] + b[1]) / 2, (b[2] + b[3]) / 2, (b[4] + b[5]) / 2]
+        Delete(t)
+        Delete(r)
+    sz = zoom.get("sigma", 2.0)
+    smooth_track = {}
+    for k in track:
+        num, den = [0.0, 0.0, 0.0], 0.0
+        for q in track:
+            wgt = math.exp(-0.5 * ((q - k) / sz) ** 2)
+            num = [num[i] + wgt * track[q][i] for i in range(3)]
+            den += wgt
+        smooth_track[k] = [x / den for x in num]
+    track = smooth_track
+
 if job.get("label"):
     txt = Text(Text=job["label"])
     td = Show(txt, view)
     td.WindowLocation = "Upper Left Corner"
     td.FontSize = job.get("label_size", 26)
     td.Color = job.get("label_color", [0.15, 0.17, 0.20])
+
+def zoom_weight(z, k):
+    """0 for the wide view, 1 for the close-up, smoothstep ramps in between."""
+    a = (k - z["in"]) / float(z["ramp"])
+    b = (z["out"] - k) / float(z["ramp"])
+    s = max(0.0, min(1.0, a, b))
+    return s * s * (3.0 - 2.0 * s)
 
 for k, f in enumerate(files):
     src = XMLPartitionedUnstructuredGridReader(FileName=[f])
@@ -159,6 +195,15 @@ for k, f in enumerate(files):
         view.CameraPosition = job["position"]
     view.CameraViewUp = job.get("up", [0, 0, 1])
     view.CameraViewAngle = job.get("angle", 30)
+    zw = zoom_weight(zoom, k) if zoom else 0.0
+    if zw > 0.0:
+        wide_f, wide_p = list(view.CameraFocalPoint), list(view.CameraPosition)
+        dirn = [wide_p[i] - wide_f[i] for i in range(3)]
+        dl = math.sqrt(sum(x * x for x in dirn))
+        near_f = track[k]
+        near_p = [near_f[i] + zoom["distance"] * dirn[i] / dl for i in range(3)]
+        view.CameraFocalPoint = [(1 - zw) * wide_f[i] + zw * near_f[i] for i in range(3)]
+        view.CameraPosition = [(1 - zw) * wide_p[i] + zw * near_p[i] for i in range(3)]
     d.Specular = job.get("specular", 0.25)
     d.Ambient = job.get("ambient", 0.30)
     d.Diffuse = job.get("diffuse", 0.75)
@@ -195,6 +240,11 @@ for k, f in enumerate(files):
     else:
         ColorBy(d, None)
         d.DiffuseColor = d.AmbientColor = job.get("surface", [0.72, 0.80, 0.90])
+    if zw > 0.0 and not job.get("edges"):
+        d.Representation = "Surface With Edges"
+        d.EdgeColor = job.get("edge_color", [0.15, 0.17, 0.20])
+        d.EdgeOpacity = zw * zoom.get("edge_opacity", 0.4)
+        d.LineWidth = job.get("edge_width", 0.6)
     if job.get("edges"):
         d.Representation = "Surface With Edges"
         d.EdgeColor = job.get("edge_color", [0.15, 0.17, 0.20])

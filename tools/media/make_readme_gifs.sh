@@ -12,7 +12,7 @@
 #        WORK_DIR   where the runs and frames go (default a temporary directory)
 #        PVBATCH    pvbatch to use (default: from PATH, else the ParaView app on macOS)
 #
-# Needs MPI with 8 slots, ParaView >= 5.11 and ffmpeg. Takes about five minutes and
+# Needs MPI with 8 slots, ParaView >= 5.11 and ffmpeg. Takes about eight minutes and
 # 9 GB of scratch space (the duct run writes 121 frames of up to 1.7 M triangles).
 set -euo pipefail
 
@@ -27,15 +27,15 @@ render="$root/tools/media/render_frames.py"
 PVBATCH="${PVBATCH:-$(command -v pvbatch || ls -d /Applications/ParaView-*.app/Contents/bin/pvbatch 2> /dev/null | tail -n 1)}"
 [ -x "$PVBATCH" ] || { echo "pvbatch not found; set PVBATCH" >&2; exit 2; }
 
-# gif NAME FPS WIDTH [HOLD_SECONDS]: RGBA frames in $work/NAME_frames -> $out/NAME.gif.
+# gif NAME FPS WIDTH [HOLD_SECONDS] [COLOURS]: RGBA frames in $work/NAME_frames -> $out/NAME.gif.
 # A GIF has 1-bit transparency, so pixels under half covered become transparent.
 gif()
 {
-  local name=$1 fps=$2 width=$3 hold=${4:-0}
+  local name=$1 fps=$2 width=$3 hold=${4:-0} colours=${5:-128}
   local pre="scale=${width}:-1:flags=lanczos,format=rgba"
   [ "$hold" != 0 ] && pre="tpad=stop_mode=clone:stop_duration=${hold},$pre"
   ffmpeg -loglevel error -y -framerate "$fps" -i "$work/${name}_frames/frame_%04d.png" \
-    -vf "$pre,palettegen=reserve_transparent=1:max_colors=128:stats_mode=diff" "$work/${name}_palette.png"
+    -vf "$pre,palettegen=reserve_transparent=1:max_colors=${colours}:stats_mode=diff" "$work/${name}_palette.png"
   ffmpeg -loglevel error -y -framerate "$fps" -i "$work/${name}_frames/frame_%04d.png" -i "$work/${name}_palette.png" \
     -lavfi "$pre[x];[x][1:v]paletteuse=alpha_threshold=128:dither=bayer:bayer_scale=4:diff_mode=rectangle" -loop 0 "$out/${name}.gif"
   echo "wrote $out/${name}.gif ($(du -h "$out/${name}.gif" | cut -f1))"
@@ -90,17 +90,20 @@ cat > "$work/liquid_jet.json" << EOF
  "edges": true, "edge_opacity": 0.3, "edge_width": 0.6, "ambient": 0.35, "diffuse": 0.7, "transparent": true}
 EOF
 "$PVBATCH" "$render" "$work/liquid_jet.json"
-gif liquid_jet 15 720 1
+gif liquid_jet 15 880 1
 
 # 3. 800 droplets of random size carried through a periodic duct by a swirling
 #    flow, remeshed every step and redistributed over 8 ranks; coloured by rank.
+#    Between frames 30 and 100 the camera closes in on droplet 42, a large one
+#    on the near side (nothing between it and the camera), and follows it.
 mkdir -p "$work/duct" && cd "$work/duct"
 mpirun -n 8 "$build/droplets_in_duct_flow" --drops 800 --refine 3 --steps 240 --report 60 --vtk 2 > run.log
 cat > "$work/duct.json" << EOF
 {"pattern": "$work/duct/duct_*.pvtu", "out": "$work/duct_frames", "stride": 1,
  "size": [1080, 400], "focal": [2.0, 0.5, 0.42], "position": [2.0, -3.1, 2.15], "up": [0, 0, 1], "angle": 30,
  "color": "TriangleOwner", "n_colors": 8, "edges": false, "ambient": 0.3, "diffuse": 0.75, "specular": 0.3,
- "box": [0, 4, 0, 1, 0, 1], "box_width": 3.0, "transparent": true}
+ "box": [0, 4, 0, 1, 0, 1], "box_width": 3.0, "transparent": true,
+ "zoom": {"in": 30, "out": 100, "ramp": 15, "body": 42, "distance": 0.4, "edge_opacity": 0.6}}
 EOF
 "$PVBATCH" "$render" "$work/duct.json"
-gif duct 15 720
+gif duct 15 800 0 64   # the close-up's mesh edges change every pixel of every frame: 64 colours keep it near 7 MB
