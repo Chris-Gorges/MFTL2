@@ -18,6 +18,11 @@ ctest --test-dir build --output-on-failure -LE np27
 of every pool array, so an array that was not grown with the rest is an AddressSanitizer failure rather than silent
 corruption.
 
+**On macOS, check what only Linux would report.** glibc declares the pointers of `memcpy`, `qsort` and friends
+nonnull, so `memcpy(dst, NULL, 0)` is a UBSan error on Linux and silent on a Mac. `tools/check_glibc_nonnull.sh
+[BUILD_DIR] [CTEST_ARGS...]` builds Debug with `tools/glibc_nonnull.h` force-included, which redeclares them as
+glibc does, runs CTest and lists every UBSan report.
+
 Tests carry CTest labels: `serial`, `mpi`, `np<N>` (rank count), `example` (a physical run of an example
 program), `np27` (oversubscribed on a laptop) and `long`. `ctest -L <label>` / `-LE <label>` select them; every
 MPI test declares its rank count as `PROCESSORS`, so `ctest -j N` schedules ranks rather than processes.

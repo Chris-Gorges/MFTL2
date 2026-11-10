@@ -44,3 +44,5 @@ CLAUDE.md
 /docs/
 /run_scaling.py
 /studies/
+/build-nonnull/
+/build-nonnull.*.log
