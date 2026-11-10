@@ -22,8 +22,10 @@ on:
 permissions:
   contents: read
 
+# Keyed on the event too: a push supersedes an older push, but must not cancel
+# the nightly (or a dispatched) full run, which tests what the push run skips.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
