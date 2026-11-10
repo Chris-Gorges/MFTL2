@@ -661,7 +661,7 @@ static void build_directory(MFTL_Coupler *c)
   MFTLCplFree(c->shard);
   c->n_shard = c->n_dir;
   c->shard = MFTLCplAlloc((size_t) MFTL_MAX(c->n_shard, 1) * sizeof(cpl_dir_entry), "directory shard");
-  memcpy(c->shard, c->dir, (size_t) c->n_shard * sizeof(cpl_dir_entry));
+  if (c->n_shard > 0) memcpy(c->shard, c->dir, (size_t) c->n_shard * sizeof(cpl_dir_entry)); /* dir is NULL on a rank providing nothing */
   c->shard_index = MFTLCplCalloc((size_t) MFTL_MAX(c->n_loc, 1), sizeof(cpl_dir_index), "directory shard");
   for (int l = 0; l < c->n_loc; ++l) MFTLCplDirIndexBuild(&c->shard_index[l], c->shard, c->n_shard, l);
   index_directory(c);

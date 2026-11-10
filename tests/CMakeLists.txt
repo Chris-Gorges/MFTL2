@@ -303,6 +303,7 @@ add_test(NAME test_coupling_memory_limit
          COMMAND ${CMAKE_COMMAND} -DMPIEXEC=${MPIEXEC_EXECUTABLE} -DNPFLAG=${MPIEXEC_NUMPROC_FLAG}
                  "-DPREFLAGS=${MPIEXEC_PREFLAGS}" "-DPOSTFLAGS=${MPIEXEC_POSTFLAGS}"
                  -DTEST_BINARY=$<TARGET_FILE:test_coupling_lifecycle>
+                 -DLOG_FILE=${CMAKE_CURRENT_BINARY_DIR}/coupling_budget_diagnostic.txt
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/check_coupling_budget.cmake)
 mftl_label_mpi_test(test_coupling_memory_limit 2)
 # Surface quadrature: the points against the triangles, the level against the

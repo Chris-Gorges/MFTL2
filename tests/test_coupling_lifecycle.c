@@ -997,6 +997,11 @@ int main(int argc, char **argv)
   {
     if (g_rank == g_nproc - 1)
     {
+      /* The diagnostic goes to a file when one is named: a launcher tearing the
+         job down after MPI_Abort may drop what is still in its stderr pipe (one
+         MPICH CI run returned the abort's exit code and no output at all), and
+         that is not the library's to fix. */
+      if (argc > 2 && freopen(argv[2], "w", stderr) == MFTL_NULL) return 2;
       MFTLCouplerSetMemoryLimit(1);
       MFTL_SolverGrid *grid = MFTLSolverGridCreate(MPI_COMM_WORLD);
       (void) grid;
