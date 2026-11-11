@@ -212,7 +212,7 @@ ctest --test-dir build --output-on-failure -j 8 -LE np27
 
 `python3 build_all.py` does the same in a fresh `build/` (`--debug` adds AddressSanitizer and
 UndefinedBehaviorSanitizer, `--valgrind` a Debug build without them, `--lib-only` skips the examples), and
-`python3 run_local_tests.py` builds and runs the whole suite.
+`python3 run_local_tests.py` builds and runs the whole suite on every core (`--debug` for the sanitizer build).
 
 Every test carries labels, so a subset is one flag away: `serial`, `mpi`, `np<N>` for the rank count, `example`
 for the physical runs of the example programs, `oversub` and `np27` for runs with more ranks than a laptop has
