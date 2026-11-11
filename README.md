@@ -5,6 +5,7 @@
 [![CI-Warnings](https://github.com/Chris-Gorges/MFTL2/actions/workflows/warnings.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/warnings.yml)
 [![CI-Format](https://github.com/Chris-Gorges/MFTL2/actions/workflows/format.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/format.yml)
 [![CI-Consumers](https://github.com/Chris-Gorges/MFTL2/actions/workflows/consumers.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/consumers.yml)
+[![CI-CUDA](https://github.com/Chris-Gorges/MFTL2/actions/workflows/cuda.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/cuda.yml)
 [![Docs](https://github.com/Chris-Gorges/MFTL2/actions/workflows/docs.yml/badge.svg)](https://chris-gorges.github.io/MFTL2/)
 [![CodeQL](https://github.com/Chris-Gorges/MFTL2/actions/workflows/codeql.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/codeql.yml)
 [![codecov](https://codecov.io/gh/Chris-Gorges/MFTL2/graph/badge.svg)](https://codecov.io/gh/Chris-Gorges/MFTL2)

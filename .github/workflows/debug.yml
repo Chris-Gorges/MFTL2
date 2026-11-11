@@ -49,7 +49,7 @@ jobs:
         # Current runner kernels randomise mmap with 32 bits, which ASan cannot map around.
         run: sudo sysctl vm.mmap_rnd_bits=28
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Debug -DENABLE_SANITIZERS=ON -DMFTL_ENABLE_GPU=ON
       - name: Build
         run: cmake --build build
       - name: Test

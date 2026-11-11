@@ -41,7 +41,7 @@ jobs:
           compiler: ${{ matrix.compiler }}
           mpi: ${{ matrix.mpi }}
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF -DMFTL_ENABLE_GPU=ON
       - name: Build
         run: cmake --build build
       - name: Test
@@ -69,7 +69,7 @@ jobs:
           compiler: clang
           mpi: openmpi
       - name: Configure
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DENABLE_SANITIZERS=OFF -DMFTL_ENABLE_GPU=ON
       - name: Build
         run: cmake --build build
       - name: Test

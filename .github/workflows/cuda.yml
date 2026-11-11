@@ -1,0 +1,51 @@
+name: CI-CUDA
+
+# The device builds of examples/gpu: nvcc compiles both CUDA backends for the
+# A100 and H100 architectures and links the examples. A hosted runner has no
+# GPU, so nothing runs here. The CPU builds of the same examples (gcc_serial,
+# gcc_omp) run in CI-Release and CI-Debug; the device builds were measured on
+# a workstation (examples/gpu/README.md).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nvcc:
+    name: nvcc 13.1 (sm_80, sm_90) + gcc + openmpi
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CUDA_VER: "13.1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/setup
+        with:
+          compiler: gcc
+          mpi: openmpi
+      - name: Install nvcc and the CUDA runtime
+        # NVIDIA's apt repository: the compiler and the runtime only, not the
+        # whole toolkit.
+        run: |
+          wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i cuda-keyring_1.1-1_all.deb
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends "cuda-nvcc-${CUDA_VER/./-}" "cuda-cudart-dev-${CUDA_VER/./-}"
+          "/usr/local/cuda-$CUDA_VER/bin/nvcc" --version | tail -n 2
+      - name: Configure
+        run: >-
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DMFTL_ENABLE_GPU=ON
+          -DCMAKE_CUDA_COMPILER=/usr/local/cuda-$CUDA_VER/bin/nvcc "-DCMAKE_CUDA_ARCHITECTURES=80;90"
+      - name: Build the CUDA examples
+        run: cmake --build build --target leveque_gpu_cuda spheres_gpu_cuda
+      - name: The tests a GPU machine runs
+        run: ctest --test-dir build -N -L gpu
