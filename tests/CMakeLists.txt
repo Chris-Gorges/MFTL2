@@ -573,13 +573,17 @@ if(BUILD_EXAMPLES)
   # maximum deformation converges at better than order 1.5 between the two
   # meshes, and the remeshed front-tracking run stays a closed sphere that
   # tracks the direct run's volume. Half a period: the error at T is no
-  # coupling measure (the interpolated field is time-reversible too).
+  # coupling measure (the interpolated field is time-reversible too). Taken in
+  # 50 steps of 0.03 rather than 75 of 0.02: the coupled and the exact-velocity
+  # trajectories take the same RK4 steps, so the order measures the
+  # interpolation alone -- 1.93 and 1.83 either way, rms errors equal to four
+  # digits -- at two thirds of the cost.
   add_test(NAME test_leveque_coupled_cartesian
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}
-                   $<TARGET_FILE:leveque_coupled_cartesian> -n 16,32 -steps 75 -verify ${MPIEXEC_POSTFLAGS})
+                   $<TARGET_FILE:leveque_coupled_cartesian> -n 16,32 -dt 0.03 -steps 50 -verify ${MPIEXEC_POSTFLAGS})
   add_test(NAME test_leveque_coupled_unstructured
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
-                   $<TARGET_FILE:leveque_coupled_unstructured> -n 8,16 -steps 75 -verify ${MPIEXEC_POSTFLAGS})
+                   $<TARGET_FILE:leveque_coupled_unstructured> -n 8,16 -dt 0.03 -steps 50 -verify ${MPIEXEC_POSTFLAGS})
 
   # OPEN SURFACES. No library test runs the distributed remesher on a surface
   # with a rim; these four examples do, and each checks what an open surface
@@ -715,11 +719,11 @@ endif()
 # Over a minute each in a Debug + ASan/UBSan build on an Apple M4, from
 # Testing/Temporary/CTestCostData.txt (read it with LC_ALL=C: a German locale
 # parses the decimal point as a separator and sorts the list wrongly). Together
-# they are about half of the suite's serial time.
-set_property(TEST test_signed_distance
-                  test_topology_change test_topology_change_np2 test_topology_change_np4
+# they are about half of the suite's serial time. The topology family goes as
+# one: its np > 1 instances need the np = 1 instance's reference, a fixture
+# CTest would run for them under any label selection.
+set_property(TEST test_topology_change test_topology_change_np2 test_topology_change_np4
                   test_topology_change_np8 test_topology_change_np27
-                  test_remeshing_parallel_np8
              APPEND PROPERTY LABELS long)
 if(BUILD_EXAMPLES)
   set_property(TEST test_leveque_coupled_unstructured test_rayleigh_taylor_topology
