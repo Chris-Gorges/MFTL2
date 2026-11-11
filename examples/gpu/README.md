@@ -36,13 +36,10 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMFTL_ENABLE_GPU=ON
 cmake --build build -j
 mpirun -n 2 build/leveque_gpu_openacc -verify
 mpirun -n 1 build/spheres_gpu_openacc -spheres 1000 -verify
-ctest --test-dir build -L gpu
 ```
 
 **Compilers.** Either one is enough; a backend whose compiler is missing is not built. Without both, only the two
-CPU builds (`gcc_serial`, `gcc_omp`) are made, so the examples and their tests also build on a machine without the
-NVIDIA tools. CI runs those on every push and compiles the CUDA backends for sm_80 and sm_90 (`CI-CUDA`); no hosted
-runner has a GPU.
+CPU builds (`gcc_serial`, `gcc_omp`) are made, so the examples also build on a machine without the NVIDIA tools.
 
 - **nvcc** builds the CUDA backends through CMake's CUDA language. It targets the GPU in the machine unless
   `-DCMAKE_CUDA_ARCHITECTURES="80;90"` says otherwise.
@@ -73,7 +70,7 @@ Each example `<ex>` (`leveque_gpu`, prefix `lv_`; `spheres_gpu`, prefix `sp_`) c
 - `-cpu` runs the library on the host without any device. It is the reference.
 - With more ranks than GPUs, ranks share a device (`local_rank % n_devices`).
 - Threaded variants need `mpirun --bind-to none`, or Open MPI pins each rank to one core.
-- Exit status 77 means no device; CTest counts that as a skip.
+- Exit status 77 means no device.
 
 ## One source, six builds: `gpu_pragmas.h`
 
@@ -520,11 +517,22 @@ primitives directives cannot express**, not one or the other.
 
 ---
 
-## Tests
+## Checking a build
 
-`ctest -L gpu`: 24 tests with every backend built, about 15 s; 12 with `gcc_serial` alone.
+The examples are not part of the CTest suite or of CI. Each run checks itself: `-verify` compares every device
+result with the library on the same input, `-compare` the final state with a host run. `-cpu` touches no device, so
+any backend's executable writes the reference:
 
-| Example | Case | Tests |
+```bash
+mpirun -n 2 build/leveque_gpu_gcc_serial -refine 3 -steps 40 -quiet -cpu -csv lv_ref.csv
+mpirun -n 2 build/leveque_gpu_cuda -refine 3 -steps 40 -quiet -verify -compare lv_ref.csv
+mpirun -n 2 build/spheres_gpu_gcc_serial -spheres 60 -refine 2 -steps 30 -quiet -cpu -verify -save sp_ref.txt
+mpirun -n 2 build/spheres_gpu_cuda -spheres 60 -refine 2 -steps 30 -quiet -verify -compare sp_ref.txt
+```
+
+The cases that cover the code paths, with every backend in place of `cuda`:
+
+| Example | Case | Runs |
 |---|---|---|
 | LeVeque | refine 3, 40 steps (inside the round-off window) | `-cpu` reference at np 2; every backend `-verify -compare` at np 2; np 1; np 4 at refine 2, where three ranks start without a triangle; a rejected option |
 | spheres | 60 spheres, refine 2, 30 steps | `-cpu -verify` reference at np 2; every backend `-verify -compare` at np 2; np 1 and np 4 against the np-2 reference; 3 spheres at np 4 (ranks without a body); a rejected option |

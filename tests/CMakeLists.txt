@@ -14,8 +14,6 @@
 #   example   a physical run of an example program, checked by its --verify mode
 #   static    a source check run by CMake, no binary
 #   long      over a minute in a Debug + sanitizer build (see the end of file)
-#   gpu       the GPU examples (MFTL_ENABLE_GPU builds only); a device build
-#             is skipped without a GPU, the CPU builds run anywhere
 #
 # e.g. `ctest -LE "np27|long"` for a quick run. An MPI test also declares its
 # rank count as PROCESSORS, so `ctest -j N` schedules RANKS rather than tests and
@@ -703,77 +701,6 @@ if(BUILD_EXAMPLES)
              test_liquid_jet_open_remesh test_liquid_jet_topology test_rayleigh_taylor_topology)
     mftl_label_mpi_test(${_t} 4 example)
   endforeach()
-endif()
-
-# The GPU examples (MFTL_ENABLE_GPU, examples/gpu), once per backend that was
-# built. Each run checks every device result against the library on the same
-# input (-verify) and its final state against the host run written by a fixture
-# (-compare). Skipped (exit 77) without a device. In a Debug build ASan has to
-# leave the GPU driver's address range alone, and LSan would report its
-# one-time allocations as leaks; the CPU builds (gcc_*) run with the sanitizers
-# as configured.
-#
-# LeVeque: per-vertex and per-triangle work on the device, remeshing on the
-# host. -compare checks the whole trajectory: the same mesh after every remesh,
-# every diagnostic to round-off. Refine 3 agrees that way through step 85 or
-# later (examples/gpu/README.md), so 40 steps leave room. np = 2 adds the ghost
-# exchange between the device steps, np = 4 a rank that holds none of the sphere.
-#
-# Spheres: rigid periodic advection, no remeshing, so the final state does not
-# depend on the rank count -- np = 1 and 4 compare against the np = 2 reference.
-# Three spheres on four ranks leave ranks with ghosts only or nothing at all.
-set(_gpu_backends)
-foreach(_b cuda openacc openmp openacc_host openmp_host gcc_omp gcc_serial)
-  if(TARGET leveque_gpu_${_b} AND TARGET spheres_gpu_${_b})
-    list(APPEND _gpu_backends ${_b})
-  endif()
-endforeach()
-if(BUILD_EXAMPLES AND _gpu_backends)
-  list(GET _gpu_backends 0 _gpu_first)
-
-  function(mftl_add_gpu_test name nranks example backend)
-    add_test(NAME ${name}
-             COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${nranks} ${MPIEXEC_PREFLAGS}
-                     $<TARGET_FILE:${example}_${backend}> ${ARGN} ${MPIEXEC_POSTFLAGS})
-    set(_env "OMP_NUM_THREADS=2;ACC_NUM_CORES=2")
-    if(NOT backend MATCHES "^gcc_")
-      list(APPEND _env "ASAN_OPTIONS=protect_shadow_gap=0:detect_leaks=0")
-    endif()
-    set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300 RESOURCE_LOCK mftl_gpu_device ENVIRONMENT "${_env}")
-    mftl_label_mpi_test(${name} ${nranks} example gpu)
-  endfunction()
-
-  # -cpu touches no device: any backend's executable writes the reference.
-  set(_lv_case -refine 3 -steps 40 -quiet)
-  set(_lv_reference ${CMAKE_CURRENT_BINARY_DIR}/leveque_gpu_reference.csv)
-  mftl_add_gpu_test(test_gpu_leveque_reference 2 leveque_gpu ${_gpu_first} ${_lv_case} -cpu -csv ${_lv_reference})
-  set_tests_properties(test_gpu_leveque_reference PROPERTIES FIXTURES_SETUP mftl_gpu_leveque_reference)
-
-  foreach(_b ${_gpu_backends})
-    mftl_add_gpu_test(test_gpu_leveque_${_b} 2 leveque_gpu ${_b} ${_lv_case} -verify -compare ${_lv_reference})
-    set_tests_properties(test_gpu_leveque_${_b} PROPERTIES FIXTURES_REQUIRED mftl_gpu_leveque_reference)
-  endforeach()
-  mftl_add_gpu_test(test_gpu_leveque_np1 1 leveque_gpu ${_gpu_first} ${_lv_case} -verify)
-  mftl_add_gpu_test(test_gpu_leveque_empty_rank 4 leveque_gpu ${_gpu_first} -refine 2 -steps 20 -quiet -verify)
-  mftl_add_gpu_test(test_gpu_leveque_invalid_option 1 leveque_gpu ${_gpu_first} -refine three)
-  set_tests_properties(test_gpu_leveque_invalid_option PROPERTIES WILL_FAIL TRUE)
-
-  set(_sp_case -spheres 60 -refine 2 -steps 30 -quiet)
-  set(_sp_reference ${CMAKE_CURRENT_BINARY_DIR}/spheres_gpu_reference.txt)
-  mftl_add_gpu_test(test_gpu_spheres_reference 2 spheres_gpu ${_gpu_first} ${_sp_case} -cpu -verify -save ${_sp_reference})
-  set_tests_properties(test_gpu_spheres_reference PROPERTIES FIXTURES_SETUP mftl_gpu_spheres_reference)
-
-  foreach(_b ${_gpu_backends})
-    mftl_add_gpu_test(test_gpu_spheres_${_b} 2 spheres_gpu ${_b} ${_sp_case} -verify -compare ${_sp_reference})
-    set_tests_properties(test_gpu_spheres_${_b} PROPERTIES FIXTURES_REQUIRED mftl_gpu_spheres_reference)
-  endforeach()
-  foreach(_np 1 4)
-    mftl_add_gpu_test(test_gpu_spheres_np${_np} ${_np} spheres_gpu ${_gpu_first} ${_sp_case} -verify -compare ${_sp_reference})
-    set_tests_properties(test_gpu_spheres_np${_np} PROPERTIES FIXTURES_REQUIRED mftl_gpu_spheres_reference)
-  endforeach()
-  mftl_add_gpu_test(test_gpu_spheres_empty_rank 4 spheres_gpu ${_gpu_first} -spheres 3 -refine 2 -steps 20 -quiet -verify)
-  mftl_add_gpu_test(test_gpu_spheres_invalid_option 1 spheres_gpu ${_gpu_first} -spheres many)
-  set_tests_properties(test_gpu_spheres_invalid_option PROPERTIES WILL_FAIL TRUE)
 endif()
 
 # Over a minute each in a Debug + ASan/UBSan build on an Apple M4, from

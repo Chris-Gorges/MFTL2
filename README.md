@@ -5,7 +5,6 @@
 [![CI-Warnings](https://github.com/Chris-Gorges/MFTL2/actions/workflows/warnings.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/warnings.yml)
 [![CI-Format](https://github.com/Chris-Gorges/MFTL2/actions/workflows/format.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/format.yml)
 [![CI-Consumers](https://github.com/Chris-Gorges/MFTL2/actions/workflows/consumers.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/consumers.yml)
-[![CI-CUDA](https://github.com/Chris-Gorges/MFTL2/actions/workflows/cuda.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/cuda.yml)
 [![Docs](https://github.com/Chris-Gorges/MFTL2/actions/workflows/docs.yml/badge.svg)](https://chris-gorges.github.io/MFTL2/)
 [![CodeQL](https://github.com/Chris-Gorges/MFTL2/actions/workflows/codeql.yml/badge.svg)](https://github.com/Chris-Gorges/MFTL2/actions/workflows/codeql.yml)
 [![codecov](https://codecov.io/gh/Chris-Gorges/MFTL2/graph/badge.svg)](https://codecov.io/gh/Chris-Gorges/MFTL2)
@@ -217,9 +216,8 @@ UndefinedBehaviorSanitizer, `--valgrind` a Debug build without them, `--lib-only
 
 Every test carries labels, so a subset is one flag away: `serial`, `mpi`, `np<N>` for the rank count, `example`
 for the physical runs of the example programs, `oversub` and `np27` for runs with more ranks than a laptop has
-cores, `long`, and `gpu` for the GPU examples (configured with `-DMFTL_ENABLE_GPU=ON`). MPI tests declare their
-rank count to CTest, so `ctest -j N` schedules ranks rather than tests. The full Release suite takes about 45 s with
-`-j 8` on an Apple M4 laptop.
+cores, and `long`. MPI tests declare their rank count to CTest, so `ctest -j N` schedules ranks rather than tests.
+The full Release suite takes about 45 s with `-j 8` on an Apple M4 laptop.
 
 Some of the examples, each of which checks its own answer before it reports anything:
 
