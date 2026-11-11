@@ -33,6 +33,12 @@ set(MFTL_ARCH_FLAGS "" CACHE STRING "Extra architecture flags for Release builds
 # this. See the instrumentation section of src/communication/comm_internal.h.
 option(MFTL_COMM_PROFILE "Time the individual phases of MFTLRedistribute()" OFF)
 
+# The GPU examples (examples/gpu): the parallel LeVeque remeshing test and the
+# periodic advection of many spheres, with their per-vertex and per-triangle
+# work offloaded, once each in CUDA, OpenACC and OpenMP. Needs nvcc and/or nvc
+# (NVIDIA HPC SDK); the library itself never does.
+option(MFTL_ENABLE_GPU "Build the GPU examples examples/gpu (needs nvcc and/or nvc, CMake >= 3.18)" OFF)
+
 # --- Dependencies ---
 find_package(MPI REQUIRED)
 
@@ -204,6 +210,10 @@ if(BUILD_EXAMPLES AND MFTL_IS_TOP_LEVEL)
         add_executable(${TARGET_NAME} ${SOURCE_FILE})
         target_link_libraries(${TARGET_NAME} PRIVATE MFTL)
     endforeach()
+
+    if(MFTL_ENABLE_GPU)
+        add_subdirectory(examples/gpu)
+    endif()
 endif()
 
 # --- Testing ---
@@ -241,6 +251,7 @@ message(STATUS "LTO (Release)    : ${IPO_SUPPORTED}")
 message(STATUS "Warnings = errors: ${MFTL_WARNINGS_AS_ERRORS}")
 message(STATUS "-march=native    : ${MFTL_ARCH_NATIVE}")
 message(STATUS "comm profiling   : ${MFTL_COMM_PROFILE}")
+message(STATUS "GPU example      : ${MFTL_ENABLE_GPU}")
 message(STATUS "Extra arch flags : ${MFTL_ARCH_FLAGS}")
 if(BUILD_EXAMPLES AND MFTL_IS_TOP_LEVEL)
     message(STATUS "Build Examples   : ON")

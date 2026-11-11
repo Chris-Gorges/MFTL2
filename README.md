@@ -216,8 +216,9 @@ UndefinedBehaviorSanitizer, `--valgrind` a Debug build without them, `--lib-only
 
 Every test carries labels, so a subset is one flag away: `serial`, `mpi`, `np<N>` for the rank count, `example`
 for the physical runs of the example programs, `oversub` and `np27` for runs with more ranks than a laptop has
-cores, and `long`. MPI tests declare their rank count to CTest, so `ctest -j N` schedules ranks rather than tests.
-The full Release suite takes about 45 s with `-j 8` on an Apple M4 laptop.
+cores, `long`, and `gpu` for the GPU examples (configured with `-DMFTL_ENABLE_GPU=ON`). MPI tests declare their
+rank count to CTest, so `ctest -j N` schedules ranks rather than tests. The full Release suite takes about 45 s with
+`-j 8` on an Apple M4 laptop.
 
 Some of the examples, each of which checks its own answer before it reports anything:
 
@@ -237,6 +238,14 @@ mpirun -n 4 ./build/rayleigh_taylor_open_surface --roll 1.7 --growth 1.4 --requi
 
 # interface advected by a solver's velocity field through the coupler
 mpirun -n 2 ./build/leveque_coupled_cartesian -n 16,32 -steps 75 -verify
+
+# the same LeVeque run with the per-vertex and per-triangle work on the GPU: CUDA, OpenACC or OpenMP offload
+# (-DMFTL_ENABLE_GPU=ON); checked against the library at every step
+mpirun -n 2 ./build/leveque_gpu_cuda -verify
+
+# 1000 spheres advected through a periodic box, all geometry on the GPU; see examples/gpu/README.md for the
+# comparison of CUDA, OpenACC and OpenMP offload
+mpirun -n 1 ./build/spheres_gpu_openacc -spheres 1000 -verify
 ```
 
 `scaling/` holds the strong- and weak-scaling drivers and the Slurm scripts used on an HPC cluster.
@@ -311,8 +320,11 @@ Present: everything in the module table above. Absent: open-surface generators o
 (`MFTLBuildMeshFromLevelSet`), a mesh reader of any format, topological ghost-layer growth, and continuous-time
 (swept) contact or topology detection.
 
-Next: GPU offload of the per-timestep geometry kernels, for which the SoA layout is designed; measurement of the
-distributed remesher at hundreds of ranks; a local (rather than global) volume correction.
+Next: GPU offload of the per-timestep geometry kernels, for which the SoA layout is designed — a first step is
+[`examples/gpu`](examples/gpu/README.md), which runs the per-vertex and per-triangle work of the LeVeque test on the
+library's own pools in CUDA, OpenACC and OpenMP offload, reproduces the host run to round-off, and measures what that
+buys while the remesher stays on the host; measurement of the distributed remesher at hundreds of ranks; a local (rather
+than global) volume correction.
 
 ## Contributing
 
