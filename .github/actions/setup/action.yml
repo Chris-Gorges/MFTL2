@@ -18,12 +18,19 @@ runs:
     # The packages, kept per runner image: a cache hit installs them without
     # touching Ubuntu's mirror, which has been slow (40 MB in five minutes) and
     # unreachable (a DNS failure that failed every job) on days the cache saves.
+    # The image is named by the runner's environment, which an expression's env
+    # context does not see, hence the step that reads it.
+    - name: Name the runner image
+      id: image
+      if: runner.os == 'Linux'
+      shell: bash
+      run: echo "key=apt-${ImageOS:-unknown}-${ImageVersion:-unknown}-${{ inputs.mpi }}" >> "$GITHUB_OUTPUT"
     - name: Restore the package cache
       if: runner.os == 'Linux'
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: ~/.cache/mftl-apt
-        key: apt-${{ env.ImageOS }}-${{ env.ImageVersion }}-${{ inputs.mpi }}
+        key: ${{ steps.image.outputs.key }}
     - name: Install and select
       shell: bash
       env:
@@ -51,6 +58,9 @@ runs:
             sudo apt-get update -q
             mkdir -p "$cache/partial"
             sudo apt-get install -y -q --no-install-recommends -o Dir::Cache::Archives="$cache" ninja-build $pkgs
+            # apt's lock and partial/ are root's and unreadable: the cache would fail to save.
+            sudo rm -rf "$cache/lock" "$cache/partial"
+            sudo chown -R "$(id -u):$(id -g)" "$cache"
           fi
         fi
 
