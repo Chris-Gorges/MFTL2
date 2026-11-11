@@ -43,7 +43,7 @@ jobs:
       - name: Build
         run: cmake --build build
       - name: Test
-        run: ctest --test-dir build --output-on-failure -j 4 --timeout 1800 -LE np27
+        run: ctest --test-dir build --output-on-failure -j "$(getconf _NPROCESSORS_ONLN)" --timeout 1800 -LE np27
       - name: Report
         run: |
           mkdir -p coverage

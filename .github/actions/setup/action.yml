@@ -15,6 +15,15 @@ inputs:
 runs:
   using: composite
   steps:
+    # The packages, kept per runner image: a cache hit installs them without
+    # touching Ubuntu's mirror, which has been slow (40 MB in five minutes) and
+    # unreachable (a DNS failure that failed every job) on days the cache saves.
+    - name: Restore the package cache
+      if: runner.os == 'Linux'
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/mftl-apt
+        key: apt-${{ env.ImageOS }}-${{ env.ImageVersion }}-${{ inputs.mpi }}
     - name: Install and select
       shell: bash
       env:
@@ -34,8 +43,15 @@ runs:
             openmpi) pkgs="openmpi-bin libopenmpi-dev" ;;
             *) echo "unknown MPI '$MPI'" >&2; exit 1 ;;
           esac
-          sudo apt-get update -q
-          sudo apt-get install -y -q --no-install-recommends ninja-build $pkgs
+          cache="$HOME/.cache/mftl-apt"
+          if compgen -G "$cache/*.deb" > /dev/null &&
+             sudo apt-get install -y -q --no-install-recommends "$cache"/*.deb; then
+            echo "Installed from the package cache"
+          else
+            sudo apt-get update -q
+            mkdir -p "$cache/partial"
+            sudo apt-get install -y -q --no-install-recommends -o Dir::Cache::Archives="$cache" ninja-build $pkgs
+          fi
         fi
 
         case "$COMPILER" in

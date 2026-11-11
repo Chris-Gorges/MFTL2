@@ -59,9 +59,9 @@ jobs:
           TESTS: ${{ inputs.tests }}
         run: |
           if [ -n "$TESTS" ]; then
-            ctest --test-dir build --output-on-failure -j 4 --timeout 3600 -R "$TESTS"
+            ctest --test-dir build --output-on-failure -j "$(getconf _NPROCESSORS_ONLN)" --timeout 3600 -R "$TESTS"
           elif [ "${{ github.event_name }}" = schedule ] || [ "${{ github.event_name }}" = workflow_dispatch ]; then
-            ctest --test-dir build --output-on-failure -j 4 --timeout 3600
+            ctest --test-dir build --output-on-failure -j "$(getconf _NPROCESSORS_ONLN)" --timeout 3600
           else
-            ctest --test-dir build --output-on-failure -j 4 --timeout 1800 -LE "np27|long"
+            ctest --test-dir build --output-on-failure -j "$(getconf _NPROCESSORS_ONLN)" --timeout 1800 -LE "np27|long"
           fi
