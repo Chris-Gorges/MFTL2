@@ -428,7 +428,42 @@ static void uncouple(coupled *x)
   MFTLCouplerDestroy(&x->c);
 }
 
-/** @brief Does every row of the binding equal the brute-force row? Returns the worst weight error. */
+/** @brief A reference entry's key and its position in the row, ordered by both. */
+typedef struct
+{
+  uint64_t key;
+  int f;
+} ref_slot;
+
+static int cmp_ref_slot(const void *a, const void *b)
+{
+  const ref_slot *x = (const ref_slot *) a, *y = (const ref_slot *) b;
+  if (x->key != y->key) return (x->key > y->key) - (x->key < y->key);
+  return (x->f > y->f) - (x->f < y->f);
+}
+
+/** @brief The LAST reference entry with this key, as a scan of the row finds it; -1 if none. */
+static int ref_slot_find(const ref_slot *sorted, int nr, uint64_t key)
+{
+  int lo = 0, hi = nr; /* first slot with a larger key */
+  while (lo < hi)
+  {
+    const int mid = lo + (hi - lo) / 2;
+    if (sorted[mid].key <= key)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  return (lo > 0 && sorted[lo - 1].key == key) ? sorted[lo - 1].f : -1;
+}
+
+/**
+ * @brief Does every row of the binding equal the brute-force row? Returns the worst weight error.
+ *
+ * Each binding entry is looked up in the reference row by key. The row is sorted
+ * once for that, which matters at a wide support: thousands of entries per row
+ * made a scan per entry the most expensive part of the coupling suite in Debug.
+ */
 static double rows_vs_reference(const coupled *x, int loc_pos, const ref_lattice *R, int *n_bad)
 {
   const int64_t nm = MFTLCouplerBindingMarkerCount(x->b);
@@ -439,6 +474,7 @@ static double rows_vs_reference(const coupled *x, int loc_pos, const ref_lattice
   };
   uint64_t *rk = (uint64_t *) malloc(CAP * sizeof(uint64_t));
   double *rw = (double *) malloc(CAP * sizeof(double)), *dd = (double *) malloc(3 * CAP * sizeof(double));
+  ref_slot *sorted = (ref_slot *) malloc(CAP * sizeof(ref_slot));
   double worst = 0.0;
   *n_bad = 0;
   for (int64_t i = 0; i < nm; ++i)
@@ -457,11 +493,11 @@ static double rows_vs_reference(const coupled *x, int loc_pos, const ref_lattice
       ++*n_bad;
       continue;
     }
+    for (int f = 0; f < nr; ++f) sorted[f] = (ref_slot){rk[f], f};
+    qsort(sorted, (size_t) nr, sizeof(ref_slot), cmp_ref_slot);
     for (int e = 0; e < n; ++e)
     {
-      int found = -1;
-      for (int f = 0; f < nr; ++f)
-        if (rk[f] == keys[e]) found = f;
+      const int found = ref_slot_find(sorted, nr, keys[e]);
       if (found < 0)
       {
         ++*n_bad;
@@ -470,6 +506,7 @@ static double rows_vs_reference(const coupled *x, int loc_pos, const ref_lattice
       worst = fmax(worst, fabs(rw[found] - w[e]));
     }
   }
+  free(sorted);
   free(rk);
   free(rw);
   free(dd);

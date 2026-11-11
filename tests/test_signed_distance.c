@@ -49,16 +49,107 @@ static double solid_angle(const double x[3], const double A[3], const double B[3
   return 2.0 * atan2(det, den);
 }
 
+/**
+ * @brief Every triangle's corners, gathered once, and its bounding box.
+ *
+ * The references below visit every triangle for every point. Reading the
+ * corners from this list gives the same numbers as MFTLGetTriangleCorners()
+ * per visit, without the call. The box lets a brute-force minimum skip a
+ * triangle that provably cannot attain it (box_dist2() is a lower bound).
+ */
+typedef struct
+{
+  int n;
+  double (*T)[3][3];
+  double (*box)[2][3];
+} corner_list;
+
+static corner_list corners_of(const MFTL_Object *obj)
+{
+  corner_list c;
+  c.n = obj->tris.n;
+  c.T = (double(*)[3][3]) malloc((size_t) (c.n > 0 ? c.n : 1) * sizeof(*c.T));
+  c.box = (double(*)[2][3]) malloc((size_t) (c.n > 0 ? c.n : 1) * sizeof(*c.box));
+  for (int t = 0; t < c.n; ++t)
+  {
+    MFTLGetTriangleCorners(obj, t, c.T[t]);
+    for (int k = 0; k < 3; ++k)
+    {
+      c.box[t][0][k] = fmin(c.T[t][0][k], fmin(c.T[t][1][k], c.T[t][2][k]));
+      c.box[t][1][k] = fmax(c.T[t][0][k], fmax(c.T[t][1][k], c.T[t][2][k]));
+    }
+  }
+  return c;
+}
+
+static void corners_free(corner_list *c)
+{
+  free(c->T);
+  free(c->box);
+}
+
+/** @brief Squared distance from x to triangle t's box: never more than the squared distance to the triangle. */
+static double box_dist2(const corner_list *c, int t, const double x[3])
+{
+  double d2 = 0.0;
+  for (int k = 0; k < 3; ++k)
+  {
+    const double g = fmax(fmax(c->box[t][0][k] - x[k], x[k] - c->box[t][1][k]), 0.0);
+    d2 += g * g;
+  }
+  return d2;
+}
+
+/**
+ * @brief Squared distance from x to the nearest triangle, by brute force.
+ *
+ * A triangle is skipped only when its box is farther than the best distance so
+ * far plus `slack`, and the box distance never exceeds the triangle's. With
+ * slack above the rounding of both (coordinates up to 1e6 below, so 1e-6
+ * against errors near 1e-15), a skipped triangle is farther than the one that
+ * attains the minimum, so the result is the minimum over all of them TO THE
+ * BIT. `feature`, if given, is the nearest triangle's feature.
+ */
+static double nearest_dist2(const corner_list *c, const double x[3], double slack, MFTL_TriangleFeature *feature)
+{
+  double best = MFTL_DBL_MAX;
+  for (int t = 0; t < c->n; ++t)
+  {
+    if (best < MFTL_DBL_MAX && box_dist2(c, t, x) > best + slack) continue;
+    double q[3];
+    MFTL_TriangleFeature f;
+    const double d2 = MFTLClosestPointOnTriangle(x, c->T[t], q, &f);
+    if (d2 < best)
+    {
+      best = d2;
+      if (feature) *feature = f;
+    }
+  }
+  return best;
+}
+
+/**
+ * @brief Does x lie on a triangle, to round-off (distance at most 1e-12)?
+ *
+ * The question the edge-crossing checks ask: only a triangle within 1e-9 can
+ * answer yes, and a box farther than that is a triangle farther than that.
+ */
+static bool on_the_mesh(const corner_list *c, const double x[3])
+{
+  for (int t = 0; t < c->n; ++t)
+  {
+    if (box_dist2(c, t, x) > 1e-18) continue;
+    double q[3];
+    if (sqrt(MFTLClosestPointOnTriangle(x, c->T[t], q, MFTL_NULL)) <= 1e-12) return MFTL_TRUE;
+  }
+  return MFTL_FALSE;
+}
+
 /** @brief 1 inside a closed outward-wound mesh, 0 outside. Unwrapped corners. */
-static double winding_number(const MFTL_Object *obj, const double x[3])
+static double winding_number(const corner_list *c, const double x[3])
 {
   double w = 0.0;
-  for (int t = 0; t < obj->tris.n; ++t)
-  {
-    double c[3][3];
-    MFTLGetTriangleCorners(obj, t, c);
-    w += solid_angle(x, c[0], c[1], c[2]);
-  }
+  for (int t = 0; t < c->n; ++t) w += solid_angle(x, c->T[t][0], c->T[t][1], c->T[t][2]);
   return w / (4.0 * MFTL_PI);
 }
 
@@ -142,6 +233,7 @@ static void node_coord(const MFTL_SdfGrid *g, size_t idx, double x[3])
  */
 static int sign_mismatches(const MFTL_Object *obj, const MFTL_SdfGrid *g, int *n_checked)
 {
+  corner_list c = corners_of(obj);
   int bad = 0;
   *n_checked = 0;
   const size_t n = (size_t) g->dims[0] * g->dims[1] * g->dims[2];
@@ -163,12 +255,13 @@ static int sign_mismatches(const MFTL_Object *obj, const MFTL_SdfGrid *g, int *n
     if ((seen++ % stride) != 0 && fabs(g->phi[i]) > near) continue;
     double x[3];
     node_coord(g, i, x);
-    const double w = winding_number(obj, x);
+    const double w = winding_number(&c, x);
     /* A node ON the surface has w = 1/2 and either sign is right. */
     if (fabs(w - 0.5) < 0.05) continue;
     (*n_checked)++;
     if ((g->phi[i] < 0.0) != (w > 0.5)) bad++;
   }
+  corners_free(&c);
   return bad;
 }
 
@@ -352,6 +445,7 @@ static int test_vertex_signs_on_a_spiky_mesh_need_angle_weighting(void)
       const double r = 0.35 + 1.3 * ((double) (st >> 8) / (double) (1u << 24));
       for (int k = 0; k < 3; ++k) obj->verts.pos[3 * v + k] *= r;
     }
+    corner_list cl = corners_of(obj);
 
     for (int s = 0; s < 1200; ++s)
     {
@@ -370,23 +464,11 @@ static int test_vertex_signs_on_a_spiky_mesh_need_angle_weighting(void)
       for (int k = 0; k < 3; ++k) x[k] = obj->verts.pos[3 * v + k] + scale * d[k] / len;
 
       /* Keep only points whose closest feature in the whole mesh is a vertex. */
-      double best = MFTL_DBL_MAX;
       MFTL_TriangleFeature bf = MFTL_TRI_FEATURE_FACE;
-      for (int t = 0; t < obj->tris.n; ++t)
-      {
-        double T[3][3];
-        MFTLGetTriangleCorners(obj, t, T);
-        MFTL_TriangleFeature f;
-        const double d2 = MFTLClosestPointOnTriangle(x, T, MFTL_NULL, &f);
-        if (d2 < best)
-        {
-          best = d2;
-          bf = f;
-        }
-      }
+      nearest_dist2(&cl, x, 1e-6, &bf);
       if (bf < MFTL_TRI_FEATURE_VERTEX0 || bf > MFTL_TRI_FEATURE_VERTEX2) continue;
 
-      const bool inside = winding_number(obj, x) > 0.5;
+      const bool inside = winding_number(&cl, x) > 0.5;
       tested++;
       for (int w = 0; w < 2; ++w)
       {
@@ -400,6 +482,7 @@ static int test_vertex_signs_on_a_spiky_mesh_need_angle_weighting(void)
         MFTLSdfGridFree(&g);
       }
     }
+    corners_free(&cl);
   }
 
   printf("\n  vertex-nearest points: %d; wrong signs: angle %d, area %d (control)\n  ", tested, wrong[0], wrong[1]);
@@ -550,7 +633,9 @@ static int test_a_banded_rasterisation_is_each_band_bit_for_bit(void)
  * bounding sphere) already exceeds the node's cutoff or its current value. A skip
  * that dropped the nearest triangle would leave a larger magnitude, or an unknown
  * node inside the cutoff; comparing bit for bit against a minimum over ALL
- * triangles with MFTLClosestPointOnTriangle() catches either.
+ * triangles with MFTLClosestPointOnTriangle() catches either. (The reference
+ * skips a triangle only by its own box test, with a slack far above rounding,
+ * which leaves the minimum unchanged to the bit; see nearest_dist2().)
  */
 static int test_every_magnitude_is_the_nearest_triangle_even_far_from_the_origin(void)
 {
@@ -572,20 +657,14 @@ static int test_every_magnitude_is_the_nearest_triangle_even_far_from_the_origin
     MFTL_SdfGrid g;
     blank_grid(&g, glo, 0.1, dim);
     MFTLRasterizeSignedDistance(&g, obj, obj->tris.n, cutoff);
+    corner_list cl = corners_of(obj);
 
     int bad = 0, known = 0;
     for (size_t i = 0; i < (size_t) dim * dim * dim; ++i)
     {
       double x[3];
       node_coord(&g, i, x);
-      double best = MFTL_DBL_MAX;
-      for (int t = 0; t < obj->tris.n; ++t)
-      {
-        double T[3][3], q[3];
-        MFTL_TriangleFeature f;
-        MFTLGetTriangleCorners(obj, t, T);
-        best = fmin(best, MFTLClosestPointOnTriangle(x, T, q, &f));
-      }
+      const double best = nearest_dist2(&cl, x, 1e-6, MFTL_NULL);
       if (best > cutoff * cutoff)
       {
         if (g.phi[i] != MFTL_SDF_UNKNOWN) bad++;
@@ -595,6 +674,7 @@ static int test_every_magnitude_is_the_nearest_triangle_even_far_from_the_origin
       const double want = sqrt(best);
       if (g.phi[i] == MFTL_SDF_UNKNOWN || fabs(g.phi[i]) != want) bad++;
     }
+    corners_free(&cl);
     TEST_ASSERT(known > 1000);
     worst += bad;
     MFTLSdfGridFree(&g);
@@ -647,6 +727,7 @@ static int test_edge_crossings_are_order_free_and_on_the_mesh(void)
   TEST_ASSERT(memcmp(a.phi, p.phi, n * sizeof(double)) == 0);
 
   /* Every single crossing is on the mesh, every MANY slot really is crossed. */
+  corner_list cl = corners_of(obj);
   int off = 0, singles = 0;
   for (size_t i = 0; i < n && singles < 3000; ++i)
     for (int k = 0; k < 3; ++k)
@@ -657,14 +738,7 @@ static int test_edge_crossings_are_order_free_and_on_the_mesh(void)
       double x[3];
       node_coord(&a, i, x);
       x[k] += f * dx;
-      double best = MFTL_DBL_MAX;
-      for (int t = 0; t < nt; ++t)
-      {
-        double T[3][3], q[3];
-        MFTLGetTriangleCorners(obj, t, T);
-        best = fmin(best, MFTLClosestPointOnTriangle(x, T, q, MFTL_NULL));
-      }
-      if (sqrt(best) > 1e-12) off++;
+      if (!on_the_mesh(&cl, x)) off++;
     }
   TEST_ASSERT(singles > 1000);
   TEST_ASSERT_EQUAL_INT(0, off);
@@ -683,15 +757,8 @@ static int test_edge_crossings_are_order_free_and_on_the_mesh(void)
     g->cross = saved;
     for (int v = 0; v < surf.n_verts; v += 3)
     {
-      double best = MFTL_DBL_MAX;
-      for (int t = 0; t < nt; ++t)
-      {
-        double T[3][3], q[3];
-        MFTLGetTriangleCorners(obj, t, T);
-        best = fmin(best, MFTLClosestPointOnTriangle(&surf.pos[3 * v], T, q, MFTL_NULL));
-      }
       tot[pass]++;
-      on[pass] += sqrt(best) <= 1e-12;
+      on[pass] += on_the_mesh(&cl, &surf.pos[3 * v]);
     }
     MFTLLevelSetSurfaceFree(&surf);
   }
@@ -699,6 +766,7 @@ static int test_edge_crossings_are_order_free_and_on_the_mesh(void)
   TEST_ASSERT(on[1] > 0.9 * tot[1]);
   TEST_ASSERT(on[0] < 0.3 * tot[0]);
 
+  corners_free(&cl);
   MFTLSdfGridFree(&a);
   MFTLSdfGridFree(&p);
   return 0;

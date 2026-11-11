@@ -7,11 +7,12 @@
  * The query a topology change is detected by: two parts of ONE surface that are
  * close without being adjacent. It is tested the way CLAUDE.md prescribes for
  * any distributed contact query -- as a MULTISET of named pairs, against an
- * exhaustive O(n^2) sweep taken while one rank still held the whole mesh, which
- * shares nothing with the BVH, the halo or the filter. Equality of the gathered
- * multisets rules out, at once, a MISSING cross-rank pair, a DUPLICATE reported
- * by two ranks, a pair of ADJACENT triangles leaking through the filter, and a
- * DIVERGENT answer at a different process count.
+ * exhaustive sweep taken while one rank still held the whole mesh (every pair
+ * that can be within reach, brute_self()), which shares nothing with the BVH,
+ * the halo or the filter. Equality of the gathered multisets rules out, at
+ * once, a MISSING cross-rank pair, a DUPLICATE reported by two ranks, a pair of
+ * ADJACENT triangles leaking through the filter, and a DIVERGENT answer at a
+ * different process count.
  *
  * Every fixture sits where the cut planes meet, and the number of pairs whose
  * two triangles are owned by different ranks is counted and asserted: a fixture
@@ -125,13 +126,73 @@ static int cmp_ll(const void *a, const void *b)
 
 static long long pair_key(int body, int ga, int gb) { return ((long long) body << (2 * KEY_SHIFT)) + ((long long) ga << KEY_SHIFT) + gb; }
 
+/** @brief Centroid x folded into the period on a periodic axis: the key the sweep below sorts by. */
+typedef struct
+{
+  double x;
+  int t;
+} sweep_key;
+
+static int cmp_sweep_key(const void *a, const void *b)
+{
+  const sweep_key *p = (const sweep_key *) a, *q = (const sweep_key *) b;
+  if (p->x != q->x) return (p->x > q->x) - (p->x < q->x);
+  return (p->t > q->t) - (p->t < q->t);
+}
+
+/** @brief One pair of brute_self(): adjacency, the nearest image, the sphere reject, the narrow phase. */
+static void brute_pair(const MFTL_Object *obj, double (*const T)[3][3], const double *ctr, int i, int j, double tol, keyset *out)
+{
+  const MFTL_Domain *d = obj->domain;
+  /* The smaller global id is A, as in an enumeration of every ordered pair. */
+  if (obj->tris.rec[i].global_id > obj->tris.rec[j].global_id)
+  {
+    const int t = i;
+    i = j;
+    j = t;
+  }
+  const int gi = obj->tris.rec[i].global_id, gj = obj->tris.rec[j].global_id;
+  if (gi >= gj) return;
+  const double(*const A)[3] = T[i];
+
+  for (int a = 0; a < 3; ++a)
+    for (int b = 0; b < 3; ++b)
+      if (obj->tris.verts[3 * i + a] == obj->tris.verts[3 * j + b]) return; /* adjacent */
+
+  /* Nearest image of B's first corner relative to A's. */
+  double shift[3];
+  MFTLGetMinimumImageVector(d, shift, A[0], T[j][0]);
+  for (int k = 0; k < 3; ++k) shift[k] = A[0][k] + shift[k] - T[j][0][k];
+
+  double dc2 = 0.0;
+  for (int k = 0; k < 3; ++k)
+  {
+    const double dk = ctr[4 * j + k] + shift[k] - ctr[4 * i + k];
+    dc2 += dk * dk;
+  }
+  const double reach = ctr[4 * i + 3] + ctr[4 * j + 3] + tol;
+  if (dc2 > reach * reach) return;
+
+  double B[3][3];
+  for (int c = 0; c < 3; ++c)
+    for (int k = 0; k < 3; ++k) B[c][k] = T[j][c][k] + shift[k];
+  if (MFTL_TriTriProximity(A, B, tol)) ks_push(out, pair_key(obj->global_id, gi, gj));
+}
+
 /**
- * @brief O(n^2), with periodic images, no BVH, no halo, no filter shared.
+ * @brief Every pair, with periodic images, no BVH, no halo, no filter shared.
  *
- * Every pair is enumerated; a pair whose bounding spheres (centroid, farthest
- * corner) are more than `tol` apart skips the narrow phase. That reject is
- * strictly more permissive than MFTL_TriTriProximity -- two points within tol
- * lie within tol of each other's spheres -- so it changes the cost, not the set.
+ * A pair whose bounding spheres (centroid, farthest corner) are more than `tol`
+ * apart skips the narrow phase. That reject is strictly more permissive than
+ * MFTL_TriTriProximity -- two points within tol lie within tol of each other's
+ * spheres -- so it changes the cost, not the set.
+ *
+ * The pairs are enumerated by a sweep along x rather than all n^2 of them: a
+ * pair whose centroids are more than R = 2 max radius + tol apart in x, in
+ * every periodic image, fails that same sphere reject, so it is never examined
+ * (R carries 1e-9 over the rounding of the nearest-image shift). Each pair
+ * within R is examined exactly once, with the smaller global id as A, so the
+ * set is the one the full enumeration produces; the caller sorts it.
  */
 static void brute_self(const MFTL_Object *obj, double tol, keyset *out)
 {
@@ -139,6 +200,10 @@ static void brute_self(const MFTL_Object *obj, double tol, keyset *out)
   const int n = obj->tris.n;
   double (*const T)[3][3] = (double (*)[3][3]) malloc((size_t) (n > 0 ? n : 1) * sizeof(*T));
   double *const ctr = (double *) malloc(4 * (size_t) (n > 0 ? n : 1) * sizeof(double));
+  sweep_key *const key = (sweep_key *) malloc((size_t) (n > 0 ? n : 1) * sizeof(sweep_key));
+  double r_max = 0.0;
+  const bool per_x = d->is_periodic[0];
+  const double L = d->domain_size[0];
   for (int i = 0; i < n; ++i)
   {
     MFTLGetTriangleCorners(obj, i, T[i]);
@@ -151,42 +216,47 @@ static void brute_self(const MFTL_Object *obj, double tol, keyset *out)
       r2 = fmax(r2, e2);
     }
     ctr[4 * i + 3] = sqrt(r2);
-  }
-
-  for (int i = 0; i < n; ++i)
-  {
-    const double (*const A)[3] = T[i];
-    for (int j = 0; j < n; ++j)
+    r_max = fmax(r_max, ctr[4 * i + 3]);
+    double x = ctr[4 * i];
+    if (per_x)
     {
-      const int gi = obj->tris.rec[i].global_id, gj = obj->tris.rec[j].global_id;
-      if (gi >= gj) continue;
-
-      bool adjacent = MFTL_FALSE;
-      for (int a = 0; a < 3; ++a)
-        for (int b = 0; b < 3; ++b)
-          if (obj->tris.verts[3 * i + a] == obj->tris.verts[3 * j + b]) adjacent = MFTL_TRUE;
-      if (adjacent) continue;
-
-      /* Nearest image of B's first corner relative to A's. */
-      double shift[3];
-      MFTLGetMinimumImageVector(d, shift, A[0], T[j][0]);
-      for (int k = 0; k < 3; ++k) shift[k] = A[0][k] + shift[k] - T[j][0][k];
-
-      double dc2 = 0.0;
-      for (int k = 0; k < 3; ++k)
-      {
-        const double dk = ctr[4 * j + k] + shift[k] - ctr[4 * i + k];
-        dc2 += dk * dk;
-      }
-      const double reach = ctr[4 * i + 3] + ctr[4 * j + 3] + tol;
-      if (dc2 > reach * reach) continue;
-
-      double B[3][3];
-      for (int c = 0; c < 3; ++c)
-        for (int k = 0; k < 3; ++k) B[c][k] = T[j][c][k] + shift[k];
-      if (MFTL_TriTriProximity(A, B, tol)) ks_push(out, pair_key(obj->global_id, gi, gj));
+      x = fmod(x - d->global_min[0], L);
+      if (x < 0.0) x += L;
     }
+    key[i] = (sweep_key){x, i};
   }
+  qsort(key, (size_t) n, sizeof(sweep_key), cmp_sweep_key);
+
+  const double R = 2.0 * r_max + tol + 1e-9;
+  if (per_x && R >= 0.5 * L)
+  {
+    /* Within R both ways round the period: no sweep, every pair once. */
+    for (int i = 0; i < n; ++i)
+      for (int j = i + 1; j < n; ++j) brute_pair(obj, T, ctr, i, j, tol, out);
+  }
+  else
+  {
+    /* Forward from each key, across the period on a periodic axis. With
+     * R < L/2 a pair is within R in at most one direction, so once. */
+    for (int p = 0; p < n; ++p)
+      for (int s = 1; s < n; ++s)
+      {
+        int q = p + s;
+        double dx;
+        if (q < n)
+          dx = key[q].x - key[p].x;
+        else if (per_x)
+        {
+          q -= n;
+          dx = key[q].x + L - key[p].x;
+        }
+        else
+          break;
+        if (dx > R) break;
+        brute_pair(obj, T, ctr, key[p].t, key[q].t, tol, out);
+      }
+  }
+  free(key);
   free(ctr);
   free(T);
 }
