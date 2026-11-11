@@ -51,10 +51,12 @@ function(mftl_add_mpi_test name nranks)
   target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   add_test(NAME ${name}
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${nranks}
-                   ${MPIEXEC_PREFLAGS} $<TARGET_FILE:${name}> ${MPIEXEC_POSTFLAGS})
+                   ${MPIEXEC_PREFLAGS} $<TARGET_FILE:${name}> ${ARGN} ${MPIEXEC_POSTFLAGS})
   mftl_label_mpi_test(${name} ${nranks})
 endfunction()
 
+# Arguments after the rank count, in all three helpers, go to the test program.
+#
 # Registers an ALREADY-DEFINED test target under a second name and rank count.
 # The rank count changes both the neighbour structure and which code path is
 # reachable, so the same binary at a different P is genuinely different coverage
@@ -62,7 +64,7 @@ endfunction()
 function(mftl_add_mpi_test_at name target nranks)
   add_test(NAME ${name}
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${nranks}
-                   ${MPIEXEC_PREFLAGS} $<TARGET_FILE:${target}> ${MPIEXEC_POSTFLAGS})
+                   ${MPIEXEC_PREFLAGS} $<TARGET_FILE:${target}> ${ARGN} ${MPIEXEC_POSTFLAGS})
   mftl_label_mpi_test(${name} ${nranks})
 endfunction()
 
@@ -84,7 +86,7 @@ function(mftl_add_mpi_test_oversub name target nranks)
   endif()
   add_test(NAME ${name}
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${nranks} ${_extra}
-                   ${MPIEXEC_PREFLAGS} $<TARGET_FILE:${target}> ${MPIEXEC_POSTFLAGS})
+                   ${MPIEXEC_PREFLAGS} $<TARGET_FILE:${target}> ${ARGN} ${MPIEXEC_POSTFLAGS})
   mftl_label_mpi_test(${name} ${nranks} oversub)
 endfunction()
 
@@ -163,15 +165,22 @@ mftl_add_mpi_test_at(test_bvh_self_np8 test_bvh_self 8)
 mftl_add_mpi_test_oversub(test_bvh_self_np27 test_bvh_self 27)
 
 # Topology changes. Every scenario is checked for what the result must BE and,
-# at np > 1, against a genuine np = 1 run of the same scenario on MPI_COMM_SELF
-# inside the same test: same bodies, same ids, same vertex positions. The rank
-# counts are the usual ones -- a face (2), an edge (4), a corner (8), an
-# interior rank (27) -- and every fixture sits where the cut planes meet.
-mftl_add_mpi_test(test_topology_change 1)
-mftl_add_mpi_test_at(test_topology_change_np2 test_topology_change 2)
-mftl_add_mpi_test_at(test_topology_change_np4 test_topology_change 4)
-mftl_add_mpi_test_at(test_topology_change_np8 test_topology_change 8)
-mftl_add_mpi_test_oversub(test_topology_change_np27 test_topology_change 27)
+# at np > 1, against a genuine np = 1 run of the same scenario: same bodies,
+# same ids, same vertex positions. The np = 1 test IS that run, so it writes its
+# censuses to a file the others read, rather than each of them rerunning every
+# scene on rank 0 while its other ranks wait (started by hand without
+# --reference-in, a run still reruns them itself). The rank counts are the
+# usual ones -- a face (2), an edge (4), a corner (8), an interior rank (27) --
+# and every fixture sits where the cut planes meet.
+set(_topo_reference ${CMAKE_CURRENT_BINARY_DIR}/topology_change_np1_reference.bin)
+mftl_add_mpi_test(test_topology_change 1 --reference-out ${_topo_reference})
+set_tests_properties(test_topology_change PROPERTIES FIXTURES_SETUP mftl_topology_reference)
+mftl_add_mpi_test_at(test_topology_change_np2 test_topology_change 2 --reference-in ${_topo_reference})
+mftl_add_mpi_test_at(test_topology_change_np4 test_topology_change 4 --reference-in ${_topo_reference})
+mftl_add_mpi_test_at(test_topology_change_np8 test_topology_change 8 --reference-in ${_topo_reference})
+mftl_add_mpi_test_oversub(test_topology_change_np27 test_topology_change 27 --reference-in ${_topo_reference})
+set_tests_properties(test_topology_change_np2 test_topology_change_np4 test_topology_change_np8 test_topology_change_np27
+                     PROPERTIES FIXTURES_REQUIRED mftl_topology_reference)
 
 # The remeshing OPERATORS are serial by construction -- MFTLRemeshObject asserts
 # the object holds no ghosts -- so one rank is not a reduced case here, it is the

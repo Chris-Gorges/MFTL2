@@ -24,6 +24,12 @@
  *   The lattice spacing divides the domain into 60 cells, which every tested
  *   grid (1, 2, 3 cuts per axis) divides, so both runs use the same lattice.
  *
+ *   The np = 1 instance of this test IS that run, so CTest has it write every
+ *   census to a file (--reference-out) and the instances at np > 1 read them
+ *   back (--reference-in) instead of rerunning each scene on rank 0 while
+ *   their other ranks wait -- which was most of their time. Started without
+ *   the options, a run computes its reference itself.
+ *
  * Registered at np = 1, 2, 4, 8 and 27; every fixture is centred where the cut
  * planes meet, so at np > 1 every event is cut by at least one rank boundary.
  */
@@ -419,6 +425,52 @@ static bool same_result(const census *a, const census *b)
   return worst <= 1e-12;
 }
 
+/* ─────────────────────────────────────────────────────────────────────────────
+ * The np = 1 reference, shared between rank counts
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+static FILE *g_ref_out = MFTL_NULL;  ///< np = 1, rank 0: every reference census is written here.
+static FILE *g_ref_in = MFTL_NULL;  ///< np > 1, rank 0: and read back from here.
+static bool g_ref_missing = MFTL_FALSE;  ///< --reference-in named a file that could not be opened.
+
+#define REF_LABEL 128
+
+/** @brief Rank 0 at np = 1: appends one census, labelled with the test that took it. */
+static void write_reference(const char *label, const census *c, int n_events)
+{
+  if (g_ref_out == MFTL_NULL) return;
+  char tag[REF_LABEL] = {0};
+  strncpy(tag, label, REF_LABEL - 1);
+  fwrite(tag, 1, REF_LABEL, g_ref_out);
+  fwrite(&n_events, sizeof n_events, 1, g_ref_out);
+  fwrite(c, sizeof *c, 1, g_ref_out);
+  if (c->n_pos > 0) fwrite(c->pos, 4 * sizeof(double), (size_t) c->n_pos, g_ref_out);
+  fflush(g_ref_out);
+}
+
+/** @brief Rank 0 at np > 1: the next census of the file; false if it is missing or out of step. */
+static bool read_reference(const char *label, census *c, int *n_events)
+{
+  memset(c, 0, sizeof *c);
+  char tag[REF_LABEL], want[REF_LABEL] = {0};
+  strncpy(want, label, REF_LABEL - 1);
+  if (g_ref_in == MFTL_NULL || fread(tag, 1, REF_LABEL, g_ref_in) != REF_LABEL || memcmp(tag, want, REF_LABEL) != 0 ||
+      fread(n_events, sizeof *n_events, 1, g_ref_in) != 1 || fread(c, sizeof *c, 1, g_ref_in) != 1)
+  {
+    printf("\n  no np = 1 reference for %s in the reference file\n  ", label);
+    memset(c, 0, sizeof *c);
+    return MFTL_FALSE;
+  }
+  c->pos = (double *) malloc((size_t) (c->n_pos > 0 ? c->n_pos : 1) * 4 * sizeof(double));
+  if (c->n_pos > 0 && fread(c->pos, 4 * sizeof(double), (size_t) c->n_pos, g_ref_in) != (size_t) c->n_pos)
+  {
+    printf("\n  the reference for %s is truncated\n  ", label);
+    c->n_pos = 0;
+    return MFTL_FALSE;
+  }
+  return MFTL_TRUE;
+}
+
 /**
  * @brief Runs a scene distributed and as a genuine np = 1 reference, and
  *        checks the two agree. The distributed census is returned.
@@ -433,7 +485,8 @@ static MFTL_Ensemble *scene_ens(MPI_Comm comm, bool periodic)
   return make_ens(comm, periodic);
 }
 
-static int run_scene(scene_fn scene, bool periodic, const MFTL_TopologyOptions *opts, bool reconstruct_all, census *out, MFTL_TopologyStats *st_out)
+static int run_scene_as(const char *label, scene_fn scene, bool periodic, const MFTL_TopologyOptions *opts, bool reconstruct_all, census *out,
+                        MFTL_TopologyStats *st_out)
 {
   MFTL_TopologyStats st;
 
@@ -453,32 +506,41 @@ static int run_scene(scene_fn scene, bool periodic, const MFTL_TopologyOptions *
   MFTLEnsembleDestroy(&ens);
   if (st_out) *st_out = st;
 
-  /* The reference, on rank 0 alone. */
+  /* The reference: at np = 1 this run itself, at np > 1 the np = 1 run's
+   * census from the reference file, or a rerun on rank 0 alone. */
   int same = 1;
+  if (g_rank == 0 && g_nproc == 1) write_reference(label, out, st.n_events);
   if (g_rank == 0 && g_nproc > 1)
   {
-    MFTL_Ensemble *ref = scene_ens(MPI_COMM_SELF, periodic);
-    scene(ref);
-    settle(ref);
     MFTL_TopologyStats rst;
-    if (reconstruct_all)
+    census rc_ref;
+    if (g_ref_in != MFTL_NULL || g_ref_missing)
     {
-      int bodies[MAX_BODIES];
-      for (int i = 0; i < ref->n_bodies_global; ++i) bodies[i] = i;
-      MFTLEnsembleReconstructBodies(ref, bodies, ref->n_bodies_global, MFTL_NULL, 0, opts, &rst);
+      same = read_reference(label, &rc_ref, &rst.n_events);
     }
     else
-      MFTLEnsembleApplyTopologyChanges(ref, opts, &rst);
-    census rc_ref;
-    take_census(ref, &rc_ref);
-    same = same_result(out, &rc_ref) && rst.n_events == st.n_events;
+    {
+      MFTL_Ensemble *ref = scene_ens(MPI_COMM_SELF, periodic);
+      scene(ref);
+      settle(ref);
+      if (reconstruct_all)
+      {
+        int bodies[MAX_BODIES];
+        for (int i = 0; i < ref->n_bodies_global; ++i) bodies[i] = i;
+        MFTLEnsembleReconstructBodies(ref, bodies, ref->n_bodies_global, MFTL_NULL, 0, opts, &rst);
+      }
+      else
+        MFTLEnsembleApplyTopologyChanges(ref, opts, &rst);
+      take_census(ref, &rc_ref);
+      MFTLEnsembleDestroy(&ref);
+    }
+    same = same && same_result(out, &rc_ref) && rst.n_events == st.n_events;
     if (!same)
       for (int b = 0; b < MFTL_MAX(out->n_live, rc_ref.n_live); ++b)
         printf("\n  body slot %d: distributed gid %d V %lld T %lld vol %.9f | reference gid %d V %lld T %lld vol %.9f", b, out->gid[b], out->V[b], out->T[b],
                out->volume[b], rc_ref.gid[b], rc_ref.V[b], rc_ref.T[b], rc_ref.volume[b]);
     if (!same) printf("\n  reference: %d bodies, %d events; distributed: %d bodies, %d events\n  ", rc_ref.n_live, rst.n_events, out->n_live, st.n_events);
     free_census(&rc_ref);
-    MFTLEnsembleDestroy(&ref);
   }
   MPI_Bcast(&same, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
@@ -488,6 +550,9 @@ static int run_scene(scene_fn scene, bool periodic, const MFTL_TopologyOptions *
   TEST_ASSERT(agreed(out->ids_dense, MPI_COMM_WORLD));
   return 0;
 }
+
+/** run_scene(...): run_scene_as() labelled with the calling test, which keys the reference file. */
+#define run_scene(...) run_scene_as(__func__, __VA_ARGS__)
 
 static MFTL_TopologyOptions base_options(double delta_b, double delta_c)
 {
@@ -718,7 +783,10 @@ static int test_reconstructing_a_sphere_without_events_is_faithful(void)
  *        to round-off, and how many of them within / beyond a radius of @p e.
  *
  * Brute force against a freshly generated copy of the original mesh -- shares
- * nothing with the rasteriser or the extractor.
+ * nothing with the rasteriser or the extractor. A triangle whose bounding box is
+ * farther than 1e-8 from the vertex is farther than that itself, so it cannot
+ * put the vertex within 1e-10 and is not measured: the count is the one over
+ * every triangle.
  */
 static void count_on_the_original(const census *c, const double e[3], double r_in, double r_out, int *on_in, int *n_in, int *on_out, int *n_out)
 {
@@ -730,19 +798,36 @@ static void count_on_the_original(const census *c, const double e[3], double r_i
   MFTLEnsembleAddObject(e0, ref);
   double ctr[3] = {C + 0.013, C - 0.021, C + 0.007};
   MFTLGenerateSphere(ref, ctr, 0.9, 4);
+  const int nt = ref->tris.n;
+  double(*const T)[3][3] = (double(*)[3][3]) malloc((size_t) (nt > 0 ? nt : 1) * sizeof(*T));
+  double(*const box)[2][3] = (double(*)[2][3]) malloc((size_t) (nt > 0 ? nt : 1) * sizeof(*box));
+  for (int t = 0; t < nt; ++t)
+  {
+    MFTLGetTriangleCorners(ref, t, T[t]);
+    for (int k = 0; k < 3; ++k)
+    {
+      box[t][0][k] = fmin(T[t][0][k], fmin(T[t][1][k], T[t][2][k]));
+      box[t][1][k] = fmax(T[t][0][k], fmax(T[t][1][k], T[t][2][k]));
+    }
+  }
   for (int i = 0; i < c->n_pos; ++i)
   {
     const double *x = &c->pos[4 * i + 1];
     const double de = sqrt((x[0] - e[0]) * (x[0] - e[0]) + (x[1] - e[1]) * (x[1] - e[1]) + (x[2] - e[2]) * (x[2] - e[2]));
     if (de >= r_in && de <= r_out) continue;
-    double best = MFTL_DBL_MAX;
-    for (int t = 0; t < ref->tris.n; ++t)
+    int on = 0;
+    for (int t = 0; t < nt && !on; ++t)
     {
-      double T[3][3], q[3];
-      MFTLGetTriangleCorners(ref, t, T);
-      best = fmin(best, MFTLClosestPointOnTriangle(x, T, q, MFTL_NULL));
+      double g2 = 0.0;
+      for (int k = 0; k < 3; ++k)
+      {
+        const double g = fmax(fmax(box[t][0][k] - x[k], x[k] - box[t][1][k]), 0.0);
+        g2 += g * g;
+      }
+      if (g2 > 1e-16) continue;
+      double q[3];
+      on = sqrt(MFTLClosestPointOnTriangle(x, T[t], q, MFTL_NULL)) <= 1e-10;
     }
-    const int on = sqrt(best) <= 1e-10;
     if (de < r_in)
     {
       (*n_in)++;
@@ -754,6 +839,8 @@ static void count_on_the_original(const census *c, const double e[3], double r_i
       *on_out += on;
     }
   }
+  free(T);
+  free(box);
   MFTLEnsembleDestroy(&e0);
 }
 
@@ -817,6 +904,14 @@ static int test_a_biased_edge_follows_the_bias_not_the_old_surface(void)
   for (int pass = 0; pass < 2; ++pass)  // distributed, then the np = 1 reference on rank 0
   {
     if (pass == 1 && (g_rank != 0 || g_nproc == 1)) break;
+    if (pass == 1 && (g_ref_in != MFTL_NULL || g_ref_missing))
+    {
+      census here;
+      int n_events = 0;
+      same = read_reference(__func__, &here, &n_events) && same_result(&c, &here);
+      free_census(&here);
+      break;
+    }
     MFTL_Ensemble *ens = make_ens(pass ? MPI_COMM_SELF : MPI_COMM_WORLD, MFTL_FALSE);
     scene_sphere(ens);
     settle(ens);
@@ -829,6 +924,7 @@ static int test_a_biased_edge_follows_the_bias_not_the_old_surface(void)
     {
       rc = r;
       c = here;
+      if (g_rank == 0 && g_nproc == 1) write_reference(__func__, &c, st.n_events);
     }
     else
     {
@@ -1383,11 +1479,25 @@ int main(int argc, char **argv)
   MPI_Comm_size(MPI_COMM_WORLD, &g_nproc);
   MFTLRegisterMpiTypes();
 
+  /* --reference-out FILE at np = 1, --reference-in FILE at np > 1: the shared np = 1 reference. */
+  const char *ref_path = MFTL_NULL;
+  for (int a = 1; a + 1 < argc && g_rank == 0; ++a)
+  {
+    if (strcmp(argv[a], "--reference-out") == 0 && g_nproc == 1) g_ref_out = fopen(ref_path = argv[a + 1], "wb");
+    if (strcmp(argv[a], "--reference-in") == 0 && g_nproc > 1)
+    {
+      g_ref_in = fopen(ref_path = argv[a + 1], "rb");
+      g_ref_missing = (g_ref_in == MFTL_NULL);
+    }
+  }
+
   if (g_rank == 0)
   {
     int cuts[3] = {0, 0, 0};
     MPI_Dims_create(g_nproc, 3, cuts);
     printf("--- Running MFTL Topology Change Tests (np = %d, grid %dx%dx%d) ---\n", g_nproc, cuts[0], cuts[1], cuts[2]);
+    if (ref_path)
+      printf("    np = 1 reference %s %s%s\n", g_ref_out ? "written to" : "read from", ref_path, g_ref_missing ? ": MISSING, every comparison fails" : "");
   }
 
   RUN_TEST(test_the_lattice_divides_every_axis_per_rank);
@@ -1417,6 +1527,8 @@ int main(int argc, char **argv)
   RUN_TEST(test_invalid_arguments_are_refused_everywhere);
 
   if (g_rank == 0) TEST_REPORT();
+  if (g_ref_out) fclose(g_ref_out);
+  if (g_ref_in) fclose(g_ref_in);
   MFTLFreeMpiTypes();
   MPI_Finalize();
   return (g_tests_failed > 0) ? 1 : 0;

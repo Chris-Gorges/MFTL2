@@ -2282,14 +2282,16 @@ static MFTL_Ensemble *rough_sphere_alone(void)
  * that is the call, and NESTED interleaves the same sweeps in the same order.
  * The projection, the carried curvature field and the canonical order are all on
  * the path, so a stray extra sweep, a second projection or a recomputed field
- * changes bits. Runs on rank 0 alone, on its own communicator, at every rank
- * count of the suite. Mutation-checked: restoring the old driver's repetition
- * (the whole call again in every placement of the budget) fails it.
+ * changes bits. Runs on its own MPI_COMM_SELF ensembles, so it is the same
+ * computation in every instance of this test: the np = 1 instance makes it, and
+ * the others would only repeat it on rank 0 while their other ranks wait.
+ * Mutation-checked: restoring the old driver's repetition (the whole call again
+ * in every placement of the budget) fails it.
  */
 static int test_both_modes_are_the_serial_call_at_one_rank(void)
 {
   int ok = 1, configs = 0;
-  if (g_rank == 0)
+  if (g_nproc == 1)
   {
     for (int cfg = 0; cfg < 3; ++cfg)
       for (int mode = 0; mode < 2; ++mode)
