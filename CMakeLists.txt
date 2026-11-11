@@ -35,9 +35,10 @@ option(MFTL_COMM_PROFILE "Time the individual phases of MFTLRedistribute()" OFF)
 
 # The GPU examples (examples/gpu): the parallel LeVeque remeshing test and the
 # periodic advection of many spheres, with their per-vertex and per-triangle
-# work offloaded, once each in CUDA, OpenACC and OpenMP. Needs nvcc and/or nvc
-# (NVIDIA HPC SDK); the library itself never does.
-option(MFTL_ENABLE_GPU "Build the GPU examples examples/gpu (needs nvcc and/or nvc, CMake >= 3.18)" OFF)
+# work offloaded, once each in CUDA, OpenACC and OpenMP. The device builds need
+# nvcc and/or nvc (NVIDIA HPC SDK); without them only the CPU builds of the same
+# source are made. The library itself never needs either.
+option(MFTL_ENABLE_GPU "Build the GPU examples examples/gpu (device builds need nvcc and/or nvc, CMake >= 3.18)" OFF)
 
 # --- Dependencies ---
 find_package(MPI REQUIRED)

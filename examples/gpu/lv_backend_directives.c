@@ -50,8 +50,7 @@ static void map_pools(const lv_mesh *p)
   const int nvc = p->nv_capacity, ntc = p->nt_capacity;
   (void) pos, (void) vn, (void) area, (void) normal, (void) center, (void) tv, (void) nbr, (void) rec, (void) nvc, (void) ntc;
 
-  GPU_ENTER_CREATE(pos[0 : 3 * nvc], vn[0 : 3 * nvc], tv[0 : 3 * ntc], nbr[0 : 3 * ntc], rec[0 : 3 * ntc], area[0 : ntc], normal[0 : 3 * ntc],
-                   center[0 : 3 * ntc])
+  GPU_ENTER_CREATE(pos [0:3 * nvc], vn [0:3 * nvc], tv [0:3 * ntc], nbr [0:3 * ntc], rec [0:3 * ntc], area [0:ntc], normal [0:3 * ntc], center [0:3 * ntc])
 }
 
 static void unmap_pools(const lv_mesh *p)
@@ -61,8 +60,7 @@ static void unmap_pools(const lv_mesh *p)
   const int nvc = p->nv_capacity, ntc = p->nt_capacity;
   (void) pos, (void) vn, (void) area, (void) normal, (void) center, (void) tv, (void) nbr, (void) rec, (void) nvc, (void) ntc;
 
-  GPU_EXIT_DELETE(pos[0 : 3 * nvc], vn[0 : 3 * nvc], tv[0 : 3 * ntc], nbr[0 : 3 * ntc], rec[0 : 3 * ntc], area[0 : ntc], normal[0 : 3 * ntc],
-                  center[0 : 3 * ntc])
+  GPU_EXIT_DELETE(pos [0:3 * nvc], vn [0:3 * nvc], tv [0:3 * ntc], nbr [0:3 * ntc], rec [0:3 * ntc], area [0:ntc], normal [0:3 * ntc], center [0:3 * ntc])
 }
 
 static int same_pools(const lv_mesh *a, const lv_mesh *b)
@@ -96,7 +94,7 @@ void lv_attach(const lv_mesh *mesh)
   const int *tv = m.tri_verts, *nbr = m.tri_nbr, *rec = m.tri_rec;
   const int nv = m.nv, nt = m.nt;
   (void) pos, (void) tv, (void) nbr, (void) rec, (void) nv, (void) nt;
-  GPU_UPDATE_DEVICE(pos[0 : 3 * nv], tv[0 : 3 * nt], nbr[0 : 3 * nt], rec[0 : 3 * nt])
+  GPU_UPDATE_DEVICE(pos [0:3 * nv], tv [0:3 * nt], nbr [0:3 * nt], rec [0:3 * nt])
   GPU_WAIT
 }
 
@@ -117,7 +115,7 @@ void lv_get_owned_positions(void)
   double *pos = m.pos;
   const int n = m.nv_owned;
   (void) pos, (void) n;
-  GPU_UPDATE_HOST(pos[0 : 3 * n])
+  GPU_UPDATE_HOST(pos [0:3 * n])
   GPU_WAIT
 }
 
@@ -128,7 +126,7 @@ void lv_put_ghost_positions(void)
   (void) pos, (void) first;
   if (count > 0)
   {
-    GPU_UPDATE_DEVICE(pos[first : count])
+    GPU_UPDATE_DEVICE(pos [first:count])
     GPU_WAIT
   }
 }
@@ -150,7 +148,7 @@ void lv_get_triangle_geometry(void)
   double *area = m.area, *normal = m.normal, *center = m.center;
   const int nt = m.nt;
   (void) area, (void) normal, (void) center, (void) nt;
-  GPU_UPDATE_HOST(area[0 : nt], normal[0 : 3 * nt], center[0 : 3 * nt])
+  GPU_UPDATE_HOST(area [0:nt], normal [0:3 * nt], center [0:3 * nt])
   GPU_WAIT
 }
 
@@ -185,7 +183,7 @@ void lv_measure(double min_len, double max_len, double vol_ref, lv_measure_out *
 
   /* One array, not six scalars: each reduction variable is its own copy back. */
   double sum[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0}, min_q = 1.0;
-  GPU_LOOP(GPU_REDUCE_ARRAY(+, sum[0 : 6]) reduction(min : min_q))
+  GPU_LOOP(GPU_REDUCE_ARRAY(+, sum [0:6]) reduction(min : min_q))
   for (int t = 0; t < nt_owned; ++t)
   {
     const lv_tri_stats s = lv_triangle_stats(pos, vn, tv, nbr, rec, t, nt_owned, min_len, max_len, vol_ref);

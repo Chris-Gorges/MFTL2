@@ -96,9 +96,9 @@ void sp_setup(int n_slots, int nv_slot, int nt_slot, const sp_box *b, const int 
   double *p = pos, *n = vn, *ar = area, *nr = normal, *ce = center, *st = stats;
   (void) bx, (void) rmap, (void) t3, (void) vo, (void) to, (void) c, (void) ch, (void) p, (void) n, (void) ar, (void) nr, (void) ce, (void) st;
 
-  GPU_ENTER_CREATE(bx[0 : 1], rmap[0 : np], p[0 : 3 * nv], n[0 : 3 * nv], ar[0 : nt], nr[0 : 3 * nt], ce[0 : 3 * nt], t3[0 : 3 * nt], vo[0 : nv],
-                   to[0 : nt], c[0 : SP_N_COUNTS * ns], ch[0 : ns], st[0 : SP_N_STATS * ns])
-  GPU_UPDATE_DEVICE(bx[0 : 1], rmap[0 : np], c[0 : SP_N_COUNTS * ns])
+  GPU_ENTER_CREATE(bx [0:1], rmap [0:np], p [0:3 * nv], n [0:3 * nv], ar [0:nt], nr [0:3 * nt], ce [0:3 * nt], t3 [0:3 * nt], vo [0:nv], to [0:nt],
+                   c [0:SP_N_COUNTS * ns], ch [0:ns], st [0:SP_N_STATS * ns])
+  GPU_UPDATE_DEVICE(bx [0:1], rmap [0:np], c [0:SP_N_COUNTS * ns])
   GPU_WAIT
 }
 
@@ -118,8 +118,8 @@ void sp_finalize(void)
   (void) bx, (void) rmap, (void) t3, (void) vo, (void) to, (void) c, (void) ch, (void) p, (void) n, (void) ar, (void) nr, (void) ce, (void) st, (void) np,
       (void) nv, (void) nt, (void) ns;
 
-  GPU_EXIT_DELETE(bx[0 : 1], rmap[0 : np], p[0 : 3 * nv], n[0 : 3 * nv], ar[0 : nt], nr[0 : 3 * nt], ce[0 : 3 * nt], t3[0 : 3 * nt], vo[0 : nv],
-                  to[0 : nt], c[0 : SP_N_COUNTS * ns], ch[0 : ns], st[0 : SP_N_STATS * ns])
+  GPU_EXIT_DELETE(bx [0:1], rmap [0:np], p [0:3 * nv], n [0:3 * nv], ar [0:nt], nr [0:3 * nt], ce [0:3 * nt], t3 [0:3 * nt], vo [0:nv], to [0:nt],
+                  c [0:SP_N_COUNTS * ns], ch [0:ns], st [0:SP_N_STATS * ns])
 
   double *d = dstage;
   int *i = istage, *g = segs;
@@ -127,15 +127,15 @@ void sp_finalize(void)
   (void) dn, (void) in, (void) gn;
   if (d)
   {
-    GPU_EXIT_DELETE(d[0 : dn])
+    GPU_EXIT_DELETE(d [0:dn])
   }
   if (i)
   {
-    GPU_EXIT_DELETE(i[0 : in])
+    GPU_EXIT_DELETE(i [0:in])
   }
   if (g)
   {
-    GPU_EXIT_DELETE(g[0 : gn])
+    GPU_EXIT_DELETE(g [0:gn])
   }
 
   free(box), free(rank_map), free(pos), free(vn), free(area), free(normal), free(center), free(tv), free(vown), free(town), free(cnt), free(changed),
@@ -148,26 +148,26 @@ void sp_finalize(void)
 /* --- Staging ----------------------------------------------------------------- */
 
 /* A grown buffer is a new host array, so its mapping is renewed with it. */
-#define SP_GROW(type, buf, cap, need)                  \
-  do                                                   \
-  {                                                    \
-    if ((need) > (cap))                                \
-    {                                                  \
-      type *old_ = (buf);                              \
-      const long old_n_ = (cap);                       \
-      (void) old_n_;                                   \
-      if (old_)                                        \
-      {                                                \
-        GPU_EXIT_DELETE(old_[0 : old_n_])              \
-      }                                                \
-      free(old_);                                      \
-      (cap) = (need) + (need) / 2 + 1024;              \
+#define SP_GROW(type, buf, cap, need)                    \
+  do                                                     \
+  {                                                      \
+    if ((need) > (cap))                                  \
+    {                                                    \
+      type *old_ = (buf);                                \
+      const long old_n_ = (cap);                         \
+      (void) old_n_;                                     \
+      if (old_)                                          \
+      {                                                  \
+        GPU_EXIT_DELETE(old_ [0:old_n_])                 \
+      }                                                  \
+      free(old_);                                        \
+      (cap) = (need) + (need) / 2 + 1024;                \
       (buf) = host_alloc((size_t) (cap) * sizeof(type)); \
-      type *new_ = (buf);                              \
-      const long new_n_ = (cap);                       \
-      (void) new_, (void) new_n_;                      \
-      GPU_ENTER_CREATE(new_[0 : new_n_])               \
-    }                                                  \
+      type *new_ = (buf);                                \
+      const long new_n_ = (cap);                         \
+      (void) new_, (void) new_n_;                        \
+      GPU_ENTER_CREATE(new_ [0:new_n_])                  \
+    }                                                    \
   } while (0)
 
 double *sp_stage_double(long n)
@@ -222,7 +222,7 @@ static long put_segments(int n_seg, const sp_segment *seg, int width)
   int *sg = segs;
   const long n4 = 4L * n_seg;
   (void) sg, (void) n4;
-  GPU_UPDATE_DEVICE(sg[0 : n4])
+  GPU_UPDATE_DEVICE(sg [0:n4])
   bytes_h2d += 4.0 * n4;
   return total * width;
 }
@@ -239,7 +239,7 @@ void sp_upload(sp_field field, int n_seg, const sp_segment *seg)
   {
     double *restrict dst = f.d;
     const double *restrict st = dstage;
-    GPU_UPDATE_DEVICE(st[0 : n])
+    GPU_UPDATE_DEVICE(st [0:n])
     GPU_OUTER()
     for (int g = 0; g < n_seg; ++g)
     {
@@ -254,7 +254,7 @@ void sp_upload(sp_field field, int n_seg, const sp_segment *seg)
   {
     int *restrict dst = f.i;
     const int *restrict st = istage;
-    GPU_UPDATE_DEVICE(st[0 : n])
+    GPU_UPDATE_DEVICE(st [0:n])
     GPU_OUTER()
     for (int g = 0; g < n_seg; ++g)
     {
@@ -299,7 +299,7 @@ const void *sp_download(sp_field field, int n_seg, const sp_segment *seg)
       GPU_INNER()
       for (int k = 0; k < m; ++k) st[to + k] = src[from + k];
     }
-    GPU_UPDATE_HOST(st[0 : n])
+    GPU_UPDATE_HOST(st [0:n])
     bytes_d2h += 8.0 * n;
     out = st;
   }
@@ -315,7 +315,7 @@ const void *sp_download(sp_field field, int n_seg, const sp_segment *seg)
       GPU_INNER()
       for (int k = 0; k < m; ++k) st[to + k] = src[from + k];
     }
-    GPU_UPDATE_HOST(st[0 : n])
+    GPU_UPDATE_HOST(st [0:n])
     bytes_d2h += 4.0 * n;
     out = st;
   }
@@ -329,7 +329,7 @@ void sp_set_counts(const int *counts)
   int *c = cnt;
   const long n = (long) SP_N_COUNTS * S;
   memcpy(c, counts, (size_t) n * sizeof(int));
-  GPU_UPDATE_DEVICE(c[0 : n])
+  GPU_UPDATE_DEVICE(c [0:n])
   GPU_WAIT
   bytes_h2d += 4.0 * n;
   n_copies += 1;
@@ -398,7 +398,7 @@ void sp_classify(int *out)
     }
     ch[s] = n_changed;
   }
-  GPU_UPDATE_HOST(ch[0 : ns])
+  GPU_UPDATE_HOST(ch [0:ns])
   GPU_WAIT
 
   memcpy(out, changed, (size_t) S * sizeof(int));
@@ -449,7 +449,7 @@ void sp_geometry(double *out)
     row[3] = max_a, row[4] = max_q, row[5] = max_e;
     row[6] = sum_a, row[7] = sum_q, row[8] = sum_e;
   }
-  GPU_UPDATE_HOST(st[0 : SP_N_STATS * ns])
+  GPU_UPDATE_HOST(st [0:SP_N_STATS * ns])
   GPU_WAIT
 
   memcpy(out, stats, (size_t) (SP_N_STATS * S) * sizeof(double));

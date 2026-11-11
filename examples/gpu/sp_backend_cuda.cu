@@ -24,15 +24,15 @@
 #include "sp_backend.h"
 #include "sp_kernels.h"
 
-#define SP_CUDA_CHECK(call)                                                                                     \
-  do                                                                                                            \
-  {                                                                                                             \
-    const cudaError_t err_ = (call);                                                                            \
-    if (err_ != cudaSuccess)                                                                                    \
-    {                                                                                                           \
+#define SP_CUDA_CHECK(call)                                                                                      \
+  do                                                                                                             \
+  {                                                                                                              \
+    const cudaError_t err_ = (call);                                                                             \
+    if (err_ != cudaSuccess)                                                                                     \
+    {                                                                                                            \
       std::fprintf(stderr, "CUDA error %s at %s:%d: %s\n", #call, __FILE__, __LINE__, cudaGetErrorString(err_)); \
-      std::abort();                                                                                             \
-    }                                                                                                           \
+      std::abort();                                                                                              \
+    }                                                                                                            \
   } while (0)
 
 namespace
@@ -155,8 +155,8 @@ __global__ void advect_kernel(__grid_constant__ const sp_box box, double *__rest
 }
 
 __global__ void classify_kernel(__grid_constant__ const sp_box box, const int *__restrict__ rank_map, const double *__restrict__ pos,
-                                const int *__restrict__ tv, const int *__restrict__ cnt, int nvs, int nts, int *__restrict__ vown,
-                                int *__restrict__ town, int *__restrict__ changed)
+                                const int *__restrict__ tv, const int *__restrict__ cnt, int nvs, int nts, int *__restrict__ vown, int *__restrict__ town,
+                                int *__restrict__ changed)
 {
   const int s = blockIdx.x;
   const double *ps = pos + 3L * s * nvs;
@@ -218,9 +218,9 @@ __device__ void block_stats(double v[SP_N_STATS])
   for (int k = 6; k < 9; ++k) v[k] = warp_sum(lane < kWarps ? partial[k][lane] : 0.0);
 }
 
-__global__ void geometry_kernel(__grid_constant__ const sp_box box, const double *__restrict__ pos, const int *__restrict__ tv,
-                                const int *__restrict__ cnt, int nvs, int nts, double *__restrict__ area, double *__restrict__ normal,
-                                double *__restrict__ center, double *__restrict__ stats)
+__global__ void geometry_kernel(__grid_constant__ const sp_box box, const double *__restrict__ pos, const int *__restrict__ tv, const int *__restrict__ cnt,
+                                int nvs, int nts, double *__restrict__ area, double *__restrict__ normal, double *__restrict__ center,
+                                double *__restrict__ stats)
 {
   const int s = blockIdx.x;
   const double *ps = pos + 3L * s * nvs;
@@ -244,8 +244,8 @@ __global__ void geometry_kernel(__grid_constant__ const sp_box box, const double
     for (int k = 0; k < SP_N_STATS; ++k) stats[SP_N_STATS * s + k] = v[k];
 }
 
-__global__ void normals_kernel(__grid_constant__ const sp_box box, const double *__restrict__ pos, const int *__restrict__ tv,
-                               const int *__restrict__ cnt, int nvs, int nts, double *__restrict__ vn)
+__global__ void normals_kernel(__grid_constant__ const sp_box box, const double *__restrict__ pos, const int *__restrict__ tv, const int *__restrict__ cnt,
+                               int nvs, int nts, double *__restrict__ vn)
 {
   const int s = blockIdx.x;
   const double *ps = pos + 3L * s * nvs;

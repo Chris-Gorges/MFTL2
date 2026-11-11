@@ -90,7 +90,7 @@
  * win for an array and stops with "not found on device": spell the copy out. */
 #define GPU_REDUCE_ARRAY(op, ...) reduction(op : __VA_ARGS__) copy(__VA_ARGS__)
 #define GPU_ENTER_CREATE(...) GPU_PRAGMA(acc enter data create(__VA_ARGS__))
-#define GPU_EXIT_DELETE(...) GPU_PRAGMA(acc exit data delete(__VA_ARGS__))
+#define GPU_EXIT_DELETE(...) GPU_PRAGMA(acc exit data delete (__VA_ARGS__))
 #define GPU_UPDATE_DEVICE(...) GPU_PRAGMA(acc update device(__VA_ARGS__) async(1))
 #define GPU_UPDATE_HOST(...) GPU_PRAGMA(acc update self(__VA_ARGS__) async(1))
 #define GPU_WAIT GPU_PRAGMA(acc wait(1))

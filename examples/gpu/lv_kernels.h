@@ -83,7 +83,7 @@ GPU_ROUTINE GPU_FN void lv_triangle_edges(const double *GPU_RESTRICT pos, const 
 
 /** @brief MFTLComputeTriangleGeometry() for one triangle (non-periodic domain). */
 GPU_ROUTINE GPU_FN void lv_triangle_geometry_one(const double *GPU_RESTRICT pos, const int *GPU_RESTRICT tri_verts, int t, double *GPU_RESTRICT area,
-                                                double *GPU_RESTRICT normal, double *GPU_RESTRICT center)
+                                                 double *GPU_RESTRICT normal, double *GPU_RESTRICT center)
 {
   double e1[3], e2[3], cr[3];
   lv_triangle_edges(pos, tri_verts, t, e1, e2, cr);
@@ -127,8 +127,8 @@ typedef struct lv_tri_stats
  * when the other side is a ghost (whose owner applies the same rule).
  */
 GPU_ROUTINE GPU_FN lv_tri_stats lv_triangle_stats(const double *GPU_RESTRICT pos, const double *GPU_RESTRICT vn, const int *GPU_RESTRICT tri_verts,
-                                                  const int *GPU_RESTRICT tri_nbr, const int *GPU_RESTRICT tri_rec, int t,
-                                                int nt_owned, double min_len, double max_len, double vol_ref)
+                                                  const int *GPU_RESTRICT tri_nbr, const int *GPU_RESTRICT tri_rec, int t, int nt_owned, double min_len,
+                                                  double max_len, double vol_ref)
 {
   lv_tri_stats s = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   const int v[3] = {tri_verts[3 * t + 0], tri_verts[3 * t + 1], tri_verts[3 * t + 2]};

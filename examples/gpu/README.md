@@ -39,7 +39,10 @@ mpirun -n 1 build/spheres_gpu_openacc -spheres 1000 -verify
 ctest --test-dir build -L gpu
 ```
 
-**Compilers.** Either one is enough; a backend whose compiler is missing is not built.
+**Compilers.** Either one is enough; a backend whose compiler is missing is not built. Without both, only the two
+CPU builds (`gcc_serial`, `gcc_omp`) are made, so the examples and their tests also build on a machine without the
+NVIDIA tools. CI runs those on every push and compiles the CUDA backends for sm_80 and sm_90 (`CI-CUDA`); no hosted
+runner has a GPU.
 
 - **nvcc** builds the CUDA backends through CMake's CUDA language. It targets the GPU in the machine unless
   `-DCMAKE_CUDA_ARCHITECTURES="80;90"` says otherwise.
@@ -519,7 +522,7 @@ primitives directives cannot express**, not one or the other.
 
 ## Tests
 
-`ctest -L gpu`: 24 tests, about 15 s.
+`ctest -L gpu`: 24 tests with every backend built, about 15 s; 12 with `gcc_serial` alone.
 
 | Example | Case | Tests |
 |---|---|---|

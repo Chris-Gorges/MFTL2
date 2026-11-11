@@ -14,7 +14,8 @@
 #   example   a physical run of an example program, checked by its --verify mode
 #   static    a source check run by CMake, no binary
 #   long      over a minute in a Debug + sanitizer build (see the end of file)
-#   gpu       needs a GPU (MFTL_ENABLE_GPU builds only; skipped without one)
+#   gpu       the GPU examples (MFTL_ENABLE_GPU builds only); a device build
+#             is skipped without a GPU, the CPU builds run anywhere
 #
 # e.g. `ctest -LE "np27|long"` for a quick run. An MPI test also declares its
 # rank count as PROCESSORS, so `ctest -j N` schedules RANKS rather than tests and
@@ -708,8 +709,9 @@ endif()
 # built. Each run checks every device result against the library on the same
 # input (-verify) and its final state against the host run written by a fixture
 # (-compare). Skipped (exit 77) without a device. In a Debug build ASan has to
-# leave the driver's address range alone, and LSan would report the driver's
-# one-time allocations as leaks.
+# leave the GPU driver's address range alone, and LSan would report its
+# one-time allocations as leaks; the CPU builds (gcc_*) run with the sanitizers
+# as configured.
 #
 # LeVeque: per-vertex and per-triangle work on the device, remeshing on the
 # host. -compare checks the whole trajectory: the same mesh after every remesh,
@@ -733,8 +735,11 @@ if(BUILD_EXAMPLES AND _gpu_backends)
     add_test(NAME ${name}
              COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${nranks} ${MPIEXEC_PREFLAGS}
                      $<TARGET_FILE:${example}_${backend}> ${ARGN} ${MPIEXEC_POSTFLAGS})
-    set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300 RESOURCE_LOCK mftl_gpu_device
-                         ENVIRONMENT "ASAN_OPTIONS=protect_shadow_gap=0:detect_leaks=0;OMP_NUM_THREADS=2;ACC_NUM_CORES=2")
+    set(_env "OMP_NUM_THREADS=2;ACC_NUM_CORES=2")
+    if(NOT backend MATCHES "^gcc_")
+      list(APPEND _env "ASAN_OPTIONS=protect_shadow_gap=0:detect_leaks=0")
+    endif()
+    set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 300 RESOURCE_LOCK mftl_gpu_device ENVIRONMENT "${_env}")
     mftl_label_mpi_test(${name} ${nranks} example gpu)
   endfunction()
 

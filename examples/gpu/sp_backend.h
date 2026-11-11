@@ -22,7 +22,8 @@
 #define SP_BACKEND_H
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
 
 /** @brief The periodic box, as the kernels need it: MFTL_Domain flattened. */

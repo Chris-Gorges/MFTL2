@@ -199,8 +199,8 @@ static void table_create(int n_ids, int S, int nvs, int nts)
 
 static void table_destroy(void)
 {
-  free(tab.slot_of), free(tab.body), free(tab.free_list), free(tab.seen), free(tab.stamp), free(tab.split), free(tab.needed), free(tab.counts),
-      free(tab.vown), free(tab.town), free(tab.changed), free(tab.stats), free(tab.seg), free(tab.seg_obj), free(tab.list);
+  free(tab.slot_of), free(tab.body), free(tab.free_list), free(tab.seen), free(tab.stamp), free(tab.split), free(tab.needed), free(tab.counts), free(tab.vown),
+      free(tab.town), free(tab.changed), free(tab.stats), free(tab.seg), free(tab.seg_obj), free(tab.list);
   memset(&tab, 0, sizeof tab);
 }
 
@@ -354,8 +354,8 @@ static void upload_bodies(MFTL_Object *const *list, int n)
     if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
     if (obj->verts.n > tab.nvs || obj->tris.n > tab.nts)
     {
-      fprintf(stderr, "spheres_gpu: body %d has %d vertices / %d triangles here, a slot holds %d / %d\n", obj->global_id, obj->verts.n, obj->tris.n,
-              tab.nvs, tab.nts);
+      fprintf(stderr, "spheres_gpu: body %d has %d vertices / %d triangles here, a slot holds %d / %d\n", obj->global_id, obj->verts.n, obj->tris.n, tab.nvs,
+              tab.nts);
       MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
@@ -562,9 +562,16 @@ static void verify_device(MFTL_Ensemble *ens, errors *e)
     at += 3 * (size_t) list[o]->verts.n;
   }
   pull(SP_VNORMAL, RANGE_ALL, list, n);
+  /* One counter per loop: Apple clang 21's loop vectorizer crashes at -O2 on
+   * this max with a second induction variable carried out of the loop. */
   at = 0;
   for (int o = 0; o < n; ++o)
-    for (int k = 0; k < 3 * list[o]->verts.n; ++k, ++at) e->vnormal = fmax(e->vnormal, fabs(list[o]->verts.normal[k] - vref[at]));
+  {
+    const double *vn = list[o]->verts.normal;
+    const size_t m = 3 * (size_t) list[o]->verts.n;
+    for (size_t k = 0; k < m; ++k) e->vnormal = fmax(e->vnormal, fabs(vn[k] - vref[at + k]));
+    at += m;
+  }
 }
 
 /** @brief The final state, independent of the partition: what -save writes and -compare checks. */
@@ -655,8 +662,8 @@ static int compare_final(const char *path, const final_state *fs)
 
 static void grid_for(int nproc, int cuts[3])
 {
-  static const int table[][4] = {{1, 1, 1, 1}, {2, 2, 1, 1}, {3, 3, 1, 1}, {4, 2, 2, 1}, {6, 3, 2, 1},
-                                 {8, 2, 2, 2}, {12, 3, 2, 2}, {16, 4, 2, 2}, {24, 4, 3, 2}, {27, 3, 3, 3}, {32, 4, 4, 2}};
+  static const int table[][4] = {{1, 1, 1, 1},  {2, 2, 1, 1},  {3, 3, 1, 1},  {4, 2, 2, 1},  {6, 3, 2, 1}, {8, 2, 2, 2},
+                                 {12, 3, 2, 2}, {16, 4, 2, 2}, {24, 4, 3, 2}, {27, 3, 3, 3}, {32, 4, 4, 2}};
   for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); ++i)
     if (table[i][0] == nproc)
     {
@@ -839,8 +846,8 @@ int main(int argc, char *argv[])
   if (rank == 0 && !quiet)
   {
     printf("# %d spheres, periodic advection + per-step geometry, quality, vertex normals; device work on: %s\n", n_spheres, backend);
-    printf("#   %d ranks on a %dx%dx%d grid   r=%g, refine %d -> %d triangles / %d vertices each   dt=%g, %d steps\n", nproc, cuts[0], cuts[1], cuts[2],
-           radius, refinements, nt_body, nv_body, dt, n_steps);
+    printf("#   %d ranks on a %dx%dx%d grid   r=%g, refine %d -> %d triangles / %d vertices each   dt=%g, %d steps\n", nproc, cuts[0], cuts[1], cuts[2], radius,
+           refinements, nt_body, nv_body, dt, n_steps);
     printf("#   A0 = %.12e   %.0f triangles, %.0f vertices\n", reference[0], reference[1], reference[2]);
   }
 

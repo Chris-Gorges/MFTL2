@@ -50,9 +50,11 @@ file(GLOB _mftl_nvc_hints
 find_program(MFTL_NVC nvc HINTS ${_mftl_nvc_hints} DOC "nvc of the NVIDIA HPC SDK, for the OpenACC and OpenMP backends")
 set(MFTL_NVC_GPU "ccnative" CACHE STRING "nvc -gpu= target, e.g. ccnative, cc90 or cc80,cc90")
 
+# Without either, only the CPU builds of the directive source (gcc_serial,
+# gcc_omp) are made: what CI and a machine without the NVIDIA tools can run.
 if(NOT CMAKE_CUDA_COMPILER AND NOT MFTL_NVC)
-    message(FATAL_ERROR "MFTL_ENABLE_GPU=ON, but neither nvcc nor nvc was found: put them on PATH, or pass "
-                        "-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc and/or -DMFTL_NVC=/path/to/nvc")
+    message(STATUS "GPU example: neither nvcc nor nvc found, building the CPU variants only. Put them on PATH, or pass "
+                   "-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc and/or -DMFTL_NVC=/path/to/nvc")
 endif()
 
 find_package(OpenMP COMPONENTS C)

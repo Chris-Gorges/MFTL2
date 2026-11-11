@@ -410,8 +410,8 @@ static int csv_read(const char *path, csv_rec **out)
   {
     csv_rec x;
     double t;
-    if (sscanf(line, "%d,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%" SCNx64, &x.step, &t, &x.ntri, &x.nvert, &x.nedge, &x.oob, &x.inv, &x.min_q, &x.avg_q,
-               &x.v, &x.a, &x.mesh) != 12)
+    if (sscanf(line, "%d,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%lf,%" SCNx64, &x.step, &t, &x.ntri, &x.nvert, &x.nedge, &x.oob, &x.inv, &x.min_q, &x.avg_q, &x.v,
+               &x.a, &x.mesh) != 12)
       continue;  // the header
     if (n == cap)
     {
@@ -481,8 +481,8 @@ static int compare_trajectory(const char *path, const csv_rec *mine, int n_mine)
 
 static void grid_for(int nproc, int cuts[3])
 {
-  static const int table[][4] = {{1, 1, 1, 1}, {2, 2, 1, 1}, {3, 3, 1, 1}, {4, 2, 2, 1}, {6, 3, 2, 1},
-                                 {8, 2, 2, 2}, {12, 3, 2, 2}, {16, 4, 2, 2}, {24, 4, 3, 2}, {27, 3, 3, 3}, {32, 4, 4, 2}};
+  static const int table[][4] = {{1, 1, 1, 1},  {2, 2, 1, 1},  {3, 3, 1, 1},  {4, 2, 2, 1},  {6, 3, 2, 1}, {8, 2, 2, 2},
+                                 {12, 3, 2, 2}, {16, 4, 2, 2}, {24, 4, 3, 2}, {27, 3, 3, 3}, {32, 4, 4, 2}};
   for (size_t i = 0; i < sizeof(table) / sizeof(table[0]); ++i)
     if (table[i][0] == nproc)
     {
@@ -627,8 +627,8 @@ int main(int argc, char *argv[])
   if (rank == 0 && !quiet)
   {
     printf("# LeVeque deformation, distributed remeshing, device work on: %s\n", backend);
-    printf("#   %d ranks on a %dx%dx%d grid   sphere r=0.15, %d refinements -> %.0f triangles   T=%.2f dt=%.3f, %d steps\n", nproc, cuts[0], cuts[1],
-           cuts[2], refinements, r0.n_tri, T, dt, n_steps);
+    printf("#   %d ranks on a %dx%dx%d grid   sphere r=0.15, %d refinements -> %.0f triangles   T=%.2f dt=%.3f, %d steps\n", nproc, cuts[0], cuts[1], cuts[2],
+           refinements, r0.n_tri, T, dt, n_steps);
     printf("#   V0 = %.12e   A0 = %.12e\n#\n", r0.volume, r0.area);
     printf("# %5s %7s %9s %8s %8s %5s %6s %18s %18s\n", "step", "t", "ntri", "minQ", "avgQ", "inv", "oob", "V/V0", "A/A0");
   }
@@ -767,7 +767,8 @@ int main(int argc, char *argv[])
     if (r.n_tri > peak_tri) peak_tri = r.n_tri;
 
     const uint64_t mesh = (csv_path || compare_path) ? mesh_key(ens) : 0;
-    traj[step] = (csv_rec){step + 1, r.n_tri, r.n_vert, r.n_edge, r.n_out_of_band, r.n_inverted, r.min_q, r.avg_q, r.volume / r0.volume, r.area / r0.area, mesh};
+    traj[step] =
+        (csv_rec){step + 1, r.n_tri, r.n_vert, r.n_edge, r.n_out_of_band, r.n_inverted, r.min_q, r.avg_q, r.volume / r0.volume, r.area / r0.area, mesh};
     if (csv) csv_row(csv, step + 1, t + dt, &r, &r0, mesh);
     if (rank == 0 && !quiet)
       printf("  %5d %7.3f %9.0f %8.5f %8.5f %5.0f %6.0f %18.15f %18.15f\n", step + 1, t + dt, r.n_tri, r.min_q, r.avg_q, r.n_inverted, r.n_out_of_band,
@@ -809,8 +810,7 @@ int main(int argc, char *argv[])
       printf("    transfers: H->D %.2f MB/step at %.2f GB/s, D->H %.2f MB/step at %.2f GB/s (pageable host memory)\n", 1e-6 * bmax[0] / n_steps,
              1e-9 * bmax[0] / fmax(tmax[T_H2D], 1e-12), 1e-6 * bmax[1] / n_steps, 1e-9 * bmax[1] / fmax(tmax[T_D2H], 1e-12));
     if (!use_cpu)
-      printf("    device memory: %ld (re)allocations of the mesh arrays in %d steps (max over ranks); every other upload reuses them\n", allocs_max,
-             n_steps);
+      printf("    device memory: %ld (re)allocations of the mesh arrays in %d steps (max over ranks); every other upload reuses them\n", allocs_max, n_steps);
   }
 
   if (verify)

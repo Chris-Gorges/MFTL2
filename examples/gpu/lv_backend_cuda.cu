@@ -19,15 +19,15 @@
 #include "lv_backend.h"
 #include "lv_kernels.h"
 
-#define LV_CUDA_CHECK(call)                                                                                     \
-  do                                                                                                            \
-  {                                                                                                             \
-    const cudaError_t err_ = (call);                                                                            \
-    if (err_ != cudaSuccess)                                                                                    \
-    {                                                                                                           \
+#define LV_CUDA_CHECK(call)                                                                                      \
+  do                                                                                                             \
+  {                                                                                                              \
+    const cudaError_t err_ = (call);                                                                             \
+    if (err_ != cudaSuccess)                                                                                     \
+    {                                                                                                            \
       std::fprintf(stderr, "CUDA error %s at %s:%d: %s\n", #call, __FILE__, __LINE__, cudaGetErrorString(err_)); \
-      std::abort();                                                                                             \
-    }                                                                                                           \
+      std::abort();                                                                                              \
+    }                                                                                                            \
   } while (0)
 
 namespace
@@ -142,9 +142,8 @@ __device__ double warp_min(double x)
  * goes through atomicMin on the bit pattern, which orders like the value for
  * non-negative doubles (a quality is never negative).
  */
-__global__ void stats_kernel(const double *__restrict__ pos, const double *__restrict__ vn, const int *__restrict__ tri_verts,
-                             const int *__restrict__ tri_nbr, const int *__restrict__ tri_rec, int nt_owned, double min_len, double max_len,
-                             double vol_ref, double *__restrict__ out)
+__global__ void stats_kernel(const double *__restrict__ pos, const double *__restrict__ vn, const int *__restrict__ tri_verts, const int *__restrict__ tri_nbr,
+                             const int *__restrict__ tri_rec, int nt_owned, double min_len, double max_len, double vol_ref, double *__restrict__ out)
 {
   double acc[6] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
   double min_q = 1.0;
@@ -240,10 +239,7 @@ extern "C" void lv_advect(double t, double dt, double T)
   finish();
 }
 
-extern "C" void lv_get_owned_positions(void)
-{
-  copy(g.host.pos, g.pos.ptr, 3 * static_cast<size_t>(g.host.nv_owned) * sizeof(double), cudaMemcpyDeviceToHost);
-}
+extern "C" void lv_get_owned_positions(void) { copy(g.host.pos, g.pos.ptr, 3 * static_cast<size_t>(g.host.nv_owned) * sizeof(double), cudaMemcpyDeviceToHost); }
 
 extern "C" void lv_put_ghost_positions(void)
 {
@@ -283,8 +279,8 @@ extern "C" void lv_measure(double min_len, double max_len, double vol_ref, lv_me
   const double init[7] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0};
   copy(red, init, sizeof init, cudaMemcpyHostToDevice);
   const int blocks = blocks_for(nt_owned) < g.max_blocks ? blocks_for(nt_owned) : g.max_blocks;
-  stats_kernel<<<blocks, kBlock>>>(pos, vn, tri_verts, static_cast<const int *>(g.tri_nbr.ptr), static_cast<const int *>(g.tri_rec.ptr), nt_owned,
-                                   min_len, max_len, vol_ref, red);
+  stats_kernel<<<blocks, kBlock>>>(pos, vn, tri_verts, static_cast<const int *>(g.tri_nbr.ptr), static_cast<const int *>(g.tri_rec.ptr), nt_owned, min_len,
+                                   max_len, vol_ref, red);
   LV_CUDA_CHECK(cudaGetLastError());
 
   double r[7];
