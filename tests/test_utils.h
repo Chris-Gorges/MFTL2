@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <math.h>
 #include <string.h>
+#include <time.h>
 
 #define ANSI_COLOR_RED "\x1b[31m"
 #define ANSI_COLOR_GREEN "\x1b[32m"
@@ -19,6 +20,14 @@
 static int g_tests_run = 0;
 static int g_tests_passed = 0;
 static int g_tests_failed = 0;
+
+/* Wall clock for RUN_TEST's per-case time: what to read first when a suite gets slow. */
+static inline double test_wall_seconds(void)
+{
+  struct timespec ts;
+  timespec_get(&ts, TIME_UTC);
+  return (double) ts.tv_sec + 1e-9 * (double) ts.tv_nsec;
+}
 
 #define TEST_REPORT()                                                                                                                   \
   do                                                                                                                                    \
@@ -29,21 +38,22 @@ static int g_tests_failed = 0;
     printf("-------------------------------------------------\n");                                                                      \
   } while (0)
 
-#define RUN_TEST(func)                                            \
-  do                                                              \
-  {                                                               \
-    g_tests_run++;                                                \
-    printf("[RUN     ] %s...", #func);                            \
-    if (func() == 0)                                              \
-    {                                                             \
-      printf("%sPASSED%s\n", ANSI_COLOR_GREEN, ANSI_COLOR_RESET); \
-      g_tests_passed++;                                           \
-    }                                                             \
-    else                                                          \
-    {                                                             \
-      printf("%sFAILED%s\n", ANSI_COLOR_RED, ANSI_COLOR_RESET);   \
-      g_tests_failed++;                                           \
-    }                                                             \
+#define RUN_TEST(func)                                                                                         \
+  do                                                                                                           \
+  {                                                                                                            \
+    g_tests_run++;                                                                                             \
+    printf("[RUN     ] %s...", #func);                                                                         \
+    const double run_test_t0_ = test_wall_seconds();                                                           \
+    if (func() == 0)                                                                                           \
+    {                                                                                                          \
+      printf("%sPASSED%s (%.2f s)\n", ANSI_COLOR_GREEN, ANSI_COLOR_RESET, test_wall_seconds() - run_test_t0_); \
+      g_tests_passed++;                                                                                        \
+    }                                                                                                          \
+    else                                                                                                       \
+    {                                                                                                          \
+      printf("%sFAILED%s (%.2f s)\n", ANSI_COLOR_RED, ANSI_COLOR_RESET, test_wall_seconds() - run_test_t0_);   \
+      g_tests_failed++;                                                                                        \
+    }                                                                                                          \
   } while (0)
 
 // Assertions return 0 on success, 1 on failure
