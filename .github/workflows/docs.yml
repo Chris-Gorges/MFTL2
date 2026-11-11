@@ -35,14 +35,14 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           path: MFTL2
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           repository: Chris-Gorges/MFTL2_Documentation
           path: MFTL2_Documentation
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.14" # what requirements-docs.lock was resolved with
       - name: Graphviz and the pinned Doxygen
