@@ -15,9 +15,8 @@ on:
   push:
     branches: [main]
   pull_request:
-  # Paused while the repository is private (no Pages site yet); restore when public.
-  # schedule:
-  #   - cron: "41 3 * * *" # picks up changes to MFTL2_Documentation
+  schedule:
+    - cron: "41 3 * * *" # picks up changes to MFTL2_Documentation
   workflow_dispatch:
 
 permissions:

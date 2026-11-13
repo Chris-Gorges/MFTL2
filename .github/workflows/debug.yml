@@ -10,10 +10,8 @@ on:
   push:
     branches: [main]
   pull_request:
-  # The nightly full suite (~85 Actions minutes) is paused while the repository
-  # is private and draws on the free plan's 2000 minutes a month; restore it when public.
-  # schedule:
-  #   - cron: "17 2 * * *"
+  schedule:
+    - cron: "17 2 * * *"
   workflow_dispatch:
     inputs:
       tests:
