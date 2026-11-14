@@ -1,8 +1,9 @@
 # 00 — Roadmap: what MFTL2 is still missing
 
-Status: 2026-11-13, branch `christian` at `d4f2b6a`. This file replaces `plans/01`–`09`. It is the single
+Status: 2026-11-13, branch `christian` at `d4f2b6a`; §3 D (known deferred issues) added 2026-11-14. This file
+replaces `plans/01`–`09`. It is the single
 source for detailed implementation plans: write one file per item, `plans/NN-<item>.md`, and cite the item id
-used here (A1, B3, ...).
+used here (A1, B3, D20, ...).
 
 Sources reviewed:
 - `christian`: the headers, the module READMEs, the "Known deferred issues" in `CLAUDE.md`, and plans 01–09.
@@ -101,7 +102,8 @@ exist in `christian`. Five things are missing:
 Priorities:
 - **A** blocks FT or IBM in production;
 - **B** is needed for coverage or scale;
-- **C** waits for a consumer or a measurement.
+- **C** waits for a consumer or a measurement;
+- **D** is a known limit with no scheduled fix.
 
 ### A1 — Surface tension and signed curvature (FT)
 
@@ -235,7 +237,7 @@ extra.
 6. optionally canonicalise to outward winding;
 7. `MFTLPublishGeneratedBodies`, then `MFTLRedistribute`.
 
-Scale, translate and rotate on read. The reader inherits the rank-0 generation peak (deferred issue 20). A
+Scale, translate and rotate on read. The reader inherits the rank-0 generation peak (D20). A
 parallel STL read is the later fix.
 
 **Gate.**
@@ -352,7 +354,7 @@ Later:
 - resolution-dependent bins;
 - incremental grid updates.
 
-### B6 — Folds at creases (deferred issue 25)
+### B6 — Folds at creases (D25)
 
 - Add a fold test against the edge neighbours' normals in flip and collapse, and a fold test in the smoother.
 - Restricted to rim-adjacent triangles, it leaves the closed-surface digests unchanged.
@@ -371,15 +373,108 @@ Owned entities only, as now.
 | C1 | Contact angle and conormal at rim vertices (old 09 F4) | a contact-line model runs on an open surface |
 | C2 | Surface viscosity force, Boussinesq–Scriven (old 09 F2); needs B4 | a case needs it |
 | C3 | Membranes: Skalak or neo-Hookean, dihedral bending, area and volume penalties; a body with a reference shape is never remeshed (old 09 F3) | capsules or red blood cells are simulated |
-| C4 | Local volume correction (deferred 29); local topology reconstruction (22); interpenetrating bodies (28); detection cost (23) | a production case measures the shape drift or the topology cost |
+| C4 | Local volume correction (D29); local topology reconstruction (D22); interpenetrating bodies (D28); detection cost (D23) | a production case measures the shape drift or the topology cost |
 | C5 | A surface-adaptive decomposition: weighted rectilinear cuts through the `MFTL_OwnerMap` seam | idle ranks are measured with a single interface (RT, a film, a jet), where a uniform grid can leave most ranks without triangles |
-| C6 | Continuous collision detection (deferred 16) | a tunnelled contact is measured in a real run |
+| C6 | Continuous collision detection (D16) | a tunnelled contact is measured in a real run |
 | C7 | Overlap-volume contact model (MFTL1) | a volume-based contact model for triangulated particles is chosen |
 | C8 | Fortran bindings (old 08 E4) | a Fortran consumer exists |
 | C9 | Phase sets (`main`) | user-declared multi-body phase compositions must be validated |
 
-The performance items that need the cluster stay in `CLAUDE.md` "Known deferred issues" and `scaling/`: the Morton
-benefit, ghost-schedule caching, the `compute_owners` slack, BVH timings, and the spanning cost at P in the hundreds.
+### D — Known deferred issues
+
+Known limits with no scheduled fix, measured where possible. Moved here from the local `CLAUDE.md` on 2026-11-14.
+The numbers are the ones code comments cite: "deferred issue N" in older text is DN here. D6 (a persistent
+redistribution workspace, `docs/analysis.md` §2.3) is done; D8 is retired. Correctness defects, most severe first,
+are listed in `docs/analysis.md` §9.
+
+**Performance questions that need the cluster**
+- **D1 Morton renumbering** (`MFTLObjectReorderMorton`) has no measured benefit on Apple silicon. It is kept because
+  it makes one index space possible and the LBVH needs it. Measure on an x86 node with 1–2 MiB L2 per core before
+  putting it in a per-timestep loop.
+- **D4 The update kernel is bound by the FP divide/sqrt unit.** It needs both `|n|` and `n/|n|`. The only lever left
+  is a hardware `rsqrt` estimate plus a Newton step: unmeasured, not bit-reproducible, microarchitecture-specific.
+- **D9 The two I/O file layouts** have only been compared on a laptop SSD, where a shared file cannot win. Open: P in
+  the thousands on Lustre or GPFS. The shared-file backend passes `MPI_INFO_NULL` (no collective-buffering hints).
+- **D10 Cluster scaling covers only the advected, redistributed timestep.** Measured in October 2026 at commit
+  `ac631b7` on 36-core nodes (`scaling/`): strong scaling of 110 592 bodies reaches 0.82 efficiency at P = 288 against
+  P = 36; weak scaling with 1000 bodies per rank reaches 0.90. Not yet written up in `docs/analysis.md`, whose §9
+  still says "nothing above four ranks". Still unmeasured above four real ranks: remeshing (D11), the holder route's
+  P ≈ 45 crossover, neighbourhood against `comm_world` collectives at large P, I/O (D9) and Morton (D1).
+- **D11 The spanning remesh's cost at scale.** A pass does one serial call's work whatever `parallel_phase_budget`
+  is (a cap, default 8). Over the LeVeque period ONCE takes 1.9–2.7 placements and 2.8–3.7 migrations per call at
+  np = 2–8, NESTED 5.5–7.4 and 6.2–8.3. Open: does migration cost stay proportional to the band at P in the
+  hundreds, and which mode is cheaper there (`scaling/launch_remesh_*.sh`).
+- **D14 Nothing in `src/bvh/` is profiled in time** beyond `orient3d_predicate_profile`. Known cliff: the broad-phase
+  cell is `2*max_half + max_envelope`, so one domain-spanning body collapses the grid to a single bucket. A two-level
+  grid removes it.
+- **D18 Coarsening at P in the hundreds.** A coarse destination lies outside the 26-neighbourhood, so
+  `MFTLRedistributeWithOwners` and `MFTLRemeshSyncGhostIds` take their global paths (O(nproc)). Redistribution's
+  32-bit `MFTL_DEDUP_BITS` reverts to a sort above 32 distinct destinations, which np ≤ 27 cannot test. The
+  single-rank gather is exempt from the second.
+- **D21 `compute_owners`** is about 30 % of the redistribution phase with the body skip on, and the skip cannot touch
+  it, because it produces the verdict. Design if it is ever built: a per-body slack (the minimum distance of any
+  entity to its cell's planes, stored on `MFTL_Object` next to `partition_settled`) against a caller-supplied motion
+  bound `dt * v_max` proves "nothing crossed a plane" without a scan. It must ship off, be selected by one hoisted
+  branch per body, have a Debug verifier, join `check_object_lists_agree`'s checksum, and be disabled when
+  `maps != MFTL_NULL`. Fusing the classification into `MFTLComputeTriangleGeometry` was rejected.
+
+**Caches and fusions not built, because the reference loop redistributes every step**
+- **D5 The ghost-exchange schedule** of `MFTLUpdateGhostPositions` is rebuilt every step. An exact cached push
+  (`docs/analysis.md` §8.2) would make a sync one `MPI_Neighbor_alltoallv`; it pays only for a solver that
+  redistributes less than once per step.
+- **D7 The geometry pass after a redistribution is bound by first touch.** The lever is fusing it into the
+  redistribution's rebuild, which would put geometry into a module that transmits none.
+- **D12 The BVH leaf-leaf narrow phase is batched but not vectorised.** `flush_batch` (`src/bvh/bvh_traverse.c`)
+  receives up to 64 independent tests. Start with `MFTL_TriTriProximity` (176 ns/pair against 31 for
+  `MFTL_TriTriIntersect`).
+- **D13 The spatial-halo overlap list is rebuilt every call.** If a solver redistributes every N steps, cache it on
+  `MFTL_SpatialHalo`, not on `MFTL_Domain`. A halo that survives a redistribution is not wanted: it is stale exactly
+  when ownership changed.
+
+**Structural and accounting limits**
+- **D2 The half-edge triple invariant is checked only in tests** (`inv_implicit_indexing`, part of
+  `inv_mesh_is_sound`), not by `MFTLCheckMeshIntegrity` or `MFTLObjectSetCounts`.
+- **D3 `tris.verts` / `tris.neighbors` are redundant state** whose benefit (4× less traffic) is arithmetic, not
+  measured. Re-examine when a consumer that isolates them exists.
+- **D15 Remeshing renumbers global ids at the end of every pass, and has to**: redistribution and the ghost sync size
+  their arrival tables from `next_*_gid`. So pool indices and global ids are both unstable across a remesh.
+- **D19 `MFTLUpdateGhostPositions` has no global fallback.** A ghost whose owner is not a graph neighbour is skipped,
+  counted (`g_n_orphaned`), reported on stderr, asserted in Debug and returned as `MFTL_ERROR`. It is safe only
+  because both remeshing drivers end with a plain `MFTLRedistribute` back to the fine partition.
+- **D20 Generation is rank-0 serial.** `MFTLGenerateSphere` / `MFTLGenerateSphereLocal` build every body whole on
+  rank 0: `3440 * 4^refine + 128` bytes per body (140 B/triangle + 64 B/vertex, from the pool layouts in
+  `src/object/object.c`). `parallel_advection_scaling` prints it and refuses above `--max-gen-mb`. The fix is a
+  distributed generator or reader (A4 inherits the peak); batched generation is not (O(N²/K), `docs/analysis.md`
+  §6.1). Bodies rank 0 keeps a sliver of hold full blocks; `MFTLRedistributeSetShrinkSlack` trims them (off by
+  default: −8 % capacity for about 2 % of the phase). Regression test
+  `test_generation_capacity_does_not_stay_resident_on_rank_0`. Measure in RSS, never in a byte counter.
+- **D24 `n_bodies_global` counts retired ids**, and the `N_bodies >= nproc` guard in `dispersed_box_min`
+  (`remesh_dispersed.c`) reads it as a body count. The fix, when it matters: a live count on `MFTL_Ensemble`, known
+  exactly in `MFTLEnsembleReconstructBodies`.
+
+**Physics, contact and coupling limits**
+- **D16 Contact detection is discrete-time** (C6). `test_tunnelling_between_two_timesteps_is_a_known_miss` asserts
+  the miss.
+- **D17 A pair's contact envelope is `MAX(tol_A, tol_B)`**, so a µm droplet against a m body is judged at the larger
+  scale (the only safe direction for the broad phase). Escape: `proximity_factor = 0` and the physical gap as
+  `proximity_floor`. `test_two_length_scales_share_the_larger_envelope`.
+- **D22 A topology change re-triangulates every body in its cluster, everywhere** (C4). Rayleigh–Taylor, np = 4:
+  3.46 s in 80 topology calls against 2.11 s in 80 remeshing passes. Skipping the reconstructions that change no
+  topology was measured WORSE: the erosion of sub-delta features is a load-bearing regulariser (`docs/analysis.md`
+  §13.3).
+- **D23 Detection queries the whole ensemble on every call**, most of which find nothing (0.16 of 0.43 s on the jet;
+  C4). Levers, unmeasured: a per-primitive normal cache, or querying only bodies whose curvature or thickness moved.
+- **D25 The remesher can fold a triangle against all its neighbours at a crease** (B6). It is why
+  `test_travelling_waves_topology` runs at 96×24.
+- **D26 The coupler is scoped to velocity and surface-load transfer** (efficiency items in B5). A broad SELECTED
+  provider certificate can still over-request; no speedup of the refactored coupler has been measured.
+- **D27 A point location's default ownership tiles** (up to 64 samples) bridge a hole thinner than a tile inside one
+  registered cloud: it is certified empty rather than unprovided. `MFTL_ProviderRegions` make it exact.
+- **D28 Bodies that already interpenetrate are reconstructed wrongly**, and nothing reports it (C4,
+  `docs/analysis.md` §13.5).
+- **D29 The volume correction is global**, a uniform offset against losses that arise locally (C4,
+  `docs/analysis.md` §15.1 and §15.4). `collapse_preserves_volume` removes most of the loss at the source; the
+  compensated-flip and flip-guard variants stay experiments and are not wanted in the library.
 
 ## 4. Integration with multiflow
 

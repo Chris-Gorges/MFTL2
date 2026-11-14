@@ -1597,7 +1597,7 @@ static int test_a_second_pass_is_stable(void)
 
   /* Density is what keeps the id RANGE proportional to the mesh, and the range
    * is what sizes redistribution's arrival table. A range growing faster than
-   * the mesh is deferred issue 15 coming back. */
+   * the mesh is roadmap item D15 coming back. */
   TEST_ASSERT(st2[1] < gid_range_after_first * 2);
   TEST_ASSERT(st2[1] == st2[2]);
 

@@ -29,7 +29,7 @@
  *
  *   EFFICIENCY    how many phases and migrations does a REAL deforming mesh
  *                 need, as opposed to the one-shot refinement the tests use?
- *                 That is CLAUDE.md deferred issue 11's open question and this
+ *                 That is roadmap item D11's open question and this
  *                 is the run that answers it.
  *
  * ═══════════════════════════════════════════════════════════════════════════

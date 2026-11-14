@@ -227,7 +227,7 @@ int main(int argc, char **argv)
     printf("  MIGRATE dominating -> it is not; the lever is fewer phases, not shorter sweeps.\n");
     printf("  GEOMETRY large     -> the O(n) floor in front of every migration, which no wire\n");
     printf("                        optimisation touches. Fusing it into the redistribution's own\n");
-    printf("                        rebuild is deferred issue 7 in CLAUDE.md.\n");
+    printf("                        rebuild is roadmap item D7 (plans/00-roadmap.md).\n");
     printf("  maxT/meanT >> 1    -> load imbalance in the PARTITION; with coarsening on, expect it\n");
     printf("                        to approach the group size, because one rank per group sweeps.\n");
     printf("  REDUCE large       -> read it as WAITING, not as bandwidth. The id collective is the\n");

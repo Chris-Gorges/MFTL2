@@ -1488,7 +1488,7 @@ static long capacity_bytes(const MFTL_Ensemble *ens)
  * MFTLGenerateSphere() builds on rank 0, pools are grow-only, and redistribution
  * lowers `n` and never `capacity` -- so without MFTLRedistributeSetShrinkSlack()
  * rank 0 keeps a full-mesh block for every body it retains a sliver of, for the
- * whole run. That is deferred issue 20 in CLAUDE.md, and this is its regression
+ * whole run. That is roadmap item D20 (plans/00-roadmap.md), and this is its regression
  * test: it FAILS with the slack at 0.
  */
 static int test_generation_capacity_does_not_stay_resident_on_rank_0(void)

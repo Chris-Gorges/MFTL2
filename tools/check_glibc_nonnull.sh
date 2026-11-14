@@ -2,8 +2,8 @@
 # Finds, on macOS, the UBSan errors that only glibc's headers would reveal.
 #
 # glibc declares memcpy, qsort and friends nonnull, so a zero-length copy from a
-# NULL array is a UBSan error on Linux and silent on a Mac (CLAUDE.md, "two
-# portability traps"). This builds Debug with ASan+UBSan and tools/glibc_nonnull.h
+# NULL array is a UBSan error on Linux and silent on a Mac (CLAUDE.md,
+# "Portability traps"). This builds Debug with ASan+UBSan and tools/glibc_nonnull.h
 # force-included into every C file, runs CTest, and lists every UBSan report.
 # UBSan does not halt, so one run finds all of them, not the first per rank.
 #
