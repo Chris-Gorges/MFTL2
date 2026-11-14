@@ -216,7 +216,12 @@
  * stays a closed body through every later remesh -- what the topology CTest
  * runs. WHEN it pinches
  * is chaotic: neighbouring (roll, growth) points scatter by half a time unit,
- * and some pinch after the 400 steps (tests/CMakeLists.txt has the sweep). At
+ * and some pinch after the 400 steps (tests/CMakeLists.txt has the sweep).
+ * The rank count moves it as much, because a distributed remesh is a different
+ * valid mesh at every partition: this point does not pinch within 400 steps at
+ * np = 1 or 2 (Release). Over roll 1.6-2.0 x growth 1.3-1.7, 500 steps, only 4
+ * of the 25 points pinched at each of np = 1, 2, 3 and 4, and the three of
+ * those tried at np = 5, 6 and 8 each failed at one of them. At
  * --res 24 the same field pinches only blobs a couple of
  * lattice cells across; the remesher collapses those to tetrahedra, the size
  * floor deletes them (MFTL_TopologyOptions::min_body_triangles), and
@@ -1421,7 +1426,10 @@ int main(int argc, char **argv)
   if (cfg.require_topology && max_bodies == 1 && max_handles == 0)
   {
     broken++;
-    if (rank == 0) fprintf(stderr, "  VACUOUS: neither the body count nor the genus ever changed -- run longer, or strengthen --roll\n");
+    if (rank == 0)
+      fprintf(stderr,
+              "  VACUOUS: neither the body count nor the genus ever changed -- run longer, or strengthen --roll "
+              "(when the cap pinches is chaotic and moves with the rank count; the CTest's point pinches at np = 4)\n");
   }
 
   /* ── Closing summary ────────────────────────────────────────────────────── */

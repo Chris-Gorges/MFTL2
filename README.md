@@ -237,16 +237,18 @@ The full Release suite takes about 30 s on an Apple M4 laptop (10 cores).
 Some of the examples, each of which checks its own answer before it reports anything:
 
 ```bash
-# a solver-shaped run configured entirely by a settings file, plus command-line overrides
-mpirun -n 4 ./build/settings_driven_run examples/settings/settings_driven_run.toml remesh.every=2 --steps 50
+# a solver-shaped run configured entirely by a settings file, plus a command-line override
+mpirun -n 4 ./build/settings_driven_run examples/settings/settings_driven_run.toml remesh.every=2
 
 # the whole timestep, distributed: advection, ghost sync, geometry, redistribution
 mpirun -n 4 ./build/parallel_advection_redistribute_list 2 2 1 1 1 1 --spheres 256 --refine 3 --verify
 
-# distributed remeshing over the LeVeque test: does it track the serial answer
-mpirun -n 4 ./build/leveque_remeshing_parallel
+# the LeVeque run of the first two animations (-sizing uniform for the other half of the second)
+mpirun -n 4 ./build/leveque_remeshing_parallel -refine 4 -sizing curvature -projection phong -verify
 
-# open surfaces with breakup and coalescence
+# open surfaces with breakup and coalescence. The Rayleigh-Taylor run is the CTest's, at 4 ranks: WHEN its cap
+# pinches is chaotic and moves with the rank count, and at -n 1 or 2 it falls after the last step, which
+# --require-topology reports as a vacuous run
 mpirun -n 4 ./build/liquid_jet_open_surface 2 2 1 --sectors 24 --length 24 --eps 0.1 --weber 2 --require-breakup
 mpirun -n 4 ./build/rayleigh_taylor_open_surface --roll 1.7 --growth 1.5 --require-topology
 
