@@ -309,8 +309,8 @@ global target, so today the job-wide minimum is used.
 
 Nothing in multiflow uses either today, so keep it small.
 
-**Have.** The distributed broad phase, the LBVH, exact triangle–triangle distance with closest points, envelopes,
-the pair filter, and the spatial halo.
+**Have.** The distributed broad phase, the LBVH, an exact intersection test, the triangle–triangle distance to rounding
+with closest points, envelopes, the pair filter, and the spatial halo.
 
 **Build.**
 - **Per body pair within an envelope:** the minimum gap, with witness points and a normal. Ties break
@@ -425,7 +425,7 @@ are listed in `docs/analysis.md` §9.
 - **D7 The geometry pass after a redistribution is bound by first touch.** The lever is fusing it into the
   redistribution's rebuild, which would put geometry into a module that transmits none.
 - **D12 The BVH leaf-leaf narrow phase is batched but not vectorised.** `flush_batch` (`src/bvh/bvh_traverse.c`)
-  receives up to 64 independent tests. Start with `MFTL_TriTriProximity` (176 ns/pair against 31 for
+  receives up to 64 independent tests. Start with `MFTL_TriTriProximity` (244 ns/pair against 31 for
   `MFTL_TriTriIntersect`).
 - **D13 The spatial-halo overlap list is rebuilt every call.** If a solver redistributes every N steps, cache it on
   `MFTL_SpatialHalo`, not on `MFTL_Domain`. A halo that survives a redistribution is not wanted: it is stale exactly

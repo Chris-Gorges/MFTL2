@@ -820,6 +820,436 @@ static int test_a_point_on_the_triangle_is_at_distance_zero(void)
   return 0;
 }
 
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Distances to rounding: segments, slivers, triangle pairs
+ *
+ * Two independent references. (1) Configurations whose distance is known
+ * EXACTLY: the two bodies lie in the half-spaces z <= 0 and z >= delta and touch
+ * those planes in features whose projections meet, so the distance is delta;
+ * mapped by an integer matrix that is 3 or 7 times a rotation, exactly (checked),
+ * so the frame is tilted and translated and the distance is 3 delta or 7 delta.
+ * (2) Random general position against a double-double evaluation (~1e-31).
+ * Both measure the error in units of eps * L, L the configuration's diameter:
+ * the 2x2 normal equations this replaces were off by up to 1e10 of those.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/** @brief Unit roundoff, 2^-53. */
+#define GEOM_EPS 0x1p-53
+
+/** @brief An integer matrix equal to `scale` times a rotation. */
+typedef struct
+{
+  int m[3][3];
+  int scale;
+} scaled_rotation;
+
+static const scaled_rotation k_frames[3] = {
+    {{{1, 0, 0}, {0, 1, 0}, {0, 0, 1}}, 1},
+    {{{1, 2, 2}, {2, 1, -2}, {2, -2, 1}}, 3},
+    {{{2, 3, 6}, {3, -6, 2}, {6, 2, -3}}, 7},
+};
+
+/**
+ * @brief out = R x + T, returning 0 unless every product and sum was EXACT
+ *        (fma residuals and Knuth two-sum errors all zero).
+ */
+static int exact_map(const scaled_rotation *R, const double T[3], const double x[3], double out[3])
+{
+  for (int i = 0; i < 3; ++i)
+  {
+    double s = T[i];
+    for (int j = 0; j < 3; ++j)
+    {
+      const double p = R->m[i][j] * x[j];
+      if (fma((double) R->m[i][j], x[j], -p) != 0.0) return 0;
+      const double n = s + p, bb = n - s;
+      if ((s - (n - bb)) + (p - bb) != 0.0) return 0;
+      s = n;
+    }
+    out[i] = s;
+  }
+  return 1;
+}
+
+/** @brief Largest distance between any two of @p n points. */
+static double diameter(const double (*pts)[3], int n)
+{
+  double d = 0.0;
+  for (int i = 0; i < n; ++i)
+    for (int j = 0; j < n; ++j)
+    {
+      const double x = pts[i][0] - pts[j][0], y = pts[i][1] - pts[j][1], z = pts[i][2] - pts[j][2];
+      d = fmax(d, sqrt(x * x + y * y + z * z));
+    }
+  return d;
+}
+
+/**
+ * @brief Two edges at a tiny angle, a gap apart, crossing in projection: the
+ *        configuration whose 1e-9 gap was reported as 7.8e-9 and missed by a
+ *        contact query. Also the crossing near either end, and exactly parallel
+ *        overlapping edges.
+ */
+static int test_segment_distance_is_accurate_at_every_angle(void)
+{
+  const int angle_exp[] = {3, 10, 17, 24, 30, 36};
+  const int gap_exp[] = {4, 12, 20, 28, 36};
+  const double crossing_slope[][2] = {{1, 1}, {1, 7}, {7, 1}};  // B's ends at -a*l, +a*r: crosses at x = l/(l+r)
+  const double T0[3] = {0.0, 0.0, 0.0}, T1[3] = {96.0, -160.0, 224.0};
+  double worst = 0.0;
+  int n = 0, skipped = 0;
+
+  for (int f = 0; f < 3; ++f)
+    for (int tr = 0; tr < 2; ++tr)
+      for (size_t ia = 0; ia < sizeof angle_exp / sizeof angle_exp[0]; ++ia)
+        for (size_t ig = 0; ig < sizeof gap_exp / sizeof gap_exp[0]; ++ig)
+          for (int cs = 0; cs < 4; ++cs)
+          {
+            const double a = ldexp(1.0, -angle_exp[ia]), delta = ldexp(1.0, -gap_exp[ig]);
+            double base[6][3] = {{0, 0, 0}, {1, 0, 0}, {0.5, 0, -1}, {0, 0, 0}, {0, 0, 0}, {0.5, 0.25, 1}};
+            if (cs < 3)
+            {
+              base[3][0] = 0, base[3][1] = -a * crossing_slope[cs][0], base[3][2] = delta;
+              base[4][0] = 1, base[4][1] = a * crossing_slope[cs][1], base[4][2] = delta;
+            }
+            else
+            {
+              base[3][0] = 0.5, base[3][1] = 0, base[3][2] = delta;  // exactly parallel, overlapping
+              base[4][0] = 1.5, base[4][1] = 0, base[4][2] = delta;
+            }
+            double P[6][3];
+            int exact = 1;
+            for (int i = 0; i < 6; ++i) exact &= exact_map(&k_frames[f], tr ? T1 : T0, base[i], P[i]);
+            if (!exact)
+            {
+              skipped++;  // not representable in this frame: the answer would not be known
+              continue;
+            }
+            const double expect = k_frames[f].scale * delta;
+            const double L = diameter((const double(*)[3]) P, 6);
+
+            double c1[3], c2[3];
+            const double ds = sqrt(MFTLClosestPointsOnSegments(P[0], P[1], P[3], P[4], c1, c2));
+            const double A[3][3] = {{P[0][0], P[0][1], P[0][2]}, {P[1][0], P[1][1], P[1][2]}, {P[2][0], P[2][1], P[2][2]}};
+            const double B[3][3] = {{P[3][0], P[3][1], P[3][2]}, {P[4][0], P[4][1], P[4][2]}, {P[5][0], P[5][1], P[5][2]}};
+            double pa[3], pb[3];
+            const double dt = sqrt(MFTLClosestPointsBetweenTriangles(A, B, pa, pb));
+            const double dw = sqrt((pa[0] - pb[0]) * (pa[0] - pb[0]) + (pa[1] - pb[1]) * (pa[1] - pb[1]) + (pa[2] - pb[2]) * (pa[2] - pb[2]));
+
+            worst = fmax(worst, fmax(fabs(ds - expect), fabs(dt - expect)) / (GEOM_EPS * L));
+            TEST_ASSERT(fabs(ds - expect) <= 16.0 * GEOM_EPS * L);
+            TEST_ASSERT(fabs(dt - expect) <= 16.0 * GEOM_EPS * L);
+            /* The witnesses are a pair of points at that distance (they sit at
+             * |T|, so their difference carries the translation's rounding). */
+            TEST_ASSERT(fabs(dw - dt) <= 16.0 * GEOM_EPS * (L + 400.0 * tr));
+            n++;
+          }
+  TEST_ASSERT(n >= 4 * skipped);  // non-vacuity: the exact frames are the bulk
+  printf("[%d configurations (%d not representable), worst %.2f eps*L] ", n, skipped, worst);
+  return 0;
+}
+
+/**
+ * @brief A corner hovering over the interior of a sliver, and over the interior
+ *        of an edge, at an exactly known height.
+ *
+ * Ericson's region weights and the Gram face test both square the sliver's
+ * conditioning: at a gap of 1e-9 a 1:1000 sliver read 6e-5 too far, a 1:1e5 one
+ * 26 times too far, and one at the old 1e-15 threshold lost the face term.
+ */
+static int test_point_face_distance_is_accurate_on_slivers(void)
+{
+  const int width_exp[] = {1, 7, 13, 19, 24, 32, 40};
+  const int gap_exp[] = {4, 12, 20, 28, 36};
+  const int height_exp[] = {1, 4, 12};  // the corner at 2^-h of the sliver's height above its long edge
+  const double T1[3] = {96.0, -160.0, 224.0};
+  double worst = 0.0;
+  int n = 0, skipped = 0;
+
+  for (int f = 0; f < 3; ++f)
+    for (int tr = 0; tr < 2; ++tr)
+      for (size_t iw = 0; iw < sizeof width_exp / sizeof width_exp[0]; ++iw)
+        for (size_t ig = 0; ig < sizeof gap_exp / sizeof gap_exp[0]; ++ig)
+          for (size_t ih = 0; ih < sizeof height_exp / sizeof height_exp[0]; ++ih)
+          {
+            const double w = ldexp(1.0, -width_exp[iw]), delta = ldexp(1.0, -gap_exp[ig]);
+            const double x = 0.3125, y = ldexp(2.0 * w * x, -height_exp[ih]);  // under the edge (0,0)-(1/2,w): height 2 w x
+            const double base[6][3] = {{0, 0, 0}, {1, 0, 0}, {0.5, w, 0}, {x, y, delta}, {x + 0.125, y + 0.0625, delta + 1}, {x - 0.25, y, delta + 0.5}};
+            const double zero[3] = {0.0, 0.0, 0.0};
+            double P[6][3];
+            int exact = 1;
+            for (int i = 0; i < 6; ++i) exact &= exact_map(&k_frames[f], tr ? T1 : zero, base[i], P[i]);
+            if (!exact)
+            {
+              skipped++;
+              continue;
+            }
+            const double expect = k_frames[f].scale * delta;
+            const double L = diameter((const double(*)[3]) P, 6);
+
+            const double S[3][3] = {{P[0][0], P[0][1], P[0][2]}, {P[1][0], P[1][1], P[1][2]}, {P[2][0], P[2][1], P[2][2]}};
+            const double A[3][3] = {{P[3][0], P[3][1], P[3][2]}, {P[4][0], P[4][1], P[4][2]}, {P[5][0], P[5][1], P[5][2]}};
+            double pa[3], pb[3];
+            const double dt = sqrt(MFTLClosestPointsBetweenTriangles(A, S, pa, pb));
+            worst = fmax(worst, fabs(dt - expect) / (GEOM_EPS * L));
+            TEST_ASSERT(fabs(dt - expect) <= 16.0 * GEOM_EPS * L);
+
+            /* The point query takes the face too while the sliver is above its
+             * documented threshold (sin^2 at corner 0 about (2w)^2 > 1e-15). */
+            if (4.0 * w * w > 1e-14)
+            {
+              MFTL_TriangleFeature ft;
+              const double dp = sqrt(MFTLClosestPointOnTriangle(P[3], S, MFTL_NULL, &ft));
+              TEST_ASSERT_EQUAL_INT(MFTL_TRI_FEATURE_FACE, ft);
+              worst = fmax(worst, fabs(dp - expect) / (GEOM_EPS * L));
+              TEST_ASSERT(fabs(dp - expect) <= 16.0 * GEOM_EPS * L);
+            }
+            n++;
+          }
+  TEST_ASSERT(n >= 4 * skipped);  // non-vacuity: the exact frames are the bulk
+  printf("[%d configurations (%d not representable), worst %.2f eps*L] ", n, skipped, worst);
+  return 0;
+}
+
+/** @brief Zero-length segments are points, parallel ones meet their overlap, and
+ *         witnesses at an end are that end bit for bit. */
+static int test_segment_distance_degenerate_cases(void)
+{
+  const double p0[3] = {0.1, 0.2, 0.3}, p1[3] = {1.1, 0.2, 0.3};
+  double c1[3], c2[3];
+
+  /* A point against a segment, both ways round, and a point against a point. */
+  const double q[3] = {0.6, 0.7, 0.3};
+  TEST_ASSERT_EQUAL_DOUBLE(0.25, MFTLClosestPointsOnSegments(p0, p1, q, q, c1, c2), 1e-15);
+  TEST_ASSERT(c2[0] == q[0] && c2[1] == q[1] && c2[2] == q[2]);
+  TEST_ASSERT_EQUAL_DOUBLE(0.25, MFTLClosestPointsOnSegments(q, q, p0, p1, c1, c2), 1e-15);
+  TEST_ASSERT(c1[0] == q[0] && c1[1] == q[1] && c1[2] == q[2]);
+  TEST_ASSERT_EQUAL_DOUBLE(0.0, MFTLClosestPointsOnSegments(q, q, q, q, MFTL_NULL, MFTL_NULL), 0.0);
+
+  /* Parallel and disjoint along their line: end to end, the ends bit-exact. */
+  const double r0[3] = {1.6, 0.2, 0.3}, r1[3] = {2.6, 0.2, 0.3};
+  TEST_ASSERT_EQUAL_DOUBLE(0.25, MFTLClosestPointsOnSegments(p0, p1, r0, r1, c1, c2), 1e-15);
+  TEST_ASSERT(c1[0] == p1[0] && c1[1] == p1[1] && c1[2] == p1[2]);
+  TEST_ASSERT(c2[0] == r0[0] && c2[1] == r0[1] && c2[2] == r0[2]);
+
+  /* Antiparallel and overlapping: the offset, wherever along the overlap. */
+  const double s0[3] = {0.9, 0.2, 0.8}, s1[3] = {0.4, 0.2, 0.8};
+  TEST_ASSERT_EQUAL_DOUBLE(0.25, MFTLClosestPointsOnSegments(p0, p1, s0, s1, c1, c2), 1e-15);
+  return 0;
+}
+
+/* Double-double arithmetic: each value is hi + lo, ~106 bits. */
+typedef struct
+{
+  double hi, lo;
+} geom_dd;
+static geom_dd dd_two_sum(double a, double b)
+{
+  const double s = a + b, bb = s - a;
+  return (geom_dd){s, (a - (s - bb)) + (b - bb)};
+}
+static geom_dd dd_add(geom_dd a, geom_dd b)
+{
+  geom_dd s = dd_two_sum(a.hi, b.hi);
+  const geom_dd t = dd_two_sum(a.lo, b.lo);
+  s.lo += t.hi;
+  s = dd_two_sum(s.hi, s.lo);
+  s.lo += t.lo;
+  return dd_two_sum(s.hi, s.lo);
+}
+static geom_dd dd_sub(geom_dd a, geom_dd b) { return dd_add(a, (geom_dd){-b.hi, -b.lo}); }
+static geom_dd dd_mul(geom_dd a, geom_dd b)
+{
+  const double p = a.hi * b.hi;
+  return dd_two_sum(p, fma(a.hi, b.hi, -p) + (a.hi * b.lo + a.lo * b.hi));
+}
+static geom_dd dd_div(geom_dd a, geom_dd b)
+{
+  const double q1 = a.hi / b.hi;
+  geom_dd r = dd_sub(a, dd_mul((geom_dd){q1, 0.0}, b));
+  const double q2 = r.hi / b.hi;
+  r = dd_sub(r, dd_mul((geom_dd){q2, 0.0}, b));
+  return dd_add(dd_two_sum(q1, q2), (geom_dd){r.hi / b.hi, 0.0});
+}
+static int dd_lt(geom_dd a, geom_dd b) { return a.hi < b.hi || (a.hi == b.hi && a.lo < b.lo); }
+static geom_dd dd_clamp01(geom_dd x)
+{
+  if (dd_lt(x, (geom_dd){0.0, 0.0})) return (geom_dd){0.0, 0.0};
+  if (dd_lt((geom_dd){1.0, 0.0}, x)) return (geom_dd){1.0, 0.0};
+  return x;
+}
+static geom_dd dd_dot(const geom_dd a[3], const geom_dd b[3]) { return dd_add(dd_add(dd_mul(a[0], b[0]), dd_mul(a[1], b[1])), dd_mul(a[2], b[2])); }
+static void dd_cross(const geom_dd a[3], const geom_dd b[3], geom_dd o[3])
+{
+  o[0] = dd_sub(dd_mul(a[1], b[2]), dd_mul(a[2], b[1]));
+  o[1] = dd_sub(dd_mul(a[2], b[0]), dd_mul(a[0], b[2]));
+  o[2] = dd_sub(dd_mul(a[0], b[1]), dd_mul(a[1], b[0]));
+}
+static void dd_diff(const double a[3], const double b[3], geom_dd o[3])
+{
+  for (int k = 0; k < 3; ++k) o[k] = dd_two_sum(a[k], -b[k]);  // exact
+}
+/** @brief |w + s u - t v|^2 in double-double. */
+static geom_dd dd_gap(const geom_dd w[3], const geom_dd u[3], const geom_dd v[3], geom_dd s, geom_dd t)
+{
+  geom_dd acc = {0.0, 0.0};
+  for (int k = 0; k < 3; ++k)
+  {
+    const geom_dd x = dd_sub(dd_add(w[k], dd_mul(s, u[k])), dd_mul(t, v[k]));
+    acc = dd_add(acc, dd_mul(x, x));
+  }
+  return acc;
+}
+/**
+ * @brief Squared segment distance: the minimum over the four sides of the
+ *        parameter square and the interior stationary point -- a complete cover
+ *        that needs no clamping cascade.
+ */
+static geom_dd dd_segments(const double p0[3], const double p1[3], const double q0[3], const double q1[3])
+{
+  geom_dd u[3], v[3], w[3], n[3], vw[3], uw[3];
+  dd_diff(p1, p0, u);
+  dd_diff(q1, q0, v);
+  dd_diff(p0, q0, w);
+  const geom_dd a = dd_dot(u, u), b = dd_dot(u, v), c = dd_dot(v, v), d = dd_dot(u, w), e = dd_dot(v, w);
+  const geom_dd zero = {0.0, 0.0}, one = {1.0, 0.0};
+  geom_dd best = dd_gap(w, u, v, zero, zero);
+  geom_dd cand;
+  if (a.hi > 0.0)
+  {
+    cand = dd_gap(w, u, v, dd_clamp01(dd_div(dd_sub(zero, d), a)), zero);
+    if (dd_lt(cand, best)) best = cand;
+    cand = dd_gap(w, u, v, dd_clamp01(dd_div(dd_sub(b, d), a)), one);
+    if (dd_lt(cand, best)) best = cand;
+  }
+  if (c.hi > 0.0)
+  {
+    cand = dd_gap(w, u, v, zero, dd_clamp01(dd_div(e, c)));
+    if (dd_lt(cand, best)) best = cand;
+    cand = dd_gap(w, u, v, one, dd_clamp01(dd_div(dd_add(e, b), c)));
+    if (dd_lt(cand, best)) best = cand;
+  }
+  dd_cross(u, v, n);
+  const geom_dd D = dd_dot(n, n);
+  if (D.hi > 0.0)
+  {
+    dd_cross(v, w, vw);
+    dd_cross(u, w, uw);
+    const geom_dd s = dd_div(dd_dot(n, vw), D), t = dd_div(dd_dot(n, uw), D);
+    if (!dd_lt(s, zero) && !dd_lt(one, s) && !dd_lt(t, zero) && !dd_lt(one, t))
+    {
+      cand = dd_gap(w, u, v, s, t);
+      if (dd_lt(cand, best)) best = cand;
+    }
+  }
+  return best;
+}
+/** @brief Squared height of @p p over the triangle's plane if it projects
+ *         strictly inside, else a huge value (sub-triangle orientations). */
+static geom_dd dd_face(const double p[3], const double T[3][3])
+{
+  geom_dd e0[3], e1[3], ap[3], bp[3], cp[3], n[3], c0[3], c1[3], c2[3];
+  dd_diff(T[1], T[0], e0);
+  dd_diff(T[2], T[0], e1);
+  dd_diff(p, T[0], ap);
+  dd_diff(p, T[1], bp);
+  dd_diff(p, T[2], cp);
+  dd_cross(e0, e1, n);
+  const geom_dd nn = dd_dot(n, n);
+  const geom_dd far = {1e300, 0.0};
+  if (!(nn.hi > 0.0)) return far;
+  dd_cross(bp, cp, c0);
+  dd_cross(cp, ap, c1);
+  dd_cross(ap, bp, c2);
+  if (!(dd_dot(n, c0).hi > 0.0 && dd_dot(n, c1).hi > 0.0 && dd_dot(n, c2).hi > 0.0)) return far;
+  const geom_dd h = dd_dot(n, ap);
+  return dd_div(dd_mul(h, h), nn);
+}
+static double dd_triangles(const double A[3][3], const double B[3][3])
+{
+  geom_dd best = {1e300, 0.0};
+  for (int i = 0; i < 3; ++i)
+  {
+    for (int j = 0; j < 3; ++j)
+    {
+      const geom_dd c = dd_segments(A[i], A[(i + 1) % 3], B[j], B[(j + 1) % 3]);
+      if (dd_lt(c, best)) best = c;
+    }
+    geom_dd c = dd_face(A[i], B);
+    if (dd_lt(c, best)) best = c;
+    c = dd_face(B[i], A);
+    if (dd_lt(c, best)) best = c;
+  }
+  return sqrt(best.hi + best.lo);
+}
+
+/**
+ * @brief Random general position -- rotated, scaled from 1e-6 to 1e3, offset up
+ *        to 1e4 L -- for near-parallel edges (angles 1e-16 to 1e-1, the crossing
+ *        inside or beyond the ends) and corners over slivers (1:3 to 1:1e12),
+ *        against the double-double reference.
+ */
+static int test_triangle_distance_matches_a_double_double_reference(void)
+{
+  unsigned seed = 4242u;
+  double worst = 0.0;
+  int n = 0;
+  for (int trial = 0; trial < 20000; ++trial)
+  {
+    /* A random rotation from a random unit quaternion. */
+    double q[4], qn = 0.0;
+    for (int i = 0; i < 4; ++i) q[i] = cp_rand(&seed, -1.0, 1.0), qn += q[i] * q[i];
+    qn = sqrt(qn);
+    const double qa = q[0] / qn, qb = q[1] / qn, qc = q[2] / qn, qd = q[3] / qn;
+    const double R[3][3] = {{qa * qa + qb * qb - qc * qc - qd * qd, 2 * (qb * qc - qa * qd), 2 * (qb * qd + qa * qc)},
+                            {2 * (qb * qc + qa * qd), qa * qa - qb * qb + qc * qc - qd * qd, 2 * (qc * qd - qa * qb)},
+                            {2 * (qb * qd - qa * qc), 2 * (qc * qd + qa * qb), qa * qa - qb * qb - qc * qc + qd * qd}};
+    const double L = pow(10.0, cp_rand(&seed, -6.0, 3.0));
+    const double off = (trial % 2) ? pow(10.0, cp_rand(&seed, 0.0, 4.0)) * L : 0.0;
+    double T[3];
+    for (int k = 0; k < 3; ++k) T[k] = off * cp_rand(&seed, -0.5, 0.5);
+
+    double base[6][3];
+    const double gap = pow(10.0, cp_rand(&seed, -14.0, -1.0));
+    if (trial % 4 < 2)
+    {
+      const double ang = pow(10.0, cp_rand(&seed, -16.0, -1.0)), xs = cp_rand(&seed, -0.3, 1.3), ts = cp_rand(&seed, 0.0, 1.0);
+      const double la = cp_rand(&seed, 0.5, 1.5), lb = cp_rand(&seed, 0.5, 1.5);
+      /* One draw per statement: initializer-list order is unsequenced in C. */
+      const double ax = cp_rand(&seed, 0, 0.3), ay = cp_rand(&seed, 0, 0.1), az = cp_rand(&seed, 0.5, 1.5);
+      const double bx = cp_rand(&seed, 0, 0.3), by = cp_rand(&seed, 0, 0.1), bz = cp_rand(&seed, 0.5, 1.5);
+      const double b[6][3] = {
+          {-la * xs, 0, 0},  {la * (1 - xs), 0, 0}, {ax, ay, -az}, {-lb * ts, -lb * ts * ang, gap}, {lb * (1 - ts), lb * (1 - ts) * ang, gap},
+          {bx, by, gap + bz}};
+      memcpy(base, b, sizeof base);
+    }
+    else
+    {
+      const double w = pow(10.0, cp_rand(&seed, -12.0, -0.5)), x = cp_rand(&seed, 0.0, 1.0), apex = cp_rand(&seed, 0.2, 0.8);
+      const double y = cp_rand(&seed, -0.2, 1.2) * w * fmin(x / apex, (1 - x) / (1 - apex));
+      const double z1 = cp_rand(&seed, 0.5, 1.5), z2 = cp_rand(&seed, 0.5, 1.5);
+      const double b[6][3] = {{0, 0, 0}, {1, 0, 0}, {apex, w, 0}, {x, y, gap}, {x + 0.1, y + 0.1, gap + z1}, {x - 0.2, y, gap + z2}};
+      memcpy(base, b, sizeof base);
+    }
+    double P[6][3];
+    for (int i = 0; i < 6; ++i)
+      for (int k = 0; k < 3; ++k) P[i][k] = T[k] + L * (R[k][0] * base[i][0] + R[k][1] * base[i][1] + R[k][2] * base[i][2]);
+    const double A[3][3] = {{P[0][0], P[0][1], P[0][2]}, {P[1][0], P[1][1], P[1][2]}, {P[2][0], P[2][1], P[2][2]}};
+    const double B[3][3] = {{P[3][0], P[3][1], P[3][2]}, {P[4][0], P[4][1], P[4][2]}, {P[5][0], P[5][1], P[5][2]}};
+    if (MFTL_TriTriIntersect(A, B)) continue;  // rounding can close a gap below its own size
+
+    const double diam = diameter((const double(*)[3]) P, 6);
+    double pa[3], pb[3];
+    const double err = fabs(sqrt(MFTLClosestPointsBetweenTriangles(A, B, pa, pb)) - dd_triangles(A, B)) / (GEOM_EPS * diam);
+    worst = fmax(worst, err);
+    TEST_ASSERT(err <= 16.0);
+    n++;
+  }
+  TEST_ASSERT(n > 19000);  // non-vacuity: nearly every pair was disjoint and measured
+  printf("[%d pairs, worst %.2f eps*L] ", n, worst);
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
@@ -859,6 +1289,10 @@ int main(int argc, char **argv)
   RUN_TEST(test_closest_point_on_degenerate_triangles);
   RUN_TEST(test_closest_point_is_scale_and_translation_invariant);
   RUN_TEST(test_a_point_on_the_triangle_is_at_distance_zero);
+  RUN_TEST(test_segment_distance_is_accurate_at_every_angle);
+  RUN_TEST(test_point_face_distance_is_accurate_on_slivers);
+  RUN_TEST(test_segment_distance_degenerate_cases);
+  RUN_TEST(test_triangle_distance_matches_a_double_double_reference);
 
   TEST_REPORT();
 

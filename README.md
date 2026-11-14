@@ -65,9 +65,11 @@ Doxygen manual with call graphs, rebuilt from `main` on every push.
 - **Breakup and coalescence that do not depend on the process count.** Events are detected from opposing triangles,
   the affected bodies are reconstructed by marching cubes on a union signed-distance field, and the surface agrees
   with the single-rank reconstruction to 1e-12 at 1 to 27 ranks.
-- **Exact contact detection.** An LBVH over Morton codes with an explicit-stack dual traversal, Shewchuk's adaptive
-  orientation predicate and an exact Guigue–Devillers triangle test, behind a broad phase derived from body extents
-  rather than all pairs, and a spatial halo that finds contacts across ranks and periodic seams.
+- **Contact detection with an exact intersection test.** An LBVH over Morton codes with an explicit-stack dual
+  traversal, Shewchuk's adaptive orientation predicate behind every intersection decision (Guigue–Devillers, coplanar
+  and zero-area pairs alike) and triangle distances to rounding at every angle and aspect ratio, behind a broad phase
+  derived from body extents rather than all pairs, and a spatial halo that finds contacts across ranks and periodic
+  seams.
 - **Coupling to a flow solver.** Interpolation from, and spreading onto (its exact transpose), a solver's lattice or
   point cloud with Peskin-type kernels corrected to linear exactness. Coverage is proved by counting indices, never
   assumed; a missing sample is reported, not renormalised away.
@@ -233,7 +235,7 @@ mpirun -n 4 ./build/leveque_remeshing_parallel
 
 # open surfaces with breakup and coalescence
 mpirun -n 4 ./build/liquid_jet_open_surface 2 2 1 --sectors 24 --length 24 --eps 0.1 --weber 2 --require-breakup
-mpirun -n 4 ./build/rayleigh_taylor_open_surface --roll 1.7 --growth 1.4 --require-topology
+mpirun -n 4 ./build/rayleigh_taylor_open_surface --roll 1.7 --growth 1.5 --require-topology
 
 # interface advected by a solver's velocity field through the coupler
 mpirun -n 2 ./build/leveque_coupled_cartesian -n 16,32 -steps 75 -verify

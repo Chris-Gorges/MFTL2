@@ -143,7 +143,7 @@ The pairs come from `MFTLEnsembleIntersectObjects` with `self_pairs` set — the
 existing distributed contact pipeline, with its halo, its broad phase and its
 ownership rule (a pair is reported by the owner of its A-side triangle) — and the
 opposing-normal test runs as a `pair_filter` BEFORE the narrow phase, since
-`MFTL_TriTriProximity` costs 176 ns per pair (@ref mftl_mod_bvh) against one dot
+`MFTL_TriTriProximity` costs 244 ns per pair (@ref mftl_mod_bvh) against one dot
 product, and most candidate pairs on a curved surface are
 neighbours facing the same way. The A-side tree is built with a zero
 envelope (the B side carries the whole $\max\delta$), which took the candidates from

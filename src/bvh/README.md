@@ -8,15 +8,15 @@
 |---|---|
 | `bvh_build.c` | primitive access, Morton keys, radix split, bottom-up fit, refit-only path |
 | `bvh_traverse.c` | dual-tree traversal over an explicit stack, batched leaf phase, the ensemble pipeline |
-| `bvh_predicates.c` | Shewchuk-adaptive `orient3d`, Guigue–Devillers overlap, exact triangle–triangle distance |
+| `bvh_predicates.c` | Shewchuk-adaptive `orient3d`, exact triangle–triangle intersection (Guigue–Devillers, coplanar, zero-area), the distance terms' entry points |
 | `bvh_internal.h` | outward float rounding, box overlap, the two module-private build entry points |
 
 @warning `bvh_predicates.c` **must** be compiled with `-ffp-contract=off` (set in
          `CMakeLists.txt`); see @ref bvh_fma.
 
 Contact detection is a **broad phase** (a tree of boxes: which triangle pairs
-deserve an exact test), a **narrow phase** (exact predicates: are they within
-the envelope), and, on a distributed mesh, the **spatial halo**
+deserve a closer look), a **narrow phase** (do they intersect — decided by exact
+signs — or is their distance, accurate to rounding, within the envelope), and, on a distributed mesh, the **spatial halo**
 (@ref mftl_mod_communication) that brings the other side of a cross-rank contact to the
 rank that must report it.
 
@@ -313,15 +313,16 @@ SIMD narrow phase, which would change that one function. It is scalar today.
 distance is at most $\tau$:
 
 ```
-MFTL_TriTriIntersect ─▶ 1 ?  yes ─▶ contact
+MFTL_TriTriIntersect ─▶ 1 ?  yes ─▶ contact                      (exact)
           │ no
-          └─ τ > 0 and  min over 9 edge–edge and 6 point–face  d² ≤ τ² ─▶ contact
+          └─ τ > 0 and  min over 9 edge–edge and 6 point–face  d² ≤ τ² ─▶ contact   (to rounding)
 ```
 
 The intersection test must come first: an edge piercing the interior of the
 other face has positive distance to every edge and vertex, so the fifteen
 distance terms cannot see it. Measured: 31 ns/pair for the intersection test,
-176 ns/pair for the full proximity test.
+244 ns/pair for the full proximity test (176 ns before the distance terms were
+made accurate to rounding, @ref bvh_distance).
 
 ### The orientation predicate {#bvh_orient}
 
@@ -369,18 +370,57 @@ triangles intersect iff the intervals overlap, which two more orientation signs
 decide: no division, no constructed point.
 -->
 
-### The coplanar case {#bvh_coplanar}
+### Pairs Guigue–Devillers cannot take {#bvh_coplanar}
 
-Reached only when all six predicates are exactly zero. The pair is projected by
-dropping the axis $k^\ast = \arg\max_k |n_k|$ of A's normal — the projection with
-the largest area ratio $|n_k|/\lVert\mathbf n\rVert$, hence the best
-conditioned — and tested completely in 2D: nine segment crossings, plus one
-corner of each triangle tested for containment in the other (if no boundaries
-cross, the triangles are disjoint or nested). The 2D determinant is plain, not
-adaptive; `MFTL_TriTriProximity`'s distance test resolves a coplanar pair within
-$\tau$ regardless.
+Guigue–Devillers assumes two proper triangles in distinct planes. Three exact
+zeros among $d_{p_1}, d_{q_1}, d_{r_1}$ (or among B's) mean that is not the
+case: A lies in B's plane — or B has zero area, because every point is "in" the
+plane of a degenerate triangle. Those pairs are recognised before the dispatch
+and decided by exact signs as well:
 
-### Exact distance between disjoint triangles {#bvh_distance}
+| Pair | Test |
+|---|---|
+| two proper triangles, coplanar | 2D, in a coordinate projection |
+| a zero-area triangle and a proper one | the segment it spans crossing the triangle; in its plane, 2D |
+| two zero-area triangles | two segments: disjoint unless coplanar, then 2D |
+
+**Zero area is decided exactly**: three points are collinear iff all three
+coordinate projections have zero signed area. The hull of collinear corners is
+the segment between the extremes along any axis on which they differ. A segment
+$[\mathbf s_0, \mathbf s_1]$ that is not in a proper triangle's plane and does
+not have both ends strictly on one side of it meets the plane in one point $X$;
+$\operatorname{orient3d}(\mathbf t_i, \mathbf t_{i+1}, \mathbf s_1, \mathbf s_0)$
+does not depend on where along the segment's line it is evaluated, equals
+$(\mathbf s_1-\mathbf s_0)\cdot\mathbf n$ times the in-plane orientation of $X$
+against edge $i$, and $X$ is in the closed triangle iff the three signs are not
+mixed.
+
+**The 2D test** covers hulls of any shape (a triangle, a segment, a point): two
+closed convex sets meet iff their boundaries do — nine segment pairs, each by
+strict crossing or an endpoint on the other segment (a zero orientation and its
+bounding box) — or one contains the other, possible only in a hull of non-zero
+area and tested with one corner. The 18 edge orientations serve both. **The 2D
+orientation is exact**: $\operatorname{orient2d}(a,b,c)$ is
+$-\operatorname{orient3d}$ of $(a,0)$, $(b,0)$, $(c,0)$ against $(c,1)$, the same
+determinant, so its sign is Shewchuk's. A plain 2D determinant rounded a small
+orientation to zero, took a corner a rounding error off an edge to be on it, and
+reported two disjoint triangles as touching, at distance zero
+(`test_coplanar_triangles_are_decided_exactly`).
+
+**Which projection.** Dropping an axis preserves intersection, and preserves
+disjointness when it is one-to-one on the common plane — certified exactly by a
+projected triangle of non-zero area. Some axis is one-to-one on the plane (on the
+line, if everything is collinear), so: a disjoint projection proves disjoint, a
+certified one proves intersecting, and three intersecting uncertified projections
+prove intersecting. The axis the larger normal is most aligned with goes first,
+so a proper coplanar pair costs one projection.
+
+Before, a zero-area triangle fell through to a 2D test in an arbitrary projection
+with its zero normal: a point five units away was reported as intersecting, and
+two collinear triangles a unit apart as touching
+(`test_zero_area_triangles_are_segments`).
+
+### Distance between disjoint triangles, to rounding {#bvh_distance}
 
 The distance between two disjoint closed triangles is attained between two edges
 or between a vertex and the interior of the other face, so
@@ -390,36 +430,43 @@ d^2(T_A,T_B) = \min\Bigl( \min_{i,j} d^2_\text{ee}(e^A_i, e^B_j),\
 \min_i d^2_\text{pf}(a_i, T_B),\ \min_i d^2_\text{pf}(b_i, T_A) \Bigr)
 $$
 
-is exact. **Edge–edge:** with $\mathbf u = P_1-P_0$, $\mathbf v = Q_1-Q_0$,
-$\mathbf w = P_0-Q_0$, $a = \mathbf u\cdot\mathbf u$, $b = \mathbf u\cdot\mathbf v$,
-$c = \mathbf v\cdot\mathbf v$, $d = \mathbf u\cdot\mathbf w$,
-$e = \mathbf v\cdot\mathbf w$, the stationary point of
-$\lVert P_0 + s\mathbf u - Q_0 - t\mathbf v\rVert^2$ solves a $2\times2$ system
-with Gram determinant $D = ac-b^2$; $s$ is clamped to $[0,1]$, $t$ recomputed
-and clamped, and $s$ recomputed if $t$ was clamped, which gives the exact
-minimum over the unit square. **Point–face:** the barycentric
-coordinates of the orthogonal projection come from the same Gram system; if the
-projection falls outside the triangle the routine returns `MFTL_DBL_MAX`, since
-the boundary is covered by the edge–edge terms.
+is a complete cover. The terms are `MFTLClosestPointsBetweenTriangles`
+(src/geometry/, @ref geom_closest_accuracy), the routine topology detection reads
+its witnesses from, so contact and topology change agree on what a gap is.
+Each term is a small least-squares problem, and it is NOT solved through its
+$2\times2$ normal equations: the Gram determinant $D = ac-b^2$ of two edges at an
+angle $\theta$ cancels to a relative error $\varepsilon/\sin^2\theta$, and a
+"parallel" threshold $D \le 10^{-15}ac$ then pinned the parameter to an end. At
+an angle of $2\cdot10^{-8}$ a gap of $10^{-9}$ read as $10^{-8}$, and a query at
+tolerance $2\cdot10^{-9}$ reported no contact; a corner over a 1:1000 sliver read
+$6\cdot10^{-5}$ too far, over a 1:$10^5$ one 26 times
+(`test_nearly_parallel_edges_are_in_contact`; in `tests/test_geometry.c`
+`test_point_face_distance_is_accurate_on_slivers` and the double-double
+reference). With the determinant written as
+$|\mathbf u\times\mathbf v|^2$, triple-product numerators and a frame
+orthogonalised on a triangle's longest edge, the error is at most
+$1.5\,\varepsilon L$ over $2\times10^5$ random near-parallel and sliver pairs in
+general position ($L$ the pair's diameter), against $10^{10}\varepsilon L$
+before. The intersection verdict is exact; the distance is a few ulps of $L$, so
+only a gap within rounding of the tolerance can go either way.
 
-#### Degeneracy tests are dimensionless {#bvh_dimensionless}
+#### No absolute thresholds {#bvh_dimensionless}
 
 $D$ has units of length⁴, so an absolute guard (`D < 1e-12`) fired for every
 triangle of a mesh at 20 µm and silently removed all point–face terms — exactly
-the vertex-into-face configuration of a resolved contact. The guards compare
-
-$$
-\frac{D}{ac} = 1-\cos^2\theta = \sin^2\theta ,
-$$
-
-which means the same at every length scale.
+the vertex-into-face configuration of a resolved contact. The terms now have no
+threshold at all: a segment is a point only at exactly zero length, two segments
+are parallel only at $\mathbf u\times\mathbf v = \mathbf 0$, and a triangle loses
+its face term only when its corners are numerically collinear.
 
 ### Why only orient3d is adaptive {#bvh_adaptive}
 
-It is the only predicate whose **sign** decides the answer; a wrong sign takes a
-branch for a configuration that does not exist and typically reports a clean
-miss for crossing triangles. Distances and interval endpoints degrade
-continuously and only move decisions sitting on the tolerance. The determinant
+It is the only predicate whose **sign** decides the answer (the 2D orientations
+are this predicate on lifted points); a wrong sign takes a branch for a
+configuration that does not exist and typically reports a clean miss for
+crossing triangles. Distances degrade continuously and only move decisions
+sitting on the tolerance — once they are computed without the normal equations
+(@ref bvh_distance). The determinant
 is ill-conditioned exactly where this library works: thin films (four points
 coplanar to within the gap) and small features at large coordinates (the
 differences cancel the offset).
@@ -483,7 +530,7 @@ adaptive result as exact reference):
 The adaptive form costs 3.66 ns against 1.83 ns in general position (40 ns only
 for exactly coplanar input). A thin-film model works at gaps of $10^{-6}$ to
 $10^{-9}$ of the body size, where the plain form would almost surely be right;
-the adaptive one is kept because it costs at most 6.2 % of a
+the adaptive one is kept because it costs at most 4.5 % of a
 `MFTL_TriTriProximity` call and removes a **silent** failure.
 `MFTL_Orient3DFast` is the plain form.
 
@@ -501,7 +548,7 @@ and there is no BVH section in `docs/analysis.md` yet.
 | fit / refit | $O(\text{nodes} + n)$, three linear scans |
 | periodic images | ≤ 27 root-box tests |
 | `MFTL_TriTriIntersect` | 3–8 `orient3d`; **31 ns/pair** |
-| `MFTL_TriTriProximity` | the above + 15 distance terms; **176 ns/pair** |
+| `MFTL_TriTriProximity` | the above + 15 distance terms; **244 ns/pair** (176 with the normal-equation terms) |
 
 **Memory:** 32 B per node with $2n$ nodes reserved (64 B/primitive, about
 16 B/primitive used at `leaf_size` 4), plus 4 B/primitive of `prim_indices`.

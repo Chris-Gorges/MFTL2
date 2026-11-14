@@ -446,34 +446,73 @@ typedef enum MFTL_TriangleFeature
 /**
  * @brief Closest point of a (closed, solid) triangle to a point, and its feature.
  *
- * Ericson's region test (*Real-Time Collision Detection*, §5.1.5): six dot
- * products select one of the seven Voronoi regions and only that region's
- * formula is evaluated; corners are returned bit-exactly. A triangle with
- * \f$|\vect{ab}\times\vect{ac}|^2 \le 10^{-15}|\vect{ab}|^2|\vect{ac}|^2\f$
- * (a scale-free \f$\sin^2\f$ test) has no face region and is answered as the
- * nearest of its three edges.
+ * Ericson's region test (*Real-Time Collision Detection*, §5.1.5): dot products
+ * select one of the seven Voronoi regions and only that region's formula is
+ * evaluated; corners are returned bit-exactly. The three "which side of an
+ * edge's line" decisions and the face point come from a frame orthogonalised on
+ * the longest edge (src/geometry/README.md, @ref geom_closest_accuracy), not
+ * from Ericson's 2x2 determinants of dot products, so the distance is accurate
+ * to rounding -- a few ulps of the triangle's size -- however thin the triangle.
+ *
+ * A triangle with \f$|\vect{ab}\times\vect{ac}|^2 \le 10^{-15}|\vect{ab}|^2|\vect{ac}|^2\f$
+ * (a scale-free \f$\sin^2\f$ test at corner 0) has no face region and is
+ * answered as the nearest of its three edges: its face normal, which a signed
+ * distance would read, is not trustworthy there. That answer can exceed the
+ * true distance by up to the triangle's height over its longest edge, at most
+ * \f$\sqrt{10^{-15}}\f$ of its two edges at corner 0;
+ * MFTLClosestPointsBetweenTriangles() has no such threshold.
  *
  * @param      p       Query point.
  * @param      tri     The three corners, in one periodic image (the caller
  *                     applies any minimum-image shift).
  * @param[out] closest The closest point, or #MFTL_NULL.
  * @param[out] feature Its feature, or #MFTL_NULL.
- * @return The SQUARED distance from @p p to the triangle.
+ * @return The SQUARED distance from @p p to the triangle, evaluated from local
+ *         differences (not from @p closest), so it keeps its accuracy far from
+ *         the origin.
  *
  * @rank_local Pure function.
  */
 double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], double closest[3], MFTL_TriangleFeature *feature);
 
 /**
+ * @brief Closest points of two closed segments, and their squared distance.
+ *
+ * The stationary point of \f$\lVert P_0 + s\vect{u} - Q_0 - t\vect{v}\rVert^2\f$
+ * by Cramer's rule with the determinant written as \f$|\vect{u}\times\vect{v}|^2\f$
+ * and the numerator as a triple product, then Ericson's clamping cascade
+ * (§5.1.9). The Gram form \f$ac - b^2\f$ cancels catastrophically for nearly
+ * parallel segments and is not used; nor is a parallelism threshold. The
+ * distance is accurate to rounding (a few ulps of the configuration's size) at
+ * every angle, and a zero-length segment is a point. This is the one
+ * segment-segment routine of the library: MFTLClosestPointsBetweenTriangles()
+ * and the contact predicates (MFTL_TriTriProximity()) both use it.
+ *
+ * @param      p0 First endpoint of segment P.
+ * @param      p1 Second endpoint of segment P.
+ * @param      q0 First endpoint of segment Q.
+ * @param      q1 Second endpoint of segment Q.
+ * @param[out] c1 The witness on P (an endpoint bit-exactly), or #MFTL_NULL.
+ * @param[out] c2 The witness on Q, or #MFTL_NULL.
+ * @return The squared distance, evaluated from local differences.
+ * @rank_local Pure function.
+ */
+double MFTLClosestPointsOnSegments(const double p0[3], const double p1[3], const double q0[3], const double q1[3], double c1[3], double c2[3]);
+
+/**
  * @brief Closest points of two DISJOINT closed triangles, and their squared
  *        distance.
  *
- * The minimum is attained at a corner of one triangle against the other or
- * between two edges; all fifteen candidates are evaluated, the corners with
- * MFTLClosestPointOnTriangle(), the edges with Ericson's segment-segment
- * closest points (§5.1.9) made scale-free. When several pairs are equally close
- * -- two parallel faces -- the first in a fixed order is returned, so the result
- * is a pure function of the arguments.
+ * The minimum is attained between two edges or at a corner of one triangle over
+ * the interior of the other: nine MFTLClosestPointsOnSegments() terms and six
+ * orthogonal projections (in the frame of MFTLClosestPointOnTriangle(), but with
+ * no sliver threshold -- a triangle is skipped as a face only when its corners
+ * are numerically collinear, and its edges then cover it). The distance is
+ * accurate to rounding for every shape, including slivers and zero-area
+ * triangles. When several pairs are equally close -- two parallel faces -- the
+ * first in a fixed order is returned, so the result is a pure function of the
+ * arguments. MFTL_TriTriDistanceSq() and MFTL_TriTriProximity() are this
+ * function behind MFTL_TriTriIntersect().
  *
  * For triangles that INTERSECT the result is the closest pair of boundary
  * points, not zero: test MFTL_TriTriIntersect() first when that matters.
@@ -482,7 +521,7 @@ double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], dou
  * @param      B  Corners of the second, in the same periodic image.
  * @param[out] pa The witness on @p A.
  * @param[out] pb The witness on @p B.
- * @return \f$|p_b - p_a|^2\f$.
+ * @return \f$|p_b - p_a|^2\f$, evaluated from local differences.
  * @rank_local Pure function.
  */
 double MFTLClosestPointsBetweenTriangles(const double A[3][3], const double B[3][3], double pa[3], double pb[3]);

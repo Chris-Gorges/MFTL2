@@ -19,6 +19,7 @@
  *       the new fast path, which is only useful if it is not a shortcut.
  */
 
+#include <float.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -335,6 +336,254 @@ static int test_point_face_distance_works_at_millimetre_scale(void)
   const double rel_small = MFTL_TriTriDistanceSq(flat, above) / (s * s);
   const double rel_big = MFTL_TriTriDistanceSq(flatS, aboveS) / (S * S);
   TEST_ASSERT_EQUAL_DOUBLE(rel_big, rel_small, 1e-9);
+  return 0;
+}
+
+/**
+ * @brief Two triangles whose nearest features are edges at a tiny angle: the
+ *        distance is exactly the gap, and contact is declared from both sides of
+ *        it.
+ *
+ * A lies in y = 0 below z = 0, B above z = gap, and their edges at z = 0 and
+ * z = gap cross in projection, so the distance is exactly the gap. The Gram
+ * determinant ac - b^2 lost the angle to cancellation and a 1e-15 "parallel"
+ * threshold then pinned the parameter to an end: at an angle of 2e-8 a 1e-9 gap
+ * read as 1e-8 and a query at tolerance 2e-9 reported no contact.
+ */
+static int test_nearly_parallel_edges_are_in_contact(void)
+{
+  const double gaps[] = {1e-3, 1e-6, 1e-9, 1e-12};
+  for (size_t g = 0; g < sizeof gaps / sizeof gaps[0]; ++g)
+    for (int k = 2; k <= 15; ++k)
+    {
+      const double gap = gaps[g], a = pow(10.0, -k);
+      const double A[3][3] = {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, {0.5, 0.0, -1.0}};
+      const double B[3][3] = {{0.0, -a, gap}, {1.0, a, gap}, {0.5, 0.0, 1.0}};
+      TEST_ASSERT_EQUAL_INT(0, MFTL_TriTriIntersect(A, B));
+      TEST_ASSERT_EQUAL_DOUBLE(gap, sqrt(MFTL_TriTriDistanceSq(A, B)), 8.0 * DBL_EPSILON);
+      TEST_ASSERT_EQUAL_INT(1, MFTL_TriTriProximity(A, B, gap * (1.0 + 1e-3)));
+      TEST_ASSERT_EQUAL_INT(0, MFTL_TriTriProximity(A, B, gap * (1.0 - 1e-3)));
+    }
+  return 0;
+}
+
+/** @brief Exact 2D orientation of integer points. */
+static long long iorient2(const long long a[2], const long long b[2], const long long c[2])
+{
+  return (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+}
+
+/**
+ * @brief Independent reference: two PROPER integer triangles in the plane are
+ *        disjoint iff a line through an edge of one has the other strictly on
+ *        its far side (the separating axis theorem; exact in 64-bit integers).
+ */
+static int iref_intersect_2d(const long long P[3][2], const long long Q[3][2])
+{
+  for (int s = 0; s < 2; ++s)
+  {
+    const long long(*X)[2] = s ? Q : P, (*Y)[2] = s ? P : Q;
+    const long long side = (iorient2(X[0], X[1], X[2]) > 0) ? 1 : -1;
+    for (int i = 0; i < 3; ++i)
+    {
+      int beyond = 1;
+      for (int j = 0; j < 3; ++j)
+        if (side * iorient2(X[i], X[(i + 1) % 3], Y[j]) >= 0) beyond = 0;
+      if (beyond) return 0;
+    }
+  }
+  return 1;
+}
+
+/** @brief A small LCG for the integer cases. */
+static long long irand(unsigned *state, long long lo, long long hi)
+{
+  *state = *state * 1664525u + 1013904223u;
+  return lo + (long long) ((*state >> 8) % (unsigned) (hi - lo + 1));
+}
+
+/**
+ * @brief Coplanar pairs are decided by exact signs.
+ *
+ * (1) A corner of B a rounding error off an edge of A: p = (fl(3 s), s) beside
+ * the edge (0,0) -> (3,1) is on the side of 3 s - fl(3 s), which fma gives
+ * exactly. The plain 2D determinant computed fl(3 s) - fl(3 s) = 0, took the
+ * corner to be ON the edge and reported two disjoint triangles as touching, at
+ * distance zero. Repeated in each coordinate plane, so every projection axis is
+ * taken. (2) Random integer triangles in the tilted plane z = x + 2y, one corner
+ * placed on or next to an edge of the other, against the separating-axis
+ * reference.
+ */
+static int test_coplanar_triangles_are_decided_exactly(void)
+{
+  unsigned seed = 2026u;
+  int n_off = 0, n_on = 0;
+  for (int trial = 0; trial < 3000; ++trial)
+  {
+    const double s = (trial % 10 == 0) ? (double) irand(&seed, 1, 1023) / 1024.0 : 0.05 + 0.9 * (double) irand(&seed, 0, 1 << 30) / (double) (1 << 30);
+    const double px = 3.0 * s;
+    const double r = fma(3.0, s, -px);  // orient2d((0,0), (3,1), p) = 3 s - fl(3 s), exactly
+    const double side = (r > 0.0) ? 1.0 : (r < 0.0) ? -1.0 : 1.0;
+    if (r != 0.0)
+      n_off++;
+    else
+      n_on++;
+    const double nrm[2] = {-1.0, 3.0};  // orient2d((0,0), (3,1), nrm) = 10 > 0
+    const double a2[3][2] = {{0.0, 0.0}, {3.0, 1.0}, {1.5 - side * nrm[0], 0.5 - side * nrm[1]}};
+    const double b2[3][2] = {{px, s}, {px + side * nrm[0], s + side * nrm[1]}, {px + side * nrm[0] + 0.5, s + side * nrm[1] + 0.25}};
+    for (int axis = 0; axis < 3; ++axis)
+    {
+      double A[3][3], B[3][3];
+      for (int c = 0; c < 3; ++c)
+      {
+        A[c][axis] = 0.0, A[c][(axis + 1) % 3] = a2[c][0], A[c][(axis + 2) % 3] = a2[c][1];
+        B[c][axis] = 0.0, B[c][(axis + 1) % 3] = b2[c][0], B[c][(axis + 2) % 3] = b2[c][1];
+      }
+      TEST_ASSERT_EQUAL_INT((r == 0.0) ? 1 : 0, MFTL_TriTriIntersect(A, B));
+      TEST_ASSERT_EQUAL_INT((r == 0.0) ? 1 : 0, MFTL_TriTriIntersect(B, A));
+      /* The gap, |r| / |(3,1)|, is below the coordinates' rounding: the distance
+       * is that to rounding (it may be 0); the contact verdict at zero tolerance
+       * is the exact predicate's. */
+      TEST_ASSERT(sqrt(MFTL_TriTriDistanceSq(A, B)) <= fabs(r) + 16.0 * DBL_EPSILON);
+      TEST_ASSERT_EQUAL_INT((r == 0.0) ? 1 : 0, MFTL_TriTriProximity(A, B, 0.0));
+    }
+  }
+  printf("[%d corners off the edge, %d on it] ", n_off, n_on);
+  TEST_ASSERT(n_off > 1000 && n_on > 300);  // both outcomes exercised
+
+  int n_hit = 0, n_miss = 0;
+  for (int trial = 0; trial < 20000; ++trial)
+  {
+    const long long R = 1 << 20;
+    long long P[3][2], Q[3][2];
+    do
+      for (int c = 0; c < 3; ++c) P[c][0] = irand(&seed, -R, R), P[c][1] = irand(&seed, -R, R);
+    while (iorient2(P[0], P[1], P[2]) == 0);
+    /* Q's first corner on or beside an edge of P: a lattice point of the edge,
+     * nudged by at most one unit. */
+    const int e = (int) irand(&seed, 0, 2);
+    const long long den = irand(&seed, 1, 8), num = irand(&seed, 0, den);
+    for (int k = 0; k < 2; ++k) Q[0][k] = P[e][k] + (P[(e + 1) % 3][k] - P[e][k]) * num / den + irand(&seed, -1, 1);
+    do
+      for (int c = 1; c < 3; ++c) Q[c][0] = Q[0][0] + irand(&seed, -R, R), Q[c][1] = Q[0][1] + irand(&seed, -R, R);
+    while (iorient2(Q[0], Q[1], Q[2]) == 0);
+
+    const int expect = iref_intersect_2d(P, Q);
+    expect ? n_hit++ : n_miss++;
+    const int perm = trial % 3;  // which coordinate is the dependent one
+    double A[3][3], B[3][3];
+    for (int c = 0; c < 3; ++c)
+    {
+      const double pa[3] = {(double) P[c][0], (double) P[c][1], (double) (P[c][0] + 2 * P[c][1])};
+      const double pb[3] = {(double) Q[c][0], (double) Q[c][1], (double) (Q[c][0] + 2 * Q[c][1])};
+      for (int k = 0; k < 3; ++k) A[c][(k + perm) % 3] = pa[k], B[c][(k + perm) % 3] = pb[k];
+    }
+    TEST_ASSERT_EQUAL_INT(expect, MFTL_TriTriIntersect(A, B));
+    TEST_ASSERT_EQUAL_INT(expect, MFTL_TriTriIntersect(B, A));
+  }
+  printf("[%d integer pairs meet, %d do not] ", n_hit, n_miss);
+  TEST_ASSERT(n_hit > 2000 && n_miss > 2000);
+  return 0;
+}
+
+/**
+ * @brief A triangle of zero area is the segment or point its corners span.
+ *
+ * Read as a triangle with a plane, it put every point "in" that plane and fell
+ * through to a 2D test in an arbitrary projection: a point five units away was
+ * reported as intersecting, and two collinear triangles one unit apart as
+ * touching at distance zero. Hand cases for every combination, then random
+ * integer segments through a point of known barycentric coordinates in a
+ * triangle's plane (inside, on the boundary, outside).
+ */
+static int test_zero_area_triangles_are_segments(void)
+{
+  const double T[3][3] = {{0, 0, 1}, {1, 0, 1}, {0, 1, 1}};
+  const double far_point[3][3] = {{5, 5, 1}, {5, 5, 1}, {5, 5, 1}};
+  const double on_point[3][3] = {{0.25, 0.25, 1}, {0.25, 0.25, 1}, {0.25, 0.25, 1}};
+  const double line_x[3][3] = {{0, 0, 0}, {1, 0, 0}, {2, 0, 0}};
+  const double line_x_up[3][3] = {{0, 0, 1}, {1, 0, 1}, {2, 0, 1}};  // one unit above line_x, in a vertical plane
+  const double line_x_side[3][3] = {{0, 1, 0}, {1, 1, 0}, {2, 1, 0}};
+  const double piercing[3][3] = {{0.2, 0.2, 0}, {0.2, 0.2, 2}, {0.2, 0.2, 1}};
+  const double missing[3][3] = {{0.8, 0.8, 0}, {0.8, 0.8, 2}, {0.8, 0.8, 1}};
+  const double touching_end[3][3] = {{0.2, 0.2, 1}, {0.2, 0.2, 2}, {0.2, 0.2, 1.5}};
+  const double in_plane_cross[3][3] = {{-1, 0.5, 1}, {2, 0.5, 1}, {0.5, 0.5, 1}};
+  const double in_plane_miss[3][3] = {{-1, 2, 1}, {2, 2, 1}, {0.5, 2, 1}};
+  const double collinear_overlap[3][3] = {{1.5, 0, 0}, {3, 0, 0}, {1.5, 0, 0}};
+  const double collinear_gap[3][3] = {{2.5, 0, 0}, {3, 0, 0}, {3, 0, 0}};
+  const double crossing_seg[3][3] = {{1, -1, 0}, {1, 1, 0}, {1, 0, 0}};
+  const double skew_seg[3][3] = {{1, -1, 0.5}, {1, 1, 0.5}, {1, 0, 0.5}};
+  const double point_on_line[3][3] = {{1.5, 0, 0}, {1.5, 0, 0}, {1.5, 0, 0}};
+  const struct
+  {
+    const double (*a)[3], (*b)[3];
+    int hit;
+    double dist_sq;  // when disjoint
+  } cases[] = {
+      {far_point, T, 0, 2.0 * 4.5 * 4.5},  // nearest: the hypotenuse midpoint
+      {on_point, T, 1, 0},
+      {line_x, line_x_up, 0, 1.0},
+      {line_x, line_x_side, 0, 1.0},
+      {piercing, T, 1, 0},
+      {missing, T, 0, 0.18},
+      {touching_end, T, 1, 0},
+      {in_plane_cross, T, 1, 0},
+      {in_plane_miss, T, 0, 1.0},
+      {line_x, collinear_overlap, 1, 0},
+      {line_x, collinear_gap, 0, 0.25},
+      {line_x, crossing_seg, 1, 0},
+      {line_x, skew_seg, 0, 0.25},
+      {line_x, point_on_line, 1, 0},
+      {point_on_line, point_on_line, 1, 0},
+      {point_on_line, far_point, 0, 3.5 * 3.5 + 25.0 + 1.0},
+  };
+  for (size_t i = 0; i < sizeof cases / sizeof cases[0]; ++i)
+  {
+    TEST_ASSERT_EQUAL_INT(cases[i].hit, MFTL_TriTriIntersect(cases[i].a, cases[i].b));
+    TEST_ASSERT_EQUAL_INT(cases[i].hit, MFTL_TriTriIntersect(cases[i].b, cases[i].a));
+    if (!cases[i].hit) TEST_ASSERT_EQUAL_DOUBLE(cases[i].dist_sq, MFTL_TriTriDistanceSq(cases[i].a, cases[i].b), 1e-14);
+  }
+
+  /* Integer segments through X = a A + b B + c C (weights summing to S) of the
+   * triangle S*T, along a direction off its plane: they meet the triangle iff
+   * every weight is >= 0. */
+  unsigned seed = 77u;
+  int n_in = 0, n_on = 0, n_out = 0;
+  for (int trial = 0; trial < 20000; ++trial)
+  {
+    long long C[3][3], n[3];
+    do
+    {
+      for (int c = 0; c < 3; ++c)
+        for (int k = 0; k < 3; ++k) C[c][k] = irand(&seed, -(1 << 14), 1 << 14);
+      const long long e1[3] = {C[1][0] - C[0][0], C[1][1] - C[0][1], C[1][2] - C[0][2]};
+      const long long e2[3] = {C[2][0] - C[0][0], C[2][1] - C[0][1], C[2][2] - C[0][2]};
+      n[0] = e1[1] * e2[2] - e1[2] * e2[1], n[1] = e1[2] * e2[0] - e1[0] * e2[2], n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+    } while (n[0] == 0 && n[1] == 0 && n[2] == 0);
+    long long w[3];
+    for (int c = 0; c < 3; ++c) w[c] = irand(&seed, -2, 6);
+    if (w[0] + w[1] + w[2] <= 0) continue;
+    const long long S = w[0] + w[1] + w[2];
+    long long D[3];
+    do
+      for (int k = 0; k < 3; ++k) D[k] = irand(&seed, -(1 << 10), 1 << 10);
+    while (D[0] * n[0] + D[1] * n[1] + D[2] * n[2] == 0);
+
+    double A[3][3], Sg[3][3];
+    for (int c = 0; c < 3; ++c)
+      for (int k = 0; k < 3; ++k) A[c][k] = (double) (S * C[c][k]);
+    for (int k = 0; k < 3; ++k)
+    {
+      const long long X = w[0] * C[0][k] + w[1] * C[1][k] + w[2] * C[2][k];
+      Sg[0][k] = (double) (X - D[k]), Sg[1][k] = (double) (X + 2 * D[k]), Sg[2][k] = (double) (X + D[k]);  // hull [X - D, X + 2D]
+    }
+    const int expect = (w[0] >= 0 && w[1] >= 0 && w[2] >= 0);
+    (!expect) ? n_out++ : (w[0] == 0 || w[1] == 0 || w[2] == 0) ? n_on++ : n_in++;
+    TEST_ASSERT_EQUAL_INT(expect, MFTL_TriTriIntersect(Sg, A));
+    TEST_ASSERT_EQUAL_INT(expect, MFTL_TriTriIntersect(A, Sg));
+  }
+  printf("[segments through the inside %d, the boundary %d, outside %d] ", n_in, n_on, n_out);
+  TEST_ASSERT(n_in > 1000 && n_on > 1000 && n_out > 1000);
   return 0;
 }
 
@@ -949,6 +1198,9 @@ int main(int argc, char **argv)
   RUN_TEST(test_tri_tri_intersect_basic_cases);
   RUN_TEST(test_tri_tri_distance_is_exact);
   RUN_TEST(test_point_face_distance_works_at_millimetre_scale);
+  RUN_TEST(test_nearly_parallel_edges_are_in_contact);
+  RUN_TEST(test_coplanar_triangles_are_decided_exactly);
+  RUN_TEST(test_zero_area_triangles_are_segments);
 
   RUN_TEST(test_build_produces_a_sound_tree);
   RUN_TEST(test_refit_only_matches_full_rebuild);

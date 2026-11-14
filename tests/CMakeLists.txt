@@ -650,7 +650,14 @@ if(BUILD_EXAMPLES)
   #                and the closest-point facing test that replaced it in 16,
   #                the first split scattering +-0.5 either way. The old point (1.6, 1.5)
   #                was one of the misses, pinching at t = 4.35; (1.7, 1.4)
-  #                passes on both, at t = 3.55, and so do 7 of its 8 neighbours
+  #                passed on both, at t = 3.55, and so did 7 of its 8 neighbours.
+  #                The rounding-exact closest points (docs/analysis.md §7) moved
+  #                the trajectory at the first reconstruction, and (1.7, 1.4)
+  #                stopped pinching in the Debug build. Over roll 1.6-1.8 x
+  #                growth 1.3-1.6 the new code pinches in 10 of 12 points in
+  #                Release and in Debug (the old one in 6 of 12 in Debug);
+  #                (1.7, 1.5) pinches in all three at t = 3.30-3.60, with 7 and
+  #                6 of its 8 neighbours
   #   travelling_  a steep carrier with a ripple plunges and its lip reconnects
   #   waves        with the face, trapping air as an open body between the
   #                channel walls. 104 steps: past that the prescribed field's
@@ -678,7 +685,7 @@ if(BUILD_EXAMPLES)
   add_test(NAME test_rayleigh_taylor_topology
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 4 ${MPIEXEC_PREFLAGS}
                    $<TARGET_FILE:rayleigh_taylor_open_surface>
-                   --roll 1.7 --growth 1.4 --vtk 0 --report 50
+                   --roll 1.7 --growth 1.5 --vtk 0 --report 50
                    --require-topology --require-rim-cut ${MPIEXEC_POSTFLAGS})
   add_test(NAME test_travelling_waves_topology
            COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} 2 ${MPIEXEC_PREFLAGS}

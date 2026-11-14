@@ -8,7 +8,7 @@ Everything in this directory is **local** — no MPI:
 
 | File | Produces |
 |---|---|
-| `triangle_geometry.c` | `tris.area`, `tris.normal`, `tris.center` for a mesh; the closest point on a triangle, and between two |
+| `triangle_geometry.c` | `tris.area`, `tris.normal`, `tris.center` for a mesh; closest points on a triangle, between two segments and between two triangles |
 | `vertex_geometry.c` | area- or angle-weighted `verts.normal` for a mesh |
 | `signed_distance.c` | signed distance to a mesh on a (periodic) lattice window, at one cutoff or two |
 | `periodic_extent.c` | a body's extent on a periodic axis, and whether it covers the axis |
@@ -157,11 +157,15 @@ makes the pass communication-free.
 
 ## Closest point and signed distance {#geom_sdf}
 
-`MFTLClosestPointOnTriangle` implements Ericson's Voronoi-region test: six dot
+`MFTLClosestPointOnTriangle` implements Ericson's Voronoi-region test: dot
 products select one of seven regions (face, three edges, three corners) and only
 that region's formula is evaluated. It also returns the **feature**; edge $k$
-is half-edge $3t+k$. A triangle with $\sin^2\theta \le 10^{-15}$ at corner 0 is
-treated as its three edges.
+is half-edge $3t+k$. The side-of-an-edge decisions and the face point come from
+an orthogonalised frame, not from Ericson's determinants of dot products
+(@ref geom_closest_accuracy). A triangle with $\sin^2\theta \le 10^{-15}$ at
+corner 0 is treated as its three edges, because the face normal a signed
+distance would read is not trustworthy there; that answer can be up to the
+triangle's height too far.
 
 `MFTLRasterizeSignedDistance` scatters, for each triangle, the value
 $\pm\lVert\mathbf{x}-\mathbf{q}\rVert$ to every lattice node $\mathbf{x}$ within
@@ -223,8 +227,56 @@ which is $O(\Delta x^2\kappa)$ off a curved surface (Wojtan et al.'s type-1
 vertices).
 
 `MFTLClosestPointsBetweenTriangles` returns the witnesses of two disjoint
-triangles' minimum distance: six corner-face and nine segment-segment candidates
-in a fixed order, so the pair it returns is a function of its arguments.
+triangles' minimum distance: six corner-face projections and nine
+`MFTLClosestPointsOnSegments` pairs in a fixed order, so the pair it returns is a
+function of its arguments. It has no sliver threshold (a triangle loses its face
+term only when its corners are numerically collinear), and it is also the
+distance of the contact predicate `MFTL_TriTriProximity` (@ref bvh_distance).
+
+### Closest points without the normal equations {#geom_closest_accuracy}
+
+Every closest-point query is a small linear least-squares problem: the foot of a
+perpendicular. Its $2\times2$ normal equations square the condition number. For
+segments $P_0 + s\mathbf u$ and $Q_0 + t\mathbf v$ ($\mathbf w = P_0 - Q_0$) the
+Gram determinant $D = ac - b^2$ of two directions at an angle $\theta$ is
+computed with a relative error $\varepsilon/\sin^2\theta$, and the numerator
+$be - cd$ cancels the same way. Ericson's triangle weights $d_1d_4 - d_3d_2$ are
+the same thing for a sliver. Measured on the old code: a gap of $10^{-9}$ between
+edges at an angle of $2\cdot10^{-8}$ came out as $10^{-8}$, a corner over a
+1:$10^5$ sliver 26 times too far, and the "parallel" threshold
+$D \le 10^{-15}ac$ that guarded the noise threw the interior answer away whenever
+it fired.
+
+What replaces them:
+
+- **Segments.** $D = |\mathbf u\times\mathbf v|^2$ (Lagrange's identity, without
+  the cancellation) and
+  $be - cd = (\mathbf u\times\mathbf v)\cdot(\mathbf v\times\mathbf w)$,
+  then Ericson's clamping cascade. There is no threshold:
+  where $D$ is too noisy to trust, the valley the error runs along is just as
+  flat, and the cascade loses a few ulps at most. $D = 0$ exactly (parallel)
+  pins $s = 0$, and the cascade finds the overlap.
+- **Triangles.** A Gram–Schmidt (QR) frame on the longest edge $\mathbf e = p_1 - p_0$:
+  the apex offset $\mathbf g = (p_2 - p_0) - c\,\mathbf e$ with
+  $c = (p_2-p_0)\cdot\mathbf e / \mathbf e\cdot\mathbf e \in [0,1]$. A point is
+  $p - p_0 = s\,\mathbf e + t\,\mathbf g + \text{off}$, with $t$ taken from the
+  residual $r = (p-p_0) - s\mathbf e$ alone, so no coordinate is a difference of
+  products. The barycentric weights are $t$, $s - ct$ and $1 - s - (1-c)t$.
+  What a sliver cannot pin down is the tilt of its plane about the long edge, and
+  because the offset is measured from that edge, within the sliver's width of the
+  projection, the tilt reaches the distance only to second order.
+- **Local differences.** Every distance is the norm of a vector built from
+  differences of nearby points, never from a returned point. A configuration far
+  from the origin therefore keeps its accuracy; only the witnesses carry the
+  offset's rounding.
+
+The distance is then accurate to rounding: at most $1.5\,\varepsilon L$ ($L$ the
+configuration's diameter) over $2\times10^5$ random near-parallel and sliver
+pairs in general position, against up to $10^{10}\varepsilon L$ before.
+`tests/test_geometry.c` checks it against configurations whose distance is known
+EXACTLY (planes $z = 0$ and $z = \delta$ mapped by an integer matrix that is 3 or
+7 times a rotation, with exactness of the mapping checked) and against a
+double-double reference in random general position.
 
 ---
 

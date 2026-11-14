@@ -4,12 +4,14 @@
  * @date 2026-08-16
  * @ingroup mftl_bvh
  *
- * @brief Linear BVH over triangle primitives, exact triangle-triangle
- *        predicates, and (distributed) object-object contact detection.
+ * @brief Linear BVH over triangle primitives, an exact triangle-triangle
+ *        intersection predicate, and (distributed) object-object contact
+ *        detection.
  *
- * The broad phase (a tree of float boxes) selects triangle pairs worth an exact
- * test; the narrow phase (exact, double precision) decides whether they touch.
- * Four decisions shape the module:
+ * The broad phase (a tree of float boxes) selects triangle pairs worth a
+ * narrow-phase test; the narrow phase decides whether they touch: intersection
+ * by exact signs, a gap by the distance to rounding (a few ulps of the pair's
+ * size). Four decisions shape the module:
  *
  * 1. **A BVH is built over a primitive soup.** Primitives `[0, n_local_prims)`
  *    are triangles of `obj`, `[n_local_prims, n_prims)` triangles of `halo`, a
@@ -471,12 +473,18 @@ int MFTLEnsembleIntersectObjects(MFTL_Ensemble *ens, const MFTL_BVHBuildParams *
 /**
  * @brief Exact triangle-triangle intersection test (Guigue & Devillers 2003).
  *
- * Every branch is taken on the sign of MFTL_Orient3D(), whose sign is exact; no
- * intersection point is constructed. Coplanar pairs get a complete 2D test.
+ * Every decision is the sign of MFTL_Orient3D(), which is exact; no
+ * intersection point is constructed. Two proper triangles in distinct planes
+ * take Guigue-Devillers. Everything else is recognised from exact zeros and
+ * answered exactly too: coplanar pairs by a 2D test whose orientations are
+ * MFTL_Orient3D() of lifted points, and a triangle of zero area (collinear or
+ * coincident corners) as the segment or point it spans -- against a proper
+ * triangle as a segment crossing it, against another such as two segments.
  *
  * @param A [3][3] corners of the first triangle.
  * @param B [3][3] corners of the second, in the SAME periodic image as @p A.
- * @return 1 if the closed triangles intersect (coplanar overlap included), else 0.
+ * @return 1 if the closed point sets intersect (coplanar overlap, touching and
+ *         degenerate triangles included), else 0.
  */
 int MFTL_TriTriIntersect(const double A[3][3], const double B[3][3]);
 
@@ -485,21 +493,27 @@ int MFTL_TriTriIntersect(const double A[3][3], const double B[3][3]);
  *        @p tolerance.
  *
  * MFTL_TriTriIntersect() first (a piercing pair has positive distance to every
- * edge and vertex, so the distance test alone would miss it), then the exact
- * minimum distance of two disjoint closed triangles: nine edge-edge and six
- * point-face terms.
+ * edge and vertex, so the distance test alone would miss it), then the minimum
+ * distance of two disjoint closed triangles from
+ * MFTLClosestPointsBetweenTriangles(): nine segment pairs and six corner-face
+ * projections, accurate to rounding -- a few ulps of the pair's size -- at
+ * every angle and aspect ratio. The intersection verdict is exact; a gap within
+ * rounding of @p tolerance can go either way.
  *
  * @param A         Corners of the first triangle.
  * @param B         Corners of the second, in the same periodic image as @p A.
  * @param tolerance Gap at which contact is declared, >= 0.
  * @return 1 on contact, 0 otherwise.
  *
- * @measured{176 ns/pair, against 31 ns for MFTL_TriTriIntersect() alone.}
+ * @measured{244 ns/pair (176 ns with the old distance terms), against 31 ns for MFTL_TriTriIntersect() alone.}
  */
 int MFTL_TriTriProximity(const double A[3][3], const double B[3][3], double tolerance);
 
 /**
  * @brief Squared minimum distance between two closed triangles; 0 if they meet.
+ *
+ * Zero exactly when MFTL_TriTriIntersect() says they meet; otherwise
+ * MFTLClosestPointsBetweenTriangles(), accurate to rounding.
  *
  * @param A Corners of the first triangle.
  * @param B Corners of the second, in the same periodic image as @p A.
@@ -522,7 +536,7 @@ double MFTL_TriTriDistanceSq(const double A[3][3], const double B[3][3]);
  *
  * It is the one predicate whose SIGN decides an answer (Guigue-Devillers takes up
  * to eight per pair); a wrong sign can report a clean miss for crossing
- * triangles. Measured: 2.00x the plain determinant, at most 6.2 % of an
+ * triangles. Measured: 2.00x the plain determinant, at most 4.5 % of an
  * MFTL_TriTriProximity() call; the plain form never misclassified in 20 000
  * samples at gaps >= 1e-12 of the body size and fails only at 1e-14..1e-16
  * (examples/orient3d_predicate_profile.c). Requires `-ffp-contract=off`.
