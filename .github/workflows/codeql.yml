@@ -2,9 +2,7 @@ name: CodeQL
 
 # GitHub's semantic code analysis over the library (not the tests or examples),
 # with the default, high-precision security query suite. Results go to the
-# Security tab -- once the repository is public: code scanning on a private
-# repository needs a paid plan, so until then the run analyses everything and
-# keeps the results as a SARIF artifact instead of uploading them.
+# Security tab.
 
 on:
   push:
@@ -47,11 +45,3 @@ jobs:
       - uses: github/codeql-action/analyze@v4
         with:
           category: /language:c-cpp
-          output: sarif
-          upload: ${{ github.event.repository.private && 'never' || 'always' }}
-      - name: Keep the results (private repository)
-        if: github.event.repository.private
-        uses: actions/upload-artifact@v6
-        with:
-          name: codeql-sarif
-          path: sarif

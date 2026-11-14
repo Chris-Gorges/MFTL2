@@ -11,6 +11,18 @@ else()
     set(MFTL_IS_TOP_LEVEL OFF)
 endif()
 
+# A plain `cmake -S . -B build` names no build type, and CMake then compiles
+# with no optimisation and with assertions on -- neither the Release nor the
+# Debug configuration below, and a slow library that looks like a release.
+# Default to Release. Only at the top level: a solver that pulls MFTL in with
+# add_subdirectory() chooses its own build type.
+get_property(MFTL_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if(MFTL_IS_TOP_LEVEL AND NOT MFTL_MULTI_CONFIG AND NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type: Release (default), Debug, RelWithDebInfo or MinSizeRel" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS Release Debug RelWithDebInfo MinSizeRel)
+    message(STATUS "No CMAKE_BUILD_TYPE given: building Release")
+endif()
+
 # --- Options ---
 option(ENABLE_SANITIZERS "Enable Address and Undefined sanitizers in Debug mode" ON)
 option(BUILD_EXAMPLES    "Build example executables" ON)
@@ -97,10 +109,14 @@ endif()
 # Usage requirements: anything linking MFTL inherits its headers and MPI.
 target_include_directories(MFTL PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/external>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
-target_link_libraries(MFTL PUBLIC MPI::MPI_C)
+# The installed package links MFTL::MPI instead of MPI::MPI_C. FindMPI looks for
+# the C bindings only in a project that has enabled the C language, so a solver
+# declared `project(Solver LANGUAGES CXX)` could not find MPI::MPI_C at all;
+# MFTLConfig.cmake defines MFTL::MPI as MPI::MPI_C when C is enabled and as
+# MPI::MPI_CXX (the same libmpi, through the C++ wrapper) when only C++ is.
+target_link_libraries(MFTL PUBLIC $<BUILD_INTERFACE:MPI::MPI_C> $<INSTALL_INTERFACE:MFTL::MPI>)
 # A C++ solver includes mpi.h through MFTL's headers, and Open MPI 4 and MPICH
 # then also declare the MPI C++ bindings (deprecated in MPI-2.2, removed in
 # MPI-3), which live in a library nothing here links: the C++ consumer failed
@@ -141,6 +157,9 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         # and linked with the same instrumentation, or ASan reports bogus errors.
         # BUILD_INTERFACE keeps them out of the installed package: a solver that
         # links an installed MFTL in its own Debug build must not inherit ASan.
+        # The flip side is that an instrumented libMFTL.a cannot be installed at
+        # all (its ASan/UBSan references would be unresolved in the solver), so
+        # the install step refuses one; see "Install and package" below.
         target_compile_options(MFTL PUBLIC
             $<BUILD_INTERFACE:$<$<CONFIG:Debug>:-fsanitize=address,undefined>>
             $<BUILD_INTERFACE:$<$<CONFIG:Debug>:-fno-omit-frame-pointer>>
@@ -152,9 +171,11 @@ if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
         target_compile_options(MFTL PUBLIC $<BUILD_INTERFACE:$<$<CONFIG:Debug>:-g>>)
     endif()
 
-elseif(MSVC)
-    target_compile_options(MFTL PRIVATE $<$<CONFIG:Release>:/O2>)
-    target_compile_definitions(MFTL PUBLIC $<$<CONFIG:Release>:NDEBUG>)
+else()
+    # GCC and Clang (Apple's included) are what CI builds and tests; the flags
+    # above, -ffp-contract=off for the exact predicates and the libm link assume
+    # one of them.
+    message(WARNING "MFTL is built and tested with GCC and Clang only; ${CMAKE_C_COMPILER_ID} is untested.")
 endif()
 
 # --- Install and package --------------------------------------------------
@@ -168,6 +189,28 @@ endif()
 #
 # MPI comes with it as a usage requirement. tests/consumer is the check.
 include(CMakePackageConfigHelpers)
+
+# An installed package is never sanitized. A Debug build with the default
+# ENABLE_SANITIZERS=ON compiles libMFTL.a with -fsanitize=address,undefined,
+# and the BUILD_INTERFACE above (deliberately) does not hand the runtimes to an
+# installed consumer, which would then fail to link with unresolved __asan_* /
+# __ubsan_* symbols. So the install refuses such a build -- checked at INSTALL
+# time, per configuration, so it also holds for multi-config generators -- and
+# runs before any other install rule, so nothing is half-copied.
+# CI-Consumers installs a Debug build with ENABLE_SANITIZERS=OFF and checks
+# that a sanitized one is refused.
+if(ENABLE_SANITIZERS AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    install(CODE [[
+        string(TOUPPER "${CMAKE_INSTALL_CONFIG_NAME}" _mftl_config)
+        if(_mftl_config STREQUAL "DEBUG")
+            message(FATAL_ERROR
+                "MFTL: this Debug build is instrumented with ASan/UBSan (ENABLE_SANITIZERS=ON), "
+                "and an installed package must not be: a consumer could not link it. "
+                "Reconfigure with -DENABLE_SANITIZERS=OFF (python3 build_all.py --valgrind) "
+                "to install a Debug build, or install a Release build.")
+        endif()
+    ]])
+endif()
 
 install(TARGETS MFTL EXPORT MFTLTargets
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -226,7 +269,7 @@ endif()
 # --- Documentation ---------------------------------------------------------
 #
 # There is none here, on purpose. The Doxygen comments in include/ and src/**,
-# the twelve src/<module>/README.md theory chapters and the measurement
+# the fourteen src/<module>/README.md theory chapters and the measurement
 # document docs/analysis.md are the sources; everything that RENDERS them -- the
 # Doxyfile, the MkDocs site, the page-generation machinery and their Python
 # environment -- lives in the separate MFTL2_Documentation repository, which
@@ -246,9 +289,30 @@ message(STATUS "-------------------------------------------------")
 message(STATUS "MFTL Build Configuration")
 message(STATUS "-------------------------------------------------")
 message(STATUS "Compiler ID      : ${CMAKE_C_COMPILER_ID}")
-message(STATUS "Build Type       : ${CMAKE_BUILD_TYPE}")
-message(STATUS "Sanitizers       : ${ENABLE_SANITIZERS}")
-message(STATUS "LTO (Release)    : ${IPO_SUPPORTED}")
+# What THIS build gets, not what the options would give some other build type:
+# sanitizers apply to Debug only, LTO to Release only.
+set(_mftl_sanitizers_capable OFF)
+if(ENABLE_SANITIZERS AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang|AppleClang")
+    set(_mftl_sanitizers_capable ON)
+endif()
+string(TOUPPER "${CMAKE_BUILD_TYPE}" _mftl_build_type)
+if(MFTL_MULTI_CONFIG)
+    message(STATUS "Build Type       : multi-config (${CMAKE_CONFIGURATION_TYPES})")
+    message(STATUS "Sanitizers       : ${_mftl_sanitizers_capable} in Debug")
+    message(STATUS "LTO              : ${IPO_SUPPORTED} in Release")
+else()
+    message(STATUS "Build Type       : ${CMAKE_BUILD_TYPE}")
+    if(_mftl_sanitizers_capable AND _mftl_build_type STREQUAL "DEBUG")
+        message(STATUS "Sanitizers       : ON (ASan+UBSan; this build cannot be installed)")
+    else()
+        message(STATUS "Sanitizers       : OFF")
+    endif()
+    if(IPO_SUPPORTED AND _mftl_build_type STREQUAL "RELEASE")
+        message(STATUS "LTO              : ON")
+    else()
+        message(STATUS "LTO              : OFF")
+    endif()
+endif()
 message(STATUS "Warnings = errors: ${MFTL_WARNINGS_AS_ERRORS}")
 message(STATUS "-march=native    : ${MFTL_ARCH_NATIVE}")
 message(STATUS "comm profiling   : ${MFTL_COMM_PROFILE}")

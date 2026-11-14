@@ -1,48 +1,33 @@
-.settings/
-/.settings/
-.cproject
-/.cproject
-/.project
-.vscode/c_cpp_properties.json
-.vscode/settings.json
+# Build trees: build_all.py's, tools/check_glibc_nonnull.sh's, and an in-source
+# configure's leftovers.
 /build/
-language.settings.xml
-.DS_Store
-.cache
-*.h5
-/rest/
-.cache/
-.vscode/
-/results/
-/build/
+/build-nonnull/
+/build-nonnull.*.log
+/Testing/
 /CMakeFiles/
 /Makefile
+/lib/
 CMakeCache.txt
 cmake_install.cmake
 CMakeConfigureLog.yaml
-lib/
+
+# Output of the examples, tests and scaling runs.
 *.vtu
 *.pvtu
-.poltergeist.log
-.watchmanconfig
-info
-poltergeist.config.json
-run_mpi.sh
-.claude/
+*.vtk
 /results/
-/Testing/
-*vtk
 /scaling/Results/
-/literature/
 
-# The documentation toolchain lives in the separate MFTL2_Documentation
-# repository and cannot appear here; only __pycache__ from the helper scripts.
+# Editors and tools.
+.DS_Store
+.vscode/
+.cache/
 __pycache__/
 
-# Local only, never published: assistant config, measurement notes, cluster scripts.
+# Local only, never published: assistant config, measurement notes, the detailed
+# roadmap, cluster scripts.
 CLAUDE.md
+.claude/
 /docs/
 /run_scaling.py
 /studies/
-/build-nonnull/
-/build-nonnull.*.log

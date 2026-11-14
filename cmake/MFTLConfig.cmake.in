@@ -2,11 +2,46 @@
 #
 #   find_package(MFTL 2.0 REQUIRED)
 #   target_link_libraries(solver PRIVATE MFTL::MFTL)
+#
+# Works from a C project, a C++ project, or both. MFTL calls MPI's C API only.
 
 @PACKAGE_INIT@
 
 include(CMakeFindDependencyMacro)
-find_dependency(MPI COMPONENTS C)
+
+# FindMPI can look for MPI's C bindings only in a project that has enabled the C
+# language ("MPI component 'C' was requested, but language C is not enabled").
+# A C++-only solver gets the same MPI library through the C++ component: its
+# wrapper links libmpi, and the MPI C++ bindings stay out of MFTL's headers
+# (OMPI_SKIP_MPICXX / MPICH_SKIP_MPICXX come with MFTL::MFTL). MFTL::MPI is
+# whichever of the two this project can have; the exported target links it.
+get_property(_mftl_languages GLOBAL PROPERTY ENABLED_LANGUAGES)
+list(FIND _mftl_languages C _mftl_has_c)
+list(FIND _mftl_languages CXX _mftl_has_cxx)
+if(NOT _mftl_has_c EQUAL -1)
+  set(_mftl_mpi_component C)
+elseif(NOT _mftl_has_cxx EQUAL -1)
+  set(_mftl_mpi_component CXX)
+else()
+  set(MFTL_FOUND FALSE)
+  set(MFTL_NOT_FOUND_MESSAGE "MFTL needs the C or the C++ language enabled before find_package(MFTL).")
+  unset(_mftl_languages)
+  unset(_mftl_has_c)
+  unset(_mftl_has_cxx)
+  return()
+endif()
+
+find_dependency(MPI COMPONENTS ${_mftl_mpi_component})
+
+if(NOT TARGET MFTL::MPI)
+  add_library(MFTL::MPI INTERFACE IMPORTED)
+  set_target_properties(MFTL::MPI PROPERTIES INTERFACE_LINK_LIBRARIES MPI::MPI_${_mftl_mpi_component})
+endif()
+
+unset(_mftl_languages)
+unset(_mftl_has_c)
+unset(_mftl_has_cxx)
+unset(_mftl_mpi_component)
 
 include("${CMAKE_CURRENT_LIST_DIR}/MFTLTargets.cmake")
 

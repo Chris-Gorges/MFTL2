@@ -66,10 +66,8 @@ jobs:
           path: site
 
   deploy:
-    # GitHub Pages is available to a private repository only on a paid plan, so
-    # the manual is published once the repository is public.
     needs: build
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && !github.event.repository.private
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:

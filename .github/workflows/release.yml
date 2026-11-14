@@ -56,10 +56,7 @@ jobs:
 
   macos:
     # The development platform: Apple clang, Open MPI 5 from Homebrew, arm64.
-    # macOS minutes count tenfold against a private repository's quota, so
-    # until the repository is public this job runs only when started by hand.
     name: clang + openmpi (macos-15)
-    if: ${{ !github.event.repository.private || github.event_name == 'workflow_dispatch' }}
     runs-on: macos-15
     timeout-minutes: 60
     steps:
