@@ -73,7 +73,9 @@ more half-edges on one edge): the surplus stays twin-less, and the integrity
 check reports the edge. The builders (`MFTLBuildIndexedMesh`,
 `MFTLBuildTopologyFromIndexList`) refuse such input before writing anything,
 because `MFTLMarkMeshBoundary` would otherwise flag the surplus as surface
-boundary for good.
+boundary for good. They also refuse a vertex that no triangle uses: its origin
+bucket stays empty, so it would have no outgoing half-edge, which the integrity
+check reports and every one-ring walk trips over.
 
 @warning Pairing is by vertex **slot**. Two bodies sharing slot numbering —
          foreign triangles appended to a pool — would be welded together. This

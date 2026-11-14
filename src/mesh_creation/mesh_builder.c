@@ -42,8 +42,9 @@ static bool index_list_is_valid(const int *tri_verts, int n_triangles, int n_ver
 }
 
 /**
- * @brief Is the (index-valid) list an ORIENTED edge-manifold: no directed edge
- *        used twice, and no two triangles with the same three corners?
+ * @brief Is the (index-valid) list an ORIENTED edge-manifold over the whole
+ *        vertex pool: no directed edge used twice, no two triangles with the
+ *        same three corners, and no vertex that no triangle uses?
  *
  * A directed edge used twice is a third triangle on an edge, or a neighbour
  * wound the other way, or a duplicated triangle: MFTLRebuildTwins() would pair
@@ -53,6 +54,10 @@ static bool index_list_is_valid(const int *tri_verts, int n_triangles, int n_ver
  * other edge then has at most one half-edge per direction, which is what the
  * half-edge structure can represent. A vertex shared by otherwise separate fans
  * (a bowtie) is NOT refused.
+ *
+ * A vertex no triangle uses would get no outgoing half-edge, which
+ * MFTLCheckMeshIntegrity() reports and every one-ring walk trips over; it is
+ * the vertex with an empty origin bucket.
  *
  * Directed edges are bucketed by origin, as in MFTLRebuildTwins(); the first
  * violation is printed to stderr.
@@ -97,6 +102,14 @@ static bool index_list_is_manifold(const int *tri_verts, int n_triangles, int n_
     }
     next[h] = head[u];
     head[u] = h;
+  }
+
+  /* Every corner of a triangle is the origin of one of its half-edges. */
+  for (int v = 0; v < n_vertices && ok; ++v)
+  {
+    if (head[v] != MFTL_ERROR) continue;
+    fprintf(stderr, "%s: vertex %d is used by no triangle (it would have no outgoing half-edge)\n", caller, v);
+    ok = MFTL_FALSE;
   }
 
   free(scratch);

@@ -395,10 +395,12 @@ static MFTL_Object *make_unchecked(int id, const double *pos, int nv, const int 
  * @brief Connectivity a half-edge mesh cannot represent is diagnosed, not
  *        certified.
  *
- * Each of these passed as "consistent" before the edge-incidence pass:
- * MFTLRebuildTwins() pairs two half-edges of the edge and leaves the surplus
- * twin-less, which the check counted as open boundary (and the builder then
- * flagged as boundary for good). The reversed duplicate even passed as CLOSED.
+ * Each of the first four passed as "consistent" before the edge-incidence
+ * pass: MFTLRebuildTwins() pairs two half-edges of the edge and leaves the
+ * surplus twin-less, which the check counted as open boundary (and the builder
+ * then flagged as boundary for good). The reversed duplicate even passed as
+ * CLOSED. The last is a vertex no triangle uses: the builder accepted it and
+ * the check then rejected the mesh the builder had just made.
  */
 static int test_integrity_check_rejects_what_a_half_edge_mesh_cannot_be(void)
 {
@@ -407,11 +409,12 @@ static int test_integrity_check_rejects_what_a_half_edge_mesh_cannot_be(void)
   static const int flipped_neighbour[6] = {0, 1, 2, 0, 1, 3};
   static const int duplicated[6] = {0, 1, 2, 0, 1, 2};
   static const int reversed_duplicate[6] = {0, 1, 2, 0, 2, 1};
+  static const int unused_vertex[3] = {0, 1, 2};  // with 4 vertices: vertex 3 is in no triangle
   const struct
   {
     const int *tri;
     int nt, nv;
-  } cases[] = {{three_on_one_edge, 3, 5}, {flipped_neighbour, 2, 4}, {duplicated, 2, 3}, {reversed_duplicate, 2, 3}};
+  } cases[] = {{three_on_one_edge, 3, 5}, {flipped_neighbour, 2, 4}, {duplicated, 2, 3}, {reversed_duplicate, 2, 3}, {unused_vertex, 1, 4}};
 
   printf("\n  (expecting diagnostics below) ");
   for (size_t c = 0; c < sizeof cases / sizeof cases[0]; ++c)

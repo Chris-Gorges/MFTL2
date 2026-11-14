@@ -91,9 +91,43 @@ static int test_indexed_mesh_rejects_bad_input(void)
   TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLBuildIndexedMesh(obj, pos, 3, repeated, 1));
   TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLBuildIndexedMesh(obj, pos, 3, out_of_range, 1));
 
+  /* A vertex no triangle uses would have no outgoing half-edge, and
+   * MFTLCheckMeshIntegrity() would reject the mesh the builder just made. */
+  const double pos4[12] = {0, 0, 0, 1, 0, 0, 0, 1, 0, 5, 5, 5};
+  printf("\n  (expecting a diagnostic below) ");
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLBuildIndexedMesh(obj, pos4, 4, tv, 1));
+
   // The object must be untouched by a rejected call.
   TEST_ASSERT_EQUAL_INT(0, obj->verts.n);
   TEST_ASSERT_EQUAL_INT(0, obj->tris.n);
+  return 0;
+}
+
+/**
+ * @brief MFTLBuildTopologyFromIndexList() applies the same rules to a pool the
+ *        caller filled: a vertex no triangle uses is refused, and nothing is
+ *        written.
+ */
+static int test_topology_from_index_list_refuses_an_unused_vertex(void)
+{
+  MFTL_Object *obj = MFTLObjectCreate(12);
+  MFTLEnsembleAddObject(g_ens, obj);
+
+  const double pos[12] = {0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1};
+  const int tv[9] = {0, 2, 1, 0, 1, 3, 1, 2, 3};  // three faces of a tetrahedron
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLBuildIndexedMesh(obj, pos, 4, tv, 3));
+  TEST_ASSERT_EQUAL_INT(3, obj->tris.n);
+
+  /* Drop vertex 3's triangles: it stays in the pool, used by nothing. */
+  printf("\n  (expecting a diagnostic below) ");
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLBuildTopologyFromIndexList(obj, tv, 1));
+  TEST_ASSERT_EQUAL_INT(3, obj->tris.n);
+  TEST_ASSERT(inv_mesh_is_sound(obj, g_ens->domain.rank));
+
+  /* All four faces use every vertex: accepted, and the mesh is closed. */
+  const int closed[12] = {0, 2, 1, 0, 1, 3, 1, 2, 3, 0, 3, 2};
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLBuildTopologyFromIndexList(obj, closed, 4));
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLCheckMeshIntegrity(obj));
   return 0;
 }
 
@@ -345,6 +379,7 @@ int main(int argc, char **argv)
   printf("--- Running MFTL Mesh Generation Tests ---\n");
 
   RUN_TEST(test_indexed_mesh_rejects_bad_input);
+  RUN_TEST(test_topology_from_index_list_refuses_an_unused_vertex);
   RUN_TEST(test_indexed_mesh_establishes_the_conventions);
   RUN_TEST(test_sphere_entity_counts);
   RUN_TEST(test_sphere_is_a_sound_closed_mesh);
