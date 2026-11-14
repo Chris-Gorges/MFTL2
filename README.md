@@ -83,33 +83,46 @@ Doxygen manual with call graphs, rebuilt from `main` on every push.
 
 The per-timestep loop of a front-tracking solver — move the owned vertices, synchronise the ghosts, recompute the
 geometry, redistribute, vertex normals — for droplets of 1280 triangles each in a periodic box, measured on an HPC
-cluster with 36 cores per node ([`scaling/`](scaling/README.md)):
+cluster with 36 cores per node (2 × Xeon Gold 6240; GCC 11, MVAPICH2 2.3.7). Machine, build, commit and the per-point
+tables: [`scaling/README.md`](scaling/README.md#measured-results).
 
 | | Problem | 36 → 288 ranks (1 → 8 nodes) |
 |---|---|---|
 | Weak scaling | 1 000 droplets (1.28 M triangles) per rank, up to 288 000 droplets and 369 M triangles | 90 % efficiency; 162 ms per step at 288 ranks |
 | Strong scaling | 110 592 droplets, 142 M triangles | 6.6× faster (82 % efficiency); 393 → 60 ms per step |
 
-Remeshing and topology changes are not part of these numbers; the remeshing sweeps in `scaling/` measure them.
+Remeshing and topology changes are not part of these numbers; `scaling/` has remeshing sweeps, not yet run on the
+cluster.
 
 ## The idea
 
 A surface mesh is two different things that want opposite memory layouts, so MFTL stores each in the layout it
 wants — and stores them in the **same allocation**, so they can never disagree about how many entities exist.
 
-![One allocation per entity class: AoS records for topology and identity, SoA arrays for geometry](.github/images/pool-layout.svg)
+![One allocation per entity class: AoS records for topology and identity, one array per geometric field](.github/images/pool-layout.svg)
 
 **Topology and identity are AoS** — a remesher edits one entity at a time and touches most of its record when it
-does. **Geometry is SoA** — it is read and written by kernels that touch one component of every entity, every
-timestep, which is the access pattern AoS is worst at. The same split is what makes the geometry arrays usable by an
-accelerator as they are: positions and compact triangle indices are plain contiguous arrays with no repacking.
+does. **Geometry is one array per field, vectors interleaved** — one contiguous array per quantity (positions,
+normals, areas, centroids), read and written by kernels that touch one quantity of every entity, every timestep,
+which is the access pattern AoS is worst at.
+
+It is a structure of arrays at the level of quantities, not of components. A 3-vector field is ONE
+array of xyz triples, `verts.pos[3*v + k]`; there are no separate `x[]`, `y[]` and `z[]` arrays. On the CPU the two
+were measured as a wash (separate components gather faster and scatter slower, by similar amounts;
+[`layout_benchmark.c`](examples/layout_benchmark.c)), so the API decided. On a GPU, a warp that reads the positions
+of 32 consecutive vertices reads one contiguous 768-byte span, but each of its three component loads is a 24-byte
+stride: every byte brought in from memory is used (the y and z loads find the lines the x load fetched), but each
+load instruction touches three times the cache sectors a split layout would. Whether that costs time on a
+bandwidth-bound GPU has not been measured — the laptop GPU of [`examples/gpu`](examples/gpu/README.md) is FP64-bound.
+What the layout does give an accelerator is plain contiguous arrays (positions, compact triangle indices) with no
+repacking.
 
 Three invariants fall out, and every module is allowed to assume them:
 
 - **Half-edge `3t+k` belongs to triangle `t`**, and `next(3t+k) == 3t+(k+1)%3`. So `he_idx`, `next_idx` and
   `triangle_idx` are not stored — they are arithmetic — and the half-edge array needs no capacity of its own.
 - **Ownership is an array prefix**: `[0, n_local)` is owned, `[n_local, n)` are ghosts. No `is_ghost` field.
-- **Positions live in the SoA and only there.** The space-filling-curve ordering is applied to the *pool*
+- **Positions live in `verts.pos` and only there.** The space-filling-curve ordering is applied to the *pool*
   (`MFTLObjectReorderMorton`), not stored as a permutation, so there is exactly one index space.
 
 Lookups are arrays, not hash maps: global IDs are dense per entity class, and "the other side of this edge" is
@@ -121,13 +134,12 @@ already an index.
 #include "mftl_core.h"
 
 MPI_Init(&argc, &argv);
-MFTLRegisterMpiTypes();                       // the wire datatypes every exchange uses
 
 int    cuts[3] = {1, 1, 1};                // one rank; the product must equal the rank count
 double lo[3]   = {-2, -2, -2}, hi[3] = {2, 2, 2};
 bool   per[3]  = {false, false, false};
 
-MFTL_Ensemble *ens = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, lo, hi, per, 10);
+MFTL_Ensemble *ens = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, lo, hi, per, 10);  // also registers MFTL's MPI datatypes
 
 MFTL_Object *obj = MFTLObjectCreate(1);
 MFTLEnsembleAddObject(ens, obj);              // links it to the domain; ensemble now owns it
@@ -138,12 +150,12 @@ MFTLObjectReorderMorton(obj);                 // local: spatial renumbering
 MFTLEnsembleUpdate(ens);                      // collective: geometry + quality, one pass
 MFTLEnsembleUpdateVertexNormals(ens, MFTL_NORMAL_WEIGHT_AREA);  // collective: normals + one ghost exchange
 
-printf("mean-ratio quality: %f\n", obj->quality.avg_aspect_ratio);
+printf("mean-ratio quality: %f\n", obj->quality.avg_mean_ratio);
 
 MFTLWriteVtu(ens, "surface", MFTL_NULL);      // collective: raw-binary .vtu per rank + .pvtu
 
 MFTLEnsembleDestroy(&ens);                    // cascades to every object
-MFTLFreeMpiTypes();
+MFTLFreeMpiTypes();                           // optional; MPI_Finalize releases them anyway
 MPI_Finalize();
 ```
 
@@ -203,18 +215,19 @@ without managing derived position state.
 
 ## Build and test
 
-Requires CMake ≥ 3.13, an MPI-3 implementation (used with Open MPI, MPICH and MVAPICH2) and a C11 compiler. CI builds
-with GCC and Clang on Linux; development is on macOS.
+Requires CMake ≥ 3.13, an MPI-3 implementation (used with Open MPI, MPICH and MVAPICH2) and GCC or Clang as a C11
+compiler. CI builds with both on Linux; development is on macOS.
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B build                  # Release unless -DCMAKE_BUILD_TYPE says otherwise
 cmake --build build -j
 ctest --test-dir build --output-on-failure -j 8 -LE np27
 ```
 
 `python3 build_all.py` does the same in a fresh `build/` (`--debug` adds AddressSanitizer and
-UndefinedBehaviorSanitizer, `--valgrind` a Debug build without them, `--lib-only` skips the examples), and
-`python3 run_local_tests.py` builds and runs the whole suite on every core (`--debug` for the sanitizer build).
+UndefinedBehaviorSanitizer, `--valgrind` a Debug build without them, `--lib-only` skips the examples and the tests),
+and `python3 run_local_tests.py` builds and runs the whole suite on every core (`--debug` for the sanitizer build).
+A Debug build has the sanitizers unless configured with `-DENABLE_SANITIZERS=OFF`.
 
 Every test carries labels, so a subset is one flag away: `serial`, `mpi`, `np<N>` for the rank count, `example`
 for the physical runs of the example programs, `oversub` and `np27` for runs with more ranks than a laptop has
@@ -271,8 +284,13 @@ target_link_libraries(solver PRIVATE MFTL::MFTL)
 ```
 
 MPI comes with the target as a usage requirement. The headers are valid C++ with C linkage, so a C++ solver
-includes them directly (the `MFTL_FOREACH_*` loop macros are C-only). Both routes, from C and from C++, are built
-and run in CI by [`tests/consumer`](tests/consumer).
+includes them directly (the `MFTL_FOREACH_*` loop macros are C-only), and a C++-only project
+(`project(Solver LANGUAGES CXX)`) finds the package without enabling C: MPI then comes through its C++ component.
+
+Install a Release build, or a Debug build configured with `-DENABLE_SANITIZERS=OFF` (`build_all.py --valgrind`). A
+sanitized Debug build refuses to install: its ASan/UBSan instrumentation would leave every consumer with unresolved
+sanitizer symbols. CI builds and runs [`tests/consumer`](tests/consumer) against the installed package (Release and
+Debug) and against a source checkout, from C, from C++ and from a C++-only project.
 
 ## Output
 
@@ -320,11 +338,13 @@ Present: everything in the module table above. Absent: open-surface generators o
 (`MFTLBuildMeshFromLevelSet`), a mesh reader of any format, topological ghost-layer growth, and continuous-time
 (swept) contact or topology detection.
 
+The full list, with the known limits of what exists, is the [roadmap](plans/00-roadmap.md).
+
 Next: measurement of the distributed remesher at hundreds of ranks, and a local (rather than global) volume
-correction. GPU offload of the per-timestep geometry kernels, for which the SoA layout is designed, follows once the
-library itself is complete. [`examples/gpu`](examples/gpu/README.md) was a first experiment in that direction — the
-geometry on the library's own pools in CUDA, OpenACC and OpenMP offload, reproducing the host run to round-off — and
-is kept out of the build, the tests and CI until then.
+correction. GPU offload of the per-timestep geometry kernels, which the one-array-per-field geometry layout is
+designed for, follows once the library itself is complete. [`examples/gpu`](examples/gpu/README.md) was a first
+experiment in that direction — the geometry on the library's own pools in CUDA, OpenACC and OpenMP offload,
+reproducing the host run to round-off — and is kept out of the build, the tests and CI until then.
 
 ## Contributing
 

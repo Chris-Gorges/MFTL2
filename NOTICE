@@ -6,3 +6,17 @@ Licensed under the Apache License, Version 2.0 (see LICENSE).
 This product includes a radix sort derived from work by Cameron Hart,
 Copyright (c) 2014 Cameron Hart, distributed under the zlib license.
 The original license notice is reproduced in src/arrayfunctions/radixsort.c.
+
+The exact floating-point expansion arithmetic and the adaptive orientation
+predicate in src/bvh/bvh_predicates.c are adapted from Jonathan Richard
+Shewchuk's "Routines for Arbitrary Precision Floating-point Arithmetic and Fast
+Robust Geometric Predicates" (predicates.c, 1996), placed in the public domain
+by its author. The method: J. R. Shewchuk, "Adaptive Precision Floating-Point
+Arithmetic and Fast Robust Geometric Predicates", Discrete & Computational
+Geometry 18 (1997).
+
+The triangle-triangle intersection test in src/bvh/bvh_predicates.c implements
+the algorithm of P. Guigue and O. Devillers, "Fast and Robust Triangle-Triangle
+Overlap Test Using Orientation Predicates", Journal of Graphics Tools 8(1)
+(2003), and follows the structure of the C implementation published with it;
+every orientation test is made exact with the predicate above.

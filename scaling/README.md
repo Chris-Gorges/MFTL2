@@ -2,9 +2,11 @@
 
 Periodic many-sphere advection with ghost synchronization, redistribution,
 triangle geometry and vertex normals — and, separately, the same with the
-remesher in the loop ([Remeshing scaling](#remeshing-scaling)). See [QUICKSTART.md](QUICKSTART.md) for
-the colleague's build/submission instructions and [SCALING_PLAN.md](SCALING_PLAN.md)
-for memory estimates and interpretation.
+remesher in the loop ([Remeshing scaling](#remeshing-scaling)). See
+[QUICKSTART.md](QUICKSTART.md) for step-by-step build and submission
+instructions, [SCALING_PLAN.md](SCALING_PLAN.md) for memory estimates and
+interpretation, and [Measured results](#measured-results) for the numbers the
+top-level README quotes.
 
 **Each launcher uses one problem size. Only the rank count is swept.**
 
@@ -38,8 +40,7 @@ scaling/launch_weak.sh
 Configure `scaling/site.sh` for the site's modules, MPI launcher,
 partition/account and binding. Use the one-/two-node smoke test in QUICKSTART
 before the production campaign. Launchers require a current Release build with
-`MFTL_COMM_PROFILE=ON`. The library workspace-growth fix in this change must be
-included in that build.
+`MFTL_COMM_PROFILE=ON`.
 
 All launcher parameters are environment overrides. `MAX_NODES=4` limits a run to
 1, 2 and 4 nodes; `NODES="1 3 6" MAX_NODES=6` selects custom points. Candidate
@@ -55,7 +56,49 @@ large workloads; exclusive CPUs do not imply all node RAM is allocated.
 
 `BUILD_DIR` selects another build. `EXTRA_ARGS` and `SBATCH_EXTRA` are
 whitespace-delimited argument lists, not shell commands or quoted expressions.
-See [BUILD_WARNINGS.md](BUILD_WARNINGS.md) for the GCC 11/MVAPICH build log.
+
+## Measured results
+
+The two default campaigns of [Run](#run), as last run on 2026-10-19. These are
+the numbers quoted in the top-level README; they have not been re-measured since,
+and the library has changed after the commit below.
+
+| | |
+|---|---|
+| Machine | Slurm cluster; nodes of 2 × Intel Xeon Gold 6240 (2 × 18 cores, 2.6 GHz), 36 ranks per node pinned one per core, 1–8 nodes |
+| Compiler | GCC 11; Release (`-O3 -DNDEBUG`), no `-march`, `MFTL_COMM_PROFILE=ON` |
+| MPI | MVAPICH2 2.3.7 |
+| Library | commit `ac631b7` (2026-10-16); `src/`, `include/` and `CMakeLists.txt` unmodified (the sweep's `snapshot/source.diff` is empty) |
+| Timing | one job per point: 5 warm-up steps, then 3 repeats of 200 steps; ms per step of the fastest repeat, and of the median one |
+
+"comm" is the exchange and synchronisation share of the step (redistribution
+buckets plus ghost exchanges); "redist" is the `MFTLRedistribute` phase.
+
+**Strong scaling**: 110,592 spheres × 1,280 triangles = 141.6 M triangles in a
+48³ periodic box.
+
+| P | nodes | grid | triangles/rank | ms/step | median | speedup | efficiency | redist ms | comm |
+|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|
+| 36 | 1 | 4×3×3 | 3,932,160 | 393.1 | 393.3 | 1.00 | 1.00 | 88.0 | 2.7 % |
+| 72 | 2 | 6×4×3 | 1,966,080 | 211.5 | 211.8 | 1.86 | 0.93 | 53.0 | 6.6 % |
+| 144 | 4 | 6×6×4 | 983,040 | 110.3 | 112.7 | 3.56 | 0.89 | 29.5 | 9.2 % |
+| 288 | 8 | 8×6×6 | 491,520 | 59.9 | 66.6 | 6.56 | 0.82 | 18.1 | 15.2 % |
+
+**Weak scaling**: 1,000 spheres (1.28 M triangles) in a 10³ box per rank.
+
+| P | nodes | grid | triangles | ms/step | median | efficiency | redist ms | comm |
+|---:|---:|---|---:|---:|---:|---:|---:|---:|
+| 36 | 1 | 4×3×3 | 46.1 M | 145.8 | 146.2 | 1.00 | 37.1 | 3.9 % |
+| 72 | 2 | 6×4×3 | 92.2 M | 142.2 | 142.3 | 1.03 | 37.1 | 9.5 % |
+| 144 | 4 | 6×6×4 | 184.3 M | 157.2 | 158.0 | 0.93 | 44.1 | 15.3 % |
+| 288 | 8 | 8×6×6 | 368.6 M | 161.6 | 162.6 | 0.90 | 45.2 | 19.3 % |
+
+Efficiency is against one full node (P = 36): strong T(36)·36 / (T(P)·P), weak
+T(36) / T(P). Every point passed the run's own checks: triangle and vertex
+counts exact and area conserved to 1e-15, no orphaned ghosts, no global
+fallback route. The repeats agree to within 3 % except strong P = 288, where
+they spread by 12 %; the median column shows what that costs. The remeshing
+campaigns ([Remeshing scaling](#remeshing-scaling)) have no cluster results yet.
 
 ## Initialization, timestep and runtime
 

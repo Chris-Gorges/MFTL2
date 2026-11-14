@@ -10,15 +10,15 @@ The default campaign tests strong and weak scaling for periodic advection of sph
 Both use 36 ranks/node throughout: **36, 72, 144, 288 ranks**
 on **1, 2, 4, 8 nodes**. Each job requests at most **one hour**.
 
-## 1. Copy the complete change and configure the site
+## 1. Configure the site
 
 Edit **`scaling/site.sh`** once:
 
 - Set `SBATCH_EXTRA` for the partition/account, if required.
 - Check that `site_modules` matches the modules used to build.
 - Check `CORES_PER_NODE=36`, `RANKS_PER_NODE=36`, `MAX_NODES=8`, and a homogeneous node type.
-- `MEMORY_PER_NODE=default` (the default) omits `--mem`, matching this site's
-  working reference job. `0` explicitly requests all configured memory;
+- `MEMORY_PER_NODE=default` (the default) omits `--mem`, like the site's
+  reference job script `job.sh`. `0` explicitly requests all configured memory;
   an integer size such as `100G` requests a fixed amount. Use site-approved
   values. An empty value also omits the flag; no script edits are needed.
 - Keep source/results on a filesystem visible from every compute node.
@@ -172,26 +172,25 @@ strong sweep must report `DIGEST IDENTICAL at every P`, and `!conv` and
 
 `CPU count per node can not be satisfied` / `Requested node configuration is
 not available` means Slurm rejected the requested resource combination. It does
-not by itself prove that 36 ranks/node is wrong. Here, removing `--mem` made the
-same CPU request acceptable, which points to the site's memory configuration or
-policy; the exact cause requires the partition/node settings.
+not by itself prove that 36 ranks/node is wrong. If removing `--mem`
+(`MEMORY_PER_NODE=default`) makes the same CPU request acceptable, the cause is
+the site's memory configuration or policy; the exact cause requires the
+partition and node settings:
 
 ```bash
-sinfo -N -p gauss -o '%N %c %m %t'
-scontrol show partition gauss
-scontrol show job 4120
+sinfo -N -p <partition> -o '%N %c %m %t'
+scontrol show partition <partition>
+scontrol show job <jobid>
 squeue -u "$USER" -o '%.18i %.24j %.9P %.2t %.6D %R'
 ```
 
-Use the actual partition and job ID. `Resources` means the job was accepted and
-is waiting for resources. `Dependency` on `mftl-strong-collect` or
-`mftl-weak-collect` is expected: the summary job waits for the benchmark jobs.
-The wider job-name column avoids confusing the collector with a benchmark.
+`Resources` means the job was accepted and is waiting for resources.
+`Dependency` on `mftl-strong-collect` or `mftl-weak-collect` is expected: the
+summary job waits for the benchmark jobs. The wider job-name column avoids
+confusing the collector with a benchmark.
 
-Omitting `--mem` does not guarantee access to the node's physical 120 GB.
+Omitting `--mem` does not guarantee access to all of the node's physical memory.
 Check `ReqTRES`/`AllocTRES` and memory fields in `scontrol show job`, now also
 recorded in the job log. Confirm enough memory for the large workload before
 the production campaign; if necessary set a permitted `MEMORY_PER_NODE`.
 No automatic retry silently lowers a rejected memory request.
-
-The compiler warnings and their severity are explained in [BUILD_WARNINGS.md](BUILD_WARNINGS.md).

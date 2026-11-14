@@ -52,6 +52,12 @@ MPI test declares its rank count as `PROCESSORS`, so `ctest -j N` schedules rank
   can pass forever without covering anything.
 - Compare a distributed result against the same call on one rank (`MPI_COMM_SELF`) wherever the answer is meant
   to be partition-independent.
+- Test a distributed contact or proximity query as a SET: gather the `(gid_A, gid_B)` pairs from every rank and
+  compare the multiset with the same query run before partitioning (itself checked against an exhaustive sweep).
+  Multiset equality rules out a missing, a duplicate, a spurious and a partition-dependent contact at once; a count
+  or a "found at least one" does not.
+- Compare two unit vectors that should be identical by the chord `|a - b|`, never by `acos(a·b)`: the arc cosine
+  has an infinite derivative at 1, so vectors one ulp apart measure ~1e-8 rad apart and look like a bug.
 
 ## Documentation
 
