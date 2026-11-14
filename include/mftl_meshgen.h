@@ -46,14 +46,23 @@ extern "C"
  *
  * Triangle geometry is current on return (when the object has a domain).
  *
+ * The list must describe an ORIENTED edge-manifold: three distinct, in-range
+ * corners per triangle, no directed edge used twice (that would be a third
+ * triangle on an edge, a neighbour wound the other way, or a duplicate), and no
+ * triangle together with its reversal. Anything else is refused with a
+ * diagnostic on stderr before the object is touched -- a half-edge mesh cannot
+ * represent it, and the surplus half-edges would be flagged as surface boundary
+ * for good. Open rims and bowtie vertices are accepted.
+ *
  * @param object      Target object; must be EMPTY and linked to a domain.
  * @param positions   [3 * n_vertices] interleaved xyz.
  * @param n_vertices  Number of vertices, >= 3.
  * @param tri_verts   [3 * n_triangles] vertex indices.
  * @param n_triangles Number of triangles, >= 1.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR on invalid arguments (including an index
- *         out of range or a triangle with a repeated corner; checked in Release
- *         before anything is modified).
+ *         out of range, a triangle with a repeated corner, or a list that is not
+ *         an oriented edge-manifold; checked in Release before anything is
+ *         modified).
  *
  * @rank_local The collective bookkeeping belongs to the caller.
  */
@@ -72,8 +81,10 @@ int MFTLBuildIndexedMesh(MFTL_Object *object, const double *positions, int n_ver
  * @param object      Object with a filled vertex pool (>= 3 vertices) and a domain.
  * @param tri_verts   [3 * n_triangles] vertex indices, counter-clockwise.
  * @param n_triangles Number of triangles, >= 1.
- * @return #MFTL_SUCCESS, or #MFTL_ERROR on invalid arguments (checked in Release
- *         before anything is modified).
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on invalid arguments, including a list
+ *         that is not an oriented edge-manifold (the rules of
+ *         MFTLBuildIndexedMesh(); checked in Release before anything is
+ *         modified).
  *
  * @rank_local
  */

@@ -353,6 +353,169 @@ static int test_integrity_check_rejects_a_stale_out_he(void)
   return 0;
 }
 
+/**
+ * @brief A pool built from an index list WITHOUT the builder's validation: the
+ *        records exactly as MFTLBuildIndexedMesh() would write them, then
+ *        MFTLRebuildTwins(). The only way to put malformed connectivity in front
+ *        of the integrity check now that the builder refuses it.
+ */
+static MFTL_Object *make_unchecked(int id, const double *pos, int nv, const int *tri, int nt)
+{
+  MFTL_Object *obj = MFTLObjectCreate(id);
+  MFTLEnsembleAddObject(g_ens, obj);
+  MFTLObjectSetCounts(obj, nv, nv, nt, nt);
+  memcpy(obj->verts.pos, pos, 3 * (size_t) nv * sizeof(double));
+  for (int v = 0; v < nv; ++v)
+  {
+    obj->verts.rec[v].global_id = v;
+    obj->verts.rec[v].owner_proc = 0;
+    obj->verts.rec[v].flags = 0;
+    obj->verts.rec[v].out_he_idx = MFTL_ERROR;
+  }
+  for (int t = 0; t < nt; ++t)
+  {
+    obj->tris.rec[t].global_id = t;
+    obj->tris.rec[t].owner_proc = 0;
+    obj->tris.rec[t].flags = 0;
+    for (int k = 0; k < 3; ++k)
+    {
+      MFTL_HalfEdge *const h = &obj->tris.he[3 * t + k];
+      h->global_id = 3 * t + k;
+      h->vertex_idx = tri[3 * t + (k + 1) % 3];
+      h->twin_idx = MFTL_ERROR;
+      h->flags = 0;
+      obj->verts.rec[tri[3 * t + k]].out_he_idx = 3 * t + k;
+    }
+  }
+  MFTLRebuildTwins(obj);
+  return obj;
+}
+
+/**
+ * @brief Connectivity a half-edge mesh cannot represent is diagnosed, not
+ *        certified.
+ *
+ * Each of these passed as "consistent" before the edge-incidence pass:
+ * MFTLRebuildTwins() pairs two half-edges of the edge and leaves the surplus
+ * twin-less, which the check counted as open boundary (and the builder then
+ * flagged as boundary for good). The reversed duplicate even passed as CLOSED.
+ */
+static int test_integrity_check_rejects_what_a_half_edge_mesh_cannot_be(void)
+{
+  static const double pos[15] = {0, 0, 0, 1, 0, 0, 0, 1, 0, 0, -1, 0, 0, 0, 1};
+  static const int three_on_one_edge[9] = {0, 1, 2, 1, 0, 3, 0, 1, 4};
+  static const int flipped_neighbour[6] = {0, 1, 2, 0, 1, 3};
+  static const int duplicated[6] = {0, 1, 2, 0, 1, 2};
+  static const int reversed_duplicate[6] = {0, 1, 2, 0, 2, 1};
+  const struct
+  {
+    const int *tri;
+    int nt, nv;
+  } cases[] = {{three_on_one_edge, 3, 5}, {flipped_neighbour, 2, 4}, {duplicated, 2, 3}, {reversed_duplicate, 2, 3}};
+
+  printf("\n  (expecting diagnostics below) ");
+  for (size_t c = 0; c < sizeof cases / sizeof cases[0]; ++c)
+  {
+    /* The builder refuses the list before writing anything... */
+    MFTL_Object *built = MFTLObjectCreate(100 + (int) c);
+    MFTLEnsembleAddObject(g_ens, built);
+    TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLBuildIndexedMesh(built, pos, cases[c].nv, cases[c].tri, cases[c].nt));
+    TEST_ASSERT_EQUAL_INT(0, built->tris.n);
+    TEST_ASSERT_EQUAL_INT(0, built->verts.n);
+
+    /* ...and the check rejects the same connectivity built around it. */
+    MFTL_Object *obj = make_unchecked(200 + (int) c, pos, cases[c].nv, cases[c].tri, cases[c].nt);
+    TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLCheckMeshIntegrity(obj));
+  }
+  return 0;
+}
+
+/**
+ * @brief A missing twin is legal only where the other side is absent.
+ *
+ * Unlinking BOTH halves of an interior edge leaves a symmetric relation the old
+ * check accepted as "open"; the edge's other half-edge is still in the pool, so
+ * on any mesh -- complete or a partition -- it must be linked.
+ */
+static int test_integrity_check_rejects_an_unpaired_interior_edge(void)
+{
+  MFTL_Object *obj = make_quad();
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLCheckMeshIntegrity(obj));
+
+  int h = MFTL_ERROR;
+  for (int i = 0; i < MFTLNumHalfEdges(obj) && h == MFTL_ERROR; ++i)
+    if (MFTLHeTwin(obj, i) != MFTL_ERROR) h = i;
+  TEST_ASSERT(h != MFTL_ERROR);
+  const int tw = MFTLHeTwin(obj, h);
+
+  printf("\n  (expecting diagnostics below) ");
+  obj->tris.he[h].twin_idx = MFTL_ERROR;
+  obj->tris.he[tw].twin_idx = MFTL_ERROR;
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLCheckMeshIntegrity(obj));
+
+  MFTLRebuildTwins(obj);
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLCheckMeshIntegrity(obj));
+  return 0;
+}
+
+/**
+ * @brief What stays legal: an open rim, a bowtie vertex, and a pool that is a
+ *        subset of a mesh (a halo-like cut through a sphere).
+ */
+static int test_integrity_check_accepts_rims_bowties_and_subsets(void)
+{
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLCheckMeshIntegrity(make_quad()));
+
+  static const double pos[] = {0, 0, 0, 1, 0, 0, 1, 1, 0, -1, 0, 0, -1, -1, 0};
+  static const int bowtie[] = {0, 1, 2, 0, 3, 4};
+  MFTL_Object *bt = MFTLObjectCreate(300);
+  MFTLEnsembleAddObject(g_ens, bt);
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLBuildIndexedMesh(bt, pos, 5, bowtie, 2));
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLCheckMeshIntegrity(bt));
+
+  /* The upper half of a sphere's triangles, with every vertex kept: twin-less
+   * half-edges along the cut whose opposite is NOT in the pool. */
+  MFTL_Object *sphere = MFTLObjectCreate(301);
+  MFTLEnsembleAddObject(g_ens, sphere);
+  double c[3] = {0.0, 0.0, 0.0};
+  MFTLGenerateSphere(sphere, c, 1.0, 2);
+  const int nt = sphere->tris.n;
+  int *tri = (int *) malloc(3 * (size_t) nt * sizeof(int));
+  int kept = 0;
+  for (int t = 0; t < nt; ++t)
+  {
+    double ct[3];
+    MFTLGetTriangleCenter(sphere, t, ct);
+    if (ct[2] <= 0.0) continue;
+    MFTLGetTriangleVertices(sphere, t, &tri[3 * kept]);
+    kept++;
+  }
+  /* Only vertices the kept triangles use, renumbered densely. */
+  int *slot = (int *) malloc((size_t) sphere->verts.n * sizeof(int));
+  for (int v = 0; v < sphere->verts.n; ++v) slot[v] = MFTL_ERROR;
+  int nv = 0;
+  double *vp = (double *) malloc(3 * (size_t) sphere->verts.n * sizeof(double));
+  for (int i = 0; i < 3 * kept; ++i)
+  {
+    const int v = tri[i];
+    if (slot[v] == MFTL_ERROR)
+    {
+      memcpy(&vp[3 * nv], MFTLVertexPos(sphere, v), 3 * sizeof(double));
+      slot[v] = nv++;
+    }
+    tri[i] = slot[v];
+  }
+  MFTL_Object *cap = MFTLObjectCreate(302);
+  MFTLEnsembleAddObject(g_ens, cap);
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLBuildIndexedMesh(cap, vp, nv, tri, kept));
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLCheckMeshIntegrity(cap));
+  TEST_ASSERT(inv_mesh_is_sound(cap, g_ens->domain.rank));
+  free(tri);
+  free(slot);
+  free(vp);
+  return 0;
+}
+
 /* ─────────────────────────────────────────────────────────────────────────────
  * Connected components
  * ─────────────────────────────────────────────────────────────────────────── */
@@ -483,6 +646,9 @@ int main(int argc, char **argv)
   RUN_TEST(test_rebuild_twins_invalidates_derived);
   RUN_TEST(test_integrity_check_rejects_a_broken_twin);
   RUN_TEST(test_integrity_check_rejects_a_stale_out_he);
+  RUN_TEST(test_integrity_check_rejects_what_a_half_edge_mesh_cannot_be);
+  RUN_TEST(test_integrity_check_rejects_an_unpaired_interior_edge);
+  RUN_TEST(test_integrity_check_accepts_rims_bowties_and_subsets);
   RUN_TEST(test_one_closed_surface_is_one_component);
   RUN_TEST(test_two_shells_in_one_pool_are_two_components);
   RUN_TEST(test_a_shared_vertex_does_not_join_components);

@@ -119,6 +119,124 @@ int MFTLMarkMeshBoundary(MFTL_Object *obj)
   return n_boundary;
 }
 
+/**
+ * @brief The edge-level half of MFTLCheckMeshIntegrity(): every undirected edge
+ *        carries at most two half-edges, in opposite directions and linked as
+ *        twins, and no two triangles have the same three corners.
+ *
+ * Each statement holds for any SUBSET of a valid mesh, so it is checked on a
+ * partition with its halo exactly as on a complete mesh: a rank holds each
+ * triangle once, a sub-mesh of an oriented 2-manifold has no edge with three
+ * half-edges or two in one direction, and redistribution links every pair whose
+ * two triangles a rank holds (the twins a full MFTLRebuildTwins() would make). A
+ * twin-less half-edge whose opposite is NOT in the pool -- an open surface's rim,
+ * a halo's outer edge -- stays legal.
+ *
+ * Half-edges are bucketed by origin, as in MFTLRebuildTwins(); every edge is
+ * reported once, from its lowest half-edge index, and every duplicated pair of
+ * triangles once, from the lower one's first half-edge. Half-edges with an
+ * out-of-range target or origin were reported by the caller and are skipped.
+ *
+ * @param obj The mesh.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR after printing every violation.
+ */
+static int check_edge_incidence(const MFTL_Object *obj)
+{
+  const MFTL_HalfEdge *const he = obj->tris.he;
+  const int n_verts = obj->verts.n;
+  const int n_hes = 3 * obj->tris.n;
+  if (n_hes < 1 || n_verts < 1) return MFTL_SUCCESS;
+
+  int *const scratch = (int *) MFTLMallocOrDie(sizeof(int) * ((size_t) n_verts + (size_t) n_hes), "MFTLCheckMeshIntegrity");
+  int *const v_heads = scratch;  // first half-edge with origin v
+  int *const he_next = scratch + n_verts;  // next half-edge with the same origin
+
+  for (int v = 0; v < n_verts; ++v) v_heads[v] = MFTL_ERROR;
+  for (int h = n_hes - 1; h >= 0; --h)
+  {
+    he_next[h] = MFTL_ERROR;
+    const int u = he[MFTLHePrevIdx(h)].vertex_idx, v = he[h].vertex_idx;
+    if (u < 0 || u >= n_verts || v < 0 || v >= n_verts) continue;
+    he_next[h] = v_heads[u];
+    v_heads[u] = h;
+  }
+
+  int ok = MFTL_SUCCESS;
+  for (int h = 0; h < n_hes; ++h)
+  {
+    const int u = he[MFTLHePrevIdx(h)].vertex_idx, v = he[h].vertex_idx;
+    if (u < 0 || u >= n_verts || v < 0 || v >= n_verts) continue;
+
+    const int gu = obj->verts.rec[u].global_id, gv = obj->verts.rec[v].global_id;
+    if (u == v)
+    {
+      fprintf(stderr, "[MeshCheck] Half-edge %d starts and ends at vertex %d: its triangle repeats a corner\n", he[h].global_id, gu);
+      ok = MFTL_ERROR;
+      continue;
+    }
+
+    const int t = MFTLHeTriIdx(h);
+    const int third = he[MFTLHeNextIdx(h)].vertex_idx;  // the corner of t off this edge
+    const int first_of_t = (h == MFTLTriFirstHe(t));  // duplicates are reported from here only
+
+    /* Everything else on the undirected edge {u, v}: same direction in u's
+     * bucket, the opposite one in v's. */
+    int n_same = 0, n_opp = 0, lowest = h, same = MFTL_ERROR, opp = MFTL_ERROR;
+    for (int g = v_heads[u]; g != MFTL_ERROR; g = he_next[g])
+    {
+      if (g == h || he[g].vertex_idx != v) continue;
+      n_same++;
+      same = g;
+      if (g < lowest) lowest = g;
+      const int s = MFTLHeTriIdx(g);
+      if (first_of_t && s > t && he[MFTLHeNextIdx(g)].vertex_idx == third)
+      {
+        fprintf(stderr, "[MeshCheck] Triangles %d and %d have the same three corners, in the same order (a duplicated triangle)\n", obj->tris.rec[t].global_id,
+                obj->tris.rec[s].global_id);
+        ok = MFTL_ERROR;
+      }
+    }
+    for (int g = v_heads[v]; g != MFTL_ERROR; g = he_next[g])
+    {
+      if (he[g].vertex_idx != u) continue;
+      n_opp++;
+      opp = g;
+      if (g < lowest) lowest = g;
+      const int s = MFTLHeTriIdx(g);
+      if (first_of_t && s > t && he[MFTLHeNextIdx(g)].vertex_idx == third)
+      {
+        fprintf(stderr, "[MeshCheck] Triangles %d and %d have the same three corners, in opposite orders (a two-triangle pillow)\n", obj->tris.rec[t].global_id,
+                obj->tris.rec[s].global_id);
+        ok = MFTL_ERROR;
+      }
+    }
+
+    if (h != lowest) continue;  // the edge is reported once, from its lowest half-edge
+
+    const int n_on_edge = 1 + n_same + n_opp;
+    if (n_on_edge > 2)
+    {
+      fprintf(stderr, "[MeshCheck] Edge %d-%d is shared by %d half-edges: a non-manifold edge\n", gu, gv, n_on_edge);
+      ok = MFTL_ERROR;
+    }
+    else if (n_same == 1)
+    {
+      fprintf(stderr, "[MeshCheck] Half-edges %d and %d both run from vertex %d to %d: their triangles are oriented inconsistently\n", he[h].global_id,
+              he[same].global_id, gu, gv);
+      ok = MFTL_ERROR;
+    }
+    else if (n_opp == 1 && (he[h].twin_idx != opp || he[opp].twin_idx != h))
+    {
+      fprintf(stderr, "[MeshCheck] Half-edges %d and %d run in opposite directions along edge %d-%d but are not each other's twin\n", he[h].global_id,
+              he[opp].global_id, gu, gv);
+      ok = MFTL_ERROR;
+    }
+  }
+
+  free(scratch);
+  return ok;
+}
+
 int MFTLCheckMeshIntegrity(const MFTL_Object *obj)
 {
   MFTL_ASSERT(obj != MFTL_NULL);
@@ -201,6 +319,8 @@ int MFTLCheckMeshIntegrity(const MFTL_Object *obj)
       ok = MFTL_ERROR;
     }
   }
+
+  if (check_edge_incidence(obj) != MFTL_SUCCESS) ok = MFTL_ERROR;
 
   if (ok == MFTL_SUCCESS)
   {

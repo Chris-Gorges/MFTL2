@@ -631,8 +631,9 @@ static inline int MFTLGetVertexOneRingHalfedges(const MFTL_Object *obj, int v, i
  * of \f$u \to v\f$ is the unlinked half-edge \f$v \to u\f$ in the bucket of
  * \f$v\f$. \f$O(V + H\cdot\bar{d})\f$ with \f$\bar{d}\f$ the mean valence, one
  * scratch allocation, no hashing. Pairing only unlinked candidates keeps the
- * relation symmetric on non-manifold input (surplus half-edges stay twin-less
- * for MFTLCheckMeshIntegrity() to report). Clears the derived bit.
+ * relation symmetric on non-manifold input; the surplus half-edges stay
+ * twin-less, and MFTLCheckMeshIntegrity() reports the edge (the builders of
+ * mftl_meshgen.h refuse such input outright). Clears the derived bit.
  *
  * @param obj The mesh; every `he.twin_idx` is rewritten.
  *
@@ -665,9 +666,20 @@ int MFTLMarkMeshBoundary(MFTL_Object *obj);
  * Checks: every vertex has an in-range outgoing half-edge whose origin is that
  * vertex (an isolated vertex is reported as an error); every half-edge target is
  * in range; every twin is in range, symmetric (\f$\mathrm{twin}(\mathrm{twin}(h))
- * = h\f$) and has swapped endpoints. Next-cycle and face back-references need no
- * check under implicit indexing. Twin-less half-edges are legal (open surfaces,
- * halo rims) and only counted.
+ * = h\f$) and has swapped endpoints. Then, per undirected edge: no half-edge
+ * starts where it ends; at most two half-edges, never two in the same direction
+ * (a third triangle on an edge, or a neighbour wound the other way); two in
+ * opposite directions must be each other's twin; and no two triangles share all
+ * three corners (in either order -- a reversed duplicate pairs up into a closed
+ * "pillow"). Next-cycle and face back-references need no check under implicit
+ * indexing.
+ *
+ * Every rule holds for any subset of a valid mesh, so a partition with its halo
+ * is checked exactly like a complete mesh. A twin-less half-edge is legal when
+ * the other half of its edge is not in the pool (an open surface's rim, a halo's
+ * outer edge) and only counted. A vertex shared by otherwise separate fans (a
+ * bowtie) is NOT reported: whether a fan is complete cannot be decided on a
+ * partition.
  *
  * It does NOT check that half-edges were created in aligned triples; that is
  * `inv_implicit_indexing()` in tests/test_mesh_invariants.h.

@@ -11,6 +11,7 @@
 #include "mftl_meshgen.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "mftl_constants.h"
@@ -38,6 +39,68 @@ static bool index_list_is_valid(const int *tri_verts, int n_triangles, int n_ver
     if (a == b || b == c || c == a) return MFTL_FALSE;
   }
   return MFTL_TRUE;
+}
+
+/**
+ * @brief Is the (index-valid) list an ORIENTED edge-manifold: no directed edge
+ *        used twice, and no two triangles with the same three corners?
+ *
+ * A directed edge used twice is a third triangle on an edge, or a neighbour
+ * wound the other way, or a duplicated triangle: MFTLRebuildTwins() would pair
+ * two of the half-edges and MFTLMarkMeshBoundary() would flag the rest as
+ * surface boundary for good. A triangle and its reversal pair up on all three
+ * edges into a closed two-triangle "pillow" that no other test sees. Every
+ * other edge then has at most one half-edge per direction, which is what the
+ * half-edge structure can represent. A vertex shared by otherwise separate fans
+ * (a bowtie) is NOT refused.
+ *
+ * Directed edges are bucketed by origin, as in MFTLRebuildTwins(); the first
+ * violation is printed to stderr.
+ *
+ * @param tri_verts   [3 * n_triangles] vertex indices, already index-valid.
+ * @param n_triangles Number of triangles.
+ * @param n_vertices  Size of the vertex pool.
+ * @param caller      Name for the diagnostic.
+ * @return `true` if the list can become a half-edge mesh.
+ */
+static bool index_list_is_manifold(const int *tri_verts, int n_triangles, int n_vertices, const char *caller)
+{
+  const int n_he = 3 * n_triangles;
+  int *const scratch = (int *) MFTLMallocOrDie(sizeof(int) * ((size_t) n_vertices + (size_t) n_he), "mesh builder manifold check");
+  int *const head = scratch;  // first directed edge leaving vertex v
+  int *const next = scratch + n_vertices;  // next directed edge with the same origin
+  for (int v = 0; v < n_vertices; ++v) head[v] = MFTL_ERROR;
+
+  /* Directed edge 3t+k runs tri_verts[3t+k] -> tri_verts[3t+(k+1)%3]; its
+   * triangle's third corner is tri_verts[3t+(k+2)%3]. */
+  bool ok = MFTL_TRUE;
+  for (int h = 0; h < n_he && ok; ++h)
+  {
+    const int t = h / 3, k = h % 3;
+    const int u = tri_verts[h], v = tri_verts[3 * t + (k + 1) % 3], w = tri_verts[3 * t + (k + 2) % 3];
+
+    for (int g = head[u]; g != MFTL_ERROR; g = next[g])
+    {
+      if (tri_verts[3 * (g / 3) + (g % 3 + 1) % 3] != v) continue;
+      fprintf(stderr, "%s: triangles %d and %d both traverse edge %d -> %d (a non-manifold edge, a duplicate, or inconsistent orientation)\n", caller, g / 3, t,
+              u, v);
+      ok = MFTL_FALSE;
+      break;
+    }
+    for (int g = (ok ? head[v] : MFTL_ERROR); g != MFTL_ERROR; g = next[g])
+    {
+      const int s = g / 3, j = g % 3;
+      if (tri_verts[3 * s + (j + 1) % 3] != u || tri_verts[3 * s + (j + 2) % 3] != w) continue;
+      fprintf(stderr, "%s: triangles %d and %d have the same three corners in opposite orders\n", caller, s, t);
+      ok = MFTL_FALSE;
+      break;
+    }
+    next[h] = head[u];
+    head[u] = h;
+  }
+
+  free(scratch);
+  return ok;
 }
 
 /**
@@ -107,6 +170,7 @@ int MFTLBuildTopologyFromIndexList(MFTL_Object *object, const int *tri_verts, in
   if (object == MFTL_NULL || tri_verts == MFTL_NULL) return MFTL_ERROR;
   if (n_triangles < 1 || object->verts.n < 3) return MFTL_ERROR;
   if (!index_list_is_valid(tri_verts, n_triangles, object->verts.n)) return MFTL_ERROR;
+  if (!index_list_is_manifold(tri_verts, n_triangles, object->verts.n, "MFTLBuildTopologyFromIndexList")) return MFTL_ERROR;
 
   build_topology(object, tri_verts, n_triangles);
   return MFTL_SUCCESS;
@@ -120,6 +184,7 @@ int MFTLBuildIndexedMesh(MFTL_Object *object, const double *positions, int n_ver
   if (object == MFTL_NULL || positions == MFTL_NULL || tri_verts == MFTL_NULL) return MFTL_ERROR;
   if (n_vertices < 3 || n_triangles < 1) return MFTL_ERROR;
   if (!index_list_is_valid(tri_verts, n_triangles, n_vertices)) return MFTL_ERROR;
+  if (!index_list_is_manifold(tri_verts, n_triangles, n_vertices, "MFTLBuildIndexedMesh")) return MFTL_ERROR;
 
   const int rank = (object->domain != MFTL_NULL) ? object->domain->rank : 0;
 

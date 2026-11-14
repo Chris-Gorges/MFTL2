@@ -663,8 +663,17 @@ static void rebuild_patch(MFTL_SpatialHalo *halo, int entry, const MFTL_PackedVe
     return;
   }
 
-  MFTLBuildTopologyFromIndexList(patch, tri_verts, n_kept);
+  /* A patch is owned triangles of one oriented surface, each sent at most once
+   * per destination, so the builder's manifold check cannot refuse it; if it
+   * ever did, an empty patch is the honest answer, not a half-built one. */
+  const int built = MFTLBuildTopologyFromIndexList(patch, tri_verts, n_kept);
   free(tri_verts);
+  MFTL_ASSERT(built == MFTL_SUCCESS && "spatial halo: the arriving triangles are not an oriented manifold");
+  if (built != MFTL_SUCCESS)
+  {
+    MFTLObjectDestroy(&halo->patch[entry]);
+    return;
+  }
 
   /* ── Restore transmitted identity over the freshly derived one ─────────── */
   int max_t_gid = 0;

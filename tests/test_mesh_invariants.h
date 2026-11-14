@@ -78,6 +78,60 @@ static int inv_twins_are_symmetric(const MFTL_Object *obj)
   return 1;
 }
 
+/** @brief qsort order of (undirected edge key, half-edge index) pairs. */
+static int inv_cmp_edge_key(const void *pa, const void *pb)
+{
+  const long long *a = (const long long *) pa, *b = (const long long *) pb;
+  if (a[0] != b[0]) return (a[0] < b[0]) ? -1 : 1;
+  return (a[1] < b[1]) ? -1 : (a[1] > b[1]);
+}
+
+/**
+ * @brief Every undirected edge in the pool carries one half-edge, or two that
+ *        run in opposite directions AND are each other's twin; no half-edge
+ *        starts where it ends.
+ *
+ * True of any subset of an oriented 2-manifold, so it holds on a partition with
+ * its halo as on a complete mesh. An independent reference for the edge pass of
+ * MFTLCheckMeshIntegrity() (sorting where that buckets), asserted after every
+ * operation through inv_mesh_is_sound().
+ */
+static int inv_edges_are_oriented_manifold(const MFTL_Object *obj)
+{
+  const int n_he = 3 * obj->tris.n;
+  if (n_he == 0) return 1;
+  long long *key = (long long *) malloc(2 * (size_t) n_he * sizeof(long long));
+  for (int h = 0; h < n_he; ++h)
+  {
+    const long long u = MFTLHeOrigin(obj, h), v = MFTLHeTarget(obj, h);
+    if (u == v)
+    {
+      free(key);
+      return 0;
+    }
+    key[2 * h] = (u < v) ? (u << 32) | v : (v << 32) | u;
+    key[2 * h + 1] = h;
+  }
+  qsort(key, (size_t) n_he, 2 * sizeof(long long), inv_cmp_edge_key);
+
+  int ok = 1;
+  for (int i = 0; i < n_he && ok;)
+  {
+    int j = i + 1;
+    while (j < n_he && key[2 * j] == key[2 * i]) ++j;
+    if (j - i > 2) ok = 0;
+    if (j - i == 2)
+    {
+      const int a = (int) key[2 * i + 1], b = (int) key[2 * i + 3];
+      if (MFTLHeOrigin(obj, a) == MFTLHeOrigin(obj, b)) ok = 0;  // same direction
+      if (MFTLHeTwin(obj, a) != b || MFTLHeTwin(obj, b) != a) ok = 0;  // present but unpaired
+    }
+    i = j;
+  }
+  free(key);
+  return ok;
+}
+
 /** @brief Every half-edge has a twin -- true exactly for a closed mesh. */
 static int inv_mesh_is_closed(const MFTL_Object *obj)
 {
@@ -412,6 +466,7 @@ static int inv_mesh_is_sound(const MFTL_Object *obj, int rank)
   if (!MFTLObjectPoolsAreConsistent(obj)) return 0;
   if (!inv_implicit_indexing(obj)) return 0;
   if (!inv_twins_are_symmetric(obj)) return 0;
+  if (!inv_edges_are_oriented_manifold(obj)) return 0;
   if (!inv_vertex_out_he_is_outgoing(obj)) return 0;
   if (!inv_derived_matches_topology(obj)) return 0;
   if (!inv_ownership_is_a_prefix(obj, rank)) return 0;

@@ -69,8 +69,11 @@ partner of $u \to v$ is the unlinked half-edge in the bucket of $v$ that ends at
 $u$. A bucket is as long as the valence, so the cost is
 $O(V + H\,\bar d)$ with one allocation and no hashing. Only unlinked candidates
 are paired, which keeps the relation symmetric on non-manifold input (three or
-more half-edges on one edge): the surplus stays twin-less and is reported by the
-integrity check.
+more half-edges on one edge): the surplus stays twin-less, and the integrity
+check reports the edge. The builders (`MFTLBuildIndexedMesh`,
+`MFTLBuildTopologyFromIndexList`) refuse such input before writing anything,
+because `MFTLMarkMeshBoundary` would otherwise flag the surplus as surface
+boundary for good.
 
 @warning Pairing is by vertex **slot**. Two bodies sharing slot numbering —
          foreign triangles appended to a pool — would be welded together. This
@@ -147,8 +150,31 @@ non-manifold fan asserts in Debug instead of looping.
 `MFTLCheckMeshIntegrity` verifies that every vertex has an in-range outgoing
 half-edge that really starts at it (isolated vertices are errors), that every
 target and twin index is in range, that twins are symmetric
-($\mathrm{twin}(\mathrm{twin}(h)) = h$) and have swapped endpoints. Twin-less
-half-edges are counted, not rejected.
+($\mathrm{twin}(\mathrm{twin}(h)) = h$) and have swapped endpoints. A second
+pass buckets the half-edges by origin and checks each **undirected edge**:
+
+| Reported | Why it is not a mesh |
+|---|---|
+| a half-edge from a vertex to itself | its triangle repeats a corner |
+| three or more half-edges on one edge | a non-manifold edge: twins can pair only two |
+| two half-edges in the same direction | a neighbour wound the other way (or a duplicate) |
+| two opposite half-edges that are not twins | the other side is present but unlinked |
+| two triangles with the same three corners | a duplicate; reversed, a closed two-triangle "pillow" |
+
+Before this pass, all of these were certified "consistent": `MFTLRebuildTwins`
+pairs two half-edges of an edge and leaves the rest twin-less, which counted as
+open boundary, and a reversed duplicate passed as a closed mesh.
+
+Each rule holds for **any subset** of an oriented manifold, so a partition with
+its halo is checked exactly like a complete mesh: a rank holds each triangle
+once, and redistribution links every pair whose two triangles a rank holds. A
+twin-less half-edge is legal when the other half of its edge is not in the pool
+— an open surface's rim, a halo's outer edge — and is counted, not rejected. A
+**bowtie** vertex (two fans sharing only a vertex) is not reported: on a
+partition, a fan that ends may just continue on another rank.
+`inv_edges_are_oriented_manifold()` in `tests/test_mesh_invariants.h` is an
+independent, sort-based form of the same rules, asserted after every operation
+through `inv_mesh_is_sound()`.
 
 It does not check that half-edges were created in aligned triples — nothing at
 the type level prevents a routine from breaking implicit indexing.
