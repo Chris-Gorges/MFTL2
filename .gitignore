@@ -27,6 +27,7 @@ __pycache__/
 # Local only, never published: assistant config, measurement notes, the detailed
 # roadmap, cluster scripts.
 CLAUDE.md
+AGENTS.md
 .claude/
 /docs/
 /run_scaling.py
