@@ -231,7 +231,7 @@ triangles' minimum distance: six corner-face projections and nine
 `MFTLClosestPointsOnSegments` pairs in a fixed order, so the pair it returns is a
 function of its arguments. It has no sliver threshold (a triangle loses its face
 term only when its corners are numerically collinear), and it is also the
-distance of the contact predicate `MFTL_TriTriProximity` (@ref bvh_distance).
+distance of the contact predicate `MFTLTriTriProximity` (@ref bvh_distance).
 
 ### Closest points without the normal equations {#geom_closest_accuracy}
 

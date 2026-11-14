@@ -15,6 +15,7 @@
 
 #include "mftl_meshgen.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -25,6 +26,9 @@
 #include "mftl_object.h"
 #include "mftl_topology.h"
 #include "mftl_vectoroperations.h"
+
+/* The cap is the int index space: 3 half-edges per triangle at the last level. */
+MFTL_STATIC_ASSERT((60LL << (2 * MFTL_SPHERE_MAX_REFINEMENTS)) <= INT_MAX, "MFTL_SPHERE_MAX_REFINEMENTS overflows the half-edge index");
 
 /**
  * @brief One level of 1-to-4 subdivision, in place.
@@ -166,7 +170,7 @@ static int generate_icosahedron(MFTL_Object *object)
   return MFTLBuildIndexedMesh(object, positions, 12, tri_verts, 20);
 }
 
-int MFTLGenerateSphereLocal(MFTL_Object *object, double center[3], double radius, int refinements)
+int MFTLGenerateSphereLocal(MFTL_Object *object, const double center[3], double radius, int refinements)
 {
   MFTL_ASSERT(object != MFTL_NULL);
   MFTL_ASSERT(object->domain != MFTL_NULL && "MFTLGenerateSphereLocal: object has no domain -- add it to an ensemble first");
@@ -175,6 +179,18 @@ int MFTLGenerateSphereLocal(MFTL_Object *object, double center[3], double radius
 
   if (object == MFTL_NULL || object->domain == MFTL_NULL || center == MFTL_NULL) return MFTL_ERROR;
   if (radius < 0.0 || refinements < 0) return MFTL_ERROR;
+
+  /* Not asserted: a too-large level is a run-time input (a settings file), and
+   * the answer is a refusal, not an abort. Without it, level 13 overflows the
+   * int half-edge count and level 14 runs for minutes before failing. */
+  if (refinements > MFTL_SPHERE_MAX_REFINEMENTS)
+  {
+    if (object->domain->rank == 0)
+    {
+      fprintf(stderr, "MFTL Error: sphere refinement %d exceeds MFTL_SPHERE_MAX_REFINEMENTS (%d).\n", refinements, MFTL_SPHERE_MAX_REFINEMENTS);
+    }
+    return MFTL_ERROR;
+  }
 
   MFTL_Domain *domain = object->domain;
   int rc = MFTL_SUCCESS;
@@ -288,7 +304,7 @@ int MFTLPublishGeneratedBodies(MFTL_Ensemble *ens)
   return publish_bodies(&ens->domain, ens->local_objects, ens->n_local_objects);
 }
 
-int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int refinements)
+int MFTLGenerateSphere(MFTL_Object *object, const double center[3], double radius, int refinements)
 {
   const int rc = MFTLGenerateSphereLocal(object, center, radius, refinements);
   if (rc == MFTL_ERROR && (object == MFTL_NULL || object->domain == MFTL_NULL)) return rc;

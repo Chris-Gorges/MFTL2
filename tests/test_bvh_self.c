@@ -5,8 +5,8 @@
  * @brief SELF-proximity through MFTLEnsembleIntersectObjects (params.self_pairs).
  *
  * The query a topology change is detected by: two parts of ONE surface that are
- * close without being adjacent. It is tested the way CLAUDE.md prescribes for
- * any distributed contact query -- as a MULTISET of named pairs, against an
+ * close without being adjacent. It is tested the way CONTRIBUTING.md prescribes
+ * for any distributed contact query -- as a MULTISET of named pairs, against an
  * exhaustive sweep taken while one rank still held the whole mesh (every pair
  * that can be within reach, brute_self()), which shares nothing with the BVH,
  * the halo or the filter. Equality of the gathered multisets rules out, at
@@ -176,7 +176,7 @@ static void brute_pair(const MFTL_Object *obj, double (*const T)[3][3], const do
   double B[3][3];
   for (int c = 0; c < 3; ++c)
     for (int k = 0; k < 3; ++k) B[c][k] = T[j][c][k] + shift[k];
-  if (MFTL_TriTriProximity(A, B, tol)) ks_push(out, pair_key(obj->global_id, gi, gj));
+  if (MFTLTriTriProximity(A, B, tol)) ks_push(out, pair_key(obj->global_id, gi, gj));
 }
 
 /**
@@ -184,7 +184,7 @@ static void brute_pair(const MFTL_Object *obj, double (*const T)[3][3], const do
  *
  * A pair whose bounding spheres (centroid, farthest corner) are more than `tol`
  * apart skips the narrow phase. That reject is strictly more permissive than
- * MFTL_TriTriProximity -- two points within tol lie within tol of each other's
+ * MFTLTriTriProximity -- two points within tol lie within tol of each other's
  * spheres -- so it changes the cost, not the set.
  *
  * The pairs are enumerated by a sweep along x rather than all n^2 of them: a
@@ -272,13 +272,13 @@ static void collect(const MFTL_BVH *bvhA, int pa, const MFTL_BVH *bvhB, int pb, 
 {
   collector *c = (collector *) ud;
   int ta, tb;
-  const MFTL_Object *oa = MFTL_BVHPrimTriangle(bvhA, pa, &ta);
-  const MFTL_Object *ob = MFTL_BVHPrimTriangle(bvhB, pb, &tb);
+  const MFTL_Object *oa = MFTLBVHPrimTriangle(bvhA, pa, &ta);
+  const MFTL_Object *ob = MFTLBVHPrimTriangle(bvhB, pb, &tb);
   const int ga = oa->tris.rec[ta].global_id, gb = ob->tris.rec[tb].global_id;
   if (oa->global_id == ob->global_id)
   {
     if (ga >= gb) c->not_ordered++;
-    if (MFTL_BVHPrimOwner(bvhB, pb) != g_rank) c->cross_rank++;
+    if (MFTLBVHPrimOwner(bvhB, pb) != g_rank) c->cross_rank++;
     ks_push(&c->ks, pair_key(oa->global_id, ga, gb));
   }
   else
@@ -338,7 +338,7 @@ static int run_scene(MFTL_Ensemble *ens, double tol, int *n_pairs_out, int *n_cr
   MFTLRedistribute(ens);
   refresh(ens);
 
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 0.0;
   p.proximity_floor = tol;
   p.self_pairs = MFTL_TRUE;
@@ -472,7 +472,7 @@ static int test_without_the_flag_one_body_reports_nothing(void)
   MFTLRedistribute(ens);
   refresh(ens);
 
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 0.0;
   p.proximity_floor = 0.15;
   collector c = {{MFTL_NULL, 0, 0}, 0, 0};
@@ -500,7 +500,7 @@ static int test_a_well_resolved_sphere_has_no_self_pairs(void)
   MFTLRedistribute(ens);
   refresh(ens);
 
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 0.0;
   p.proximity_floor = 0.02;
   p.self_pairs = MFTL_TRUE;

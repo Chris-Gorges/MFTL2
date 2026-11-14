@@ -165,15 +165,15 @@ static void unpack_slot(MFTL_ObjectQualityStatistics *qs, const double *mn, cons
 
   /* Averages against the GLOBAL counts. */
   qs->avg_triangle_area = (n_tris_g > 0.0) ? sm[0] / n_tris_g : 0.0;
-  qs->avg_aspect_ratio = (n_tris_g > 0.0) ? sm[1] / n_tris_g : 0.0;
+  qs->avg_mean_ratio = (n_tris_g > 0.0) ? sm[1] / n_tris_g : 0.0;
   qs->avg_edge_length_sq = (n_edges_g > 0.0) ? sm[2] / n_edges_g : 0.0;
 
   /* No triangles anywhere: report zeros, not the DBL_MAX identities. */
   const bool empty = (n_tris_g <= 0.0);
   qs->min_triangle_area = empty ? 0.0 : mn[0];
   qs->max_triangle_area = empty ? 0.0 : mx[0];
-  qs->min_aspect_ratio = empty ? 0.0 : mn[1];
-  qs->max_aspect_ratio = empty ? 0.0 : mx[1];
+  qs->min_mean_ratio = empty ? 0.0 : mn[1];
+  qs->max_mean_ratio = empty ? 0.0 : mx[1];
   qs->min_edge_length_sq = empty ? 0.0 : mn[2];
   qs->max_edge_length_sq = empty ? 0.0 : mx[2];
 }

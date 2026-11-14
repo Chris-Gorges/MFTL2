@@ -1186,6 +1186,7 @@ static bool watermarks_agree(MFTL_Ensemble *ens)
 
 int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats)
 {
+  if (MFTLRemeshRefuseNullArguments(ens, params, stats, "MFTLRemeshEnsembleParallel")) return MFTL_ERROR;
   return MFTLRemeshSpanningPass(ens, params, stats, "MFTLRemeshEnsembleParallel");
 }
 

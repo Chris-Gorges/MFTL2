@@ -91,6 +91,15 @@ int MFTLBuildIndexedMesh(MFTL_Object *object, const double *positions, int n_ver
 int MFTLBuildTopologyFromIndexList(MFTL_Object *object, const int *tri_verts, int n_triangles);
 
 /**
+ * @brief The largest refinement level MFTLGenerateSphere() accepts.
+ *
+ * Level 12 is \f$20\cdot4^{12}\f$ = 335 M triangles, about 58 GB on rank 0
+ * (`3440 * 4^r + 128` bytes). Level 13 would need \f$60\cdot4^{13}\f$ = 4.0 G
+ * half-edges, beyond the `int` index space of the pools.
+ */
+#define MFTL_SPHERE_MAX_REFINEMENTS 12
+
+/**
  * @brief Generates an icosphere: a regular icosahedron, @p refinements rounds of
  *        1-to-4 midpoint subdivision, then one central projection onto the
  *        sphere of radius @p radius about @p center.
@@ -108,12 +117,15 @@ int MFTLBuildTopologyFromIndexList(MFTL_Object *object, const int *tri_verts, in
  * @param object      The object to generate into; must already be in an ensemble.
  * @param center      Sphere centre.
  * @param radius      Sphere radius, >= 0.
- * @param refinements Subdivision levels, >= 0 (0: the bare icosahedron).
- * @return #MFTL_SUCCESS, or #MFTL_ERROR on invalid arguments.
+ * @param refinements Subdivision levels, 0 (the bare icosahedron) to
+ *                    #MFTL_SPHERE_MAX_REFINEMENTS.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on invalid arguments (the object is
+ *         left empty, and every rank returns the same verdict for the same
+ *         arguments).
  *
  * @collective One broadcast (id counters) and one reduction (global counts).
  */
-int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int refinements);
+int MFTLGenerateSphere(MFTL_Object *object, const double center[3], double radius, int refinements);
 
 /**
  * @brief The local half of MFTLGenerateSphere(): builds the mesh on rank 0 and
@@ -128,13 +140,13 @@ int MFTLGenerateSphere(MFTL_Object *object, double center[3], double radius, int
  * @param object      The object to generate into; must already be in an ensemble.
  * @param center      Sphere centre.
  * @param radius      Sphere radius, >= 0.
- * @param refinements Subdivision levels, >= 0.
- * @return #MFTL_SUCCESS, or #MFTL_ERROR on failure.
+ * @param refinements Subdivision levels, 0 to #MFTL_SPHERE_MAX_REFINEMENTS.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on invalid arguments or failure.
  *
  * @rank_local Every rank must still call it (non-root ranks mark their empty
  *             object's derived arrays valid).
  */
-int MFTLGenerateSphereLocal(MFTL_Object *object, double center[3], double radius, int refinements);
+int MFTLGenerateSphereLocal(MFTL_Object *object, const double center[3], double radius, int refinements);
 
 /**
  * @brief The collective half: broadcasts every object's id counters from rank 0

@@ -117,8 +117,8 @@ static void detect_pair(const MFTL_BVH *bvhA, int pa, const MFTL_BVH *bvhB, int 
   detect_ctx *const ctx = (detect_ctx *) ud;
 
   double TA[3][3], TB[3][3], nA[3], nB[3], cA[3], cB[3];
-  MFTL_BVHPrimVerts(bvhA, pa, TA);
-  MFTL_BVHPrimVerts(bvhB, pb, TB);
+  MFTLBVHPrimVerts(bvhA, pa, TA);
+  MFTLBVHPrimVerts(bvhB, pb, TB);
   if (!normal_and_centre(TA, nA, cA) || !normal_and_centre(TB, nB, cB)) return;
 
   /* B in the periodic image nearest A: the traversal tried every image, but the
@@ -135,7 +135,7 @@ static void detect_pair(const MFTL_BVH *bvhA, int pa, const MFTL_BVH *bvhB, int 
    * closest point -- and only when that segment runs along both normals. See
    * the file comment: a laterally offset pair reads the wrong side. Crossing
    * triangles have no gap to read. */
-  if (MFTL_TriTriIntersect(TA, TB)) return;
+  if (MFTLTriTriIntersect(TA, TB)) return;
   double qa[3], qb[3];
   const double gap = sqrt(MFTLClosestPointsBetweenTriangles(TA, TB, qa, qb));
   if (!(gap > 0.0) || gap > ctx->delta_max) return;
@@ -160,8 +160,8 @@ static void detect_pair(const MFTL_BVH *bvhA, int pa, const MFTL_BVH *bvhB, int 
   if (!(delta > 0.0) || gap > delta) return;
 
   int ta, tb;
-  const MFTL_Object *const oa = MFTL_BVHPrimTriangle(bvhA, pa, &ta);
-  const MFTL_Object *const ob = MFTL_BVHPrimTriangle(bvhB, pb, &tb);
+  const MFTL_Object *const oa = MFTLBVHPrimTriangle(bvhA, pa, &ta);
+  const MFTL_Object *const ob = MFTLBVHPrimTriangle(bvhB, pb, &tb);
 
   MFTL_TopologyEvent ev;
   ev.body_a = MFTL_MIN(oa->global_id, ob->global_id);
@@ -185,8 +185,8 @@ static bool opposing_normals(const MFTL_BVH *bvhA, int pa, const MFTL_BVH *bvhB,
 {
   const detect_ctx *const ctx = (const detect_ctx *) ud;
   double TA[3][3], TB[3][3], nA[3], nB[3], cA[3], cB[3];
-  MFTL_BVHPrimVerts(bvhA, pa, TA);
-  MFTL_BVHPrimVerts(bvhB, pb, TB);
+  MFTLBVHPrimVerts(bvhA, pa, TA);
+  MFTLBVHPrimVerts(bvhB, pb, TB);
   if (!normal_and_centre(TA, nA, cA) || !normal_and_centre(TB, nB, cB)) return MFTL_FALSE;
   return nA[0] * nB[0] + nA[1] * nB[1] + nA[2] * nB[2] <= -ctx->cos_tol;
 }
@@ -203,7 +203,7 @@ int MFTLTopoDetectLocal(MFTL_Ensemble *ens, const MFTL_TopologyOptions *opts, MF
 
   /* The envelope is ABSOLUTE and the same for every body: a thread breaks at
    * delta whatever the size of the drop it belongs to. */
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 0.0;
   p.proximity_floor = MFTL_MAX(opts->delta_breakup, opts->delta_coalescence);
   p.self_pairs = MFTL_TRUE;

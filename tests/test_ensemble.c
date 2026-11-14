@@ -236,8 +236,8 @@ static int test_update_computes_geometry_and_quality(void)
   TEST_ASSERT_EQUAL_DOUBLE(0.5, q->max_triangle_area, 1e-12);
   TEST_ASSERT_EQUAL_DOUBLE(0.5, q->avg_triangle_area, 1e-12);
 
-  TEST_ASSERT_EQUAL_DOUBLE(sqrt(3.0) / 2.0, q->min_aspect_ratio, 1e-12);
-  TEST_ASSERT_EQUAL_DOUBLE(sqrt(3.0) / 2.0, q->max_aspect_ratio, 1e-12);
+  TEST_ASSERT_EQUAL_DOUBLE(sqrt(3.0) / 2.0, q->min_mean_ratio, 1e-12);
+  TEST_ASSERT_EQUAL_DOUBLE(sqrt(3.0) / 2.0, q->max_mean_ratio, 1e-12);
 
   TEST_ASSERT_EQUAL_DOUBLE(1.0, q->min_edge_length_sq, 1e-12);
   TEST_ASSERT_EQUAL_DOUBLE(2.0, q->max_edge_length_sq, 1e-12);
@@ -315,7 +315,7 @@ static int test_update_on_an_object_with_no_triangles(void)
    * measurement -- the MIN identity has to be zeroed on the way out. */
   TEST_ASSERT_EQUAL_DOUBLE(0.0, obj->quality.min_triangle_area, 0.0);
   TEST_ASSERT_EQUAL_DOUBLE(0.0, obj->quality.max_triangle_area, 0.0);
-  TEST_ASSERT_EQUAL_DOUBLE(0.0, obj->quality.avg_aspect_ratio, 0.0);
+  TEST_ASSERT_EQUAL_DOUBLE(0.0, obj->quality.avg_mean_ratio, 0.0);
 
   MFTLEnsembleDestroy(&e);
   return 0;

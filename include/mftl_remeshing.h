@@ -1403,9 +1403,10 @@ int MFTLRemeshEnsemblePrepareSizing(MFTL_Ensemble *ens, const MFTL_RemeshParamet
  * serial remesh exactly.
  *
  * @param      obj    The mesh, remeshed in place.
- * @param      params The parameter block (MFTLInitRemeshParams()).
+ * @param      params The parameter block (MFTLInitRemeshParams()); #MFTL_NULL
+ *                    is refused.
  * @param[out] stats  May be #MFTL_NULL.
- * @return #MFTL_SUCCESS.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on a NULL @p obj or @p params.
  * @rank_local
  */
 int MFTLRemeshObject(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats);
@@ -1435,10 +1436,13 @@ int MFTLRemeshObject(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL
  *
  * @param      ens    The ensemble, remeshed in place.
  * @param      params The parameter block, identical on every rank (checked).
+ *                    Unlike MFTLWriteVtu()'s options it has no default (the
+ *                    target edge length is the caller's): #MFTL_NULL is refused
+ *                    with #MFTL_ERROR.
  * @param[out] stats  May be #MFTL_NULL. Sums over the objects; see
  *                    #MFTL_RemeshStats for which fields are rank-local.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR on every rank if the parameters were
- *         refused, or if any object or migration failed.
+ *         refused (NULL included), or if any object or migration failed.
  *
  * @collective For `nproc > 1`, including ranks holding nothing. The strategy
  *             is decided from reduced data only; two ranks in different
@@ -1477,7 +1481,7 @@ int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, 
  * Smoothing outside a placement (NESTED, ONCE's band) moves replicated
  * vertices and is followed by an exchange after every sweep.
  *
- * Preconditions: MFTLRegisterMpiTypes() called; the same bodies on every rank
+ * Preconditions: the same bodies on every rank
  * in the same order with agreeing `next_*_gid` (checked in Debug); the same
  * parameter block on every rank with a valid band (checked, see
  * MFTLRemeshEnsemble()); \f$h > 4\delta\f$ (warned about once, see
@@ -1490,7 +1494,7 @@ int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, 
  * #MFTL_FLAG_FROZEN cleared.
  *
  * @param      ens    The ensemble, remeshed in place.
- * @param      params The parameter block.
+ * @param      params The parameter block. #MFTL_NULL is refused (no default).
  * @param[out] stats  May be #MFTL_NULL.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR on every rank if the parameters were
  *         refused, or if a migration or the id exchange failed.
@@ -1520,7 +1524,7 @@ int MFTLRemeshEnsembleParallel(MFTL_Ensemble *ens, const MFTL_RemeshParameters *
  * of MFTLRemeshEnsembleParallel() without \f$h > 4\delta\f$.
  *
  * @param      ens    The ensemble, remeshed in place.
- * @param      params The parameter block.
+ * @param      params The parameter block. #MFTL_NULL is refused (no default).
  * @param[out] stats  May be #MFTL_NULL.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR on every rank if the parameters were
  *         refused, or if a migration failed.

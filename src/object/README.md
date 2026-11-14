@@ -15,6 +15,10 @@
 
 An entity class needs an AoS record array *and* several SoA geometry arrays that
 describe the same entities, so all of them must always have the same capacity.
+"SoA" here means one array per FIELD: a 3-vector field such as `pos` or
+`normal` is one array of xyz triples (`pos[3*v+k]`, the `[3cap]` below), not
+three component arrays. Splitting the components was measured as a wash on the
+CPU (faster gathers, slower scatters; `examples/layout_benchmark.c`).
 Rather than keeping several capacity fields in step by convention, each pool is
 **one** 64-byte-aligned block. `vertex_layout_compute` / `triangle_layout_compute`
 walk one cursor through the fields,

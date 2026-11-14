@@ -109,7 +109,7 @@ static inline float mftl_bvh_node_volume(const MFTL_BVHNode *n)
  * 3. Forward scan inflating every node by the tolerance -- valid because a
  *    uniform inflation commutes with the min/max merge.
  *
- * Shared by MFTL_GenerateLBVH() and MFTL_RefitLBVH()
+ * Shared by MFTLGenerateLBVH() and MFTLRefitLBVH()
  * (`test_refit_only_matches_full_rebuild`).
  *
  * @param bvh The hierarchy; boxes, `bounding_radius` and `tolerance` rewritten.
@@ -119,7 +119,7 @@ void MFTLBVHRefit(MFTL_BVH *bvh);
 /**
  * @brief Keys, sort, split and fit over the CURRENT primitive set -- the part of
  *        a build independent of where the primitives came from. Used by
- *        MFTL_GenerateLBVH() and, after attaching a patch, MFTL_BVHSetHalo()
+ *        MFTLGenerateLBVH() and, after attaching a patch, MFTLBVHSetHalo()
  *        (the order is a function of the whole set, so leaves cannot be
  *        appended to an existing tree).
  *

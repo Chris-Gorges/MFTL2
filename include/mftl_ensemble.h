@@ -49,7 +49,8 @@ extern "C"
  *
  * @collective
  */
-MFTL_Ensemble *MFTLEnsembleCreate(MPI_Comm comm, int cuts[3], double global_min[3], double global_max[3], bool is_periodic[3], int initial_object_capacity);
+MFTL_Ensemble *MFTLEnsembleCreate(MPI_Comm comm, const int cuts[3], const double global_min[3], const double global_max[3], const bool is_periodic[3],
+                                  int initial_object_capacity);
 
 /**
  * @brief Adds an object, links it to the domain, and gives it its body id.

@@ -10,7 +10,7 @@
  * WHAT THIS SUITE IS NOT TESTING
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * Not Guigue-Devillers. Not MFTL_Orient3D. Not the exact triangle-triangle
+ * Not Guigue-Devillers. Not MFTLOrient3D. Not the exact triangle-triangle
  * distance. Those are pure geometry, they take three doubles per corner and give
  * the same answer on every rank of every machine, and tests/test_bvh.c covers
  * them -- including the one check that makes THIS file's reference trustworthy,
@@ -266,8 +266,8 @@ static void collect(const MFTL_BVH *bvhA, int primA, const MFTL_BVH *bvhB, int p
   collector *const c = (collector *) user_data;
   if (bvhA->obj == bvhB->obj) c->self_pairs++;
 
-  const long long ga = MFTL_BVHPrimGlobalId(c->ba, primA);
-  const long long gb = MFTL_BVHPrimGlobalId(c->bb, primB);
+  const long long ga = MFTLBVHPrimGlobalId(c->ba, primA);
+  const long long gb = MFTLBVHPrimGlobalId(c->bb, primB);
   ks_push(&c->ks, ga * KEY_LIMIT + gb);
 }
 
@@ -307,8 +307,8 @@ static void collect_resolved(const MFTL_BVH *bvhA, int primA, const MFTL_BVH *bv
 {
   keyset *const ks = (keyset *) user_data;
   int ta, tb;
-  const MFTL_Object *const oa = MFTL_BVHPrimTriangle(bvhA, primA, &ta);
-  const MFTL_Object *const ob = MFTL_BVHPrimTriangle(bvhB, primB, &tb);
+  const MFTL_Object *const oa = MFTLBVHPrimTriangle(bvhA, primA, &ta);
+  const MFTL_Object *const ob = MFTLBVHPrimTriangle(bvhB, primB, &tb);
   const long long body_pair = (long long) oa->global_id * 256 + ob->global_id;
   ks_push(ks, (body_pair << (2 * KEY_SHIFT)) + ((long long) oa->tris.rec[ta].global_id << KEY_SHIFT) + ob->tris.rec[tb].global_id);
 }
@@ -334,9 +334,9 @@ static MFTL_Object *add_sphere(int gid, const double c[3], double r, int refine)
 /**
  * @brief An OPEN triangulated patch: a rectangle of @p nu x @p nv quads.
  *
- * There is no open-surface generator in the library yet (CLAUDE.md lists it as
- * not-yet-ported), and this suite needs one for two reasons that a closed sphere
- * cannot supply:
+ * There is no open-surface generator in the library yet (README.md, "Status and
+ * roadmap", lists it as absent), and this suite needs one for two reasons that a
+ * closed sphere cannot supply:
  *
  *   - a FREE RIM. A rim half-edge has no twin, so the only contact witness on it
  *     is an edge-edge distance; if the halo delivers a rim triangle without the
@@ -505,8 +505,7 @@ static void brute_contacts(const MFTL_Object *A, const MFTL_Object *B, double to
 
             double TA[3][3];
             MFTLGetTriangleCorners(A, ta, TA);
-            if (MFTL_TriTriProximity(TA, TB, tol))
-              ks_push(out, (long long) A->tris.rec[ta].global_id * KEY_LIMIT + B->tris.rec[tb].global_id);
+            if (MFTLTriTriProximity(TA, TB, tol)) ks_push(out, (long long) A->tris.rec[ta].global_id * KEY_LIMIT + B->tris.rec[tb].global_id);
           }
         }
       }
@@ -535,7 +534,7 @@ typedef struct
    * @brief Could this rank have reported anything at all?
    *
    * True iff both trees have a node, i.e. this rank owns an A-side primitive AND
-   * holds or was sent a B-side one. False makes MFTL_IntersectObjects return
+   * holds or was sent a B-side one. False makes MFTLIntersectObjects return
    * before it looks at a box, so nothing about this rank's envelope is
    * observable -- which is why the envelope comparison below is conditioned on
    * it rather than taken over every rank.
@@ -578,10 +577,10 @@ static void run_pipeline(int ia, int ib, const MFTL_BVHBuildParams *p, keyset *l
   MFTL_SpatialHalo *halo = MFTLSpatialHaloCreate(g_ens);
   MFTLSpatialHaloResolveRadii(g_ens, halo);
 
-  MFTL_BVH *const ba = MFTL_GenerateLBVH(a, p);
-  MFTL_BVH *const bb = MFTL_GenerateLBVH(b, p);
-  MFTL_BVHSetGlobalRadius(ba, MFTLSpatialHaloRadius(halo, ia));
-  MFTL_BVHSetGlobalRadius(bb, MFTLSpatialHaloRadius(halo, ib));
+  MFTL_BVH *const ba = MFTLGenerateLBVH(a, p);
+  MFTL_BVH *const bb = MFTLGenerateLBVH(b, p);
+  MFTLBVHSetGlobalRadius(ba, MFTLSpatialHaloRadius(halo, ia));
+  MFTLBVHSetGlobalRadius(bb, MFTLSpatialHaloRadius(halo, ib));
 
   MFTL_SpatialHaloRequest req;
   req.body_a = ia;
@@ -589,7 +588,7 @@ static void run_pipeline(int ia, int ib, const MFTL_BVHBuildParams *p, keyset *l
   req.margin = MFTL_MAX(ba->tolerance, bb->tolerance);
 
   MFTLExtendSpatialHalo(g_ens, &req, 1, halo);
-  MFTL_BVHSetHalo(bb, MFTLSpatialHaloPatch(halo, ib));
+  MFTLBVHSetHalo(bb, MFTLSpatialHaloPatch(halo, ib));
 
   collector c;
   c.ks.k = MFTL_NULL;
@@ -599,7 +598,7 @@ static void run_pipeline(int ia, int ib, const MFTL_BVHBuildParams *p, keyset *l
   c.bb = bb;
   c.self_pairs = 0;
 
-  MFTL_IntersectObjects(a, ba, b, bb, collect, &c);
+  MFTLIntersectObjects(a, ba, b, bb, collect, &c);
 
   info->tolerance = MFTL_MAX(ba->tolerance, bb->tolerance);
   info->active = (ba->nodes_used > 0 && bb->nodes_used > 0);
@@ -638,8 +637,8 @@ static void run_pipeline(int ia, int ib, const MFTL_BVHBuildParams *p, keyset *l
 
   *local_out = c.ks;
 
-  MFTL_DestroyBVH(ba);
-  MFTL_DestroyBVH(bb);
+  MFTLDestroyBVH(ba);
+  MFTLDestroyBVH(bb);
   MFTLSpatialHaloDestroy(&halo);
 }
 
@@ -921,7 +920,7 @@ static void build_case(const ghost_case *c)
  */
 static int test_the_distributed_answer_matches_the_unpartitioned_one(void)
 {
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 2.0e-2;
   p.proximity_floor = 0.0;
 
@@ -1096,7 +1095,8 @@ static void plain_ensemble(double side, bool periodic)
  * "this body is L wide" and every envelope scaled by it grows by that factor.
  *
  * Unlike the Morton bounding box -- where a domain-wide root for a straddling
- * object is accepted locality loss (CLAUDE.md) -- this one changes the ANSWER:
+ * object is accepted locality loss (src/bvh/README.md, "Periodicity is two
+ * problems") -- this one changes the ANSWER:
  * contact would be declared between surfaces nowhere near each other, and the
  * error grows with the domain rather than staying bounded.
  *
@@ -1144,7 +1144,7 @@ static int test_a_seam_straddling_body_is_not_measured_as_domain_sized(void)
  */
 static int test_contact_through_the_seam_survives_the_decomposition(void)
 {
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 2.0e-2;
   p.proximity_floor = 0.0;
 
@@ -1204,7 +1204,7 @@ static int test_contact_through_the_seam_survives_the_decomposition(void)
  */
 static int test_a_self_overlapping_body_reports_no_self_contact(void)
 {
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 1.0e-3;
   p.proximity_floor = 0.0;
 
@@ -1258,7 +1258,7 @@ static int test_a_self_overlapping_body_reports_no_self_contact(void)
  * @brief Two bodies passing through each other between rebuilds: EXPECTED MISS.
  *
  * This is a documented limit, not a bug. The library is a DISCRETE-time contact
- * detector: MFTL_GenerateLBVH and MFTL_RefitLBVH see the configuration at one
+ * detector: MFTLGenerateLBVH and MFTLRefitLBVH see the configuration at one
  * instant, and nothing sweeps the volume between two instants. A pair whose
  * relative displacement in one step exceeds the sum of their sizes therefore
  * passes through without ever being coincident at a sampled instant, and both
@@ -1274,7 +1274,7 @@ static int test_a_self_overlapping_body_reports_no_self_contact(void)
  */
 static int test_tunnelling_between_two_timesteps_is_a_known_miss(void)
 {
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 1.0e-3;
   p.proximity_floor = 0.0;
 
@@ -1341,7 +1341,7 @@ static int test_tunnelling_between_two_timesteps_is_a_known_miss(void)
  */
 static int test_a_body_that_migrates_wholesale_keeps_the_answer(void)
 {
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 2.0e-2;
   p.proximity_floor = 0.0;
 
@@ -1427,7 +1427,7 @@ static int test_a_body_that_migrates_wholesale_keeps_the_answer(void)
 /**
  * @brief The contact predicate at exactly the tolerance, from both sides.
  *
- * `MFTL_TriTriProximity` declares contact at `distance <= tolerance`, and the
+ * `MFTLTriTriProximity` declares contact at `distance <= tolerance`, and the
  * cases that decide whether a lubrication model switches on live within an ulp
  * of that threshold. Two spheres cannot be placed at an exact surface
  * separation -- the discretisation moves the surface inside the sphere by an
@@ -1448,7 +1448,7 @@ static int test_the_tolerance_threshold_is_exact_from_both_sides(void)
 
   for (int g = 0; g < 3; ++g)
   {
-    MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+    MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
     p.proximity_factor = 0.0;  // pure absolute envelope: the gap IS the physics
     p.proximity_floor = tol;
 
@@ -1514,7 +1514,7 @@ static int test_the_tolerance_threshold_is_exact_from_both_sides(void)
  * consequence of a deliberate design choice so that changing the choice is
  * visible rather than accidental.
  *
- * `MFTL_IntersectObjects` tests a pair against `MAX(tol_A, tol_B)`. The maximum
+ * `MFTLIntersectObjects` tests a pair against `MAX(tol_A, tol_B)`. The maximum
  * is the only safe direction for the BROAD phase -- each tree's leaves are
  * inflated by its own tolerance, so admitting the larger one is what keeps the
  * narrow-phase threshold inside what the traversal can deliver. But it means the
@@ -1532,7 +1532,7 @@ static int test_the_tolerance_threshold_is_exact_from_both_sides(void)
  */
 static int test_two_length_scales_share_the_larger_envelope(void)
 {
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 1.0e-2;
   p.proximity_floor = 0.0;
 
@@ -1553,10 +1553,10 @@ static int test_two_length_scales_share_the_larger_envelope(void)
   MFTL_SpatialHalo *halo = MFTLSpatialHaloCreate(g_ens);
   MFTLSpatialHaloResolveRadii(g_ens, halo);
 
-  MFTL_BVH *const ba = MFTL_GenerateLBVH(bodyv(0), &p);
-  MFTL_BVH *const bb = MFTL_GenerateLBVH(bodyv(1), &p);
-  MFTL_BVHSetGlobalRadius(ba, MFTLSpatialHaloRadius(halo, 0));
-  MFTL_BVHSetGlobalRadius(bb, MFTLSpatialHaloRadius(halo, 1));
+  MFTL_BVH *const ba = MFTLGenerateLBVH(bodyv(0), &p);
+  MFTL_BVH *const bb = MFTLGenerateLBVH(bodyv(1), &p);
+  MFTLBVHSetGlobalRadius(ba, MFTLSpatialHaloRadius(halo, 0));
+  MFTLBVHSetGlobalRadius(bb, MFTLSpatialHaloRadius(halo, 1));
 
   /* Each body's OWN envelope is a fixed fraction of itself -- three orders of
    * magnitude apart, which is exactly what a single hardcoded length cannot do. */
@@ -1573,7 +1573,7 @@ static int test_two_length_scales_share_the_larger_envelope(void)
 
   MFTL_SpatialHaloRequest req = {0, 1, pair_tol};
   MFTLExtendSpatialHalo(g_ens, &req, 1, halo);
-  MFTL_BVHSetHalo(bb, MFTLSpatialHaloPatch(halo, 1));
+  MFTLBVHSetHalo(bb, MFTLSpatialHaloPatch(halo, 1));
 
   collector c;
   c.ks.k = MFTL_NULL;
@@ -1582,15 +1582,15 @@ static int test_two_length_scales_share_the_larger_envelope(void)
   c.ba = ba;
   c.bb = bb;
   c.self_pairs = 0;
-  MFTL_IntersectObjects(bodyv(0), ba, bodyv(1), bb, collect, &c);
+  MFTLIntersectObjects(bodyv(0), ba, bodyv(1), bb, collect, &c);
 
   int total = 0;
   MPI_Allreduce(&c.ks.n, &total, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
   TEST_ASSERT(agreed(total > 0, MPI_COMM_WORLD));
 
   ks_free(&c.ks);
-  MFTL_DestroyBVH(ba);
-  MFTL_DestroyBVH(bb);
+  MFTLDestroyBVH(ba);
+  MFTLDestroyBVH(bb);
   MFTLSpatialHaloDestroy(&halo);
   return 0;
 }
@@ -1611,7 +1611,7 @@ static int test_two_length_scales_share_the_larger_envelope(void)
  */
 static int test_degenerate_partitions_build_and_traverse(void)
 {
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 1.0e-2;
   p.proximity_floor = 1.0e-6;
 
@@ -1655,8 +1655,8 @@ static int test_degenerate_partitions_build_and_traverse(void)
   /* Before redistribution: rank 0 has 1 and 2 primitives, every other rank has
    * none. All three degenerate counts, in one configuration. */
   {
-    MFTL_BVH *const ba = MFTL_GenerateLBVH(a, &p);
-    MFTL_BVH *const bb = MFTL_GenerateLBVH(b, &p);
+    MFTL_BVH *const ba = MFTLGenerateLBVH(a, &p);
+    MFTL_BVH *const bb = MFTLGenerateLBVH(b, &p);
 
     TEST_ASSERT(agreed(ba != MFTL_NULL && bb != MFTL_NULL, MPI_COMM_WORLD));
     if (g_rank == 0)
@@ -1670,8 +1670,8 @@ static int test_degenerate_partitions_build_and_traverse(void)
     }
 
     /* A refit of a one-node and a zero-node tree must be a no-op, not a crash. */
-    TEST_ASSERT(agreed(MFTL_RefitLBVH(ba, a) == MFTL_SUCCESS, MPI_COMM_WORLD));
-    TEST_ASSERT(agreed(MFTL_RefitLBVH(bb, b) == MFTL_SUCCESS, MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(MFTLRefitLBVH(ba, a) == MFTL_SUCCESS, MPI_COMM_WORLD));
+    TEST_ASSERT(agreed(MFTLRefitLBVH(bb, b) == MFTL_SUCCESS, MPI_COMM_WORLD));
 
     collector c;
     c.ks.k = MFTL_NULL;
@@ -1680,15 +1680,15 @@ static int test_degenerate_partitions_build_and_traverse(void)
     c.ba = ba;
     c.bb = bb;
     c.self_pairs = 0;
-    MFTL_IntersectObjects(a, ba, b, bb, collect, &c);
+    MFTLIntersectObjects(a, ba, b, bb, collect, &c);
 
     int total = 0;
     MPI_Allreduce(&c.ks.n, &total, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
     TEST_ASSERT(agreed(total > 0, MPI_COMM_WORLD));  // the quad really does cross the triangle
     ks_free(&c.ks);
 
-    MFTL_DestroyBVH(ba);
-    MFTL_DestroyBVH(bb);
+    MFTLDestroyBVH(ba);
+    MFTLDestroyBVH(bb);
   }
 
   /* And the whole collective pipeline over a mesh most ranks hold none of. */
@@ -1741,7 +1741,7 @@ static int test_degenerate_partitions_build_and_traverse(void)
  */
 static int test_a_body_wider_than_a_subdomain_is_still_exact(void)
 {
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 2.0e-2;
   p.proximity_floor = 0.0;
 
@@ -1839,7 +1839,7 @@ static int test_the_broad_phase_finds_the_pairs_without_enumerating_them(void)
     N_BODIES = 2 * N_COUPLES
   };
 
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 1.0e-3;
   p.proximity_floor = 0.0;
 
@@ -1869,9 +1869,9 @@ static int test_the_broad_phase_finds_the_pairs_without_enumerating_them(void)
      * here, so this is one number, but it is READ off a BVH rather than assumed
      * -- the point of the comparison is that the pipeline and the oracle test
      * against the same threshold. */
-    MFTL_BVH *const probe = MFTL_GenerateLBVH(bodyv(0), &p);
+    MFTL_BVH *const probe = MFTLGenerateLBVH(bodyv(0), &p);
     const double tol = probe->tolerance;
-    MFTL_DestroyBVH(probe);
+    MFTLDestroyBVH(probe);
 
     for (int i = 0; i < N_BODIES; ++i)
     {
@@ -1933,10 +1933,10 @@ static int test_the_broad_phase_finds_the_pairs_without_enumerating_them(void)
     double *const tol = (double *) calloc((size_t) (nb > 0 ? nb : 1), sizeof(double));
     for (int o = 0; o < nb; ++o)
     {
-      MFTL_BVH *const one = MFTL_GenerateLBVH(g_ens->local_objects[o], &p);
-      MFTL_BVHSetGlobalRadius(one, MFTLSpatialHaloRadius(halo, g_ens->local_objects[o]->global_id));
+      MFTL_BVH *const one = MFTLGenerateLBVH(g_ens->local_objects[o], &p);
+      MFTLBVHSetGlobalRadius(one, MFTLSpatialHaloRadius(halo, g_ens->local_objects[o]->global_id));
       tol[o] = one->tolerance;
-      MFTL_DestroyBVH(one);
+      MFTLDestroyBVH(one);
     }
 
     TEST_ASSERT(agreed(MFTLExtendSpatialHaloNearBodies(g_ens, tol, halo) == MFTL_SUCCESS, MPI_COMM_WORLD));
@@ -1987,14 +1987,14 @@ static int test_the_broad_phase_finds_the_pairs_without_enumerating_them(void)
  *
  * tests/test_bvh.c already checks that refit == rebuild after small motion on
  * one rank. What it cannot check is that the equivalence survives a partition,
- * where the tree also carries a spatial halo: `MFTL_RefitLBVH` deliberately does
+ * where the tree also carries a spatial halo: `MFTLRefitLBVH` deliberately does
  * NOT re-run the exchange, so the remote primitives keep the positions they
  * arrived with. That is correct only while the neighbours' surfaces move less
  * than the tolerance, and the two answers must agree in exactly that regime.
  */
 static int test_refit_matches_rebuild_on_a_partitioned_mesh(void)
 {
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 2.0e-2;
   p.proximity_floor = 0.0;
 
@@ -2015,14 +2015,14 @@ static int test_refit_matches_rebuild_on_a_partitioned_mesh(void)
   MFTL_SpatialHalo *halo = MFTLSpatialHaloCreate(g_ens);
   MFTLSpatialHaloResolveRadii(g_ens, halo);
 
-  MFTL_BVH *const ba = MFTL_GenerateLBVH(bodyv(0), &p);
-  MFTL_BVH *const bb = MFTL_GenerateLBVH(bodyv(1), &p);
-  MFTL_BVHSetGlobalRadius(ba, MFTLSpatialHaloRadius(halo, 0));
-  MFTL_BVHSetGlobalRadius(bb, MFTLSpatialHaloRadius(halo, 1));
+  MFTL_BVH *const ba = MFTLGenerateLBVH(bodyv(0), &p);
+  MFTL_BVH *const bb = MFTLGenerateLBVH(bodyv(1), &p);
+  MFTLBVHSetGlobalRadius(ba, MFTLSpatialHaloRadius(halo, 0));
+  MFTLBVHSetGlobalRadius(bb, MFTLSpatialHaloRadius(halo, 1));
 
   MFTL_SpatialHaloRequest req = {0, 1, MFTL_MAX(ba->tolerance, bb->tolerance)};
   MFTLExtendSpatialHalo(g_ens, &req, 1, halo);
-  MFTL_BVHSetHalo(bb, MFTLSpatialHaloPatch(halo, 1));
+  MFTLBVHSetHalo(bb, MFTLSpatialHaloPatch(halo, 1));
 
   /* A motion small against the tolerance, so the stale remote geometry is still
    * within the regime the refit path documents. */
@@ -2030,7 +2030,7 @@ static int test_refit_matches_rebuild_on_a_partitioned_mesh(void)
   MFTLUpdateGhostPositions(g_ens);
   refresh();
 
-  TEST_ASSERT(agreed(MFTL_RefitLBVH(ba, bodyv(0)) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(MFTLRefitLBVH(ba, bodyv(0)) == MFTL_SUCCESS, MPI_COMM_WORLD));
 
   collector cr;
   cr.ks.k = MFTL_NULL;
@@ -2039,12 +2039,12 @@ static int test_refit_matches_rebuild_on_a_partitioned_mesh(void)
   cr.ba = ba;
   cr.bb = bb;
   cr.self_pairs = 0;
-  MFTL_IntersectObjects(bodyv(0), ba, bodyv(1), bb, collect, &cr);
+  MFTLIntersectObjects(bodyv(0), ba, bodyv(1), bb, collect, &cr);
   ks_sort(&cr.ks);
 
   /* The same query from a tree built from scratch on the moved geometry. */
-  MFTL_BVH *const ba2 = MFTL_GenerateLBVH(bodyv(0), &p);
-  MFTL_BVHSetGlobalRadius(ba2, MFTLSpatialHaloRadius(halo, 0));
+  MFTL_BVH *const ba2 = MFTLGenerateLBVH(bodyv(0), &p);
+  MFTLBVHSetGlobalRadius(ba2, MFTLSpatialHaloRadius(halo, 0));
 
   collector cf;
   cf.ks.k = MFTL_NULL;
@@ -2053,7 +2053,7 @@ static int test_refit_matches_rebuild_on_a_partitioned_mesh(void)
   cf.ba = ba2;
   cf.bb = bb;
   cf.self_pairs = 0;
-  MFTL_IntersectObjects(bodyv(0), ba2, bodyv(1), bb, collect, &cf);
+  MFTLIntersectObjects(bodyv(0), ba2, bodyv(1), bb, collect, &cf);
   ks_sort(&cf.ks);
 
   int same = (cr.ks.n == cf.ks.n);
@@ -2066,9 +2066,9 @@ static int test_refit_matches_rebuild_on_a_partitioned_mesh(void)
 
   ks_free(&cr.ks);
   ks_free(&cf.ks);
-  MFTL_DestroyBVH(ba);
-  MFTL_DestroyBVH(ba2);
-  MFTL_DestroyBVH(bb);
+  MFTLDestroyBVH(ba);
+  MFTLDestroyBVH(ba2);
+  MFTLDestroyBVH(bb);
   MFTLSpatialHaloDestroy(&halo);
   return 0;
 }

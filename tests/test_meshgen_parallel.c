@@ -111,8 +111,8 @@ static int test_ensemble_update_tolerates_empty_ranks(void)
   ok = ok && (obj->quality.max_triangle_area < 1.0);
   ok = ok && (obj->quality.avg_triangle_area * 1280.0 < exact);
   ok = ok && (obj->quality.avg_triangle_area * 1280.0 > 0.99 * exact);
-  ok = ok && (obj->quality.min_aspect_ratio > 0.5);  // icosphere triangles are near-equilateral
-  ok = ok && (obj->quality.max_aspect_ratio <= 1.0 + 1e-12);
+  ok = ok && (obj->quality.min_mean_ratio > 0.5);  // icosphere triangles are near-equilateral
+  ok = ok && (obj->quality.max_mean_ratio <= 1.0 + 1e-12);
 
   TEST_ASSERT(agreed(ok, g_ens->domain.comm_world));
   return 0;

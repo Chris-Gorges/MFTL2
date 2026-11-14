@@ -385,6 +385,37 @@ static int test_mpi_types_register_is_idempotent(void)
   return 0;
 }
 
+/**
+ * @brief An application that never calls MFTLRegisterMpiTypes() still works:
+ *        MFTLEnsembleCreate() registers the datatypes. Before, the first
+ *        exchange aborted inside MPI with MPI_ERR_TYPE. The scatter from rank 0
+ *        moves entities at any nproc > 1, so the datatypes are really used.
+ */
+static int test_the_ensemble_registers_the_mpi_types(void)
+{
+  MFTLFreeMpiTypes();
+  TEST_ASSERT(agreed(MFTL_MPI_PackedVertex == MPI_DATATYPE_NULL, MPI_COMM_WORLD));
+
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 1);
+  TEST_ASSERT(ens != MFTL_NULL);
+  TEST_ASSERT(agreed(
+      MFTL_MPI_PackedVertex != MPI_DATATYPE_NULL && MFTL_MPI_PackedTriangleComplex != MPI_DATATYPE_NULL && MFTL_MPI_GhostUpdatePayload != MPI_DATATYPE_NULL,
+      MPI_COMM_WORLD));
+
+  MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.7, 2);
+  const int global_t = obj->global_n_triangles;
+  TEST_ASSERT(agreed(MFTLRedistribute(ens) == MFTL_SUCCESS, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(ensemble_is_sound(ens), MPI_COMM_WORLD));
+
+  double totals[3];
+  refresh_geometry(ens);
+  global_totals(ens, totals);
+  TEST_ASSERT_EQUAL_INT(global_t, (int) totals[0]);
+
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
 /* ─────────────────────────────────────────────────────────────────────────────
  * 2. The initial scatter
  * ─────────────────────────────────────────────────────────────────────────── */
@@ -751,7 +782,7 @@ static int test_vertex_normals_match_serial_reference(void)
  * The CHORD |a - b|, never acos(a.b): the arc cosine has infinite derivative at
  * 1, so two unit vectors agreeing to one ulp measure ~1.5e-8 rad apart and look
  * like a bug. tests/test_vertex_normals.c records the false failure that
- * produced, and CLAUDE.md makes it a rule.
+ * produced, and CONTRIBUTING.md ("Writing tests") makes it a rule.
  */
 static double normal_chord(const MFTL_Object *obj, const double *reference, int v)
 {
@@ -1810,6 +1841,7 @@ int main(int argc, char **argv)
 
   RUN_TEST(test_wire_format_is_compact);
   RUN_TEST(test_mpi_types_register_is_idempotent);
+  RUN_TEST(test_the_ensemble_registers_the_mpi_types);
   RUN_TEST(test_scatter_from_rank0);
   RUN_TEST(test_redistribute_is_idempotent);
   RUN_TEST(test_twin_repair_matches_full_rebuild);

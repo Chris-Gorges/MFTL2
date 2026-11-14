@@ -323,8 +323,8 @@ static int test_quality_statistics_are_scale_invariant(void)
 
     MFTLEnsembleUpdate(g_open);
 
-    TEST_ASSERT_EQUAL_DOUBLE(1.0, obj->quality.min_aspect_ratio, 1e-12);
-    TEST_ASSERT_EQUAL_DOUBLE(1.0, obj->quality.max_aspect_ratio, 1e-12);
+    TEST_ASSERT_EQUAL_DOUBLE(1.0, obj->quality.min_mean_ratio, 1e-12);
+    TEST_ASSERT_EQUAL_DOUBLE(1.0, obj->quality.max_mean_ratio, 1e-12);
     TEST_ASSERT_EQUAL_DOUBLE(0.25 * sqrt(3.0) * s * s, obj->quality.min_triangle_area, 1e-12 * s * s);
   }
   return 0;
@@ -1236,7 +1236,7 @@ static int test_triangle_distance_matches_a_double_double_reference(void)
       for (int k = 0; k < 3; ++k) P[i][k] = T[k] + L * (R[k][0] * base[i][0] + R[k][1] * base[i][1] + R[k][2] * base[i][2]);
     const double A[3][3] = {{P[0][0], P[0][1], P[0][2]}, {P[1][0], P[1][1], P[1][2]}, {P[2][0], P[2][1], P[2][2]}};
     const double B[3][3] = {{P[3][0], P[3][1], P[3][2]}, {P[4][0], P[4][1], P[4][2]}, {P[5][0], P[5][1], P[5][2]}};
-    if (MFTL_TriTriIntersect(A, B)) continue;  // rounding can close a gap below its own size
+    if (MFTLTriTriIntersect(A, B)) continue;  // rounding can close a gap below its own size
 
     const double diam = diameter((const double(*)[3]) P, 6);
     double pa[3], pb[3];

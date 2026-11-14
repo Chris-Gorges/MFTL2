@@ -195,7 +195,8 @@ static int domain_init_comm(MFTL_Domain *domain)
   return MFTL_SUCCESS;
 }
 
-MFTL_Ensemble *MFTLEnsembleCreate(MPI_Comm comm, int cuts[3], double global_min[3], double global_max[3], bool is_periodic[3], int initial_object_capacity)
+MFTL_Ensemble *MFTLEnsembleCreate(MPI_Comm comm, const int cuts[3], const double global_min[3], const double global_max[3], const bool is_periodic[3],
+                                  int initial_object_capacity)
 {
   if (!cuts || !global_min || !global_max) return MFTL_NULL;
 
@@ -255,6 +256,11 @@ MFTL_Ensemble *MFTLEnsembleCreate(MPI_Comm comm, int cuts[3], double global_min[
     dom->inv_domain_size[i] = (dom->domain_size[i] > 0.0) ? 1.0 / dom->domain_size[i] : 0.0;
     dom->is_periodic[i] = is_periodic ? is_periodic[i] : MFTL_FALSE;
   }
+
+  /* Every exchange needs an ensemble, so the wire datatypes are registered
+   * here and an application cannot forget them (it used to abort inside MPI
+   * with MPI_ERR_TYPE). Idempotent, and no communication. */
+  MFTLRegisterMpiTypes();
 
   // --- 4. Build the MPI topology ---
   if (domain_init_comm(dom) != MFTL_SUCCESS)

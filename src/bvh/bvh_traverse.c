@@ -120,8 +120,8 @@ typedef struct
 static bool self_pair_admissible(const MFTL_BVH *bvhA, int pa, const MFTL_BVH *bvhB, int pb)
 {
   int ta, tb;
-  const MFTL_Object *const oa = MFTL_BVHPrimTriangle(bvhA, pa, &ta);
-  const MFTL_Object *const ob = MFTL_BVHPrimTriangle(bvhB, pb, &tb);
+  const MFTL_Object *const oa = MFTLBVHPrimTriangle(bvhA, pa, &ta);
+  const MFTL_Object *const ob = MFTLBVHPrimTriangle(bvhB, pb, &tb);
   if (oa->tris.rec[ta].global_id >= ob->tris.rec[tb].global_id) return MFTL_FALSE;
 
   for (int i = 0; i < 3; ++i)
@@ -154,8 +154,8 @@ static void flush_batch(narrow_ctx *ctx)
     double TA[3][3];
     double TB[3][3];
 
-    MFTL_BVHPrimVerts(ctx->bvhA, ctx->prim_a[i], TA);
-    MFTL_BVHPrimVerts(ctx->bvhB, ctx->prim_b[i], TB);
+    MFTLBVHPrimVerts(ctx->bvhA, ctx->prim_a[i], TA);
+    MFTLBVHPrimVerts(ctx->bvhB, ctx->prim_b[i], TB);
 
     for (int c = 0; c < 3; ++c)
     {
@@ -164,7 +164,7 @@ static void flush_batch(narrow_ctx *ctx)
       TB[c][2] += sz;
     }
 
-    if (MFTL_TriTriProximity(TA, TB, ctx->tolerance)) ctx->callback(ctx->bvhA, ctx->prim_a[i], ctx->bvhB, ctx->prim_b[i], ctx->user_data);
+    if (MFTLTriTriProximity(TA, TB, ctx->tolerance)) ctx->callback(ctx->bvhA, ctx->prim_a[i], ctx->bvhB, ctx->prim_b[i], ctx->user_data);
   }
 
   ctx->n_batched = 0;
@@ -216,15 +216,15 @@ static void traverse_image(narrow_ctx *ctx, pair_stack *stack, const float shift
 
     if (!mftl_bvh_aabb_overlap(na, nb, shift_f)) continue;
 
-    const bool leaf_a = MFTL_BVHNodeIsLeaf(na);
-    const bool leaf_b = MFTL_BVHNodeIsLeaf(nb);
+    const bool leaf_a = MFTLBVHNodeIsLeaf(na);
+    const bool leaf_b = MFTLBVHNodeIsLeaf(nb);
 
     if (leaf_a && leaf_b)
     {
-      const int firstA = MFTL_BVHLeafFirst(na);
-      const int countA = MFTL_BVHLeafCount(na);
-      const int firstB = MFTL_BVHLeafFirst(nb);
-      const int countB = MFTL_BVHLeafCount(nb);
+      const int firstA = MFTLBVHLeafFirst(na);
+      const int countA = MFTLBVHLeafCount(na);
+      const int firstB = MFTLBVHLeafFirst(nb);
+      const int countB = MFTLBVHLeafCount(nb);
 
       for (int i = 0; i < countA; ++i)
       {
@@ -240,7 +240,7 @@ static void traverse_image(narrow_ctx *ctx, pair_stack *stack, const float shift
 
     if (leaf_a)
     {
-      const int l = MFTL_BVHLeftChild(nb);
+      const int l = MFTLBVHLeftChild(nb);
       stack_push(stack, top.a, l);
       stack_push(stack, top.a, l + 1);
       continue;
@@ -248,7 +248,7 @@ static void traverse_image(narrow_ctx *ctx, pair_stack *stack, const float shift
 
     if (leaf_b)
     {
-      const int l = MFTL_BVHLeftChild(na);
+      const int l = MFTLBVHLeftChild(na);
       stack_push(stack, l, top.b);
       stack_push(stack, l + 1, top.b);
       continue;
@@ -256,13 +256,13 @@ static void traverse_image(narrow_ctx *ctx, pair_stack *stack, const float shift
 
     if (mftl_bvh_node_volume(na) > mftl_bvh_node_volume(nb))
     {
-      const int l = MFTL_BVHLeftChild(na);
+      const int l = MFTLBVHLeftChild(na);
       stack_push(stack, l, top.b);
       stack_push(stack, l + 1, top.b);
     }
     else
     {
-      const int l = MFTL_BVHLeftChild(nb);
+      const int l = MFTLBVHLeftChild(nb);
       stack_push(stack, top.a, l);
       stack_push(stack, top.a, l + 1);
     }
@@ -271,11 +271,11 @@ static void traverse_image(narrow_ctx *ctx, pair_stack *stack, const float shift
   flush_batch(ctx);
 }
 
-void MFTL_IntersectObjects(const MFTL_Object *objA, MFTL_BVH *bvhA, const MFTL_Object *objB, MFTL_BVH *bvhB, IntersectionCallback callback, void *user_data)
+void MFTLIntersectObjects(const MFTL_Object *objA, MFTL_BVH *bvhA, const MFTL_Object *objB, MFTL_BVH *bvhB, IntersectionCallback callback, void *user_data)
 {
   if (objA == MFTL_NULL || bvhA == MFTL_NULL || objB == MFTL_NULL || bvhB == MFTL_NULL || callback == MFTL_NULL) return;
   if (bvhA->nodes_used <= 0 || bvhB->nodes_used <= 0) return;
-  MFTL_ASSERT(bvhA != bvhB && "MFTL_IntersectObjects: a BVH against itself is not a self-intersection query");
+  MFTL_ASSERT(bvhA != bvhB && "MFTLIntersectObjects: a BVH against itself is not a self-intersection query");
 
   narrow_ctx ctx;
   ctx.bvhA = bvhA;
@@ -355,7 +355,7 @@ int MFTLEnsembleIntersectObjects(MFTL_Ensemble *ens, const MFTL_BVHBuildParams *
 
   /* One tree per body this rank holds. */
   MFTL_BVH **const bvhs = (MFTL_BVH **) MFTLCallocOrDie((size_t) MFTL_MAX(nb, 1), sizeof(MFTL_BVH *), "BVH list");
-  for (int o = 0; o < nb; ++o) bvhs[o] = MFTL_GenerateLBVH(ens->local_objects[o], params);
+  for (int o = 0; o < nb; ++o) bvhs[o] = MFTLGenerateLBVH(ens->local_objects[o], params);
 
   /* Global radii first (the envelope is a fraction of the body, and this rank's
    * share would make it depend on the process count), then one halo exchange
@@ -366,7 +366,7 @@ int MFTLEnsembleIntersectObjects(MFTL_Ensemble *ens, const MFTL_BVHBuildParams *
   double *const tol = (double *) MFTLCallocOrDie((size_t) MFTL_MAX(nb, 1), sizeof(double), "BVH pair envelopes");
   for (int o = 0; o < nb; ++o)
   {
-    MFTL_BVHSetGlobalRadius(bvhs[o], MFTLSpatialHaloRadius(halo, ens->local_objects[o]->global_id));
+    MFTLBVHSetGlobalRadius(bvhs[o], MFTLSpatialHaloRadius(halo, ens->local_objects[o]->global_id));
     tol[o] = bvhs[o]->tolerance;
   }
 
@@ -397,7 +397,7 @@ int MFTLEnsembleIntersectObjects(MFTL_Ensemble *ens, const MFTL_BVHBuildParams *
     }
     else if (halo->patch[e] != MFTL_NULL)
     {
-      by_entry[e] = MFTL_GenerateLBVH(empty, params);
+      by_entry[e] = MFTLGenerateLBVH(empty, params);
       obj_by_entry[e] = empty;
     }
     else
@@ -406,11 +406,11 @@ int MFTLEnsembleIntersectObjects(MFTL_Ensemble *ens, const MFTL_BVHBuildParams *
     }
 
     /* Attach only a real patch (attaching rebuilds the tree). */
-    if (halo->patch[e] != MFTL_NULL) MFTL_BVHSetHalo(by_entry[e], halo->patch[e]);
+    if (halo->patch[e] != MFTL_NULL) MFTLBVHSetHalo(by_entry[e], halo->patch[e]);
 
     /* Radius last, so every rank that can report the pair uses the same
      * envelope (test_tolerance_is_independent_of_the_partition). */
-    MFTL_BVHSetGlobalRadius(by_entry[e], MFTLSpatialHaloRadius(halo, gid));
+    MFTLBVHSetGlobalRadius(by_entry[e], MFTLSpatialHaloRadius(halo, gid));
   }
 
   /* The candidate pairs (body_a < body_b, A held here); the traversal's A-side
@@ -424,7 +424,7 @@ int MFTLEnsembleIntersectObjects(MFTL_Ensemble *ens, const MFTL_BVHBuildParams *
 
     if (ea != eb)
     {
-      MFTL_IntersectObjects(obj_by_entry[ea], by_entry[ea], obj_by_entry[eb], by_entry[eb], callback, user_data);
+      MFTLIntersectObjects(obj_by_entry[ea], by_entry[ea], obj_by_entry[eb], by_entry[eb], callback, user_data);
       continue;
     }
 
@@ -434,19 +434,19 @@ int MFTLEnsembleIntersectObjects(MFTL_Ensemble *ens, const MFTL_BVHBuildParams *
      * rather than tol_A + tol_B -- 129 candidate pairs per triangle otherwise,
      * measured on a 17k-triangle tube at an envelope of 1.5 edges. */
     const MFTL_Object *const obj = obj_by_entry[ea];
-    MFTL_BVHBuildParams tight = (params != MFTL_NULL) ? *params : MFTL_BVHDefaultParams();
+    MFTL_BVHBuildParams tight = (params != MFTL_NULL) ? *params : MFTLBVHDefaultParams();
     tight.proximity_factor = 0.0;
     tight.proximity_floor = 0.0;
-    MFTL_BVH *const a_side = MFTL_GenerateLBVH(obj, &tight);
-    MFTL_IntersectObjects(obj, a_side, obj, by_entry[eb], callback, user_data);
-    MFTL_DestroyBVH(a_side);
+    MFTL_BVH *const a_side = MFTLGenerateLBVH(obj, &tight);
+    MFTLIntersectObjects(obj, a_side, obj, by_entry[eb], callback, user_data);
+    MFTLDestroyBVH(a_side);
   }
 
   for (int e = 0; e < ne; ++e)
   {
-    if (obj_by_entry[e] == empty) MFTL_DestroyBVH(by_entry[e]);
+    if (obj_by_entry[e] == empty) MFTLDestroyBVH(by_entry[e]);
   }
-  for (int o = 0; o < nb; ++o) MFTL_DestroyBVH(bvhs[o]);
+  for (int o = 0; o < nb; ++o) MFTLDestroyBVH(bvhs[o]);
 
   MFTLObjectDestroy(&empty);
   free(obj_by_entry);

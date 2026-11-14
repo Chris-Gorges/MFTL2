@@ -45,7 +45,7 @@
  * cost an owned triangle an edge neighbour (a Debug assertion checks the
  * centres).
  *
- * **Preconditions.** MFTLRegisterMpiTypes() has been called; every rank added
+ * **Preconditions.** Every rank added
  * the same bodies in the same order (body ids are the names on the wire); the
  * triangle centres of every local object are current, ghosts included. The
  * generators leave them current, so a generated ensemble can be redistributed
@@ -145,7 +145,7 @@ MFTL_STATIC_ASSERT(sizeof(MFTL_GhostUpdatePayload) == 32, "MFTL_GhostUpdatePaylo
  * 2. MPI datatypes
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/** @brief MPI datatype for #MFTL_PackedVertex. Valid between MFTLRegisterMpiTypes() and MFTLFreeMpiTypes(). */
+/** @brief MPI datatype for #MFTL_PackedVertex. Valid between MFTLRegisterMpiTypes() (which MFTLEnsembleCreate() calls) and MFTLFreeMpiTypes(). */
 extern MPI_Datatype MFTL_MPI_PackedVertex;
 /** @brief MPI datatype for #MFTL_PackedTriangleComplex. */
 extern MPI_Datatype MFTL_MPI_PackedTriangleComplex;
@@ -154,11 +154,21 @@ extern MPI_Datatype MFTL_MPI_GhostUpdatePayload;
 
 /**
  * @brief Creates and commits the MFTL MPI datatypes (extents pinned to the C
- *        `sizeof`). Call once after `MPI_Init`, before any exchange; idempotent.
+ *        `sizeof`). Idempotent.
+ *
+ * MFTLEnsembleCreate() calls it, and every exchange needs an ensemble, so an
+ * application need not: forgetting it used to abort inside MPI with
+ * `MPI_ERR_TYPE`. Calling it explicitly after `MPI_Init` is harmless.
  */
 void MFTLRegisterMpiTypes(void);
 
-/** @brief Frees the MFTL MPI datatypes. Call before MPI_Finalize. Idempotent. */
+/**
+ * @brief Frees the MFTL MPI datatypes. Idempotent.
+ *
+ * Optional: `MPI_Finalize` releases them anyway. Call it, if at all, after the
+ * last ensemble is destroyed and before `MPI_Finalize` (a clean shutdown for a
+ * leak checker); a later MFTLEnsembleCreate() registers them again.
+ */
 void MFTLFreeMpiTypes(void);
 
 /* ═══════════════════════════════════════════════════════════════════════════

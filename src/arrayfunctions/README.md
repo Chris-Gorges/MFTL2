@@ -12,7 +12,7 @@ from Cameron Hart's zlib-licensed radix sort (notice preserved in the file).
 | Caller | Key | Purpose |
 |---|---|---|
 | `MFTLObjectReorderMorton` | 63-bit Morton code; min vertex index | space-filling-curve renumbering of the pools |
-| `MFTL_GenerateLBVH` | 63-bit Morton code | the sorted order *is* the LBVH leaf order |
+| `MFTLGenerateLBVH` | 63-bit Morton code | the sorted order *is* the LBVH leaf order |
 | `src/communication/redistribute.c` | vertex index | de-duplicate a destination's vertex list |
 | `src/topology_change/` | body id | canonical body sets of a cluster |
 

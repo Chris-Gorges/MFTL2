@@ -486,7 +486,7 @@ double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], dou
  * distance is accurate to rounding (a few ulps of the configuration's size) at
  * every angle, and a zero-length segment is a point. This is the one
  * segment-segment routine of the library: MFTLClosestPointsBetweenTriangles()
- * and the contact predicates (MFTL_TriTriProximity()) both use it.
+ * and the contact predicates (MFTLTriTriProximity()) both use it.
  *
  * @param      p0 First endpoint of segment P.
  * @param      p1 Second endpoint of segment P.
@@ -511,11 +511,11 @@ double MFTLClosestPointsOnSegments(const double p0[3], const double p1[3], const
  * accurate to rounding for every shape, including slivers and zero-area
  * triangles. When several pairs are equally close -- two parallel faces -- the
  * first in a fixed order is returned, so the result is a pure function of the
- * arguments. MFTL_TriTriDistanceSq() and MFTL_TriTriProximity() are this
- * function behind MFTL_TriTriIntersect().
+ * arguments. MFTLTriTriDistanceSq() and MFTLTriTriProximity() are this
+ * function behind MFTLTriTriIntersect().
  *
  * For triangles that INTERSECT the result is the closest pair of boundary
- * points, not zero: test MFTL_TriTriIntersect() first when that matters.
+ * points, not zero: test MFTLTriTriIntersect() first when that matters.
  *
  * @param      A  Corners of the first triangle.
  * @param      B  Corners of the second, in the same periodic image.

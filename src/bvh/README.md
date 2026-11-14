@@ -30,14 +30,14 @@ rank that must report it.
 MFTLEnsembleIntersectObjects(ens, params, callback, user_data)      COLLECTIVE
 ├─ n_bodies_global < (self_pairs ? 1 : 2) ?  ─▶ return   (GLOBAL count: all
 │                                                          ranks must agree)
-├─ 1  MFTL_GenerateLBVH per body THIS RANK HOLDS                     local
+├─ 1  MFTLGenerateLBVH per body THIS RANK HOLDS                     local
 ├─ 2  MFTLSpatialHaloResolveRadii: per-body reduction over the
 │     holders + (gid, radius) to the 26 neighbours              collective
-│     MFTL_BVHSetGlobalRadius per tree (refit only)                  local
+│     MFTLBVHSetGlobalRadius per tree (refit only)                  local
 ├─ 3  MFTLExtendSpatialHaloNearBodies: extents + envelopes out,
 │     patches and candidate pairs back                           collective
-├─ 4  per directory entry: MFTL_BVHSetHalo (rebuild), radius last    local
-├─ 5  per candidate pair: MFTL_IntersectObjects                      local
+├─ 4  per directory entry: MFTLBVHSetHalo (rebuild), radius last    local
+├─ 5  per candidate pair: MFTLIntersectObjects                      local
 └─ 6  destroy trees and halo
 ```
 
@@ -53,7 +53,7 @@ MFTLEnsembleIntersectObjects(ens, params, callback, user_data)      COLLECTIVE
   pairs (`test_the_broad_phase_finds_the_pairs_without_enumerating_them`).
 - **Trees are `O(local bodies)`.** A body this rank holds nothing of but received
   a patch for gets a tree over a shared empty object (all primitives resolve
-  through the patch) — which is why `MFTL_GenerateLBVH` returns an *empty*
+  through the patch) — which is why `MFTLGenerateLBVH` returns an *empty*
   hierarchy rather than `MFTL_NULL` for an empty partition.
 - **Self-proximity** (`self_pairs`) tests a body's owned triangles (A side, zero
   envelope) against its tree *with* patch (B side). A zero A-side envelope makes
@@ -74,7 +74,7 @@ p \in [0, n_\text{local}) \mapsto \text{triangle } p \text{ of } \texttt{obj},
 p \in [n_\text{local}, n) \mapsto \text{triangle } p - n_\text{local} \text{ of } \texttt{halo}.
 $$
 
-Both kinds are read through `MFTL_BVHPrimVerts`, which gathers the current
+Both kinds are read through `MFTLBVHPrimVerts`, which gathers the current
 corners with minimum-image edges, so the three corners are always mutually
 unwrapped and "local or remote" is one index comparison.
 
@@ -143,7 +143,7 @@ index in the extended key splits them, so every node splits.
 -->
 
 `MFTLBVHRefit` is three linear passes, shared by the build and by
-`MFTL_RefitLBVH` so they cannot disagree:
+`MFTLRefitLBVH` so they cannot disagree:
 
 1. **Reverse scan** of the node array: leaves fit their primitives, internal
    nodes merge their children. Valid because a child pair is allocated after its
@@ -156,19 +156,19 @@ index in the extended key splits them, so every node splits.
    nodes afterwards equals inflating the leaves first — without knowing the
    radius in pass 1.
 
-`MFTL_BVHSetGlobalRadius` and `MFTL_RefitLBVH` re-enter at the fit: neither the
+`MFTLBVHSetGlobalRadius` and `MFTLRefitLBVH` re-enter at the fit: neither the
 order nor the shape depends on the tolerance or on vertex motion.
 
 ### Refit or rebuild {#bvh_refitguard}
 
-`MFTL_RefitLBVH` returns `MFTL_ERROR` (not an assertion — "refit if you can,
+`MFTLRefitLBVH` returns `MFTL_ERROR` (not an assertion — "refit if you can,
 otherwise rebuild" is supported) when a primitive count changed. Leaves address
 primitives by index; after a re-triangulation the indices name different
 triangles and a refit would report **wrong** contacts, not missing ones.
 
 ### Attaching a halo rebuilds {#bvh_setphalo}
 
-`MFTL_BVHSetHalo` rebuilds the whole tree over local plus received primitives.
+`MFTLBVHSetHalo` rebuilds the whole tree over local plus received primitives.
 The Morton order is a function of the whole set, so leaves cannot be appended to
 a tree over the local part: the result would still terminate and still be
 fitted, and would silently miss contacts.
@@ -202,7 +202,7 @@ only direction in which a broad phase may err.
 
 **Within an object**, a triangle straddling a seam has corners on both sides of
 the box, so raw coordinates give a centroid in the middle of the domain and a
-domain-spanning box. Fixed by `MFTL_BVHPrimVerts` (minimum-image edges) and the
+domain-spanning box. Fixed by `MFTLBVHPrimVerts` (minimum-image edges) and the
 unwrapped centroid (`test_periodic_morton_of_a_straddling_object`). A straddling
 object's *root* box legitimately spans the domain.
 
@@ -247,7 +247,7 @@ $$
   radius of a sphere and `proximity_factor` means what it says (the diagonal
   would inflate every envelope by $\sqrt3$).
 - **$R$ is global.** The root box covers one rank's share; the pipeline replaces
-  it with the body's global radius (`MFTL_BVHSetGlobalRadius`, from the halo's
+  it with the body's global radius (`MFTLBVHSetGlobalRadius`, from the halo's
   per-body holder reduction), so the detection distance does not depend on the
   partition (`test_tolerance_is_independent_of_the_partition`).
 - **One $\tau$ inflates the leaves and is the narrow-phase gap.**
@@ -264,7 +264,7 @@ diameter. For a physical gap set `proximity_factor = 0` and
 
 ## The traversal {#bvh_traverse}
 
-`MFTL_IntersectObjects` walks the two trees with an **explicit stack** of node
+`MFTLIntersectObjects` walks the two trees with an **explicit stack** of node
 pairs (initial depth 256, doubling): the loop-invariant state stays in
 registers, a pathological pair cannot overflow the call stack (a dual
 traversal is not tail-recursive), and leaf pairs can be batched.
@@ -309,11 +309,11 @@ SIMD narrow phase, which would change that one function. It is scalar today.
 
 ## The narrow phase {#bvh_narrow}
 
-`MFTL_TriTriProximity(A, B, τ)` returns 1 if the triangles intersect or their
+`MFTLTriTriProximity(A, B, τ)` returns 1 if the triangles intersect or their
 distance is at most $\tau$:
 
 ```
-MFTL_TriTriIntersect ─▶ 1 ?  yes ─▶ contact                      (exact)
+MFTLTriTriIntersect ─▶ 1 ?  yes ─▶ contact                      (exact)
           │ no
           └─ τ > 0 and  min over 9 edge–edge and 6 point–face  d² ≤ τ² ─▶ contact   (to rounding)
 ```
@@ -494,8 +494,12 @@ $$
 \varepsilon_C = (26+288\varepsilon)\varepsilon^2,
 $$
 
-with the machine $\varepsilon$ **measured** once by `exactinit()` (halving until
-$1+\varepsilon = 1$), so the bounds are true for the actual arithmetic.
+with $\varepsilon = 2^{-53}$ and Dekker's splitter $2^{27}+1$ as compile-time
+constants: the values Shewchuk's `exactinit()` measures for IEEE binary64, and
+all three bounds are exact in binary64, so they are the same bits. A build that
+evaluates doubles in extended precision (`FLT_EVAL_METHOD > 0`) is refused at
+compile time. No lazily initialised global remains, so the predicate is safe
+to call from several threads.
 
 #### Error-free transformations {#bvh_eft}
 
@@ -531,8 +535,8 @@ The adaptive form costs 3.66 ns against 1.83 ns in general position (40 ns only
 for exactly coplanar input). A thin-film model works at gaps of $10^{-6}$ to
 $10^{-9}$ of the body size, where the plain form would almost surely be right;
 the adaptive one is kept because it costs at most 4.5 % of a
-`MFTL_TriTriProximity` call and removes a **silent** failure.
-`MFTL_Orient3DFast` is the plain form.
+`MFTLTriTriProximity` call and removes a **silent** failure.
+`MFTLOrient3DFast` is the plain form.
 
 ---
 
@@ -547,14 +551,14 @@ and there is no BVH section in `docs/analysis.md` yet.
 | radix split | $O(n)$ nodes, binary search per split, depth ≤ 95 |
 | fit / refit | $O(\text{nodes} + n)$, three linear scans |
 | periodic images | ≤ 27 root-box tests |
-| `MFTL_TriTriIntersect` | 3–8 `orient3d`; **31 ns/pair** |
-| `MFTL_TriTriProximity` | the above + 15 distance terms; **244 ns/pair** (176 with the normal-equation terms) |
+| `MFTLTriTriIntersect` | 3–8 `orient3d`; **31 ns/pair** |
+| `MFTLTriTriProximity` | the above + 15 distance terms; **244 ns/pair** (176 with the normal-equation terms) |
 
 **Memory:** 32 B per node with $2n$ nodes reserved (64 B/primitive, about
 16 B/primitive used at `leaf_size` 4), plus 4 B/primitive of `prim_indices`.
 Both objects are borrowed `const`.
 
-**Defaults** (`MFTL_BVHDefaultParams()`): `proximity_factor` $10^{-3}$,
+**Defaults** (`MFTLBVHDefaultParams()`): `proximity_factor` $10^{-3}$,
 `proximity_floor` 0, `leaf_size` 4, `include_ghosts` false, `self_pairs` false,
 `pair_filter` NULL.
 
@@ -562,7 +566,7 @@ Both objects are borrowed `const`.
 
 ## Open issues {#bvh_deferred}
 
-1. **The batched narrow phase is not vectorised.** `MFTL_TriTriIntersect` is a
+1. **The batched narrow phase is not vectorised.** `MFTLTriTriIntersect` is a
    decision tree with early exits, so the useful form is a gather of the first
    orientation test over the batch; start with the fifteen distance terms, where
    the time is.

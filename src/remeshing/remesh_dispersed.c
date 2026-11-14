@@ -939,6 +939,7 @@ static void assign_destinations(MFTL_Ensemble *ens, const MFTL_RemeshParameters 
 
 int MFTLRemeshEnsembleDispersed(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats)
 {
+  if (MFTLRemeshRefuseNullArguments(ens, params, stats, "MFTLRemeshEnsembleDispersed")) return MFTL_ERROR;
   return MFTLRemeshDispersedPass(ens, params, stats, "MFTLRemeshEnsembleDispersed");
 }
 

@@ -21,7 +21,7 @@
  * 2. **Periodicity at two scales.** Within an object, every primitive's corners
  *    are mutually unwrapped (minimum-image edges from corner 0), so a
  *    seam-straddling triangle has a tight box and its true centroid. Between
- *    objects, MFTL_IntersectObjects() traverses the pair once per periodic image
+ *    objects, MFTLIntersectObjects() traverses the pair once per periodic image
  *    of B (up to 27), each gated by one root-box test.
  * 3. **The envelope scales with the body:**
  *    `tol = MAX(proximity_floor, proximity_factor * R)`, with R the body's
@@ -79,26 +79,26 @@ MFTL_STATIC_ASSERT(sizeof(MFTL_BVHNode) == 32, "MFTL_BVHNode must be exactly 32 
  * @param n The node.
  * @return `true` iff bit 0 of the payload is set.
  */
-static inline bool MFTL_BVHNodeIsLeaf(const MFTL_BVHNode *n) { return (n->payload & 1u) != 0u; }
+static inline bool MFTLBVHNodeIsLeaf(const MFTL_BVHNode *n) { return (n->payload & 1u) != 0u; }
 /**
  * @brief Number of primitives in leaf @p n.
  * @param n The node.
  * @return The leaf's primitive count. **Undefined on an internal node** -- test
- *         MFTL_BVHNodeIsLeaf() first.
+ *         MFTLBVHNodeIsLeaf() first.
  */
-static inline int MFTL_BVHLeafCount(const MFTL_BVHNode *n) { return (int) ((n->payload >> 1) & 0x7FFFFFFFu); }
+static inline int MFTLBVHLeafCount(const MFTL_BVHNode *n) { return (int) ((n->payload >> 1) & 0x7FFFFFFFu); }
 /**
  * @brief First slot of leaf @p n in `prim_indices`.
  * @param n The node.
  * @return Index into `MFTL_BVH::prim_indices`. Undefined on an internal node.
  */
-static inline int MFTL_BVHLeafFirst(const MFTL_BVHNode *n) { return (int) (n->payload >> 32); }
+static inline int MFTLBVHLeafFirst(const MFTL_BVHNode *n) { return (int) (n->payload >> 32); }
 /**
  * @brief Left child of internal node @p n; the right child is that plus one.
  * @param n The node.
  * @return Node index of the left child. Undefined on a leaf.
  */
-static inline int MFTL_BVHLeftChild(const MFTL_BVHNode *n) { return (int) (n->payload >> 1); }
+static inline int MFTLBVHLeftChild(const MFTL_BVHNode *n) { return (int) (n->payload >> 1); }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 2. Build parameters
@@ -113,7 +113,7 @@ struct MFTL_BVH;  // defined in section 3; the pair filter below takes pointers 
 
 /**
  * @struct MFTL_BVHBuildParams
- * @brief Build and query parameters. Start from MFTL_BVHDefaultParams(); a
+ * @brief Build and query parameters. Start from MFTLBVHDefaultParams(); a
  *        zero-initialised struct gives a zero envelope.
  */
 typedef struct MFTL_BVHBuildParams
@@ -179,7 +179,7 @@ typedef struct MFTL_BVHBuildParams
  * @return Factor #MFTL_BVH_DEFAULT_PROXIMITY_FACTOR, no floor, leaf size
  *         #MFTL_BVH_DEFAULT_LEAF_SIZE, ghosts excluded, no self pairs, no filter.
  */
-static inline MFTL_BVHBuildParams MFTL_BVHDefaultParams(void)
+static inline MFTL_BVHBuildParams MFTLBVHDefaultParams(void)
 {
   MFTL_BVHBuildParams p;
   p.proximity_factor = MFTL_BVH_DEFAULT_PROXIMITY_FACTOR;
@@ -201,7 +201,7 @@ static inline MFTL_BVHBuildParams MFTL_BVHDefaultParams(void)
  *        patch.
  *
  * Owns only its nodes and its primitive permutation. The object and the patch
- * are borrowed and must outlive the BVH; MFTL_RefitLBVH() must be given the same
+ * are borrowed and must outlive the BVH; MFTLRefitLBVH() must be given the same
  * object.
  */
 typedef struct MFTL_BVH
@@ -246,11 +246,11 @@ typedef struct MFTL_BVH
    * `bounding_radius` covers only this rank's primitives, so an envelope scaled
    * by it would depend on the process count. MFTLSpatialHaloResolveRadii()
    * provides the global value (a per-body reduction over the holders, published
-   * one hop further); set it with MFTL_BVHSetGlobalRadius().
+   * one hop further); set it with MFTLBVHSetGlobalRadius().
    */
   double radius_hint;
 
-  /** @brief Primitive count the tree was built for; MFTL_RefitLBVH() refuses if it changed. */
+  /** @brief Primitive count the tree was built for; MFTLRefitLBVH() refuses if it changed. */
   int built_for_n_prims;
 } MFTL_BVH;
 
@@ -266,7 +266,7 @@ typedef struct MFTL_BVH
  * @param      p   Primitive index in `[0, n_prims)`.
  * @param[out] out Row k is corner k.
  */
-void MFTL_BVHPrimVerts(const MFTL_BVH *bvh, int p, double out[3][3]);
+void MFTLBVHPrimVerts(const MFTL_BVH *bvh, int p, double out[3][3]);
 
 /**
  * @brief The object and triangle a primitive is: `bvh->obj` for a local
@@ -280,7 +280,7 @@ void MFTL_BVHPrimVerts(const MFTL_BVH *bvh, int p, double out[3][3]);
  * @param[out] tri Triangle index within the returned object.
  * @return The object the triangle lives in.
  */
-const MFTL_Object *MFTL_BVHPrimTriangle(const MFTL_BVH *bvh, int p, int *tri);
+const MFTL_Object *MFTLBVHPrimTriangle(const MFTL_BVH *bvh, int p, int *tri);
 
 /**
  * @brief True if primitive @p p is a triangle of `bvh->obj`, not a halo copy.
@@ -288,7 +288,7 @@ const MFTL_Object *MFTL_BVHPrimTriangle(const MFTL_BVH *bvh, int p, int *tri);
  * @param p   Primitive index.
  * @return `true` iff \f$p < n_\mathrm{local\,prims}\f$.
  */
-static inline bool MFTL_BVHPrimIsLocal(const MFTL_BVH *bvh, int p) { return p < bvh->n_local_prims; }
+static inline bool MFTLBVHPrimIsLocal(const MFTL_BVH *bvh, int p) { return p < bvh->n_local_prims; }
 
 /**
  * @brief Global triangle id of primitive @p p -- the identity a callback should
@@ -297,7 +297,7 @@ static inline bool MFTL_BVHPrimIsLocal(const MFTL_BVH *bvh, int p) { return p < 
  * @param p   Primitive index.
  * @return The triangle's global id.
  */
-int MFTL_BVHPrimGlobalId(const MFTL_BVH *bvh, int p);
+int MFTLBVHPrimGlobalId(const MFTL_BVH *bvh, int p);
 
 /**
  * @brief The rank owning primitive @p p.
@@ -305,7 +305,7 @@ int MFTL_BVHPrimGlobalId(const MFTL_BVH *bvh, int p);
  * @param p   Primitive index.
  * @return The owning rank. For a local primitive this is the calling rank.
  */
-int MFTL_BVHPrimOwner(const MFTL_BVH *bvh, int p);
+int MFTLBVHPrimOwner(const MFTL_BVH *bvh, int p);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 5. Build, refit, destroy
@@ -325,14 +325,14 @@ int MFTL_BVHPrimOwner(const MFTL_BVH *bvh, int p);
  * rank may hold nothing of a body and still receive a patch of it.
  *
  * @param obj    The object; borrowed for the BVH's lifetime.
- * @param params #MFTL_NULL for MFTL_BVHDefaultParams().
- * @return A new BVH (free with MFTL_DestroyBVH()), or #MFTL_NULL if @p obj is
+ * @param params #MFTL_NULL for MFTLBVHDefaultParams().
+ * @return A new BVH (free with MFTLDestroyBVH()), or #MFTL_NULL if @p obj is
  *         #MFTL_NULL.
  *
  * @rank_local The tolerance uses this rank's radius until
- *             MFTL_BVHSetGlobalRadius() is called.
+ *             MFTLBVHSetGlobalRadius() is called.
  */
-MFTL_BVH *MFTL_GenerateLBVH(const MFTL_Object *obj, const MFTL_BVHBuildParams *params);
+MFTL_BVH *MFTLGenerateLBVH(const MFTL_Object *obj, const MFTL_BVHBuildParams *params);
 
 /**
  * @brief Refits the boxes after the vertices moved; tree and order are kept.
@@ -351,7 +351,7 @@ MFTL_BVH *MFTL_GenerateLBVH(const MFTL_Object *obj, const MFTL_BVHBuildParams *p
  *
  * @rank_local
  */
-int MFTL_RefitLBVH(MFTL_BVH *bvh, const MFTL_Object *obj);
+int MFTLRefitLBVH(MFTL_BVH *bvh, const MFTL_Object *obj);
 
 /**
  * @brief Destroys a BVH and everything it owns. Safe on MFTL_NULL.
@@ -359,7 +359,7 @@ int MFTL_RefitLBVH(MFTL_BVH *bvh, const MFTL_Object *obj);
  * @param bvh The hierarchy, or #MFTL_NULL. The borrowed object and halo patch
  *            are NOT freed -- they belong to the caller.
  */
-void MFTL_DestroyBVH(MFTL_BVH *bvh);
+void MFTLDestroyBVH(MFTL_BVH *bvh);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 6. Attaching a spatial halo
@@ -380,7 +380,7 @@ void MFTL_DestroyBVH(MFTL_BVH *bvh);
  *
  * @rank_local
  */
-int MFTL_BVHSetHalo(MFTL_BVH *bvh, const MFTL_Object *patch);
+int MFTLBVHSetHalo(MFTL_BVH *bvh, const MFTL_Object *patch);
 
 /**
  * @brief Sets the body's GLOBAL radius (MFTLSpatialHaloRadius()) so the envelope
@@ -391,7 +391,7 @@ int MFTL_BVHSetHalo(MFTL_BVH *bvh, const MFTL_Object *patch);
  *               value \f$\le 0\f$ returns to the local measurement.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR on a NULL hierarchy.
  */
-int MFTL_BVHSetGlobalRadius(MFTL_BVH *bvh, double radius);
+int MFTLBVHSetGlobalRadius(MFTL_BVH *bvh, double radius);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 7. Traversal
@@ -402,7 +402,7 @@ int MFTL_BVHSetGlobalRadius(MFTL_BVH *bvh, double radius);
  *
  * Receives the HIERARCHIES, because a primitive index is meaningful only with
  * its tree (past `n_local_prims` it names a patch triangle); resolve primitives
- * with MFTL_BVHPrimTriangle(), MFTL_BVHPrimVerts() or MFTL_BVHPrimGlobalId().
+ * with MFTLBVHPrimTriangle(), MFTLBVHPrimVerts() or MFTLBVHPrimGlobalId().
  *
  * @param bvhA      The A-side hierarchy; primA is always LOCAL to it.
  * @param primA     Primitive index in @p bvhA.
@@ -418,7 +418,7 @@ typedef void (*IntersectionCallback)(const MFTL_BVH *bvhA, int primA, const MFTL
  * For every periodic image of B whose shifted root box overlaps A's root, a
  * dual-tree descent over an explicit stack of node pairs splits the node with
  * the larger box volume; leaf-leaf candidates are collected into batches of 64
- * and passed to MFTL_TriTriProximity() at tolerance `MAX(tol_A, tol_B)`. Only
+ * and passed to MFTLTriTriProximity() at tolerance `MAX(tol_A, tol_B)`. Only
  * pairs with a LOCAL A-side primitive are tested, so a distributed run reports
  * each contact once.
  *
@@ -434,20 +434,20 @@ typedef void (*IntersectionCallback)(const MFTL_BVH *bvhA, int primA, const MFTL
  *
  * @rank_local
  */
-void MFTL_IntersectObjects(const MFTL_Object *objA, MFTL_BVH *bvhA, const MFTL_Object *objB, MFTL_BVH *bvhB, IntersectionCallback callback, void *user_data);
+void MFTLIntersectObjects(const MFTL_Object *objA, MFTL_BVH *bvhA, const MFTL_Object *objB, MFTL_BVH *bvhB, IntersectionCallback callback, void *user_data);
 
 /**
  * @brief Contact detection for a whole ensemble: build, measure, exchange, attach,
  *        traverse, destroy.
  *
- * 1. MFTL_GenerateLBVH() for every body this rank holds;
- * 2. MFTLSpatialHaloResolveRadii() and MFTL_BVHSetGlobalRadius() -- the envelope
+ * 1. MFTLGenerateLBVH() for every body this rank holds;
+ * 2. MFTLSpatialHaloResolveRadii() and MFTLBVHSetGlobalRadius() -- the envelope
  *    is a fraction of the body, whose size is only known collectively;
  * 3. MFTLExtendSpatialHaloNearBodies() with those envelopes, which returns the
  *    patches AND the candidate body pairs (no all-pairs list is enumerated);
- * 4. MFTL_BVHSetHalo() per patched body; a body held nowhere here but patched
+ * 4. MFTLBVHSetHalo() per patched body; a body held nowhere here but patched
  *    gets a tree over a shared empty object;
- * 5. MFTL_IntersectObjects() per candidate pair (A = smaller body id). A self
+ * 5. MFTLIntersectObjects() per candidate pair (A = smaller body id). A self
  *    pair uses a second, tight (zero-envelope), patch-free A-side tree.
  *
  * Cost: trees `O(bodies held)`, traversals `O(candidate pairs)`; two collective
@@ -473,11 +473,11 @@ int MFTLEnsembleIntersectObjects(MFTL_Ensemble *ens, const MFTL_BVHBuildParams *
 /**
  * @brief Exact triangle-triangle intersection test (Guigue & Devillers 2003).
  *
- * Every decision is the sign of MFTL_Orient3D(), which is exact; no
+ * Every decision is the sign of MFTLOrient3D(), which is exact; no
  * intersection point is constructed. Two proper triangles in distinct planes
  * take Guigue-Devillers. Everything else is recognised from exact zeros and
  * answered exactly too: coplanar pairs by a 2D test whose orientations are
- * MFTL_Orient3D() of lifted points, and a triangle of zero area (collinear or
+ * MFTLOrient3D() of lifted points, and a triangle of zero area (collinear or
  * coincident corners) as the segment or point it spans -- against a proper
  * triangle as a segment crossing it, against another such as two segments.
  *
@@ -486,13 +486,13 @@ int MFTLEnsembleIntersectObjects(MFTL_Ensemble *ens, const MFTL_BVHBuildParams *
  * @return 1 if the closed point sets intersect (coplanar overlap, touching and
  *         degenerate triangles included), else 0.
  */
-int MFTL_TriTriIntersect(const double A[3][3], const double B[3][3]);
+int MFTLTriTriIntersect(const double A[3][3], const double B[3][3]);
 
 /**
  * @brief Contact predicate: intersection, or a minimum distance within
  *        @p tolerance.
  *
- * MFTL_TriTriIntersect() first (a piercing pair has positive distance to every
+ * MFTLTriTriIntersect() first (a piercing pair has positive distance to every
  * edge and vertex, so the distance test alone would miss it), then the minimum
  * distance of two disjoint closed triangles from
  * MFTLClosestPointsBetweenTriangles(): nine segment pairs and six corner-face
@@ -505,21 +505,21 @@ int MFTL_TriTriIntersect(const double A[3][3], const double B[3][3]);
  * @param tolerance Gap at which contact is declared, >= 0.
  * @return 1 on contact, 0 otherwise.
  *
- * @measured{244 ns/pair (176 ns with the old distance terms), against 31 ns for MFTL_TriTriIntersect() alone.}
+ * @measured{244 ns/pair (176 ns with the old distance terms), against 31 ns for MFTLTriTriIntersect() alone.}
  */
-int MFTL_TriTriProximity(const double A[3][3], const double B[3][3], double tolerance);
+int MFTLTriTriProximity(const double A[3][3], const double B[3][3], double tolerance);
 
 /**
  * @brief Squared minimum distance between two closed triangles; 0 if they meet.
  *
- * Zero exactly when MFTL_TriTriIntersect() says they meet; otherwise
+ * Zero exactly when MFTLTriTriIntersect() says they meet; otherwise
  * MFTLClosestPointsBetweenTriangles(), accurate to rounding.
  *
  * @param A Corners of the first triangle.
  * @param B Corners of the second, in the same periodic image as @p A.
  * @return \f$d^2\f$, exactly 0 if they touch or intersect.
  */
-double MFTL_TriTriDistanceSq(const double A[3][3], const double B[3][3]);
+double MFTLTriTriDistanceSq(const double A[3][3], const double B[3][3]);
 
 /**
  * @brief Robust orientation predicate: six times the signed volume of the
@@ -537,7 +537,7 @@ double MFTL_TriTriDistanceSq(const double A[3][3], const double B[3][3]);
  * It is the one predicate whose SIGN decides an answer (Guigue-Devillers takes up
  * to eight per pair); a wrong sign can report a clean miss for crossing
  * triangles. Measured: 2.00x the plain determinant, at most 4.5 % of an
- * MFTL_TriTriProximity() call; the plain form never misclassified in 20 000
+ * MFTLTriTriProximity() call; the plain form never misclassified in 20 000
  * samples at gaps >= 1e-12 of the body size and fails only at 1e-14..1e-16
  * (examples/orient3d_predicate_profile.c). Requires `-ffp-contract=off`.
  *
@@ -547,7 +547,7 @@ double MFTL_TriTriDistanceSq(const double A[3][3], const double B[3][3]);
  * @param pd The point being classified.
  * @return \f$6V\f$; the SIGN is exact, the magnitude approximate.
  */
-double MFTL_Orient3D(const double pa[3], const double pb[3], const double pc[3], const double pd[3]);
+double MFTLOrient3D(const double pa[3], const double pb[3], const double pc[3], const double pd[3]);
 
 /**
  * @brief The plain (non-adaptive) orientation determinant, for comparison and
@@ -560,7 +560,7 @@ double MFTL_Orient3D(const double pa[3], const double pb[3], const double pc[3],
  * @param pd The point being classified.
  * @return \f$6V\f$ from the plain \f$3\times3\f$ determinant.
  */
-double MFTL_Orient3DFast(const double pa[3], const double pb[3], const double pc[3], const double pd[3]);
+double MFTLOrient3DFast(const double pa[3], const double pb[3], const double pc[3], const double pd[3]);
 
 #ifdef __cplusplus
 }

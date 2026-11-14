@@ -146,8 +146,8 @@ static void run_thin_film(void)
        * the configuration IS coplanar and neither form is wrong to say so. */
       if (d[2] != c[2]) representable++;
 
-      const double exact = MFTL_Orient3D(a, b, c, d);
-      const double fast = MFTL_Orient3DFast(a, b, c, d);
+      const double exact = MFTLOrient3D(a, b, c, d);
+      const double fast = MFTLOrient3DFast(a, b, c, d);
 
       if (sign_of(exact) != sign_of(fast)) wrong++;
       if (fast == 0.0 && exact != 0.0) fast_zero++;
@@ -200,7 +200,7 @@ static void run_offset_sweep(void)
         {
           double a[3], b[3], c[3], d[3];
           near_coplanar_case(L, gap, offset, a, b, c, d);
-          if (sign_of(MFTL_Orient3D(a, b, c, d)) != sign_of(MFTL_Orient3DFast(a, b, c, d))) wrong++;
+          if (sign_of(MFTLOrient3D(a, b, c, d)) != sign_of(MFTLOrient3DFast(a, b, c, d))) wrong++;
         }
 
         printf(" %12.3f", 100.0 * wrong / N);
@@ -241,12 +241,12 @@ static void run_cost(void)
   for (int rep = 0; rep < 5; ++rep)
   {
     double t0 = MPI_Wtime();
-    for (int i = 0; i < N; ++i) sink += MFTL_Orient3DFast(&pts[12 * i], &pts[12 * i + 3], &pts[12 * i + 6], &pts[12 * i + 9]);
+    for (int i = 0; i < N; ++i) sink += MFTLOrient3DFast(&pts[12 * i], &pts[12 * i + 3], &pts[12 * i + 6], &pts[12 * i + 9]);
     double dt = MPI_Wtime() - t0;
     if (dt < best_fast) best_fast = dt;
 
     t0 = MPI_Wtime();
-    for (int i = 0; i < N; ++i) sink += MFTL_Orient3D(&pts[12 * i], &pts[12 * i + 3], &pts[12 * i + 6], &pts[12 * i + 9]);
+    for (int i = 0; i < N; ++i) sink += MFTLOrient3D(&pts[12 * i], &pts[12 * i + 3], &pts[12 * i + 6], &pts[12 * i + 9]);
     dt = MPI_Wtime() - t0;
     if (dt < best_exact) best_exact = dt;
   }
@@ -276,12 +276,12 @@ static void run_cost(void)
   for (int rep = 0; rep < 5; ++rep)
   {
     double t0 = MPI_Wtime();
-    for (int i = 0; i < N; ++i) sink += MFTL_Orient3DFast(&pts[12 * i], &pts[12 * i + 3], &pts[12 * i + 6], &pts[12 * i + 9]);
+    for (int i = 0; i < N; ++i) sink += MFTLOrient3DFast(&pts[12 * i], &pts[12 * i + 3], &pts[12 * i + 6], &pts[12 * i + 9]);
     double dt = MPI_Wtime() - t0;
     if (dt < best_fast) best_fast = dt;
 
     t0 = MPI_Wtime();
-    for (int i = 0; i < N; ++i) sink += MFTL_Orient3D(&pts[12 * i], &pts[12 * i + 3], &pts[12 * i + 6], &pts[12 * i + 9]);
+    for (int i = 0; i < N; ++i) sink += MFTLOrient3D(&pts[12 * i], &pts[12 * i + 3], &pts[12 * i + 6], &pts[12 * i + 9]);
     dt = MPI_Wtime() - t0;
     if (dt < best_exact) best_exact = dt;
   }
@@ -299,8 +299,8 @@ static void run_cost(void)
   /* ── The number that actually decides ───────────────────────────────────
    *
    * 2x on the predicate is only affordable if the predicate is a small part of
-   * the narrow phase. MFTL_TriTriIntersect makes three to eight orientation
-   * calls per pair; MFTL_TriTriProximity adds fifteen distance sub-tests on top
+   * the narrow phase. MFTLTriTriIntersect makes three to eight orientation
+   * calls per pair; MFTLTriTriProximity adds fifteen distance sub-tests on top
    * whenever the pair does NOT intersect, which is the common case for anything
    * the broad phase admits. Measuring both says how much of a contact query the
    * exactness is really costing. */
@@ -332,19 +332,19 @@ static void run_cost(void)
     for (int rep = 0; rep < 5; ++rep)
     {
       double t0 = MPI_Wtime();
-      for (int i = 0; i < M; ++i) hits += MFTL_TriTriIntersect((const double(*)[3]) & tris[18 * i], (const double(*)[3]) & tris[18 * i + 9]);
+      for (int i = 0; i < M; ++i) hits += MFTLTriTriIntersect((const double(*)[3]) & tris[18 * i], (const double(*)[3]) & tris[18 * i + 9]);
       double dt = MPI_Wtime() - t0;
       if (dt < best_i) best_i = dt;
 
       t0 = MPI_Wtime();
-      for (int i = 0; i < M; ++i) hits += MFTL_TriTriProximity((const double(*)[3]) & tris[18 * i], (const double(*)[3]) & tris[18 * i + 9], 0.05);
+      for (int i = 0; i < M; ++i) hits += MFTLTriTriProximity((const double(*)[3]) & tris[18 * i], (const double(*)[3]) & tris[18 * i + 9], 0.05);
       dt = MPI_Wtime() - t0;
       if (dt < best_p) best_p = dt;
     }
 
     printf("\n  narrow phase, per triangle pair:\n");
-    printf("    MFTL_TriTriIntersect   %6.2f ns\n", 1e9 * best_i / M);
-    printf("    MFTL_TriTriProximity   %6.2f ns\n", 1e9 * best_p / M);
+    printf("    MFTLTriTriIntersect   %6.2f ns\n", 1e9 * best_i / M);
+    printf("    MFTLTriTriProximity   %6.2f ns\n", 1e9 * best_p / M);
     printf("    (checksum %lld)\n", hits);
 
     printf("\n  If the predicate were the plain determinant, a proximity query would\n");
@@ -366,7 +366,7 @@ static void run_cost(void)
  *        intersection test.
  *
  * A misclassified orientation only matters if it changes what
- * MFTL_TriTriIntersect reports. This builds pairs that genuinely cross by a
+ * MFTLTriTriIntersect reports. This builds pairs that genuinely cross by a
  * whisker and counts how many the two predicate forms disagree about
  * end-to-end -- the number that decides whether the adaptive version earns its
  * place.
@@ -407,7 +407,7 @@ static void run_end_to_end(void)
     };
 
     /* The exact verdict. B's first edge spans the plane, so it crosses. */
-    const int exact = MFTL_TriTriIntersect(A, B);
+    const int exact = MFTLTriTriIntersect(A, B);
     if (exact) crossing++;
 
     /* What the plain determinant would have decided, reconstructed from the
@@ -417,12 +417,12 @@ static void run_end_to_end(void)
     const double *p1 = A[0], *q1 = A[1], *r1 = A[2];
     const double *p2 = B[0], *q2 = B[1], *r2 = B[2];
 
-    if (sign_of(MFTL_Orient3D(p1, p2, q2, r2)) != sign_of(MFTL_Orient3DFast(p1, p2, q2, r2))) differs = 1;
-    if (sign_of(MFTL_Orient3D(q1, p2, q2, r2)) != sign_of(MFTL_Orient3DFast(q1, p2, q2, r2))) differs = 1;
-    if (sign_of(MFTL_Orient3D(r1, p2, q2, r2)) != sign_of(MFTL_Orient3DFast(r1, p2, q2, r2))) differs = 1;
-    if (sign_of(MFTL_Orient3D(p2, p1, q1, r1)) != sign_of(MFTL_Orient3DFast(p2, p1, q1, r1))) differs = 1;
-    if (sign_of(MFTL_Orient3D(q2, p1, q1, r1)) != sign_of(MFTL_Orient3DFast(q2, p1, q1, r1))) differs = 1;
-    if (sign_of(MFTL_Orient3D(r2, p1, q1, r1)) != sign_of(MFTL_Orient3DFast(r2, p1, q1, r1))) differs = 1;
+    if (sign_of(MFTLOrient3D(p1, p2, q2, r2)) != sign_of(MFTLOrient3DFast(p1, p2, q2, r2))) differs = 1;
+    if (sign_of(MFTLOrient3D(q1, p2, q2, r2)) != sign_of(MFTLOrient3DFast(q1, p2, q2, r2))) differs = 1;
+    if (sign_of(MFTLOrient3D(r1, p2, q2, r2)) != sign_of(MFTLOrient3DFast(r1, p2, q2, r2))) differs = 1;
+    if (sign_of(MFTLOrient3D(p2, p1, q1, r1)) != sign_of(MFTLOrient3DFast(p2, p1, q1, r1))) differs = 1;
+    if (sign_of(MFTLOrient3D(q2, p1, q1, r1)) != sign_of(MFTLOrient3DFast(q2, p1, q1, r1))) differs = 1;
+    if (sign_of(MFTLOrient3D(r2, p1, q1, r1)) != sign_of(MFTLOrient3DFast(r2, p1, q1, r1))) differs = 1;
 
     if (differs) disagree++;
   }
@@ -440,7 +440,7 @@ int main(int argc, char **argv)
 
   printf("\n");
   printf("#####################################################################\n");
-  printf("#  MFTL_Orient3D: adaptive vs plain determinant                     #\n");
+  printf("#  MFTLOrient3D: adaptive vs plain determinant                     #\n");
   printf("#  Reference is the ADAPTIVE form, whose sign is exact.             #\n");
   printf("#####################################################################\n");
 

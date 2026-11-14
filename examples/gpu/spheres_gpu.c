@@ -402,12 +402,12 @@ static void unpack_quality(MFTL_ObjectQualityStatistics *qs, const double *r)
   const double n_tris = r[9], n_edges = r[10];
   const int empty = n_tris <= 0.0;
   qs->avg_triangle_area = empty ? 0.0 : r[6] / n_tris;
-  qs->avg_aspect_ratio = empty ? 0.0 : r[7] / n_tris;
+  qs->avg_mean_ratio = empty ? 0.0 : r[7] / n_tris;
   qs->avg_edge_length_sq = (n_edges > 0.0) ? r[8] / n_edges : 0.0;
   qs->min_triangle_area = empty ? 0.0 : r[0];
   qs->max_triangle_area = empty ? 0.0 : r[3];
-  qs->min_aspect_ratio = empty ? 0.0 : r[1];
-  qs->max_aspect_ratio = empty ? 0.0 : r[4];
+  qs->min_mean_ratio = empty ? 0.0 : r[1];
+  qs->max_mean_ratio = empty ? 0.0 : r[4];
   qs->min_edge_length_sq = empty ? 0.0 : r[2];
   qs->max_edge_length_sq = empty ? 0.0 : r[5];
 }
@@ -602,9 +602,9 @@ static final_state measure_final(const MFTL_Ensemble *ens)
     }
     if (obj->tris.n_local > 0)
     {
-      mins[0] = fmin(mins[0], obj->quality.min_aspect_ratio);
+      mins[0] = fmin(mins[0], obj->quality.min_mean_ratio);
       mins[1] = fmin(mins[1], obj->quality.min_edge_length_sq);
-      maxs[0] = fmax(maxs[0], obj->quality.max_aspect_ratio);
+      maxs[0] = fmax(maxs[0], obj->quality.max_mean_ratio);
       maxs[1] = fmax(maxs[1], obj->quality.max_edge_length_sq);
     }
   }

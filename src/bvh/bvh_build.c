@@ -49,27 +49,27 @@ static inline const MFTL_Object *prim_source(const MFTL_BVH *bvh, int p, int *t_
   return bvh->obj;
 }
 
-const MFTL_Object *MFTL_BVHPrimTriangle(const MFTL_BVH *bvh, int p, int *tri)
+const MFTL_Object *MFTLBVHPrimTriangle(const MFTL_BVH *bvh, int p, int *tri)
 {
   MFTL_ASSERT(bvh != MFTL_NULL && tri != MFTL_NULL);
   return prim_source(bvh, p, tri);
 }
 
-void MFTL_BVHPrimVerts(const MFTL_BVH *bvh, int p, double out[3][3])
+void MFTLBVHPrimVerts(const MFTL_BVH *bvh, int p, double out[3][3])
 {
   int t;
   const MFTL_Object *const src = prim_source(bvh, p, &t);
   MFTLGetTriangleCorners(src, t, out);
 }
 
-int MFTL_BVHPrimGlobalId(const MFTL_BVH *bvh, int p)
+int MFTLBVHPrimGlobalId(const MFTL_BVH *bvh, int p)
 {
   int t;
   const MFTL_Object *const src = prim_source(bvh, p, &t);
   return src->tris.rec[t].global_id;
 }
 
-int MFTL_BVHPrimOwner(const MFTL_BVH *bvh, int p)
+int MFTLBVHPrimOwner(const MFTL_BVH *bvh, int p)
 {
   int t;
   const MFTL_Object *const src = prim_source(bvh, p, &t);
@@ -179,10 +179,10 @@ void MFTLBVHRefit(MFTL_BVH *bvh)
   {
     MFTL_BVHNode *const n = &nodes[i];
 
-    if (MFTL_BVHNodeIsLeaf(n))
+    if (MFTLBVHNodeIsLeaf(n))
     {
-      const int first = MFTL_BVHLeafFirst(n);
-      const int count = MFTL_BVHLeafCount(n);
+      const int first = MFTLBVHLeafFirst(n);
+      const int count = MFTLBVHLeafCount(n);
 
       double lo[3] = {MFTL_DBL_MAX, MFTL_DBL_MAX, MFTL_DBL_MAX};
       double hi[3] = {-MFTL_DBL_MAX, -MFTL_DBL_MAX, -MFTL_DBL_MAX};
@@ -190,7 +190,7 @@ void MFTLBVHRefit(MFTL_BVH *bvh)
       for (int s = 0; s < count; ++s)
       {
         double tri[3][3];
-        MFTL_BVHPrimVerts(bvh, prims[first + s], tri);
+        MFTLBVHPrimVerts(bvh, prims[first + s], tri);
         for (int c = 0; c < 3; ++c)
         {
           for (int k = 0; k < 3; ++k)
@@ -220,7 +220,7 @@ void MFTLBVHRefit(MFTL_BVH *bvh)
     }
     else
     {
-      const int l = MFTL_BVHLeftChild(n);
+      const int l = MFTLBVHLeftChild(n);
       const MFTL_BVHNode *const a = &nodes[l];
       const MFTL_BVHNode *const b = &nodes[l + 1];
       MFTL_ASSERT(l > i && l + 1 < bvh->nodes_used && "BVH child index must exceed its parent's");
@@ -269,7 +269,7 @@ void MFTLBVHRefit(MFTL_BVH *bvh)
   }
 }
 
-int MFTL_RefitLBVH(MFTL_BVH *bvh, const MFTL_Object *obj)
+int MFTLRefitLBVH(MFTL_BVH *bvh, const MFTL_Object *obj)
 {
   if (bvh == MFTL_NULL || obj == MFTL_NULL) return MFTL_ERROR;
 
@@ -283,7 +283,7 @@ int MFTL_RefitLBVH(MFTL_BVH *bvh, const MFTL_Object *obj)
     return MFTL_ERROR;
   }
 
-  MFTL_ASSERT(obj == bvh->obj && "MFTL_RefitLBVH: must be handed the object the BVH was built from");
+  MFTL_ASSERT(obj == bvh->obj && "MFTLRefitLBVH: must be handed the object the BVH was built from");
   bvh->obj = obj;
 
   MFTLBVHRefit(bvh);
@@ -294,11 +294,11 @@ int MFTL_RefitLBVH(MFTL_BVH *bvh, const MFTL_Object *obj)
  * 4. Build
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-MFTL_BVH *MFTL_GenerateLBVH(const MFTL_Object *obj, const MFTL_BVHBuildParams *params)
+MFTL_BVH *MFTLGenerateLBVH(const MFTL_Object *obj, const MFTL_BVHBuildParams *params)
 {
   if (obj == MFTL_NULL) return MFTL_NULL;
 
-  const MFTL_BVHBuildParams p = (params != MFTL_NULL) ? *params : MFTL_BVHDefaultParams();
+  const MFTL_BVHBuildParams p = (params != MFTL_NULL) ? *params : MFTLBVHDefaultParams();
   const int n_local = p.include_ghosts ? obj->tris.n : obj->tris.n_local;
 
   MFTL_BVH *const bvh = (MFTL_BVH *) MFTLCallocOrDie(1, sizeof(MFTL_BVH), "MFTL_BVH");
@@ -349,7 +349,7 @@ void MFTLBVHBuildFromPrims(MFTL_BVH *bvh)
   for (int i = 0; i < n; ++i)
   {
     double tri[3][3];
-    MFTL_BVHPrimVerts(bvh, i, tri);
+    MFTLBVHPrimVerts(bvh, i, tri);
 
     for (int k = 0; k < 3; ++k)
     {
@@ -394,7 +394,7 @@ void MFTLBVHBuildFromPrims(MFTL_BVH *bvh)
   MFTLBVHRefit(bvh);
 }
 
-int MFTL_BVHSetHalo(MFTL_BVH *bvh, const MFTL_Object *patch)
+int MFTLBVHSetHalo(MFTL_BVH *bvh, const MFTL_Object *patch)
 {
   if (bvh == MFTL_NULL) return MFTL_ERROR;
 
@@ -420,7 +420,7 @@ int MFTL_BVHSetHalo(MFTL_BVH *bvh, const MFTL_Object *patch)
   return MFTL_SUCCESS;
 }
 
-int MFTL_BVHSetGlobalRadius(MFTL_BVH *bvh, double radius)
+int MFTLBVHSetGlobalRadius(MFTL_BVH *bvh, double radius)
 {
   if (bvh == MFTL_NULL) return MFTL_ERROR;
   bvh->radius_hint = (radius > 0.0) ? radius : 0.0;
@@ -428,7 +428,7 @@ int MFTL_BVHSetGlobalRadius(MFTL_BVH *bvh, double radius)
   return MFTL_SUCCESS;
 }
 
-void MFTL_DestroyBVH(MFTL_BVH *bvh)
+void MFTLDestroyBVH(MFTL_BVH *bvh)
 {
   if (bvh == MFTL_NULL) return;
   free(bvh->nodes);

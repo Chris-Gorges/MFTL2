@@ -1485,6 +1485,34 @@ static int test_the_pool_order_does_not_reach_the_remesh(void)
 
 /* ═══════════════════════════════════════════════════════════════════════════ */
 
+/**
+ * @brief A NULL parameter block is refused with MFTL_ERROR and the mesh left
+ *        alone. There is no default block (the target length is the caller's);
+ *        before, MFTLRemeshEnsemble(ens, NULL, ...) segfaulted.
+ */
+static int test_a_null_parameter_block_is_refused(void)
+{
+  MFTL_Object *obj = make_sphere(2);
+  const int nt = obj->tris.n, nv = obj->verts.n;
+
+  MFTL_RemeshStats st;
+  memset(&st, 0xFF, sizeof(st));
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLRemeshEnsemble(g_ens, MFTL_NULL, &st));
+  TEST_ASSERT_EQUAL_INT(0, st.n_split);
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLRemeshEnsembleParallel(g_ens, MFTL_NULL, MFTL_NULL));
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLRemeshEnsembleDispersed(g_ens, MFTL_NULL, MFTL_NULL));
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLRemeshObject(obj, MFTL_NULL, MFTL_NULL));
+
+  MFTL_RemeshParameters p;
+  MFTLInitRemeshParams(&p, MFTL_REMESH_ISOTROPIC, MFTLMeanEdgeLength(obj), 1, MFTL_SMOOTH_TRIANGLE_BASED, 180.0);
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLRemeshEnsemble(MFTL_NULL, &p, MFTL_NULL));
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLRemeshObject(MFTL_NULL, &p, MFTL_NULL));
+
+  TEST_ASSERT_EQUAL_INT(nt, obj->tris.n);
+  TEST_ASSERT_EQUAL_INT(nv, obj->verts.n);
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
@@ -1538,6 +1566,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_remeshing_is_independent_of_the_length_unit);
   RUN_TEST(test_the_pool_order_does_not_reach_the_remesh);
   RUN_TEST(test_compaction_removes_orphans);
+  RUN_TEST(test_a_null_parameter_block_is_refused);
 
   TEST_REPORT();
 

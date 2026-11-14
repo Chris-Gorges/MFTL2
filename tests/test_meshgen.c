@@ -309,6 +309,30 @@ static int test_sphere_survives_a_morton_reorder(void)
   return 0;
 }
 
+/**
+ * @brief Level 13 needs 4.0 G half-edges, past the int index space; without the
+ *        cap it overflowed, and level 14 did not return in minutes. The refusal
+ *        must be immediate and leave the object empty; the cap itself is accepted
+ *        as an argument (not generated here: 335 M triangles).
+ */
+static int test_refinement_beyond_the_index_space_is_refused(void)
+{
+  MFTL_Object *obj = MFTLObjectCreate(1);
+  MFTLEnsembleAddObject(g_ens, obj);
+  const double c[3] = {0.0, 0.0, 0.0};
+
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLGenerateSphere(obj, c, 1.0, MFTL_SPHERE_MAX_REFINEMENTS + 1));
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLGenerateSphere(obj, c, 1.0, 14));
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLGenerateSphereLocal(obj, c, 1.0, 1000));
+  TEST_ASSERT_EQUAL_INT(0, obj->verts.n);
+  TEST_ASSERT_EQUAL_INT(0, obj->tris.n);
+
+  /* The object is still usable: a valid level afterwards succeeds. */
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLGenerateSphere(obj, c, 1.0, 1));
+  TEST_ASSERT_EQUAL_INT(80, obj->tris.n);
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
@@ -330,6 +354,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_surface_area_converges_from_below);
   RUN_TEST(test_zero_radius_sphere_is_valid);
   RUN_TEST(test_sphere_survives_a_morton_reorder);
+  RUN_TEST(test_refinement_beyond_the_index_space_is_refused);
 
   TEST_REPORT();
 

@@ -422,7 +422,13 @@ int MFTLRemeshEdgeSweeps(MFTL_Object *obj, const MFTL_RemeshParameters *params, 
 
 int MFTLRemeshObject(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats)
 {
-  MFTL_ASSERT(obj != MFTL_NULL && params != MFTL_NULL);
+  /* Refused, not asserted: unlike MFTLWriteVtu's options there is no default
+   * parameter block -- the target edge length is the caller's. */
+  if (obj == MFTL_NULL || params == MFTL_NULL)
+  {
+    if (stats) memset(stats, 0, sizeof(*stats));
+    return MFTL_ERROR;
+  }
   MFTL_ASSERT(obj->tris.n_local == obj->tris.n && obj->verts.n_local == obj->verts.n &&
               "MFTLRemeshObject: object holds ghosts. Collapsing an edge whose far endpoint is owned elsewhere "
               "needs agreement, so a 'serial' remesh of a partitioned object silently diverges between ranks. "
@@ -465,9 +471,23 @@ int MFTLRemeshObject(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL
   return MFTL_SUCCESS;
 }
 
+bool MFTLRemeshRefuseNullArguments(const MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats, const char *caller)
+{
+  if (ens != MFTL_NULL && params != MFTL_NULL) return MFTL_FALSE;
+
+  if (stats) memset(stats, 0, sizeof(*stats));
+  if (ens != MFTL_NULL && ens->domain.rank == 0)
+  {
+    fprintf(stderr,
+            "MFTL Error: %s: the parameter block is NULL; there is no default (the target edge length is the caller's), start from MFTLInitRemeshParams().\n",
+            caller);
+  }
+  return MFTL_TRUE;
+}
+
 int MFTLRemeshEnsemble(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats)
 {
-  MFTL_ASSERT(ens != MFTL_NULL && params != MFTL_NULL);
+  if (MFTLRemeshRefuseNullArguments(ens, params, stats, "MFTLRemeshEnsemble")) return MFTL_ERROR;
 
   /* One rank stays on the path below, and not merely as an optimisation: the
    * phase schedule migrates, renumbers ids collectively and rebuilds the halo,

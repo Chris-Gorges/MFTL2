@@ -188,8 +188,8 @@ static int test_update_reduces_min_and_max_across_ranks(void)
   /* Quality is scale invariant, so every rank measures the same value and the
    * reduction must not perturb it -- a good check that MIN and MAX are not
    * accidentally reading each other's buffer. */
-  ok = ok && fabs(obj->quality.min_aspect_ratio - sqrt(3.0) / 2.0) < 1e-9;
-  ok = ok && fabs(obj->quality.max_aspect_ratio - sqrt(3.0) / 2.0) < 1e-9;
+  ok = ok && fabs(obj->quality.min_mean_ratio - sqrt(3.0) / 2.0) < 1e-9;
+  ok = ok && fabs(obj->quality.max_mean_ratio - sqrt(3.0) / 2.0) < 1e-9;
 
   /* The average must be weighted by the GLOBAL triangle count, not averaged over
    * per-rank averages. Here both give the same answer only because every rank
@@ -250,14 +250,14 @@ static int test_repeated_updates_are_stable(void)
    * or a reused buffer would show up as a hang or as drifting values. */
   MFTLEnsembleUpdate(e);
   const double a0 = obj->quality.avg_triangle_area;
-  const double q0 = obj->quality.min_aspect_ratio;
+  const double q0 = obj->quality.min_mean_ratio;
 
   int ok = 1;
   for (int i = 0; i < 20; ++i)
   {
     MFTLEnsembleUpdate(e);
     if (fabs(obj->quality.avg_triangle_area - a0) > 1e-15) ok = 0;
-    if (fabs(obj->quality.min_aspect_ratio - q0) > 1e-15) ok = 0;
+    if (fabs(obj->quality.min_mean_ratio - q0) > 1e-15) ok = 0;
   }
 
   TEST_ASSERT(agreed(ok, e->domain.comm_world));

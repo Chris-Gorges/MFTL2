@@ -1827,7 +1827,7 @@ static void check_object_lists_agree(const MFTL_Domain *dom, int n_bodies_global
  */
 static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
 {
-  MFTL_ASSERT(MFTL_MPI_PackedVertex != MPI_DATATYPE_NULL && "MFTLRedistribute: call MFTLRegisterMpiTypes() first");
+  MFTL_ASSERT(MFTL_MPI_PackedVertex != MPI_DATATYPE_NULL && "MFTLRedistribute: MPI datatypes not registered (MFTLFreeMpiTypes() while an ensemble is in use?)");
 
   MFTL_Domain *const domain = &ens->domain;
   MFTL_Object **const objects = ens->local_objects;

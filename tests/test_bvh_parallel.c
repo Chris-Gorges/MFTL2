@@ -71,8 +71,8 @@ static void record_contact(const MFTL_BVH *bvhA, int primA, const MFTL_BVH *bvhB
     s->keys = (long long *) realloc(s->keys, (size_t) s->cap * sizeof(long long));
   }
 
-  const long long ga = MFTL_BVHPrimGlobalId(s->bvh_a, primA);
-  const long long gb = MFTL_BVHPrimGlobalId(s->bvh_b, primB);
+  const long long ga = MFTLBVHPrimGlobalId(s->bvh_a, primA);
+  const long long gb = MFTLBVHPrimGlobalId(s->bvh_b, primB);
   s->keys[s->n++] = ga * (1LL << 20) + gb;
 }
 
@@ -172,8 +172,8 @@ static MFTL_SpatialHalo *prepare_pair(MFTL_BVH *ba, MFTL_BVH *bb)
   MFTL_SpatialHalo *const halo = MFTLSpatialHaloCreate(g_ens);
   MFTLSpatialHaloResolveRadii(g_ens, halo);
 
-  MFTL_BVHSetGlobalRadius(ba, MFTLSpatialHaloRadius(halo, 0));
-  MFTL_BVHSetGlobalRadius(bb, MFTLSpatialHaloRadius(halo, 1));
+  MFTLBVHSetGlobalRadius(ba, MFTLSpatialHaloRadius(halo, 0));
+  MFTLBVHSetGlobalRadius(bb, MFTLSpatialHaloRadius(halo, 1));
 
   MFTL_SpatialHaloRequest req;
   req.body_a = 0;
@@ -181,7 +181,7 @@ static MFTL_SpatialHalo *prepare_pair(MFTL_BVH *ba, MFTL_BVH *bb)
   req.margin = MFTL_MAX(ba->tolerance, bb->tolerance);
 
   MFTLExtendSpatialHalo(g_ens, &req, 1, halo);
-  MFTL_BVHSetHalo(bb, MFTLSpatialHaloPatch(halo, 1));
+  MFTLBVHSetHalo(bb, MFTLSpatialHaloPatch(halo, 1));
   return halo;
 }
 
@@ -203,7 +203,7 @@ static MFTL_SpatialHalo *prepare_pair(MFTL_BVH *ba, MFTL_BVH *bb)
  */
 static int test_distributed_contacts_match_the_serial_answer(void)
 {
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 2.0e-2;
   p.proximity_floor = 0.0;
 
@@ -217,18 +217,18 @@ static int test_distributed_contacts_match_the_serial_answer(void)
   long long *ref = MFTL_NULL;
   if (g_rank == 0)
   {
-    MFTL_BVH *const ba = MFTL_GenerateLBVH(a, &p);
-    MFTL_BVH *const bb = MFTL_GenerateLBVH(b, &p);
+    MFTL_BVH *const ba = MFTLGenerateLBVH(a, &p);
+    MFTL_BVH *const bb = MFTLGenerateLBVH(b, &p);
 
     contact_set s = {MFTL_NULL, 0, 0, ba, bb};
-    MFTL_IntersectObjects(a, ba, b, bb, record_contact, &s);
+    MFTLIntersectObjects(a, ba, b, bb, record_contact, &s);
 
     qsort(s.keys, (size_t) s.n, sizeof(long long), cmp_ll);
     ref = s.keys;
     n_ref = s.n;
 
-    MFTL_DestroyBVH(ba);
-    MFTL_DestroyBVH(bb);
+    MFTLDestroyBVH(ba);
+    MFTLDestroyBVH(bb);
   }
   MPI_Bcast(&n_ref, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
@@ -242,8 +242,8 @@ static int test_distributed_contacts_match_the_serial_answer(void)
   b = bodyv(1);
   refresh(g_ens);
 
-  MFTL_BVH *const ba = MFTL_GenerateLBVH(a, &p);
-  MFTL_BVH *const bb = MFTL_GenerateLBVH(b, &p);
+  MFTL_BVH *const ba = MFTLGenerateLBVH(a, &p);
+  MFTL_BVH *const bb = MFTLGenerateLBVH(b, &p);
   MFTL_SpatialHalo *halo = prepare_pair(ba, bb);
 
   /* THE HALO MUST HAVE DONE SOMETHING. Without this the whole test degrades
@@ -262,7 +262,7 @@ static int test_distributed_contacts_match_the_serial_answer(void)
   }
 
   contact_set s = {MFTL_NULL, 0, 0, ba, bb};
-  MFTL_IntersectObjects(a, ba, b, bb, record_contact, &s);
+  MFTLIntersectObjects(a, ba, b, bb, record_contact, &s);
 
   int n_got = 0;
   long long *got = gather_contacts(&s, &n_got);
@@ -294,8 +294,8 @@ static int test_distributed_contacts_match_the_serial_answer(void)
   TEST_ASSERT(agreed(same, MPI_COMM_WORLD));
 
   free(s.keys);
-  MFTL_DestroyBVH(ba);
-  MFTL_DestroyBVH(bb);
+  MFTLDestroyBVH(ba);
+  MFTLDestroyBVH(bb);
   MFTLSpatialHaloDestroy(&halo);
   return 0;
 }
@@ -323,7 +323,7 @@ static int test_distributed_contacts_match_the_serial_answer(void)
  */
 static int test_halo_patch_is_a_valid_object(void)
 {
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 2.0e-2;
   p.proximity_floor = 0.0;
 
@@ -339,8 +339,8 @@ static int test_halo_patch_is_a_valid_object(void)
   b = bodyv(1);
   refresh(g_ens);
 
-  MFTL_BVH *const ba = MFTL_GenerateLBVH(a, &p);
-  MFTL_BVH *const bb = MFTL_GenerateLBVH(b, &p);
+  MFTL_BVH *const ba = MFTLGenerateLBVH(a, &p);
+  MFTL_BVH *const bb = MFTLGenerateLBVH(b, &p);
   MFTL_SpatialHalo *halo = prepare_pair(ba, bb);
 
   const MFTL_Object *const patch = MFTLSpatialHaloPatch(halo, 1);
@@ -387,8 +387,8 @@ static int test_halo_patch_is_a_valid_object(void)
   TEST_ASSERT(agreed(any > 0, MPI_COMM_WORLD));
   TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
 
-  MFTL_DestroyBVH(ba);
-  MFTL_DestroyBVH(bb);
+  MFTLDestroyBVH(ba);
+  MFTLDestroyBVH(bb);
   MFTLSpatialHaloDestroy(&halo);
   return 0;
 }
@@ -408,7 +408,7 @@ static int test_halo_patch_is_a_valid_object(void)
  */
 static int test_tolerance_is_independent_of_the_partition(void)
 {
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 1.0e-2;
   p.proximity_floor = 0.0;
 
@@ -424,8 +424,8 @@ static int test_tolerance_is_independent_of_the_partition(void)
   b = bodyv(1);
   refresh(g_ens);
 
-  MFTL_BVH *const ba = MFTL_GenerateLBVH(a, &p);
-  MFTL_BVH *const bb = MFTL_GenerateLBVH(b, &p);
+  MFTL_BVH *const ba = MFTLGenerateLBVH(a, &p);
+  MFTL_BVH *const bb = MFTLGenerateLBVH(b, &p);
   MFTL_SpatialHalo *halo = prepare_pair(ba, bb);
 
   double lo = 0.0, hi = 0.0;
@@ -437,8 +437,8 @@ static int test_tolerance_is_independent_of_the_partition(void)
   // ...and equal to 1 % of the WHOLE sphere's radius, not of one rank's slice.
   TEST_ASSERT(agreed(fabs(lo - 1.0e-2) < 1.0e-3, MPI_COMM_WORLD));
 
-  MFTL_DestroyBVH(ba);
-  MFTL_DestroyBVH(bb);
+  MFTLDestroyBVH(ba);
+  MFTLDestroyBVH(bb);
   MFTLSpatialHaloDestroy(&halo);
   return 0;
 }
@@ -448,13 +448,13 @@ static int test_tolerance_is_independent_of_the_partition(void)
  *
  * The zero-traffic path through every collective. A rank whose partition holds
  * nothing of either body still has to enter the reduction, the allgather and the
- * exchange -- which is why MFTL_GenerateLBVH returns an empty hierarchy rather
+ * exchange -- which is why MFTLGenerateLBVH returns an empty hierarchy rather
  * than MFTL_NULL, and why the request list is built from the object list rather
  * than from what a rank happens to hold.
  */
 static int test_separated_bodies_are_silent_and_do_not_hang(void)
 {
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 1.0e-3;
   p.proximity_floor = 0.0;
 
@@ -470,12 +470,12 @@ static int test_separated_bodies_are_silent_and_do_not_hang(void)
   b = bodyv(1);
   refresh(g_ens);
 
-  MFTL_BVH *const ba = MFTL_GenerateLBVH(a, &p);
-  MFTL_BVH *const bb = MFTL_GenerateLBVH(b, &p);
+  MFTL_BVH *const ba = MFTLGenerateLBVH(a, &p);
+  MFTL_BVH *const bb = MFTLGenerateLBVH(b, &p);
   MFTL_SpatialHalo *halo = prepare_pair(ba, bb);
 
   contact_set s = {MFTL_NULL, 0, 0, ba, bb};
-  MFTL_IntersectObjects(a, ba, b, bb, record_contact, &s);
+  MFTLIntersectObjects(a, ba, b, bb, record_contact, &s);
   const int hits = s.n;
   free(s.keys);
 
@@ -483,8 +483,8 @@ static int test_separated_bodies_are_silent_and_do_not_hang(void)
   MPI_Allreduce(&hits, &total, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
   TEST_ASSERT(agreed(total == 0, MPI_COMM_WORLD));
 
-  MFTL_DestroyBVH(ba);
-  MFTL_DestroyBVH(bb);
+  MFTLDestroyBVH(ba);
+  MFTLDestroyBVH(bb);
   MFTLSpatialHaloDestroy(&halo);
   return 0;
 }
@@ -499,7 +499,7 @@ static int test_separated_bodies_are_silent_and_do_not_hang(void)
  */
 static int test_ensemble_pipeline_matches_the_explicit_one(void)
 {
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 2.0e-2;
   p.proximity_floor = 0.0;
 
@@ -517,17 +517,17 @@ static int test_ensemble_pipeline_matches_the_explicit_one(void)
 
   int n_explicit = 0;
   {
-    MFTL_BVH *const ba = MFTL_GenerateLBVH(a, &p);
-    MFTL_BVH *const bb = MFTL_GenerateLBVH(b, &p);
+    MFTL_BVH *const ba = MFTLGenerateLBVH(a, &p);
+    MFTL_BVH *const bb = MFTLGenerateLBVH(b, &p);
     MFTL_SpatialHalo *halo = prepare_pair(ba, bb);
 
     contact_set s = {MFTL_NULL, 0, 0, ba, bb};
-    MFTL_IntersectObjects(a, ba, b, bb, record_contact, &s);
+    MFTLIntersectObjects(a, ba, b, bb, record_contact, &s);
     n_explicit = s.n;
     free(s.keys);
 
-    MFTL_DestroyBVH(ba);
-    MFTL_DestroyBVH(bb);
+    MFTLDestroyBVH(ba);
+    MFTLDestroyBVH(bb);
     MFTLSpatialHaloDestroy(&halo);
   }
 
@@ -555,7 +555,7 @@ static int test_ensemble_pipeline_matches_the_explicit_one(void)
  */
 static int test_halo_does_not_touch_the_bodies(void)
 {
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 2.0e-2;
   p.proximity_floor = 0.0;
 
@@ -574,8 +574,8 @@ static int test_halo_does_not_touch_the_bodies(void)
   const int va = a->verts.n, ta = a->tris.n, vla = a->verts.n_local, tla = a->tris.n_local;
   const int vb = b->verts.n, tb = b->tris.n, vlb = b->verts.n_local, tlb = b->tris.n_local;
 
-  MFTL_BVH *const ba = MFTL_GenerateLBVH(a, &p);
-  MFTL_BVH *const bb = MFTL_GenerateLBVH(b, &p);
+  MFTL_BVH *const ba = MFTLGenerateLBVH(a, &p);
+  MFTL_BVH *const bb = MFTLGenerateLBVH(b, &p);
   MFTL_SpatialHalo *halo = prepare_pair(ba, bb);
 
   TEST_ASSERT(agreed(a->verts.n == va && a->tris.n == ta && a->verts.n_local == vla && a->tris.n_local == tla, MPI_COMM_WORLD));
@@ -587,8 +587,8 @@ static int test_halo_does_not_touch_the_bodies(void)
   TEST_ASSERT(agreed(inv_partition_is_sound(a, g_rank), MPI_COMM_WORLD));
   TEST_ASSERT(agreed(inv_partition_is_sound(b, g_rank), MPI_COMM_WORLD));
 
-  MFTL_DestroyBVH(ba);
-  MFTL_DestroyBVH(bb);
+  MFTLDestroyBVH(ba);
+  MFTLDestroyBVH(bb);
   MFTLSpatialHaloDestroy(&halo);
   return 0;
 }
@@ -621,7 +621,7 @@ static int test_a_micron_contact_does_not_overflow_the_broad_phase(void)
   MFTLPublishGeneratedBodies(g_ens);
   MFTLEnsembleComputeTriangleGeometry(g_ens);
 
-  const MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  const MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   int mine = 0, before = 0, after = 0;
   TEST_ASSERT(agreed(MFTLEnsembleIntersectObjects(g_ens, &p, count_only, &mine) == MFTL_SUCCESS, MPI_COMM_WORLD));
   MPI_Allreduce(&mine, &before, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);

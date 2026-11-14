@@ -529,8 +529,8 @@ static int test_the_library_consumers_still_see_the_whole_body(void)
     /* Refine 1 is 80 triangles; every body is one whole sphere. */
     ok = ok && (obj->global_n_triangles == 80);
     ok = ok && (obj->quality.min_triangle_area > 0.0);
-    ok = ok && (obj->quality.max_aspect_ratio <= 1.0 + 1e-12);
-    ok = ok && (obj->quality.min_aspect_ratio > 0.5);
+    ok = ok && (obj->quality.max_mean_ratio <= 1.0 + 1e-12);
+    ok = ok && (obj->quality.min_mean_ratio > 0.5);
   }
 
   MPI_Allreduce(MPI_IN_PLACE, tri_lo, nb, MPI_INT, MPI_MIN, MPI_COMM_WORLD);

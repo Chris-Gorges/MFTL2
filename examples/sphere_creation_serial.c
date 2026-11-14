@@ -129,7 +129,7 @@ int main(int argc, char *argv[])
 
     printf("\nMesh quality (global):\n");
     printf("  triangle area     min %.6e  avg %.6e  max %.6e\n", q->min_triangle_area, q->avg_triangle_area, q->max_triangle_area);
-    printf("  mean-ratio        min %.6f  avg %.6f  max %.6f   (1 = equilateral)\n", q->min_aspect_ratio, q->avg_aspect_ratio, q->max_aspect_ratio);
+    printf("  mean-ratio        min %.6f  avg %.6f  max %.6f   (1 = equilateral)\n", q->min_mean_ratio, q->avg_mean_ratio, q->max_mean_ratio);
     printf("  edge length^2     min %.6e  avg %.6e  max %.6e\n", q->min_edge_length_sq, q->avg_edge_length_sq, q->max_edge_length_sq);
     printf("  total area        %.9f   (exact %.9f, error %.4f %%)\n", q->avg_triangle_area * object->global_n_triangles, exact_area,
            100.0 * (exact_area - q->avg_triangle_area * object->global_n_triangles) / exact_area);

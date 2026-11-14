@@ -24,7 +24,7 @@ On this laptop (see [Machine](#machine)), in short:
 - **OpenACC worked best out of the box.** OpenMP matched it only after the nest was written with the `loop`
   construct ([below](#1-openmp-generic-mode-and-the-loop-construct)).
 
-[Verdict](#verdict-cuda-or-directives) · [The architecture advice, checked](#the-architecture-advice-checked) ·
+[Verdict](#verdict-cuda-or-directives) · [The porting checklist, checked](#the-porting-checklist-checked) ·
 [Pitfalls](#pitfalls-found-on-the-way)
 
 ---
@@ -172,13 +172,14 @@ Lines without comments and blank lines:
 
 ---
 
-## The architecture advice, checked
+## The porting checklist, checked
 
-The advice suggested a central `_Pragma` header, data parked on the device, `restrict` local pointers, routine
-markers, and targeted host–device sync around the remesh with 1.5× capacity headroom. Both examples follow it. A
-few details had to change, and some things that mattered more were missing.
+The examples were built against a porting checklist for directive-based codes: a central `_Pragma` header (A), data
+parked on the device (B), `restrict` local pointers, routine markers and targeted host–device sync around the remesh
+(rules 1–3), with 1.5× capacity headroom. Both examples follow it. This section checks each item against what the
+examples needed: a few details had to change, and some things that mattered more were not on the list.
 
-| Advice | Status | Notes |
+| Checklist item | Status | Notes |
 |---|---|---|
 | A: central `_Pragma` header | **done**, `gpu_pragmas.h` | Variadic, so `reduction(...)` and other clauses pass through. Keyed on `_OPENACC` / `_OPENMP` instead of `USE_*` flags. Adds data macros, `GPU_WAIT` and `default(present)`. |
 | `GPU_PARALLEL_LOOP_3D collapse(3)` | not used | A triangulated front has no 3D index space. `collapse(3)` belongs to the Eulerian grid of an IBM solver. The front needs flat loops (`GPU_LOOP`) and, for many bodies, a two-level nest (`GPU_OUTER` / `GPU_INNER`). |
@@ -192,7 +193,7 @@ few details had to change, and some things that mattered more were missing.
 | 1.5× capacity headroom | **done** where the example allocates | Spheres: slots are 1.5× the bodies held + 64, and staging buffers grow by 1.5×. LeVeque sizes the device arrays by the library pools' own capacity, which already has headroom. |
 | "while only coordinates move, everything stays 100 % on the GPU" | **only on one rank** | With domain decomposition, ghost positions and the redistribution need host data every step, since this MPI is not CUDA-aware. The sphere example therefore moves only the bodies split across ranks, packed into one copy. That is still 2.1 MB/step at np 2. |
 
-**What mattered more than the advice:**
+**What mattered more than the checklist:**
 
 1. **Batching.** A launch costs ~16 µs, a small copy ~30 µs. One kernel per body and phase would cost ~80 ms per
    step for 1000 bodies, against 2.7 ms for the whole step. Hence one launch over all bodies: `GPU_OUTER` over the
@@ -474,7 +475,7 @@ with passive waiting. The CPU baselines therefore use at most 8 threads and 12 r
 ### 7. Launch and copy latency
 
 A launch costs ~16 µs, launch + sync ~35 µs, and any copy ~30 µs. Pageable transfers reach 10–12 GB/s at 64 MB and
-half that at 1 MB. Everything that is per body must be batched (see [above](#the-architecture-advice-checked)).
+half that at 1 MB. Everything that is per body must be batched (see [above](#the-porting-checklist-checked)).
 
 ---
 

@@ -29,8 +29,8 @@
  * gap/L >= 1e-12, up to 0.035 % at 1e-14, 0.125 % at 1e-15 and 4.7 % at 1e-16.
  * The adaptive form costs 3.66 ns against 1.83 ns in general position (40 ns
  * only for exactly coplanar input), i.e. at most 4.5 % of a 244 ns
- * MFTL_TriTriProximity() call. It is kept because the failure it removes is
- * silent; MFTL_Orient3DFast() is the plain form.
+ * MFTLTriTriProximity() call. It is kept because the failure it removes is
+ * silent; MFTLOrient3DFast() is the plain form.
  *
  * Shewchuk's construction (Discrete Comput. Geom. 18, 1997) is a filter: the
  * plain determinant plus a comparison against a rigorous relative error bound,
@@ -49,6 +49,7 @@
 
 #include "mftl_bvh.h"
 
+#include <float.h>
 #include <math.h>
 #include <stddef.h>
 
@@ -64,49 +65,31 @@
  * magnitude and non-overlapping; its exact value is the sum of its parts.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/** @brief Machine constants, computed once by exactinit(). */
-static double mftl_splitter;  ///< 2^ceil(p/2) + 1, splits a double into two halves.
-static double mftl_epsilon;  ///< Half of the last-place unit, 2^-53.
-static double mftl_o3derrbound_a;  ///< Bound for the first (plain determinant) estimate.
-static double mftl_o3derrbound_b;  ///< Bound after the first correction term.
-static double mftl_o3derrbound_c;  ///< Bound after the second correction term.
-static int mftl_predicates_ready = 0;  ///< Set by exactinit(); guards lazy initialisation.
+/* The constants are those Shewchuk's exactinit() measures at run time, written
+ * out for IEEE-754 binary64 with round-to-nearest: the measuring loop ends at
+ * epsilon = 2^-53 with splitter = 2^27 + 1. As compile-time constants they need
+ * no initialisation, so the predicate has no lazily written global and is safe
+ * to call from several threads at once. Every bound below is exact in binary64
+ * (each sum is a multiple of the ulp of its leading term), so the values are the
+ * same bits exactinit() produced. A platform that evaluates double expressions
+ * in extended precision (x87, FLT_EVAL_METHOD 2) breaks the error-free
+ * transformations themselves, and is refused here. */
+MFTL_STATIC_ASSERT(FLT_RADIX == 2 && DBL_MANT_DIG == 53, "MFTLOrient3D's constants assume IEEE-754 binary64");
+#if defined(FLT_EVAL_METHOD) && FLT_EVAL_METHOD > 0
+#error "MFTLOrient3D needs double expressions evaluated in double precision (FLT_EVAL_METHOD 0)"
+#endif
 
-/**
- * @brief Determines the machine's rounding behaviour and the error bounds.
- *
- * Measured rather than assumed: the loop finds the actual epsilon of whatever
- * the compiler and hardware do, so a target with extended-precision registers or
- * a different rounding mode gets bounds that are true for IT. The error bound
- * constants are Shewchuk's, derived for the 3x3 determinant.
- */
-static void exactinit(void)
-{
-  double half = 0.5;
-  double check = 1.0;
-  double lastcheck;
-  int every_other = 1;
+/** @brief Half of the last-place unit of 1.0, \f$2^{-53}\f$. */
+#define MFTL_PRED_EPSILON 0x1p-53
 
-  mftl_epsilon = 1.0;
-  mftl_splitter = 1.0;
-
-  do
-  {
-    lastcheck = check;
-    mftl_epsilon *= half;
-    if (every_other) mftl_splitter *= 2.0;
-    every_other = !every_other;
-    check = 1.0 + mftl_epsilon;
-  } while ((check != 1.0) && (check != lastcheck));
-
-  mftl_splitter += 1.0;
-
-  mftl_o3derrbound_a = (7.0 + 56.0 * mftl_epsilon) * mftl_epsilon;
-  mftl_o3derrbound_b = (3.0 + 28.0 * mftl_epsilon) * mftl_epsilon;
-  mftl_o3derrbound_c = (26.0 + 288.0 * mftl_epsilon) * mftl_epsilon * mftl_epsilon;
-
-  mftl_predicates_ready = 1;
-}
+/** @brief \f$2^{\lceil p/2\rceil} + 1 = 2^{27} + 1\f$: splits a double into two non-overlapping halves. */
+static const double mftl_splitter = 0x1p27 + 1.0;
+/** @brief Bound for the first (plain determinant) estimate, \f$(7 + 56\varepsilon)\varepsilon\f$. */
+static const double mftl_o3derrbound_a = (7.0 + 56.0 * MFTL_PRED_EPSILON) * MFTL_PRED_EPSILON;
+/** @brief Bound after the first correction term, \f$(3 + 28\varepsilon)\varepsilon\f$. */
+static const double mftl_o3derrbound_b = (3.0 + 28.0 * MFTL_PRED_EPSILON) * MFTL_PRED_EPSILON;
+/** @brief Bound after the second correction term, \f$(26 + 288\varepsilon)\varepsilon^2\f$. */
+static const double mftl_o3derrbound_c = (26.0 + 288.0 * MFTL_PRED_EPSILON) * MFTL_PRED_EPSILON * MFTL_PRED_EPSILON;
 
 /**
  * @brief Splits @p a into two non-overlapping halves.
@@ -377,7 +360,7 @@ static double estimate(int elen, const double *e)
  * 2. The orientation predicate
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-double MFTL_Orient3DFast(const double pa[3], const double pb[3], const double pc[3], const double pd[3])
+double MFTLOrient3DFast(const double pa[3], const double pb[3], const double pc[3], const double pd[3])
 {
   const double adx = pa[0] - pd[0], bdx = pb[0] - pd[0], cdx = pc[0] - pd[0];
   const double ady = pa[1] - pd[1], bdy = pb[1] - pd[1], cdy = pc[1] - pd[1];
@@ -728,10 +711,8 @@ static double orient3dadapt(const double pa[3], const double pb[3], const double
   return finnow[finlength - 1];
 }
 
-double MFTL_Orient3D(const double pa[3], const double pb[3], const double pc[3], const double pd[3])
+double MFTLOrient3D(const double pa[3], const double pb[3], const double pc[3], const double pd[3])
 {
-  if (!mftl_predicates_ready) exactinit();
-
   const double adx = pa[0] - pd[0], bdx = pb[0] - pd[0], cdx = pc[0] - pd[0];
   const double ady = pa[1] - pd[1], bdy = pb[1] - pd[1], cdy = pc[1] - pd[1];
   const double adz = pa[2] - pd[2], bdz = pb[2] - pd[2], cdz = pc[2] - pd[2];
@@ -757,7 +738,7 @@ double MFTL_Orient3D(const double pa[3], const double pb[3], const double pc[3],
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 3. Guigue-Devillers triangle-triangle intersection (J. Graphics Tools 8(1),
- * 2003), with every branch taken on an exact MFTL_Orient3D sign. The
+ * 2003), with every branch taken on an exact MFTLOrient3D sign. The
  * permutations normalise both WHICH vertex is isolated and the ORIENTATION of
  * the second triangle. Guigue-Devillers assumes two proper triangles in
  * distinct planes; every other configuration -- coplanar, or a zero-area
@@ -782,8 +763,8 @@ double MFTL_Orient3D(const double pa[3], const double pb[3], const double pc[3],
  */
 static int check_min_max(const double *p1, const double *q1, const double *r1, const double *p2, const double *q2, const double *r2)
 {
-  if (MFTL_Orient3D(q2, p2, p1, q1) > 0.0) return 0;
-  if (MFTL_Orient3D(r2, p2, r1, p1) > 0.0) return 0;
+  if (MFTLOrient3D(q2, p2, p1, q1) > 0.0) return 0;
+  if (MFTLOrient3D(r2, p2, r1, p1) > 0.0) return 0;
   return 1;
 }
 
@@ -792,7 +773,7 @@ static int check_min_max(const double *p1, const double *q1, const double *r1, c
  *        against A's plane, then run the terminal test.
  *
  * Never reached with all three of @p dp2, @p dq2, @p dr2 zero: that pair is
- * flat (B in A's plane, or A of zero area) and MFTL_TriTriIntersect() has
+ * flat (B in A's plane, or A of zero area) and MFTLTriTriIntersect() has
  * already answered it.
  *
  * @param p1     First triangle's first corner.
@@ -855,7 +836,7 @@ static inline int same_strict_sign(double a, double b, double c) { return (a > 0
 /* Section 4: a pair Guigue-Devillers cannot take. */
 static int tri_tri_flat(const double A[3][3], const double B[3][3], int a_in_plane_of_b, int b_in_plane_of_a);
 
-int MFTL_TriTriIntersect(const double A[3][3], const double B[3][3])
+int MFTLTriTriIntersect(const double A[3][3], const double B[3][3])
 {
   const double *p1 = A[0], *q1 = A[1], *r1 = A[2];
   const double *p2 = B[0], *q2 = B[1], *r2 = B[2];
@@ -865,14 +846,14 @@ int MFTL_TriTriIntersect(const double A[3][3], const double B[3][3])
    * is an odd permutation of the four arguments and negates every sign, which
    * the early-outs survive but the dispatch does not
    * (test_tri_tri_intersect_basic_cases). */
-  const double dp1 = MFTL_Orient3D(p1, p2, q2, r2);
-  const double dq1 = MFTL_Orient3D(q1, p2, q2, r2);
-  const double dr1 = MFTL_Orient3D(r1, p2, q2, r2);
+  const double dp1 = MFTLOrient3D(p1, p2, q2, r2);
+  const double dq1 = MFTLOrient3D(q1, p2, q2, r2);
+  const double dr1 = MFTLOrient3D(r1, p2, q2, r2);
   if (same_strict_sign(dp1, dq1, dr1)) return 0;
 
-  const double dp2 = MFTL_Orient3D(p2, p1, q1, r1);
-  const double dq2 = MFTL_Orient3D(q2, p1, q1, r1);
-  const double dr2 = MFTL_Orient3D(r2, p1, q1, r1);
+  const double dp2 = MFTLOrient3D(p2, p1, q1, r1);
+  const double dq2 = MFTLOrient3D(q2, p1, q1, r1);
+  const double dr2 = MFTLOrient3D(r2, p1, q1, r1);
   if (same_strict_sign(dp2, dq2, dr2)) return 0;
 
   /* Three exact zeros: A lies in B's plane, or B has zero area (every point is
@@ -910,7 +891,7 @@ int MFTL_TriTriIntersect(const double A[3][3], const double B[3][3])
   }
 
   if (dr1 > 0.0) return tri_tri_3d(r1, p1, q1, p2, q2, r2, dp2, dq2, dr2);
-  MFTL_ASSERT(dr1 < 0.0 && "MFTL_TriTriIntersect: a flat pair reached the dispatch");
+  MFTL_ASSERT(dr1 < 0.0 && "MFTLTriTriIntersect: a flat pair reached the dispatch");
   return tri_tri_3d(r1, p1, q1, p2, r2, q2, dp2, dr2, dq2);
 }
 
@@ -918,7 +899,7 @@ int MFTL_TriTriIntersect(const double A[3][3], const double B[3][3])
  * 4. Flat pairs: coplanar triangles, and triangles of zero area.
  *
  * Every decision is an exact sign. In 2D that is orient2d on the projected
- * points, evaluated as MFTL_Orient3D of the points lifted to z = 0 against a
+ * points, evaluated as MFTLOrient3D of the points lifted to z = 0 against a
  * point at z = 1 -- the lifted determinant IS -orient2d, so its sign is exact
  * and no second adaptive predicate is needed. A plain 2D determinant reported
  * two disjoint coplanar triangles as touching when a small orientation rounded
@@ -945,7 +926,7 @@ static double orient2d(const double a[2], const double b[2], const double c[2])
 {
   const double pa[3] = {a[0], a[1], 0.0}, pb[3] = {b[0], b[1], 0.0}, pc[3] = {c[0], c[1], 0.0};
   const double pd[3] = {c[0], c[1], 1.0};
-  return -MFTL_Orient3D(pa, pb, pc, pd);
+  return -MFTLOrient3D(pa, pb, pc, pd);
 }
 
 /**
@@ -1154,7 +1135,7 @@ static int segment_meets_triangle(const double s0[3], const double s1[3], const 
   int pos = 0, neg = 0;
   for (int i = 0; i < 3; ++i)
   {
-    const double o = MFTL_Orient3D(T[i], T[(i + 1) % 3], s1, s0);
+    const double o = MFTLOrient3D(T[i], T[(i + 1) % 3], s1, s0);
     pos |= (o > 0.0);
     neg |= (o < 0.0);
   }
@@ -1188,7 +1169,7 @@ static int tri_tri_flat(const double A[3][3], const double B[3][3], int a_in_pla
     int a0, a1, b0, b1;
     hull_ends(A, &a0, &a1);
     hull_ends(B, &b0, &b1);
-    if (MFTL_Orient3D(A[a0], A[a1], B[b0], B[b1]) != 0.0) return 0;
+    if (MFTLOrient3D(A[a0], A[a1], B[b0], B[b1]) != 0.0) return 0;
     return coplanar_tri_tri(A, B);
   }
 
@@ -1214,18 +1195,18 @@ static int tri_tri_flat(const double A[3][3], const double B[3][3], int a_in_pla
  * every angle and aspect ratio (src/geometry/README.md, "Closest points").
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-double MFTL_TriTriDistanceSq(const double A[3][3], const double B[3][3])
+double MFTLTriTriDistanceSq(const double A[3][3], const double B[3][3])
 {
   /* An edge piercing the other face has positive distance to every edge and
    * vertex, so only the intersection predicate sees it: it runs first. */
-  if (MFTL_TriTriIntersect(A, B)) return 0.0;
+  if (MFTLTriTriIntersect(A, B)) return 0.0;
   double pa[3], pb[3];
   return MFTLClosestPointsBetweenTriangles(A, B, pa, pb);
 }
 
-int MFTL_TriTriProximity(const double A[3][3], const double B[3][3], double tolerance)
+int MFTLTriTriProximity(const double A[3][3], const double B[3][3], double tolerance)
 {
-  if (MFTL_TriTriIntersect(A, B)) return 1;
+  if (MFTLTriTriIntersect(A, B)) return 1;
   if (tolerance <= 0.0) return 0;
   double pa[3], pb[3];
   return (MFTLClosestPointsBetweenTriangles(A, B, pa, pb) <= tolerance * tolerance) ? 1 : 0;

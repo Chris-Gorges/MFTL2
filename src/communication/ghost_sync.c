@@ -126,7 +126,7 @@ static void answer_object_requests(const MFTL_Object *obj, ghost_field field, co
 static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
 {
   if (ens == MFTL_NULL || ens->local_objects == MFTL_NULL) return MFTL_ERROR;
-  MFTL_ASSERT(MFTL_MPI_GhostUpdatePayload != MPI_DATATYPE_NULL && "ghost sync: call MFTLRegisterMpiTypes() first");
+  MFTL_ASSERT(MFTL_MPI_GhostUpdatePayload != MPI_DATATYPE_NULL && "ghost sync: MPI datatypes not registered (MFTLFreeMpiTypes() while an ensemble is in use?)");
 
   MFTL_Domain *const domain = &ens->domain;
   MFTL_Object *const *const objects = ens->local_objects;

@@ -401,7 +401,7 @@ const MFTL_SettingSection *MFTLSettingsSection(int i);
  * @brief Fills @p s with the default of every key.
  *
  * Module blocks start from their module's own defaults (MFTLInitRemeshParams(),
- * MFTLTopologyDefaultOptions(), MFTL_BVHDefaultParams(), MFTLVtkDefaults()) and
+ * MFTLTopologyDefaultOptions(), MFTLBVHDefaultParams(), MFTLVtkDefaults()) and
  * every key is then set from its table default. Two defaults differ from the
  * module's on purpose, because a settings file describes a SIMULATION rather
  * than one call: `remesh.parallel_phase_budget` is 4, the measured best in a

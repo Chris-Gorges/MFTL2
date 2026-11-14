@@ -968,6 +968,23 @@ void MFTLRemeshMeasurementFree(MFTL_RemeshMeasurement *m);
 MFTL_RemeshParallelStrategy MFTLRemeshChooseStrategyMeasured(MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshMeasurement *m);
 
 /**
+ * @brief The NULL-argument refusal of the public ensemble entry points.
+ *
+ * There is no default parameter block (the target edge length is the
+ * caller's), so a NULL @p params is refused rather than replaced. No
+ * communication: a NULL that is the same on every rank -- the realistic
+ * mistake -- makes every rank return, and rank 0 names the cause.
+ *
+ * @param      ens    The ensemble argument.
+ * @param      params The parameter block argument.
+ * @param[out] stats  Zeroed on refusal; may be #MFTL_NULL.
+ * @param      caller Entry-point name for the diagnostic.
+ * @return true if the call must return #MFTL_ERROR.
+ * @rank_local
+ */
+bool MFTLRemeshRefuseNullArguments(const MFTL_Ensemble *ens, const MFTL_RemeshParameters *params, MFTL_RemeshStats *stats, const char *caller);
+
+/**
  * @brief MFTLRemeshEnsembleParallel(), with the parameter check optional.
  *
  * The check (MFTLRemeshAgreeParams()) is taken at the pass's first collective,

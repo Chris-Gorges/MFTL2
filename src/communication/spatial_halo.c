@@ -1131,7 +1131,8 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
   const int nb = ens->n_local_objects;
   if (near) halo->n_pairs = 0;
 
-  MFTL_ASSERT(MFTL_MPI_PackedVertex != MPI_DATATYPE_NULL && "MFTLExtendSpatialHalo: call MFTLRegisterMpiTypes() first");
+  MFTL_ASSERT(MFTL_MPI_PackedVertex != MPI_DATATYPE_NULL &&
+              "MFTLExtendSpatialHalo: MPI datatypes not registered (MFTLFreeMpiTypes() while an ensemble is in use?)");
 
   /* ── 0. One record per held body with an owned share, ascending by id (so a
    * neighbour's block can be binary-searched). */

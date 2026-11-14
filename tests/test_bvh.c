@@ -99,7 +99,7 @@ static MFTL_Object *make_sphere(MFTL_Ensemble *ens, double cx, double cy, double
 /** @brief Params with an explicit factor and no floor. */
 static MFTL_BVHBuildParams params_with(double factor)
 {
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = factor;
   p.proximity_floor = 0.0;
   return p;
@@ -117,15 +117,15 @@ static void brute_force_pairs(MFTL_BVH *bvhA, MFTL_BVH *bvhB, double tolerance, 
 {
   for (int i = 0; i < bvhA->n_prims; ++i)
   {
-    if (!MFTL_BVHPrimIsLocal(bvhA, i)) continue;
+    if (!MFTLBVHPrimIsLocal(bvhA, i)) continue;
     double TA[3][3];
-    MFTL_BVHPrimVerts(bvhA, i, TA);
+    MFTLBVHPrimVerts(bvhA, i, TA);
 
     for (int j = 0; j < bvhB->n_prims; ++j)
     {
       double TB[3][3];
-      MFTL_BVHPrimVerts(bvhB, j, TB);
-      if (MFTL_TriTriProximity(TA, TB, tolerance)) log_pair(MFTL_NULL, i, MFTL_NULL, j, out);
+      MFTLBVHPrimVerts(bvhB, j, TB);
+      if (MFTLTriTriProximity(TA, TB, tolerance)) log_pair(MFTL_NULL, i, MFTL_NULL, j, out);
     }
   }
 }
@@ -142,11 +142,11 @@ static int test_orient3d_sign_on_an_obvious_tetrahedron(void)
   const double above[3] = {0.0, 0.0, 1.0};
   const double below[3] = {0.0, 0.0, -1.0};
 
-  TEST_ASSERT(MFTL_Orient3D(a, b, c, above) * MFTL_Orient3D(a, b, c, below) < 0.0);
-  TEST_ASSERT_EQUAL_DOUBLE(0.0, MFTL_Orient3D(a, b, c, a), 0.0);
+  TEST_ASSERT(MFTLOrient3D(a, b, c, above) * MFTLOrient3D(a, b, c, below) < 0.0);
+  TEST_ASSERT_EQUAL_DOUBLE(0.0, MFTLOrient3D(a, b, c, a), 0.0);
 
   // The adaptive and plain forms must agree wherever the plain one is reliable.
-  TEST_ASSERT((MFTL_Orient3D(a, b, c, above) > 0.0) == (MFTL_Orient3DFast(a, b, c, above) > 0.0));
+  TEST_ASSERT((MFTLOrient3D(a, b, c, above) > 0.0) == (MFTLOrient3DFast(a, b, c, above) > 0.0));
   return 0;
 }
 
@@ -170,7 +170,7 @@ static int test_orient3d_is_exact_for_translated_coplanar_points(void)
   const double c[3] = {off + 0.9, off + 0.2, off};
   const double d[3] = {off + 0.5, off + 0.4, off};  // same plane z = off
 
-  TEST_ASSERT_EQUAL_DOUBLE(0.0, MFTL_Orient3D(a, b, c, d), 0.0);
+  TEST_ASSERT_EQUAL_DOUBLE(0.0, MFTLOrient3D(a, b, c, d), 0.0);
   return 0;
 }
 
@@ -208,7 +208,7 @@ static int test_orient3d_is_exactly_antisymmetric(void)
   const double c[3] = {0.5, 1.7, 0.29999999999999993};
   const double d[3] = {0.7, 0.9, 0.30000000000000010};
 
-  const double base = MFTL_Orient3D(a, b, c, d);
+  const double base = MFTLOrient3D(a, b, c, d);
   TEST_ASSERT(base != 0.0);  // otherwise every assertion below is vacuous
 
   /* ── What "exactly" applies to ────────────────────────────────────────────
@@ -226,17 +226,17 @@ static int test_orient3d_is_exactly_antisymmetric(void)
 #define SIGN_OF(x) (((x) > 0.0) - ((x) < 0.0))
 
   // One transposition -> the negated sign.
-  TEST_ASSERT_EQUAL_INT(-SIGN_OF(base), SIGN_OF(MFTL_Orient3D(b, a, c, d)));
-  TEST_ASSERT_EQUAL_INT(-SIGN_OF(base), SIGN_OF(MFTL_Orient3D(a, c, b, d)));
-  TEST_ASSERT_EQUAL_INT(-SIGN_OF(base), SIGN_OF(MFTL_Orient3D(d, b, c, a)));
+  TEST_ASSERT_EQUAL_INT(-SIGN_OF(base), SIGN_OF(MFTLOrient3D(b, a, c, d)));
+  TEST_ASSERT_EQUAL_INT(-SIGN_OF(base), SIGN_OF(MFTLOrient3D(a, c, b, d)));
+  TEST_ASSERT_EQUAL_INT(-SIGN_OF(base), SIGN_OF(MFTLOrient3D(d, b, c, a)));
 
   // Two transpositions -> the original sign.
-  TEST_ASSERT_EQUAL_INT(SIGN_OF(base), SIGN_OF(MFTL_Orient3D(b, a, d, c)));
-  TEST_ASSERT_EQUAL_INT(SIGN_OF(base), SIGN_OF(MFTL_Orient3D(c, d, a, b)));
+  TEST_ASSERT_EQUAL_INT(SIGN_OF(base), SIGN_OF(MFTLOrient3D(b, a, d, c)));
+  TEST_ASSERT_EQUAL_INT(SIGN_OF(base), SIGN_OF(MFTLOrient3D(c, d, a, b)));
 
   // The magnitudes still have to agree to within rounding.
-  TEST_ASSERT_EQUAL_DOUBLE(-base, MFTL_Orient3D(b, a, c, d), fabs(base) * 1e-12);
-  TEST_ASSERT_EQUAL_DOUBLE(base, MFTL_Orient3D(c, d, a, b), fabs(base) * 1e-12);
+  TEST_ASSERT_EQUAL_DOUBLE(-base, MFTLOrient3D(b, a, c, d), fabs(base) * 1e-12);
+  TEST_ASSERT_EQUAL_DOUBLE(base, MFTLOrient3D(c, d, a, b), fabs(base) * 1e-12);
 
 #undef SIGN_OF
 
@@ -251,7 +251,7 @@ static int test_orient3d_is_exactly_antisymmetric(void)
     c2[k] = c[k] * 4.0;
     d2[k] = d[k] * 4.0;
   }
-  const double scaled = MFTL_Orient3D(a2, b2, c2, d2);
+  const double scaled = MFTLOrient3D(a2, b2, c2, d2);
   TEST_ASSERT_EQUAL_DOUBLE(base * 64.0, scaled, fabs(base) * 64.0 * 1e-14);
 
   return 0;
@@ -267,21 +267,21 @@ static int test_tri_tri_intersect_basic_cases(void)
 
   // A triangle standing on the first one, piercing its interior.
   const double crossing[3][3] = {{0.25, 0.25, -1.0}, {0.25, 0.25, 1.0}, {0.9, 0.9, 0.0}};
-  TEST_ASSERT_EQUAL_INT(1, MFTL_TriTriIntersect(flat, crossing));
+  TEST_ASSERT_EQUAL_INT(1, MFTLTriTriIntersect(flat, crossing));
 
   // The same triangle lifted clear of the plane.
   const double lifted[3][3] = {{0.25, 0.25, 1.0}, {0.25, 0.25, 3.0}, {0.9, 0.9, 2.0}};
-  TEST_ASSERT_EQUAL_INT(0, MFTL_TriTriIntersect(flat, lifted));
+  TEST_ASSERT_EQUAL_INT(0, MFTLTriTriIntersect(flat, lifted));
 
   // Coplanar and overlapping.
   const double copl_hit[3][3] = {{0.2, 0.2, 0.0}, {0.8, 0.2, 0.0}, {0.2, 0.8, 0.0}};
-  TEST_ASSERT_EQUAL_INT(1, MFTL_TriTriIntersect(flat, copl_hit));
+  TEST_ASSERT_EQUAL_INT(1, MFTLTriTriIntersect(flat, copl_hit));
 
   /* Coplanar and disjoint. A coplanar branch that returns 1 UNCONDITIONALLY --
    * the shape it takes when the real test is left as a comment -- reports contact
    * for two triangles in the same plane a metre apart. */
   const double copl_miss[3][3] = {{5.0, 5.0, 0.0}, {6.0, 5.0, 0.0}, {5.0, 6.0, 0.0}};
-  TEST_ASSERT_EQUAL_INT(0, MFTL_TriTriIntersect(flat, copl_miss));
+  TEST_ASSERT_EQUAL_INT(0, MFTLTriTriIntersect(flat, copl_miss));
 
   return 0;
 }
@@ -293,16 +293,16 @@ static int test_tri_tri_distance_is_exact(void)
   // Directly above the interior: the distance is the height, found by the
   // point-face branch.
   const double above[3][3] = {{0.2, 0.2, 0.5}, {0.3, 0.2, 0.5}, {0.2, 0.3, 0.5}};
-  TEST_ASSERT_EQUAL_DOUBLE(0.25, MFTL_TriTriDistanceSq(flat, above), 1e-15);
+  TEST_ASSERT_EQUAL_DOUBLE(0.25, MFTLTriTriDistanceSq(flat, above), 1e-15);
 
   // Intersecting triangles are at distance zero, which the fifteen sub-tests
   // cannot see on their own -- only the predicate can.
   const double crossing[3][3] = {{0.25, 0.25, -1.0}, {0.25, 0.25, 1.0}, {0.9, 0.9, 0.0}};
-  TEST_ASSERT_EQUAL_DOUBLE(0.0, MFTL_TriTriDistanceSq(flat, crossing), 0.0);
+  TEST_ASSERT_EQUAL_DOUBLE(0.0, MFTLTriTriDistanceSq(flat, crossing), 0.0);
 
   // Proximity is the distance test plus a tolerance, and must be monotone in it.
-  TEST_ASSERT_EQUAL_INT(0, MFTL_TriTriProximity(flat, above, 0.4));
-  TEST_ASSERT_EQUAL_INT(1, MFTL_TriTriProximity(flat, above, 0.6));
+  TEST_ASSERT_EQUAL_INT(0, MFTLTriTriProximity(flat, above, 0.4));
+  TEST_ASSERT_EQUAL_INT(1, MFTLTriTriProximity(flat, above, 0.6));
   return 0;
 }
 
@@ -323,7 +323,7 @@ static int test_point_face_distance_works_at_millimetre_scale(void)
   const double gap = 0.2 * s;
   const double above[3][3] = {{0.2 * s, 0.2 * s, gap}, {0.3 * s, 0.2 * s, gap}, {0.2 * s, 0.3 * s, gap}};
 
-  const double d_sq = MFTL_TriTriDistanceSq(flat, above);
+  const double d_sq = MFTLTriTriDistanceSq(flat, above);
   TEST_ASSERT_EQUAL_DOUBLE(gap * gap, d_sq, gap * gap * 1e-9);
 
   /* And the same shape scaled up by 1e5 must give the same RELATIVE answer --
@@ -333,8 +333,8 @@ static int test_point_face_distance_works_at_millimetre_scale(void)
   const double gapS = 0.2 * S;
   const double aboveS[3][3] = {{0.2 * S, 0.2 * S, gapS}, {0.3 * S, 0.2 * S, gapS}, {0.2 * S, 0.3 * S, gapS}};
 
-  const double rel_small = MFTL_TriTriDistanceSq(flat, above) / (s * s);
-  const double rel_big = MFTL_TriTriDistanceSq(flatS, aboveS) / (S * S);
+  const double rel_small = MFTLTriTriDistanceSq(flat, above) / (s * s);
+  const double rel_big = MFTLTriTriDistanceSq(flatS, aboveS) / (S * S);
   TEST_ASSERT_EQUAL_DOUBLE(rel_big, rel_small, 1e-9);
   return 0;
 }
@@ -359,10 +359,10 @@ static int test_nearly_parallel_edges_are_in_contact(void)
       const double gap = gaps[g], a = pow(10.0, -k);
       const double A[3][3] = {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, {0.5, 0.0, -1.0}};
       const double B[3][3] = {{0.0, -a, gap}, {1.0, a, gap}, {0.5, 0.0, 1.0}};
-      TEST_ASSERT_EQUAL_INT(0, MFTL_TriTriIntersect(A, B));
-      TEST_ASSERT_EQUAL_DOUBLE(gap, sqrt(MFTL_TriTriDistanceSq(A, B)), 8.0 * DBL_EPSILON);
-      TEST_ASSERT_EQUAL_INT(1, MFTL_TriTriProximity(A, B, gap * (1.0 + 1e-3)));
-      TEST_ASSERT_EQUAL_INT(0, MFTL_TriTriProximity(A, B, gap * (1.0 - 1e-3)));
+      TEST_ASSERT_EQUAL_INT(0, MFTLTriTriIntersect(A, B));
+      TEST_ASSERT_EQUAL_DOUBLE(gap, sqrt(MFTLTriTriDistanceSq(A, B)), 8.0 * DBL_EPSILON);
+      TEST_ASSERT_EQUAL_INT(1, MFTLTriTriProximity(A, B, gap * (1.0 + 1e-3)));
+      TEST_ASSERT_EQUAL_INT(0, MFTLTriTriProximity(A, B, gap * (1.0 - 1e-3)));
     }
   return 0;
 }
@@ -439,13 +439,13 @@ static int test_coplanar_triangles_are_decided_exactly(void)
         A[c][axis] = 0.0, A[c][(axis + 1) % 3] = a2[c][0], A[c][(axis + 2) % 3] = a2[c][1];
         B[c][axis] = 0.0, B[c][(axis + 1) % 3] = b2[c][0], B[c][(axis + 2) % 3] = b2[c][1];
       }
-      TEST_ASSERT_EQUAL_INT((r == 0.0) ? 1 : 0, MFTL_TriTriIntersect(A, B));
-      TEST_ASSERT_EQUAL_INT((r == 0.0) ? 1 : 0, MFTL_TriTriIntersect(B, A));
+      TEST_ASSERT_EQUAL_INT((r == 0.0) ? 1 : 0, MFTLTriTriIntersect(A, B));
+      TEST_ASSERT_EQUAL_INT((r == 0.0) ? 1 : 0, MFTLTriTriIntersect(B, A));
       /* The gap, |r| / |(3,1)|, is below the coordinates' rounding: the distance
        * is that to rounding (it may be 0); the contact verdict at zero tolerance
        * is the exact predicate's. */
-      TEST_ASSERT(sqrt(MFTL_TriTriDistanceSq(A, B)) <= fabs(r) + 16.0 * DBL_EPSILON);
-      TEST_ASSERT_EQUAL_INT((r == 0.0) ? 1 : 0, MFTL_TriTriProximity(A, B, 0.0));
+      TEST_ASSERT(sqrt(MFTLTriTriDistanceSq(A, B)) <= fabs(r) + 16.0 * DBL_EPSILON);
+      TEST_ASSERT_EQUAL_INT((r == 0.0) ? 1 : 0, MFTLTriTriProximity(A, B, 0.0));
     }
   }
   printf("[%d corners off the edge, %d on it] ", n_off, n_on);
@@ -478,8 +478,8 @@ static int test_coplanar_triangles_are_decided_exactly(void)
       const double pb[3] = {(double) Q[c][0], (double) Q[c][1], (double) (Q[c][0] + 2 * Q[c][1])};
       for (int k = 0; k < 3; ++k) A[c][(k + perm) % 3] = pa[k], B[c][(k + perm) % 3] = pb[k];
     }
-    TEST_ASSERT_EQUAL_INT(expect, MFTL_TriTriIntersect(A, B));
-    TEST_ASSERT_EQUAL_INT(expect, MFTL_TriTriIntersect(B, A));
+    TEST_ASSERT_EQUAL_INT(expect, MFTLTriTriIntersect(A, B));
+    TEST_ASSERT_EQUAL_INT(expect, MFTLTriTriIntersect(B, A));
   }
   printf("[%d integer pairs meet, %d do not] ", n_hit, n_miss);
   TEST_ASSERT(n_hit > 2000 && n_miss > 2000);
@@ -539,9 +539,9 @@ static int test_zero_area_triangles_are_segments(void)
   };
   for (size_t i = 0; i < sizeof cases / sizeof cases[0]; ++i)
   {
-    TEST_ASSERT_EQUAL_INT(cases[i].hit, MFTL_TriTriIntersect(cases[i].a, cases[i].b));
-    TEST_ASSERT_EQUAL_INT(cases[i].hit, MFTL_TriTriIntersect(cases[i].b, cases[i].a));
-    if (!cases[i].hit) TEST_ASSERT_EQUAL_DOUBLE(cases[i].dist_sq, MFTL_TriTriDistanceSq(cases[i].a, cases[i].b), 1e-14);
+    TEST_ASSERT_EQUAL_INT(cases[i].hit, MFTLTriTriIntersect(cases[i].a, cases[i].b));
+    TEST_ASSERT_EQUAL_INT(cases[i].hit, MFTLTriTriIntersect(cases[i].b, cases[i].a));
+    if (!cases[i].hit) TEST_ASSERT_EQUAL_DOUBLE(cases[i].dist_sq, MFTLTriTriDistanceSq(cases[i].a, cases[i].b), 1e-14);
   }
 
   /* Integer segments through X = a A + b B + c C (weights summing to S) of the
@@ -579,8 +579,8 @@ static int test_zero_area_triangles_are_segments(void)
     }
     const int expect = (w[0] >= 0 && w[1] >= 0 && w[2] >= 0);
     (!expect) ? n_out++ : (w[0] == 0 || w[1] == 0 || w[2] == 0) ? n_on++ : n_in++;
-    TEST_ASSERT_EQUAL_INT(expect, MFTL_TriTriIntersect(Sg, A));
-    TEST_ASSERT_EQUAL_INT(expect, MFTL_TriTriIntersect(A, Sg));
+    TEST_ASSERT_EQUAL_INT(expect, MFTLTriTriIntersect(Sg, A));
+    TEST_ASSERT_EQUAL_INT(expect, MFTLTriTriIntersect(A, Sg));
   }
   printf("[segments through the inside %d, the boundary %d, outside %d] ", n_in, n_on, n_out);
   TEST_ASSERT(n_in > 1000 && n_on > 1000 && n_out > 1000);
@@ -595,7 +595,7 @@ static int test_build_produces_a_sound_tree(void)
 {
   MFTL_Object *const obj = make_sphere(g_open, 0.0, 0.0, 0.0, 1.0, 2);
   MFTL_BVHBuildParams p = params_with(1e-3);
-  MFTL_BVH *const bvh = MFTL_GenerateLBVH(obj, &p);
+  MFTL_BVH *const bvh = MFTLGenerateLBVH(obj, &p);
 
   TEST_ASSERT(bvh != MFTL_NULL);
   TEST_ASSERT_EQUAL_INT(obj->tris.n_local, bvh->n_prims);
@@ -608,15 +608,15 @@ static int test_build_produces_a_sound_tree(void)
   for (int i = 0; i < bvh->nodes_used; ++i)
   {
     const MFTL_BVHNode *const n = &bvh->nodes[i];
-    if (!MFTL_BVHNodeIsLeaf(n))
+    if (!MFTLBVHNodeIsLeaf(n))
     {
       // Children live above their parent -- what the reverse-scan refit needs.
-      TEST_ASSERT(MFTL_BVHLeftChild(n) > i);
-      TEST_ASSERT(MFTL_BVHLeftChild(n) + 1 < bvh->nodes_used);
+      TEST_ASSERT(MFTLBVHLeftChild(n) > i);
+      TEST_ASSERT(MFTLBVHLeftChild(n) + 1 < bvh->nodes_used);
       continue;
     }
-    const int first = MFTL_BVHLeafFirst(n);
-    const int count = MFTL_BVHLeafCount(n);
+    const int first = MFTLBVHLeafFirst(n);
+    const int count = MFTLBVHLeafCount(n);
     TEST_ASSERT(count > 0 && count <= bvh->params.leaf_size);
     for (int s = 0; s < count; ++s) seen[bvh->prim_indices[first + s]]++;
     leaf_total += count;
@@ -630,12 +630,12 @@ static int test_build_produces_a_sound_tree(void)
   for (int i = 0; i < bvh->nodes_used; ++i)
   {
     const MFTL_BVHNode *const n = &bvh->nodes[i];
-    if (!MFTL_BVHNodeIsLeaf(n)) continue;
-    const int first = MFTL_BVHLeafFirst(n);
-    for (int s = 0; s < MFTL_BVHLeafCount(n); ++s)
+    if (!MFTLBVHNodeIsLeaf(n)) continue;
+    const int first = MFTLBVHLeafFirst(n);
+    for (int s = 0; s < MFTLBVHLeafCount(n); ++s)
     {
       double tri[3][3];
-      MFTL_BVHPrimVerts(bvh, bvh->prim_indices[first + s], tri);
+      MFTLBVHPrimVerts(bvh, bvh->prim_indices[first + s], tri);
       for (int c = 0; c < 3; ++c)
       {
         for (int k = 0; k < 3; ++k)
@@ -650,7 +650,7 @@ static int test_build_produces_a_sound_tree(void)
   // The root must bound the sphere, inflated by the envelope.
   TEST_ASSERT_EQUAL_DOUBLE(1.0, bvh->bounding_radius, 0.05);
 
-  MFTL_DestroyBVH(bvh);
+  MFTLDestroyBVH(bvh);
   return 0;
 }
 
@@ -671,7 +671,7 @@ static int test_refit_only_matches_full_rebuild(void)
   MFTL_Object *const obj = make_sphere(g_open, 0.0, 0.0, 0.0, 1.0, 2);
   MFTL_BVHBuildParams p = params_with(1e-3);
 
-  MFTL_BVH *const refitted = MFTL_GenerateLBVH(obj, &p);
+  MFTL_BVH *const refitted = MFTLGenerateLBVH(obj, &p);
   TEST_ASSERT(refitted != MFTL_NULL);
 
   // A small, smooth deformation: the geometry moves, the connectivity does not.
@@ -682,9 +682,9 @@ static int test_refit_only_matches_full_rebuild(void)
     pos[1] += 0.01 * cos(2.0 * pos[2]);
     pos[2] += 0.005 * sin(5.0 * pos[0]);
   }
-  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTL_RefitLBVH(refitted, obj));
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLRefitLBVH(refitted, obj));
 
-  MFTL_BVH *const rebuilt = MFTL_GenerateLBVH(obj, &p);
+  MFTL_BVH *const rebuilt = MFTLGenerateLBVH(obj, &p);
   TEST_ASSERT(rebuilt != MFTL_NULL);
 
   /* The Morton order can legitimately differ after motion -- that is what makes
@@ -703,12 +703,12 @@ static int test_refit_only_matches_full_rebuild(void)
   for (int i = 0; i < refitted->nodes_used; ++i)
   {
     const MFTL_BVHNode *const n = &refitted->nodes[i];
-    if (!MFTL_BVHNodeIsLeaf(n)) continue;
-    const int first = MFTL_BVHLeafFirst(n);
-    for (int s = 0; s < MFTL_BVHLeafCount(n); ++s)
+    if (!MFTLBVHNodeIsLeaf(n)) continue;
+    const int first = MFTLBVHLeafFirst(n);
+    for (int s = 0; s < MFTLBVHLeafCount(n); ++s)
     {
       double tri[3][3];
-      MFTL_BVHPrimVerts(refitted, refitted->prim_indices[first + s], tri);
+      MFTLBVHPrimVerts(refitted, refitted->prim_indices[first + s], tri);
       for (int c = 0; c < 3; ++c)
         for (int k = 0; k < 3; ++k)
         {
@@ -720,12 +720,12 @@ static int test_refit_only_matches_full_rebuild(void)
 
   /* And the contacts they report against a third body must be the same SET. */
   MFTL_Object *const other = make_sphere(g_open, 1.7, 0.0, 0.0, 1.0, 2);
-  MFTL_BVH *const bvh_other = MFTL_GenerateLBVH(other, &p);
+  MFTL_BVH *const bvh_other = MFTLGenerateLBVH(other, &p);
 
   pair_log la = {MFTL_NULL, 0, 0};
   pair_log lb = {MFTL_NULL, 0, 0};
-  MFTL_IntersectObjects(obj, refitted, other, bvh_other, log_pair, &la);
-  MFTL_IntersectObjects(obj, rebuilt, other, bvh_other, log_pair, &lb);
+  MFTLIntersectObjects(obj, refitted, other, bvh_other, log_pair, &la);
+  MFTLIntersectObjects(obj, rebuilt, other, bvh_other, log_pair, &lb);
 
   pair_log_sort(&la);
   pair_log_sort(&lb);
@@ -734,9 +734,9 @@ static int test_refit_only_matches_full_rebuild(void)
 
   free(la.keys);
   free(lb.keys);
-  MFTL_DestroyBVH(bvh_other);
-  MFTL_DestroyBVH(rebuilt);
-  MFTL_DestroyBVH(refitted);
+  MFTLDestroyBVH(bvh_other);
+  MFTLDestroyBVH(rebuilt);
+  MFTLDestroyBVH(refitted);
   return 0;
 }
 
@@ -751,19 +751,19 @@ static int test_refit_refuses_after_a_topology_change(void)
 {
   MFTL_Object *const obj = make_sphere(g_open, 0.0, 0.0, 0.0, 1.0, 1);
   MFTL_BVHBuildParams p = params_with(1e-3);
-  MFTL_BVH *const bvh = MFTL_GenerateLBVH(obj, &p);
+  MFTL_BVH *const bvh = MFTLGenerateLBVH(obj, &p);
 
   /* Simulate a re-triangulation by shrinking the owned count. Any change to the
    * primitive count has to be caught; this is the cheapest way to make one. */
   const int saved = obj->tris.n_local;
   obj->tris.n_local = saved - 3;
 
-  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTL_RefitLBVH(bvh, obj));
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLRefitLBVH(bvh, obj));
 
   obj->tris.n_local = saved;
-  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTL_RefitLBVH(bvh, obj));
+  TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLRefitLBVH(bvh, obj));
 
-  MFTL_DestroyBVH(bvh);
+  MFTLDestroyBVH(bvh);
   return 0;
 }
 
@@ -790,13 +790,13 @@ static int test_traversal_agrees_with_the_brute_force_baseline(void)
   MFTL_Object *const a = make_sphere(g_open, -0.4, 0.0, 0.0, 1.0, 2);
   MFTL_Object *const b = make_sphere(g_open, 0.4, 0.1, 0.05, 1.0, 2);
 
-  MFTL_BVH *const bvhA = MFTL_GenerateLBVH(a, &p);
-  MFTL_BVH *const bvhB = MFTL_GenerateLBVH(b, &p);
+  MFTL_BVH *const bvhA = MFTLGenerateLBVH(a, &p);
+  MFTL_BVH *const bvhB = MFTLGenerateLBVH(b, &p);
 
   pair_log accel = {MFTL_NULL, 0, 0};
   pair_log brute = {MFTL_NULL, 0, 0};
 
-  MFTL_IntersectObjects(a, bvhA, b, bvhB, log_pair, &accel);
+  MFTLIntersectObjects(a, bvhA, b, bvhB, log_pair, &accel);
   brute_force_pairs(bvhA, bvhB, MFTL_MAX(bvhA->tolerance, bvhB->tolerance), &brute);
 
   pair_log_sort(&accel);
@@ -808,8 +808,8 @@ static int test_traversal_agrees_with_the_brute_force_baseline(void)
 
   free(accel.keys);
   free(brute.keys);
-  MFTL_DestroyBVH(bvhA);
-  MFTL_DestroyBVH(bvhB);
+  MFTLDestroyBVH(bvhA);
+  MFTLDestroyBVH(bvhB);
   return 0;
 }
 
@@ -820,15 +820,15 @@ static int test_separated_bodies_report_nothing(void)
   MFTL_Object *const a = make_sphere(g_open, -2.0, 0.0, 0.0, 0.5, 2);
   MFTL_Object *const b = make_sphere(g_open, 2.0, 0.0, 0.0, 0.5, 2);
 
-  MFTL_BVH *const bvhA = MFTL_GenerateLBVH(a, &p);
-  MFTL_BVH *const bvhB = MFTL_GenerateLBVH(b, &p);
+  MFTL_BVH *const bvhA = MFTLGenerateLBVH(a, &p);
+  MFTL_BVH *const bvhB = MFTLGenerateLBVH(b, &p);
 
   hit_counter h = {0, -1, -1};
-  MFTL_IntersectObjects(a, bvhA, b, bvhB, count_hits, &h);
+  MFTLIntersectObjects(a, bvhA, b, bvhB, count_hits, &h);
   TEST_ASSERT_EQUAL_INT(0, h.hits);
 
-  MFTL_DestroyBVH(bvhA);
-  MFTL_DestroyBVH(bvhB);
+  MFTLDestroyBVH(bvhA);
+  MFTLDestroyBVH(bvhB);
   return 0;
 }
 
@@ -859,20 +859,20 @@ static int test_periodic_morton_of_a_straddling_object(void)
 
   // Centred exactly on the x = 0 face of the [0, 10]^3 periodic box.
   MFTL_Object *const straddling = make_sphere(g_per, 0.0, 5.0, 5.0, R, 2);
-  MFTL_BVH *const bvh = MFTL_GenerateLBVH(straddling, &p);
+  MFTL_BVH *const bvh = MFTLGenerateLBVH(straddling, &p);
   TEST_ASSERT(bvh != MFTL_NULL);
   TEST_ASSERT(bvh->n_prims > 100);
 
   /* The control: the same sphere well away from any face. Its triangles bound
    * the size a correctly-built primitive may have. */
   MFTL_Object *const interior = make_sphere(g_per, 5.0, 5.0, 5.0, R, 2);
-  MFTL_BVH *const bvh_ref = MFTL_GenerateLBVH(interior, &p);
+  MFTL_BVH *const bvh_ref = MFTLGenerateLBVH(interior, &p);
 
   double ref_widest = 0.0;
   for (int i = 0; i < bvh_ref->n_prims; ++i)
   {
     double tri[3][3];
-    MFTL_BVHPrimVerts(bvh_ref, i, tri);
+    MFTLBVHPrimVerts(bvh_ref, i, tri);
     for (int k = 0; k < 3; ++k)
     {
       double lo = tri[0][k], hi = tri[0][k];
@@ -901,7 +901,7 @@ static int test_periodic_morton_of_a_straddling_object(void)
   for (int i = 0; i < bvh->n_prims; ++i)
   {
     double tri[3][3];
-    MFTL_BVHPrimVerts(bvh, i, tri);
+    MFTLBVHPrimVerts(bvh, i, tri);
 
     /* Count the ones that genuinely sit on the seam, so a silently non-
      * straddling mesh cannot make this test vacuous. */
@@ -926,7 +926,7 @@ static int test_periodic_morton_of_a_straddling_object(void)
   for (int i = 0; i < bvh->nodes_used; ++i)
   {
     const MFTL_BVHNode *const n = &bvh->nodes[i];
-    if (!MFTL_BVHNodeIsLeaf(n)) continue;
+    if (!MFTLBVHNodeIsLeaf(n)) continue;
     for (int k = 0; k < 3; ++k) TEST_ASSERT(((double) n->aabb_max[k] - (double) n->aabb_min[k]) < R);
   }
 
@@ -946,8 +946,8 @@ static int test_periodic_morton_of_a_straddling_object(void)
    * Correctness across the seam is a separate mechanism -- the periodic image
    * loop -- and it has its own test, test_contact_across_a_periodic_face. */
 
-  MFTL_DestroyBVH(bvh_ref);
-  MFTL_DestroyBVH(bvh);
+  MFTLDestroyBVH(bvh_ref);
+  MFTLDestroyBVH(bvh);
   return 0;
 }
 
@@ -957,7 +957,7 @@ static int test_periodic_morton_of_a_straddling_object(void)
  * The second half of the periodic problem, and the one no per-triangle
  * unwrapping can reach: each body is internally consistent and they are
  * genuinely a domain length apart in stored coordinates. Only the image loop in
- * MFTL_IntersectObjects sees it.
+ * MFTLIntersectObjects sees it.
  */
 static int test_contact_across_a_periodic_face(void)
 {
@@ -970,11 +970,11 @@ static int test_contact_across_a_periodic_face(void)
   MFTL_Object *const a = make_sphere(g_per, 0.4, 5.0, 5.0, 1.0, 2);
   MFTL_Object *const b = make_sphere(g_per, 9.7, 5.0, 5.0, 1.0, 2);
 
-  MFTL_BVH *const bvhA = MFTL_GenerateLBVH(a, &p);
-  MFTL_BVH *const bvhB = MFTL_GenerateLBVH(b, &p);
+  MFTL_BVH *const bvhA = MFTLGenerateLBVH(a, &p);
+  MFTL_BVH *const bvhB = MFTLGenerateLBVH(b, &p);
 
   hit_counter h = {0, -1, -1};
-  MFTL_IntersectObjects(a, bvhA, b, bvhB, count_hits, &h);
+  MFTLIntersectObjects(a, bvhA, b, bvhB, count_hits, &h);
   TEST_ASSERT(h.hits > 0);
 
   /* The control: the same two bodies in a NON-periodic domain of the same size
@@ -982,17 +982,17 @@ static int test_contact_across_a_periodic_face(void)
    * for the image loop, opposite answer. */
   MFTL_Object *const a2 = make_sphere(g_si, 0.04, 0.5, 0.5, 0.1, 2);
   MFTL_Object *const b2 = make_sphere(g_si, 1.97, 0.5, 0.5, 0.1, 2);
-  MFTL_BVH *const bvhA2 = MFTL_GenerateLBVH(a2, &p);
-  MFTL_BVH *const bvhB2 = MFTL_GenerateLBVH(b2, &p);
+  MFTL_BVH *const bvhA2 = MFTLGenerateLBVH(a2, &p);
+  MFTL_BVH *const bvhB2 = MFTLGenerateLBVH(b2, &p);
 
   hit_counter h2 = {0, -1, -1};
-  MFTL_IntersectObjects(a2, bvhA2, b2, bvhB2, count_hits, &h2);
+  MFTLIntersectObjects(a2, bvhA2, b2, bvhB2, count_hits, &h2);
   TEST_ASSERT_EQUAL_INT(0, h2.hits);
 
-  MFTL_DestroyBVH(bvhA);
-  MFTL_DestroyBVH(bvhB);
-  MFTL_DestroyBVH(bvhA2);
-  MFTL_DestroyBVH(bvhB2);
+  MFTLDestroyBVH(bvhA);
+  MFTLDestroyBVH(bvhB);
+  MFTLDestroyBVH(bvhA2);
+  MFTLDestroyBVH(bvhB2);
   return 0;
 }
 
@@ -1032,22 +1032,22 @@ static int test_detection_at_two_disparate_length_scales(void)
   MFTL_Object *const d1 = make_sphere(g_si, 0.30, 0.30, 0.30, r_drop, 2);
   MFTL_Object *const d2 = make_sphere(g_si, 0.30 + 2.0 * r_drop + 0.005 * r_drop, 0.30, 0.30, r_drop, 2);
 
-  MFTL_BVH *const bd1 = MFTL_GenerateLBVH(d1, &p);
-  MFTL_BVH *const bd2 = MFTL_GenerateLBVH(d2, &p);
+  MFTL_BVH *const bd1 = MFTLGenerateLBVH(d1, &p);
+  MFTL_BVH *const bd2 = MFTLGenerateLBVH(d2, &p);
 
   hit_counter hd = {0, -1, -1};
-  MFTL_IntersectObjects(d1, bd1, d2, bd2, count_hits, &hd);
+  MFTLIntersectObjects(d1, bd1, d2, bd2, count_hits, &hd);
   TEST_ASSERT(hd.hits > 0);
 
   /* --- The body pair: same RELATIVE separation, must also be DETECTED ------ */
   MFTL_Object *const b1 = make_sphere(g_si, 1.0, 1.0, 1.0, r_body, 2);
   MFTL_Object *const b2 = make_sphere(g_si, 1.0 + 2.0 * r_body + 0.005 * r_body, 1.0, 1.0, r_body, 2);
 
-  MFTL_BVH *const bb1 = MFTL_GenerateLBVH(b1, &p);
-  MFTL_BVH *const bb2 = MFTL_GenerateLBVH(b2, &p);
+  MFTL_BVH *const bb1 = MFTLGenerateLBVH(b1, &p);
+  MFTL_BVH *const bb2 = MFTLGenerateLBVH(b2, &p);
 
   hit_counter hb = {0, -1, -1};
-  MFTL_IntersectObjects(b1, bb1, b2, bb2, count_hits, &hb);
+  MFTLIntersectObjects(b1, bb1, b2, bb2, count_hits, &hb);
   TEST_ASSERT(hb.hits > 0);
 
   /* --- The envelope really did scale with the body ------------------------ */
@@ -1057,16 +1057,16 @@ static int test_detection_at_two_disparate_length_scales(void)
 
   /* --- And it still SEPARATES: five radii apart is not contact, either scale */
   MFTL_Object *const d3 = make_sphere(g_si, 0.30 + 10.0 * r_drop, 0.30, 0.30, r_drop, 2);
-  MFTL_BVH *const bd3 = MFTL_GenerateLBVH(d3, &p);
+  MFTL_BVH *const bd3 = MFTLGenerateLBVH(d3, &p);
   hit_counter hd3 = {0, -1, -1};
-  MFTL_IntersectObjects(d1, bd1, d3, bd3, count_hits, &hd3);
+  MFTLIntersectObjects(d1, bd1, d3, bd3, count_hits, &hd3);
   TEST_ASSERT_EQUAL_INT(0, hd3.hits);
 
-  MFTL_DestroyBVH(bd1);
-  MFTL_DestroyBVH(bd2);
-  MFTL_DestroyBVH(bd3);
-  MFTL_DestroyBVH(bb1);
-  MFTL_DestroyBVH(bb2);
+  MFTLDestroyBVH(bd1);
+  MFTLDestroyBVH(bd2);
+  MFTLDestroyBVH(bd3);
+  MFTLDestroyBVH(bb1);
+  MFTLDestroyBVH(bb2);
   return 0;
 }
 
@@ -1078,25 +1078,25 @@ static int test_detection_at_two_disparate_length_scales(void)
  */
 static int test_absolute_floor_overrides_the_relative_envelope(void)
 {
-  MFTL_BVHBuildParams p = MFTL_BVHDefaultParams();
+  MFTL_BVHBuildParams p = MFTLBVHDefaultParams();
   p.proximity_factor = 0.0;
   p.proximity_floor = 0.02;
 
   MFTL_Object *const a = make_sphere(g_open, -0.505, 0.0, 0.0, 0.5, 2);
   MFTL_Object *const b = make_sphere(g_open, 0.505, 0.0, 0.0, 0.5, 2);
 
-  MFTL_BVH *const bvhA = MFTL_GenerateLBVH(a, &p);
-  MFTL_BVH *const bvhB = MFTL_GenerateLBVH(b, &p);
+  MFTL_BVH *const bvhA = MFTLGenerateLBVH(a, &p);
+  MFTL_BVH *const bvhB = MFTLGenerateLBVH(b, &p);
 
   TEST_ASSERT_EQUAL_DOUBLE(0.02, bvhA->tolerance, 1e-15);
 
   // The surfaces are ~0.01 apart, inside the 0.02 floor.
   hit_counter h = {0, -1, -1};
-  MFTL_IntersectObjects(a, bvhA, b, bvhB, count_hits, &h);
+  MFTLIntersectObjects(a, bvhA, b, bvhB, count_hits, &h);
   TEST_ASSERT(h.hits > 0);
 
-  MFTL_DestroyBVH(bvhA);
-  MFTL_DestroyBVH(bvhB);
+  MFTLDestroyBVH(bvhA);
+  MFTLDestroyBVH(bvhB);
   return 0;
 }
 
@@ -1111,7 +1111,7 @@ static int test_prim_verts_agree_for_both_connectivity_paths(void)
 {
   MFTL_Object *const obj = make_sphere(g_per, 0.2, 5.0, 5.0, 1.0, 1);
   MFTL_BVHBuildParams p = params_with(1e-3);
-  MFTL_BVH *const bvh = MFTL_GenerateLBVH(obj, &p);
+  MFTL_BVH *const bvh = MFTLGenerateLBVH(obj, &p);
 
   const int n = bvh->n_local_prims;
   double *const with_topology = (double *) malloc(9 * (size_t) n * sizeof(double));
@@ -1120,7 +1120,7 @@ static int test_prim_verts_agree_for_both_connectivity_paths(void)
   for (int i = 0; i < n; ++i)
   {
     double tri[3][3];
-    MFTL_BVHPrimVerts(bvh, i, tri);
+    MFTLBVHPrimVerts(bvh, i, tri);
     memcpy(&with_topology[9 * i], tri, 9 * sizeof(double));
   }
 
@@ -1130,14 +1130,14 @@ static int test_prim_verts_agree_for_both_connectivity_paths(void)
   for (int i = 0; i < n; ++i)
   {
     double tri[3][3];
-    MFTL_BVHPrimVerts(bvh, i, tri);
+    MFTLBVHPrimVerts(bvh, i, tri);
     for (int c = 0; c < 3; ++c)
       for (int k = 0; k < 3; ++k) TEST_ASSERT_EQUAL_DOUBLE(with_topology[9 * i + 3 * c + k], tri[c][k], 1e-15);
   }
 
   free(with_topology);
   MFTLObjectBuildDerived(obj);
-  MFTL_DestroyBVH(bvh);
+  MFTLDestroyBVH(bvh);
   return 0;
 }
 
@@ -1149,21 +1149,21 @@ static int test_empty_partition_yields_an_empty_hierarchy(void)
   MFTL_Object *const obj = MFTLObjectCreate(0);
   MFTLEnsembleAddObject(g_open, obj);
 
-  MFTL_BVH *const bvh = MFTL_GenerateLBVH(obj, MFTL_NULL);
+  MFTL_BVH *const bvh = MFTLGenerateLBVH(obj, MFTL_NULL);
   TEST_ASSERT(bvh != MFTL_NULL);
   TEST_ASSERT_EQUAL_INT(0, bvh->n_prims);
   TEST_ASSERT_EQUAL_INT(0, bvh->nodes_used);
 
   // And it must be inert rather than a crash.
   MFTL_Object *const other = make_sphere(g_open, 0.0, 0.0, 0.0, 1.0, 1);
-  MFTL_BVH *const bvh_other = MFTL_GenerateLBVH(other, MFTL_NULL);
+  MFTL_BVH *const bvh_other = MFTLGenerateLBVH(other, MFTL_NULL);
 
   hit_counter h = {0, -1, -1};
-  MFTL_IntersectObjects(obj, bvh, other, bvh_other, count_hits, &h);
+  MFTLIntersectObjects(obj, bvh, other, bvh_other, count_hits, &h);
   TEST_ASSERT_EQUAL_INT(0, h.hits);
 
-  MFTL_DestroyBVH(bvh);
-  MFTL_DestroyBVH(bvh_other);
+  MFTLDestroyBVH(bvh);
+  MFTLDestroyBVH(bvh_other);
   return 0;
 }
 

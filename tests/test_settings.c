@@ -226,7 +226,7 @@ static int test_defaults_follow_the_modules(void)
   m.topology.options = MFTLTopologyDefaultOptions();
   m.volume.params = MFTLVolumeCorrectionDefaultParameters();
   m.undulation.params = MFTLUndulationDefaultParameters();
-  m.contact.params = MFTL_BVHDefaultParams();
+  m.contact.params = MFTLBVHDefaultParams();
   MFTLCouplerDefaultParams(&m.coupling.params);
   m.output.vtk = MFTLVtkDefaults();
 

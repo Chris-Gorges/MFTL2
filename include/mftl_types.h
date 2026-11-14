@@ -8,13 +8,16 @@
  *
  * Layer 1: types only, no behaviour, so module headers never include each other.
  *
- * ## Layout: topology in AoS, geometry in SoA, one allocation per pool
+ * ## Layout: topology in AoS, geometry one array per field, one allocation per pool
  *
  * - **Topology and identity -> Array of Structures.** #MFTL_Vertex (16 B),
  *   #MFTL_Triangle (12 B), #MFTL_HalfEdge (16 B). A remesher edits one entity at
  *   a time and touches most of its record when it does.
- * - **Geometry -> Structure of Arrays.** Positions, normals, areas, centroids:
- *   kernels touch one component of every entity, every timestep.
+ * - **Geometry -> one array per field, vectors interleaved.** Positions,
+ *   normals, areas, centroids: kernels touch one field of every entity, every
+ *   timestep. A 3-vector field is one array of xyz triples (`pos[3*v+k]`), not
+ *   three component arrays: separate components measured faster for gathers and
+ *   slower for scatters by similar amounts (examples/layout_benchmark.c).
  *
  * Both live in ONE allocation per entity class, cut into cache-line-aligned
  * sub-arrays (mftl_memory.h, src/object/object.c):
@@ -246,12 +249,12 @@ typedef struct MFTL_ObjectQualityStatistics
   /**
    * Worst mean-ratio quality in the mesh, \f$q = 4\sqrt{3}A/(a^2+b^2+c^2)\f$
    * (#MFTL_FOUR_SQRT3): 1 for an equilateral triangle, \f$\to 0\f$ as one
-   * degenerates, never above 1. Despite the name it is a quality, not an aspect
-   * ratio: larger is better.
+   * degenerates, never above 1. A quality, not an aspect ratio: larger is
+   * better.
    */
-  double min_aspect_ratio;
-  double max_aspect_ratio;  ///< Best mean-ratio quality in the mesh. Never exceeds 1.
-  double avg_aspect_ratio;  ///< Summed quality divided by the GLOBAL triangle count.
+  double min_mean_ratio;
+  double max_mean_ratio;  ///< Best mean-ratio quality in the mesh. Never exceeds 1.
+  double avg_mean_ratio;  ///< Summed quality divided by the GLOBAL triangle count.
 
   double min_edge_length_sq;  ///< Shortest edge, SQUARED. Squares throughout, so no sqrt in the reduction.
   double max_edge_length_sq;  ///< Longest edge, squared.

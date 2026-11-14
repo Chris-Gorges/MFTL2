@@ -30,8 +30,8 @@
  *
  * ── Why the generators live in this file ───────────────────────────────────
  *
- * The library has no open-surface generator (CLAUDE.md lists it as absent), and
- * it does not need one to produce these meshes: MFTLBuildIndexedMesh owns every
+ * The library has no open-surface generator (README.md, "Status and roadmap",
+ * lists it as absent), and it does not need one to produce these meshes: MFTLBuildIndexedMesh owns every
  * half-edge convention -- implicit indexing, dense ids, twins, the boundary
  * marking -- so a caller supplies positions and a winding-consistent triangle
  * list and gets a fully described open surface back. Each shape below is a

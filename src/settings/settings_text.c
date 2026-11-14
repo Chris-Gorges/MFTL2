@@ -730,7 +730,7 @@ void MFTLSettingsDefaults(MFTL_Settings *s)
   s->topology.options = MFTLTopologyDefaultOptions();
   s->volume.params = MFTLVolumeCorrectionDefaultParameters();
   s->undulation.params = MFTLUndulationDefaultParameters();
-  s->contact.params = MFTL_BVHDefaultParams();
+  s->contact.params = MFTLBVHDefaultParams();
   MFTLCouplerDefaultParams(&s->coupling.params);
   s->output.vtk = MFTLVtkDefaults();
 
