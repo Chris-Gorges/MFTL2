@@ -36,12 +36,20 @@ The job file (see make_readme_gifs.sh for the ones the README uses):
                   the fixed camera's direction; mesh edges fade in to opacity e
     box           [xmin, xmax, ymin, ymax, zmin, zmax]: draw the domain outline
     ambient, diffuse, specular   lighting
+
+    stream        internal handoff settings from make_duct_gif.sh; waits for a
+                  collectively completed mesh, renders it, deletes only that
+                  mesh, then acknowledges it. Zoom tracking uses the current
+                  frame, without a pre-pass over future meshes.
 """
 import glob, json, os, sys
+from pathlib import Path
 from paraview.simple import *
+from duct_gif import atomic_text, check_png, finish_frame, stream_frames
 
 job = json.load(open(sys.argv[1]))
-files = sorted(glob.glob(job["pattern"]))[:: job.get("stride", 1)]
+stream = job.get("stream")
+files = stream_frames(job) if stream else sorted(glob.glob(job["pattern"]))[:: job.get("stride", 1)]
 if "frames" in job:
     files = [files[i] for i in job["frames"]]
 os.makedirs(job["out"], exist_ok=True)
@@ -138,7 +146,7 @@ out.GetCellData().AddArray(arr)
 """
 
 zoom = job.get("zoom")
-if zoom:
+if zoom and not stream:
     # Where the followed body is, frame by frame, lightly smoothed: its box
     # changes a little with every remesh.
     track = {}
@@ -161,6 +169,16 @@ if zoom:
         smooth_track[k] = [x / den for x in num]
     track = smooth_track
 
+if stream:
+    # Test screenshot creation before the supervisor launches the large MPI job.
+    preflight = Path(job["out"]).parent / "preflight.png"
+    SaveScreenshot(str(preflight), view, ImageResolution=[64, 64], TransparentBackground=1)
+    check_png(preflight)
+    preflight.unlink()
+    atomic_text(preflight.parent / "renderer.ready", "ready\n")
+    track = {}
+    previous_track = None
+
 if job.get("label"):
     txt = Text(Text=job["label"])
     td = Show(txt, view)
@@ -175,6 +193,7 @@ def zoom_weight(z, k):
     s = max(0.0, min(1.0, a, b))
     return s * s * (3.0 - 2.0 * s)
 
+rendered = 0
 for k, f in enumerate(files):
     src = XMLPartitionedUnstructuredGridReader(FileName=[f])
     if job.get("role_from_wall"):
@@ -196,6 +215,27 @@ for k, f in enumerate(files):
     view.CameraViewUp = job.get("up", [0, 0, 1])
     view.CameraViewAngle = job.get("angle", 30)
     zw = zoom_weight(zoom, k) if zoom else 0.0
+    if stream and zw > 0.0:
+        # Reuse this frame's reader; do not read a second copy of a huge mesh.
+        followed = Threshold(Input=src, Scalars=["CELLS", "BodyID"], LowerThreshold=zoom["body"],
+                             UpperThreshold=zoom["body"], ThresholdMethod="Between")
+        followed.UpdatePipeline()
+        info = followed.GetDataInformation()
+        if info.GetNumberOfCells() == 0:
+            raise RuntimeError("Zoom body %s is absent" % zoom["body"])
+        bounds = info.GetBounds()
+        centre = [(bounds[2*i] + bounds[2*i+1]) / 2 for i in range(3)]
+        Delete(followed)
+        # At the periodic seam a body may be drawn in two pieces at opposite
+        # ends. Use the overview for that frame, rather than track their midpoint.
+        length = job["box"][1] - job["box"][0]
+        if bounds[1] - bounds[0] > length / 2:
+            zw = 0.0
+            previous_track = None
+        else:
+            if previous_track is not None and abs(centre[0] - previous_track[0]) < length / 2:
+                centre = [0.75 * centre[i] + 0.25 * previous_track[i] for i in range(3)]
+            track[k] = previous_track = centre
     if zw > 0.0:
         wide_f, wide_p = list(view.CameraFocalPoint), list(view.CameraPosition)
         dirn = [wide_p[i] - wide_f[i] for i in range(3)]
@@ -254,7 +294,17 @@ for k, f in enumerate(files):
             pass
         d.LineWidth = job.get("edge_width", 1.0)
     Render(view)
-    SaveScreenshot(os.path.join(job["out"], "frame_%04d.png" % k), view, ImageResolution=[w, h], TransparentBackground=1 if job.get("transparent") else 0)
+    png = Path(job["out"]) / ("frame_%04d.png" % k)
+    target = png.with_name(png.stem + ".pending.png") if stream else png
+    SaveScreenshot(str(target), view, ImageResolution=[w, h], TransparentBackground=1 if job.get("transparent") else 0)
+    if stream:
+        check_png(target)
+        target.replace(png)
+        triangles = src.GetDataInformation().GetNumberOfCells()
+        Delete(d)
     Delete(src)
     del src
-print("rendered", len(files), "frames")
+    if stream:
+        finish_frame(job, f, png, triangles)
+    rendered += 1
+print("rendered", rendered, "frames")

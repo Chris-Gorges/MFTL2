@@ -41,7 +41,7 @@
  * Usage:
  *   mpirun -n 8 droplets_in_duct_flow [--drops N] [--rmin R] [--rmax R] [--length L]
  *          [--refine N] [--steps N] [--time T] [--swirl a] [--seed S]
- *          [--vtk N] [--report N] [--verify]
+ *          [--vtk N] [--vtk-stream] [--vtk-timeout S] [--report N] [--verify]
  *
  *   --drops N    number of droplets                      (default 600)
  *                (the README animation: 800 on 8 ranks, --refine 3 --vtk 2)
@@ -57,15 +57,21 @@
  *   --sizing S   curvature | uniform                     (default curvature: a small
  *                droplet gets edges as short as its curvature asks for)
  *   --vtk N      write duct_NNNN.pvtu every N steps      (default 0)
+ *   --vtk-stream publish a .ready marker after all pieces close, then wait for
+ *                a renderer's .done marker before proceeding (tools/media/make_duct_gif.sh)
+ *   --vtk-timeout S  maximum seconds to wait for each rendered frame (default 3600)
  *   --verify     exit non-zero unless every droplet is still a closed sphere
  *                topologically and the total volume moved by less than 1 %
  */
 
+#include <errno.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/select.h>
+#include <unistd.h>
 
 #include <mpi.h>
 
@@ -236,6 +242,72 @@ static void measure(MFTL_Ensemble *ens, duct_stats *g)
  * The run
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/**
+ * @brief Write a frame and optionally hand it to the streaming renderer.
+ * @param ens Distributed mesh; every rank calls.
+ * @param step Timestep used in the output filename.
+ * @param stream Wait until the renderer has saved the PNG and removed the mesh.
+ * @param timeout Maximum seconds to wait for acknowledgement.
+ *
+ * MFTLWriteVtu agrees that every piece is closed before rank 0 publishes .ready.
+ * All ranks sleep while waiting, leaving the CPUs available for rendering. The
+ * consumer creates .done only after deleting this frame's mesh files. The final
+ * reduction ensures every rank saw it before rank 0 removes the markers.
+ */
+static void write_frame(MFTL_Ensemble *ens, int step, bool stream, double timeout)
+{
+  char prefix[64], ready[80], pending[80], done[80];
+  snprintf(prefix, sizeof prefix, "duct_%04d", step);
+  if (MFTLWriteVtu(ens, prefix, MFTL_NULL) != MFTL_SUCCESS) MPI_Abort(MPI_COMM_WORLD, 1);
+  if (!stream) return;
+
+  snprintf(ready, sizeof ready, "%s.ready", prefix);
+  snprintf(pending, sizeof pending, "%s.ready.tmp", prefix);
+  snprintf(done, sizeof done, "%s.done", prefix);
+  int status = MFTL_SUCCESS;
+  if (ens->domain.rank == 0)
+  {
+    if (access(done, F_OK) == 0 || access(ready, F_OK) == 0)
+      status = MFTL_ERROR;  // the runner must use a fresh output directory
+    else
+    {
+      FILE *fp = fopen(pending, "w");
+      if (!fp)
+        status = MFTL_ERROR;
+      else
+      {
+        if (fprintf(fp, "%d %d\n", step, ens->domain.nproc) < 0) status = MFTL_ERROR;
+        if (fclose(fp) != 0) status = MFTL_ERROR;
+        if (status == MFTL_SUCCESS && rename(pending, ready) != 0) status = MFTL_ERROR;
+      }
+    }
+  }
+  MPI_Bcast(&status, 1, MPI_INT, 0, MPI_COMM_WORLD);
+  if (status != MFTL_SUCCESS) MPI_Abort(MPI_COMM_WORLD, 1);
+
+  const double start = MPI_Wtime();
+  while (access(done, F_OK) != 0)
+  {
+    if (errno != ENOENT || MPI_Wtime() - start >= timeout)
+    {
+      status = MFTL_ERROR;
+      break;
+    }
+    struct timeval pause = {0, 100000};
+    (void) select(0, NULL, NULL, NULL, &pause);
+  }
+  MPI_Allreduce(MPI_IN_PLACE, &status, 1, MPI_INT, MPI_MIN, MPI_COMM_WORLD);
+  if (status != MFTL_SUCCESS)
+  {
+    if (ens->domain.rank == 0) fprintf(stderr, "Streaming renderer did not acknowledge %s within %.0f seconds.\n", prefix, timeout);
+    MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+  if (ens->domain.rank == 0)
+  {
+    if (remove(done) != 0 || remove(ready) != 0) MPI_Abort(MPI_COMM_WORLD, 1);
+  }
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
@@ -243,12 +315,15 @@ int main(int argc, char **argv)
   int rank = 0, nproc = 1;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   MPI_Comm_size(MPI_COMM_WORLD, &nproc);
+  setvbuf(stdout, NULL, _IOLBF, 0);
 
   int n_drops = 600, refine = 2, steps = 240, vtk_every = 0, report = 40;
   double rmin = 0.03, rmax = 0.07, length = 4.0, time_passes = 1.0, swirl = 0.15, margin = 0.15;
   bool curvature = MFTL_TRUE;
   uint64_t seed = 20261109;
   bool verify = MFTL_FALSE;
+  bool vtk_stream = MFTL_FALSE;
+  double vtk_timeout = 3600.0;
   for (int i = 1; i < argc; ++i)
   {
     const bool has = i + 1 < argc;
@@ -276,6 +351,10 @@ int main(int argc, char **argv)
       seed = (uint64_t) strtoull(argv[++i], MFTL_NULL, 10);
     else if (!strcmp(argv[i], "--vtk") && has)
       vtk_every = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--vtk-stream"))
+      vtk_stream = MFTL_TRUE;
+    else if (!strcmp(argv[i], "--vtk-timeout") && has)
+      vtk_timeout = atof(argv[++i]);
     else if (!strcmp(argv[i], "--report") && has)
       report = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--verify"))
@@ -285,6 +364,11 @@ int main(int argc, char **argv)
       if (rank == 0) fprintf(stderr, "unknown or incomplete option '%s'; see the header of droplets_in_duct_flow.c\n", argv[i]);
       MPI_Abort(MPI_COMM_WORLD, 2);
     }
+  }
+  if (vtk_stream && (vtk_every <= 0 || !isfinite(vtk_timeout) || vtk_timeout <= 0.0))
+  {
+    if (rank == 0) fprintf(stderr, "--vtk-stream requires --vtk > 0 and a positive finite --vtk-timeout.\n");
+    MPI_Abort(MPI_COMM_WORLD, 2);
   }
 
   const duct_flow flow = {1.0, length, 1.0, swirl};
@@ -299,6 +383,11 @@ int main(int argc, char **argv)
   double *radius = (double *) malloc((size_t) n_drops * sizeof(double));
   if (!centre || !radius) MPI_Abort(MPI_COMM_WORLD, 1);
   const int placed = place_drops(n_drops, rmin, rmax, length, flow.H, margin, seed, centre, radius);
+  if (vtk_stream && placed != n_drops)
+  {
+    if (rank == 0) fprintf(stderr, "Only %d of %d droplets fitted; reduce the radii before producing the animation.\n", placed, n_drops);
+    MPI_Abort(MPI_COMM_WORLD, 2);
+  }
 
   MFTL_Ensemble *ens = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, lo, hi, periodic, placed);
   if (!ens) MPI_Abort(MPI_COMM_WORLD, 1);
@@ -332,12 +421,7 @@ int main(int argc, char **argv)
   }
 
   const double T = time_passes * length / flow.U, dt = T / (double) steps;
-  char name[64];
-  if (vtk_every > 0)
-  {
-    snprintf(name, sizeof name, "duct_%04d", 0);
-    MFTLWriteVtu(ens, name, MFTL_NULL);
-  }
+  if (vtk_every > 0) write_frame(ens, 0, vtk_stream, vtk_timeout);
 
   double step_max = 0.0, step_sum = 0.0;
   for (int step = 1; step <= steps; ++step)
@@ -359,8 +443,7 @@ int main(int argc, char **argv)
 
     if (vtk_every > 0 && step % vtk_every == 0)
     {
-      snprintf(name, sizeof name, "duct_%04d", step);
-      MFTLWriteVtu(ens, name, MFTL_NULL);
+      write_frame(ens, step, vtk_stream, vtk_timeout);
     }
     if ((report > 0 && step % report == 0) || step == steps)
     {

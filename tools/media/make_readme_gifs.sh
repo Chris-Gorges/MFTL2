@@ -8,6 +8,9 @@
 # light and dark themes alike.
 #
 # Usage: tools/media/make_readme_gifs.sh [BUILD_DIR] [WORK_DIR]
+#        tools/media/make_readme_gifs.sh --duct-workstation [BUILD_DIR] [WORK_DIR] [options]
+#        The workstation mode runs only the 20,000-droplet/32-rank case, renders
+#        each frame immediately and deletes its mesh. See make_duct_gif.sh --help.
 #        BUILD_DIR  a Release build with the examples (default build)
 #        WORK_DIR   where the runs and frames go (default a temporary directory)
 #        PVBATCH    pvbatch to use (default: from PATH, else the ParaView app on macOS)
@@ -17,6 +20,10 @@
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
+if [ "${1:-}" = --duct-workstation ]; then
+  shift
+  exec bash "$root/tools/media/make_duct_gif.sh" "$@"
+fi
 build="$(cd "${1:-$root/build}" && pwd)"
 work="${2:-$(mktemp -d)}"
 mkdir -p "$work"
