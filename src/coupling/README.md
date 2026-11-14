@@ -4,7 +4,7 @@
 **Public header:** `include/mftl_coupling.h` · **Layer:** 3 ·
 **Module group:** @ref mftl_coupling
 
-**Improvement plan:** `plans/06-coupler-improvements.md`.
+**Open work:** `plans/00-roadmap.md`, item B5.
 
 A flow solver owns velocity components and force targets on ITS samples — cell centres,
 staggered faces, the centroids of an unstructured mesh — distributed its own way. A
