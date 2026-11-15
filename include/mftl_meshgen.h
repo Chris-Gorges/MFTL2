@@ -44,7 +44,7 @@ extern "C"
  * owns the winding: the normal \f$(\vect{p}_1-\vect{p}_0)\times(\vect{p}_2-\vect{p}_0)\f$
  * points to the side the triangles are counter-clockwise from.
  *
- * Triangle geometry is current on return (when the object has a domain).
+ * Triangle geometry is current on return.
  *
  * The list must describe an ORIENTED edge-manifold over all @p n_vertices:
  * three distinct, in-range corners per triangle, no directed edge used twice
@@ -61,10 +61,10 @@ extern "C"
  * @param n_vertices  Number of vertices, >= 3.
  * @param tri_verts   [3 * n_triangles] vertex indices.
  * @param n_triangles Number of triangles, >= 1.
- * @return #MFTL_SUCCESS, or #MFTL_ERROR on invalid arguments (including an index
- *         out of range, a triangle with a repeated corner, a list that is not
- *         an oriented edge-manifold, or an unused vertex; checked in Release
- *         before anything is modified).
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on invalid arguments (including an
+ *         object without a domain, an index out of range, a triangle with a
+ *         repeated corner, a list that is not an oriented edge-manifold, or an
+ *         unused vertex; checked in Release before anything is modified).
  *
  * @rank_local The collective bookkeeping belongs to the caller.
  */
@@ -279,7 +279,8 @@ void MFTLLevelSetSurfaceFree(MFTL_LevelSetSurface *s);
  * @param obj  An EMPTY object linked to a domain.
  * @param grid The values.
  * @param snap Relative snap distance; see MFTLExtractLevelSet().
- * @return #MFTL_SUCCESS, or #MFTL_ERROR on invalid input.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on invalid input (an object without a
+ *         domain included, whether or not the level set crosses the window).
  * @rank_local
  */
 int MFTLBuildMeshFromLevelSet(MFTL_Object *obj, const MFTL_SdfGrid *grid, double snap);

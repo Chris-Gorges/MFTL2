@@ -401,14 +401,16 @@ const MFTL_SettingSection *MFTLSettingsSection(int i);
  * @brief Fills @p s with the default of every key.
  *
  * Module blocks start from their module's own defaults (MFTLInitRemeshParams(),
- * MFTLTopologyDefaultOptions(), MFTLBVHDefaultParams(), MFTLVtkDefaults()) and
- * every key is then set from its table default. Two defaults differ from the
- * module's on purpose, because a settings file describes a SIMULATION rather
- * than one call: `remesh.parallel_phase_budget` is 4, the measured best in a
- * timestep loop, rather than 32; and the arguments MFTLInitRemeshParams() has no
- * default for are `target_length = 0` (derive), 3 iterations, triangle-based
- * smoothing and feature detection off (180 degrees, right for a smooth
- * interface).
+ * MFTLTopologyDefaultOptions(), MFTLVolumeCorrectionDefaultParameters(),
+ * MFTLUndulationDefaultParameters(), MFTLBVHDefaultParams(),
+ * MFTLCouplerDefaultParams(), MFTLVtkDefaults()) and every key is then set from
+ * its table default, which equals the module's on every key
+ * (`test_defaults_follow_the_modules`). `remesh.parallel_phase_budget` is
+ * therefore 8, the whole placement table: one spanning pass does one serial
+ * call's work, so a timestep loop and a one-shot remesh want the same cap. The
+ * table chooses only the arguments MFTLInitRemeshParams() has no default for:
+ * `target_length = 0` (derive), 3 iterations, triangle-based smoothing and
+ * feature detection off (180 degrees, right for a smooth interface).
  *
  * @param[out] s The settings.
  * @rank_local

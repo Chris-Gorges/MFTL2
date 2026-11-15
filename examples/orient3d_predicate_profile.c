@@ -12,7 +12,7 @@
  * actually look like. If it does not, the adaptive predicate is overhead and
  * should be reverted to the plain determinant.
  *
- * Three experiments, each isolating one variable:
+ * Four experiments, each isolating one variable:
  *
  *   1. THIN FILM vs GAP. Two nearly parallel triangles separated by a gap that
  *      shrinks from 1e-3 to 1e-16 of the triangle size. This is the geometry a
@@ -25,11 +25,16 @@
  *      that makes the failure a function of WHERE the body is rather than of
  *      what shape it has.
  *
- *   3. COST. Nanoseconds per call for both forms, on well-conditioned input
+ *   3. END TO END. Millimetre triangles half a metre from the origin, one
+ *      pierced through the other by a film of 1e-6 to 1e-17 of their size: how
+ *      often the plain form would send MFTLTriTriIntersect() down a different
+ *      branch.
+ *
+ *   4. COST. Nanoseconds per call for both forms, on well-conditioned input
  *      (which is what the traversal spends its time on) and on degenerate input
  *      (the worst case).
  *
- * The adaptive predicate is the reference for experiments 1 and 2, because its
+ * The adaptive predicate is the reference for experiments 1 to 3, because its
  * sign is exact by construction: any disagreement IS a misclassification by the
  * plain form.
  *
@@ -60,6 +65,23 @@ static double rnd_unit(void)
 static double rnd_sym(void) { return 2.0 * rnd_unit() - 1.0; }
 
 static inline int sign_of(double x) { return (x > 0.0) - (x < 0.0); }
+
+/* The unit normal of the plane through a, b, c, and its two edge vectors. */
+static void plane_frame(const double a[3], const double b[3], const double c[3], double e1[3], double e2[3], double n[3])
+{
+  for (int k = 0; k < 3; ++k)
+  {
+    e1[k] = b[k] - a[k];
+    e2[k] = c[k] - a[k];
+  }
+  n[0] = e1[1] * e2[2] - e1[2] * e2[1];
+  n[1] = e1[2] * e2[0] - e1[0] * e2[2];
+  n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+
+  const double len = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+  const double inv = (len > 0.0) ? 1.0 / len : 0.0;
+  for (int k = 0; k < 3; ++k) n[k] *= inv;
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Experiment 1: thin film
@@ -94,18 +116,7 @@ static void near_coplanar_case(double L, double gap, double offset, double a[3],
   }
 
   double e1[3], e2[3], n[3];
-  for (int k = 0; k < 3; ++k)
-  {
-    e1[k] = b[k] - a[k];
-    e2[k] = c[k] - a[k];
-  }
-  n[0] = e1[1] * e2[2] - e1[2] * e2[1];
-  n[1] = e1[2] * e2[0] - e1[0] * e2[2];
-  n[2] = e1[0] * e2[1] - e1[1] * e2[0];
-
-  const double len = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-  const double inv = (len > 0.0) ? 1.0 / len : 0.0;
-  for (int k = 0; k < 3; ++k) n[k] *= inv;
+  plane_frame(a, b, c, e1, e2, n);
 
   /* An interior barycentric point, plus the gap along the unit normal. Every
    * term here rounds, and at a large `offset` the rounding of the first three
@@ -123,7 +134,7 @@ static void run_thin_film(void)
   printf(" 1. THIN FILM: two surfaces separated by a shrinking gap\n");
   printf("    triangle size L = 1, gap swept, coordinates at the origin\n");
   printf("=====================================================================\n");
-  printf("  %-12s %-14s %-14s %-12s\n", "gap/L", "fast wrong %", "fast says 0 %", "resolvable");
+  printf("  %-12s %-14s %-14s %-14s\n", "gap/L", "fast wrong %", "fast says 0 %", "gap survives %");
   printf("  ---------------------------------------------------------------------\n");
 
   const int N = 20000;
@@ -135,25 +146,31 @@ static void run_thin_film(void)
 
     int wrong = 0;
     int fast_zero = 0;
-    int representable = 0;
+    int survives = 0;
 
     for (int i = 0; i < N; ++i)
     {
       double a[3], b[3], c[3], d[3];
       near_coplanar_case(L, gap, 0.0, a, b, c, d);
 
-      /* Did the gap survive being stored? If d[2] rounded back onto the plane
-       * the configuration IS coplanar and neither form is wrong to say so. */
-      if (d[2] != c[2]) representable++;
-
       const double exact = MFTLOrient3D(a, b, c, d);
       const double fast = MFTLOrient3DFast(a, b, c, d);
+
+      /* Did the gap survive being stored? d was put on the +n side; the exact
+       * sign of the STORED point says whether it is still there, or rounded
+       * onto or through the plane -- where the gap is no longer a property of
+       * the input and neither form can be blamed for the side it reports. The
+       * +n side's sign is read off a point a whole L above the plane. */
+      double e1[3], e2[3], n[3], above[3];
+      plane_frame(a, b, c, e1, e2, n);
+      for (int k = 0; k < 3; ++k) above[k] = a[k] + L * n[k];
+      if (exact != 0.0 && sign_of(exact) == sign_of(MFTLOrient3D(a, b, c, above))) survives++;
 
       if (sign_of(exact) != sign_of(fast)) wrong++;
       if (fast == 0.0 && exact != 0.0) fast_zero++;
     }
 
-    printf("  %-12.0e %-14.4f %-14.4f %d/%d\n", gap, 100.0 * wrong / N, 100.0 * fast_zero / N, representable, N);
+    printf("  %-12.0e %-14.4f %-14.4f %-14.4f\n", gap, 100.0 * wrong / N, 100.0 * fast_zero / N, 100.0 * survives / N);
   }
   printf("\n  (percentages of %d samples)\n", N);
 }
@@ -212,14 +229,96 @@ static void run_offset_sweep(void)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Experiment 3: what the filter costs
+ * Experiment 3: does a wrong sign reach the intersection test?
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Millimetre triangles at a droplet's position, one pierced through the
+ *        other by a thin film, and the six orientation signs
+ *        MFTLTriTriIntersect() dispatches on.
+ *
+ * A misclassified orientation only matters if it changes what
+ * MFTLTriTriIntersect() reports. The test cannot be rerun with the plain
+ * determinant inside it, so this computes the six signs its dispatch branches on
+ * first, with the same arguments in the same order, in both forms. A pair where
+ * one of them differs takes a different branch: the count is an UPPER BOUND on
+ * the pairs whose verdict the plain form could change, not that number.
+ *
+ * A lies in a plane of GENERAL orientation. An axis-aligned A (the obvious
+ * construction) factors the film thickness out of every determinant, as
+ * near_coplanar_case() explains, and the two forms then never disagree. B's
+ * first edge crosses A along A's normal, so B's first two corners are the
+ * near-degenerate ones; its third lies in A's plane, as the third corner of a
+ * triangle meeting a surface edge-on does.
+ */
+static void run_end_to_end(void)
+{
+  printf("\n");
+  printf("=====================================================================\n");
+  printf(" 3. END TO END: pairs the plain form would send down another branch\n");
+  printf("=====================================================================\n");
+
+  const int N = 200000;
+  const double L = 1.0e-3;  // millimetre droplet triangles
+  const double offset = 0.5;  // half a metre from the origin
+
+  int disagree = 0;
+  int crossing = 0;
+
+  for (int i = 0; i < N; ++i)
+  {
+    double A[3][3], B[3][3];
+    for (int v = 0; v < 3; ++v)
+      for (int k = 0; k < 3; ++k) A[v][k] = offset + L * rnd_sym();
+
+    double e1[3], e2[3], n[3];
+    plane_frame(A[0], A[1], A[2], e1, e2, n);
+
+    const double s = 0.2 + 0.3 * rnd_unit();
+    const double t = 0.2 + 0.3 * rnd_unit();
+    const double dz = L * pow(10.0, -6.0 - 11.0 * rnd_unit());  // 1e-6 L .. 1e-17 L
+    for (int k = 0; k < 3; ++k)
+    {
+      const double x = A[0][k] + s * e1[k] + t * e2[k];
+      B[0][k] = x - dz * n[k];
+      B[1][k] = x + dz * n[k];
+      B[2][k] = x + 0.5 * e1[k];
+    }
+
+    /* The exact verdict. Below about 1e-13 L the film is under the rounding of
+     * the corners at 0.5 m, so not every stored pair still crosses. */
+    if (MFTLTriTriIntersect((const double(*)[3]) A, (const double(*)[3]) B)) crossing++;
+
+    const double *p1 = A[0], *q1 = A[1], *r1 = A[2];
+    const double *p2 = B[0], *q2 = B[1], *r2 = B[2];
+
+    int differs = 0;
+    if (sign_of(MFTLOrient3D(p1, p2, q2, r2)) != sign_of(MFTLOrient3DFast(p1, p2, q2, r2))) differs = 1;
+    if (sign_of(MFTLOrient3D(q1, p2, q2, r2)) != sign_of(MFTLOrient3DFast(q1, p2, q2, r2))) differs = 1;
+    if (sign_of(MFTLOrient3D(r1, p2, q2, r2)) != sign_of(MFTLOrient3DFast(r1, p2, q2, r2))) differs = 1;
+    if (sign_of(MFTLOrient3D(p2, p1, q1, r1)) != sign_of(MFTLOrient3DFast(p2, p1, q1, r1))) differs = 1;
+    if (sign_of(MFTLOrient3D(q2, p1, q1, r1)) != sign_of(MFTLOrient3DFast(q2, p1, q1, r1))) differs = 1;
+    if (sign_of(MFTLOrient3D(r2, p1, q1, r1)) != sign_of(MFTLOrient3DFast(r2, p1, q1, r1))) differs = 1;
+
+    if (differs) disagree++;
+  }
+
+  printf("  droplet triangles of %.0e m at %.1f m from the origin\n", L, offset);
+  printf("  film thickness 1e-6 .. 1e-17 of the triangle size (log-uniform)\n\n");
+  printf("  pairs tested                                %d\n", N);
+  printf("  crossing (exact verdict)                    %d\n", crossing);
+  printf("  a dispatch sign differs (verdict at risk)   %d  (%.3f %%)\n", disagree, 100.0 * disagree / N);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Experiment 4: what the filter costs
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 static void run_cost(void)
 {
   printf("\n");
   printf("=====================================================================\n");
-  printf(" 3. COST per call\n");
+  printf(" 4. COST per call\n");
   printf("=====================================================================\n");
 
   const int N = 400000;
@@ -355,83 +454,6 @@ static void run_cost(void)
   }
 
   free(pts);
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * Experiment 4: does it reach the ANSWER, not just the predicate?
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/**
- * @brief Two triangles in a thin-film configuration, run through the full
- *        intersection test.
- *
- * A misclassified orientation only matters if it changes what
- * MFTLTriTriIntersect reports. This builds pairs that genuinely cross by a
- * whisker and counts how many the two predicate forms disagree about
- * end-to-end -- the number that decides whether the adaptive version earns its
- * place.
- */
-static void run_end_to_end(void)
-{
-  printf("\n");
-  printf("=====================================================================\n");
-  printf(" 4. END TO END: pairs whose INTERSECTION verdict changes\n");
-  printf("=====================================================================\n");
-
-  const int N = 200000;
-  const double L = 1.0e-3;  // millimetre droplet triangles
-  const double offset = 0.5;  // half a metre from the origin
-
-  int disagree = 0;
-  int crossing = 0;
-
-  for (int i = 0; i < N; ++i)
-  {
-    /* A flat triangle, and a second one pierced through it by a tiny amount --
-     * the moment of contact between two resolved surfaces. */
-    const double z = offset;
-    const double A[3][3] = {
-        {offset + 0.0, offset + 0.0, z},
-        {offset + L, offset + 0.0, z},
-        {offset + 0.0, offset + L, z},
-    };
-
-    const double px = offset + 0.2 * L + 0.1 * L * rnd_unit();
-    const double py = offset + 0.2 * L + 0.1 * L * rnd_unit();
-    const double dz = L * pow(10.0, -6.0 - 11.0 * rnd_unit());  // 1e-6 L .. 1e-17 L
-
-    const double B[3][3] = {
-        {px, py, z - dz},
-        {px, py, z + dz},
-        {px + 0.5 * L, py + 0.5 * L, z},
-    };
-
-    /* The exact verdict. B's first edge spans the plane, so it crosses. */
-    const int exact = MFTLTriTriIntersect(A, B);
-    if (exact) crossing++;
-
-    /* What the plain determinant would have decided, reconstructed from the
-     * six orientation values the dispatch branches on. A disagreement in any
-     * of them is a different branch and, in general, a different answer. */
-    int differs = 0;
-    const double *p1 = A[0], *q1 = A[1], *r1 = A[2];
-    const double *p2 = B[0], *q2 = B[1], *r2 = B[2];
-
-    if (sign_of(MFTLOrient3D(p1, p2, q2, r2)) != sign_of(MFTLOrient3DFast(p1, p2, q2, r2))) differs = 1;
-    if (sign_of(MFTLOrient3D(q1, p2, q2, r2)) != sign_of(MFTLOrient3DFast(q1, p2, q2, r2))) differs = 1;
-    if (sign_of(MFTLOrient3D(r1, p2, q2, r2)) != sign_of(MFTLOrient3DFast(r1, p2, q2, r2))) differs = 1;
-    if (sign_of(MFTLOrient3D(p2, p1, q1, r1)) != sign_of(MFTLOrient3DFast(p2, p1, q1, r1))) differs = 1;
-    if (sign_of(MFTLOrient3D(q2, p1, q1, r1)) != sign_of(MFTLOrient3DFast(q2, p1, q1, r1))) differs = 1;
-    if (sign_of(MFTLOrient3D(r2, p1, q1, r1)) != sign_of(MFTLOrient3DFast(r2, p1, q1, r1))) differs = 1;
-
-    if (differs) disagree++;
-  }
-
-  printf("  droplet triangles of %.0e m at %.1f m from the origin\n", L, offset);
-  printf("  film thickness 1e-6 .. 1e-17 of the triangle size\n\n");
-  printf("  pairs tested                 %d\n", N);
-  printf("  genuinely crossing (exact)   %d\n", crossing);
-  printf("  at least one predicate sign disagrees:  %d  (%.3f %%)\n", disagree, 100.0 * disagree / N);
 }
 
 int main(int argc, char **argv)

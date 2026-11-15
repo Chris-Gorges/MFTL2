@@ -194,12 +194,14 @@ int MFTLBuildIndexedMesh(MFTL_Object *object, const double *positions, int n_ver
   MFTL_ASSERT(object != MFTL_NULL);
   MFTL_ASSERT(object->tris.n == 0 && object->verts.n == 0 && "MFTLBuildIndexedMesh: object is not empty");
 
-  if (object == MFTL_NULL || positions == MFTL_NULL || tri_verts == MFTL_NULL) return MFTL_ERROR;
+  /* No domain, no owner rank and no periodic frame for the geometry: the mesh
+   * could not leave "current" as the contract says, so it is not built. */
+  if (object == MFTL_NULL || object->domain == MFTL_NULL || positions == MFTL_NULL || tri_verts == MFTL_NULL) return MFTL_ERROR;
   if (n_vertices < 3 || n_triangles < 1) return MFTL_ERROR;
   if (!index_list_is_valid(tri_verts, n_triangles, n_vertices)) return MFTL_ERROR;
   if (!index_list_is_manifold(tri_verts, n_triangles, n_vertices, "MFTLBuildIndexedMesh")) return MFTL_ERROR;
 
-  const int rank = (object->domain != MFTL_NULL) ? object->domain->rank : 0;
+  const int rank = object->domain->rank;
 
   MFTLObjectSetCounts(object, n_vertices, n_vertices, 0, 0);
 
@@ -219,7 +221,7 @@ int MFTLBuildIndexedMesh(MFTL_Object *object, const double *positions, int n_ver
   build_topology(object, tri_verts, n_triangles);
 
   /* A new mesh leaves with current geometry, so the first MFTLRedistribute()
-   * routes by real centres. Without a domain nothing can route it yet. */
-  if (object->domain != MFTL_NULL) MFTLComputeTriangleGeometry(object, object->tris.n);
+   * routes by real centres. */
+  MFTLComputeTriangleGeometry(object, object->tris.n);
   return MFTL_SUCCESS;
 }

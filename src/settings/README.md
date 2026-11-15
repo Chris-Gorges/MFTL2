@@ -32,7 +32,10 @@ parameter block its module already defines:
 | `sphere` | refinement level, radius, centre | to `MFTLGenerateSphere` |
 | `remesh` | `every` + #MFTL_RemeshParameters | `&cfg.remesh.params` to `MFTLRemeshEnsemble` |
 | `topology` | `every`, the resolution-relative factors + #MFTL_TopologyOptions | `&cfg.topology.options` to `MFTLEnsembleApplyTopologyChanges` |
+| `volume` | `every` + #MFTL_VolumeCorrectionParameters | `&cfg.volume.params` to `MFTLEnsembleCorrectVolumes` |
+| `undulation` | `every` + #MFTL_UndulationParameters | `&cfg.undulation.params` to `MFTLEnsembleRemoveUndulations` |
 | `contact` | `every` + #MFTL_BVHBuildParams | `&cfg.contact.params` to `MFTLEnsembleIntersectObjects` |
+| `coupling` | #MFTL_CouplerParams | `&cfg.coupling.params` to `MFTLCouplerCreate` |
 | `redistribute` | the two process-wide switches | applied by `MFTLSettingsCreateEnsemble` |
 | `geometry` | the vertex-normal weighting | to `MFTLEnsembleUpdateVertexNormals` |
 | `output` | `every`, file prefix + #MFTL_VtkOptions | `&cfg.output.vtk` to `MFTLWriteVtu` |
@@ -201,20 +204,19 @@ Nothing to measure is an error only when something scheduled needs the length
 (`remesh.every > 0`, or `topology.every > 0`); otherwise the zeros stay, and a
 remesh attempted with them is refused loudly by the remesher's own band check.
 
-### Two defaults differ from the module's, on purpose {#settings_defaults}
+### The defaults are the modules' own {#settings_defaults}
 
 `MFTLSettingsDefaults` starts every module block from its module's own defaults
 and then applies the table, and `test_defaults_follow_the_modules` asserts that
-the two agree on every module key but one:
+the two agree on every module key. That includes
+**`remesh.parallel_phase_budget` = 8**, the whole placement table: one spanning
+pass does one serial call's work whatever the cap (#MFTL_RemeshParameters), so a
+timestep loop and a one-shot remesh want the same value.
 
-- **`remesh.parallel_phase_budget` is 4, not 32.** A settings file describes a
-  simulation, i.e. a timestep loop, where 4 was measured best and the API
-  default of 32 re-converges a good mesh every step at five times the cost and a
-  worse volume (the table on #MFTL_RemeshParameters). 32 remains right for a
-  one-shot remesh, which a caller who wants one sets.
-- **The arguments `MFTLInitRemeshParams` has no default for** — `target_length`
-  0 (derive), 3 iterations, triangle-based smoothing, and feature detection off
-  at 180 degrees, which is right for a smooth interface.
+What the table does choose are **the arguments `MFTLInitRemeshParams` has no
+default for** — `target_length` 0 (derive), 3 iterations, triangle-based
+smoothing, and feature detection off at 180 degrees, which is right for a
+smooth interface.
 
 ---
 

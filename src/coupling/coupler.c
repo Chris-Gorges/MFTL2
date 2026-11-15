@@ -4205,11 +4205,17 @@ static bool positions_moved_silently(const MFTL_Coupler *c, const MFTL_CouplingB
   s.quadrature_max_level = b->q_max;
   s.quadrature_ratio = b->q_ratio;
   cpl_markers m;
+  memset(&m, 0, sizeof m);
   int *locs = (int *) MFTLCplAlloc((size_t) MFTL_MAX(b->n_loc, 1) * sizeof(int), "binding locations");
   for (int i = 0; i < b->n_loc; ++i) locs[i] = b->win->locs[b->loc_band[i]];
   const int gst = gather_markers(c, &s, locs, b->n_loc, &m, MFTL_NULL);
   MFTLCplFree(locs);
-  if (gst != MFTL_COUPLING_OK) return true;
+  if (gst != MFTL_COUPLING_OK)
+  {
+    /* A failed gather may already hold arrays. */
+    MFTLCplMarkersFree(&m);
+    return true;
+  }
   const bool moved = (m.n != b->n_markers) || MFTLCplPositionsChecksum(m.pos, m.n) != b->pos_checksum;
   MFTLCplMarkersFree(&m);
   if (moved) fprintf(stderr, "MFTL coupling: bound vertex positions changed without MFTLObjectMarkChanged()\n");

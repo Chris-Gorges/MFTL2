@@ -98,7 +98,8 @@ typedef struct MFTL_UndulationStats
 } MFTL_UndulationStats;
 
 /**
- * @brief The defaults: one sweep, every edge, full relaxation.
+ * @brief The defaults: one sweep, edges kinked by more than 15 degrees, full
+ *        relaxation.
  * @return The parameter set to start from.
  */
 MFTL_UndulationParameters MFTLUndulationDefaultParameters(void);

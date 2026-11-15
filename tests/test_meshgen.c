@@ -100,6 +100,14 @@ static int test_indexed_mesh_rejects_bad_input(void)
   // The object must be untouched by a rejected call.
   TEST_ASSERT_EQUAL_INT(0, obj->verts.n);
   TEST_ASSERT_EQUAL_INT(0, obj->tris.n);
+
+  /* Without a domain there is no owner rank and no frame for the geometry the
+   * contract promises: refused, not built with rank 0 and stale geometry. */
+  MFTL_Object *orphan = MFTLObjectCreate(10);
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLBuildIndexedMesh(orphan, pos, 3, tv, 1));
+  TEST_ASSERT_EQUAL_INT(0, orphan->verts.n);
+  TEST_ASSERT_EQUAL_INT(0, orphan->tris.n);
+  MFTLObjectDestroy(&orphan);
   return 0;
 }
 

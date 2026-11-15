@@ -431,8 +431,8 @@ int MFTLSettingsSectionCount(void) { return N_SECTIONS; }
 
 const MFTL_SettingSection *MFTLSettingsSection(int i) { return (i >= 0 && i < N_SECTIONS) ? &g_sections[i] : MFTL_NULL; }
 
-/* A linear scan: sixty keys, looked up while parsing a file of a few dozen
- * lines, once per run. */
+/* A linear scan: about a hundred keys, looked up while parsing a file of a few
+ * dozen lines, once per run. */
 const MFTL_SettingInfo *MFTLSettingsFindKey(const char *key)
 {
   if (!key) return MFTL_NULL;

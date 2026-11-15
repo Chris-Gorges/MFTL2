@@ -811,6 +811,11 @@ static int test_unknown_corners_are_skipped_not_guessed(void)
   TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLBuildMeshFromLevelSet(c, &h, 1e-3));
   TEST_ASSERT_EQUAL_INT(0, c->tris.n);
 
+  /* An object without a domain is refused, even by a grid it would leave empty. */
+  MFTL_Object *orphan = MFTLObjectCreate(0);
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLBuildMeshFromLevelSet(orphan, &h, 1e-3));
+  MFTLObjectDestroy(&orphan);
+
   /* And a non-empty object is refused. */
   TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLBuildMeshFromLevelSet(a, &g, 1e-3));
 
@@ -834,13 +839,18 @@ static int test_extraction_is_scale_and_translation_invariant(void)
       const double lo[3] = {O - 1.5 * L, O - 1.5 * L, O - 1.5 * L}, hi[3] = {O + 1.5 * L, O + 1.5 * L, O + 1.5 * L};
       MFTL_SdfGrid g;
       fill_grid(&g, lo, hi, 0.125 * L, sphere_field, s);
-      MFTL_Object *obj = MFTLObjectCreate(0);  // no domain: nothing to wrap into
+      /* A domain of the grid's own box, so the scene, not only the sphere, is
+       * scaled and translated (and nothing wraps: no axis is periodic). */
+      int cuts[3] = {1, 1, 1};
+      double dlo[3] = {lo[0], lo[1], lo[2]}, dhi[3] = {hi[0], hi[1], hi[2]};
+      MFTL_Ensemble *ens = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, dlo, dhi, MFTL_NULL, 1);
+      MFTL_Object *obj = new_object(ens);
       TEST_ASSERT_EQUAL_INT(MFTL_SUCCESS, MFTLBuildMeshFromLevelSet(obj, &g, 1e-3));
       MFTLSdfGridFree(&g);
       TEST_ASSERT(inv_mesh_is_closed(obj));
       TEST_ASSERT_EQUAL_INT(2, euler_characteristic(obj));
       counts[si][oi] = obj->tris.n;
-      MFTLObjectDestroy(&obj);
+      MFTLEnsembleDestroy(&ens);
     }
   TEST_ASSERT_EQUAL_INT(counts[1][0], counts[0][0]);
   TEST_ASSERT_EQUAL_INT(counts[1][0], counts[1][1]);

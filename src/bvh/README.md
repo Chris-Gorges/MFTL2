@@ -516,8 +516,9 @@ exact value.
 `Two_Product` relies on $x - a_\text{hi}b_\text{hi}$ being rounded separately.
 A fused multiply-add contracts it into one rounding, the residue comes out zero,
 and every guarantee silently disappears while the results still look plausible.
-The file carries `#pragma STDC FP_CONTRACT OFF`, and `CMakeLists.txt` sets the
-flag for compilers that ignore the pragma. **Do not remove either.**
+The file gives `#pragma STDC FP_CONTRACT OFF` to every compiler but GCC (which
+ignores it with a warning), and `CMakeLists.txt` sets the flag for GCC and
+Clang; any other compiler has only the pragma. **Do not remove either.**
 
 #### Cost and benefit {#bvh_orientcost}
 

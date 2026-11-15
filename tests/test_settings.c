@@ -211,8 +211,8 @@ static int test_every_default_is_admissible(void)
 }
 
 /**
- * @brief The defaults of the module blocks are the modules' own, except the one
- *        difference the documentation states.
+ * @brief The defaults of the module blocks are the modules' own, without
+ *        exception.
  *
  * The table carries each default as text for the manual; this is what keeps
  * that text from drifting when a module changes its default.

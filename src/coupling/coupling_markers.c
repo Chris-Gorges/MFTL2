@@ -515,11 +515,15 @@ void MFTLCplQuadInterpolate(MPI_Comm comm, const cpl_quad *q, int64_t n_markers,
     if (n > 0)
     {
       MFTLCplSchedSend(comm, &s, CPL_TAG_QUAD, q->req_rank[r], sbuf + q->req_off[r] * ncomp, (size_t) n * sizeof(double), messages);
-      if (bytes) *bytes += (long) (2 * n * (int64_t) sizeof(double));
+      if (bytes) *bytes += (long) (n * (int64_t) sizeof(double));
     }
   }
   MFTLCplSchedWait(&s);
   MFTLCplSchedFree(&s);
+  /* Sent plus received on THIS rank, as MFTLCplQuadAccumulate() counts: what a
+   * rank receives (its ghosts) is not what it sends (owned vertices that other
+   * ranks hold as ghosts). */
+  if (bytes) *bytes += (long) (q->n_ghost * ncomp * (int64_t) sizeof(double));
   for (int64_t i = 0; i < n_markers; ++i)
   {
     const double l1 = q->bary[2 * i], l2 = q->bary[2 * i + 1];

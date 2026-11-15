@@ -677,7 +677,7 @@ void MFTLRemeshSmooth(MFTL_Object *obj, const MFTL_RemeshParameters *params, int
 
     memcpy(new_pos, obj->verts.pos, (size_t) n_v * 3 * sizeof(double));
 
-    for (int v = 0; v < n_v; ++v)  // why also over ghosts? Dont I want to smooth only locals?
+    for (int v = 0; v < n_v; ++v)
     {
       const MFTL_Vertex *const rec = &obj->verts.rec[v];
 

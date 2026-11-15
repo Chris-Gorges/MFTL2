@@ -18,9 +18,9 @@ On this laptop (see [Machine](#machine)), in short:
   same directive source on 8 CPU threads, 6.4–7.7× faster than the pure-MPI library on 12 cores, and 17–18× faster
   than one core. This is on a laptop GPU that runs FP64 at 1/64 of FP32.
 - **LeVeque: it does not.** The remesher stays on the host and takes 92–98 % of the step.
-- **CUDA is not faster.** OpenACC and OpenMP are as fast as CUDA, or up to 8 % faster. The kernels are FP64-bound,
-  so code generation hardly matters here. Their compute code is the same size; CUDA adds a second language and build,
-  hand-written reductions, and no CPU fallback.
+- **A straightforward CUDA port is not faster.** OpenACC and OpenMP are as fast as the CUDA port of the same kernels,
+  or up to 8 % faster. The kernels are FP64-bound on this GPU, so code generation hardly matters here. Their compute
+  code is the same size; CUDA adds a second language and build, hand-written reductions, and no CPU fallback.
 - **OpenACC worked best out of the box.** OpenMP matched it only after the nest was written with the `loop`
   construct ([below](#1-openmp-generic-mode-and-the-loop-construct)).
 
@@ -398,14 +398,15 @@ spheres and single runs otherwise.
 - **CPU threads.** The best CPU variant is the directive source on gcc's OpenMP threads. The nvc multicore builds
   keep the GPU code's atomics in the normals: 8.4 against gcc's 2.1 ms. Their geometry is faster (3.1 vs 4.4 ms).
 
-**Why CUDA is not faster: the kernels are FP64-bound.**
+**Why the CUDA port is not faster: the kernels are FP64-bound.**
 
 - The geometry kernel issues about 180–250 FP64 instructions per triangle (counted in the SASS).
 - This GPU retires 86–124 G FP64 instructions/s. That puts the floor at 1.9–2.7 ms at 1000 spheres; measured:
   1.8–2.0 ms.
 - Memory traffic is ~88 GB/s, 23 % of the 384 GB/s the board offers.
 - So all three models wait on the same FP64 units, and differences in code generation hardly show.
-- Shared-memory tiling or other CUDA-only tuning would not help either.
+- Shared-memory tiling and other CUDA-only tuning were not tried. They mainly save memory traffic, which is not the
+  limit on this GPU, so little gain is expected here.
 - On a data-centre GPU (FP64 at 1/2 of FP32) the same kernels would be memory-bound. There the GPU's margin over
   the CPU would be far larger, and memory layout and coalescing would matter more. That is where a CUDA-vs-directives
   difference could appear. Not tested here.

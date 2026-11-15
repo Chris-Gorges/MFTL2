@@ -608,6 +608,11 @@ int main(int argc, char *argv[])
 {
   MPI_Init(&argc, &argv);
 
+  /* A single-core measurement: rank 0 runs it on MPI_COMM_SELF and any other
+   * rank only waits in MPI_Finalize. An ensemble on MPI_COMM_WORLD would make
+   * MFTLEnsembleCreate() a collective the other ranks never join (a hang under
+   * mpirun -n 2), and running the tables on every rank at once would measure
+   * memory-bandwidth contention rather than the layout. */
   int rank;
   MPI_Comm_rank(MPI_COMM_WORLD, &rank);
   if (rank != 0)
@@ -619,7 +624,7 @@ int main(int argc, char *argv[])
   int cuts[3] = {1, 1, 1};
   double lo[3] = {-2.0, -2.0, -2.0};
   double hi[3] = {2.0, 2.0, 2.0};
-  MFTL_Ensemble *ens = MFTLEnsembleCreate(MPI_COMM_WORLD, cuts, lo, hi, MFTL_NULL, 8);
+  MFTL_Ensemble *ens = MFTLEnsembleCreate(MPI_COMM_SELF, cuts, lo, hi, MFTL_NULL, 8);
 
   printf("Position layout: interleaved pos[3v+k] vs padded pos[4v+k] vs split x[v],y[v],z[v]\n");
   printf("ns per element, best of %d runs of %d repetitions. Lower is better.\n\n", TRIALS, REP);
@@ -655,8 +660,8 @@ int main(int argc, char *argv[])
   printf("      three separate load-add-store triples: SIX. Scattering into one array\n");
   printf("      pairs up; scattering into three cannot.\n");
   printf("\n");
-  printf("  Net: the two gathered/scattered patterns (P3 and P4)\n");
-  printf("  vertex normals) pull in OPPOSITE directions by similar amounts, so the\n");
+  printf("  Net: the two indexed patterns (P3 triangle geometry, P4 vertex\n");
+  printf("  normals) pull in OPPOSITE directions by similar amounts, so the\n");
   printf("  layout question is close to a wash on time and is therefore decided on\n");
   printf("  the API instead. Interleaved keeps MFTLVertexPos() returning a plain\n");
   printf("  const double[3], which is what every geometry routine in the library\n");

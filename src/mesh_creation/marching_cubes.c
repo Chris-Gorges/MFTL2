@@ -447,7 +447,7 @@ int MFTLExtractLevelSet(const MFTL_SdfGrid *grid, const int cell_lo[3], const in
 int MFTLBuildMeshFromLevelSet(MFTL_Object *obj, const MFTL_SdfGrid *grid, double snap)
 {
   MFTL_ASSERT(obj != MFTL_NULL && grid != MFTL_NULL);
-  if (obj == MFTL_NULL || grid == MFTL_NULL || grid->phi == MFTL_NULL) return MFTL_ERROR;
+  if (obj == MFTL_NULL || obj->domain == MFTL_NULL || grid == MFTL_NULL || grid->phi == MFTL_NULL) return MFTL_ERROR;
   if (obj->verts.n != 0 || obj->tris.n != 0) return MFTL_ERROR;
 
   /* Every cell of the window, including the seam-closing cell on a periodic
@@ -471,8 +471,7 @@ int MFTLBuildMeshFromLevelSet(MFTL_Object *obj, const MFTL_SdfGrid *grid, double
   }
   else
   {
-    if (obj->domain != MFTL_NULL)
-      for (int v = 0; v < s.n_verts; ++v) MFTLApplyPeriodicity(obj->domain, &s.pos[3 * (size_t) v]);
+    for (int v = 0; v < s.n_verts; ++v) MFTLApplyPeriodicity(obj->domain, &s.pos[3 * (size_t) v]);
     status = MFTLBuildIndexedMesh(obj, s.pos, s.n_verts, s.tri, s.n_tris);
   }
 
