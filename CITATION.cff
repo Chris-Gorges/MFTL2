@@ -12,6 +12,8 @@ abstract: >-
 authors:
   - given-names: Christian
     family-names: Gorges
+  - given-names: Fabian
+    family-names: Denner
   - given-names: Berend
     name-particle: van
     family-names: Wachem

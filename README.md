@@ -354,6 +354,12 @@ reproducing the host run to round-off — and is kept out of the build, the test
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
 
+## Authors
+
+- **Christian Gorges** — principal developer
+- **Fabian Denner** — co-supervisor
+- **Berend van Wachem** — supervisor
+
 ## Citing
 
 If you use MFTL in your work, please cite it — GitHub's "Cite this repository" button reads
@@ -361,5 +367,5 @@ If you use MFTL in your work, please cite it — GitHub's "Cite this repository"
 
 ## License
 
-Copyright 2025–2026 Christian Gorges and Berend van Wachem. Licensed under the [Apache License 2.0](LICENSE);
-see [NOTICE](NOTICE) for third-party attributions.
+Copyright 2025–2026 Christian Gorges, Fabian Denner and Berend van Wachem. Licensed under the
+[Apache License 2.0](LICENSE); see [NOTICE](NOTICE) for third-party attributions.
