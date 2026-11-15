@@ -1,7 +1,9 @@
 # README animations
 
-`make_readme_gifs.sh` regenerates the four existing animations. The larger Linux
-workstation duct animation has a separate entry point, `make_duct_gif.sh`.
+`make_readme_gifs.sh` regenerates three of the README's four animations on a
+laptop (LeVeque's test, the sizing comparison, the liquid jet). The fourth, 20,000
+droplets in a duct on 32 ranks, needs a Linux workstation and has its own entry
+point, `make_duct_gif.sh`.
 
 ## Linux workstation: 20,000 droplets on 32 ranks
 

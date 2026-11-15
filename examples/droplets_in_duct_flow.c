@@ -44,7 +44,8 @@
  *          [--vtk N] [--vtk-stream] [--vtk-timeout S] [--report N] [--verify]
  *
  *   --drops N    number of droplets                      (default 600)
- *                (the README animation: 800 on 8 ranks, --refine 3 --vtk 2)
+ *                (the README animation: 20000 on 32 ranks, --refine 4, radii
+ *                0.0103 .. 0.0239; tools/media/make_duct_gif.sh)
  *   --rmin/rmax  radius range, in units of H             (default 0.03 .. 0.07)
  *   --length L   duct length, in units of H              (default 4)
  *   --refine N   icosphere level of the generated drops  (default 2)

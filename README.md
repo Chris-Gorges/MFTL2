@@ -32,13 +32,15 @@ Doxygen manual with call graphs, rebuilt from `main` on every push.
       instead of 1.42 %, with up to twice the triangles.</td>
   </tr>
   <tr>
-    <td colspan="2"><img src=".github/images/duct.gif" alt="800 droplets carried through a periodic duct, coloured by owning rank; the camera closes in on one droplet"></td>
+    <td colspan="2"><img src=".github/images/duct.gif" alt="20 000 droplets carried through a periodic duct, coloured by owning rank; the camera closes in on one droplet"></td>
   </tr>
   <tr>
-    <td colspan="2" valign="top"><b>Many bodies.</b> 800 droplets of random size carried through a periodic duct by a
-      prescribed swirling flow, remeshed every step and redistributed across 8 ranks as they move (colour: owning rank; a droplet in
-      two colours is shared by two ranks). Midway the camera follows one droplet to show its mesh and how it deforms.
-      1.0 &rarr; 1.7 M triangles, volume +0.3 % over one pass through the duct.</td>
+    <td colspan="2" valign="top"><b>Many bodies.</b> 20&nbsp;000 droplets of random size carried through a periodic duct
+      by a prescribed swirling flow, remeshed every step and redistributed across 32 ranks as they move (colour: owning
+      rank, the 8&times;2&times;2 decomposition; a droplet in two colours is shared by two ranks). Midway the camera
+      closes in on one droplet and follows it, to show the meshes and how the droplets deform. 102.4 &rarr; 123.7 M
+      triangles; after one pass through the duct every droplet is still a closed surface of sphere topology and the
+      volume is off by 0.025 %.</td>
   </tr>
   <tr>
     <td colspan="2"><img src=".github/images/liquid_jet.gif" alt="A liquid jet whose necks pinch off into drops"></td>

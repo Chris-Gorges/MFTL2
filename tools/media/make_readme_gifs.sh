@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# Regenerates the four animations in the README (.github/images/*.gif) --
-# LeVeque's deformation test face-on, the same test with uniform against
-# curvature-adaptive sizing, droplets in a duct and a liquid jet breaking up:
-# runs the examples with VTU output, renders the frames with ParaView's pvbatch
+# Regenerates three of the four animations in the README (.github/images/*.gif)
+# -- LeVeque's deformation test face-on, the same test with uniform against
+# curvature-adaptive sizing, and a liquid jet breaking up: runs the examples
+# with VTU output, renders the frames with ParaView's pvbatch
 # (render_frames.py) on a TRANSPARENT background, and encodes each GIF with a
 # palette of its own and one transparent colour (ffmpeg), so it sits on GitHub's
 # light and dark themes alike.
@@ -15,8 +15,10 @@
 #        WORK_DIR   where the runs and frames go (default a temporary directory)
 #        PVBATCH    pvbatch to use (default: from PATH, else the ParaView app on macOS)
 #
-# Needs MPI with 8 slots, ParaView >= 5.11 and ffmpeg. Takes about eight minutes and
-# 9 GB of scratch space (the duct run writes 121 frames of up to 1.7 M triangles).
+# Needs MPI with 4 slots, ParaView >= 5.11 and ffmpeg.
+#
+# The fourth, 20,000 droplets in a duct on 32 ranks, needs a workstation and is
+# made by make_duct_gif.sh (the --duct-workstation mode above; tools/media/README.md).
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -98,19 +100,3 @@ cat > "$work/liquid_jet.json" << EOF
 EOF
 "$PVBATCH" "$render" "$work/liquid_jet.json"
 gif liquid_jet 15 880 1
-
-# 3. 800 droplets of random size carried through a periodic duct by a swirling
-#    flow, remeshed every step and redistributed over 8 ranks; coloured by rank.
-#    Between frames 30 and 100 the camera closes in on droplet 42, a large one
-#    on the near side (nothing between it and the camera), and follows it.
-mkdir -p "$work/duct" && cd "$work/duct"
-mpirun -n 8 "$build/droplets_in_duct_flow" --drops 800 --refine 3 --steps 240 --report 60 --vtk 2 > run.log
-cat > "$work/duct.json" << EOF
-{"pattern": "$work/duct/duct_*.pvtu", "out": "$work/duct_frames", "stride": 1,
- "size": [1080, 400], "focal": [2.0, 0.5, 0.42], "position": [2.0, -3.1, 2.15], "up": [0, 0, 1], "angle": 30,
- "color": "TriangleOwner", "n_colors": 8, "edges": false, "ambient": 0.3, "diffuse": 0.75, "specular": 0.3,
- "box": [0, 4, 0, 1, 0, 1], "box_width": 3.0, "transparent": true,
- "zoom": {"in": 30, "out": 100, "ramp": 15, "body": 42, "distance": 0.4, "edge_opacity": 0.6}}
-EOF
-"$PVBATCH" "$render" "$work/duct.json"
-gif duct 15 800 0 64   # the close-up's mesh edges change every pixel of every frame: 64 colours keep it near 7 MB
