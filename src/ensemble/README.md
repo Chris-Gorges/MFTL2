@@ -11,6 +11,8 @@
 | `ensemble_reduce.c` | per-body reductions and exclusive scans over each body's holders |
 | `ensemble_extents.c` | the periodic extent rule, checked over every body |
 | `ensemble_integrals.c` | area, volume and centroid of every body |
+| `ensemble_fields.c` | registered per-entity fields, collectively declared before bodies are added |
+| `ensemble_surface.c` | the signed curvature and the surface-tension force on every body, with the ghost exchanges their inputs and outputs need, and the per-body force statistics |
 
 ---
 
@@ -99,6 +101,24 @@ Measured points worth knowing (docs/analysis.md §1.6):
 **exchange**, not a reduction: owned normals are already exact (vertex-complete
 halo); one ghost exchange (`MFTLUpdateGhostVertexNormals`, three neighbourhood
 collectives) supplies the ghost half.
+
+The signed curvature and the surface-tension force follow the same rule
+(@ref geom_curvature, @ref geom_surface_tension): the local kernel on every object,
+plus exactly the exchanges its inputs and outputs need, decided from arguments that
+are identical on every rank.
+
+| call | before the kernels | after |
+|---|---|---|
+| `MFTLEnsembleComputeCurvature`, COTAN | -- | ghost rows of the result field |
+| `MFTLEnsembleComputeCurvature`, FIT | vertex normals, exact on ghosts | ghost rows of the result field |
+| `MFTLEnsembleComputeSurfaceTension`, uniform sigma, triangle normals | -- | -- |
+| ... with a sigma field | its ghost rows | -- |
+| ... with vertex normals on the contour | vertex normals, exact on ghosts | -- |
+| `MFTLEnsembleSurfaceTensionStats` | -- | one holder reduction, five sums per body |
+
+Results go to registered fields (`MFTLEnsembleRegisterField`), which follow the
+body through redistributions and remeshing; the curvature field's component count
+(1, 2, 4 or 7) selects the record.
 
 ---
 

@@ -75,9 +75,16 @@ Doxygen manual with call graphs, rebuilt from `main` on every push.
 - **Coupling to a flow solver.** Interpolation from, and spreading onto (its exact transpose), a solver's lattice or
   point cloud with Peskin-type kernels corrected to linear exactness. Coverage is proved by counting indices, never
   assumed; a missing sample is reported, not renormalised away.
+- **Surface tension and curvature that converge on the meshes a run produces.** Tryggvason's Frenet vertex and
+  Frenet element forces, with the net force of a closed body zero to round-off, Marangoni stresses from a varying
+  surface-tension field, and rims that slide along walls. The vertex form as the book prints it (the default) is the
+  exact gradient of the discrete surface energy: its net torque vanishes too, and the work it does on any velocity is
+  exactly the energy the surface loses. The signed curvature with its Gaussian and principal parts, by Meyer et al.'s
+  cotangent operators or by a one-ring fit. With fitted vertex normals the forces and the curvature converge pointwise
+  on remeshed and marching-cubes meshes, where the cotangent formula does not.
 - **Communication that scales with what a rank holds.** Per-body reductions and prefix sums go to each body's
   holders over a 26-neighbour graph communicator, certified after the exchange, with an exact global fallback.
-- **Tests that check the answer.** 150 CTest entries at 1, 2, 3, 4, 8 and 27 ranks. Distributed results are compared
+- **Tests that check the answer.** 156 CTest entries at 1, 2, 3, 4, 8 and 27 ranks. Distributed results are compared
   with the same call on one rank, contact queries as multisets against an exhaustive sweep, coupling rows against
   brute-force references written without the library's machinery; several suites were mutation-checked.
 
@@ -317,7 +324,7 @@ Every public function is documented in its header (`include/`), and each module 
 |---|---|
 | Mesh container: pools, layout, derived arrays | [`src/object`](src/object/README.md) |
 | Half-edge connectivity | [`src/topology`](src/topology/README.md) |
-| Periodic-aware geometry, closest point, signed distance, least squares | [`src/geometry`](src/geometry/README.md) |
+| Periodic-aware geometry: vertex normals, curvature, surface tension, closest point, signed distance, least squares | [`src/geometry`](src/geometry/README.md) |
 | Ensemble handle and per-body collectives | [`src/ensemble`](src/ensemble/README.md) |
 | Mesh construction: icosphere, marching cubes | [`src/mesh_creation`](src/mesh_creation/README.md) |
 | Redistribution, ghost synchronisation, spatial halo | [`src/communication`](src/communication/README.md) |

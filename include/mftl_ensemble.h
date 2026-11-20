@@ -555,9 +555,11 @@ void MFTLEnsembleComputeTriangleGeometry(MFTL_Ensemble *ensemble);
  *       (counts, requests, replies), 8 B request + 32 B reply per ghost vertex.
  *
  * @param ensemble  The ensemble.
- * @param weighting #MFTL_NORMAL_WEIGHT_AREA (volume gradient; advection and
- *                  smoothing) or #MFTL_NORMAL_WEIGHT_ANGLE (pseudo-normal for
- *                  signed distances). Should be the same on every rank for a
+ * @param weighting Which normal (#MFTL_NormalWeighting): #MFTL_NORMAL_WEIGHT_AREA
+ *                  (the cheapest; the volume gradient's direction),
+ *                  #MFTL_NORMAL_WEIGHT_ANGLE (the pseudo-normal of signed
+ *                  distances) or #MFTL_NORMAL_WEIGHT_FIT (second order; what
+ *                  curvature reads). Should be the same on every rank for a
  *                  consistent field; the exchange does not read it.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR if this rank could not refresh every
  *         ghost (a LOCAL outcome, not agreed across ranks).
@@ -625,6 +627,99 @@ int MFTLEnsembleRegisterField(MFTL_Ensemble *ens, const char *name, MFTL_FieldEn
  * @return Field id, or MFTL_ERROR if absent.
  */
 int MFTLEnsembleFindField(const MFTL_Ensemble *ens, const char *name);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Signed curvature and surface tension
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Signed curvature of every vertex of every body into a registered
+ *        vertex field, owned AND ghost rows exact.
+ *
+ * MFTLComputeVertexCurvature() on every object -- exact on owned vertices --
+ * followed by ONE ghost exchange of the field (MFTLUpdateGhostFields()), so a
+ * ghost row holds its owner's record. #MFTL_CURVATURE_FIT first computes the
+ * fitted vertex normals (#MFTL_NORMAL_WEIGHT_FIT) and makes the ghosts' exact
+ * (MFTLEnsembleUpdateVertexNormals()), because it reads the normals of the
+ * one-ring and converges only with second-order ones; #MFTL_CURVATURE_COTAN
+ * needs no normals and leaves `verts.normal` alone.
+ *
+ * @param ens        The ensemble.
+ * @param method     #MFTL_CURVATURE_COTAN or #MFTL_CURVATURE_FIT; identical on every rank.
+ * @param field_id   A registered VERTEX field of 1, 2, 4 or
+ *                   #MFTL_CURVATURE_COMPONENTS components; the component count
+ *                   selects the record (mftl_geometry.h, section 11).
+ * @param n_fallback THIS rank's owned vertices whose fit fell back to the
+ *                   cotangent values, or #MFTL_NULL. Not reduced.
+ * @return #MFTL_SUCCESS, #MFTL_ERROR on every rank for invalid arguments (the
+ *         registry is replicated, so the verdict agrees), or #MFTL_ERROR on a
+ *         rank whose ghosts could not all be refreshed (a local verdict).
+ *
+ * @collective Ranks holding no bodies must call it too.
+ */
+int MFTLEnsembleComputeCurvature(MFTL_Ensemble *ens, MFTL_CurvatureMethod method, int field_id, int *n_fallback);
+
+/**
+ * @brief The surface-tension force on every owned vertex or triangle of every
+ *        body, into a registered field.
+ *
+ * Adds to MFTLComputeSurfaceTension() exactly what its inputs need: the ghost
+ * rows of `p->sigma_field` when sigma is a field (MFTLUpdateGhostFields()),
+ * and with #MFTL_CONTOUR_NORMAL_VERTICES the fitted vertex normals
+ * (#MFTL_NORMAL_WEIGHT_FIT), exact on ghosts (MFTLEnsembleUpdateVertexNormals(),
+ * which overwrites `verts.normal`). With a uniform sigma and triangle normals
+ * on the contour it makes no collective call at all, but every rank must
+ * still call it. Owned rows are exact; ghost rows are not forces and are not
+ * exchanged.
+ *
+ * @param ens         The ensemble.
+ * @param p           The parameters, identical on every rank. Must not be #MFTL_NULL.
+ * @param force_field A registered field of 3 components: a VERTEX field for
+ *                    #MFTL_TENSION_FRENET_VERTEX, a TRIANGLE field for
+ *                    #MFTL_TENSION_FRENET_ELEMENT.
+ * @return #MFTL_SUCCESS; #MFTL_ERROR on every rank for invalid parameters or
+ *         fields; #MFTL_ERROR on a rank whose ghosts could not all be refreshed.
+ *
+ * @collective Ranks holding no bodies must call it too.
+ */
+int MFTLEnsembleComputeSurfaceTension(MFTL_Ensemble *ens, const MFTL_SurfaceTensionParameters *p, int force_field);
+
+/**
+ * @struct MFTL_SurfaceTensionStats
+ * @brief Per-body totals of a surface-tension field. Identical, to the bit, on
+ *        every rank that holds the body.
+ */
+typedef struct MFTL_SurfaceTensionStats
+{
+  /**
+   * The sum of the force over the body's owned entities, over every holder.
+   * Zero to round-off for a closed body in both forms, and for an open one with
+   * free rims; with #MFTL_RIM_FORCE_WALL it is the force the walls do not take.
+   */
+  double net_force[3];
+  double energy;  ///< The surface energy \f$E = \sum_T \sigma_T A_T\f$ the vertex form is the gradient of.
+  double area;  ///< The body's area.
+} MFTL_SurfaceTensionStats;
+
+/**
+ * @brief Net force, surface energy and area of every body this rank holds,
+ *        from a force field filled by MFTLEnsembleComputeSurfaceTension().
+ *
+ * One MFTLEnsembleReduceBodies() of five sums per held body. Reads sigma as
+ * the force call did; call it after that call, with the same parameters, so
+ * the sigma ghosts are current.
+ *
+ * @param ens         The ensemble.
+ * @param p           The parameters the force was computed with.
+ * @param force_field The force field.
+ * @param[out] out    `[n_local_objects]` by LOCAL SLOT; may be #MFTL_NULL when
+ *                    this rank holds no body.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on every rank for invalid parameters or
+ *         fields, or on a rank holding bodies that passes a NULL @p out.
+ *
+ * @collective Ranks holding no bodies must call it too.
+ */
+int MFTLEnsembleSurfaceTensionStats(MFTL_Ensemble *ens, const MFTL_SurfaceTensionParameters *p, int force_field, MFTL_SurfaceTensionStats *out);
 
 #ifdef __cplusplus
 }

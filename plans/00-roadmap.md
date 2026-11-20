@@ -1,7 +1,7 @@
 # Roadmap
 
 What MFTL does not do yet, what is deliberately not planned, and the known limits of what it does. Status
-2026-11-14. Item ids (A1, B3, D20, ...) are stable: source comments cite them as "roadmap item DN". A detailed plan
+2026-11-20. Item ids (A1, B3, D20, ...) are stable: source comments cite them as "roadmap item DN". A detailed plan
 for an item, when one is written, is a separate `plans/NN-<item>.md` that cites its id and is deleted once the item
 is done and its theory is in the module README.
 
@@ -15,7 +15,6 @@ Priorities:
 
 | Id | Item | Plan |
 |---|---|---|
-| A1 | **Surface tension and signed curvature.** The force a coupled solver spreads; today every solver re-derives it. | A vertex area-gradient force (one scatter, exact on owned vertices, ΣF = 0 and Σx×F = 0 to round-off, Marangoni from a per-triangle σ); signed mean curvature by cotangent and by a 1-ring position-plus-normal fit; rim modes. Gate: momentum to round-off at np 1–27, a measured convergence rate for the Laplace pressure, the 2⁻²⁰ length-unit test bit for bit. |
 | A2 | **Distance and inside/outside at the solver's points.** Which cells lie inside a body, and the signed distance and closest surface point near the front, for any shape and without gathering the body. | Three steps: a band query (φ, body, closest triangle and barycentrics) from owned triangles only, bitwise np-independent; an exact sign everywhere (ray parity with exact predicates, summed along the process row); exact cut-cell volume moments. |
 | A3 | **Rigid bodies.** Moving every rigid body every step; mass properties; the load per body. | An exact inertia tensor by the divergence theorem; motion as a pose (`x = c + R(q) x_ref` from a stored body-frame field), not composed increments, so it never drifts and ghosts stay bitwise equal to owners; per-body force and torque through the holder reduction. The rigid-body integrator stays with the solver. |
 | A4 | **Mesh input.** STL, GTS and OBJ. | One pipeline: parse on rank 0, weld, drop degenerate facets, `MFTLBuildIndexedMesh`, reject non-manifold input on every rank, publish and redistribute. Inherits the rank-0 generation peak (D20). |
@@ -37,7 +36,7 @@ Priorities:
 
 | Id | Item | Revive when |
 |---|---|---|
-| C1 | Contact angle and conormal at rim vertices | a contact-line model runs on an open surface |
+| C1 | Contact angle and conormal at rim vertices. The surface-tension rim modes build the rim's conormal from a one-sided normal, which is first order (a cap's wall force 1.4 % off at 24 rings) | a contact-line model runs on an open surface |
 | C2 | Surface viscosity (Boussinesq–Scriven); needs B4 | a case needs it |
 | C3 | Membranes: hyperelastic in-plane forces, dihedral bending, area and volume penalties; a body with a reference shape is never remeshed | capsules or red blood cells are simulated |
 | C4 | Local volume correction (D29), local topology reconstruction (D22), interpenetrating bodies (D28), detection cost (D23) | a production case measures the shape drift or the topology cost |
@@ -57,7 +56,7 @@ Capabilities that earlier front-tracking libraries offer and MFTL replaces or le
 | Boundary tags, loops and boundary-curve objects | A rim is identified by its position; `MFTL_RimProjector` takes application constraints. |
 | Opaque per-triangle byte payloads | Typed registered fields with transfer policies. |
 | Pointer handles, an edge facade, per-entity accessors in hot loops | Implicit indexing makes edge identity `3t+k`; kernels work on arrays. |
-| 2- and 3-ring neighbourhoods; topological ghost-layer growth | Curvature from a 1-ring fit (A1); edge forces by reverse accumulation (B4). |
+| 2- and 3-ring neighbourhoods; topological ghost-layer growth | Curvature from a 1-ring position-plus-normal fit (`MFTL_CURVATURE_FIT`) with second-order fitted normals; edge forces by reverse accumulation (B4). |
 | A process grid matched to the fluid decomposition | The coupler decouples the two decompositions; cuts matter only for load balance (C5). |
 | Per-point ray casting with random rays and retries | Replaced by A2's exact predicates. |
 | Gathering a body to one rank, or sending every triangle to every rank | Exactly the O(N) per rank the library exists to avoid. |

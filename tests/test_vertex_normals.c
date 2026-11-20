@@ -2,7 +2,8 @@
  * @Author: Christian Gorges
  * @Date: 2026-08-14
  *
- * @brief Unit tests for MFTLComputeVertexNormals (src/geometry/vertex_geometry.c).
+ * @brief Unit tests for MFTLComputeVertexNormals and MFTLComputeVertexNormalAt
+ *        (src/geometry/vertex_geometry.c).
  *
  * The pass is a scatter, which is the shape most likely to be subtly wrong: an
  * index computed one way in the accumulation and another way in a consumer, a
@@ -532,7 +533,7 @@ static int test_angle_weighted_normal_ignores_how_the_fan_is_split(void)
   return 0;
 }
 
-static int test_both_weightings_agree_on_a_regular_sphere(void)
+static int test_the_three_normals_agree_on_a_regular_sphere(void)
 {
   const double c[3] = {0.1, 0.2, -0.3};
   MFTL_Object *obj = make_sphere(g_open, c, 1.0, 4);
@@ -544,26 +545,149 @@ static int test_both_weightings_agree_on_a_regular_sphere(void)
     double *area = (double *) malloc(bytes);
     memcpy(area, obj->verts.normal, bytes);
 
-    MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_ANGLE);
-
-    /* Near-equilateral fans: the two agree closely but not exactly. */
-    const double dev = max_deviation(area, obj->verts.normal, obj->verts.n);
-    if (!(dev > 0.0 && dev < 5e-3)) ok = 0;
-
-    for (int v = 0; v < obj->verts.n; ++v)
+    for (int w = 0; w < 2; ++w)
     {
-      const double *n = &obj->verts.normal[3 * v];
-      const double *p = &obj->verts.pos[3 * v];
-      const double r[3] = {p[0] - c[0], p[1] - c[1], p[2] - c[2]};
-      const double rl = sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
-      const double len = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-      if (fabs(len - 1.0) > 1e-14) ok = 0;
-      if ((n[0] * r[0] + n[1] * r[1] + n[2] * r[2]) / rl < 0.999) ok = 0;
+      MFTLComputeVertexNormals(obj, (w == 0) ? MFTL_NORMAL_WEIGHT_ANGLE : MFTL_NORMAL_WEIGHT_FIT);
+
+      /* Near-equilateral fans: they agree closely but not exactly. */
+      const double dev = max_deviation(area, obj->verts.normal, obj->verts.n);
+      if (!(dev > 0.0 && dev < 5e-3)) ok = 0;
+
+      for (int v = 0; v < obj->verts.n; ++v)
+      {
+        const double *n = &obj->verts.normal[3 * v];
+        const double *p = &obj->verts.pos[3 * v];
+        const double r[3] = {p[0] - c[0], p[1] - c[1], p[2] - c[2]};
+        const double rl = sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+        const double len = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+        if (fabs(len - 1.0) > 1e-14) ok = 0;
+        if ((n[0] * r[0] + n[1] * r[1] + n[2] * r[2]) / rl < 0.999) ok = 0;
+      }
     }
     free(area);
   }
 
   TEST_ASSERT(agreed(ok, g_open->domain.comm_world));
+  return 0;
+}
+
+/** @brief Moves every coordinate by a deterministic pseudo-random amount in [-amp/2, amp/2), then wraps. */
+static void jitter(MFTL_Object *obj, double amp, unsigned seed)
+{
+  for (int v = 0; v < obj->verts.n; ++v)
+  {
+    double *p = &obj->verts.pos[3 * v];
+    for (int k = 0; k < 3; ++k)
+    {
+      seed = seed * 1664525u + 1013904223u;
+      p[k] += amp * ((double) (seed >> 8) / (double) (1u << 24) - 0.5);
+    }
+    MFTLApplyPeriodicity(obj->domain, p);
+  }
+}
+
+/** @brief Enclosed volume by the divergence theorem, sum of x0 . (x1 x x2) / 6 (non-periodic). */
+static double enclosed_volume(const MFTL_Object *obj)
+{
+  double vol = 0.0;
+  for (int t = 0; t < obj->tris.n; ++t)
+  {
+    const int *tv = &obj->tris.verts[3 * t];
+    const double *a = &obj->verts.pos[3 * tv[0]], *b = &obj->verts.pos[3 * tv[1]], *c = &obj->verts.pos[3 * tv[2]];
+    vol += (a[0] * (b[1] * c[2] - b[2] * c[1]) + a[1] * (b[2] * c[0] - b[0] * c[2]) + a[2] * (b[0] * c[1] - b[1] * c[0])) / 6.0;
+  }
+  return vol;
+}
+
+/**
+ * @brief The area-weighted normal is the direction of dV/dx_v, which is what
+ *        the smoother and the volume corrections rely on: against central
+ *        differences of the enclosed volume, on a jittered sphere where the
+ *        angle-weighted normal is a different vector.
+ */
+static int test_the_area_normal_is_the_direction_of_the_volume_gradient(void)
+{
+  MFTL_Ensemble *ens = MFTLEnsembleCreate(MPI_COMM_SELF, (int[3]){1, 1, 1}, (double[3]){-4, -4, -4}, (double[3]){4, 4, 4}, MFTL_NULL, 4);
+  const double c[3] = {0.0, 0.0, 0.0};
+  MFTL_Object *obj = make_sphere(ens, c, 1.0, 3);
+  jitter(obj, 0.02, 7u);
+  MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
+  double *g = (double *) malloc(3 * (size_t) obj->verts.n * sizeof(double));
+  memcpy(g, obj->verts.normal, 3 * (size_t) obj->verts.n * sizeof(double));
+  MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_ANGLE);
+
+  double worst = 0.0, angle_off = 0.0;
+  const double h = 1e-5;  // V is cubic in x_v: the central difference's truncation error is tiny
+  for (int v = 0; v < obj->verts.n; v += 7)
+  {
+    double d[3];
+    for (int k = 0; k < 3; ++k)
+    {
+      double *x = &obj->verts.pos[3 * v + k];
+      const double x0 = *x;
+      *x = x0 + h;
+      const double vp = enclosed_volume(obj);
+      *x = x0 - h;
+      const double vm = enclosed_volume(obj);
+      *x = x0;
+      d[k] = (vp - vm) / (2.0 * h);
+    }
+    const double m = sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    for (int k = 0; k < 3; ++k)
+    {
+      worst = fmax(worst, fabs(d[k] / m - g[3 * v + k]));
+      angle_off = fmax(angle_off, fabs(obj->verts.normal[3 * v + k] - g[3 * v + k]));
+    }
+  }
+  int rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  if (rank == 0) printf("\n    worst component against central differences %.1e; the angle normal differs by up to %.1e\n  ", worst, angle_off);
+  free(g);
+  MFTLEnsembleDestroy(&ens);
+  TEST_ASSERT(agreed(worst < 1e-7, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(angle_off > 1e-4, MPI_COMM_WORLD));  // the control: a different vector on this mesh
+  return 0;
+}
+
+/**
+ * @brief MFTLComputeVertexNormalAt() is MFTLComputeVertexNormals() for one
+ *        vertex, for every weighting: on a jittered sphere across the corner
+ *        of a periodic box, and on the open fans of a mesh rim, where it must
+ *        also report the fan as open.
+ */
+static int test_one_vertex_is_the_whole_pool_pass(void)
+{
+  MFTL_Ensemble *ens = MFTLEnsembleCreate(MPI_COMM_SELF, (int[3]){1, 1, 1}, (double[3]){0, 0, 0}, (double[3]){8, 8, 8}, (bool[3]){true, true, true}, 4);
+  MFTL_Object *sphere = make_sphere(ens, (double[3]){0.2, 7.9, 0.1}, 1.0, 3);
+  jitter(sphere, 0.02, 11u);
+  MFTL_Object *corner = make_corner(ens, MFTL_TRUE);  // closed fans at O and Q (0 and 4), open at the rim (1, 2, 3)
+
+  const MFTL_NormalWeighting w[3] = {MFTL_NORMAL_WEIGHT_AREA, MFTL_NORMAL_WEIGHT_ANGLE, MFTL_NORMAL_WEIGHT_FIT};
+  MFTL_Object *const objs[2] = {sphere, corner};
+  double worst = 0.0;
+  int wrong_closed = 0, n_open = 0;
+  for (int o = 0; o < 2; ++o)
+    for (int i = 0; i < 3; ++i)
+    {
+      MFTL_Object *const obj = objs[o];
+      MFTLComputeVertexNormals(obj, w[i]);
+      for (int v = 0; v < obj->verts.n; ++v)
+      {
+        double n[3];
+        const bool closed = MFTLComputeVertexNormalAt(obj, v, w[i], n);
+        for (int k = 0; k < 3; ++k) worst = fmax(worst, fabs(n[k] - obj->verts.normal[3 * v + k]));
+        const bool expect = (obj == sphere) || v == 0 || v == 4;
+        if (closed != expect) wrong_closed++;
+        if (!closed) n_open++;
+      }
+    }
+  int rank = 0;
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  if (rank == 0) printf("\n    worst component against the whole-pool pass %.1e; %d open fans\n  ", worst, n_open);
+  MFTLEnsembleDestroy(&ens);
+  TEST_ASSERT(agreed(worst < 1e-13, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(wrong_closed == 0, MPI_COMM_WORLD));
+  TEST_ASSERT(agreed(n_open == 9, MPI_COMM_WORLD));  // the three rim vertices, under three weightings
   return 0;
 }
 
@@ -621,9 +745,9 @@ static int test_normals_are_unit_on_a_tiny_and_a_huge_sphere(void)
     const double c[3] = {0.0, 0.0, 0.0};
     MFTL_Object *obj = make_sphere(ens, c, radii[r], 3);
 
-    for (int w = 0; w < 2; ++w)
+    for (int w = 0; w < 3; ++w)
     {
-      MFTLComputeVertexNormals(obj, (w == 0) ? MFTL_NORMAL_WEIGHT_AREA : MFTL_NORMAL_WEIGHT_ANGLE);
+      MFTLComputeVertexNormals(obj, (MFTL_NormalWeighting) w);
       for (int v = 0; v < obj->verts.n; ++v)
       {
         const double *n = &obj->verts.normal[3 * v];
@@ -670,7 +794,9 @@ int main(int argc, char **argv)
   RUN_TEST(test_normals_follow_vertex_motion);
   RUN_TEST(test_mesh_stays_sound_around_the_pass);
   RUN_TEST(test_angle_weighted_normal_ignores_how_the_fan_is_split);
-  RUN_TEST(test_both_weightings_agree_on_a_regular_sphere);
+  RUN_TEST(test_the_three_normals_agree_on_a_regular_sphere);
+  RUN_TEST(test_the_area_normal_is_the_direction_of_the_volume_gradient);
+  RUN_TEST(test_one_vertex_is_the_whole_pool_pass);
   RUN_TEST(test_angle_weighting_skips_a_degenerate_face);
   RUN_TEST(test_normals_are_unit_on_a_tiny_and_a_huge_sphere);
 

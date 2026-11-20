@@ -104,6 +104,11 @@ mftl_add_mpi_test(test_derived 1)
 mftl_add_mpi_test(test_meshgen 1)
 mftl_add_mpi_test(test_vertex_normals 1)
 
+# Signed curvature (Meyer's operators and the one-ring fit), the fitted vertex
+# normal and the identities tying them to the surface-tension forces, against
+# closed-form shapes. Serial; the distributed half is test_surface_tension.
+mftl_add_mpi_test(test_curvature 1)
+
 # Marching cubes: the generated 256-case table, exhaustively (crack freedom over
 # every pair of cells that can share a face), and the extraction against
 # analytic shapes and adversarial random / checkerboard fields. Serial by
@@ -264,6 +269,17 @@ mftl_add_mpi_test_at(test_correction_np2 test_correction 2)
 mftl_add_mpi_test_at(test_correction_np4 test_correction 4)
 mftl_add_mpi_test_at(test_correction_np8 test_correction 8)
 mftl_add_mpi_test_oversub(test_correction_np27 test_correction 27)
+
+# Surface tension and signed curvature on a partitioned front (roadmap A1):
+# owned forces and curvatures against the same body on one rank before it was
+# partitioned, ghosts to the bit, conservation of force (and torque, for the
+# area gradient), the Marangoni force on a flat sheet with its sigma ghosts
+# poisoned, a cap pressing on its wall with the Laplace pressure, refusals.
+mftl_add_mpi_test(test_surface_tension 1)
+mftl_add_mpi_test_at(test_surface_tension_np2 test_surface_tension 2)
+mftl_add_mpi_test_at(test_surface_tension_np4 test_surface_tension 4)
+mftl_add_mpi_test_at(test_surface_tension_np8 test_surface_tension 8)
+mftl_add_mpi_test_oversub(test_surface_tension_np27 test_surface_tension 27)
 
 # --- Coupling to a flow solver ------------------------------------------------
 #

@@ -162,20 +162,20 @@ static int test_curvature_of_a_sphere(void)
   {
     MFTL_Object *obj = make_ellipsoid(r, 2.0, 2.0, 2.0);
     const int n = obj->verts.n;
-    double *H = malloc((size_t) n * sizeof(double)), *K = malloc((size_t) n * sizeof(double));
-    MFTLComputeVertexCurvatures(obj, H, K);
+    /* The sizing's estimator: Meyer's operators, kappa = 2 H = 1 and K = 1/4 at R = 2. */
+    double *rec = malloc(4 * (size_t) n * sizeof(double));
+    TEST_ASSERT(MFTLComputeVertexCurvature(obj, MFTL_CURVATURE_COTAN, 4, rec, NULL) == MFTL_SUCCESS);
     double eh = 0.0, ek = 0.0;
     for (int v = 0; v < n; ++v)
     {
-      eh = fmax(eh, fabs(H[v] - 0.5) / 0.5);
-      ek = fmax(ek, fabs(K[v] - 0.25) / 0.25);
+      eh = fmax(eh, fabs(0.5 * rec[4 * v + MFTL_CURVATURE_KAPPA] - 0.5) / 0.5);
+      ek = fmax(ek, fabs(rec[4 * v + MFTL_CURVATURE_GAUSS] - 0.25) / 0.25);
     }
     printf("\n    refine %d: max rel error H %.2e, K %.2e", r, eh, ek);
     TEST_ASSERT(eh < prev);  // converges
     prev = eh;
     if (r == 4) TEST_ASSERT(eh < 0.02 && ek < 0.05);
-    free(H);
-    free(K);
+    free(rec);
   }
   return 0;
 }
@@ -188,14 +188,14 @@ static int test_curvature_of_an_ellipsoid(void)
   {
     MFTL_Object *obj = make_ellipsoid(r, a, b, c);
     const int n = obj->verts.n;
-    double *H = malloc((size_t) n * sizeof(double)), *K = malloc((size_t) n * sizeof(double));
-    MFTLComputeVertexCurvatures(obj, H, K);
+    double *rec = malloc(4 * (size_t) n * sizeof(double));
+    TEST_ASSERT(MFTLComputeVertexCurvature(obj, MFTL_CURVATURE_COTAN, 4, rec, NULL) == MFTL_SUCCESS);
     double err = 0.0;
     for (int v = 0; v < n; ++v)
     {
       double He, Ke;
       ellipsoid_curvature(MFTLVertexPos(obj, v), a, b, c, &He, &Ke);
-      const double km = H[v] + sqrt(fmax(H[v] * H[v] - K[v], 0.0));
+      const double km = fmax(fabs(rec[4 * v + MFTL_CURVATURE_K1]), fabs(rec[4 * v + MFTL_CURVATURE_K2]));  // what the sizing reads
       const double ke = He + sqrt(fmax(He * He - Ke, 0.0));
       err += (km - ke) * (km - ke) / (ke * ke);
     }
@@ -203,8 +203,7 @@ static int test_curvature_of_an_ellipsoid(void)
     printf("\n    refine %d: rms rel error of kappa_max %.2e", r, err);
     TEST_ASSERT(err < prev);
     prev = err;
-    free(H);
-    free(K);
+    free(rec);
   }
   TEST_ASSERT(prev < 0.05);
   return 0;

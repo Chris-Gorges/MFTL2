@@ -424,9 +424,12 @@ static int test_a_gap_narrower_than_a_cell_stays_outside(void)
  * vertex pseudo-normal decides the sign. Each point is rasterised on its own
  * one-node grid, so what is tested is the rasteriser's own path.
  *
- * Measured while writing this: angle weighting 0 wrong of ~15 000, area
- * weighting 122 wrong. The area run is kept as a CONTROL and must fail: without
- * it this test could pass with the weighting argument silently ignored.
+ * Measured: angle weighting 0 wrong of 2277, area weighting 10 wrong (Max's
+ * (1999) weights, not offered, 14: docs/analysis.md §16.9). The area run is
+ * kept as a CONTROL and must fail: without it this test could pass with the
+ * weighting argument silently ignored. Bærentzen & Aanæs (2005) prove the sign
+ * for angle weights only; any other weighting can fail where two incident
+ * faces turn by more than 90 degrees.
  */
 static int test_vertex_signs_on_a_spiky_mesh_need_angle_weighting(void)
 {

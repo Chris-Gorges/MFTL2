@@ -206,8 +206,8 @@ feature:
 
 This is Bærentzen & Aanæs' result: with angle weighting the sign is exact for any
 closed, consistently oriented mesh, where area weighting is wrong at a spiky vertex —
-on randomly spiked spheres, of about 15 000 query points whose nearest feature is a
-vertex, angle weighting signs none wrongly and area weighting 122
+on randomly spiked spheres, of 2277 query points whose nearest feature is a
+vertex, angle weighting signs none wrongly and area weighting 10
 (`test_vertex_signs_on_a_spiky_mesh_need_angle_weighting`, which keeps the area run
 as a control that must fail).
 Angle weighting is a second mode of `MFTLComputeVertexNormals`, not a second

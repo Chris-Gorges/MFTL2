@@ -1253,14 +1253,15 @@ int MFTLDetectFeatures(MFTL_Object *obj, double angle_degrees, double corner_ang
  *   projected onto the ridge tangent (1D). Moving to the midpoint itself cuts
  *   the chord and erodes the ridge.
  * - **Free:** the pull towards the target point of `smooth_mode`, minus its
- *   component along the area-weighted vertex normal (2D). Without the
+ *   component along the area-weighted vertex normal, the direction of the
+ *   volume gradient (#MFTL_NORMAL_WEIGHT_AREA; 2D). Without the
  *   projection, Laplacian smoothing shrinks the surface. Under curvature
  *   sizing each triangle is weighted by its area over its squared mean target
  *   (Dunyach et al. 2013, with the ODT density). Ridge and rim vertices follow
  *   the sized 1D rule under curvature sizing.
  *
- * Vertex normals come from MFTLComputeVertexNormals(), refreshed every sweep; a
- * vertex whose normal is zero (degenerate one-ring) stays put. Steps are scaled
+ * The normals come from MFTLComputeVertexNormals() with
+ * #MFTL_NORMAL_WEIGHT_AREA, refreshed every sweep; a vertex whose direction is zero (degenerate one-ring) stays put. Steps are scaled
  * by `smooth_relaxation` and capped at `smooth_max_step_fraction` of the
  * shortest incident edge. All differences are minimum-image vectors and
  * positions are wrapped, so the smoother is seam-safe. Frozen vertices and
@@ -1341,8 +1342,9 @@ double MFTLRemeshCurvatureSizing(double kappa, const MFTL_RemeshParameters *para
  *        (#MFTL_REMESH_SIZING_CURVATURE); a no-op under the other modes.
  *
  * Enables the array (MFTLObjectEnableSizing()), classifies features, takes the
- * discrete curvature of every vertex (MFTLComputeVertexCurvatures(),
- * \f$\kappa = H + \sqrt{\max(H^2 - K, 0)}\f$) through
+ * larger absolute principal curvature of every vertex
+ * (MFTLComputeVertexCurvature() with #MFTL_CURVATURE_COTAN,
+ * \f$\max(|\kappa_1|, |\kappa_2|) = |\kappa|/2 + \sqrt{\max(\kappa^2/4 - K, 0)}\f$) through
  * MFTLRemeshCurvatureSizing(), and gives every feature, corner and boundary
  * vertex the mean target of its non-feature neighbours (Dunyach et al. 2013,
  * Sect. 3). The remeshing drivers call it once per kernel call; the operators

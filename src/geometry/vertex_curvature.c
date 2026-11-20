@@ -4,28 +4,39 @@
  * @date 2026-10-23
  * @ingroup mftl_geometry
  *
- * @brief Discrete curvature (Meyer et al. 2003), for the remesher's curvature
- *        sizing.
+ * @brief Discrete curvature of a triangulated surface: Meyer et al. (2003)
+ *        and a one-ring position-plus-normal fit.
  *
- * Both curvatures are ONE-RING sums, which is what makes them exact on an owned
- * vertex of a distributed mesh with no communication: the redistribution halo
- * is vertex-complete, so every triangle incident to an owned vertex is present
- * locally. A ghost vertex receives a PARTIAL sum -- plausible and wrong,
- * exactly like a ghost's vertex normal.
+ * One entry point, MFTLComputeVertexCurvature(): the SIGNED curvature
+ * kappa = k1 + k2 (2/R on a sphere with outward normals) and on request the
+ * Gaussian curvature, the principal curvatures and the principal direction,
+ * by Meyer's operators (COTAN) or by a height paraboloid fitted to the
+ * one-ring (FIT). The remesher's curvature sizing reads max(|k1|, |k2|) off
+ * the COTAN record.
  *
- * The pass is a scatter over triangles (MFTL_FOREACH_TRIANGLE_GEOMETRY), for
+ * Every estimate is a ONE-RING quantity, which is what makes it exact on an
+ * owned vertex of a distributed mesh with no communication: the redistribution
+ * halo is vertex-complete, so every triangle incident to an owned vertex is
+ * present locally. A ghost vertex receives a PARTIAL sum -- plausible and
+ * wrong, exactly like a ghost's vertex normal. The fit additionally reads the
+ * neighbours' normals, which must be the owners' on ghosts.
+ *
+ * The sums are a scatter over triangles (MFTL_FOREACH_TRIANGLE_GEOMETRY), for
  * the same reason MFTLComputeVertexNormals() is one: a per-vertex fan walk
- * serialises dependent loads.
+ * serialises dependent loads. Only the least-squares parts (Meyer's tensor fit
+ * and the paraboloid) gather a vertex's ring, because a least-squares system
+ * is per vertex by nature.
  *
  * Nothing here compares a dimensional quantity against a constant: degenerate
- * triangles are those whose cross product is exactly zero. Scaling a mesh by a
- * power of two therefore scales every output by the matching power, bit for
- * bit.
+ * triangles are those whose cross product is exactly zero, and the fit works
+ * in units of the ring's own edge length. Scaling a mesh by a power of two
+ * therefore scales every output by the matching power, bit for bit.
  */
 
 #include "mftl_geometry.h"
 
 #include <math.h>
+#include <stdbool.h>
 #include <stdlib.h>
 
 #include "mftl_constants.h"
@@ -35,24 +46,32 @@
 #include "mftl_types.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Mean and Gaussian curvature
+ * The cotangent scatter
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-void MFTLComputeVertexCurvatures(const MFTL_Object *obj, double *mean_curvature, double *gauss_curvature)
+/* Per-vertex accumulator record: one cache line. */
+enum
 {
-  MFTL_ASSERT(obj != MFTL_NULL && mean_curvature != MFTL_NULL && gauss_curvature != MFTL_NULL);
-  MFTL_ASSERT(MFTLObjectHasTopology(obj) && "MFTLComputeVertexCurvatures: tris.verts is stale -- MFTLObjectBuildDerived first");
+  ACC_LAP = 0,  // [3] sum (cot alpha + cot beta)(x_i - x_j) = 2 grad A
+  ACC_NRM = 3,  // [3] sum (e1 x e2): the area-weighted normal, unnormalised
+  ACC_ANGLE = 6,  // sum of the corner angles
+  ACC_AREA = 7,  // the MIXED area
+  ACC_STRIDE = 8
+};
 
-  const int n_v = obj->verts.n;
-  if (n_v == 0) return;
-
-  /* Per vertex: the cotangent Laplacian (3), the angle sum (1) and the mixed
-   * area (1), accumulated face by face and resolved in one pass at the end. */
-  double *const acc = (double *) MFTLCallocOrDie((size_t) n_v * 5, sizeof(double), "vertex curvature accumulators");
-  double *restrict lap = acc;
-  double *restrict angle = acc + 3 * (size_t) n_v;
-  double *restrict area = acc + 4 * (size_t) n_v;
-
+/**
+ * @brief One pass over every triangle the rank holds: the cotangent
+ *        Laplacian, the area-weighted normal, the angle sum and the mixed area
+ *        of every vertex.
+ *
+ * @param obj    The mesh; current `tris.verts`.
+ * @param angles Whether to accumulate the angle sums (three `atan2` per
+ *               triangle, most of the pass): only the Gaussian curvature reads
+ *               them.
+ * @param acc    `[ACC_STRIDE * verts.n]`, zeroed by the caller, accumulated into.
+ */
+static void scatter_cotan(const MFTL_Object *obj, bool angles, double *restrict acc)
+{
   // clang-format off
   MFTL_FOREACH_TRIANGLE_GEOMETRY(
       obj, obj->tris.n,
@@ -79,21 +98,39 @@ void MFTLComputeVertexCurvatures(const MFTL_Object *obj, double *mean_curvature,
     const double inv = 1.0 / mag;
     const double cot0 = d0 * inv, cot1 = d1 * inv, cot2 = d2 * inv;
 
+    double *const a0 = &acc[ACC_STRIDE * v0];
+    double *const a1 = &acc[ACC_STRIDE * v1];
+    double *const a2 = &acc[ACC_STRIDE * v2];
+
     /* (cot alpha + cot beta)(x_i - x_j), one triangle's share per edge:
      * edge v1-v2 carries cot0, v0-v2 cot1, v0-v1 cot2. */
-    lap[3 * v0 + 0] += -cot1 * e2x - cot2 * e1x;
-    lap[3 * v0 + 1] += -cot1 * e2y - cot2 * e1y;
-    lap[3 * v0 + 2] += -cot1 * e2z - cot2 * e1z;
-    lap[3 * v1 + 0] += -cot0 * cx + cot2 * e1x;
-    lap[3 * v1 + 1] += -cot0 * cy + cot2 * e1y;
-    lap[3 * v1 + 2] += -cot0 * cz + cot2 * e1z;
-    lap[3 * v2 + 0] += cot0 * cx + cot1 * e2x;
-    lap[3 * v2 + 1] += cot0 * cy + cot1 * e2y;
-    lap[3 * v2 + 2] += cot0 * cz + cot1 * e2z;
+    a0[ACC_LAP + 0] += -cot1 * e2x - cot2 * e1x;
+    a0[ACC_LAP + 1] += -cot1 * e2y - cot2 * e1y;
+    a0[ACC_LAP + 2] += -cot1 * e2z - cot2 * e1z;
+    a1[ACC_LAP + 0] += -cot0 * cx + cot2 * e1x;
+    a1[ACC_LAP + 1] += -cot0 * cy + cot2 * e1y;
+    a1[ACC_LAP + 2] += -cot0 * cz + cot2 * e1z;
+    a2[ACC_LAP + 0] += cot0 * cx + cot1 * e2x;
+    a2[ACC_LAP + 1] += cot0 * cy + cot1 * e2y;
+    a2[ACC_LAP + 2] += cot0 * cz + cot1 * e2z;
 
-    angle[v0] += atan2(mag, d0);
-    angle[v1] += atan2(mag, d1);
-    angle[v2] += atan2(mag, d2);
+    /* e1 x e2 = 2 A n_hat: accumulating it raw IS area weighting. */
+    a0[ACC_NRM + 0] += nx;
+    a0[ACC_NRM + 1] += ny;
+    a0[ACC_NRM + 2] += nz;
+    a1[ACC_NRM + 0] += nx;
+    a1[ACC_NRM + 1] += ny;
+    a1[ACC_NRM + 2] += nz;
+    a2[ACC_NRM + 0] += nx;
+    a2[ACC_NRM + 1] += ny;
+    a2[ACC_NRM + 2] += nz;
+
+    if (angles)
+    {
+      a0[ACC_ANGLE] += atan2(mag, d0);
+      a1[ACC_ANGLE] += atan2(mag, d1);
+      a2[ACC_ANGLE] += atan2(mag, d2);
+    }
 
     /* The MIXED area (Meyer et al., Fig. 4): the Voronoi share where the
      * triangle is not obtuse, else half the area to the obtuse corner and a
@@ -102,34 +139,384 @@ void MFTLComputeVertexCurvatures(const MFTL_Object *obj, double *mean_curvature,
     const double A = 0.5 * mag;
     if (d0 >= 0.0 && d1 >= 0.0 && d2 >= 0.0)
     {
-      area[v0] += 0.125 * (l2 * cot1 + l1 * cot2);
-      area[v1] += 0.125 * (l1 * cot2 + lc * cot0);
-      area[v2] += 0.125 * (lc * cot0 + l2 * cot1);
+      a0[ACC_AREA] += 0.125 * (l2 * cot1 + l1 * cot2);
+      a1[ACC_AREA] += 0.125 * (l1 * cot2 + lc * cot0);
+      a2[ACC_AREA] += 0.125 * (lc * cot0 + l2 * cot1);
     }
     else
     {
-      area[v0] += (d0 < 0.0) ? 0.5 * A : 0.25 * A;
-      area[v1] += (d1 < 0.0) ? 0.5 * A : 0.25 * A;
-      area[v2] += (d2 < 0.0) ? 0.5 * A : 0.25 * A;
+      a0[ACC_AREA] += (d0 < 0.0) ? 0.5 * A : 0.25 * A;
+      a1[ACC_AREA] += (d1 < 0.0) ? 0.5 * A : 0.25 * A;
+      a2[ACC_AREA] += (d2 < 0.0) ? 0.5 * A : 0.25 * A;
     });
   // clang-format on
+}
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Signed curvature: shared pieces
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/** Relative rank tolerance of both least-squares fits (the placement's value, src/remeshing/remesh_fit.c). */
+#define CURVATURE_FIT_TAU 1e-3
+
+/**
+ * Below this cosine between a neighbour's normal and the frame normal (about
+ * 75 degrees) the neighbour's slope rows are left out: dz/dx = -n_x/n_z
+ * diverges as the normal turns into the tangent plane. Dimensionless.
+ */
+#define CURVATURE_FIT_MIN_COS 0.25
+
+/** @brief `out = b - a` under the minimum image of @p dom (plain difference without a domain). */
+static inline void min_image(const MFTL_Domain *dom, const double *a, const double *b, double out[3])
+{
+  if (dom != MFTL_NULL)
+    MFTLGetMinimumImageVector(dom, out, a, b);
+  else
+  {
+    out[0] = b[0] - a[0];
+    out[1] = b[1] - a[1];
+    out[2] = b[2] - a[2];
+  }
+}
+
+/**
+ * @brief An orthonormal tangent frame for the unit normal @p n: @p t1 is the
+ *        coordinate axis @p n is least aligned with, made orthogonal to it,
+ *        and @p t2 = n x t1. Depends on the direction of @p n only.
+ */
+static void tangent_frame(const double n[3], double t1[3], double t2[3])
+{
+  int a = 0;
+  if (fabs(n[1]) < fabs(n[a])) a = 1;
+  if (fabs(n[2]) < fabs(n[a])) a = 2;
+  t1[0] = -n[a] * n[0];
+  t1[1] = -n[a] * n[1];
+  t1[2] = -n[a] * n[2];
+  t1[a] += 1.0;
+  const double m = MFTL_SQRT(t1[0] * t1[0] + t1[1] * t1[1] + t1[2] * t1[2]);
+  const double inv = (m > 0.0) ? 1.0 / m : 0.0;
+  t1[0] *= inv;
+  t1[1] *= inv;
+  t1[2] *= inv;
+  t2[0] = n[1] * t1[2] - n[2] * t1[1];
+  t2[1] = n[2] * t1[0] - n[0] * t1[2];
+  t2[2] = n[0] * t1[1] - n[1] * t1[0];
+}
+
+/**
+ * @brief Writes the record from kappa and the Gaussian curvature: the
+ *        principal curvatures k1,2 = kappa/2 +- sqrt(max(kappa^2/4 - K, 0))
+ *        (Meyer et al., eqs. 10-11; a negative discriminant is rounding at an
+ *        umbilic and is clamped). The direction slots are left to the caller.
+ */
+static void write_scalars(double *rec, int ncomp, double kappa, double gauss)
+{
+  rec[MFTL_CURVATURE_KAPPA] = kappa;
+  if (ncomp < 2) return;
+  rec[MFTL_CURVATURE_GAUSS] = gauss;
+  if (ncomp < 4) return;
+  const double h = 0.5 * kappa;
+  double disc = h * h - gauss;
+  if (!(disc > 0.0)) disc = 0.0;
+  const double r = MFTL_SQRT(disc);
+  rec[MFTL_CURVATURE_K1] = h + r;
+  rec[MFTL_CURVATURE_K2] = h - r;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * COTAN: Meyer et al. (2003)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Meyer's principal direction (section 5.3): the curvature tensor
+ *        whose normal curvature along each one-ring edge best matches the
+ *        edge's own estimate \f$\kappa^N_{ij} = 2(\vect{x}_i -
+ *        \vect{x}_j)\cdot\hat{\vect{n}}/|\vect{x}_i - \vect{x}_j|^2\f$.
+ *
+ * With the trace fixed to kappa (their constraint a + c = 2 kappa_H) the
+ * tensor is \f$B = \tfrac{\kappa}{2} I + \begin{pmatrix} p & q \\ q & -p
+ * \end{pmatrix}\f$ in the tangent frame, and an edge at angle theta predicts
+ * \f$\kappa/2 + p\cos2\theta + q\sin2\theta\f$: a two-unknown linear least
+ * squares problem, solved by QR. Each triangle of the fan contributes one row
+ * per edge it has at the vertex, weighted by its half of Meyer's weight
+ * \f$\tfrac18(\cot\alpha + \cot\beta)|\vect{x}_i - \vect{x}_j|^2\f$ (a negative
+ * half, behind an obtuse angle, is dropped); the rows of one edge from its two
+ * triangles add up to Meyer's single row. The larger eigenvalue's eigenvector
+ * is at angle \f$\tfrac12\operatorname{atan2}(q, p)\f$.
+ *
+ * @param obj   The mesh.
+ * @param v     The vertex.
+ * @param n     Its unit normal.
+ * @param kappa Its signed curvature.
+ * @param dir   Out: unit tangent along the larger principal curvature.
+ */
+static void cotan_direction(const MFTL_Object *obj, int v, const double n[3], double kappa, double dir[3])
+{
+  double t1[3], t2[3];
+  tangent_frame(n, t1, t2);
+  dir[0] = t1[0];
+  dir[1] = t1[1];
+  dir[2] = t1[2];
+
+  int ring[MFTL_MAX_VALENCE];
+  const int nt = MFTLGetVertexOneRing(obj, v, ring, MFTL_MAX_VALENCE, MFTL_FALSE);
+
+  enum
+  {
+    MAX_ROWS = 2 * MFTL_MAX_VALENCE
+  };
+  double cs[MAX_ROWS][2], rhs[MAX_ROWS];
+  int m = 0;
+  const MFTL_Domain *const dom = obj->domain;
+  const double *const xv = MFTLVertexPos(obj, v);
+  const int *const tv = obj->tris.verts;
+
+  for (int i = 0; i < nt; ++i)
+  {
+    const int t = ring[i];
+    int c = 0;
+    while (c < 3 && tv[3 * t + c] != v) ++c;
+    if (c == 3) continue;
+    const int j = tv[3 * t + (c + 1) % 3], k = tv[3 * t + (c + 2) % 3];
+
+    double e[2][3];
+    min_image(dom, xv, MFTLVertexPos(obj, j), e[0]);
+    min_image(dom, xv, MFTLVertexPos(obj, k), e[1]);
+    const double cr[3] = {e[0][1] * e[1][2] - e[0][2] * e[1][1], e[0][2] * e[1][0] - e[0][0] * e[1][2], e[0][0] * e[1][1] - e[0][1] * e[1][0]};
+    const double mag = MFTL_SQRT(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+    if (!(mag > 0.0)) continue;
+
+    const double ljj = e[0][0] * e[0][0] + e[0][1] * e[0][1] + e[0][2] * e[0][2];
+    const double lkk = e[1][0] * e[1][0] + e[1][1] * e[1][1] + e[1][2] * e[1][2];
+    const double ljk = e[0][0] * e[1][0] + e[0][1] * e[1][1] + e[0][2] * e[1][2];
+    /* The angle at k faces the edge v-j: its edges are -e_k and e_j - e_k. */
+    const double cot_k = (lkk - ljk) / mag;
+    const double cot_j = (ljj - ljk) / mag;
+    const double w[2] = {cot_k * ljj, cot_j * lkk};
+
+    for (int s = 0; s < 2; ++s)
+    {
+      if (!(w[s] > 0.0)) continue;
+      const double *const d = e[s];
+      const double l2 = (s == 0) ? ljj : lkk;
+      const double dn = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+      const double kn = -2.0 * dn / l2;  // normal curvature along the edge
+      const double a = d[0] * t1[0] + d[1] * t1[1] + d[2] * t1[2];
+      const double b = d[0] * t2[0] + d[1] * t2[1] + d[2] * t2[2];
+      const double ab = a * a + b * b;
+      if (!(ab > 0.0)) continue;
+      const double sw = MFTL_SQRT(w[s]);
+      cs[m][0] = sw * (a * a - b * b) / ab;
+      cs[m][1] = sw * (2.0 * a * b) / ab;
+      rhs[m] = sw * (kn - 0.5 * kappa);
+      ++m;
+    }
+  }
+  if (m < 2) return;
+
+  double A[2 * MAX_ROWS], x[2];
+  for (int r = 0; r < m; ++r)
+  {
+    A[r] = cs[r][0];
+    A[m + r] = cs[r][1];
+  }
+  MFTLLeastSquaresQRCP(m, 2, 2, A, rhs, CURVATURE_FIT_TAU, x, MFTL_NULL);
+  const double phi = 0.5 * atan2(x[1], x[0]);
+  const double cp = cos(phi), sp = sin(phi);
+  for (int k = 0; k < 3; ++k) dir[k] = cp * t1[k] + sp * t2[k];
+}
+
+/**
+ * @brief The COTAN record of vertex @p v from its scatter accumulator.
+ *
+ * \f$\vect{K} = \nabla A / A_\text{mixed}\f$ (the accumulated Laplacian is
+ * twice the area gradient), \f$\kappa = \vect{K}\cdot\hat{\vect{N}}\f$ with the
+ * area-weighted normal, \f$\kappa_G = (2\pi - \sum\theta)/A_\text{mixed}\f$.
+ */
+static void cotan_record(const MFTL_Object *obj, int v, const double *r, int ncomp, double *rec)
+{
+  const double a = r[ACC_AREA];
+  const double *const N = &r[ACC_NRM];
+  const double nm = MFTL_SQRT(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]);
+  if (!(a > 0.0) || !(nm > 0.0))
+  {
+    for (int c = 0; c < ncomp; ++c) rec[c] = 0.0;
+    return;
+  }
+  const double inv = 1.0 / nm;
+  const double n[3] = {N[0] * inv, N[1] * inv, N[2] * inv};
+  const double *const L = &r[ACC_LAP];
+  const double kappa = 0.5 * (L[0] * n[0] + L[1] * n[1] + L[2] * n[2]) / a;
+  const double gauss = (MFTL_TWO_PI - r[ACC_ANGLE]) / a;
+  write_scalars(rec, ncomp, kappa, gauss);
+  if (ncomp >= MFTL_CURVATURE_COMPONENTS) cotan_direction(obj, v, n, kappa, &rec[MFTL_CURVATURE_DIR1]);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * FIT: a height paraboloid through the one-ring positions and normals
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief The FIT record of vertex @p v.
+ *
+ * In the frame (t1, t2, n) of the vertex normal, every sample -- the vertex
+ * itself at the origin and each one-ring neighbour -- gives its height and,
+ * from its normal, its two slopes \f$\partial_x z = -n_x/n_z\f$,
+ * \f$\partial_y z = -n_y/n_z\f$; coordinates are divided by the ring's RMS
+ * edge length so that heights and slopes are both O(1) and one weight serves
+ * both kinds of row (MFTLFitHeightParaboloid()). With \f$z = c_0 + c_1x + c_2y
+ * + c_3x^2 + c_4xy + c_5y^2\f$ the first fundamental form at the vertex is
+ * \f$I = \begin{pmatrix}1+c_1^2 & c_1c_2\\ c_1c_2 & 1+c_2^2\end{pmatrix}\f$,
+ * the second \f$I\!I = -\tfrac1W\begin{pmatrix}2c_3 & c_4\\ c_4 & 2c_5
+ * \end{pmatrix}\f$ with \f$W = \sqrt{1 + c_1^2 + c_2^2}\f$ (signed so that a
+ * sphere is positive with an outward frame normal), and the shape operator is
+ * \f$S = I^{-1}I\!I\f$: \f$\kappa = \operatorname{tr}S\f$,
+ * \f$\kappa_G = \det S\f$, the principal direction its eigenvector.
+ *
+ * @return `true` on success; `false` (the caller falls back to COTAN) for a
+ *         zero normal, fewer than three neighbours or fewer than three whose
+ *         normals are within 75 degrees of the vertex's, or a rank-deficient
+ *         fit.
+ */
+static bool fit_record(const MFTL_Object *obj, int v, int ncomp, double *rec)
+{
+  const double *const nv = &obj->verts.normal[3 * v];
+  const double nm = MFTL_SQRT(nv[0] * nv[0] + nv[1] * nv[1] + nv[2] * nv[2]);
+  if (!(nm > 0.0)) return MFTL_FALSE;
+  const double ninv = 1.0 / nm;
+  const double n[3] = {nv[0] * ninv, nv[1] * ninv, nv[2] * ninv};
+
+  int ring[MFTL_MAX_VALENCE + 1];
+  const int nr = MFTLGetVertexOneRingVertices(obj, v, ring, MFTL_MAX_VALENCE + 1, MFTL_FALSE);
+  if (nr < 3) return MFTL_FALSE;
+
+  double t1[3], t2[3];
+  tangent_frame(n, t1, t2);
+
+  enum
+  {
+    MAX_SAMPLES = MFTL_MAX_VALENCE + 2
+  };
+  double pts[3 * MAX_SAMPLES], slopes[2 * MAX_SAMPLES], w[MAX_SAMPLES];
+  unsigned char use[MAX_SAMPLES];
+
+  /* Sample 0: the vertex, on its own tangent plane. */
+  pts[0] = pts[1] = pts[2] = 0.0;
+  slopes[0] = slopes[1] = 0.0;
+  use[0] = 1;
+  w[0] = 1.0;
+
+  const MFTL_Domain *const dom = obj->domain;
+  const double *const xv = MFTLVertexPos(obj, v);
+  double h2 = 0.0;
+  int n_slopes = 0;
+  for (int i = 0; i < nr; ++i)
+  {
+    const int j = ring[i];
+    double d[3];
+    min_image(dom, xv, MFTLVertexPos(obj, j), d);
+    h2 += d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    double *const p = &pts[3 * (i + 1)];
+    p[0] = d[0] * t1[0] + d[1] * t1[1] + d[2] * t1[2];
+    p[1] = d[0] * t2[0] + d[1] * t2[1] + d[2] * t2[2];
+    p[2] = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+
+    const double *const nj = &obj->verts.normal[3 * j];
+    const double nz = nj[0] * n[0] + nj[1] * n[1] + nj[2] * n[2];
+    const double nn = MFTL_SQRT(nj[0] * nj[0] + nj[1] * nj[1] + nj[2] * nj[2]);
+    use[i + 1] = (unsigned char) (nz > CURVATURE_FIT_MIN_COS * nn);
+    if (use[i + 1])
+    {
+      ++n_slopes;
+      slopes[2 * (i + 1) + 0] = -(nj[0] * t1[0] + nj[1] * t1[1] + nj[2] * t1[2]) / nz;
+      slopes[2 * (i + 1) + 1] = -(nj[0] * t2[0] + nj[1] * t2[1] + nj[2] * t2[2]) / nz;
+    }
+    else
+      slopes[2 * (i + 1) + 0] = slopes[2 * (i + 1) + 1] = 0.0;
+    w[i + 1] = 1.0;
+  }
+  /* Neighbours whose normals turn away from this vertex's by more than 75
+   * degrees say the frame is wrong (a fold), not that the surface is curved. */
+  if (!(h2 > 0.0) || n_slopes < 3) return MFTL_FALSE;
+
+  /* Lengths in units of the RMS edge: heights and slopes both O(1). */
+  const double hs = MFTL_SQRT(h2 / (double) nr), hinv = 1.0 / hs;
+  for (int i = 3; i < 3 * (nr + 1); ++i) pts[i] *= hinv;
+
+  double c[6];
+  unsigned char kept[6];
+  if (MFTLFitHeightParaboloid(nr + 1, pts, slopes, use, w, CURVATURE_FIT_TAU, c, kept) < 6) return MFTL_FALSE;
+
+  const double hx = c[1], hy = c[2], hxx = 2.0 * c[3], hxy = c[4], hyy = 2.0 * c[5];
+  const double E = 1.0 + hx * hx, F = hx * hy, G = 1.0 + hy * hy;
+  const double W2 = 1.0 + hx * hx + hy * hy, W = MFTL_SQRT(W2);
+  const double Lf = -hxx / W, Mf = -hxy / W, Nf = -hyy / W;
+
+  /* S = I^{-1} II, in units of 1/hs. */
+  const double S11 = (G * Lf - F * Mf) / W2, S12 = (G * Mf - F * Nf) / W2;
+  const double S21 = (E * Mf - F * Lf) / W2, S22 = (E * Nf - F * Mf) / W2;
+  const double kappa_s = S11 + S22;
+  const double gauss_s = S11 * S22 - S12 * S21;
+
+  write_scalars(rec, ncomp, kappa_s * hinv, gauss_s * hinv * hinv);
+  if (ncomp < MFTL_CURVATURE_COMPONENTS) return MFTL_TRUE;
+
+  /* The k1 eigenvector: (S - k2 I) maps every vector into it (Cayley-Hamilton);
+   * take its larger column. Both columns vanish only at an umbilic. */
+  const double h = 0.5 * kappa_s;
+  double disc = h * h - gauss_s;
+  if (!(disc > 0.0)) disc = 0.0;
+  const double k2 = h - MFTL_SQRT(disc);
+  const double a1 = S11 - k2, b1 = S21, a2 = S12, b2 = S22 - k2;
+  double u = 1.0, q = 0.0;
+  if (a1 * a1 + b1 * b1 >= a2 * a2 + b2 * b2)
+  {
+    if (a1 * a1 + b1 * b1 > 0.0) u = a1, q = b1;
+  }
+  else
+    u = a2, q = b2;
+
+  /* Parameter direction (u, q) to a tangent vector u x_u + q x_v. */
+  double *const dir = &rec[MFTL_CURVATURE_DIR1];
+  for (int k = 0; k < 3; ++k) dir[k] = u * t1[k] + q * t2[k] + (u * hx + q * hy) * n[k];
+  const double dm = MFTL_SQRT(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+  const double dinv = (dm > 0.0) ? 1.0 / dm : 0.0;
+  for (int k = 0; k < 3; ++k) dir[k] *= dinv;
+  return MFTL_TRUE;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Entry point
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+int MFTLComputeVertexCurvature(const MFTL_Object *obj, MFTL_CurvatureMethod method, int ncomp, double *out, int *n_fallback)
+{
+  if (n_fallback != MFTL_NULL) *n_fallback = 0;
+  if (obj == MFTL_NULL) return MFTL_ERROR;
+  if (method != MFTL_CURVATURE_COTAN && method != MFTL_CURVATURE_FIT) return MFTL_ERROR;
+  if (ncomp != 1 && ncomp != 2 && ncomp != 4 && ncomp != MFTL_CURVATURE_COMPONENTS) return MFTL_ERROR;
+
+  const int n_v = obj->verts.n;
+  if (n_v == 0) return MFTL_SUCCESS;
+  if (out == MFTL_NULL) return MFTL_ERROR;
+  MFTL_ASSERT(MFTLObjectHasTopology(obj) && "MFTLComputeVertexCurvature: tris.verts is stale -- MFTLObjectBuildDerived first");
+
+  double *const acc = (double *) MFTLCallocOrDie((size_t) n_v * ACC_STRIDE, sizeof(double), "vertex curvature accumulators");
+  scatter_cotan(obj, ncomp >= 2, acc);
+
+  int fallbacks = 0;
   for (int v = 0; v < n_v; ++v)
   {
-    const double a = area[v];
-    if (!(a > 0.0))
+    double *const rec = &out[(size_t) ncomp * v];
+    if (method == MFTL_CURVATURE_FIT)
     {
-      mean_curvature[v] = 0.0;
-      gauss_curvature[v] = 0.0;
-      continue;
+      if (fit_record(obj, v, ncomp, rec)) continue;
+      if (v < obj->verts.n_local) ++fallbacks;
     }
-
-    /* Delta x = (1 / 2A) SUM (cot alpha + cot beta)(x_i - x_j) = 2 H n. */
-    const double *const L = &lap[3 * v];
-    const double len = MFTL_SQRT(L[0] * L[0] + L[1] * L[1] + L[2] * L[2]);
-    mean_curvature[v] = 0.25 * len / a;
-    gauss_curvature[v] = (MFTL_TWO_PI - angle[v]) / a;
+    cotan_record(obj, v, &acc[ACC_STRIDE * v], ncomp, rec);
   }
 
   free(acc);
+  if (n_fallback != MFTL_NULL) *n_fallback = fallbacks;
+  return MFTL_SUCCESS;
 }

@@ -215,8 +215,14 @@ For a free vertex $\mathbf d = \sum_i A_i\mathbf c_i/\sum_i A_i - \mathbf p$
 over the incident triangles (`MFTL_SMOOTH_TRIANGLE_BASED`; area and centroid
 offset both come from the two edge vectors leaving $\mathbf p$), or the umbrella
 mean of the neighbours (`MFTL_SMOOTH_VERTEX_BASED`); $\hat{\mathbf n}$ is the
-area-weighted vertex normal, refreshed every sweep, and a vertex whose normal is
-zero stays put. For a ridge vertex with offsets $\mathbf d_1, \mathbf d_2$ to its
+area-weighted vertex normal (`MFTL_NORMAL_WEIGHT_AREA`), the direction of the
+volume gradient, refreshed every sweep, and a vertex whose
+$\hat{\mathbf n}$ is zero stays put. In that plane a move changes the enclosed
+volume only at second order, and the choice is load-bearing: with angle-weighted
+normals instead, a LeVeque run without back-projection (uniform sizing,
+refinement 4) ends 25 % of $R_0$ off the exact surface with a worst triangle
+quality of 0.004; with Max or fitted normals the volume is kept better but the
+curvature is 2–15 times noisier (docs/analysis.md §16.9). For a ridge vertex with offsets $\mathbf d_1, \mathbf d_2$ to its
 feature neighbours, $\boldsymbol\tau = \mathbf d_2 - \mathbf d_1$ and
 $\boldsymbol\Delta = \tfrac12(\mathbf d_1+\mathbf d_2)$. Moving it *to*
 $\boldsymbol\Delta$ instead cuts the chord: a regular 24-gon ridge shrinks to
@@ -373,13 +379,14 @@ surface it cuts — through the circumcircle of an equilateral triangle:
 
 $$
   L(v) = \sqrt{6\varepsilon/\kappa - 3\varepsilon^2}\ \in [L_{\min}, L_{\max}],
-  \qquad \kappa = H + \sqrt{\max(H^2 - K, 0)} .
+  \qquad \kappa = \max(|\kappa_1|, |\kappa_2|) = |H| + \sqrt{\max(H^2 - K, 0)} .
 $$
 
-$H = \tfrac12\lVert\Delta\mathbf x\rVert$ and $K = (2\pi - \sum\theta)/A_\text{mixed}$
-are the paper's operators (Meyer et al. 2003: cotangent Laplacian, angle defect,
-mixed Voronoi area with the obtuse cases), computed by
-`MFTLComputeVertexCurvatures` in `src/geometry/`. `MFTLRemeshCurvatureSizing`
+$H$ and $K = (2\pi - \sum\theta)/A_\text{mixed}$ are the paper's operators (Meyer et
+al. 2003: cotangent Laplacian, angle defect, mixed Voronoi area with the obtuse
+cases), read off the COTAN record of `MFTLComputeVertexCurvature` in
+`src/geometry/` ($H = \tfrac12(\kappa_1 + \kappa_2)$, signed: the normal component of
+the mean-curvature vector, the estimate the surface tension uses too). `MFTLRemeshCurvatureSizing`
 evaluates the formula without dividing before the clamps: $\kappa \le 0$ is the
 coarsest target, $\kappa \ge 2/\varepsilon$ the finest, and no input gives NaN.
 An edge's target is the smaller of its ends'. A feature, corner or rim vertex has
@@ -485,9 +492,14 @@ midpoint:
 
 - **Frame.** Origin at the minimum-image midpoint $m$, $z$ along the normalised
   sum of the endpoints' vertex normals, $x$ along the edge projected into the
-  tangent plane. Normals use Max's weights
-  $\sum (\mathbf e_1\times\mathbf e_2)/(|\mathbf e_1|^2|\mathbf e_2|^2)$,
-  exact for vertices on a sphere; they measured better than angle weights here.
+  tangent plane. The vertex normals, of the frame and of every sample, are the
+  library's area-weighted ones, one fan walk each (`MFTLComputeVertexNormalAt`):
+  over the LeVeque period they were best or tied against Max's, angle and fitted
+  normals, and 10–20 % behind Max's only in the curvature error at uniform
+  refinement 5 (docs/analysis.md §16.10). Max's weights, the fit's own sum until
+  then, are exact on a sphere, which only a static sphere rewards: with the
+  normals' slopes the placed point there converges at fourth order with them and
+  at second with area weights.
 - **Samples.** The vertices of the edge's two-ring, 20–30 of them, each weighted
   by Wendland's C2 function $(1-q)^4(1+4q)$ of
   $q = |\mathbf x - m| / (\rho h)$, with $h$ the mean length of the edges at

@@ -182,7 +182,13 @@ static double split_all_error(int refinements, MFTL_RemeshPlacement split, MFTL_
 
 /**
  * @brief Split points on a sphere: the chord midpoint is off by the sagitta,
- *        O(h^2); the fitted points converge at least two orders faster.
+ *        O(h^2); the points fitted to positions converge at least two orders
+ *        faster. Fitting the normals' slopes too is limited by the normals:
+ *        area-weighted ones (the library's) are first order on an irregular
+ *        mesh and second order on these near-symmetric fans, so that placement
+ *        is checked at second order with a smaller constant than the midpoint.
+ *        (Max's weights, exact on a sphere, made it fourth order HERE only; over
+ *        the LeVeque period they were no better, docs/analysis.md §16.10.)
  */
 static int test_split_points_land_on_the_sphere(void)
 {
@@ -198,11 +204,10 @@ static int test_split_points_land_on_the_sphere(void)
   MFTL_RemeshFitCounters fc;
   MFTLRemeshGetFitCounters(&fc);
   printf("\n    %ld fits, %ld fallbacks", fc.n_fits, fc.n_fallbacks);
-  for (int k = 1; k <= 2; ++k)
-  {
-    TEST_ASSERT(e[2][k] < 0.05 * e[2][0]);
-    TEST_ASSERT(e[1][k] / e[2][k] > 8.0);  // fourth order would be 16
-  }
+  TEST_ASSERT(e[2][1] < 0.05 * e[2][0]);
+  TEST_ASSERT(e[1][1] / e[2][1] > 8.0);  // fourth order would be 16
+  TEST_ASSERT(e[2][2] < 0.25 * e[2][0]);  // measured 0.14
+  TEST_ASSERT(e[1][2] / e[2][2] > 3.0);  // second order would be 4; measured 3.5
   TEST_ASSERT(fc.n_fallbacks == 0);
   return 0;
 }

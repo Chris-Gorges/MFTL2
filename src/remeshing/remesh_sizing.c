@@ -138,25 +138,26 @@ int MFTLRemeshSizingBegin(MFTL_Object *obj, const MFTL_RemeshParameters *params)
    * re-detects before every sweep that reads it. */
   MFTLDetectFeatures(obj, params->feature_angle_threshold, params->feature_corner_angle, MFTL_NULL);
 
-  double *const hk = (double *) MFTLMallocOrDie(2 * (size_t) n_v * sizeof(double), "remesh sizing curvature");
-  MFTLComputeVertexCurvatures(obj, hk, hk + n_v);
+  /* Meyer's operators (MFTL_CURVATURE_COTAN): kappa, K, k1 >= k2. */
+  double *const rec = (double *) MFTLMallocOrDie(4 * (size_t) n_v * sizeof(double), "remesh sizing curvature");
+  MFTLComputeVertexCurvature(obj, MFTL_CURVATURE_COTAN, 4, rec, MFTL_NULL);
 
-  /* The RAW maximum absolute curvature, parked in the sizing array until
-   * MFTLRemeshSizingFinish() turns it into a length: the second half reads
-   * neighbours' curvatures, and on a partitioned mesh those must have been
-   * exchanged first -- the array is what the exchange carries. */
+  /* The RAW maximum absolute principal curvature, parked in the sizing array
+   * until MFTLRemeshSizingFinish() turns it into a length: the second half
+   * reads neighbours' curvatures, and on a partitioned mesh those must have
+   * been exchanged first -- the array is what the exchange carries.
+   * max(|k1|, |k2|) = |kappa|/2 + sqrt(max(kappa^2/4 - K, 0)) is Dunyach's
+   * Eq. 5 with the mean curvature taken as the NORMAL component of Meyer's
+   * mean-curvature vector; the clamp of the discriminant (two independent
+   * estimates can disagree) is the record's. */
   double *const kappa = obj->verts.sizing;
   for (int v = 0; v < n_v; ++v)
   {
-    const double H = hk[v];
-    const double K = hk[n_v + v];
-    /* kappa = H + sqrt(H^2 - K) (Dunyach Eq. 5). The two discrete estimates are
-     * independent, so H^2 - K can come out negative; it is clamped, not NaN. */
-    const double disc = H * H - K;
-    kappa[v] = H + ((disc > 0.0) ? MFTL_SQRT(disc) : 0.0);
+    const double *const r = &rec[4 * v];
+    kappa[v] = MFTL_MAX(fabs(r[MFTL_CURVATURE_K1]), fabs(r[MFTL_CURVATURE_K2]));
   }
 
-  free(hk);
+  free(rec);
   return MFTL_SUCCESS;
 }
 

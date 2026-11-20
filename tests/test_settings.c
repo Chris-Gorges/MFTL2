@@ -103,6 +103,7 @@ static bool is_module_block_key(const MFTL_SettingInfo *k)
       {offsetof(MFTL_Settings, topology.options), sizeof(MFTL_TopologyOptions)},
       {offsetof(MFTL_Settings, volume.params), sizeof(MFTL_VolumeCorrectionParameters)},
       {offsetof(MFTL_Settings, undulation.params), sizeof(MFTL_UndulationParameters)},
+      {offsetof(MFTL_Settings, surface_tension.params), sizeof(MFTL_SurfaceTensionParameters)},
       {offsetof(MFTL_Settings, contact.params), sizeof(MFTL_BVHBuildParams)},
       {offsetof(MFTL_Settings, coupling.params), sizeof(MFTL_CouplerParams)},
       {offsetof(MFTL_Settings, output.vtk), sizeof(MFTL_VtkOptions)},
@@ -226,6 +227,7 @@ static int test_defaults_follow_the_modules(void)
   m.topology.options = MFTLTopologyDefaultOptions();
   m.volume.params = MFTLVolumeCorrectionDefaultParameters();
   m.undulation.params = MFTLUndulationDefaultParameters();
+  m.surface_tension.params = MFTLSurfaceTensionDefaultParameters();
   m.contact.params = MFTLBVHDefaultParams();
   MFTLCouplerDefaultParams(&m.coupling.params);
   m.output.vtk = MFTLVtkDefaults();
@@ -253,6 +255,7 @@ static int test_defaults_follow_the_modules(void)
   /* The fields no key covers come from the modules untouched. */
   TEST_ASSERT(d.remesh.params.type == MFTL_REMESH_ISOTROPIC);
   TEST_ASSERT(d.contact.params.pair_filter == NULL);
+  TEST_ASSERT(d.surface_tension.params.sigma_field == -1);  // the uniform sigma, not field 0
   TEST_ASSERT(d.topology.options.remesh == &d.remesh.params);
   return 0;
 }

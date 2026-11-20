@@ -28,7 +28,8 @@
  *   units of the local edge length and the tolerance is 1e-3 of the first pivot.
  * - **The frame depended on the partition** (owned normals only). Here it uses
  *   the endpoints' normals, whose fans are complete wherever an operation is
- *   allowed.
+ *   allowed, from the library's one vertex-normal rule
+ *   (MFTLComputeVertexNormalAt(), area weights).
  *
  * Its coordinate transformation was right: the "inverse" it formed is the
  * cofactor matrix over the determinant, i.e. the inverse TRANSPOSED, which for an
@@ -69,6 +70,18 @@
 /** @brief Largest admitted height above the chord, as a fraction of the edge (a 105-degree arc). */
 #define MFTL_REMESH_FIT_MAX_HEIGHT 0.25
 
+/**
+ * @brief The vertex normals of the fit: the frame (the endpoints' sum) and the
+ *        samples' (their 60-degree filter and, with normals, their slopes).
+ *
+ * Area weights, measured against Max's (the fit's own sum until 2026-11-20),
+ * angle weights and fitted normals over the LeVeque period (docs/analysis.md
+ * §16.10): best or tied in most measures, 20 % behind Max in the curvature
+ * error at uniform refinement 5, and the cheapest. Max's weights are exact on a
+ * sphere, which only a static sphere rewards.
+ */
+#define MFTL_REMESH_FIT_NORMALS MFTL_NORMAL_WEIGHT_AREA
+
 static long g_fit_counts[4] = {0, 0, 0, 0};
 static double g_fit_time = 0.0;
 
@@ -88,72 +101,6 @@ void MFTLRemeshResetFitCounters(void)
 }
 
 void MFTLRemeshFitNoteFallback(void) { g_fit_counts[2]++; }
-
-/**
- * @brief Unit vertex normal from Max's weights (Max 1999), exact for vertices on
- *        a sphere: \f$\sum_f (\vect{e}_1\times\vect{e}_2)/(|\vect{e}_1|^2|\vect{e}_2|^2)\f$.
- *
- * Walks the fan both ways from `out_he_idx`, so an open fan (mesh rim, halo
- * rim) is summed as far as it is present.
- *
- * @param      obj The mesh.
- * @param      v   The vertex.
- * @param[out] n   The unit normal (zero if the fan has no area).
- * @return `true` if the fan closed (the normal is that of the whole fan).
- */
-static bool max_normal(const MFTL_Object *obj, int v, double n[3])
-{
-  n[0] = n[1] = n[2] = 0.0;
-  const int start = obj->verts.rec[v].out_he_idx;
-  if (start == MFTL_ERROR) return MFTL_FALSE;
-
-  const double *const p = MFTLVertexPos(obj, v);
-  bool closed = MFTL_FALSE;
-
-  /* Forward: outgoing v->w1 in (v, w1, w2), then the outgoing v->w2 = twin(prev). */
-  int h = start;
-  for (int guard = 0; guard < MFTL_REMESH_RING_MAX; ++guard)
-  {
-    double d1[3], d2[3], c[3];
-    MFTLGetMinimumImageVector(obj->domain, d1, p, MFTLVertexPos(obj, MFTLHeTarget(obj, h)));
-    MFTLGetMinimumImageVector(obj->domain, d2, p, MFTLVertexPos(obj, MFTLHeTarget(obj, MFTLHeNextIdx(h))));
-    MFTLVectorCrossVector(c, d1, d2);
-    const double w = MFTLVectorNormSq(d1) * MFTLVectorNormSq(d2);
-    if (w > 0.0)
-      for (int k = 0; k < 3; ++k) n[k] += c[k] / w;
-    h = obj->tris.he[MFTLHePrevIdx(h)].twin_idx;
-    if (h == start)
-    {
-      closed = MFTL_TRUE;
-      break;
-    }
-    if (h == MFTL_ERROR) break;
-  }
-
-  /* Backward from the start when the fan is open: the triangle before is the
-   * one across the start's twin. */
-  if (!closed)
-  {
-    int g = obj->tris.he[start].twin_idx;
-    for (int guard = 0; g != MFTL_ERROR && guard < MFTL_REMESH_RING_MAX; ++guard)
-    {
-      const int out = MFTLHeNextIdx(g);  // v -> x in the triangle of g
-      double d1[3], d2[3], c[3];
-      MFTLGetMinimumImageVector(obj->domain, d1, p, MFTLVertexPos(obj, MFTLHeTarget(obj, out)));
-      MFTLGetMinimumImageVector(obj->domain, d2, p, MFTLVertexPos(obj, MFTLHeTarget(obj, MFTLHeNextIdx(out))));
-      MFTLVectorCrossVector(c, d1, d2);
-      const double w = MFTLVectorNormSq(d1) * MFTLVectorNormSq(d2);
-      if (w > 0.0)
-        for (int k = 0; k < 3; ++k) n[k] += c[k] / w;
-      g = obj->tris.he[out].twin_idx;
-    }
-  }
-
-  const double len = MFTLVectorNorm(n);
-  const double inv = (len > 0.0) ? 1.0 / len : 0.0;
-  for (int k = 0; k < 3; ++k) n[k] *= inv;
-  return closed;
-}
 
 /**
  * @brief Appends @p v to @p list unless present.
@@ -234,8 +181,8 @@ static int fit_edge_point(const MFTL_Object *obj, int h, const MFTL_RemeshParame
 
   /* ── The frame ──────────────────────────────────────────────────────── */
   double na[3], nb[3], nz[3];
-  max_normal(obj, a, na);
-  max_normal(obj, b, nb);
+  MFTLComputeVertexNormalAt(obj, a, MFTL_REMESH_FIT_NORMALS, na);
+  MFTLComputeVertexNormalAt(obj, b, MFTL_REMESH_FIT_NORMALS, nb);
   for (int k = 0; k < 3; ++k) nz[k] = na[k] + nb[k];
   if (!(MFTLVectorNormSq(nz) > 0.0)) goto fail;
   MFTLNormalizeVector(nz);
@@ -275,7 +222,7 @@ static int fit_edge_point(const MFTL_Object *obj, int h, const MFTL_RemeshParame
     if (!(wi > 0.0)) continue;
 
     double nv[3];
-    const bool closed = max_normal(obj, v, nv);
+    const bool closed = MFTLComputeVertexNormalAt(obj, v, MFTL_REMESH_FIT_NORMALS, nv);
     const double nzl = MFTLVectorInProd(nv, nz);
     if (!(nzl >= MFTL_REMESH_FIT_NORMAL_COS)) continue;
 

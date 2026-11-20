@@ -34,6 +34,7 @@ parameter block its module already defines:
 | `topology` | `every`, the resolution-relative factors + #MFTL_TopologyOptions | `&cfg.topology.options` to `MFTLEnsembleApplyTopologyChanges` |
 | `volume` | `every` + #MFTL_VolumeCorrectionParameters | `&cfg.volume.params` to `MFTLEnsembleCorrectVolumes` |
 | `undulation` | `every` + #MFTL_UndulationParameters | `&cfg.undulation.params` to `MFTLEnsembleRemoveUndulations` |
+| `surface_tension` | #MFTL_SurfaceTensionParameters (but `sigma_field`, a run-time id) + the curvature method | `&cfg.surface_tension.params` to `MFTLEnsembleComputeSurfaceTension`; `curvature` to `MFTLEnsembleComputeCurvature` |
 | `contact` | `every` + #MFTL_BVHBuildParams | `&cfg.contact.params` to `MFTLEnsembleIntersectObjects` |
 | `coupling` | #MFTL_CouplerParams | `&cfg.coupling.params` to `MFTLCouplerCreate` |
 | `redistribute` | the two process-wide switches | applied by `MFTLSettingsCreateEnsemble` |

@@ -215,6 +215,24 @@ typedef struct MFTL_UndulationSettings
 } MFTL_UndulationSettings;
 
 /**
+ * @struct MFTL_SurfaceTensionSettings
+ * @brief Surface tension and signed curvature: the parameters of
+ *        MFTLEnsembleComputeSurfaceTension() and the choices of
+ *        MFTLEnsembleComputeCurvature().
+ */
+typedef struct MFTL_SurfaceTensionSettings
+{
+  /**
+   * The parameters to pass to MFTLEnsembleComputeSurfaceTension().
+   * `sigma_field` cannot be set from a file: it is a field id, registered at
+   * run time, and stays -1 (the uniform `sigma`).
+   */
+  MFTL_SurfaceTensionParameters params;
+
+  MFTL_CurvatureMethod curvature;  ///< The method to pass to MFTLEnsembleComputeCurvature().
+} MFTL_SurfaceTensionSettings;
+
+/**
  * @struct MFTL_ContactSettings
  * @brief Contact detection: the schedule and the parameters of
  *        MFTLEnsembleIntersectObjects().
@@ -256,7 +274,7 @@ typedef struct MFTL_RedistributeSettings
  */
 typedef struct MFTL_GeometrySettings
 {
-  /** For MFTLEnsembleUpdateVertexNormals(): area for a solver, angle for an exact pseudo-normal sign. */
+  /** For MFTLEnsembleUpdateVertexNormals(): area (cheapest, the volume gradient), angle (an exact pseudo-normal sign) or fit (second order). */
   MFTL_NormalWeighting normal_weighting;
 } MFTL_GeometrySettings;
 
@@ -290,6 +308,7 @@ typedef struct MFTL_Settings
   MFTL_TopologySettings topology;  ///< `[topology]`
   MFTL_VolumeSettings volume;  ///< `[volume]`
   MFTL_UndulationSettings undulation;  ///< `[undulation]`
+  MFTL_SurfaceTensionSettings surface_tension;  ///< `[surface_tension]`
   MFTL_ContactSettings contact;  ///< `[contact]`
   MFTL_CouplingSettings coupling;  ///< `[coupling]`
   MFTL_RedistributeSettings redistribute;  ///< `[redistribute]`
@@ -402,7 +421,7 @@ const MFTL_SettingSection *MFTLSettingsSection(int i);
  *
  * Module blocks start from their module's own defaults (MFTLInitRemeshParams(),
  * MFTLTopologyDefaultOptions(), MFTLVolumeCorrectionDefaultParameters(),
- * MFTLUndulationDefaultParameters(), MFTLBVHDefaultParams(),
+ * MFTLUndulationDefaultParameters(), MFTLSurfaceTensionDefaultParameters(), MFTLBVHDefaultParams(),
  * MFTLCouplerDefaultParams(), MFTLVtkDefaults()) and every key is then set from
  * its table default, which equals the module's on every key
  * (`test_defaults_follow_the_modules`). `remesh.parallel_phase_budget` is

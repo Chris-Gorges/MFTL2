@@ -555,30 +555,77 @@ double MFTLClosestPointsBetweenTriangles(const double A[3][3], const double B[3]
 void MFTLComputeTriangleGeometry(MFTL_Object *obj, int count);
 
 /**
- * @brief How MFTLComputeVertexNormals() weights the faces around a vertex.
+ * @brief Which vertex normal MFTLComputeVertexNormals() and
+ *        MFTLComputeVertexNormalAt() compute.
+ *
+ * One choice on two levels (src/geometry/README.md, "Vertex normals"):
+ *
+ * - FROM THE TRIANGLES, a weighted sum of the face normals around the vertex:
+ *   #MFTL_NORMAL_WEIGHT_AREA or #MFTL_NORMAL_WEIGHT_ANGLE. Cheap, and
+ *   first-order accurate on an irregular mesh.
+ * - FITTED, #MFTL_NORMAL_WEIGHT_FIT: the normal of a one-ring paraboloid,
+ *   second-order accurate; one small least-squares solve per vertex.
+ *
+ * Where the library uses which: AREA wherever a vertex MOVES (the remesher's
+ * smoother, its placement fit and its projection's orientation test, the
+ * volume corrections),
+ * ANGLE wherever inside and outside are DECIDED (the signed distance, topology
+ * change) and for the remesher's Phong reference, FIT for curvature and the
+ * fitted-normal surface tension. Max's (1999) weights were measured and are
+ * not offered (docs/analysis.md §16.9).
  */
 typedef enum MFTL_NormalWeighting
 {
   /**
    * Weight each face by its AREA: \f$\vect{N}_v \propto \sum_{f \ni v}
    * (\vect{e}_1\times\vect{e}_2)_f = 2\sum_f A_f\hat{\vect{n}}_f\f$, free given
-   * the cross product. Parallel to the gradient of the enclosed volume with
-   * respect to the vertex position, \f$\partial V/\partial\vect{x}_v =
-   * \tfrac13\sum_f A_f\hat{\vect{n}}_f\f$ -- the normal a volume-conserving
-   * front-tracking scheme wants. The default for moving vertices.
+   * the cross product (6-7 ns per vertex). On a closed fan this is the
+   * direction of the gradient of the enclosed volume, \f$\partial
+   * V/\partial\vect{x}_v = \tfrac16\sum_f(\vect{e}_1\times\vect{e}_2)_f\f$:
+   * the direction in which the vertex changes the volume fastest, and the
+   * normal of the plane in which it moves without changing the volume to first
+   * order. Hence the volume corrections move along it and the remesher's
+   * smoother moves in that plane; any other normal there makes the smoother
+   * leak volume into noise (LeVeque, uniform sizing, refinement 4: angle
+   * normals end 25 % of the radius off the exact surface,
+   * src/remeshing/README.md). It is also the partner \f$\vect{G}\f$ of the
+   * default surface-tension force in a balanced-force curvature
+   * (src/geometry/README.md, "Surface tension"). Its pseudo-normal sign is
+   * NOT exact at a spiky vertex: use ANGLE for inside/outside.
    */
   MFTL_NORMAL_WEIGHT_AREA = 0,
 
   /**
    * Weight each face by its INTERIOR ANGLE at the vertex (Thürmer & Wüthrich
-   * 1998): \f$\vect{N}_v \propto \sum_f \alpha_f(v)\,\hat{\vect{n}}_f\f$.
-   * Invariant under re-triangulation of the fan, and the pseudo-normal for which
-   * \f$\sign((\vect{x}-\vect{v})\cdot\vect{N}_v)\f$ is provably the correct
-   * inside/outside test when \f$\vect{v}\f$ is the closest surface point to
-   * \f$\vect{x}\f$ (Bærentzen & Aanæs 2005). Used for signed distances. One
-   * `atan2` per corner; degenerate faces contribute nothing.
+   * 1998): \f$\vect{N}_v \propto \sum_f \alpha_f(v)\,\hat{\vect{n}}_f\f$,
+   * \f$\alpha = \operatorname{atan2}(\norm{\vect{e}_1\times\vect{e}_2},
+   * \vect{e}_1\cdot\vect{e}_2)\f$ (well conditioned at every angle, unlike
+   * `acos`). Invariant under re-triangulation of the fan, and the only
+   * weighting for which \f$\sign((\vect{x}-\vect{v})\cdot\vect{N}_v)\f$ is
+   * provably the correct inside/outside test when \f$\vect{v}\f$ is the
+   * closest surface point to \f$\vect{x}\f$ (Bærentzen & Aanæs 2005): the
+   * signed distance and topology change use it, and the remesher's Phong
+   * reference, where it measured best. Three `atan2` per face (40-66 ns per
+   * vertex); degenerate faces contribute nothing.
    */
-  MFTL_NORMAL_WEIGHT_ANGLE = 1
+  MFTL_NORMAL_WEIGHT_ANGLE = 1,
+
+  /**
+   * Not a weighting of face normals: the normal at the vertex of the
+   * least-squares paraboloid through the vertex and its one-ring POSITIONS,
+   * in the frame of the area-weighted normal (MFTLFitHeightParaboloid(),
+   * lengths in units of the ring's RMS edge), \f$\vect{N}_v \propto \vect{n} -
+   * c_1\vect{t}_1 - c_2\vect{t}_2\f$. SECOND-order accurate on an irregular
+   * mesh, where any weighting of face normals is first-order: 3-27 times
+   * more accurate than the best weighting measured on remeshed, graded and
+   * marching-cubes ellipsoids and tori (src/geometry/README.md, "Vertex
+   * normals"). Which weighting gives the frame does not change the result
+   * (three digits), so it is the cheapest. The normals #MFTL_CURVATURE_FIT is
+   * meant to read. A vertex with fewer than three neighbours, a fit that
+   * cannot determine its slope, or a fitted normal more than 75 degrees from
+   * the frame keeps the area normal. One small QR per vertex (about 240 ns).
+   */
+  MFTL_NORMAL_WEIGHT_FIT = 2
 } MFTL_NormalWeighting;
 
 /**
@@ -594,12 +641,38 @@ typedef enum MFTL_NormalWeighting
  * faces and holds a normalised PARTIAL sum -- plausible-looking and wrong.
  * MFTLEnsembleUpdateVertexNormals() adds the exchange that makes ghosts exact.
  *
+ * #MFTL_NORMAL_WEIGHT_FIT is a one-ring quantity too, so the same holds for it.
+ *
  * @param obj       The mesh; `verts.normal` is overwritten for every vertex.
- * @param weighting #MFTL_NORMAL_WEIGHT_AREA or #MFTL_NORMAL_WEIGHT_ANGLE.
+ * @param weighting Which normal (#MFTL_NormalWeighting).
  *
  * @rank_local
  */
 void MFTLComputeVertexNormals(MFTL_Object *obj, MFTL_NormalWeighting weighting);
+
+/**
+ * @brief The unit normal of ONE vertex, by the rule of
+ *        MFTLComputeVertexNormals(), from a walk of its fan. Writes nothing to
+ *        the pool.
+ *
+ * For a caller that edits the mesh between two normals (the remesher's
+ * placement fit): a whole-pool pass is stale after the first edit, and a fan
+ * walk for every vertex is 3.4 times slower than the whole-pool scatter. The
+ * weights and the fit are the same code; the result differs from
+ * MFTLComputeVertexNormals()'s only by the order of the sum. The walk goes both
+ * ways from `out_he_idx`, so an open fan (a mesh rim, or a ghost's partial
+ * fan) is summed as far as it is present. Needs the half-edges and
+ * `out_he_idx`, not `tris.verts`.
+ *
+ * @param      obj       The mesh.
+ * @param      v         The vertex, `[0, verts.n)`.
+ * @param      weighting Which normal (#MFTL_NormalWeighting).
+ * @param[out] n         The unit normal; zero for a vertex without area.
+ * @return `true` if the fan closed, i.e. the normal is that of the whole fan.
+ *
+ * @rank_local
+ */
+bool MFTLComputeVertexNormalAt(const MFTL_Object *obj, int v, MFTL_NormalWeighting weighting, double n[3]);
 
 // -----------------------------------------------------------------------------
 // 7. SIGNED DISTANCE ON A LATTICE  (see src/geometry/signed_distance.c)
@@ -790,8 +863,8 @@ static inline double MFTLSdfMerge(double current, double candidate)
  * face normals (T's alone at a mesh rim); for a vertex `verts.normal`, which
  * must hold ANGLE-weighted normals. Values are merged with MFTLSdfMerge(). For a
  * closed, consistently oriented, non-self-intersecting surface this yields the
- * exact signed distance (Bærentzen & Aanæs 2005); area-weighted vertex normals
- * can give the wrong sign near thin, sharply folded sheets.
+ * exact signed distance (Bærentzen & Aanæs 2005); area-weighted vertex
+ * normals can give the wrong sign near thin, sharply folded sheets.
  *
  * **Cutoff.** Nodes farther than @p cutoff from every triangle stay
  * #MFTL_SDF_UNKNOWN. Every corner of a lattice cell crossed by the surface lies
@@ -1091,7 +1164,10 @@ void MFTLBodyFluxMoments(const MFTL_Object *obj, int k, double ref, const double
  * @brief The displacement field of a volume correction, left in `verts.normal`,
  *        and this rank's share of the derivative of the enclosed volume along it.
  *
- * The field \f$\vect{u}\f$ is the area-weighted unit vertex normal; a vertex
+ * The field \f$\vect{u}\f$ is the unit direction of the volume gradient,
+ * \f$\partial V/\partial\vect{x}_v \propto \sum_{T\ni v}(\vect{e}_1\times\vect{e}_2)_T\f$
+ * (#MFTL_NORMAL_WEIGHT_AREA): every vertex moves in the
+ * direction in which it changes the volume fastest. A vertex
  * flagged #MFTL_FLAG_BOUNDARY loses the component normal to every wall it lies
  * on (within #MFTL_BODY_WALL_TOL), so it slides in the wall and the rim stays
  * there. Moving every OWNED vertex by \f$d\,\vect{u}\f$ changes the enclosed
@@ -1113,34 +1189,7 @@ void MFTLBodyFluxMoments(const MFTL_Object *obj, int k, double ref, const double
 double MFTLBodyVolumeDisplacement(MFTL_Object *obj);
 
 // -----------------------------------------------------------------------------
-// 10. CURVATURE  (see src/geometry/vertex_curvature.c)
-// -----------------------------------------------------------------------------
-
-/**
- * @brief Discrete mean and Gaussian curvature of every vertex (Meyer, Desbrun,
- *        Schröder & Barr 2003).
- *
- * With \f$A_i\f$ the MIXED area (the Voronoi area where no incident triangle
- * is obtuse; half or a quarter of an obtuse triangle's area otherwise):
- * \f[
- *   H_i = \tfrac12 \Big\lVert \tfrac{1}{2A_i} \sum_j (\cot\alpha_{ij} + \cot\beta_{ij})(\vect{x}_i - \vect{x}_j) \Big\rVert,
- *   \qquad K_i = \frac{2\pi - \sum_f \theta_f}{A_i},
- * \f]
- * so a sphere of radius \f$R\f$ gives \f$H = 1/R\f$ and \f$K = 1/R^2\f$. \f$H\f$
- * is UNSIGNED. One scatter over all triangles; degenerate faces contribute
- * nothing and a vertex without area gets zeros. The values are meaningful only
- * on a closed fan: on the rim of an open surface, and on a ghost vertex of a
- * distributed mesh (whose fan is partial), they are not curvatures.
- *
- * @param      obj             The mesh; needs current `tris.verts`.
- * @param[out] mean_curvature  `[verts.n]` \f$H_i \ge 0\f$.
- * @param[out] gauss_curvature `[verts.n]` \f$K_i\f$.
- * @rank_local
- */
-void MFTLComputeVertexCurvatures(const MFTL_Object *obj, double *mean_curvature, double *gauss_curvature);
-
-// -----------------------------------------------------------------------------
-// 11. LEAST SQUARES AND LOCAL HEIGHT FITS  (see src/geometry/surface_fit.c)
+// 10. LEAST SQUARES AND LOCAL HEIGHT FITS  (see src/geometry/surface_fit.c)
 // -----------------------------------------------------------------------------
 
 /** @brief Most unknowns MFTLLeastSquaresQRCP() solves for (a quadratic in two variables). */
@@ -1213,6 +1262,295 @@ int MFTLLeastSquaresQRCP(int m, int n, int n_lead, double *A, double *b, double 
  */
 int MFTLFitHeightParaboloid(int n, const double *pts, const double *slopes, const unsigned char *use_slope, const double *w, double tau, double c[6],
                             unsigned char kept[6]);
+
+// -----------------------------------------------------------------------------
+// 11. SIGNED CURVATURE  (see src/geometry/vertex_curvature.c)
+//
+// THE CONVENTION, stated once: kappa = kappa_1 + kappa_2 = div_s n, with n the
+// OUTWARD normal (corners counter-clockwise seen from outside). A sphere of
+// radius R has kappa = 2/R, the Young-Laplace jump is p_in - p_out = sigma
+// kappa, and the surface-tension force density -sigma kappa n points inward.
+// The remesher's curvature sizing reads max(|kappa_1|, |kappa_2|) off the COTAN
+// record.
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief How MFTLComputeVertexCurvature() estimates the curvature of a vertex.
+ *
+ * Both are one-ring estimates, so both are exact on an owned vertex of a
+ * distributed mesh given what the vertex-complete halo holds; they differ in
+ * what they assume between the vertices.
+ */
+typedef enum MFTL_CurvatureMethod
+{
+  /**
+   * Meyer, Desbrun, Schröder & Barr (2003), every operator of their paper:
+   * the mean-curvature normal \f$\vect{K}_i = \nabla_i A / A_i\f$ (the
+   * cotangent formula over the MIXED area \f$A_i\f$), signed by projection on
+   * the area-weighted vertex normal, \f$\kappa_i = \vect{K}_i\cdot\hat{\vect{N}}_i\f$
+   * (their eq. 12); the Gaussian curvature by the angle deficit
+   * \f$(2\pi - \sum_f\theta_f)/A_i\f$ (eq. 9); the principal curvatures from
+   * both (eqs. 10, 11); the principal directions from their least-squares fit
+   * of the curvature tensor to the edge normal curvatures, with the trace
+   * fixed to \f$\kappa_i\f$ (section 5.3). Needs nothing but positions.
+   * Converges in an integral sense, NOT pointwise on an irregular mesh
+   * (src/geometry/README.md, "Signed curvature").
+   */
+  MFTL_CURVATURE_COTAN = 0,
+
+  /**
+   * A weighted least-squares height paraboloid in the frame of the vertex
+   * normal, through the vertex and its one-ring: three rows per sample (the
+   * height and the two slopes its normal gives), solved by
+   * MFTLFitHeightParaboloid(). Curvatures and the principal direction are those
+   * of the fitted surface at the vertex (shape operator \f$I^{-1}I\!I\f$). Reads
+   * `verts.normal` of the vertex AND of its neighbours: a ghost neighbour's
+   * normal must be its owner's (MFTLEnsembleUpdateVertexNormals()). The fit is
+   * only as good as those normals: with #MFTL_NORMAL_WEIGHT_FIT normals it
+   * converges on every mesh measured (second order on spheres and the
+   * ellipsoid, first order on an irregular torus), with area- or
+   * angle-weighted ones it stalls at a few percent on irregular meshes. A
+   * vertex with fewer than three neighbours, fewer than three neighbours whose
+   * normal is within 75 degrees of its own, or a rank-deficient system gets
+   * the COTAN values and is counted.
+   */
+  MFTL_CURVATURE_FIT = 1
+} MFTL_CurvatureMethod;
+
+/** @brief Record slot: the signed curvature \f$\kappa = \kappa_1 + \kappa_2\f$ (2/R on a sphere). */
+#define MFTL_CURVATURE_KAPPA 0
+/** @brief Record slot: the Gaussian curvature \f$\kappa_G = \kappa_1\kappa_2\f$. */
+#define MFTL_CURVATURE_GAUSS 1
+/** @brief Record slot: the larger principal curvature \f$\kappa_1\f$. */
+#define MFTL_CURVATURE_K1 2
+/** @brief Record slot: the smaller principal curvature \f$\kappa_2\f$. */
+#define MFTL_CURVATURE_K2 3
+/** @brief Record slots 4-6: a unit tangent along the principal direction of \f$\kappa_1\f$ (a line: its sign is arbitrary). */
+#define MFTL_CURVATURE_DIR1 4
+/** @brief Components of a full curvature record. 1, 2, 4 and 7 are the valid prefixes. */
+#define MFTL_CURVATURE_COMPONENTS 7
+
+/**
+ * @brief Signed curvature of every vertex: \f$\kappa\f$, and on request the
+ *        Gaussian curvature, the principal curvatures and the principal
+ *        direction.
+ *
+ * Writes a RECORD of @p ncomp doubles per vertex, interleaved, in the slot
+ * order #MFTL_CURVATURE_KAPPA, #MFTL_CURVATURE_GAUSS, #MFTL_CURVATURE_K1,
+ * #MFTL_CURVATURE_K2, #MFTL_CURVATURE_DIR1 -- the layout of a vertex field of
+ * @p ncomp components, so `MFTLObjectField(obj, id)` can be passed directly.
+ * Asking for a shorter prefix skips the work it does not need (the
+ * principal-direction fit is a per-vertex gather).
+ *
+ * Exact on OWNED vertices `[0, verts.n_local)`: the cotangent sums are a
+ * scatter over every triangle the rank holds, and the halo is vertex-complete.
+ * A GHOST vertex gets a value from its partial neighbourhood -- plausible and
+ * wrong, as for a ghost's vertex normal; MFTLEnsembleComputeCurvature() replaces
+ * it with the owner's. On a RIM vertex (#MFTL_FLAG_BOUNDARY) the cotangent
+ * estimate is one-sided and not a curvature; the fit is.
+ *
+ * Nothing compares a dimensional quantity against a constant: a mesh scaled by
+ * \f$2^{-20}\f$ gives every curvature times \f$2^{20}\f$ (the Gaussian times
+ * \f$2^{40}\f$) bit for bit.
+ *
+ * @param      obj        The mesh; needs current `tris.verts`, and for
+ *                        #MFTL_CURVATURE_FIT current `verts.normal` on every
+ *                        vertex of the one-rings it evaluates.
+ * @param      method     #MFTL_CURVATURE_COTAN or #MFTL_CURVATURE_FIT.
+ * @param      ncomp      Record length: 1, 2, 4 or #MFTL_CURVATURE_COMPONENTS.
+ * @param[out] out        `[ncomp * verts.n]` records.
+ * @param[out] n_fallback OWNED vertices for which the fit fell back to the
+ *                        cotangent values, or #MFTL_NULL. Always 0 for COTAN.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR for a NULL object or output, an
+ *         unknown method or an invalid @p ncomp.
+ *
+ * @rank_local MFTLEnsembleComputeCurvature() adds the normal and the result
+ *             exchanges.
+ */
+int MFTLComputeVertexCurvature(const MFTL_Object *obj, MFTL_CurvatureMethod method, int ncomp, double *out, int *n_fallback);
+
+// -----------------------------------------------------------------------------
+// 12. SURFACE TENSION  (see src/geometry/surface_tension.c)
+//
+// The INTEGRATED force on a piece of surface, sigma times the contour integral
+// of the outward conormal around it (Tryggvason et al. 2011, eqs. 7.52-7.53):
+// what a front-tracking solver spreads. Same convention as section 11: on a
+// closed body with outward normals it is -sigma kappa n A, pointing inward.
+// -----------------------------------------------------------------------------
+
+/**
+ * @brief Which piece of surface the force is integrated over, and where it
+ *        is applied.
+ */
+typedef enum MFTL_SurfaceTensionForm
+{
+  /**
+   * FRENET VERTEX (Tryggvason et al. 2011, eqs. 7.54-7.59): the pull on the
+   * boundary of each vertex's barycentric cell, which inside a triangle runs
+   * from an edge midpoint to the centroid to the next edge midpoint. With
+   * the triangle's own normal on it (#MFTL_CONTOUR_NORMAL_TRIANGLES, the
+   * book's eq. 7.59) the two segments add up to half the pull on the opposite
+   * edge, \f$\vect{F}_v = \sum_{T\ni v}\tfrac12\sigma_T(\vect{x}_k -
+   * \vect{x}_j)\times\hat{\vect{n}}_T\f$ for \f$(v, j, k)\f$ counter-clockwise:
+   * exactly \f$-\partial E/\partial\vect{x}_v\f$ of \f$E = \sum_T\sigma_T A_T\f$,
+   * so the net force AND torque of a closed body vanish to round-off. For
+   * vertex markers.
+   */
+  MFTL_TENSION_FRENET_VERTEX = 0,
+
+  /**
+   * FRENET ELEMENT (Tryggvason et al. 2011, eq. 7.53 on a triangle): the pull
+   * of the neighbours across each edge, \f$\vect{F}_T = \sum_{e\in T}
+   * \sigma_e L_e \hat{\vect{m}}_e\f$, \f$\hat{\vect{m}}_e\f$ the unit outward
+   * conormal on the edge. The triangle's own normal on all three edges would
+   * cancel exactly, so the normal on an edge comes from both sides
+   * (#MFTL_ContourNormal). The two triangles of an edge receive opposite
+   * pulls, so the net force of a closed body vanishes to round-off; the net
+   * torque does not (the force is applied at centroids). For centroid
+   * markers.
+   */
+  MFTL_TENSION_FRENET_ELEMENT = 1
+} MFTL_SurfaceTensionForm;
+
+/**
+ * @brief The normal the conormal \f$\hat{\vect{m}} = \hat{\vect{t}}\times
+ *        \hat{\vect{n}}\f$ is built from along the contour.
+ *
+ * What decides POINTWISE accuracy (src/geometry/README.md, "Surface tension";
+ * measured by examples/curvature_comparison.c). Both choices conserve the
+ * net force exactly, because each piece of contour is shared by two cells and
+ * evaluated once.
+ */
+typedef enum MFTL_ContourNormal
+{
+  /**
+   * The TRIANGLES' normals, as printed in the book: in the vertex form each
+   * triangle's own (the area gradient: torque-free and energy-consistent),
+   * in the element form the mean of the two triangles of the edge. Needs no
+   * vertex normals and no communication. Integrally consistent but NOT
+   * pointwise on an irregular mesh: the vertex form is \f$\sigma\f$ times
+   * Meyer's cotangent operator times the mixed area, with its errors (17 %
+   * at the worst vertex of a remeshed sphere).
+   */
+  MFTL_CONTOUR_NORMAL_TRIANGLES = 0,
+
+  /**
+   * The FITTED vertex normals (#MFTL_NORMAL_WEIGHT_FIT, in `verts.normal`),
+   * interpolated linearly along the contour; the book's "higher order
+   * approximations" (p. 173). Both forms then converge pointwise on irregular
+   * meshes -- the vertex form to \f$-\sigma\kappa\vect{n}\f$ times the
+   * vertex's BARYCENTRIC area, which is the coupler's marker weight. The net
+   * torque is then zero only to truncation error. A ghost vertex must carry
+   * its owner's normal; the ensemble call computes and exchanges them.
+   */
+  MFTL_CONTOUR_NORMAL_VERTICES = 1
+} MFTL_ContourNormal;
+
+/**
+ * @brief What acts on the RIM of an open surface (#MFTL_FLAG_BOUNDARY).
+ *
+ * The rim's line force is \f$\sigma\hat{\vect{m}}\,dl\f$ along the outward
+ * conormal. A wall is a non-periodic domain face; a rim edge is on it when both
+ * ends are within #MFTL_BODY_WALL_TOL of it (the MFTLBodyRimWalls() rule).
+ */
+typedef enum MFTL_RimForce
+{
+  /**
+   * A FREE EDGE: nothing beyond the rim pulls, so the rim is pulled into the
+   * surface. Both forms then give a total of zero on every body.
+   */
+  MFTL_RIM_FORCE_FREE = 0,
+
+  /**
+   * The WALL REACTS: as FREE, plus the wall-normal component of the line
+   * force on every rim edge lying on a wall, which the wall supplies. A flat
+   * sheet meeting its walls at a right angle feels no force, and with a
+   * linear \f$\sigma\f$ (vertex field) the total over the sheet is the
+   * Marangoni force \f$\Delta\sigma\,W\f$ exactly, in both forms. A rim edge on
+   * no wall is treated as FREE.
+   */
+  MFTL_RIM_FORCE_WALL = 1,
+
+  /** Rim vertices (vertex form) and triangles with a rim edge (element form) get zero force. */
+  MFTL_RIM_FORCE_EXCLUDE = 2
+} MFTL_RimForce;
+
+/**
+ * @struct MFTL_SurfaceTensionParameters
+ * @brief Everything MFTLComputeSurfaceTension() and
+ *        MFTLEnsembleComputeSurfaceTension() need. Start from
+ *        MFTLSurfaceTensionDefaultParameters().
+ */
+typedef struct MFTL_SurfaceTensionParameters
+{
+  MFTL_SurfaceTensionForm form;  ///< Frenet vertex (default) or Frenet element.
+
+  /** The uniform coefficient, used when `sigma_field` is negative. Any unit; the force is linear in it. */
+  double sigma;
+
+  /**
+   * A registered one-component field holding \f$\sigma\f$, or -1 for the
+   * uniform `sigma`. A TRIANGLE field is \f$\sigma_T\f$, on an edge the mean of
+   * its two triangles. A VERTEX field is the linear interpolant: on a triangle
+   * the mean of its corners (the vertex form with triangle normals), along a
+   * piece of contour the mean of its ends. Ghost values must be the owners'
+   * (the ensemble call exchanges them).
+   */
+  int sigma_field;
+
+  MFTL_ContourNormal contour_normal;  ///< The normal along the contour; #MFTL_CONTOUR_NORMAL_TRIANGLES by default.
+
+  MFTL_RimForce rim;  ///< What acts on the rim of an open surface.
+} MFTL_SurfaceTensionParameters;
+
+/**
+ * @brief The defaults: Frenet vertex, \f$\sigma = 1\f$ uniform, the
+ *        triangles' normals along the contour (the book's formula), free rims.
+ *        That force is the exact gradient of the discrete surface energy:
+ *        net force, net torque and the work it does on any velocity are
+ *        exact, it needs no vertex normals and no communication, and it costs
+ *        9 ns per vertex. For a solver that spreads the force plainly it is
+ *        as good as any variant measured (src/geometry/README.md, "Surface
+ *        tension"). #MFTL_CONTOUR_NORMAL_VERTICES (fitted normals, about
+ *        thirty times dearer) converges per vertex, which is what a
+ *        balanced-force curvature needs.
+ * @return The default parameter block.
+ * @rank_local
+ */
+MFTL_SurfaceTensionParameters MFTLSurfaceTensionDefaultParameters(void);
+
+/**
+ * @brief The integrated surface-tension force on every vertex (Frenet vertex)
+ *        or every triangle (Frenet element).
+ *
+ * Rows `[0, n_local)` are exact on a distributed mesh without communication,
+ * given current ghost values of what the form reads (sigma, and with
+ * #MFTL_CONTOUR_NORMAL_VERTICES the vertex normals): the vertex form is a
+ * scatter over every triangle the rank holds (the halo is vertex-complete), and
+ * every owned triangle has all three edge neighbours. Ghost rows are computed
+ * from a partial neighbourhood and are not forces. The force is integrated (a
+ * force, not a density): pass the owned prefix to the coupler with
+ * #MFTL_SPREAD_INTEGRATED and #MFTL_MARKERS_VERTICES or
+ * #MFTL_MARKERS_CENTROIDS.
+ *
+ * Reads positions and `verts.normal`, never the cached `tris.normal`. Scaling a
+ * mesh by \f$2^{-20}\f$ scales every force by \f$2^{-20}\f$, bit for bit.
+ *
+ * @param      obj   The mesh; needs current `tris.verts` and `tris.neighbors`,
+ *                   and for #MFTL_CONTOUR_NORMAL_VERTICES current
+ *                   `verts.normal` (MFTLComputeVertexNormals() with
+ *                   #MFTL_NORMAL_WEIGHT_FIT; this call does not compute them).
+ * @param      p     The parameters.
+ * @param[out] force `[3 * verts.n]` (vertex form) or `[3 * tris.n]` (element
+ *                   form), xyz interleaved, overwritten.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR for a NULL argument, an unknown
+ *         enumerator, or a `sigma_field` that is not a one-component field of
+ *         this object.
+ *
+ * @rank_local MFTLEnsembleComputeSurfaceTension() adds the normals and the
+ *             exchanges.
+ */
+int MFTLComputeSurfaceTension(const MFTL_Object *obj, const MFTL_SurfaceTensionParameters *p, double *force);
 
 #ifdef __cplusplus
 }

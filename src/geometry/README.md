@@ -9,15 +9,17 @@ Everything in this directory is **local** — no MPI:
 | File | Produces |
 |---|---|
 | `triangle_geometry.c` | `tris.area`, `tris.normal`, `tris.center` for a mesh; closest points on a triangle, between two segments and between two triangles |
-| `vertex_geometry.c` | area- or angle-weighted `verts.normal` for a mesh |
+| `vertex_geometry.c` | area-weighted, angle-weighted or fitted vertex normals, for the whole pool (`verts.normal`) or one vertex |
 | `signed_distance.c` | signed distance to a mesh on a (periodic) lattice window, at one cutoff or two |
 | `periodic_extent.c` | a body's extent on a periodic axis, and whether it covers the axis |
 | `body_integrals.c` | a body's flux integrals (volume, first moments) and where its rims lie, per rank |
-| `vertex_curvature.c` | discrete mean and Gaussian curvature per vertex (Meyer et al.) |
+| `vertex_curvature.c` | the SIGNED curvature per vertex with the Gaussian, the principal curvatures and direction, by Meyer et al.'s operators or a one-ring fit (the remesher's sizing reads the larger principal curvature magnitude off it) |
+| `surface_tension.c` | the integrated surface-tension force per vertex or per triangle (Tryggvason's Frenet forms) |
 | `surface_fit.c` | small dense least squares (QR with grouped column pivoting) and the weighted height-paraboloid fit |
 
-The collective wrappers (`MFTLEnsembleUpdate`, `MFTLEnsembleUpdateVertexNormals`)
-live in @ref mftl_mod_ensemble; the split is by *scope*, not by entity
+The collective wrappers (`MFTLEnsembleUpdate`, `MFTLEnsembleUpdateVertexNormals`,
+`MFTLEnsembleComputeCurvature`, `MFTLEnsembleComputeSurfaceTension`) live in
+@ref mftl_mod_ensemble; the split is by *scope*, not by entity
 (@ref arch_geometry_split). Small queries (`MFTLGetMinimumImageVector`,
 `MFTLGetTriangleProperties`, `MFTLGetTriangleCorners`, `MFTLGetOwnerProc`) are
 `static inline` in the header.
@@ -105,12 +107,27 @@ every scale ($10^{-8}\ldots10^{8}$ in `test_triangle_normals_are_unit_at_every_s
 
 ## Vertex normals {#geom_vertex_normals}
 
+One rule, `MFTLComputeVertexNormals(obj, weighting)` for the whole pool and
+`MFTLComputeVertexNormalAt(obj, v, weighting, n)` for one vertex, and one choice
+on two levels (`MFTL_NormalWeighting`): a normal **from the triangles**, a
+weighted sum of the face normals around the vertex, weighted by area or by
+angle; or a **fitted** normal.
+
 $$
   \mathbf{N}_v^{\text{area}} \propto \sum_{f \ni v} A_f\,\hat{\mathbf{n}}_f
   = \tfrac12 \sum_{f\ni v} (\mathbf{e}_1\times\mathbf{e}_2)_f,
   \qquad
-  \mathbf{N}_v^{\text{angle}} \propto \sum_{f \ni v} \alpha_f(v)\,\hat{\mathbf{n}}_f .
+  \mathbf{N}_v^{\text{angle}} \propto \sum_{f \ni v} \alpha_f(v)\,\hat{\mathbf{n}}_f ,
+  \qquad
+  \mathbf{N}_v^{\text{fit}} \propto \mathbf n - c_1\mathbf t_1 - c_2\mathbf t_2 .
 $$
+
+| | `MFTL_NORMAL_WEIGHT_AREA` | `MFTL_NORMAL_WEIGHT_ANGLE` | `MFTL_NORMAL_WEIGHT_FIT` |
+|---|---|---|---|
+| what it is | the direction of the volume gradient | the pseudo-normal whose inside/outside sign is exact | the normal of a one-ring paraboloid |
+| accuracy on an irregular mesh | first order | first order | second order |
+| cost per vertex, whole pool (Release, Apple M4) | 6–7 ns | 40–66 ns | about 240 ns |
+| the library uses it for | the remesher's smoother (its tangent plane), the frame and samples of its placement fit and its projection's orientation test; the volume corrections | the signed distance and topology change; the remesher's Phong reference | curvature (`MFTL_CURVATURE_FIT`) and the surface tension with vertex normals |
 
 **Area weighting** is free (the raw cross product carries it) and parallel to the
 gradient of the enclosed volume on a closed fan,
@@ -119,11 +136,40 @@ $$
   \frac{\partial V}{\partial \mathbf{x}_v} = \tfrac13\sum_{f\ni v} A_f\,\hat{\mathbf{n}}_f ,
 $$
 
-the direction a volume-conserving front-tracking scheme moves vertices along. **Angle
-weighting** (Thürmer–Wüthrich) is invariant under re-triangulation of the fan
-and is the pseudo-normal of the signed-distance theorem below. The corner angles
-come from one cross product and three dot products via `atan2`, which is well
-conditioned where `acos` is not.
+so it is the direction in which a vertex changes the volume fastest, and the
+normal of the one plane in which a vertex moves without changing the volume to
+first order (`test_the_area_normal_is_the_direction_of_the_volume_gradient`).
+The volume corrections move vertices along it, and the remesher's smoother moves
+them in that plane. There the choice is load-bearing: with any other vertex
+normal every smoothing move leaks volume at first order, and the leak roughens
+the front. Over the LeVeque period without back-projection, angle normals in the
+smoother left the uniform refinement-4 front 25 % of the radius off the exact
+surface with a worst triangle quality of 0.004, and Max or fitted normals made
+the curvature 2–15 times noisier (docs/analysis.md §16.9).
+
+**Angle weighting** (Thürmer–Wüthrich) is invariant under re-triangulation of the
+fan and is the only weighting of face normals whose pseudo-normal sign is provably
+right (@ref geom_sdf). The corner angle is
+$\alpha = \operatorname{atan2}(\lVert\mathbf e_1\times\mathbf e_2\rVert,\, \mathbf e_1\cdot\mathbf e_2)$
+from the cross product the face normal needs anyway
+and one dot product: both carry the factor $|\mathbf e_1||\mathbf e_2|$, so no
+edge is normalised, and `atan2` is well conditioned at every angle, where `acos`
+of the normalised dot product loses digits near 0 and $\pi$. On jagged meshes,
+of 2277 points whose nearest mesh feature is a vertex, angle weights classify
+all correctly and area weights get 10 wrong
+(`test_vertex_signs_on_a_spiky_mesh_need_angle_weighting`). As the reference
+normals of the remesher's Phong projection it measured best or tied everywhere.
+
+**Max's (1999) weights are not offered.** They are exact when the one-ring lies
+on a sphere and the most accurate of the three weightings on remeshed and
+marching-cubes meshes (1.6–8 times angle weights, RMS, table below), but they
+have no sign property (14 wrong in the test above), they are first order like
+the others on a general surface, the fit makes their accuracy moot, and as Phong
+reference normals they measured tens of percent worse than angle weights
+(docs/analysis.md §16.9). In the remesher's placement fit, which kept a
+private Max sum until 2026-11-20, area weights measured best or tied over the
+LeVeque period (Max's were 10–20 % better only in the curvature error at uniform
+refinement 5), so the fit now uses the library's area normals (§16.10).
 
 <!-- figure: vertex-normals
 Normals. (a) One square root serves both $A = \tfrac12\lVert\mathbf{e}_1\times\mathbf{e}_2\rVert$
@@ -135,17 +181,57 @@ weighting is invariant under re-triangulation of the fan and is the
 pseudo-normal the signed distance needs.
 -->
 
-The pass is a **scatter** over triangles (flat loop, compact connectivity) rather
-than a gather over fans (dependent loads, measured 3.4× slower); a
+The whole pool is a **scatter** over triangles (flat loop, compact connectivity)
+rather than a gather over fans (dependent loads, measured 3.4× slower); a
 vertex→triangle CSR gather was a dead heat and is not stored
 (docs/analysis.md §1.5). `verts.normal` stays xyz-interleaved: the three-double
 read-modify-write is four memory operations per vertex instead of six
-(1.20–1.25×, `examples/layout_benchmark.c`).
+(1.20–1.25×, `examples/layout_benchmark.c`). One vertex is that gather, a walk of
+its fan both ways from `out_he_idx`, for a caller that edits the mesh between two
+normals and would find a whole-pool pass stale after its first edit (the
+remesher's placement fit). Both take the corner angle and the fit from the same
+code; they differ only in the order of the sum
+(`test_one_vertex_is_the_whole_pool_pass`, every weighting, across a periodic
+corner and at a mesh rim).
+
+### The fitted normal {#geom_fit_normal}
+
+`MFTL_NORMAL_WEIGHT_FIT` is not a weighting of face normals. In the frame
+$(\mathbf t_1, \mathbf t_2, \mathbf n)$ of the area-weighted normal, a height
+paraboloid $z = c_0 + c_1x + c_2y + c_3x^2 + c_4xy + c_5y^2$ is fitted to the
+vertex and its one-ring positions (`MFTLFitHeightParaboloid`, lengths in units of
+the ring's RMS edge), and the normal is that of the fitted surface at the vertex,
+$\mathbf N \propto \mathbf n - c_1\mathbf t_1 - c_2\mathbf t_2$. A vertex with
+fewer than three neighbours, a fit that cannot determine its slope, or a fitted
+normal more than 75° from the frame keeps the area normal. Which weighting
+gives the frame does not change the fitted normal (area, angle and Max frames
+agree to three digits, docs/analysis.md §16.8), so the frame is the cheapest.
+
+Why it exists: any weighting of face normals is **first-order** accurate on an
+irregular mesh (second order only where the fan is symmetric); the fit is second
+order on any mesh whose vertices lie on the surface. RMS error in degrees at the
+finest of five levels on six meshes of the kind a run produces (39 000 to 562 000
+vertices; docs/analysis.md §16.8), Max weights for comparison:
+
+| mesh | area | angle | Max | fit |
+|---|---|---|---|---|
+| ellipsoid 1 : 0.7 : 0.5, isotropically remeshed | 8.1e-2 | 4.6e-2 | 2.4e-2 | 6.8e-3 |
+| ellipsoid, curvature-graded (edges 0.3–2 h) | 3.2e-2 | 2.2e-2 | 1.4e-2 | 4.6e-3 |
+| ellipsoid, marching cubes | 0.27 | 0.15 | 1.9e-2 | 2.1e-3 |
+| torus $R = 1$, $r = 0.6$, jittered | 0.14 | 6.5e-2 | 4.0e-2 | 1.8e-3 |
+| torus, isotropically remeshed | 1.4e-2 | 8.4e-3 | 8.7e-3 | 1.6e-3 |
+| torus, marching cubes | 0.24 | 0.13 | 3.5e-2 | 1.3e-3 |
+
+A curvature read off the normals (the fit of @ref geom_curvature, the forces of
+@ref geom_surface_tension) inherits the normals' order divided by $h$: first-order
+normals give an error that does not vanish. The fit costs one small QR per vertex,
+about 240 ns on top of the area frame.
 
 ### Exactness needs a vertex-complete halo
 
 The scatter runs over **all** triangles, ghosts included, so an owned vertex is
-exact iff every incident triangle is present locally — which the redistribution
+exact iff every incident triangle is present locally (the fitted normal needs the
+same, the one-ring positions) — which the redistribution
 halo guarantees (a triangle is sent to the owner of each of its corners). This
 makes the pass communication-free.
 
@@ -470,3 +556,417 @@ curvature terms and the placed height was off by 4.5 sagittas.
 positions, 72 with normals): 0.39–0.53 µs and 1.2–1.3 µs, against 1.3–1.5 µs and
 2.4–2.5 µs for `dgelsy` with a precomputed workspace: 1.9 to 3.4 times faster at
 these sizes, where LAPACK's blocking and workspace logic is pure overhead.
+
+---
+
+## Signed curvature {#geom_curvature}
+
+**The convention, stated once.** $\kappa = \kappa_1 + \kappa_2 = \nabla_s\cdot\hat{\mathbf n}$
+with $\hat{\mathbf n}$ the OUTWARD normal (corners counter-clockwise seen from
+outside): a sphere of radius $R$ has $\kappa = 2/R$, the Young–Laplace jump is
+$p_\text{in} - p_\text{out} = \sigma\kappa$, and the surface-tension force density
+$-\sigma\kappa\hat{\mathbf n}$ points inward. The remesher's curvature sizing reads
+$\max(|\kappa_1|, |\kappa_2|)$ off the COTAN record.
+
+`MFTLComputeVertexCurvature(obj, method, ncomp, out, &n_fallback)` writes a record
+of `ncomp` doubles per vertex, the layout of a vertex field: $\kappa$; $\kappa_G$;
+$\kappa_1 \ge \kappa_2$; a unit tangent along the principal direction of
+$\kappa_1$. A shorter prefix (1, 2 or 4) skips the work it does not need. Owned
+vertices are exact on a distributed mesh (one-ring quantities, vertex-complete
+halo); `MFTLEnsembleComputeCurvature` makes the ghosts their owners' with one
+field exchange.
+
+### COTAN: Meyer, Desbrun, Schröder & Barr (2003) {#geom_curvature_cotan}
+
+Every curvature operator of the paper, from one scatter over the triangles:
+
+| quantity | formula | paper |
+|---|---|---|
+| mean-curvature normal | $\mathbf K_i = \dfrac{1}{2A_i}\sum_{j}(\cot\alpha_{ij} + \cot\beta_{ij})(\mathbf x_i - \mathbf x_j) = \dfrac{\nabla_i A}{A_i}$ | eq. 8 |
+| signed curvature | $\kappa_i = \mathbf K_i\cdot\hat{\mathbf N}_i$, $\hat{\mathbf N}_i$ area-weighted | eq. 12 |
+| Gaussian curvature | $\kappa_{G,i} = (2\pi - \sum_f\theta_f)/A_i$ | eq. 9 |
+| principal curvatures | $\kappa_{1,2} = \tfrac{\kappa}{2} \pm \sqrt{\max(\kappa^2/4 - \kappa_G, 0)}$ | eqs. 10–11 |
+| principal direction | least-squares curvature tensor from the edge normal curvatures $2(\mathbf x_i - \mathbf x_j)\cdot\hat{\mathbf n}/|\mathbf x_i - \mathbf x_j|^2$, trace fixed to $\kappa$ | §5.3 |
+
+$A_i$ is the MIXED area: the Voronoi share of a non-obtuse triangle, half or a
+quarter of an obtuse one (their Fig. 4), so the cells tile the surface. With the
+trace fixed the tensor is $\tfrac{\kappa}{2}I + \begin{pmatrix}p & q\\ q & -p\end{pmatrix}$
+in a tangent frame and an edge at angle $\theta$ predicts
+$\tfrac{\kappa}{2} + p\cos2\theta + q\sin2\theta$: a two-unknown QR, no normal
+equations. Each triangle of the fan contributes one row per edge it has at the
+vertex with its half of Meyer's weight
+$\tfrac18(\cot\alpha + \cot\beta)|\mathbf x_i - \mathbf x_j|^2$
+(a negative half, behind an obtuse angle, is dropped), so an
+edge's two rows add up to Meyer's one. Meyer's non-linear determinant constraint is
+left out, as they found it unnecessary.
+
+What it guarantees: zero on a plane; $\sum_i \kappa_{G,i}A_i = 2\pi\chi$ to
+round-off on any closed mesh (`test_gauss_bonnet_holds_to_round_off`); and
+$\sigma A_i\mathbf K_i$ IS the Frenet-vertex force of @ref geom_surface_tension
+with triangle normals, to $2\cdot10^{-15}$
+(`test_the_frenet_vertex_force_is_the_cotangent_operator`). What it does not: the
+cotangent formula is **not pointwise convergent on an irregular mesh** (Xu 2004;
+Wardetzky et al. 2007), only in an integral sense. Where $\kappa \approx 0$ and
+$\kappa_G \approx 0$ (a plane), a rounding-sized $\kappa_G$ becomes its square root
+in $\kappa_{1,2}$: $10^{-13}$ turns into $3\cdot10^{-7}$.
+
+The rest of the paper -- anisotropic smoothing (§6.3) and operators on manifolds in
+$n$ dimensions (§7) -- is mesh processing and image denoising, not a curvature of a
+front, and is not in the library.
+
+### FIT: a one-ring paraboloid through positions and normals {#geom_curvature_fit}
+
+In the frame of the vertex normal every sample -- the vertex at the origin and
+each one-ring neighbour -- gives three rows: its height and the two slopes
+$\partial_x z = -n_x/n_z$, $\partial_y z = -n_y/n_z$ of its normal. Lengths are
+divided by the ring's RMS edge, so heights and slopes are both $O(1)$ and one
+weight serves both kinds of row. `MFTLFitHeightParaboloid` solves for
+$z = c_0 + \dots + c_5y^2$ by QR with grouped pivoting, and the curvatures are
+those of the fitted surface at the vertex:
+
+$$
+  I = \begin{pmatrix}1+c_1^2 & c_1c_2\\ c_1c_2 & 1+c_2^2\end{pmatrix},\qquad
+  I\!I = -\frac{1}{W}\begin{pmatrix}2c_3 & c_4\\ c_4 & 2c_5\end{pmatrix},\qquad
+  W = \sqrt{1+c_1^2+c_2^2},
+$$
+
+the shape operator is $S = I^{-1}I\!I$, $\kappa = \operatorname{tr}S$,
+$\kappa_G = \det S$, and the principal direction is its eigenvector, mapped to
+$u\,\mathbf x_u + w\,\mathbf x_v$.
+
+Three normal-equation-free rows per sample make five unknowns well determined from
+the one-ring alone, so the fit needs no topological ghost growth -- only the
+neighbours' normals, which `MFTLEnsembleUpdateVertexNormals` makes exact on ghosts.
+It is only as good as those normals: the slope rows turn a normal error $\delta$
+into a curvature error $\delta/h$. Area-, angle- or Max-weighted normals are first
+order on an irregular mesh and stall the fit at a few percent, so the fit always
+reads `MFTL_NORMAL_WEIGHT_FIT` normals (second order, @ref geom_fit_normal), with
+which it is as good as with exact normals; `MFTLEnsembleComputeCurvature` computes
+and exchanges them. A vertex with fewer than three neighbours, fewer than three
+whose normal is within 75° of its own (a fold), or a rank-deficient system gets the
+COTAN values and is counted.
+
+### Measured {#geom_curvature_measured}
+
+Maximum error of $\kappa$ over the vertices, relative to the largest $|\kappa|$ on
+the shape, at about 41 k vertices (246 k on the tori, 309 k on the marching-cubes
+sphere), every vertex exactly on the surface (`examples/curvature_comparison.c`):
+
+| mesh | COTAN | FIT, area normals | FIT, fitted normals | FIT, exact normals |
+|---|---|---|---|---|
+| icosphere | 1.2e-7 | 5.2e-2 | 2.1e-4 | 2.1e-4 |
+| icosphere, vertices jittered by 0.3 h | 9.7 | 0.47 | 3.9e-4 | 3.7e-4 |
+| isotropically remeshed sphere | 0.19 | 0.14 | 2.6e-4 | 2.5e-4 |
+| marching-cubes sphere | 809 | 35 | 5.2e-3 | 6.9e-5 |
+| ellipsoid 1 : 0.7 : 0.5 | 1.4e-2 | 4.2e-2 | 9.1e-4 | 6.2e-4 |
+| torus, structured | 7.5e-5 | 2.2e-4 | 2.1e-4 | 1.9e-4 |
+| torus, jittered by 0.2 cells | 0.92 | 0.46 | 9.8e-3 | 8.7e-3 |
+
+COTAN is superb on the symmetric meshes (the icosphere, the structured torus) and
+does not converge on the irregular ones; the error does not fall with $h$ (orders
+around zero) and is largest where triangles are poorly shaped -- 800 times the
+curvature at a marching-cubes sliver. The fit with fitted normals converges on
+every mesh: at second order on the spheres and the ellipsoid, at first order on
+the jittered torus, whose asymmetric stencils leave the cubic terms uncancelled
+(the exact normals do no better there). The principal direction follows the same
+pattern (RMS 0.06° FIT against 12° COTAN on the jittered torus).
+
+Cost per vertex, Release, Apple M4, isotropically remeshed sphere of 41 k
+vertices:
+
+| | ns/vertex |
+|---|---|
+| COTAN, $\kappa$ | 14 |
+| COTAN, $\kappa$ and $\kappa_G$ (three `atan2` per triangle) | 47 |
+| COTAN, full record (Meyer's direction fit) | 268 |
+| fitted normals | 233 |
+| FIT, $\kappa$ (normals not included) | 421 |
+| FIT, full record | 502 |
+
+**Which to use.** `MFTL_CURVATURE_FIT` with `MFTL_NORMAL_WEIGHT_FIT` normals for
+a pointwise curvature on a remeshed, topology-changed or otherwise irregular front
+(the settings default). COTAN where only an integral matters, where the mesh is
+symmetric, or where 14 ns per vertex matters more than accuracy.
+
+---
+
+## Surface tension {#geom_surface_tension}
+
+The force on a piece of surface is the pull of the rest of the surface on its
+boundary (Tryggvason et al. 2011, eqs. 7.52–7.53),
+
+$$
+  \delta\mathbf F = \oint_C \sigma\,\hat{\mathbf m}\,dl
+  = \int_{\Delta A}\big(\nabla_s\sigma - \sigma\kappa\hat{\mathbf n}\big)\,dA,
+  \qquad \hat{\mathbf m} = \hat{\mathbf t}\times\hat{\mathbf n},
+$$
+
+with $\hat{\mathbf m}$ the unit outward conormal: the force a front-tracking solver
+spreads, INTEGRATED over the piece (a force, not a density). The two forms differ in
+the piece, and each in the normal the conormal is built from
+(`MFTL_SurfaceTensionParameters::contour_normal`).
+
+**Frenet vertex** (eqs. 7.54–7.59): the barycentric cell of a vertex, whose boundary
+inside a triangle runs from an edge midpoint to the centroid to the next midpoint.
+
+- *Triangle normals* (the book's eq. 7.59): the two segments' pulls add up to half
+  the pull on the opposite edge,
+  $\mathbf F_v = \sum_{T\ni v}\tfrac12\sigma_T(\mathbf x_k - \mathbf x_j)\times\hat{\mathbf n}_T$
+  for $(v, j, k)$ counter-clockwise -- exactly $-\partial E/\partial\mathbf x_v$ of
+  $E = \sum_T\sigma_T A_T$. So the net force AND the net torque of a closed body
+  vanish to round-off, the discrete surface energy is the one the force derives
+  from, and for constant $\sigma$ the force is $-\sigma A_\text{mixed}\mathbf K$ with
+  Meyer's operator. (Eq. 7.57 writes $\hat{\mathbf n}\times\hat{\mathbf t}$ where
+  eq. 7.52 has $\hat{\mathbf t}\times\hat{\mathbf n}$; with outward normals the pull
+  is the form given here, inward on a sphere.)
+- *Vertex normals*: along each segment the vertex normals are interpolated
+  linearly, and the segment's pull is evaluated ONCE and given to the two cells it
+  separates with opposite signs. The force then converges pointwise to
+  $-\sigma\kappa\hat{\mathbf n}$ times the vertex's BARYCENTRIC area -- the weight
+  the coupler gives a vertex marker. The net force is still zero to round-off; the
+  net torque only to truncation error.
+
+**Frenet element** (eq. 7.53 on a triangle):
+$\mathbf F_T = \sum_{e\in T}\sigma_e L_e\hat{\mathbf m}_e$,
+the pull of the neighbours across each edge. With the
+triangle's own normal on all three edges the pulls cancel exactly and nothing is
+left, so the edge normal comes from both sides: the two triangles' normals summed
+(*triangle normals*), or the two end vertices' normals summed (*vertex normals*).
+The edge vector is a direct minimum-image difference and the normal a commutative
+sum, so the two triangles of an edge compute the same pull with opposite signs, to
+the bit: the net force of a closed body vanishes to round-off. The torque does not
+(the force is applied at centroids).
+
+The conormal is always $(L/|\mathbf c|)\,\mathbf c$ with
+$\mathbf c = \mathbf e\times\mathbf s$ and $\mathbf s$ the unnormalised normal: normalising the cross product
+keeps it a unit vector when $\mathbf s$ is not perpendicular to the piece (vertex
+normals), and a vanishing $\mathbf c$ (a fold) falls back to the triangle's normal.
+
+### What each variant conserves {#geom_surface_tension_conservation}
+
+The four variants are named by form and contour normal: **V-T** (vertex form,
+triangle normals: the book's eq. 7.59, the default), **V-F** (vertex form, fitted
+vertex normals), **E-T** (element form, triangle normals) and **E-F** (element
+form, fitted vertex normals).
+
+**V-T is the gradient of the discrete surface energy** $E_h = \sum_T\sigma_TA_T$.
+Inside a flat triangle the normal is constant, so the pull on the polyline from the
+midpoint of edge $(v,j)$ through the centroid to the midpoint of edge $(v,k)$
+depends on its ends only,
+$\tfrac12(\mathbf x_k-\mathbf x_j)\times\hat{\mathbf n}_T = -\partial A_T/\partial\mathbf x_v$.
+For uniform $\sigma$ this is the cotangent
+formula, $\nabla_vA = A_\text{mixed}\mathbf K_v$ (Pinkall & Polthier 1993; Meyer et
+al. 2003). Three exact properties follow from the invariances of $E_h$, and each
+holds triangle by triangle:
+
+- *momentum*: a translation does not change $E_h$, so $\sum_v\mathbf F_v = 0$;
+- *angular momentum*: nor does a rotation. Differentiating $E_h(\mathsf R\mathbf x)$
+  along any rotation $\boldsymbol\omega$ gives
+  $\boldsymbol\omega\cdot\sum_v\mathbf x_v\times\mathbf F_v = 0$, so the net torque
+  vanishes;
+- *energy*: for any vertex velocities $\mathbf u_v$,
+  $\sum_v\mathbf F_v\cdot\mathbf u_v = -dE_h/dt$ (the chain rule).
+
+$E_h$ is also homogeneous of degree 2 in the positions, so
+$\sum_v\mathbf x_v\cdot\nabla_vE_h = 2E_h$ (Euler): on a sphere about the origin the
+Laplace pressure $-\sum\mathbf F\cdot\hat{\mathbf n}/A = 2\sigma/R$ is exact at every
+resolution.
+
+The energy property is the one coupling needs. With the markers moving at the
+interpolated velocity $\mathbf u_v = (S^\mathsf T\mathbf u)_v$ and the force spread
+with $S$ (the coupler's spread IS the exact transpose of its interpolation), the
+power the force puts into the fluid is
+$\langle S\mathbf F,\mathbf u\rangle = \sum_v\mathbf F_v\cdot\mathbf u_v = -dE_h/dt$:
+kinetic plus surface energy can only decrease, by the viscous dissipation, in the
+semi-discrete system. That is the mechanism of energy-stable immersed-boundary
+schemes whose forces derive from an energy (Peskin 2002; Newren et al. 2007), and of
+the unconditionally stable parametric finite elements of Barrett, Garcke & Nürnberg
+(2015), whose piecewise-linear curvature is this same area gradient.
+
+**The others conserve momentum only.** Each piece of contour is shared by two cells
+and evaluated once, so its two pulls cancel and $\sum\mathbf F = 0$ to round-off in
+all four variants (the conservative property of Tryggvason et al. 2001). The torque
+is another matter. The continuous surface stress
+$\sigma(\mathsf I - \hat{\mathbf n}\hat{\mathbf n})$ is symmetric and exerts none, but a discrete pull
+$\mathbf P$ on a shared piece acts on two markers at different points and leaves the
+couple $(\mathbf x_1-\mathbf x_2)\times\mathbf P$:
+
+- *E-T and E-F*: the pull $\sigma L\hat{\mathbf m}$ across an edge acts on the two
+  centroids, $\mathbf d = \mathbf c_1-\mathbf c_2$. In the edge frame
+  ($\hat{\mathbf t}$ along the edge, $\hat{\mathbf m} = \hat{\mathbf t}\times\hat{\mathbf n}$)
+  the couple is
+  $\sigma L\,[-(\mathbf d\cdot\hat{\mathbf t})\,\hat{\mathbf n} + (\mathbf d\cdot\hat{\mathbf n})\,\hat{\mathbf t}]$:
+  a twist about the normal wherever
+  the two centroids are offset along the edge, and a bend about the edge wherever
+  they sit at different heights, $O(\kappa h^2)$. Mirror-symmetric pairs cancel,
+  which is why an icosphere shows nothing; an irregular mesh does not;
+- *V-F*: a segment's pull acts on two vertices of the same edge, so its couple is
+  small, but the three segments of a triangle now carry three different
+  interpolated normals, and the triangle's corner forces no longer balance;
+- *V-T*: the same per-segment couples exist, and those of each triangle sum to
+  zero, because its three corner forces are the gradient of $A_T$.
+
+None of V-F, E-T and E-F is the gradient of a function of the positions, so
+$\sum\mathbf F\cdot\mathbf u \ne -dE_h/dt$: an $O(h^2)$ consistency error of
+uncontrolled sign, work done on the fluid that the interface energy does not pay
+for.
+
+### Per marker and on the grid {#geom_surface_tension_grid}
+
+**Per marker, the normal decides.** The force on a cell is
+$\sigma\oint\hat{\mathbf t}\times\hat{\mathbf n}\,dl$ around a contour of length
+$O(h)$. With triangle normals $\hat{\mathbf n}$ is a facet's, $O(h)$ off the
+surface's on an irregular mesh: an $O(h^3)$ error in a force of $O(\kappa h^2)$,
+which does not converge. Fitted normals are $O(h^2)$ accurate, which leaves the
+force first-order accurate per marker. A vertex cell averages the errors of about
+six triangles, where a triangle cell carries one triangle's alone (a sliver on a
+marching-cubes mesh included), so V-F is better per marker than E-F, with half the
+markers.
+
+**On the grid a solver sees a spread sum, never one marker.** With
+$\mathbf F_i^*$ the exact integral of $\mathbf f = -\sigma\kappa\hat{\mathbf n}$ over
+marker $i$'s cell and $\delta_w$ a kernel of width $w$,
+
+$$
+  \sum_i\mathbf F_i\,\delta_w(\mathbf X-\mathbf x_i) - \int\mathbf f\,\delta_w(\mathbf X-\mathbf x)\,dA
+  = \underbrace{\sum_i(\mathbf F_i-\mathbf F_i^*)\,\delta_w(\mathbf X-\mathbf x_i)}_{\text{force error}}
+  + \underbrace{\Big[\sum_i\mathbf F_i^*\,\delta_w(\mathbf X-\mathbf x_i) - \int\mathbf f\,\delta_w\,dA\Big]}_{\text{lumping error}} .
+$$
+
+The lumping error is the quadrature error of putting a cell's force at its marker:
+the same for every force formula, and $O((h/w)^2)$. V-T's per-marker error is in
+divergence form (the error on a shared segment enters its two cells with opposite
+signs), so it cancels under a smooth kernel. Three regimes follow.
+
+1. *A smooth kernel* ($w \gg h$; what integrated quantities see, such as the net
+   force on a region or a drop's motion): every variant converges at second order,
+   and V-T is among the best.
+2. *Plain spreading at grid scale* ($w \approx 2h$): at a fixed $h/w$ the lumping
+   error is a fixed fraction (0.05–1 % on an irregular mesh), so no variant
+   converges, whichever force it spreads. On top of it, V-T's force error cancels
+   only partly over the twenty or so markers under a kernel: on irregular tori V-T
+   is 2–11 times V-F, on ellipsoids within a factor 2. The element forms halve the
+   lumping error with twice the markers.
+3. *A balanced-force curvature* (the hybrid formulation of Shin et al. 2005, recipe
+   below): $(\sigma\kappa)_h = -\mathbf F_h\cdot\mathbf G_h/(\mathbf G_h\cdot\mathbf G_h)$,
+   with $\mathbf G$ each marker's normal times its cell area spread by the same
+   kernel. Writing $\mathbf F_i = -\sigma\hat\kappa_i\mathbf G_i + (\text{tangential})$,
+   the ratio is a kernel-weighted mean of the per-marker curvatures $\hat\kappa_i$.
+   The lumping error is common to numerator and denominator and cancels, and what
+   reaches the grid is the per-marker accuracy: V-T and E-T stall at 0.1–0.6 %, V-F
+   and E-F converge (orders 1–2).
+
+The last number is the parasitic-current number. In the balanced-force formulation
+the grid force $(\sigma\kappa)_h\nabla_hI$ is an exact discrete gradient wherever
+$(\sigma\kappa)_h$ is constant, and the pressure absorbs it without flow, so
+spurious currents follow the variation of $(\sigma\kappa)_h$ along the interface
+(Francois et al. 2006; Popinet 2018). A plainly spread force is not a discrete
+gradient at all, and the lumping noise common to every variant drives the currents.
+
+### Variable sigma: Marangoni stresses come for free
+
+`sigma_field` names a registered one-component field. A TRIANGLE field is
+$\sigma_T$, on an edge the mean of its two triangles. A VERTEX field is the linear
+interpolant: on a triangle the mean of its corners (which makes
+$E = \sum_T\sigma_T A_T = \int\sigma\,dA$ exact), along a piece of contour the mean
+of its ends. No gradient operator is needed: the tangential force is what the
+unequal pulls leave. On a flat sheet with $\sigma$ linear along it, every vertex of
+both vertex forms carries exactly $\nabla\sigma$ times its barycentric area, and
+both forms total $\Delta\sigma\,W$ (`test_a_linear_sigma_on_a_flat_sheet_is_the_marangoni_force`,
+at np = 1–27, with the sigma ghosts poisoned so a missing exchange fails).
+
+### Rims of open surfaces
+
+The rim's line force is $\sigma\hat{\mathbf m}\,dl$ along its outward conormal.
+`MFTL_RimForce` says what acts there:
+
+| mode | meaning | a flat sheet between walls |
+|---|---|---|
+| `FREE` | nothing beyond the rim pulls; the rim is pulled into the surface | pulled inward at the rim; total zero |
+| `WALL` | as FREE, plus the wall-normal component of the pull on every rim edge lying on a wall (both ends within `MFTL_BODY_WALL_TOL` of it), which the wall supplies | no force anywhere |
+| `EXCLUDE` | rim vertices, and triangles with a rim edge, carry nothing | -- |
+
+For the vertex forms the pull on a rim edge is shared by its ends as their cells
+share the edge: by the hat functions with triangle normals,
+$(2\sigma_a + \sigma_b)/6$ per unit pull, by halves with vertex normals,
+$(3\sigma_a + \sigma_b)/8$. A spherical cap on a wall then presses on it, in WALL mode, with the
+Laplace pressure times its base, $2\sigma\pi a^2/R$
+(`test_a_cap_presses_on_its_wall_with_the_laplace_pressure`) -- to FIRST order
+only: the rim's conormal comes from a one-sided normal (a rim triangle's, or a fit
+on half a ring), 1.1–1.4 % off at 24 rings, half of what it is at 12. Contact
+angles and accurate rim conormals are roadmap item C1.
+
+### Distributed
+
+Owned rows are exact without communication given current ghost values of what the
+form reads: the vertex form is a scatter over every triangle the rank holds
+(vertex-complete halo), and every owned triangle has its three edge neighbours.
+`MFTLEnsembleComputeSurfaceTension` adds exactly those exchanges: the sigma
+field's ghost rows when sigma is a field, and the fitted vertex normals (exact on
+ghosts) with vertex normals on the contour. With a
+uniform sigma and triangle normals it makes no collective call at all. Owned forces
+equal the single-rank forces of the same body to $2\cdot10^{-15}$ at np = 1–27
+(`test_the_distributed_force_and_curvature_are_the_serial_ones`).
+`MFTLEnsembleSurfaceTensionStats` reduces each body's net force, surface energy
+and area over its holders.
+
+### Measured {#geom_surface_tension_measured}
+
+Six meshes whose vertices lie exactly on a surface with known curvature, the kind a
+run produces: an ellipsoid 1 : 0.7 : 0.5 isotropically remeshed, remeshed with
+curvature sizing (edges 0.3–2 h), and from marching cubes (slivers); a torus
+$R = 1$, $r = 0.6$ jittered, remeshed, and from marching cubes. 39 000 to 562 000
+vertices; each cell gives the range over the six meshes at the finest level, with
+the observed order between the two finest levels in brackets (2: the error quarters
+when $h$ halves; 0: no convergence). Errors are relative to the largest $|\kappa|$
+on the shape (docs/analysis.md §16.8):
+
+| measure | V-T | V-F | E-T | E-F |
+|---|---|---|---|---|
+| per marker: $-\mathbf F\cdot\hat{\mathbf n}/(\sigma A) - \kappa$, RMS | 6.1e-3 – 7.2 (0) | 2.1e-4 – 2.4e-3 (1–1.8) | 5.8e-2 – 8.4 (0) | 4.9e-4 – 2.3e-2 (1–3) |
+| net torque, $\lvert\sum\mathbf x\times\mathbf F\rvert/\sum\lvert\mathbf x\rvert\lvert\mathbf F\rvert$ | ≤ 4.3e-16 | 4.1e-9 – 6.1e-7 | 9.0e-8 – 8.3e-7 | 5.0e-9 – 1.1e-6 |
+| energy, $\lvert\sum\mathbf F\cdot\mathbf u + \sigma\dot A\rvert/\lvert\sigma\dot A\rvert$ | ≤ 1.5e-11 (round-off) | 1.2e-6 – 6.5e-5 (2) | 3.8e-6 – 3.6e-5 (2) | 6.7e-6 – 6.0e-5 (2) |
+| smooth kernel, $w = 0.4$ | 1.5e-5 – 7.2e-5 (2) | 4.2e-5 – 1.1e-4 (2) | 3.1e-5 – 2.5e-4 (1–2) | 2.7e-5 – 8.8e-5 (2) |
+| plain spreading, $w = 2h$ | 2.3e-3 – 1.1e-2 (≈0) | 1.0e-3 – 4.4e-3 (≈0) | 2.6e-3 – 4.2e-2 (≈0) | 5.3e-4 – 1.5e-3 (≈0) |
+| balanced-force $(\sigma\kappa)_h$, $w = 2h$ | 9.5e-4 – 3.5e-3 (0) | 5.4e-5 – 2.9e-4 (1–2) | 9.7e-4 – 6.2e-3 (0) | 4.3e-5 – 1.6e-4 (0.7–2) |
+| markers per vertex; ns per vertex | 1; 9 | 1; 21 + 240 for the normals | 2; 24 | 2; 27 + 240 |
+
+$A$ is the cell the force integrates over: Meyer's mixed area for V-T, the
+barycentric area for V-F, the triangle for E-T and E-F. Read with the barycentric
+area instead (what a solver dividing by the coupler's marker weight gets), V-T is
+15 % off at the worst vertex even on an icosphere. $\mathbf u$ is a smooth non-rigid
+velocity field. The kernel rows are the spread force against the exact surface
+integral, $\lvert\sum_i\varphi(\mathbf x_i)\mathbf F_i - \int\varphi\mathbf f\,dA\rvert/\int\varphi\lvert\mathbf f\rvert\,dA$,
+RMS over 64 (smooth) or 256 (grid-scale) kernel centres on the surface; the last
+row is $\lvert(\sigma\kappa)_h/\sigma - \kappa_\text{ref}\rvert$ at 256 centres,
+$\kappa_\text{ref}$ the same ratio of the exact integrals. The net force is below
+$2\cdot10^{-14}$ of $\sum\lvert\mathbf F\rvert$ in every case.
+
+**Which to use.**
+
+- *A solver that spreads the force as it is*: **V-T, the default.** At grid scale
+  every variant stalls at the lumping floor; V-F is 1–11 times lower there but costs
+  thirty times as much, needs a normal exchange, and gives up the exact torque and
+  energy balance.
+- *A balanced-force curvature*: **V-F**, with $\mathbf G_v = \hat{\mathbf n}_vA_v$
+  (fitted normal, barycentric area). It is the only vertex variant whose grid
+  curvature converges.
+- *Centroid markers*: **E-F**.
+
+### Recipe: balanced force (Shin & Juric 2005; Tryggvason et al. 2011, eqs. 7.61–7.65)
+
+Spreading $\sigma\kappa\hat{\mathbf n}\delta$ directly produces parasitic currents
+when the pressure gradient cannot balance it on the grid. The hybrid formulation
+balances them exactly, from library outputs and two spreads through the coupler:
+
+1. spread the vertex force $\mathbf F_v$ and its partner $\mathbf G_v$, the normal
+   and the cell the force is built from: $\hat{\mathbf n}_vA_v$ with the fitted
+   normal and the barycentric area for V-F, the volume gradient
+   $\sum_{T\ni v}\tfrac13A_T\hat{\mathbf n}_T$ for V-T
+   (`MFTL_SPREAD_INTEGRATED`);
+2. on the grid, $(\sigma\kappa)_h = -\mathbf F\cdot\mathbf G/(\mathbf G\cdot\mathbf G)$
+   (positive on a drop: $\mathbf F$ points in, $\mathbf G$ out);
+3. apply $(\sigma\kappa)_h\nabla_h I$ with the solver's OWN gradient operator
+   $\nabla_h$ of its indicator.
+
+Step 3 needs the solver's pressure-gradient operator, so it stays with the solver.

@@ -66,12 +66,16 @@ _Static_assert(sizeof(MFTL_VtkEncoding) == sizeof(int), "keyword storage");
 _Static_assert(sizeof(MFTL_CouplingKernel) == sizeof(int), "keyword storage");
 _Static_assert(sizeof(MFTL_Reproduction) == sizeof(int), "keyword storage");
 _Static_assert(sizeof(MFTL_SamplingPolicy) == sizeof(int), "keyword storage");
+_Static_assert(sizeof(MFTL_SurfaceTensionForm) == sizeof(int), "keyword storage");
+_Static_assert(sizeof(MFTL_ContourNormal) == sizeof(int), "keyword storage");
+_Static_assert(sizeof(MFTL_RimForce) == sizeof(int), "keyword storage");
+_Static_assert(sizeof(MFTL_CurvatureMethod) == sizeof(int), "keyword storage");
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Sections
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-// clang-format off -- the tables below are laid out by hand, one entry per macro
+// clang-format off: the tables below are laid out by hand, one entry per macro
 static const MFTL_SettingSection g_sections[] = {
     SECTION("domain", "Domain and decomposition",
             "The domain box and how it is cut into rank boxes. Read by MFTLSettingsCreateEnsemble()."),
@@ -89,6 +93,9 @@ static const MFTL_SettingSection g_sections[] = {
     SECTION("undulation", "Undulation removal (TSUR3D)",
             "Volume-conserving removal of grid-scale undulations: `MFTLEnsembleRemoveUndulations(ens, &cfg.undulation.params, &stats)`. "
             "Outside the remesher, so its Phong projection keeps the smoothing."),
+    SECTION("surface_tension", "Surface tension and curvature",
+            "The force on the front, `MFTLEnsembleComputeSurfaceTension(ens, &cfg.surface_tension.params, force_field)`, and its signed "
+            "curvature, `MFTLEnsembleComputeCurvature(ens, cfg.surface_tension.curvature, field, NULL)`."),
     SECTION("contact", "Contact detection",
             "Triangle contact between and within bodies: `MFTLEnsembleIntersectObjects(ens, &cfg.contact.params, callback, user_data)`."),
     SECTION("coupling", "Coupling to a flow solver",
@@ -144,8 +151,34 @@ static const MFTL_SettingChoice g_projection[] = {
 };
 
 static const MFTL_SettingChoice g_normal_weighting[] = {
-    CHOICE("area", MFTL_NORMAL_WEIGHT_AREA, "faces weighted by area; what a flow solver wants"),
+    CHOICE("area", MFTL_NORMAL_WEIGHT_AREA, "faces weighted by area; the cheapest, the direction of the volume gradient, what moving vertices want"),
     CHOICE("angle", MFTL_NORMAL_WEIGHT_ANGLE, "faces weighted by their angle at the vertex; the pseudo-normal of an exact inside/outside test"),
+    CHOICE("fit", MFTL_NORMAL_WEIGHT_FIT, "the normal of a paraboloid fitted to the one-ring; second order on irregular meshes, what curvature needs"),
+    END_CHOICES,
+};
+
+static const MFTL_SettingChoice g_tension_form[] = {
+    CHOICE("frenet_vertex", MFTL_TENSION_FRENET_VERTEX, "the force on each vertex's barycentric cell, for vertex markers"),
+    CHOICE("frenet_element", MFTL_TENSION_FRENET_ELEMENT, "the force on each triangle, for centroid markers"),
+    END_CHOICES,
+};
+
+static const MFTL_SettingChoice g_contour_normal[] = {
+    CHOICE("triangles", MFTL_CONTOUR_NORMAL_TRIANGLES, "the triangles' normals, as in the book: the exact energy gradient, torque-free"),
+    CHOICE("vertices", MFTL_CONTOUR_NORMAL_VERTICES, "fitted vertex normals along the contour; converges per vertex"),
+    END_CHOICES,
+};
+
+static const MFTL_SettingChoice g_rim_force[] = {
+    CHOICE("free", MFTL_RIM_FORCE_FREE, "nothing pulls across the rim of an open surface"),
+    CHOICE("wall", MFTL_RIM_FORCE_WALL, "a wall the rim lies on takes the wall-normal part of the rim's pull"),
+    CHOICE("exclude", MFTL_RIM_FORCE_EXCLUDE, "rim vertices and rim triangles carry no force"),
+    END_CHOICES,
+};
+
+static const MFTL_SettingChoice g_curvature_method[] = {
+    CHOICE("fit", MFTL_CURVATURE_FIT, "a paraboloid through the one-ring positions and normals; converges on irregular meshes"),
+    CHOICE("cotan", MFTL_CURVATURE_COTAN, "Meyer et al.'s cotangent operators; needs no normals, not pointwise on irregular meshes"),
     END_CHOICES,
 };
 
@@ -345,6 +378,21 @@ static const MFTL_SettingInfo g_keys[] = {
     KEY("undulation", "relaxation", REAL, undulation.params.relaxation, "1.0", "(0, 1]", NO_CHOICES, "", 1,
         "Fraction of the way to the common height each end of an edge moves; any value conserves the volume exactly."),
 
+    /* ── surface_tension ────────────────────────────────────────────────── */
+    KEY("surface_tension", "form", KEYWORD, surface_tension.params.form, "\"frenet_vertex\"", "", g_tension_form, "", 0,
+        "Which piece of surface the force is integrated over: each vertex's barycentric cell or each triangle (Tryggvason's Frenet vertex "
+        "and Frenet element)."),
+    KEY("surface_tension", "sigma", REAL, surface_tension.params.sigma, "1.0", "[0, inf)", NO_CHOICES, "force/length", 0,
+        "The uniform surface-tension coefficient; the force is linear in it. A varying one is a registered field, which a file cannot name."),
+    KEY("surface_tension", "contour_normal", KEYWORD, surface_tension.params.contour_normal, "\"triangles\"", "", g_contour_normal, "", 0,
+        "The normal the pull along each piece of contour is built from. `triangles` is the book's formula, the exact gradient of the "
+        "surface energy, and right for plain spreading; `vertices` (fitted normals, about thirty times dearer) converges per vertex, "
+        "which a balanced-force curvature needs."),
+    KEY("surface_tension", "rim", KEYWORD, surface_tension.params.rim, "\"free\"", "", g_rim_force, "", 0,
+        "What acts on the rim of an open surface; `wall` for a rim that slides along a wall."),
+    KEY("surface_tension", "curvature", KEYWORD, surface_tension.curvature, "\"fit\"", "", g_curvature_method, "", 0,
+        "The estimator of the signed curvature (2/R on a sphere with outward normals)."),
+
     /* ── contact ────────────────────────────────────────────────────────── */
     KEY("contact", "every", INT, contact.every, "0", "[0, inf)", NO_CHOICES, "", 0,
         "Run contact detection every this many timesteps; 0 never. Read by the caller's loop."),
@@ -393,7 +441,8 @@ static const MFTL_SettingInfo g_keys[] = {
 
     /* ── geometry ───────────────────────────────────────────────────────── */
     KEY("geometry", "normal_weighting", KEYWORD, geometry.normal_weighting, "\"area\"", "", g_normal_weighting, "", 0,
-        "Face weighting of vertex normals, for `MFTLEnsembleUpdateVertexNormals(ens, cfg.geometry.normal_weighting)`."),
+        "Which vertex normal, for `MFTLEnsembleUpdateVertexNormals(ens, cfg.geometry.normal_weighting)`: from the triangles, "
+        "weighted by area or by angle (first order, cheap), or fitted (second order)."),
 
     /* ── output ─────────────────────────────────────────────────────────── */
     KEY("output", "every", INT, output.every, "0", "[0, inf)", NO_CHOICES, "", 0,

@@ -29,10 +29,13 @@
  *
  * ## The normal
  *
- * MFTLComputeVertexNormals() gives the exact area-weighted normal of every
- * vertex in one flat, seam-safe triangle pass; a per-vertex fan accumulation
- * here would be slower (3.4x, src/geometry/vertex_geometry.c) and must handle
- * open fans itself.
+ * MFTLComputeVertexNormals() gives the area-weighted normal of every vertex in
+ * one flat, seam-safe triangle pass; a per-vertex fan accumulation here would
+ * be slower (3.4x, src/geometry/vertex_geometry.c) and must handle open fans
+ * itself. AREA, because it is the direction of the volume gradient: its
+ * tangent plane is the one plane a vertex moves in without changing the volume
+ * to first order. Angle, Max or fitted normals here measured far noisier, and
+ * angle normals ruined an unprojected LeVeque run (docs/analysis.md §16.9).
  */
 
 #include "mftl_remeshing.h"
@@ -673,7 +676,7 @@ void MFTLRemeshSmooth(MFTL_Object *obj, const MFTL_RemeshParameters *params, int
   for (int sweep = 0; sweep < iterations; ++sweep)
   {
     /* Normals are refreshed from current positions every sweep. */
-    MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);
+    MFTLComputeVertexNormals(obj, MFTL_NORMAL_WEIGHT_AREA);  // the volume gradient: see the file comment
 
     memcpy(new_pos, obj->verts.pos, (size_t) n_v * 3 * sizeof(double));
 
