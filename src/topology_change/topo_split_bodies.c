@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "mftl_communication.h"
 #include "mftl_constants.h"
 #include "mftl_ensemble.h"
 #include "mftl_geometry.h"
@@ -739,136 +740,82 @@ int MFTLTopoBuildObjects(MFTL_Ensemble *ens, const MFTL_TopoLattice *lat, MFTL_T
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 5. Ghost ids
+ *
+ * A pull on the library's ghost engine (MFTLGhostPull()), KEYED: the ids being
+ * asked for are the ones just handed out, so a ghost names its entity by the
+ * lattice key every holder computed identically. No MPI here.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/** @brief Per-owner offsets of the ghost requests of the created objects, in pack order. */
-static void ghost_id_offsets(const MFTL_Ensemble *ens, const int *created, int n_created, int nproc, int *counts, int *offsets)
+/** @brief Owner side: the densified id of each owned entity asked for, or #MFTL_ERROR. */
+static void serve_topo_ids(const MFTL_Object *obj, int slot, MFTL_FieldEntity pool, const int *idx, const int *offset, int n, unsigned char *reply, void *ctx)
 {
-  for (int r = 0; r < nproc; ++r) counts[r] = 0;
-  for (int i = 0; i < n_created; ++i)
+  (void) slot;
+  (void) ctx;
+  for (int j = 0; j < n; ++j)
   {
-    const MFTL_Object *const obj = MFTLEnsembleFindLocalObject(ens, created[i]);
-    for (int v = obj->verts.n_local; v < obj->verts.n; ++v) counts[obj->verts.rec[v].owner_proc]++;
-    for (int t = obj->tris.n_local; t < obj->tris.n; ++t) counts[obj->tris.rec[t].owner_proc]++;
-  }
-  int total = 0;
-  for (int r = 0; r < nproc; ++r)
-  {
-    offsets[r] = total;
-    total += counts[r];
+    const int i = idx[j];
+    const int id = (i == MFTL_ERROR) ? MFTL_ERROR : (pool == MFTL_FIELD_VERTEX) ? obj->verts.rec[i].global_id : obj->tris.rec[i].global_id;
+    memcpy(reply + offset[j], &id, sizeof id);
   }
 }
 
-void MFTLTopoPackIdRequests(const MFTL_Ensemble *ens, const int *created, int n_created, long long **vkeys, long long **tkeys, int nproc, int *dest_counts,
-                            double **records)
+/** @brief Holder side: writes the owners' ids into the ghosts. */
+static int apply_topo_ids(MFTL_Object *obj, int slot, MFTL_FieldEntity pool, const int *idx, int n, const unsigned char *rows, void *ctx)
 {
-  int *const cursor = (int *) MFTLMallocOrDie((size_t) nproc * sizeof(int), "topology id cursors");
-  ghost_id_offsets(ens, created, n_created, nproc, dest_counts, cursor);
-  int total = 0;
-  for (int r = 0; r < nproc; ++r) total += dest_counts[r];
-  double *const buf = (double *) MFTLMallocOrDie(3 * (size_t) MFTL_MAX(total, 1) * sizeof(double), "topology id requests");
-
-  for (int i = 0; i < n_created; ++i)
+  (void) slot;
+  (void) ctx;
+  int skipped = 0;
+  for (int j = 0; j < n; ++j)
   {
-    const MFTL_Object *const obj = MFTLEnsembleFindLocalObject(ens, created[i]);
-    for (int v = obj->verts.n_local; v < obj->verts.n; ++v)
+    int id;
+    memcpy(&id, rows + (size_t) j * sizeof id, sizeof id);
+    if (id == MFTL_ERROR)
     {
-      double *const rec = &buf[3 * (size_t) cursor[obj->verts.rec[v].owner_proc]++];
-      rec[0] = (double) created[i];
-      rec[1] = 0.0;
-      rec[2] = (double) vkeys[i][v];
+      skipped++;
+      continue;
     }
-    for (int t = obj->tris.n_local; t < obj->tris.n; ++t)
-    {
-      double *const rec = &buf[3 * (size_t) cursor[obj->tris.rec[t].owner_proc]++];
-      rec[0] = (double) created[i];
-      rec[1] = 1.0;
-      rec[2] = (double) tkeys[i][t];
-    }
+    if (pool == MFTL_FIELD_VERTEX)
+      obj->verts.rec[idx[j]].global_id = id;
+    else
+      obj->tris.rec[idx[j]].global_id = id;
   }
-  free(cursor);
-  *records = buf;
+  return skipped;
 }
 
-void MFTLTopoServeIdRequests(const MFTL_Ensemble *ens, const int *created, int n_created, long long **vkeys, long long **tkeys, const double *req, int n_req,
-                             double *reply)
+int MFTLTopoSyncGhostIds(MFTL_Ensemble *ens, const int *created, int n_created, long long **vkeys, long long **tkeys)
 {
-  /* Sorted (key, index) of the OWNED entities of every created object. */
-  long long **vs = (long long **) MFTLCallocOrDie((size_t) MFTL_MAX(n_created, 1), sizeof(long long *), "topology owned vertex keys");
-  long long **ts = (long long **) MFTLCallocOrDie((size_t) MFTL_MAX(n_created, 1), sizeof(long long *), "topology owned triangle keys");
+  /* The engine reads keys by LOCAL SLOT; a body not created here takes no part. */
+  const int nl = ens->n_local_objects;
+  const long long **const by_slot = (const long long **) MFTLCallocOrDie(2 * (size_t) MFTL_MAX(nl, 1), sizeof(long long *), "topology ghost id keys");
   for (int i = 0; i < n_created; ++i)
   {
-    const MFTL_Object *const obj = MFTLEnsembleFindLocalObject(ens, created[i]);
-    const int nv = obj->verts.n_local, nt = obj->tris.n_local;
-    vs[i] = (long long *) MFTLMallocOrDie(2 * (size_t) MFTL_MAX(nv, 1) * sizeof(long long), "topology owned vertex keys");
-    ts[i] = (long long *) MFTLMallocOrDie(2 * (size_t) MFTL_MAX(nt, 1) * sizeof(long long), "topology owned triangle keys");
-    for (int v = 0; v < nv; ++v)
-    {
-      vs[i][2 * v] = vkeys[i][v];
-      vs[i][2 * v + 1] = v;
-    }
-    for (int t = 0; t < nt; ++t)
-    {
-      ts[i][2 * t] = tkeys[i][t];
-      ts[i][2 * t + 1] = t;
-    }
-    qsort(vs[i], (size_t) nv, 2 * sizeof(long long), cmp_pair_ll);
-    qsort(ts[i], (size_t) nt, 2 * sizeof(long long), cmp_pair_ll);
+    const int slot = MFTLEnsembleFindLocalSlot(ens, created[i]);
+    MFTL_ASSERT(slot != MFTL_ERROR && "topology ids: a created body is not in the local list");
+    if (slot == MFTL_ERROR) continue;
+    by_slot[slot] = vkeys[i];
+    by_slot[MFTL_MAX(nl, 1) + slot] = tkeys[i];
   }
 
-  for (int q = 0; q < n_req; ++q)
-  {
-    const int body = (int) req[3 * q];
-    const bool tri = req[3 * q + 1] > 0.5;
-    const long long key = (long long) req[3 * q + 2];
-    reply[q] = -1.0;
+  MFTL_GhostPull pull;
+  pull.row_bytes[MFTL_FIELD_VERTEX] = pull.row_bytes[MFTL_FIELD_TRIANGLE] = (int) sizeof(int);
+  pull.route = MFTL_GHOST_ROUTE_AUTO;
+  pull.keys[MFTL_FIELD_VERTEX] = by_slot;
+  pull.keys[MFTL_FIELD_TRIANGLE] = by_slot + MFTL_MAX(nl, 1);
+  pull.serve = serve_topo_ids;
+  pull.apply = apply_topo_ids;
+  pull.ctx = MFTL_NULL;
+  const int rc = MFTLGhostPull(ens, &pull);
+  free(by_slot);
 
-    int lo = 0, hi = n_created - 1, i = -1;
-    while (lo <= hi)
-    {
-      const int mid = (lo + hi) / 2;
-      if (created[mid] == body)
-      {
-        i = mid;
-        break;
-      }
-      if (created[mid] < body)
-        lo = mid + 1;
-      else
-        hi = mid - 1;
-    }
-    MFTL_ASSERT(i >= 0 && "topology ids: asked about a body this rank did not create");
-    if (i < 0) continue;
-
-    const MFTL_Object *const obj = MFTLEnsembleFindLocalObject(ens, created[i]);
-    const long long idx = tri ? find_pair(ts[i], obj->tris.n_local, key) : find_pair(vs[i], obj->verts.n_local, key);
-    MFTL_ASSERT(idx >= 0 && "topology ids: asked about an entity this rank does not own");
-    if (idx < 0) continue;
-    reply[q] = tri ? (double) obj->tris.rec[idx].global_id : (double) obj->verts.rec[idx].global_id;
-  }
-
-  for (int i = 0; i < n_created; ++i)
-  {
-    free(vs[i]);
-    free(ts[i]);
-  }
-  free(vs);
-  free(ts);
-}
-
-void MFTLTopoApplyIdReplies(MFTL_Ensemble *ens, const int *created, int n_created, int nproc, const double *reply)
-{
-  int *const counts = (int *) MFTLMallocOrDie(2 * (size_t) nproc * sizeof(int), "topology id reply cursors");
-  int *const cursor = counts + nproc;
-  ghost_id_offsets(ens, created, n_created, nproc, counts, cursor);
-
+  /* Half-edge ids are 3 * triangle id + k mesh-wide: refresh them for every
+   * triangle of a created body, owned ones included (their ids came from the
+   * scan, after the pieces were built). */
   for (int i = 0; i < n_created; ++i)
   {
     MFTL_Object *const obj = MFTLEnsembleFindLocalObject(ens, created[i]);
-    for (int v = obj->verts.n_local; v < obj->verts.n; ++v) obj->verts.rec[v].global_id = (int) reply[cursor[obj->verts.rec[v].owner_proc]++];
-    for (int t = obj->tris.n_local; t < obj->tris.n; ++t) obj->tris.rec[t].global_id = (int) reply[cursor[obj->tris.rec[t].owner_proc]++];
+    if (obj == MFTL_NULL) continue;
     for (int t = 0; t < obj->tris.n; ++t)
       for (int k = 0; k < 3; ++k) obj->tris.he[3 * t + k].global_id = 3 * obj->tris.rec[t].global_id + k;
   }
-  free(counts);
+  return rc;
 }

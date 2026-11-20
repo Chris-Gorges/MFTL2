@@ -296,16 +296,20 @@ const MFTL_TopoComponent *MFTLTopoFindComponent(const MFTL_TopoComponent *comps,
 int MFTLTopoBuildObjects(MFTL_Ensemble *ens, const MFTL_TopoLattice *lat, MFTL_TopoCluster *cl, int n_cl, MFTL_TopoPiece *pieces,
                          const MFTL_TopoComponent *comps, int n_comps, int **created, long long ***vkeys, long long ***tkeys);
 
-/** @brief Packs `(body, kind, key)` id requests for every ghost of the new objects, by owner. */
-void MFTLTopoPackIdRequests(const MFTL_Ensemble *ens, const int *created, int n_created, long long **vkeys, long long **tkeys, int nproc, int *dest_counts,
-                            double **records);
-
-/** @brief Owner side: answers `(body, kind, key)` with the densified id. */
-void MFTLTopoServeIdRequests(const MFTL_Ensemble *ens, const int *created, int n_created, long long **vkeys, long long **tkeys, const double *req, int n_req,
-                             double *reply);
-
-/** @brief Holder side: writes the replies into the ghosts, in request order. */
-void MFTLTopoApplyIdReplies(MFTL_Ensemble *ens, const int *created, int n_created, int nproc, const double *reply);
+/**
+ * @brief Gives every ghost vertex and triangle of the new objects its owner's
+ *        densified id: a keyed MFTLGhostPull() (lattice keys, because the ids
+ *        are what is being asked for) on #MFTL_GHOST_ROUTE_AUTO, then the
+ *        half-edge ids of every triangle of those objects.
+ * @param ens       The ensemble, the new objects inserted and their OWNED ids dense.
+ * @param created   `[n_created]` body ids of the new objects, sorted.
+ * @param n_created Their number.
+ * @param vkeys     `[n_created]` the lattice key of each vertex of each new object.
+ * @param tkeys     `[n_created]` the lattice key of each triangle.
+ * @return As MFTLGhostPull().
+ * @collective
+ */
+int MFTLTopoSyncGhostIds(MFTL_Ensemble *ens, const int *created, int n_created, long long **vkeys, long long **tkeys);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 5. Communication (topo_comm.c -- the only file with MPI)

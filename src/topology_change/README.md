@@ -32,6 +32,7 @@ module it belongs to rather than here:
 | the marching cubes table and the extractor | `MFTLMarchingCubesCase`, `MFTLExtractLevelSet`, `MFTLBuildMeshFromLevelSet` (`src/mesh_creation/`) | a mesh generator from a field |
 | connected components | `MFTLLabelConnectedComponents` (`src/topology/`) | a half-edge traversal |
 | self-proximity | `MFTL_BVHBuildParams.self_pairs` / `pair_filter` (`src/bvh/`) | the contact pipeline, one flag wider |
+| a ghost asking its owner for an id | `MFTLGhostPull` keyed by lattice key (`src/communication/`) | the library's one ghost request/reply engine, with a 64-bit key instead of the id that does not exist yet |
 
 ## Notation {#topo_notation}
 
@@ -357,7 +358,11 @@ jet, and the pool a drop falls into stays the pool. A CLOSED component below
 
 **Vertex and triangle ids are made dense** with `MFTLEnsembleExscanBodies` — each
 owner numbers what it owns from its holder-scan base — and a ghost asks its owner for
-the id of the entity with its key. The closing `MFTLRedistribute` then rebuilds the
+the id of the entity with its key (`MFTLTopoSyncGhostIds`: a keyed `MFTLGhostPull`,
+12 B of request and 4 B of reply per ghost). The component labels are NOT such a
+pull: a request carries a label the owner folds into a minimum over all requests
+and its own components before any answer exists, over per-cluster scratch meshes,
+so the label rounds keep their own exchange in `topo_comm.c`. The closing `MFTLRedistribute` then rebuilds the
 canonical halo from correct ids. `MFTLObjectSetCounts` marks every new object
 partition-dirty, so the redistribution's body skip cannot mistake one for settled.
 

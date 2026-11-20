@@ -442,17 +442,185 @@ void MFTLCommWorkspaceDestroy(void **p_ws);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 5. Ghost synchronisation
+ *
+ * ONE request/reply engine, MFTLGhostPull(): every ghost (the pool suffix
+ * `[n_local, n)`) asks its owner by (body id, key), the owner looks the key up
+ * among its OWNED entities and answers, and the answers come back in request
+ * order. Every ghost refresh of the library is a payload on it: positions,
+ * normals and registered fields (MFTLUpdateGhostColumns() and the wrappers
+ * below), the remesher's ids, sizing and feature classes, and the global ids a
+ * topology change hands out (keyed by lattice key, because the ids do not exist
+ * yet). What varies is a parameter: the pools, the reply width, the key and the
+ * route -- never a second copy of the schedule.
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Which communicator a ghost pull takes.
+ *
+ * A switch that changes the message pattern is COLLECTIVE STATE: every rank
+ * must pass the same route.
+ */
+typedef enum
+{
+  /**
+   * `comm_graph` only and no `comm_world` collective: the per-timestep route. A
+   * ghost whose owner is not a graph neighbour is skipped, keeps its value, is
+   * counted in `g_n_orphaned`, and the call returns #MFTL_ERROR on that rank.
+   */
+  MFTL_GHOST_ROUTE_GRAPH = 0,
+  /**
+   * `comm_graph` unless some rank holds a ghost whose owner is not a graph
+   * neighbour, `comm_world` otherwise; agreed by one `MPI_Allreduce(LOR)`. For
+   * the partitions the remesher makes (a coarsened placement), whose halo
+   * leaves the 26-neighbourhood.
+   */
+  MFTL_GHOST_ROUTE_AUTO = 1
+} MFTL_GhostRoute;
+
+/**
+ * @brief Owner side of a ghost pull: writes the replies to @p n requests for
+ *        ONE body and ONE pool.
+ *
+ * Called once per (body, pool) that was asked something, never per request, so
+ * a payload's loop is its own and the engine has no per-ghost dispatch. Reply
+ * `j` goes to `reply + offset[j]` and is `row_bytes[pool]` bytes.
+ *
+ * @param obj    The body, or #MFTL_NULL for requests naming a body this rank
+ *               does not hold (every `idx[j]` is then #MFTL_ERROR).
+ * @param slot   Its local slot, or #MFTL_ERROR with a NULL @p obj.
+ * @param pool   #MFTL_FIELD_VERTEX or #MFTL_FIELD_TRIANGLE.
+ * @param idx    `[n]` the OWNED pool index asked for, or #MFTL_ERROR for a
+ *               request this rank cannot answer -- the reply must then carry a
+ *               sentinel the apply function recognises.
+ * @param offset `[n]` byte offset of each reply in @p reply.
+ * @param n      Requests, at least one.
+ * @param reply  The reply buffer.
+ * @param ctx    The pull's context.
+ */
+typedef void (*MFTL_GhostServeFn)(const MFTL_Object *obj, int slot, MFTL_FieldEntity pool, const int *idx, const int *offset, int n, unsigned char *reply,
+                                  void *ctx);
+
+/**
+ * @brief Requester side of a ghost pull: applies @p n replies to ghosts of ONE
+ *        body and ONE pool, in the order they were requested.
+ *
+ * @param obj  The body.
+ * @param slot Its local slot.
+ * @param pool #MFTL_FIELD_VERTEX or #MFTL_FIELD_TRIANGLE.
+ * @param idx  `[n]` the GHOST pool indices, ascending.
+ * @param n    Replies, at least one.
+ * @param rows `n` contiguous replies of `row_bytes[pool]` bytes.
+ * @param ctx  The pull's context.
+ * @return How many replies were the owner's sentinel and were NOT applied; the
+ *         pull then returns #MFTL_ERROR on this rank.
+ */
+typedef int (*MFTL_GhostApplyFn)(MFTL_Object *obj, int slot, MFTL_FieldEntity pool, const int *idx, int n, const unsigned char *rows, void *ctx);
+
+/**
+ * @struct MFTL_GhostPull
+ * @brief What one ghost pull moves, and how its ghosts are named.
+ *
+ * Arguments are identical on every rank, which makes a refusal of invalid ones
+ * unanimous without communication.
+ */
+typedef struct MFTL_GhostPull
+{
+  /** Reply bytes per vertex ghost and per triangle ghost; 0 leaves the pool out. */
+  int row_bytes[2];
+  MFTL_GhostRoute route;  ///< Graph only, or graph with an agreed global fallback.
+  /**
+   * #MFTL_NULL in both entries: a ghost is named by its global id, and the owner
+   * resolves it through the communication workspace's id table, keyed by the
+   * requests (never sized by a large body's id range). Otherwise `keys[pool]` is `[n_local_objects]`,
+   * by LOCAL SLOT, of per-entity 64-bit keys indexed by pool index (owned and
+   * ghost), unique within a body and identical on every holder; a body whose
+   * entry is #MFTL_NULL takes no part, as a requester or as an owner. For
+   * entities whose global ids are not agreed yet (topology change: lattice
+   * keys). Requests are then 12 B instead of 8.
+   */
+  const long long *const *keys[2];
+  MFTL_GhostServeFn serve;  ///< Owner side, once per asked (body, pool).
+  MFTL_GhostApplyFn apply;  ///< Requester side, once per run of one (body, pool).
+  void *ctx;  ///< Handed to both.
+} MFTL_GhostPull;
+
+/**
+ * @brief The ghost request/reply engine: every ghost of every local body asks
+ *        its owner, and the owner's answer is applied in request order.
+ *
+ * Three exchanges on the chosen route -- counts (two ints per neighbour, posted
+ * non-blocking and overlapped with packing), requests (8 B per ghost, 12 B when
+ * keyed), replies (`row_bytes`, no count exchange: one reply per request) --
+ * plus one `MPI_Allreduce` under #MFTL_GHOST_ROUTE_AUTO. Per call it allocates
+ * nothing sized by the process count on the graph route (the rank-to-neighbour
+ * table is built once per ensemble) and nothing sized by a large body's id
+ * range: the owner keys its id table by the REQUESTS (direct and bounded for a
+ * small body; O(requests) behind a bit filter for a large one) and reads its
+ * owned ids once, sequentially. Requests are grouped per (body, pool) on the
+ * owner, so each body is scanned once whatever the number of requesters.
+ *
+ * @param ens  The ensemble.
+ * @param pull What to move. Identical on every rank.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on THIS rank if one of its ghosts was
+ *         not refreshed (an unreachable owner on the graph route, or the
+ *         owner's sentinel), if it was asked for an entity it does not own, or
+ *         on invalid arguments (then on every rank, before communicating).
+ *
+ * @collective
+ */
+int MFTLGhostPull(MFTL_Ensemble *ens, const MFTL_GhostPull *pull);
+
+/** @brief The per-entity double arrays MFTLUpdateGhostColumns() can refresh. */
+typedef enum
+{
+  MFTL_GHOST_COLUMN_POSITION = 0,  ///< `verts.pos`, 3 doubles per vertex.
+  MFTL_GHOST_COLUMN_NORMAL = 1,  ///< `verts.normal`, 3 doubles per vertex.
+  MFTL_GHOST_COLUMN_SIZING = 2,  ///< `verts.sizing`, 1 double per vertex; a body without it is not served.
+  MFTL_GHOST_COLUMN_FIELD = 3  ///< A registered field (`field`), `ncomp` doubles per vertex or triangle.
+} MFTL_GhostColumnKind;
+
+/**
+ * @struct MFTL_GhostColumn
+ * @brief One per-entity double array to refresh on the ghosts.
+ */
+typedef struct MFTL_GhostColumn
+{
+  MFTL_GhostColumnKind kind;  ///< Which array.
+  int field;  ///< The registered field id for #MFTL_GHOST_COLUMN_FIELD; ignored otherwise.
+} MFTL_GhostColumn;
+
+/**
+ * @brief Copies the owner's values of @p n_columns per-entity arrays to every
+ *        ghost, in one MFTLGhostPull().
+ *
+ * A reply row of a pool is the doubles of that pool's columns, in the order
+ * given, followed by the entity's global id (echoed, #MFTL_ERROR when the owner
+ * could not answer, which leaves the ghost's old value in place) and 4 bytes of
+ * padding: a row of one 3-vector is exactly an #MFTL_GhostUpdatePayload. Pulling
+ * #MFTL_GHOST_COLUMN_POSITION clears #MFTL_DERIVED_GEOMETRY and renews the
+ * surface generation of every local object (MFTLObjectMarkChanged()).
+ *
+ * @param ens       The ensemble.
+ * @param columns   `[n_columns]` arrays, each at most once, identical on every rank.
+ * @param n_columns At least one.
+ * @param route     The route, identical on every rank.
+ * @return As MFTLGhostPull(); #MFTL_ERROR on every rank, without communicating,
+ *         for an invalid or repeated column.
+ *
+ * @collective
+ */
+int MFTLUpdateGhostColumns(MFTL_Ensemble *ens, const MFTL_GhostColumn *columns, int n_columns, MFTL_GhostRoute route);
 
 /**
  * @brief Refreshes the POSITION of every ghost vertex from its owning rank.
  *
- * Request/reply over `comm_graph`: each rank asks the owners for the
- * (body id, vertex id) pairs it holds as ghosts (8 B each) and the owners answer
- * with an #MFTL_GhostUpdatePayload (32 B); the reply order equals the request
- * order, so replies are applied by direct index. Three neighbourhood
- * collectives (counts, requests, replies). Topology is untouched: call it after
- * moving vertices, and redistribute only when ownership may have changed.
+ * MFTLUpdateGhostColumns() of #MFTL_GHOST_COLUMN_POSITION on
+ * #MFTL_GHOST_ROUTE_GRAPH: each rank asks the owners for the (body id,
+ * vertex id) pairs it holds as ghosts (8 B each) and the owners answer with an
+ * #MFTL_GhostUpdatePayload (32 B); the reply order equals the request order, so
+ * replies are applied by direct index. Three neighbourhood collectives (counts,
+ * requests, replies). Topology is untouched: call it after moving vertices, and
+ * redistribute only when ownership may have changed.
  *
  * A ghost whose owner is not a graph neighbour cannot be served, keeps a STALE
  * value and is reported (asserted in Debug); this happens only on a partition
@@ -472,7 +640,8 @@ int MFTLUpdateGhostPositions(MFTL_Ensemble *ens);
 /**
  * @brief Refreshes `verts.normal` of every ghost vertex from its owning rank.
  *
- * The same exchange as MFTLUpdateGhostPositions(). Owned vertices get exact
+ * The same exchange as MFTLUpdateGhostPositions() (#MFTL_GHOST_COLUMN_NORMAL);
+ * it leaves the derived state and the generation alone. Owned vertices get exact
  * normals locally (vertex-complete halo); ghosts hold partial sums until this
  * call. MFTLEnsembleUpdateVertexNormals() is the one-call form.
  *
@@ -938,6 +1107,7 @@ typedef struct
   long g_n_calls;  ///< Syncs performed.
   long g_n_ghosts_requested;  ///< Ghost entities asked for, summed over calls.
   long g_n_orphaned;  ///< Ghosts whose owner was not a graph neighbour, and were SKIPPED.
+  long g_n_route_global;  ///< Ghost pulls whose #MFTL_GHOST_ROUTE_AUTO went to `comm_world` (a scaling cost no answer shows).
   long g_n_bytes_sent;  ///< Request bytes out plus reply bytes out.
   long g_n_bytes_recv;  ///< Request bytes in plus reply bytes in.
   long g_n_allocs;  ///< Allocation calls on the path.
@@ -961,6 +1131,14 @@ void MFTLRedistributeGetStats(MFTL_RedistributeStats *out);
 
 /**
  * @brief Collectively overwrite selected vertex/triangle ghosts with owner values.
+ *
+ * MFTLUpdateGhostColumns() on #MFTL_GHOST_ROUTE_GRAPH with the positions (if
+ * asked) and the fields as columns, in one pull. The ids are checked by one
+ * `MPI_Allreduce` before it and the verdict agreed by one after it, so the
+ * return is the same on every rank. A ghost whose owner is not a graph
+ * neighbour keeps its value and makes the verdict #MFTL_ERROR; the other ghosts
+ * are refreshed.
+ *
  * @param ens Ensemble on the canonical partition (owners must be graph neighbours).
  * @param ids Registered field ids, identical and in the same order on every rank.
  * @param nfields Number of ids; no duplicates. Zero preserves the position-only path.

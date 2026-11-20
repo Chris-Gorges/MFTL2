@@ -349,6 +349,15 @@ static inline void gt_begin(mftl_gid_table *t, int n_entries, int range)
 }
 
 /**
+ * @brief gt_begin() in DIRECT mode whatever the entry count: for a caller that
+ *        has decided `range` slots are affordable (it declares range / 4
+ *        entries, which is what the mode rule asks for).
+ * @param t     The table.
+ * @param range One past the largest global id that will be presented.
+ */
+static inline void gt_begin_direct(mftl_gid_table *t, int range) { gt_begin(t, (range + 3) / 4, range); }
+
+/**
  * @brief Finds the slot @p gid occupies, or the free slot it would occupy.
  *
  * Sparse mode stops at the first slot not of the current epoch (sound because
@@ -430,6 +439,20 @@ static inline int gt_get(const mftl_gid_table *t, int gid)
 }
 
 /**
+ * @brief The value stored for @p gid, or #MFTL_ERROR: gt_has() and gt_get() in
+ *        ONE probe, for a caller that answers absent ids instead of skipping them.
+ * @param t   The table.
+ * @param gid The global id, non-negative.
+ * @return The stored value, or #MFTL_ERROR if @p gid was not stored this epoch.
+ */
+static inline int gt_find(const mftl_gid_table *t, int gid)
+{
+  bool found = false;
+  const int i = gt_probe(t, gid, &found);
+  return found ? t->value[i] : MFTL_ERROR;
+}
+
+/**
  * @brief Stores @p value under @p gid for the current epoch.
  * @param t     The table.
  * @param gid   The global id. Must be non-negative and below the declared range.
@@ -453,5 +476,17 @@ static inline void gt_put(mftl_gid_table *t, int gid, int value)
  * @return The table; owned by the ensemble, never freed by the caller.
  */
 mftl_gid_table *MFTLCommWorkspaceGhostTable(MFTL_Ensemble *ens);
+
+/**
+ * @brief `[nproc]` rank -> slot in `domain.neighbors`, #MFTL_ERROR for a rank
+ *        that is not a graph neighbour. Built on first use and kept for the
+ *        ensemble's lifetime (the domain is read-only after creation), so a ghost
+ *        exchange pays its O(nproc) once per ensemble instead of once per call.
+ *        Internal, like MFTLCommWorkspaceGhostTable().
+ *
+ * @param ens The ensemble.
+ * @return The table; owned by the ensemble, never freed by the caller.
+ */
+const int *MFTLCommWorkspaceNeighborSlots(MFTL_Ensemble *ens);
 
 #endif  // MFTL_COMM_INTERNAL_H

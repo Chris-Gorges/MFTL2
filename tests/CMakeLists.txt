@@ -718,6 +718,16 @@ mftl_add_mpi_test_at(test_fields_np4 test_fields 4)
 mftl_add_mpi_test_oversub(test_fields_np8 test_fields 8)
 mftl_add_mpi_test_oversub(test_fields_np27 test_fields 27)
 
+# The one ghost request/reply engine (MFTLGhostPull) and its column payload:
+# every array of both pools against a reference computed from (body, id) alone,
+# 64-bit keys, and the AUTO route on a partition whose ghosts are owned by ranks
+# that are not graph neighbours (non-vacuous from np = 4: asserted by count).
+mftl_add_mpi_test(test_ghost_pull 1)
+mftl_add_mpi_test_at(test_ghost_pull_np2 test_ghost_pull 2)
+mftl_add_mpi_test_at(test_ghost_pull_np4 test_ghost_pull 4)
+mftl_add_mpi_test_oversub(test_ghost_pull_np8 test_ghost_pull 8)
+mftl_add_mpi_test_oversub(test_ghost_pull_np27 test_ghost_pull 27)
+
 # --- Labels of the tests registered directly with add_test ---------------------
 
 set_property(TEST test_remeshing_mpi_is_confined test_topology_change_mpi_is_confined

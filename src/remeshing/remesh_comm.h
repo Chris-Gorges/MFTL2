@@ -26,12 +26,14 @@
  *                               redistribution falls back to its global path
  *                               otherwise.
  *   MFTLRemeshSumInts           Allreduce of 3 ints per phase (certificate).
- *   MFTLRemeshSyncGhostIds      3 neighbourhood collectives, 4 bytes per ghost
- *                               vertex, once per pass; global fallback when a
- *                               ghost's owner is not a graph neighbour (normal
- *                               under coarsening).
- *   MFTLRemeshSyncGhostSizing   the same route, 8 bytes per ghost vertex, twice
- *                               per phase -- only under curvature sizing.
+ *   MFTLRemeshSyncGhostIds      MFTLGhostPull() on #MFTL_GHOST_ROUTE_AUTO: one
+ *                               LOR, 3 neighbourhood collectives, 4 bytes per
+ *                               ghost vertex, once per pass; global fallback
+ *                               when a ghost's owner is not a graph neighbour
+ *                               (normal under coarsening).
+ *   MFTLRemeshSyncGhostSizing   MFTLUpdateGhostColumns() on the same route, 16
+ *                               bytes per ghost vertex, twice per phase -- only
+ *                               under curvature sizing.
  *   MFTLRemeshMeasureBodies     per-body holder reductions (9 values, then 1)
  *                               plus one scalar MPI_MAX; once per pass.
  *   MFTLRemeshAgree*            small fixed-size Allreduces (the parameter block
@@ -46,9 +48,10 @@
  * h_k, so the moved fraction is 1 - PROD_k (1 - |b_k - a_k| / h_k): 87.5 % for
  * (0,0,0) -> (1,1,1), 50 % for one axis, 75 % for two
  * (MFTL_RemeshStats::n_entities_migrated). The band is what is FROZEN, not what
- * moves. Not everything here is O(degree) either: MFTLRemeshSyncGhostIds() and
- * the redistribution behind every migration allocate arrays sized by nproc,
- * which matters at P in the thousands times the phase count.
+ * moves. Not everything here is O(degree) either: the redistribution behind
+ * every migration, and a ghost exchange that had to take its global fallback,
+ * allocate arrays sized by nproc, which matters at P in the thousands times the
+ * phase count.
  */
 
 #ifndef MFTL_REMESH_COMM_H
@@ -511,15 +514,17 @@ double MFTLRemeshWallTime(void);
  * partition boundary. Ghost TRIANGLES have no such problem: they are dropped and
  * re-received every time, which is why only the vertices need this.
  *
- * ── Why it is here and not a third field of MFTLUpdateGhostPositions ───────
+ * ── Why it shares the schedule but not the payload ───────────────────────────
  *
- * It asks the same question of the same set, so sharing that schedule was
- * tempting and was in fact tried. The cost landed in the wrong place: the shared
- * function acquired a payload discriminator that every per-timestep position
- * sync then evaluated once per ghost vertex, to serve a call made once per
- * remesh. Written separately it is also strictly cheaper on the wire -- 4 bytes
- * per ghost instead of the 32-byte MFTL_GhostUpdatePayload, and no registered
- * MPI datatype at all.
+ * It asks the same question of the same set as MFTLUpdateGhostPositions(). The
+ * first shared version cost in the wrong place: one function with a payload
+ * DISCRIMINATOR that every per-timestep position sync evaluated once per ghost
+ * vertex, to serve a call made once per remesh. Five private copies of the
+ * schedule followed, and drifted (only this one had the global fallback; it
+ * cleared a table the size of the body's whole id range per call). Now the
+ * schedule is MFTLGhostPull() and the payload is two block callbacks, called
+ * once per (body, pool), so no loop the position sync runs tests for a payload,
+ * and the id is still 4 bytes per ghost on the wire.
  *
  * @param ens             The ensemble.
  * @param vertex_gid_base `[ens->n_local_objects]` first new vertex id this rank was
@@ -538,8 +543,10 @@ int MFTLRemeshSyncGhostIds(MFTL_Ensemble *ens, const int *vertex_gid_base);
  * of an unfrozen entity reads is owned -- but the convergence certificate does:
  * `count_unoffered_edges` judges edges whose endpoints may be ghosts, and it is
  * exact only if every copy of a vertex holds the same target.
- * Same route as MFTLRemeshSyncGhostIds(), including its global fallback for a
- * coarsened placement; 8 bytes per ghost vertex.
+ * MFTLUpdateGhostColumns() of #MFTL_GHOST_COLUMN_SIZING on the route of
+ * MFTLRemeshSyncGhostIds(), including its global fallback for a coarsened
+ * placement; 16 bytes per ghost vertex (the value and the echoed id). A body
+ * without `verts.sizing` is not served, and the call then returns #MFTL_ERROR.
  *
  * @param ens The ensemble; every local body must have `verts.sizing` enabled.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR if some ghost could not be served.
@@ -637,7 +644,8 @@ double *MFTLRemeshExchangeRecords(const MFTL_Domain *domain, const double *rec, 
 /**
  * @brief Gives every ghost vertex its owner's #MFTL_FLAG_FEATURE / #MFTL_FLAG_CORNER
  *        bits: a ghost's fan is partial, so its own classification can be wrong.
- *        Same route as MFTLRemeshSyncGhostIds(); 4 bytes per ghost vertex.
+ *        MFTLGhostPull() on the route of MFTLRemeshSyncGhostIds(); 4 bytes per
+ *        ghost vertex.
  * @param ens The ensemble, features detected on every rank.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR if a request went unserved.
  * @collective
@@ -648,7 +656,9 @@ int MFTLRemeshSyncGhostClass(MFTL_Ensemble *ens);
  * @brief Gives every ghost vertex its owner's position, on any partition the
  *        remesher makes -- unlike MFTLUpdateGhostPositions(), with the global
  *        fallback a coarsened placement needs. Used by the NESTED mode's
- *        smoothing sweeps; 24 bytes per ghost vertex.
+ *        smoothing sweeps. MFTLUpdateGhostColumns() of the positions on
+ *        #MFTL_GHOST_ROUTE_AUTO -- MFTLUpdateGhostPositions() with the route as
+ *        the only difference; 32 bytes per ghost vertex.
  * @param ens The ensemble.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR if a request went unserved.
  * @collective

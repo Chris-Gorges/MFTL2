@@ -4,627 +4,283 @@
  * @date 2026-08-14
  * @ingroup mftl_communication
  *
- * @brief Ghost synchronisation of one per-vertex 3-vector (position or normal)
- *        with the topology unchanged.
+ * @brief Ghost refreshes of per-entity double arrays with the topology
+ *        unchanged: the COLUMN payload of MFTLGhostPull() (ghost_pull.c), and
+ *        the public syncs built on it.
  *
- * A request/reply exchange, because only the HOLDER of a ghost knows it holds
- * it; no owner-to-holder state is kept between calls. Per ghost vertex 8 B of
- * request and 32 B of reply; three neighbourhood collectives (counts, requests,
- * replies). One field per exchange: bundling recomputable fields with the
+ * Positions, normals, the remesher's target lengths and registered fields are
+ * all "copy the owner's row of a double array", so they are one payload: a
+ * reply row is the doubles of the pulled columns followed by the entity's
+ * global id (echoed, or #MFTL_ERROR when the owner could not answer) and 4
+ * bytes of padding. A row of one 3-vector is therefore exactly an
+ * #MFTL_GhostUpdatePayload, 32 B, as before. Per ghost: 8 B of request and
+ * `8 * (components + 1)` B of reply; three exchanges.
+ *
+ * One quantity per call is the default: bundling recomputable fields with the
  * position would ship bytes the receiver computes more cheaply.
- *
- * Per call it builds one `[nproc]` rank-to-neighbour lookup (O(nproc) memory
- * and time), the only term here that grows with the process count.
  */
 
 #include "mftl_communication.h"
 
-#include <stdio.h>
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 
-#include "comm_internal.h"
 #include "mftl_constants.h"
 #include "mftl_ensemble.h"
 #include "mftl_memory.h"
 #include "mftl_object.h"
-#include "mftl_topology.h"
 
-/** @brief Which per-vertex 3-vector an exchange moves. */
-typedef enum
+/** @brief Bytes after a row's doubles: the echoed id and 4 bytes of padding. */
+#define GHOST_TAG_BYTES 8
+
+/** @brief One pulled column, placed in its pool's reply row. */
+typedef struct
 {
-  GHOST_FIELD_POSITION = 0,  ///< `verts.pos`.
-  GHOST_FIELD_NORMAL = 1  ///< `verts.normal`.
-} ghost_field;
+  MFTL_GhostColumnKind kind;  ///< Which array.
+  int field;  ///< Field id for #MFTL_GHOST_COLUMN_FIELD.
+  int ncomp;  ///< Doubles per entity.
+  int at;  ///< First double of the column in the row.
+} ghost_column;
+
+/** @brief The column payload's context: the columns of each pool and a scratch. */
+typedef struct
+{
+  ghost_column *col[2];  ///< `[n[p]]` the columns of pool p, in the caller's order.
+  int n[2];  ///< Columns per pool.
+  int width[2];  ///< Doubles per row of pool p, before the tag.
+  double **arr;  ///< `[n_columns]` the arrays of the body being served or applied.
+} ghost_columns;
 
 /**
- * @brief The pool array a field names, read side.
- * @param obj The mesh.
- * @param f   Which field.
- * @return Const pointer to the named `[3*capacity]` array.
+ * @brief The array behind a column on one body.
+ * @param obj The body.
+ * @param c   The column.
+ * @return The `[ncomp * capacity]` array, or #MFTL_NULL if the body lacks it.
  */
-static const double *ghost_field_read(const MFTL_Object *obj, ghost_field f)
+static double *column_array(const MFTL_Object *obj, const ghost_column *c)
 {
-  return (f == GHOST_FIELD_POSITION) ? obj->verts.pos : obj->verts.normal;
-}
-
-/**
- * @brief The pool array a field names, write side.
- * @param obj The mesh.
- * @param f   Which field.
- * @return Writable pointer to the named `[3*capacity]` array.
- */
-static double *ghost_field_write(MFTL_Object *obj, ghost_field f)
-{
-  return (f == GHOST_FIELD_POSITION) ? obj->verts.pos : obj->verts.normal;
-}
-
-/**
- * @brief Answers the requests addressed to one object.
- *
- * The owner turns a vertex global id into a pool slot through the epoch-stamped
- * id table (comm_internal.h), filled with this object's OWNED vertices only for
- * objects that actually received requests. An unanswerable request (the
- * requester believes this rank owns a vertex it does not) is answered with
- * `global_id == MFTL_ERROR`, asserted in Debug and skipped by the requester.
- *
- * @param      obj        The mesh whose OWNED vertices answer the requests.
- * @param      field      Which per-vertex 3-vector is being synchronised.
- * @param      flat_recv  The received requests (local slot, vertex id), all senders.
- * @param      order      Request indices belonging to this object.
- * @param      first      First slot of @p order to serve.
- * @param      last       One past the last slot to serve.
- * @param[out] replies    One payload per request.
- * @param      tbl        Epoch-stamped id-to-slot table, reused across objects.
- * @param[out] n_unserved Incremented once per request this rank could not answer.
- */
-static void answer_object_requests(const MFTL_Object *obj, ghost_field field, const int *restrict flat_recv, const int *restrict order, int first, int last,
-                                   MFTL_GhostUpdatePayload *restrict replies, mftl_gid_table *tbl, int *n_unserved)
-{
-  const MFTL_Vertex *const restrict vr = obj->verts.rec;
-  const double *const restrict src = ghost_field_read(obj, field);
-  const int n_local = obj->verts.n_local;
-
-  CS_BEGIN(ts_tbl);
-  /* Owned vertices go in; the mode follows the share of the body held here. */
-  gt_begin(tbl, n_local, MFTL_MAX(obj->next_vertex_gid, 1));
-  for (int v = 0; v < n_local; ++v) gt_put(tbl, vr[v].global_id, v);
-  CS_END(ts_tbl, g_t_table);
-
-  for (int i = first; i < last; ++i)
+  switch (c->kind)
   {
-    const int k = order[i];
-    const int gid = flat_recv[2 * k + 1];
-    MFTL_GhostUpdatePayload *const p = &replies[k];
+    case MFTL_GHOST_COLUMN_POSITION: return obj->verts.pos;
+    case MFTL_GHOST_COLUMN_NORMAL: return obj->verts.normal;
+    case MFTL_GHOST_COLUMN_SIZING: return obj->verts.has_sizing ? obj->verts.sizing : MFTL_NULL;
+    case MFTL_GHOST_COLUMN_FIELD: return (obj->field_data != MFTL_NULL) ? obj->field_data[c->field] : MFTL_NULL;
+  }
+  return MFTL_NULL;
+}
 
-    if (gid < 0 || !gt_has(tbl, gid))
+/**
+ * @brief Resolves every column of pool @p p on @p obj into the scratch.
+ * @param cs  The payload.
+ * @param obj The body, or #MFTL_NULL.
+ * @param p   The pool.
+ * @return True if the body has every column.
+ */
+static bool bind_columns(ghost_columns *cs, const MFTL_Object *obj, int p)
+{
+  if (obj == MFTL_NULL) return MFTL_FALSE;
+  for (int c = 0; c < cs->n[p]; ++c)
+  {
+    cs->arr[c] = column_array(obj, &cs->col[p][c]);
+    if (cs->arr[c] == MFTL_NULL) return MFTL_FALSE;
+  }
+  return MFTL_TRUE;
+}
+
+/** @brief Owner side (#MFTL_GhostServeFn): the owned rows, tagged with their ids. */
+static void serve_columns(const MFTL_Object *obj, int slot, MFTL_FieldEntity pool, const int *idx, const int *offset, int n, unsigned char *reply, void *ctx)
+{
+  (void) slot;
+  ghost_columns *const cs = (ghost_columns *) ctx;
+  const int p = (int) pool;
+  const int nc = cs->n[p];
+  const int width = cs->width[p];
+  const ghost_column *const col = cs->col[p];
+  const double *const *const arr = (const double *const *) cs->arr;
+  const bool whole = bind_columns(cs, obj, p);
+  const int padding = 0;
+
+  for (int j = 0; j < n; ++j)
+  {
+    unsigned char *const row = reply + offset[j];
+    const int i = idx[j];
+    int tag = MFTL_ERROR;
+    if (i == MFTL_ERROR || !whole)
     {
-      MFTL_ASSERT(0 && "ghost sync: asked for a vertex this rank does not own");
-      memset(p, 0, sizeof *p);
-      p->global_id = MFTL_ERROR;
-      (*n_unserved)++;
+      memset(row, 0, (size_t) width * sizeof(double));
+    }
+    else
+    {
+      for (int c = 0; c < nc; ++c)
+      {
+        const int m = col[c].ncomp;
+        double *const restrict out = (double *) row + col[c].at;
+        const double *const restrict in = arr[c] + (size_t) i * m;
+        for (int k = 0; k < m; ++k) out[k] = in[k];
+      }
+      tag = (p == MFTL_FIELD_VERTEX) ? obj->verts.rec[i].global_id : obj->tris.rec[i].global_id;
+    }
+    memcpy(row + (size_t) width * sizeof(double), &tag, sizeof tag);
+    memcpy(row + (size_t) width * sizeof(double) + sizeof tag, &padding, sizeof padding);  // defined bytes on the wire
+  }
+}
+
+/** @brief Requester side (#MFTL_GhostApplyFn): copies every tagged row; a sentinel keeps the old value. */
+static int apply_columns(MFTL_Object *obj, int slot, MFTL_FieldEntity pool, const int *idx, int n, const unsigned char *rows, void *ctx)
+{
+  (void) slot;
+  ghost_columns *const cs = (ghost_columns *) ctx;
+  const int p = (int) pool;
+  const int nc = cs->n[p];
+  const int width = cs->width[p];
+  const size_t row_bytes = (size_t) width * sizeof(double) + GHOST_TAG_BYTES;
+  const ghost_column *const col = cs->col[p];
+  if (!bind_columns(cs, obj, p)) return n;  // nowhere to put them
+  double *const *const arr = cs->arr;
+
+  int skipped = 0;
+  for (int j = 0; j < n; ++j)
+  {
+    const unsigned char *const row = rows + (size_t) j * row_bytes;
+    int tag;
+    memcpy(&tag, row + (size_t) width * sizeof(double), sizeof tag);
+    if (tag == MFTL_ERROR)
+    {
+      skipped++;  // the owner could not serve it: keep the stale value, report
       continue;
     }
-
-    const int v = gt_get(tbl, gid);
-
-    p->value[0] = src[3 * v + 0];
-    p->value[1] = src[3 * v + 1];
-    p->value[2] = src[3 * v + 2];
-
-    p->global_id = gid;  // echoes the request, which is how the requester matches it
+    const int i = idx[j];
+    MFTL_ASSERT(tag == ((p == MFTL_FIELD_VERTEX) ? obj->verts.rec[i].global_id : obj->tris.rec[i].global_id) && "ghost reply does not match the request order");
+    for (int c = 0; c < nc; ++c)
+    {
+      const int m = col[c].ncomp;
+      const double *const restrict in = (const double *) row + col[c].at;
+      double *const restrict out = arr[c] + (size_t) i * m;
+      for (int k = 0; k < m; ++k) out[k] = in[k];
+    }
   }
+  return skipped;
 }
 
-/**
- * @brief The shared request/reply exchange behind both public ghost syncs.
- * @param ens   The ensemble.
- * @param field Which per-vertex 3-vector to move.
- * @return #MFTL_SUCCESS, or #MFTL_ERROR if the exchange failed.
- */
-static int ghost_sync_vec3(MFTL_Ensemble *ens, ghost_field field)
+int MFTLUpdateGhostColumns(MFTL_Ensemble *ens, const MFTL_GhostColumn *columns, int n_columns, MFTL_GhostRoute route)
 {
-  if (ens == MFTL_NULL || ens->local_objects == MFTL_NULL) return MFTL_ERROR;
-  MFTL_ASSERT(MFTL_MPI_GhostUpdatePayload != MPI_DATATYPE_NULL && "ghost sync: MPI datatypes not registered (MFTLFreeMpiTypes() while an ensemble is in use?)");
+  if (ens == MFTL_NULL || columns == MFTL_NULL || n_columns < 1) return MFTL_ERROR;
 
-  MFTL_Domain *const domain = &ens->domain;
-  MFTL_Object *const *const objects = ens->local_objects;
-  const int num_objects = ens->n_local_objects;
-  const int nproc = domain->nproc;
-  const int nn = domain->num_neighbors;
+  ghost_columns cs;
+  ghost_column *const all = (ghost_column *) MFTLMallocOrDie(2 * (size_t) n_columns * sizeof(ghost_column), "ghost columns");
+  cs.col[0] = all;
+  cs.col[1] = all + n_columns;
+  cs.n[0] = cs.n[1] = 0;
+  cs.width[0] = cs.width[1] = 0;
+  cs.arr = (double **) MFTLMallocOrDie((size_t) n_columns * sizeof(double *), "ghost column arrays");
 
-  /* Guards on GLOBAL state (or on a rank with no graph neighbours, which nobody
-   * expects a message from): a rank holding nothing must still enter the
-   * neighbourhood collectives. */
-  if (ens->n_bodies_global == 0 || nn == 0 || nproc == 1) return MFTL_SUCCESS;
-
-  CS_BEGIN(ts_total);
-  MFTLCommStats.g_n_calls++;
-  CS_BEGIN(ts_collect);
-
-  /* ── 1. Collect every ghost (the pool suffix), grouped by owner: a REQUEST
-   * (body id, vertex id) for the wire and a TARGET (local slot, vertex slot)
-   * kept here, so replies are applied by direct index. */
-  mftl_int_buffer *const requests = (mftl_int_buffer *) MFTLMallocOrDie((size_t) nn * sizeof(mftl_int_buffer), "ghost request lists");
-  mftl_int_buffer *const targets = (mftl_int_buffer *) MFTLMallocOrDie((size_t) nn * sizeof(mftl_int_buffer), "ghost target lists");
-  for (int i = 0; i < nn; ++i)
+  /* Validated from arguments every rank shares, so a refusal is unanimous. */
+  bool valid = MFTL_TRUE, positions = MFTL_FALSE;
+  for (int j = 0; j < n_columns && valid; ++j)
   {
-    ib_init(&requests[i], 1024);
-    ib_init(&targets[i], 1024);
+    const MFTL_GhostColumn *const c = &columns[j];
+    int pool = MFTL_FIELD_VERTEX, ncomp = 0;
+    switch (c->kind)
+    {
+      case MFTL_GHOST_COLUMN_POSITION:
+      case MFTL_GHOST_COLUMN_NORMAL: ncomp = 3; break;
+      case MFTL_GHOST_COLUMN_SIZING: ncomp = 1; break;
+      case MFTL_GHOST_COLUMN_FIELD:
+        if (c->field < 0 || c->field >= ens->fields.n)
+        {
+          valid = MFTL_FALSE;
+          break;
+        }
+        pool = (int) ens->fields.entries[c->field].entity;
+        ncomp = ens->fields.entries[c->field].ncomp;
+        break;
+      default: valid = MFTL_FALSE; break;
+    }
+    if (!valid || ncomp < 1) break;
+    for (int k = 0; k < j; ++k)
+      if (columns[k].kind == c->kind && (c->kind != MFTL_GHOST_COLUMN_FIELD || columns[k].field == c->field)) valid = MFTL_FALSE;
+    if (cs.width[pool] > (INT_MAX - GHOST_TAG_BYTES) / (int) sizeof(double) - ncomp) valid = MFTL_FALSE;  // the row must fit an int
+    if (!valid) break;
+
+    ghost_column *const g = &cs.col[pool][cs.n[pool]++];
+    g->kind = c->kind;
+    g->field = c->field;
+    g->ncomp = ncomp;
+    g->at = cs.width[pool];
+    cs.width[pool] += ncomp;
+    if (c->kind == MFTL_GHOST_COLUMN_POSITION) positions = MFTL_TRUE;
   }
 
-  int *const rank_to_neigh = (int *) MFTLMallocOrDie((size_t) nproc * sizeof(int), "ghost neighbour index");
-  for (int r = 0; r < nproc; ++r) rank_to_neigh[r] = MFTL_ERROR;
-  for (int i = 0; i < nn; ++i) rank_to_neigh[domain->neighbors[i]] = i;
-
-  int orphaned = 0;
-  for (int o = 0; o < num_objects; ++o)
+  int rc = MFTL_ERROR;
+  if (valid)
   {
-    const MFTL_Object *const obj = objects[o];
-    const MFTL_Vertex *const vr = obj->verts.rec;
-
-    for (int v = obj->verts.n_local; v < obj->verts.n; ++v)
-    {
-      const int owner = vr[v].owner_proc;
-      const int n_idx = (owner >= 0 && owner < nproc) ? rank_to_neigh[owner] : MFTL_ERROR;
-      if (n_idx == MFTL_ERROR)
+    /* New ghost positions: geometry computed before this is stale on the
+     * ghosts, and the surface changed. */
+    if (positions)
+      for (int o = 0; o < ens->n_local_objects; ++o)
       {
-        /* Owner outside the 26-neighbourhood: unreachable. Skipped (aborting
-         * would deadlock the others) but asserted, because the stale position
-         * later makes two ranks route a triangle differently. There is no global
-         * fallback (unlike MFTLRemeshSyncGhostIds()); a partition whose halo
-         * leaves the neighbourhood must not outlive the call that created it. */
-        MFTL_ASSERT(0 && "ghost sync: ghost vertex whose owner is not a graph neighbour -- its position will not be updated");
-        orphaned++;
-        continue;
+        ens->local_objects[o]->derived &= ~MFTL_DERIVED_GEOMETRY;
+        MFTLObjectMarkChanged(ens->local_objects[o]);
       }
 
-      /* Body by global id on the wire; local slot in the target. */
-      ib_add2(&requests[n_idx], obj->global_id, vr[v].global_id);
-      ib_add2(&targets[n_idx], o, v);
-      MFTLCommStats.g_n_ghosts_requested++;
-    }
-  }
-  free(rank_to_neigh);
-  MFTLCommStats.g_n_orphaned += orphaned;
-
-  if (orphaned > 0)
-  {
-    fprintf(stderr, "[MFTL rank %d] ghost sync: %d ghost vertices whose owner is not a graph neighbour were not updated\n", domain->rank, orphaned);
-  }
-
-  CS_END(ts_collect, g_t_collect);
-
-  /* ── 2. Request counts, non-blocking and overlapped with flattening the
-   * requests; everything after is a strict dependency chain. */
-  int *const n_send = (int *) MFTLMallocOrDie((size_t) nn * sizeof(int), "ghost send counts");
-  int *const n_recv = (int *) MFTLMallocOrDie((size_t) nn * sizeof(int), "ghost recv counts");
-  for (int i = 0; i < nn; ++i) n_send[i] = requests[i].size;
-
-  MPI_Request count_req;
-  CS_BEGIN(ts_counts);
-  MPI_Ineighbor_alltoall(n_send, 1, MPI_INT, n_recv, 1, MPI_INT, domain->comm_graph, &count_req);
-
-  int *const s_displs = (int *) MFTLMallocOrDie((size_t) nn * sizeof(int), "ghost send displs");
-  int total_send = 0;
-  for (int i = 0; i < nn; ++i)
-  {
-    s_displs[i] = total_send;
-    total_send += n_send[i];
-  }
-
-  int *const flat_send = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(total_send, 1) * sizeof(int), "ghost request image");
-  for (int i = 0; i < nn; ++i)
-  {
-    if (n_send[i] > 0) memcpy(flat_send + s_displs[i], requests[i].data, (size_t) n_send[i] * sizeof(int));
-  }
-
-  MPI_Wait(&count_req, MPI_STATUS_IGNORE);
-  CS_END(ts_counts, g_t_counts);
-
-  int *const r_displs = (int *) MFTLMallocOrDie((size_t) nn * sizeof(int), "ghost recv displs");
-  int total_recv = 0;
-  for (int i = 0; i < nn; ++i)
-  {
-    r_displs[i] = total_recv;
-    total_recv += n_recv[i];
-  }
-
-  /* ── 3. Exchange the requests ────────────────────────────────────────────── */
-  CS_BEGIN(ts_req);
-  int *const flat_recv = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(total_recv, 1) * sizeof(int), "ghost incoming requests");
-  MPI_Neighbor_alltoallv(flat_send, n_send, s_displs, MPI_INT, flat_recv, n_recv, r_displs, MPI_INT, domain->comm_graph);
-  free(flat_send);
-  CS_END(ts_req, g_t_requests);
-  MFTLCommStats.g_n_bytes_sent += (long) total_send * (long) sizeof(int);
-  MFTLCommStats.g_n_bytes_recv += (long) total_recv * (long) sizeof(int);
-
-  CS_BEGIN(ts_answer);
-
-  /* ── 4. Answer: group the requests by object (counting sort) so each object's
-   * id table is built once; replies go back at the request's ORIGINAL position,
-   * since the requester matches them positionally. */
-  const int n_replies = total_recv / 2;
-  MFTL_GhostUpdatePayload *const replies =
-      (MFTL_GhostUpdatePayload *) MFTLMallocOrDie((size_t) MFTL_MAX(n_replies, 1) * sizeof(MFTL_GhostUpdatePayload), "ghost replies");
-
-  int *const obj_off = (int *) MFTLCallocOrDie((size_t) num_objects + 1, sizeof(int), "ghost request grouping");
-  int *const order = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_replies, 1) * sizeof(int), "ghost request order");
-  int unserved = 0;
-
-  {
-    /* Resolve each body id to this rank's slot once, in place. A body not held
-     * here is a routing error: the requester named this rank as the owner. */
-    int dropped = 0;
-    for (int k = 0; k < n_replies; ++k)
+    MFTL_GhostPull pull;
+    for (int p = 0; p < 2; ++p)
     {
-      const int slot = MFTLEnsembleFindLocalSlot(ens, flat_recv[2 * k]);
-      flat_recv[2 * k] = slot;
-      if (slot != MFTL_ERROR)
-        obj_off[slot + 1]++;
-      else
-        dropped++;
+      pull.row_bytes[p] = (cs.width[p] > 0) ? cs.width[p] * (int) sizeof(double) + GHOST_TAG_BYTES : 0;
+      pull.keys[p] = MFTL_NULL;
     }
-    for (int o = 0; o < num_objects; ++o) obj_off[o + 1] += obj_off[o];
-
-    int *const cursor = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(num_objects, 1) * sizeof(int), "ghost grouping cursors");
-    for (int o = 0; o < num_objects; ++o) cursor[o] = obj_off[o];
-
-    for (int k = 0; k < n_replies; ++k)
-    {
-      const int o = flat_recv[2 * k];
-      if (o == MFTL_ERROR)
-      {
-        MFTL_ASSERT(0 && "ghost sync: request names a body this rank does not hold, but claims this rank owns the vertex");
-        memset(&replies[k], 0, sizeof replies[k]);
-        replies[k].global_id = MFTL_ERROR;
-        continue;
-      }
-      order[cursor[o]++] = k;
-    }
-    free(cursor);
-    unserved += dropped;
+    pull.route = route;
+    pull.serve = serve_columns;
+    pull.apply = apply_columns;
+    pull.ctx = &cs;
+    rc = MFTLGhostPull(ens, &pull);
   }
 
-  {
-    /* The ensemble's persistent table, retired per object by an epoch bump. */
-    mftl_gid_table *const tbl = MFTLCommWorkspaceGhostTable(ens);
-    for (int o = 0; o < num_objects; ++o)
-    {
-      if (obj_off[o + 1] == obj_off[o]) continue;  // nothing asked of this body
-      answer_object_requests(objects[o], field, flat_recv, order, obj_off[o], obj_off[o + 1], replies, tbl, &unserved);
-    }
-  }
-
-  free(order);
-  free(obj_off);
-  free(flat_recv);
-  CS_END(ts_answer, g_t_answer);
-
-  CS_BEGIN(ts_rep);
-
-  /* ── 5. Replies: counts are the request counts halved, known to both sides. */
-  int *const n_send_rep = n_recv;  // what we were asked for, we now answer
-  int *const n_recv_rep = n_send;  // what we asked for, we now receive
-  for (int i = 0; i < nn; ++i)
-  {
-    n_send_rep[i] /= 2;
-    n_recv_rep[i] /= 2;
-    s_displs[i] /= 2;
-    r_displs[i] /= 2;
-  }
-
-  const int n_incoming = total_send / 2;
-  MFTL_GhostUpdatePayload *const incoming =
-      (MFTL_GhostUpdatePayload *) MFTLMallocOrDie((size_t) MFTL_MAX(n_incoming, 1) * sizeof(MFTL_GhostUpdatePayload), "ghost updates");
-
-  MPI_Neighbor_alltoallv(replies, n_send_rep, r_displs, MFTL_MPI_GhostUpdatePayload, incoming, n_recv_rep, s_displs, MFTL_MPI_GhostUpdatePayload,
-                         domain->comm_graph);
-  free(replies);
-  CS_END(ts_rep, g_t_replies);
-  MFTLCommStats.g_n_bytes_sent += (long) (total_recv / 2) * (long) sizeof(MFTL_GhostUpdatePayload);
-  MFTLCommStats.g_n_bytes_recv += (long) (total_send / 2) * (long) sizeof(MFTL_GhostUpdatePayload);
-  CS_BEGIN(ts_apply);
-
-  /* ── 6. Apply in request order through the target list. */
-  int p = 0;
-  for (int i = 0; i < nn; ++i)
-  {
-    const int *const t = targets[i].data;
-    const int count = targets[i].size;
-
-    for (int k = 0; k < count; k += 2, ++p)
-    {
-      const MFTL_GhostUpdatePayload *const src = &incoming[p];
-      if (src->global_id == MFTL_ERROR) continue;  // owner could not serve it
-
-      MFTL_Object *const obj = objects[t[k]];
-      const int idx = t[k + 1];
-      MFTL_ASSERT(obj->verts.rec[idx].global_id == src->global_id && "ghost reply does not match the request order");
-
-      double *const dst = ghost_field_write(obj, field);
-      dst[3 * idx + 0] = src->value[0];
-      dst[3 * idx + 1] = src->value[1];
-      dst[3 * idx + 2] = src->value[2];
-    }
-  }
-
-  free(incoming);
-  CS_END(ts_apply, g_t_apply);
-  CS_BEGIN(ts_free);
-  for (int i = 0; i < nn; ++i)
-  {
-    ib_free(&requests[i]);
-    ib_free(&targets[i]);
-  }
-  free(requests);
-  free(targets);
-  free(n_send);
-  free(n_recv);
-  free(s_displs);
-  free(r_displs);
-  CS_END(ts_free, g_t_teardown);
-
-  CS_END(ts_total, g_t_total);
-
-  /* An orphaned or unserved ghost kept a stale value: report it. */
-  return (unserved == 0 && orphaned == 0) ? MFTL_SUCCESS : MFTL_ERROR;
+  free(cs.arr);
+  free(all);
+  return rc;
 }
 
 int MFTLUpdateGhostPositions(MFTL_Ensemble *ens)
 {
-  /* New ghost positions: geometry computed before this is stale on the ghosts. */
-  if (ens != MFTL_NULL && ens->local_objects != MFTL_NULL)
-    for (int o = 0; o < ens->n_local_objects; ++o)
-    {
-      ens->local_objects[o]->derived &= ~MFTL_DERIVED_GEOMETRY;
-      MFTLObjectMarkChanged(ens->local_objects[o]);
-    }
-  return ghost_sync_vec3(ens, GHOST_FIELD_POSITION);
+  const MFTL_GhostColumn c = {MFTL_GHOST_COLUMN_POSITION, 0};
+  return MFTLUpdateGhostColumns(ens, &c, 1, MFTL_GHOST_ROUTE_GRAPH);
 }
 
-int MFTLUpdateGhostVertexNormals(MFTL_Ensemble *ens) { return ghost_sync_vec3(ens, GHOST_FIELD_NORMAL); }
+int MFTLUpdateGhostVertexNormals(MFTL_Ensemble *ens)
+{
+  const MFTL_GhostColumn c = {MFTL_GHOST_COLUMN_NORMAL, 0};
+  return MFTLUpdateGhostColumns(ens, &c, 1, MFTL_GHOST_ROUTE_GRAPH);
+}
 
-/* Attached fields use the same request/reply protocol, with a variable row per
- * entity class. The fixed vec3 entry points above retain their original path. */
 int MFTLUpdateGhostFields(MFTL_Ensemble *ens, const int *ids, int nfields, bool with_positions)
 {
   if (!ens) return MFTL_ERROR;
   if (nfields == 0) return with_positions ? MFTLUpdateGhostPositions(ens) : MFTL_SUCCESS;
-  CS_BEGIN(ts_fields);
-  MFTL_Domain *dom = &ens->domain;
-  int valid = nfields > 0 && ids != NULL;
-  int width[2] = {with_positions ? 3 : 0, 0};
-  if (valid)
-    for (int j = 0; j < nfields; ++j)
-    {
-      if (ids[j] < 0 || ids[j] >= ens->fields.n)
-      {
-        valid = 0;
-        break;
-      }
-      const MFTL_FieldDescriptor *d = &ens->fields.entries[ids[j]];
-      if (d->ncomp > INT_MAX - 1 - width[d->entity])
-      {
-        valid = 0;
-        break;
-      }
-      width[d->entity] += d->ncomp;
-      for (int k = 0; k < j; ++k)
-        if (ids[k] == ids[j]) valid = 0;
-    }
-  int agreed;
-  MPI_Allreduce(&valid, &agreed, 1, MPI_INT, MPI_MIN, dom->comm_world);
-  if (!agreed)
-  {
-    CS_END(ts_fields, g_t_total);
-    return MFTL_ERROR;
-  }
 
-  CS_BEGIN(ts_collect);
-  const int nn = dom->num_neighbors, np = dom->nproc;
-  MFTL_SendBuffer *requests = MFTLCallocOrDie((size_t) np, sizeof(*requests), "field ghost requests");
-  mftl_int_buffer *targets = MFTLCallocOrDie((size_t) MFTL_MAX(nn, 1), sizeof(*targets), "field ghost targets");
-  int *neighbor = MFTLMallocOrDie((size_t) np * sizeof(int), "field ghost neighbors");
-  for (int r = 0; r < np; ++r) neighbor[r] = MFTL_ERROR;
-  for (int r = 0; r < nn; ++r) neighbor[dom->neighbors[r]] = r;
-  for (int o = 0; o < ens->n_local_objects; ++o)
+  /* Agreed before any rank takes a different path: one rank's bad list must
+   * not leave the others inside the pull. */
+  int valid = nfields > 0 && ids != MFTL_NULL;
+  for (int j = 0; valid && j < nfields; ++j)
   {
-    MFTL_Object *obj = ens->local_objects[o];
-    for (int e = 0; e < 2; ++e)
-    {
-      if (!width[e]) continue;
-      const int first = e ? obj->tris.n_local : obj->verts.n_local;
-      const int end = e ? obj->tris.n : obj->verts.n;
-      for (int i = first; i < end; ++i)
-      {
-        const int owner = e ? obj->tris.rec[i].owner_proc : obj->verts.rec[i].owner_proc;
-        if (owner < 0 || owner >= np || neighbor[owner] == MFTL_ERROR)
-        {
-          MFTLCommStats.g_n_orphaned++;
-          valid = 0;
-          continue;
-        }
-        MFTL_SendBuffer *b = &requests[owner];
-        if (b->count > INT_MAX - 3) MPI_Abort(dom->comm_world, MFTL_ERROR);
-        if (b->count + 3 > b->capacity)
-        {
-          b->capacity = MFTLGrowCapacity(b->capacity, b->count + 3);
-          b->buffer = MFTLReallocOrDie(b->buffer, (size_t) b->capacity * sizeof(int), "field request buffer");
-        }
-        int *q = (int *) b->buffer + b->count;
-        q[0] = obj->global_id;
-        q[1] = e;
-        q[2] = e ? obj->tris.rec[i].global_id : obj->verts.rec[i].global_id;
-        b->count += 3;
-        ib_add(&targets[neighbor[owner]], o);
-        ib_add(&targets[neighbor[owner]], e);
-        ib_add(&targets[neighbor[owner]], i);
-      }
-    }
+    if (ids[j] < 0 || ids[j] >= ens->fields.n) valid = 0;
+    for (int k = 0; k < j; ++k)
+      if (ids[k] == ids[j]) valid = 0;
   }
-  free(neighbor);
-  CS_END(ts_collect, g_t_collect);
-  MPI_Allreduce(&valid, &agreed, 1, MPI_INT, MPI_MIN, dom->comm_world);
-  if (!agreed)
-  {
-    for (int r = 0; r < np; ++r) free(requests[r].buffer);
-    for (int r = 0; r < nn; ++r) ib_free(&targets[r]);
-    free(requests);
-    free(targets);
-    CS_END(ts_fields, g_t_total);
-    return MFTL_ERROR; /* A noncanonical partition needs a supported route. */
-  }
+  int agreed = 0;
+  MPI_Allreduce(&valid, &agreed, 1, MPI_INT, MPI_MIN, ens->domain.comm_world);
+  if (!agreed) return MFTL_ERROR;
 
-  MFTL_Exchange x = {0};
-  x.send_bufs = requests;
-  x.type = MPI_INT;
-  x.type_size = sizeof(int);
-  MFTL_ExchangeCtx ctx;
-  MFTLExchangeStart(dom, &x, 1, false, &ctx);
-  MFTLExchangeWait(&ctx, 0);
-  const int *wire = x.recv_buf;
-  const int nr = x.recv_count / 3;
-  int *counts = MFTLCallocOrDie((size_t) MFTL_MAX(nn, 1) * 4, sizeof(int), "field ghost reply counts");
-  int *sc = counts, *rc = sc + MFTL_MAX(nn, 1), *sd = rc + MFTL_MAX(nn, 1), *rd = sd + MFTL_MAX(nn, 1);
-  int *offset = MFTLMallocOrDie(((size_t) nr + 1) * sizeof(int), "field ghost reply offsets");
-  int ns = 0, ni = 0, request = 0;
-  for (int r = 0; r < nn; ++r)
-  {
-    sd[r] = ns;
-    rd[r] = ni;
-    const int number = ctx.counts[MFTL_MAX(nn, 1) + r] / 3;
-    for (int j = 0; j < number; ++j, ++request)
-    {
-      const int w = 1 + width[wire[3 * request + 1]];
-      if (ns > INT_MAX - w) MPI_Abort(dom->comm_world, MFTL_ERROR);
-      offset[request] = ns;
-      ns += w;
-    }
-    for (int j = 0; j < targets[r].size; j += 3)
-    {
-      const int w = 1 + width[targets[r].data[j + 1]];
-      if (ni > INT_MAX - w) MPI_Abort(dom->comm_world, MFTL_ERROR);
-      ni += w;
-    }
-    sc[r] = ns - sd[r];
-    rc[r] = ni - rd[r];
-  }
-  offset[nr] = ns;
-  double *reply = MFTLCallocOrDie((size_t) MFTL_MAX(ns, 1), sizeof(double), "field ghost replies");
-  double *incoming = MFTLMallocOrDie((size_t) MFTL_MAX(ni, 1) * sizeof(double), "field ghost incoming");
+  MFTL_GhostColumn *const cols = (MFTL_GhostColumn *) MFTLMallocOrDie(((size_t) nfields + 1) * sizeof(MFTL_GhostColumn), "field ghost columns");
+  int n = 0;
+  if (with_positions) cols[n++] = (MFTL_GhostColumn){MFTL_GHOST_COLUMN_POSITION, 0};
+  for (int j = 0; j < nfields; ++j) cols[n++] = (MFTL_GhostColumn){MFTL_GHOST_COLUMN_FIELD, ids[j]};
+  int ok = MFTLUpdateGhostColumns(ens, cols, n, MFTL_GHOST_ROUTE_GRAPH) == MFTL_SUCCESS;
+  free(cols);
 
-  /* Group requests by (local object, entity class); build each owned gid table
-   * only once, exactly as the fixed-width exchange does for vertices. */
-  if (ens->n_local_objects > (INT_MAX - 1) / 2) MPI_Abort(dom->comm_world, MFTL_ERROR);
-  const int ng = 2 * ens->n_local_objects;
-  int *groups = MFTLCallocOrDie((size_t) ng + 1, sizeof(int), "field request groups");
-  int *order = MFTLMallocOrDie((size_t) MFTL_MAX(nr, 1) * sizeof(int), "field request order");
-  int *group_of = MFTLMallocOrDie((size_t) MFTL_MAX(nr, 1) * sizeof(int), "field request group ids");
-  for (int k = 0; k < nr; ++k)
-  {
-    const int o = MFTLEnsembleFindLocalSlot(ens, wire[3 * k]);
-    group_of[k] = o < 0 ? MFTL_ERROR : 2 * o + wire[3 * k + 1];
-    if (o < 0)
-      valid = 0;
-    else
-      groups[group_of[k] + 1]++;
-  }
-  for (int g = 0; g < ng; ++g) groups[g + 1] += groups[g];
-  int *cursor = MFTLMallocOrDie(((size_t) ng + 1) * sizeof(int), "field group cursor");
-  memcpy(cursor, groups, ((size_t) ng + 1) * sizeof(int));
-  for (int k = 0; k < nr; ++k)
-    if (group_of[k] >= 0) order[cursor[group_of[k]]++] = k;
-  mftl_gid_table *tbl = MFTLCommWorkspaceGhostTable(ens);
-  for (int g = 0; g < ng; ++g)
-  {
-    if (groups[g] == groups[g + 1]) continue;
-    const int e = g % 2;
-    MFTL_Object *obj = ens->local_objects[g / 2];
-    const int n = e ? obj->tris.n_local : obj->verts.n_local;
-    gt_begin(tbl, n, MFTL_MAX(e ? obj->next_triangle_gid : obj->next_vertex_gid, 1));
-    for (int i = 0; i < n; ++i) gt_put(tbl, e ? obj->tris.rec[i].global_id : obj->verts.rec[i].global_id, i);
-    for (int j = groups[g]; j < groups[g + 1]; ++j)
-    {
-      const int k = order[j], gid = wire[3 * k + 2];
-      if (gid < 0 || !gt_has(tbl, gid))
-      {
-        valid = 0;
-        continue;
-      }
-      const int i = gt_get(tbl, gid);
-      double *out = reply + offset[k];
-      *out++ = 1.0;
-      if (e == 0 && with_positions)
-      {
-        memcpy(out, obj->verts.pos + 3 * i, 3 * sizeof(double));
-        out += 3;
-      }
-      for (int f = 0; f < nfields; ++f)
-      {
-        const MFTL_FieldDescriptor *d = &ens->fields.entries[ids[f]];
-        if ((int) d->entity != e) continue;
-        memcpy(out, obj->field_data[ids[f]] + (size_t) i * d->ncomp, (size_t) d->ncomp * sizeof(double));
-        out += d->ncomp;
-      }
-    }
-  }
-  MPI_Neighbor_alltoallv(reply, sc, sd, MPI_DOUBLE, incoming, rc, rd, MPI_DOUBLE, dom->comm_graph);
-  for (int r = 0; r < nn; ++r)
-  {
-    const double *in = incoming + rd[r];
-    for (int j = 0; j < targets[r].size; j += 3)
-    {
-      const int *t = targets[r].data + j;
-      MFTL_Object *obj = ens->local_objects[t[0]];
-      const int e = t[1], i = t[2];
-      if (*in++ != 1.0)
-      {
-        valid = 0;
-        in += width[e];
-        continue;
-      }
-      if (e == 0 && with_positions)
-      {
-        memcpy(obj->verts.pos + 3 * i, in, 3 * sizeof(double));
-        in += 3;
-      }
-      for (int f = 0; f < nfields; ++f)
-      {
-        const MFTL_FieldDescriptor *d = &ens->fields.entries[ids[f]];
-        if ((int) d->entity != e) continue;
-        memcpy(obj->field_data[ids[f]] + (size_t) i * d->ncomp, in, (size_t) d->ncomp * sizeof(double));
-        in += d->ncomp;
-      }
-    }
-  }
-  if (with_positions)
-    for (int o = 0; o < ens->n_local_objects; ++o)
-    {
-      ens->local_objects[o]->derived &= ~MFTL_DERIVED_GEOMETRY;
-      MFTLObjectMarkChanged(ens->local_objects[o]);
-    }
-  MFTLCommStats.g_n_calls++;
-  for (int r = 0; r < nn; ++r) MFTLCommStats.g_n_ghosts_requested += targets[r].size / 3;
-  MFTLCommStats.g_n_bytes_sent += (long) ns * sizeof(double);
-  MFTLCommStats.g_n_bytes_recv += (long) ni * sizeof(double) + (long) x.recv_count * sizeof(int);
-  for (int r = 0; r < np; ++r) MFTLCommStats.g_n_bytes_sent += (long) requests[r].count * sizeof(int);
-  for (int r = 0; r < np; ++r) free(requests[r].buffer);
-  for (int r = 0; r < nn; ++r) ib_free(&targets[r]);
-  free(requests);
-  free(targets);
-  free(counts);
-  free(offset);
-  free(reply);
-  free(incoming);
-  free(groups);
-  free(order);
-  free(group_of);
-  free(cursor);
-  free(x.recv_buf);
-  MFTLExchangeFree(&ctx);
-  MPI_Allreduce(&valid, &agreed, 1, MPI_INT, MPI_MIN, dom->comm_world);
-  CS_END(ts_fields, g_t_total);
+  /* The same verdict everywhere: an unreachable ghost on one rank is a failure
+   * of the call, not of that rank. */
+  MPI_Allreduce(&ok, &agreed, 1, MPI_INT, MPI_MIN, ens->domain.comm_world);
   return agreed ? MFTL_SUCCESS : MFTL_ERROR;
 }

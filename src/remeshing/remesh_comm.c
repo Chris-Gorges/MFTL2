@@ -708,451 +708,101 @@ void MFTLRemeshNeighborAlltoall(const MFTL_Domain *domain, const double *send, i
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 5. The ghost global-id exchange
+ * 5. Ghost exchanges: payloads on the library's one engine
  *
- * Request/reply over comm_graph, the same schedule shape as
- * MFTLUpdateGhostPositions and deliberately a separate implementation of it --
- * see remesh_comm.h. Four bytes per ghost vertex, no registered datatype.
+ * Every ghost refresh the remesher needs is a payload on MFTLGhostPull()
+ * (mftl_communication.h) over #MFTL_GHOST_ROUTE_AUTO, the route with the global
+ * fallback a coarsened placement needs. They are listed here because this file
+ * is the module's inventory of network use; none of them calls MPI. Each is a
+ * pair of block callbacks (once per (body, pool), never per ghost), so the
+ * per-timestep position sync, which shares the engine, has no payload test in
+ * any loop of its own (see remesh_comm.h for why that matters).
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/** @brief The 2-int-at-a-time growable list the request/target pairs go into. */
-typedef struct
-{
-  int *data;  ///< [cap] interleaved pairs.
-  int size;  ///< INTS written, i.e. twice the pair count.
-  int cap;  ///< Ints allocated.
-} pair_list;
-
-/**
- * @brief Initialises the list with its starting capacity.
- * @param b The list.
- */
-static void pl_init(pair_list *b)
-{
-  b->cap = 256;
-  b->size = 0;
-  b->data = (int *) MFTLMallocOrDie((size_t) b->cap * sizeof(int), "remesh ghost id list");
-}
-
-/**
- * @brief Appends one pair.
- * @param b The list.
- * @param a First member.
- * @param c Second member.
- */
-static void pl_add2(pair_list *b, int a, int c)
-{
-  MFTL_ENSURE_CAPACITY(b->data, &b->size, &b->cap, 2, int);
-  b->data[b->size++] = a;
-  b->data[b->size++] = c;
-}
-
-/**
- * @brief Releases the list.
- * @param b The list.
- */
-static void pl_free(pair_list *b) { free(b->data); }
-
-/**
- * @brief What the owner sends back for one ghost vertex: writes `width` bytes
- *        to @p out. Called with @p v = #MFTL_ERROR for a request it cannot
- *        serve, and must then write a sentinel its ghost_apply_fn skips.
- */
-typedef void (*ghost_answer_fn)(const MFTL_Object *obj, int slot, int v, void *out, const void *ctx);
-
-/** @brief Applies one reply (`width` bytes at @p in) to ghost vertex @p v of @p obj. */
-typedef void (*ghost_apply_fn)(MFTL_Object *obj, int v, const void *in);
-
-/**
- * @brief Answers every request addressed to one body.
- *
- * The owner has to turn a global id into a pool slot, which is the one lookup
- * in this module that is not already an index. It needs no hash map for the
- * same reason the ghost sync does not: ids are DENSE per entity class, so a
- * scatter of the owned vertices into an array sized by `next_vertex_gid` answers
- * every request with one indexed read.
- *
- * O(owned) to build and O(requests) to use, so it is built once per body that
- * was actually asked something -- which is what the counting sort in the caller
- * is for.
- *
- * @param      obj         The mesh whose OWNED vertices answer the requests.
- * @param      slot        Its local slot, handed to @p answer.
- * @param      flat_recv   The received request ids, all senders concatenated.
- * @param      order       Request indices belonging to this body.
- * @param      first       First slot of @p order to serve.
- * @param      last        One past the last slot to serve.
- * @param[out] reply       `width` bytes per request, written by @p answer.
- * @param      width       Bytes per reply.
- * @param      answer      Writes one reply.
- * @param      ctx         Passed to @p answer.
- * @param      slot_of_gid Scatter table from global id to pool slot.
- * @param      table_len   Addressable length of @p slot_of_gid.
- * @param[out] n_unserved  Incremented once per unanswerable request.
- */
-static void answer_body(const MFTL_Object *obj, int slot, const int *restrict flat_recv, const int *restrict order, int first, int last,
-                        unsigned char *restrict reply, size_t width, ghost_answer_fn answer, const void *ctx, int *restrict slot_of_gid,
-                        int table_len, int *n_unserved)
-{
-  for (int i = 0; i < table_len; ++i) slot_of_gid[i] = MFTL_ERROR;
-
-  const MFTL_Vertex *const restrict vr = obj->verts.rec;
-  const int n_local = obj->verts.n_local;
-  for (int v = 0; v < n_local; ++v)
-  {
-    const int g = vr[v].global_id;
-    MFTL_ASSERT(g >= 0 && g < table_len && "remesh ghost ids: owned vertex outside the body's id range");
-    if (g >= 0 && g < table_len) slot_of_gid[g] = v;
-  }
-
-  for (int i = first; i < last; ++i)
-  {
-    const int k = order[i];
-    const int gid = flat_recv[2 * k + 1];
-    const int v = (gid >= 0 && gid < table_len) ? slot_of_gid[gid] : MFTL_ERROR;
-
-    if (v == MFTL_ERROR)
-    {
-      /* The requester believes this rank owns a vertex it does not have. Report
-       * it rather than dereferencing garbage: the requester skips the reply and
-       * keeps its stale value, which the caller turns into MFTL_ERROR. */
-      MFTL_ASSERT(0 && "remesh ghost exchange: asked for a vertex this rank does not own");
-      (*n_unserved)++;
-    }
-    answer(obj, slot, v, reply + (size_t) k * width, ctx);
-  }
-}
-
-/**
- * @brief Owner-to-ghost request/reply over the ghost VERTICES of every local
- *        body: each ghost asks its owner, by (body gid, vertex gid), and the
- *        owner's @p answer comes back @p width bytes per ghost.
- *
- * The one route both remesher exchanges take -- the new global ids after a
- * phase (MFTLRemeshSyncGhostIds()) and the curvature sizing after a migration
- * (MFTLRemeshSyncGhostSizing()) -- so the global fallback a coarsened placement
- * needs exists once. Requests are two ints, replies opaque bytes.
- *
- * @param ens    The ensemble; every rank calls.
- * @param width  Bytes per reply.
- * @param answer Owner side, per request.
- * @param ctx    Passed to @p answer.
- * @param apply  Requester side, per reply.
- * @param what   Name for the diagnostics.
- * @return #MFTL_SUCCESS, or #MFTL_ERROR when some request could not be served
- *         (the ghost keeps its old value).
- * @collective
- */
-static int ghost_vertex_exchange(MFTL_Ensemble *ens, size_t width, ghost_answer_fn answer, const void *ctx, ghost_apply_fn apply, const char *what)
-{
-
-  MFTL_Domain *const dom = &ens->domain;
-  MFTL_Object *const *const objects = ens->local_objects;
-  const int n_local = ens->n_local_objects;
-  const int nproc = dom->nproc;
-  const int nn = dom->num_neighbors;
-
-  /* GLOBAL: an MPI_Allreduce decides the route below, so a rank holding no
-   * bodies must still reach it. */
-  if (ens->n_bodies_global == 0 || nproc == 1) return MFTL_SUCCESS;
-
-  /* ── 0. Can the 26-neighbourhood carry this exchange at all? ─────────────
-   *
-   * THE FAILURE THIS REMOVES IS SILENT AND IT TEARS THE SURFACE. The graph
-   * communicator reaches the 26 cells around this one, and for the production
-   * decomposition that is where every ghost's owner is. It is not where the
-   * owner is under a COARSENED placement (the representative of an adjacent
-   * coarse block is `group` fine cells away), nor when a body is large enough
-   * that redistribution had to use the global path in the first place.
-   *
-   * What used to happen then: the request was dropped, the ghost kept its OLD
-   * global id, and the closing redistribution -- which de-duplicates arrivals by
-   * global id -- failed to match it against the authoritative copy. Both
-   * survived, and repair_twins, which pairs by vertex SLOT, welded the surface
-   * to itself along the partition boundary. Nothing asserts, nothing crashes,
-   * and MFTLCheckMeshIntegrity reports a perfectly valid mesh.
-   *
-   * So: detect it, agree about it in one int, and fall back to the global
-   * communicator. The fallback is not cheap -- it is an Alltoall over nproc --
-   * but it is entered only when the neighbourhood provably cannot deliver, and
-   * the alternative is a wrong answer. Everything below is written against
-   * `n_slots` rather than against `nn` so that the two paths share it all. */
-  int *const rank_to_slot = (int *) MFTLMallocOrDie((size_t) nproc * sizeof(int), "remesh ghost slot index");
-  for (int r = 0; r < nproc; ++r) rank_to_slot[r] = MFTL_ERROR;
-  for (int i = 0; i < nn; ++i) rank_to_slot[dom->neighbors[i]] = i;
-
-  int needs_global = 0;
-  for (int o = 0; o < n_local && !needs_global; ++o)
-  {
-    const MFTL_Object *const obj = objects[o];
-    for (int v = obj->verts.n_local; v < obj->verts.n; ++v)
-    {
-      const int owner = obj->verts.rec[v].owner_proc;
-      if (owner < 0 || owner >= nproc || rank_to_slot[owner] == MFTL_ERROR)
-      {
-        needs_global = 1;
-        break;
-      }
-    }
-  }
-  MPI_Allreduce(MPI_IN_PLACE, &needs_global, 1, MPI_INT, MPI_LOR, dom->comm_world);
-
-  if (!needs_global && nn == 0)
-  {
-    free(rank_to_slot);
-    return MFTL_SUCCESS;
-  }
-
-  const int n_slots = needs_global ? nproc : nn;
-  if (needs_global)
-  {
-    for (int r = 0; r < nproc; ++r) rank_to_slot[r] = r;
-  }
-
-  /* ── 1. Every ghost we hold, grouped by owner ────────────────────────────
-   * Two lists filled in lockstep: the REQUEST (body, old gid) that goes on the
-   * wire, and the TARGET (body, local slot) that stays here so that the apply
-   * phase is a direct indexed write. Ghosts are an array suffix, so the loop
-   * bound is the ownership filter. */
-  pair_list *const requests = (pair_list *) MFTLMallocOrDie((size_t) n_slots * sizeof(pair_list), "remesh ghost requests");
-  pair_list *const targets = (pair_list *) MFTLMallocOrDie((size_t) n_slots * sizeof(pair_list), "remesh ghost targets");
-  for (int i = 0; i < n_slots; ++i)
-  {
-    pl_init(&requests[i]);
-    pl_init(&targets[i]);
-  }
-
-  int unserved = 0;
-  for (int o = 0; o < n_local; ++o)
-  {
-    const MFTL_Object *const obj = objects[o];
-    const MFTL_Vertex *const vr = obj->verts.rec;
-
-    for (int v = obj->verts.n_local; v < obj->verts.n; ++v)
-    {
-      const int owner = vr[v].owner_proc;
-      const int idx = (owner >= 0 && owner < nproc) ? rank_to_slot[owner] : MFTL_ERROR;
-      if (idx == MFTL_ERROR)
-      {
-        /* Unreachable now that the global path exists -- an owner outside
-         * [0, nproc) is a corrupt record, not a routing problem. Counted rather
-         * than dereferenced, and asserted because it means something upstream is
-         * already wrong. */
-        MFTL_ASSERT(0 && "remesh ghost ids: ghost vertex with an owner_proc outside the communicator");
-        unserved++;
-        continue;
-      }
-      /* The REQUEST names the body by its global id -- the owner has its own
-       * slot for it and no reason to have the same one. The TARGET never leaves
-       * this rank, so it keeps the local slot and the apply phase stays a direct
-       * indexed write. */
-      pl_add2(&requests[idx], obj->global_id, vr[v].global_id);
-      pl_add2(&targets[idx], o, v);
-    }
-  }
-  free(rank_to_slot);
-
-  /* ── 2. Counts, overlapped with packing the request image ────────────────
-   * The one place non-blocking buys anything here: assembling the flat image is
-   * real work that does not depend on the counts. Everything after it is a
-   * strict dependency chain -- replies cannot be computed before the requests
-   * arrive, nor applied before they come back -- so the two alltoallv calls are
-   * blocking, which is the cheaper spelling of a dependency. */
-  int *const n_send = (int *) MFTLMallocOrDie((size_t) (4 * n_slots) * sizeof(int), "remesh ghost counts");
-  int *const n_recv = n_send + n_slots;
-  int *const s_displs = n_send + 2 * n_slots;
-  int *const r_displs = n_send + 3 * n_slots;
-
-  for (int i = 0; i < n_slots; ++i) n_send[i] = requests[i].size;
-
-  MPI_Request count_req;
-  if (needs_global)
-    MPI_Ialltoall(n_send, 1, MPI_INT, n_recv, 1, MPI_INT, dom->comm_world, &count_req);
-  else
-    MPI_Ineighbor_alltoall(n_send, 1, MPI_INT, n_recv, 1, MPI_INT, dom->comm_graph, &count_req);
-
-  int total_send = 0;
-  for (int i = 0; i < n_slots; ++i)
-  {
-    s_displs[i] = total_send;
-    total_send += n_send[i];
-  }
-
-  int *const flat_send = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(total_send, 1) * sizeof(int), "remesh ghost request image");
-  for (int i = 0; i < n_slots; ++i)
-  {
-    if (n_send[i] > 0) memcpy(flat_send + s_displs[i], requests[i].data, (size_t) n_send[i] * sizeof(int));
-  }
-
-  MPI_Wait(&count_req, MPI_STATUS_IGNORE);
-
-  int total_recv = 0;
-  for (int i = 0; i < n_slots; ++i)
-  {
-    r_displs[i] = total_recv;
-    total_recv += n_recv[i];
-  }
-
-  /* ── 3. Requests out ─────────────────────────────────────────────────────── */
-  int *const flat_recv = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(total_recv, 1) * sizeof(int), "remesh ghost incoming requests");
-  if (needs_global)
-    MPI_Alltoallv(flat_send, n_send, s_displs, MPI_INT, flat_recv, n_recv, r_displs, MPI_INT, dom->comm_world);
-  else
-    MPI_Neighbor_alltoallv(flat_send, n_send, s_displs, MPI_INT, flat_recv, n_recv, r_displs, MPI_INT, dom->comm_graph);
-  free(flat_send);
-
-  /* ── 4. Answer them, one id table per body ───────────────────────────────
-   * The stream arrives grouped by sender and, within a sender, by body, so
-   * answering in arrival order would rebuild a body's table once per SENDER. A
-   * counting sort by body -- O(requests + bodies), no comparisons -- makes it
-   * once per body instead. Replies go back at the request's original position,
-   * because the requester matches them positionally. */
-  const int n_req = total_recv / 2;
-  unsigned char *const reply = (unsigned char *) MFTLMallocOrDie((size_t) MFTL_MAX(n_req, 1) * width, "remesh ghost replies");
-  int *const obj_off = (int *) MFTLCallocOrDie((size_t) n_local + 1, sizeof(int), "remesh ghost grouping");
-  int *const order = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_req, 1) * sizeof(int), "remesh ghost order");
-
-  /* Resolve each request's body id to THIS rank's slot for it, ONCE, in place.
-   * Everything downstream then buckets by local slot, so the counting sort and
-   * its cursors are sized by what this rank holds rather than by the ensemble.
-   * `flat_recv[2k+1]` -- the vertex id answer_body() actually reads -- is left
-   * alone. A request for a body this rank has nothing of is a routing error, not
-   * a partition this rank simply is not part of: the requester named this rank
-   * as the vertex's OWNER. */
-  for (int k = 0; k < n_req; ++k)
-  {
-    const int slot = MFTLEnsembleFindLocalSlot(ens, flat_recv[2 * k]);
-    flat_recv[2 * k] = slot;
-    if (slot == MFTL_ERROR)
-    {
-      MFTL_ASSERT(0 && "remesh ghost ids: request names a body this rank does not hold, but claims this rank owns the vertex");
-      unserved++;
-      continue;
-    }
-    obj_off[slot + 1]++;
-  }
-  for (int o = 0; o < n_local; ++o) obj_off[o + 1] += obj_off[o];
-
-  {
-    int *const cursor = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_local, 1) * sizeof(int), "remesh ghost cursors");
-    for (int o = 0; o < n_local; ++o) cursor[o] = obj_off[o];
-
-    for (int k = 0; k < n_req; ++k)
-    {
-      const int o = flat_recv[2 * k];
-      if (o == MFTL_ERROR)
-      {
-        answer(MFTL_NULL, MFTL_ERROR, MFTL_ERROR, reply + (size_t) k * width, ctx);
-        continue;
-      }
-      order[cursor[o]++] = k;
-    }
-    free(cursor);
-  }
-
-  {
-    int table_len = 0;
-    for (int o = 0; o < n_local; ++o)
-    {
-      if (obj_off[o + 1] > obj_off[o]) table_len = MFTL_MAX(table_len, objects[o]->next_vertex_gid);
-    }
-
-    int *const slot_of_gid = (table_len > 0) ? (int *) MFTLMallocOrDie((size_t) table_len * sizeof(int), "remesh ghost id table") : MFTL_NULL;
-
-    for (int o = 0; o < n_local; ++o)
-    {
-      if (obj_off[o + 1] == obj_off[o]) continue;  // nothing asked of this body
-
-      /* A request only arrives here when it names this rank as a vertex's
-       * owner, so every body asked about is one this rank holds -- and the
-       * answer can be keyed by LOCAL SLOT. */
-      answer_body(objects[o], o, flat_recv, order, obj_off[o], obj_off[o + 1], reply, width, answer, ctx, slot_of_gid, objects[o]->next_vertex_gid,
-                  &unserved);
-    }
-    free(slot_of_gid);
-  }
-
-  free(order);
-  free(obj_off);
-  free(flat_recv);
-
-  /* ── 5. Replies back ─────────────────────────────────────────────────────
-   * No second count exchange: one reply per request, so the reply counts are the
-   * request counts halved and both sides already know both. Counted in BYTES,
-   * so the id exchange still sends four per ghost. */
-  const int w = (int) width;
-  for (int i = 0; i < n_slots; ++i)
-  {
-    n_recv[i] = (n_recv[i] / 2) * w;
-    n_send[i] = (n_send[i] / 2) * w;
-    s_displs[i] = (s_displs[i] / 2) * w;
-    r_displs[i] = (r_displs[i] / 2) * w;
-  }
-
-  const int n_in = total_send / 2;
-  unsigned char *const incoming = (unsigned char *) MFTLMallocOrDie((size_t) MFTL_MAX(n_in, 1) * width, "remesh ghost replies in");
-  if (needs_global)
-    MPI_Alltoallv(reply, n_recv, r_displs, MPI_BYTE, incoming, n_send, s_displs, MPI_BYTE, dom->comm_world);
-  else
-    MPI_Neighbor_alltoallv(reply, n_recv, r_displs, MPI_BYTE, incoming, n_send, s_displs, MPI_BYTE, dom->comm_graph);
-  free(reply);
-
-  /* ── 6. Apply ────────────────────────────────────────────────────────────
-   * The replies come back in exactly the order the requests went out, so the
-   * target list resolves each one directly -- no hashing, no body search. */
-  int p = 0;
-  for (int i = 0; i < n_slots; ++i)
-  {
-    const int *const t = targets[i].data;
-    const int count = targets[i].size;
-
-    for (int k = 0; k < count; k += 2, ++p) apply(objects[t[k]], t[k + 1], incoming + (size_t) p * width);
-  }
-
-  free(incoming);
-  for (int i = 0; i < n_slots; ++i)
-  {
-    pl_free(&requests[i]);
-    pl_free(&targets[i]);
-  }
-  free(requests);
-  free(targets);
-  free(n_send);
-
-  /* A non-zero count here means a request could not be answered -- the requester
-   * believes a rank owns a vertex it does not have. That is a disagreement about
-   * ownership, not a routing problem, and it leaves the ghost with a stale id
-   * that the closing redistribution will duplicate rather than match. Loud in
-   * Debug, reported in Release. */
-  (void) what;
-  return (unserved == 0) ? MFTL_SUCCESS : MFTL_ERROR;
-}
-
 /** @brief Owner side of the id exchange: `base[slot] + v`, or #MFTL_ERROR. */
-static void answer_ghost_id(const MFTL_Object *obj, int slot, int v, void *out, const void *ctx)
+static void serve_ghost_ids(const MFTL_Object *obj, int slot, MFTL_FieldEntity pool, const int *idx, const int *offset, int n, unsigned char *reply, void *ctx)
 {
   (void) obj;
-  /* Owned entities occupy [0, n_local) and are renumbered `base + slot`, so
-   * the answer is arithmetic. That is the whole reason the re-densification
-   * numbers BY SLOT rather than by any other rule -- any other rule would need
-   * a second table here. `base` is keyed by LOCAL SLOT: it came out of a
-   * per-body scan over that body's holders. */
-  const int id = (v == MFTL_ERROR) ? MFTL_ERROR : ((const int *) ctx)[slot] + v;
-  memcpy(out, &id, sizeof id);
+  (void) pool;
+  /* Owned entities occupy [0, n_local) and are renumbered `base + slot`, so the
+   * answer is arithmetic. That is the whole reason the re-densification numbers
+   * BY SLOT rather than by any other rule -- any other rule would need a second
+   * table here. `base` is keyed by LOCAL SLOT: it came out of a per-body scan
+   * over that body's holders. */
+  const int base = (slot != MFTL_ERROR) ? ((const int *) ctx)[slot] : 0;
+  for (int j = 0; j < n; ++j)
+  {
+    const int id = (idx[j] == MFTL_ERROR) ? MFTL_ERROR : base + idx[j];
+    memcpy(reply + offset[j], &id, sizeof id);
+  }
+}
+
+/**
+ * @brief Requester side of an exchange of one int per ghost vertex that
+ *        #MFTL_ERROR marks unserved.
+ * @param obj    The body.
+ * @param idx    `[n]` ghost indices.
+ * @param n      Replies.
+ * @param rows   `[n]` ints.
+ * @param id_out Writes the global id (true) or merges the feature bits (false);
+ *               a literal at both call sites, so inlining folds the test away.
+ * @return Replies that were the sentinel.
+ */
+static inline int apply_ints(MFTL_Object *obj, const int *idx, int n, const unsigned char *rows, bool id_out)
+{
+  int skipped = 0;
+  for (int j = 0; j < n; ++j)
+  {
+    int value;
+    memcpy(&value, rows + (size_t) j * sizeof value, sizeof value);
+    if (value == MFTL_ERROR)
+    {
+      skipped++;  // owner could not serve it: the ghost keeps its value
+      continue;
+    }
+    MFTL_Vertex *const v = &obj->verts.rec[idx[j]];
+    if (id_out)
+      v->global_id = value;
+    else
+      v->flags = (v->flags & ~(MFTL_FLAG_FEATURE | MFTL_FLAG_CORNER)) | value;
+  }
+  return skipped;
 }
 
 /** @brief Requester side of the id exchange. */
-static void apply_ghost_id(MFTL_Object *obj, int v, const void *in)
+static int apply_ghost_ids(MFTL_Object *obj, int slot, MFTL_FieldEntity pool, const int *idx, int n, const unsigned char *rows, void *ctx)
 {
-  int id;
-  memcpy(&id, in, sizeof id);
-  if (id != MFTL_ERROR) obj->verts.rec[v].global_id = id;  // owner could not serve it otherwise
+  (void) slot;
+  (void) pool;
+  (void) ctx;
+  return apply_ints(obj, idx, n, rows, MFTL_TRUE);
+}
+
+/**
+ * @brief A one-int-per-ghost-vertex pull on the remesher's route.
+ * @param ens   The ensemble.
+ * @param serve Owner side.
+ * @param apply Requester side.
+ * @param ctx   Their context.
+ * @return As MFTLGhostPull().
+ */
+static int pull_vertex_ints(MFTL_Ensemble *ens, MFTL_GhostServeFn serve, MFTL_GhostApplyFn apply, void *ctx)
+{
+  MFTL_GhostPull pull;
+  pull.row_bytes[MFTL_FIELD_VERTEX] = (int) sizeof(int);
+  pull.row_bytes[MFTL_FIELD_TRIANGLE] = 0;
+  pull.route = MFTL_GHOST_ROUTE_AUTO;
+  pull.keys[0] = pull.keys[1] = MFTL_NULL;
+  pull.serve = serve;
+  pull.apply = apply;
+  pull.ctx = ctx;
+  return MFTLGhostPull(ens, &pull);
 }
 
 int MFTLRemeshSyncGhostIds(MFTL_Ensemble *ens, const int *vertex_gid_base)
 {
   MFTL_ASSERT(ens != MFTL_NULL && vertex_gid_base != MFTL_NULL);
-  const int rc = ghost_vertex_exchange(ens, sizeof(int), answer_ghost_id, vertex_gid_base, apply_ghost_id, "MFTLRemeshSyncGhostIds");
+  const int rc = pull_vertex_ints(ens, serve_ghost_ids, apply_ghost_ids, (void *) vertex_gid_base);
 
   /* A failure means a request could not be answered -- the requester believes a
    * rank owns a vertex it does not have. That is a disagreement about
@@ -1163,32 +813,52 @@ int MFTLRemeshSyncGhostIds(MFTL_Ensemble *ens, const int *vertex_gid_base)
   return rc;
 }
 
-/** @brief Owner side of the sizing exchange: the owner's target length, or -1. */
-static void answer_ghost_sizing(const MFTL_Object *obj, int slot, int v, void *out, const void *ctx)
-{
-  (void) slot;
-  (void) ctx;
-  /* -1 is the "not served" sentinel: every real target length is positive. */
-  const double size = (v == MFTL_ERROR || !obj->verts.has_sizing) ? -1.0 : obj->verts.sizing[v];
-  memcpy(out, &size, sizeof size);
-}
-
-/** @brief Requester side of the sizing exchange. */
-static void apply_ghost_sizing(MFTL_Object *obj, int v, const void *in)
-{
-  double size;
-  memcpy(&size, in, sizeof size);
-  if (size > 0.0 && obj->verts.has_sizing) obj->verts.sizing[v] = size;
-}
-
 int MFTLRemeshSyncGhostSizing(MFTL_Ensemble *ens)
 {
   MFTL_ASSERT(ens != MFTL_NULL);
-  return ghost_vertex_exchange(ens, sizeof(double), answer_ghost_sizing, MFTL_NULL, apply_ghost_sizing, "MFTLRemeshSyncGhostSizing");
+  const MFTL_GhostColumn c = {MFTL_GHOST_COLUMN_SIZING, 0};
+  return MFTLUpdateGhostColumns(ens, &c, 1, MFTL_GHOST_ROUTE_AUTO);
 }
 
+/** @brief Owner side of the classification exchange: its FEATURE/CORNER bits, or #MFTL_ERROR. */
+static void serve_ghost_class(const MFTL_Object *obj, int slot, MFTL_FieldEntity pool, const int *idx, const int *offset, int n, unsigned char *reply,
+                              void *ctx)
+{
+  (void) slot;
+  (void) pool;
+  (void) ctx;
+  for (int j = 0; j < n; ++j)
+  {
+    const int bits = (idx[j] == MFTL_ERROR) ? MFTL_ERROR : (obj->verts.rec[idx[j]].flags & (MFTL_FLAG_FEATURE | MFTL_FLAG_CORNER));
+    memcpy(reply + offset[j], &bits, sizeof bits);
+  }
+}
+
+/** @brief Requester side of the classification exchange. */
+static int apply_ghost_class(MFTL_Object *obj, int slot, MFTL_FieldEntity pool, const int *idx, int n, const unsigned char *rows, void *ctx)
+{
+  (void) slot;
+  (void) pool;
+  (void) ctx;
+  return apply_ints(obj, idx, n, rows, MFTL_FALSE);
+}
+
+int MFTLRemeshSyncGhostClass(MFTL_Ensemble *ens)
+{
+  MFTL_ASSERT(ens != MFTL_NULL);
+  return pull_vertex_ints(ens, serve_ghost_class, apply_ghost_class, MFTL_NULL);
+}
+
+int MFTLRemeshSyncGhostPositions(MFTL_Ensemble *ens)
+{
+  MFTL_ASSERT(ens != MFTL_NULL);
+  /* MFTLUpdateGhostPositions() on the route with the global fallback: the same
+   * payload, the same invalidation of the derived geometry. */
+  const MFTL_GhostColumn c = {MFTL_GHOST_COLUMN_POSITION, 0};
+  return MFTLUpdateGhostColumns(ens, &c, 1, MFTL_GHOST_ROUTE_AUTO);
+}
 /* ═══════════════════════════════════════════════════════════════════════════
- * 6. Routed records, classification, positions and the projection halo
+ * 6. Routed records and the projection halo
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 double *MFTLRemeshExchangeRecords(const MFTL_Domain *domain, const double *rec, const int *dest, int n_rec, int width, int *n_out)
@@ -1258,65 +928,6 @@ double *MFTLRemeshExchangeRecords(const MFTL_Domain *domain, const double *rec, 
   free(rank_to_slot);
   *n_out = n_self + rtot / width;
   return out;
-}
-
-/** @brief Owner side of the classification exchange: its FEATURE/CORNER bits, or -1. */
-static void answer_ghost_class(const MFTL_Object *obj, int slot, int v, void *out, const void *ctx)
-{
-  (void) slot;
-  (void) ctx;
-  const int bits = (v == MFTL_ERROR) ? -1 : (obj->verts.rec[v].flags & (MFTL_FLAG_FEATURE | MFTL_FLAG_CORNER));
-  memcpy(out, &bits, sizeof bits);
-}
-
-/** @brief Requester side of the classification exchange. */
-static void apply_ghost_class(MFTL_Object *obj, int v, const void *in)
-{
-  int bits;
-  memcpy(&bits, in, sizeof bits);
-  if (bits < 0) return;
-  obj->verts.rec[v].flags = (obj->verts.rec[v].flags & ~(MFTL_FLAG_FEATURE | MFTL_FLAG_CORNER)) | bits;
-}
-
-int MFTLRemeshSyncGhostClass(MFTL_Ensemble *ens)
-{
-  MFTL_ASSERT(ens != MFTL_NULL);
-  return ghost_vertex_exchange(ens, sizeof(int), answer_ghost_class, MFTL_NULL, apply_ghost_class, "MFTLRemeshSyncGhostClass");
-}
-
-/** @brief Owner side of the position exchange. */
-static void answer_ghost_position(const MFTL_Object *obj, int slot, int v, void *out, const void *ctx)
-{
-  (void) slot;
-  (void) ctx;
-  double p[4] = {0.0, 0.0, 0.0, -1.0};
-  if (v != MFTL_ERROR)
-  {
-    for (int k = 0; k < 3; ++k) p[k] = obj->verts.pos[3 * v + k];
-    p[3] = 1.0;
-  }
-  memcpy(out, p, sizeof p);
-}
-
-/** @brief Requester side of the position exchange. */
-static void apply_ghost_position(MFTL_Object *obj, int v, const void *in)
-{
-  double p[4];
-  memcpy(p, in, sizeof p);
-  if (p[3] < 0.0) return;
-  for (int k = 0; k < 3; ++k) obj->verts.pos[3 * v + k] = p[k];
-}
-
-int MFTLRemeshSyncGhostPositions(MFTL_Ensemble *ens)
-{
-  MFTL_ASSERT(ens != MFTL_NULL);
-  const int rc = ghost_vertex_exchange(ens, 4 * sizeof(double), answer_ghost_position, MFTL_NULL, apply_ghost_position, "MFTLRemeshSyncGhostPositions");
-  for (int o = 0; o < ens->n_local_objects; ++o)
-  {
-    ens->local_objects[o]->derived &= ~MFTL_DERIVED_GEOMETRY;
-    MFTLObjectMarkChanged(ens->local_objects[o]);
-  }
-  return rc;
 }
 
 int MFTLRemeshReferenceHalo(MFTL_Ensemble *ens, double width, double **out, int *n_out)

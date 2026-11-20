@@ -834,6 +834,9 @@ typedef struct
    * body's id range is not allocated and freed every timestep.
    */
   mftl_gid_table ghost_tbl;
+
+  /** `[nproc]` rank -> graph slot, built once (MFTLCommWorkspaceNeighborSlots()). */
+  int *neighbor_slot;
 } comm_workspace;
 
 /**
@@ -1057,6 +1060,7 @@ static void ws_free(comm_workspace *ws)
   gt_free(&s->v_tbl);
   gt_free(&s->t_tbl);
   gt_free(&ws->ghost_tbl);
+  free(ws->neighbor_slot);
 
   memset(ws, 0, sizeof *ws);
 }
@@ -1065,6 +1069,20 @@ mftl_gid_table *MFTLCommWorkspaceGhostTable(MFTL_Ensemble *ens)
 {
   if (ens->comm_workspace == MFTL_NULL) ens->comm_workspace = MFTLCallocOrDie(1, sizeof(comm_workspace), "MFTL communication workspace");
   return &((comm_workspace *) ens->comm_workspace)->ghost_tbl;
+}
+
+const int *MFTLCommWorkspaceNeighborSlots(MFTL_Ensemble *ens)
+{
+  if (ens->comm_workspace == MFTL_NULL) ens->comm_workspace = MFTLCallocOrDie(1, sizeof(comm_workspace), "MFTL communication workspace");
+  comm_workspace *const ws = (comm_workspace *) ens->comm_workspace;
+  if (ws->neighbor_slot == MFTL_NULL)
+  {
+    const MFTL_Domain *const dom = &ens->domain;
+    ws->neighbor_slot = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(dom->nproc, 1) * sizeof(int), "MFTL neighbour slots");
+    for (int r = 0; r < dom->nproc; ++r) ws->neighbor_slot[r] = MFTL_ERROR;
+    for (int i = 0; i < dom->num_neighbors; ++i) ws->neighbor_slot[dom->neighbors[i]] = i;
+  }
+  return ws->neighbor_slot;
 }
 
 void MFTLCommWorkspaceDestroy(void **p_ws)

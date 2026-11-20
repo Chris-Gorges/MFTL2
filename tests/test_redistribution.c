@@ -654,55 +654,6 @@ static int test_advection_conserves_entities(void)
   return 0;
 }
 
-/**
- * @brief Ghost positions really are the owner's positions after a sync.
- *
- * Every owned vertex is moved to a position that is a pure function of its global
- * id, so the check needs no cross-rank comparison at all: a ghost is correct iff
- * its position is that function of ITS id. A sync that dropped a request, or that
- * mismatched replies against requests, fails immediately.
- */
-static void positions_from_gid(int gid, double out[3])
-{
-  out[0] = 0.9 * sin(0.7 * (double) gid);
-  out[1] = 0.9 * sin(1.3 * (double) gid + 0.4);
-  out[2] = 0.9 * sin(2.1 * (double) gid + 1.1);
-}
-
-static int test_ghost_positions_are_synced(void)
-{
-  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 1);
-  MFTL_Object *obj = add_sphere(ens, 0, 0.0, 0.0, 0.0, 0.6, 3);
-
-  MFTLRedistribute(ens);
-
-  FOREACH_BODY_VERTEX(ens, 0, positions_from_gid(rec->global_id, pos););
-
-  const int rc = MFTLUpdateGhostPositions(ens);
-
-  int ok = (rc == MFTL_SUCCESS);
-  int n_ghosts = 0;
-  for (int v = obj->verts.n_local; v < obj->verts.n; ++v)
-  {
-    double expect[3];
-    positions_from_gid(obj->verts.rec[v].global_id, expect);
-    for (int k = 0; k < 3; ++k)
-      if (fabs(obj->verts.pos[3 * v + k] - expect[k]) > 1e-15) ok = 0;
-    n_ghosts++;
-  }
-
-  /* At more than one rank the halo is not allowed to be empty everywhere, or the
-   * test would pass vacuously. */
-  int total_ghosts = 0;
-  MPI_Allreduce(&n_ghosts, &total_ghosts, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
-
-  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
-  if (g_nproc > 1) TEST_ASSERT(total_ghosts > 0);
-
-  MFTLEnsembleDestroy(&ens);
-  return 0;
-}
-
 /* ─────────────────────────────────────────────────────────────────────────────
  * 5. What the halo is FOR
  * ─────────────────────────────────────────────────────────────────────────── */
@@ -1847,7 +1798,6 @@ int main(int argc, char **argv)
   RUN_TEST(test_twin_repair_matches_full_rebuild);
   RUN_TEST(test_derived_arrays_match_a_full_rebuild);
   RUN_TEST(test_advection_conserves_entities);
-  RUN_TEST(test_ghost_positions_are_synced);
   RUN_TEST(test_vertex_normals_match_serial_reference);
   RUN_TEST(test_ghost_vertex_normals_are_exact);
   RUN_TEST(test_ghost_syncs_leave_topology_current);

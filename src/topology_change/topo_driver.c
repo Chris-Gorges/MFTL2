@@ -499,21 +499,10 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
     free(val);
     free(tot);
   }
-  {
-    double *req = MFTL_NULL;
-    MFTLTopoPackIdRequests(ens, created, n_created, vkeys, tkeys, dom->nproc, dest, &req);
-    const bool far = any_far(dom, dest);
-    int n_req = 0;
-    double *const got = MFTLTopoCommExchange(dom, req, dest, 3, far, &n_req, src);
-    double *const answer = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(n_req, 1) * sizeof(double), "topology id answers");
-    MFTLTopoServeIdRequests(ens, created, n_created, vkeys, tkeys, got, n_req, answer);
-    double *const back = MFTLTopoCommReply(dom, answer, src, 1, far);
-    MFTLTopoApplyIdReplies(ens, created, n_created, dom->nproc, back);
-    free(back);
-    free(answer);
-    free(got);
-    free(req);
-  }
+  /* Ghosts take their owners' ids, asked for by lattice key. Unserved only on a
+   * partition the owners disagree about, which the census tests would see. */
+  const bool ids_ok = (MFTLTopoSyncGhostIds(ens, created, n_created, vkeys, tkeys) == MFTL_SUCCESS);
+  MFTL_ASSERT(ids_ok && "topology ids: a ghost kept its provisional id");
   for (int i = 0; i < n_created; ++i)
   {
     free(vkeys[i]);
@@ -665,7 +654,10 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
   st->t_redistribute = t[2];
   st->t_remesh = t[3];
   st->t_total = t[4];
-  return status;
+  /* A ghost that kept its provisional id is reported only here, after every
+   * collective: the verdict is this rank's, and the remesh above must be
+   * entered (or skipped) by every rank alike. */
+  return ids_ok ? status : MFTL_ERROR;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

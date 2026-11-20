@@ -7,7 +7,8 @@
 | File | Job |
 |---|---|
 | `redistribute.c` | *the mesh moved — who owns what now?* Re-partition and rebuild the halo |
-| `ghost_sync.c` | *the mesh deformed — refresh my ghosts.* One per-vertex 3-vector, topology untouched |
+| `ghost_pull.c` | *refresh my ghosts from their owners.* The one request/reply engine (`MFTLGhostPull`) every ghost refresh is a payload on |
+| `ghost_sync.c` | *the mesh deformed — refresh my ghosts.* The column payload: positions, normals, sizing, registered fields; topology untouched |
 | `spatial_halo.c` | *what of body B is near my share of body A?* A geometric halo as shadow objects |
 | `exchange.c` | MPI datatypes, the non-blocking multi-payload all-to-all-v, the neighbourhood allgather |
 | `comm_internal.h`, `comm_stats.c` | the lazy `int` list, the global-id table, the diagnostics accumulator |
@@ -77,7 +78,8 @@ is unchanged; recomputed fields consume no wire bytes. The byte statistics
 include the optional values, which cost eight bytes per component per sent row.
 
 `MFTLUpdateGhostFields` requests both vertex and triangle global ids and returns
-the selected fields in one request/reply batch, optionally including positions.
+the selected fields in one pull (the column payload, @ref comm_ghost), optionally
+including positions.
 All ranks must use the same id list and position flag. Updates copy owner rows
 to ghosts; reverse accumulation is not provided. Persistent vertex ghosts must
 already be current before redistribution, whose senders can include several
@@ -192,21 +194,58 @@ $P = 4$; the optional shrink saves a further ~8 % for ~2 % of the phase time.
 
 ## Ghost synchronisation {#comm_ghost}
 
-`MFTLUpdateGhostPositions` / `MFTLUpdateGhostVertexNormals` run one request/reply
-round over `comm_graph`: each rank lists its ghost vertices (the pool suffix) by
-owner and sends `(body id, vertex id)` requests (8 B); owners answer through the
-id table with an #MFTL_GhostUpdatePayload (32 B); replies return in request order
-and are applied by direct index. Three neighbourhood collectives. Only the
-holder of a ghost knows it holds it, so a request phase is unavoidable; no
-owner-to-holder state is cached between calls. One field per exchange: bundling
-recomputable quantities with the position would ship bytes the receiver computes
-more cheaply.
+Only the holder of a ghost knows it holds it, so refreshing ghosts is a PULL,
+and the library has exactly one: `MFTLGhostPull` (`ghost_pull.c`). Each rank
+lists its ghosts (the pool suffix) by owner and sends `(body id, key)` requests;
+the owner groups them per (body, pool), resolves each key among what it OWNS and
+answers; replies return in request order and are applied by direct index. Three
+exchanges: counts (two ints per neighbour, posted non-blocking and overlapped
+with packing), requests, replies (no count exchange, one reply per request). No
+owner-to-holder state is cached between calls.
 
-@warning A ghost whose owner is not a graph neighbour cannot be served: it keeps a
-         stale value, the call returns `MFTL_ERROR` on that rank, and Debug
-         builds assert. There is no global fallback, so a partition whose halo
-         leaves the 26-neighbourhood (a coarsened remeshing partition) must not
-         outlive the remeshing call; both remeshing drivers end with a plain
+What varies between the library's ghost refreshes is a parameter of that one
+schedule, never a copy of it:
+
+| Parameter | Values | Who uses which |
+|---|---|---|
+| pools | a reply width per pool; 0 leaves it out | vertices only, or vertices and triangles (fields, topology ids) |
+| key | the global id (8 B request), or a caller's 64-bit key (12 B; sort and bisect) | everything but topology change, which asks for ids that do not exist yet by lattice key |
+| route | `MFTL_GHOST_ROUTE_GRAPH`: `comm_graph`, no global collective; `MFTL_GHOST_ROUTE_AUTO`: one `MPI_Allreduce(LOR)`, `comm_world` when some owner is not a graph neighbour | the per-timestep syncs and the fields; the remesher and topology change |
+| payload | an owner callback and a requester callback, each called once per (body, pool) block | — |
+
+**The owner's lookup is keyed by the requests, not by what it owns.** Every
+former copy wrote one table entry per OWNED entity to answer a few requests; on
+a body spanning the ranks that is random writes into megabytes (82 000 owned ids
+for 1 500 requests at $P = 8$). The engine puts the requested ids in the
+workspace's epoch-stamped table and streams the owned ids past it once,
+sequentially: DIRECT (indexed by id, one load per owned id) when the body's id
+range fits $2^{16}$ slots, as a droplet's does; otherwise behind a bit filter of
+32 bits per request, because nearly every owned id is then unasked and a miss
+in an open-addressed table mispredicts its probe loop (5.6 ns per owned id
+measured without the filter, 0.7 ns with it). Memory: a bounded constant, or
+O(requests).
+
+The payload callbacks run per BLOCK, never per ghost. The first attempt at a
+shared schedule asked "which payload?" once per ghost and slowed the
+per-timestep position sync; five private copies followed and drifted (one route
+had a global fallback, one cleared a table the size of a body's whole id range
+per call, one refused before exchanging). `MFTLUpdateGhostColumns` is the
+library's column payload: a reply row is the doubles of the pulled arrays
+followed by the echoed global id (`MFTL_ERROR` when the owner could not answer:
+the ghost keeps its value) and 4 bytes of padding, so a row of one 3-vector is
+exactly an #MFTL_GhostUpdatePayload (32 B). `MFTLUpdateGhostPositions`,
+`MFTLUpdateGhostVertexNormals` and `MFTLUpdateGhostFields` are that payload on
+the graph route; the remesher's position and sizing syncs are the same payload
+on the AUTO route. One quantity per call is the default: bundling recomputable
+quantities with the position would ship bytes the receiver computes more
+cheaply.
+
+@warning On the graph route a ghost whose owner is not a graph neighbour cannot be
+         served: it keeps a stale value, the call returns `MFTL_ERROR` on that
+         rank, and Debug builds assert. The per-timestep syncs take the graph
+         route on purpose (no global collective per step), so a partition whose
+         halo leaves the 26-neighbourhood (a coarsened remeshing partition) must
+         not outlive the remeshing call; both remeshing drivers end with a plain
          `MFTLRedistribute`.
 
 ---
@@ -296,10 +335,11 @@ table).
 
 ## Known limitations {#comm_deferred}
 
-1. `MFTLUpdateGhostPositions` builds an `[nproc]` rank-to-neighbour table per
-   call, and the halo exchange allocates two `[nproc]` send-buffer descriptor
-   arrays per call — $O(P)$ per rank and timestep, harmless at the tested scales
-   but a candidate for the persistent workspace at $P$ in the thousands.
+1. The halo exchange allocates two `[nproc]` send-buffer descriptor arrays per
+   call — $O(P)$ per rank and timestep, harmless at the tested scales but a
+   candidate for the persistent workspace at $P$ in the thousands. (The ghost
+   pull's rank-to-neighbour table is built once per ensemble; only its global
+   route allocates by $P$.)
 2. The ghost exchange rebuilds its schedule every call; it could be cached for a
    solver that redistributes only every $N$ steps.
 3. The geometry pass after a redistribution runs on freshly rewritten pools and is

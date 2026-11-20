@@ -20,10 +20,17 @@
  *                           away that will reconstruct part of a body it does
  *                           not yet hold.
  *   MFTLTopoCommExchange /    26-neighbour personalised exchanges: the lattice
- *   MFTLTopoCommReply         overlap, the component labels, the ghost ids. The
- *                           global communicator only when some destination is
+ *   MFTLTopoCommReply         overlap and the component labels. The global
+ *                           communicator only when some destination is
  *                           provably outside the neighbourhood, which the caller
  *                           detects and this file agrees on.
+ *
+ * The ghost ids of the new bodies are not here: they are a keyed pull on the
+ * library's one ghost engine, MFTLGhostPull() (MFTLTopoSyncGhostIds()). The
+ * label rounds stay here, because they are not a pull: the request carries a
+ * label the owner folds into a minimum over every request and its own
+ * components before any answer exists, and the "ghosts" are triangles of
+ * per-cluster scratch meshes, not the pool suffix of an ensemble body.
  */
 
 #include "topo_internal.h"
