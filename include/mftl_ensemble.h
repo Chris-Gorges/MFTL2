@@ -587,25 +587,24 @@ int MFTLEnsembleUpdateVertexNormals(MFTL_Ensemble *ensemble, MFTL_NormalWeightin
 double MFTLDomainGetHMin(const MFTL_Domain *domain);
 
 /**
- * @brief Slot of rank @p r in `domain->neighbors`, by linear scan (at most 26).
+ * @brief Slot of rank @p r in `domain->neighbors`: one load from
+ *        `domain->neighbor_slot`, the table MFTLEnsembleCreate() builds once.
  *
- * On grids with a single cut on a periodic axis `comm_graph` contains a
- * self-loop, so asking for this rank itself is legitimate.
+ * The one rank -> slot rule of the library, cheap enough for a per-ghost loop;
+ * nothing else keeps an `[nproc]` copy of it. On grids with a single cut on a
+ * periodic axis `comm_graph` contains a self-loop, so asking for this rank
+ * itself is legitimate.
  *
  * @param domain The MPI/physical world.
- * @param r      A rank.
- * @return The first slot holding @p r, or #MFTL_ERROR if @p r is not a graph
- *         neighbour.
+ * @param r      A rank, or any int: one outside `[0, nproc)` is no neighbour.
+ * @return The slot holding @p r (the list holds each rank once), or
+ *         #MFTL_ERROR if @p r is not a graph neighbour.
  *
  * @rank_local
  */
 static inline int MFTLDomainNeighborIndex(const MFTL_Domain *domain, int r)
 {
-  for (int i = 0; i < domain->num_neighbors; ++i)
-  {
-    if (domain->neighbors[i] == r) return i;
-  }
-  return MFTL_ERROR;
+  return (r >= 0 && r < domain->nproc) ? (int) domain->neighbor_slot[r] : MFTL_ERROR;
 }
 
 /**

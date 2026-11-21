@@ -96,7 +96,7 @@ void MFTLTopoFreeClusters(MFTL_TopoCluster *cl, int n);
 /** @brief Index of the cluster body @p gid is in, or -1. */
 int MFTLTopoClusterOf(const MFTL_TopoCluster *cl, int n, int gid);
 
-/** @brief Fills the lattice for @p dom at spacing @p dx; `coords` comes from topo_comm. */
+/** @brief Fills the lattice for @p dom at spacing @p dx, `coords` included (`MFTL_Domain::cell`). */
 void MFTLTopoLatticeInit(MFTL_TopoLattice *lat, const MFTL_Domain *dom, double dx);
 
 /**
@@ -305,9 +305,6 @@ int MFTLTopoSyncGhostIds(MFTL_Ensemble *ens, const int *created, int n_created, 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 5. Communication (topo_comm.c -- the only file with MPI)
  * ═══════════════════════════════════════════════════════════════════════════ */
-
-/** @brief This rank's Cartesian coordinates. */
-void MFTLTopoCommCoords(const MFTL_Domain *dom, int coords[3]);
 
 /** @brief Wall-clock seconds. */
 double MFTLTopoCommTime(void);

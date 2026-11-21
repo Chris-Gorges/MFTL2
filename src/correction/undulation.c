@@ -460,9 +460,8 @@ int MFTLEnsembleRemoveUndulations(MFTL_Ensemble *ens, const MFTL_UndulationParam
   long long work[27] = {0};
   if (dom->nproc > 1)
   {
-    int coords[3], nc[3], cc[3];
-    MFTLCorrectionCoords(dom, coords);
-    for (int k = 0; k < 3; ++k) cc[k] = axis_colour(coords[k], dom->cuts[k], dom->is_periodic[k], &nc[k]);
+    int nc[3], cc[3];
+    for (int k = 0; k < 3; ++k) cc[k] = axis_colour(dom->cell[k], dom->cuts[k], dom->is_periodic[k], &nc[k]);
     n_col = nc[0] * nc[1] * nc[2];
     my_col = cc[0] + nc[0] * (cc[1] + nc[1] * cc[2]);
     work[my_col] = any_shared ? 1 : 0;

@@ -240,7 +240,6 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
   /* ── The lattice and the clusters ─────────────────────────────────────── */
   MFTL_TopoLattice lat;
   MFTLTopoLatticeInit(&lat, dom, opts->dx);
-  MFTLTopoCommCoords(dom, lat.coords);
   for (int k = 0; k < 3; ++k) st->lattice_cells[k] = lat.cells[k];
 
   MFTL_TopoCluster *cl = MFTL_NULL;

@@ -108,7 +108,7 @@ typedef struct
 {
   MFTL_Ensemble *ens;
   const MFTL_GhostPull *pull;
-  const int *nslot;  ///< `[nproc]` rank -> graph slot (#MFTL_ERROR: not a neighbour).
+  const signed char *nslot;  ///< `MFTL_Domain::neighbor_slot`: rank -> graph slot (#MFTL_ERROR: not a neighbour).
   const int *peer;  ///< Global route: `[n_slots]` the peers, ascending.
   int nproc;
   int n_slots;  ///< Graph degree, or the global route's peers.
@@ -142,7 +142,7 @@ static inline int slot_of_owner(const pull_plan *pl, int owner)
 {
   if (owner < 0 || owner >= pl->nproc) return MFTL_ERROR;
   if (pl->by_rank) return owner;
-  if (!pl->global) return pl->nslot[owner];
+  if (!pl->global) return pl->nslot[owner];  // MFTLDomainNeighborIndex(), its range test already made
   int lo = 0, hi = pl->n_slots;  // the global route's peers ascend
   while (lo < hi)
   {
@@ -459,7 +459,7 @@ int MFTLGhostPull(MFTL_Ensemble *ens, const MFTL_GhostPull *pull)
   pull_plan pl;
   pl.ens = ens;
   pl.pull = pull;
-  pl.nslot = MFTLCommWorkspaceNeighborSlots(ens);
+  pl.nslot = dom->neighbor_slot;
   pl.peer = MFTL_NULL;
   pl.nproc = nproc;
   pl.n_slots = nn;

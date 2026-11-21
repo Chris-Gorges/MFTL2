@@ -315,8 +315,8 @@ typedef struct
  * hence the arrival slot order.
  *
  * @param      obj         The mesh.
- * @param      my_rank     This rank.
- * @param      is_neighbor `[nproc]` flags marking the 26-neighbourhood.
+ * @param      domain      The domain: this rank, and which ranks are graph
+ *                         neighbours (MFTLDomainNeighborIndex()).
  * @param      tri_owner   `[tris.n]` destination rank per triangle.
  * @param      vert_owner  `[verts.n]` destination rank per vertex.
  * @param      dd          Per-destination vertex de-duplication state.
@@ -329,14 +329,15 @@ typedef struct
  * @return 1 if any destination lies outside the 26-neighbourhood (forcing the
  *         global route).
  */
-static int collect_destinations(const MFTL_Object *obj, int my_rank, const char *restrict is_neighbor, const int *restrict tri_owner,
-                                const int *restrict vert_owner, vertex_dedup *dd, char *restrict keep_t, char *restrict keep_v, mftl_int_buffer *tri_ids,
-                                mftl_int_buffer *vert_ids, int *touched, int *n_touched)
+static int collect_destinations(const MFTL_Object *obj, const MFTL_Domain *domain, const int *restrict tri_owner, const int *restrict vert_owner,
+                                vertex_dedup *dd, char *restrict keep_t, char *restrict keep_v, mftl_int_buffer *tri_ids, mftl_int_buffer *vert_ids,
+                                int *touched, int *n_touched)
 {
   MFTL_ASSERT(MFTLObjectHasTopology(obj) && "redistribute: tris.verts/neighbors are stale -- MFTLObjectBuildDerived first");
 
   const int n_owned = obj->tris.n_local;
   if (n_owned < 1) return 0;
+  const int my_rank = domain->rank;
 
   /* 12 B per triangle each, streaming (48 B from the half-edge records). */
   const int *const restrict tv = obj->tris.verts;
@@ -395,7 +396,7 @@ static int collect_destinations(const MFTL_Object *obj, int my_rank, const char 
         continue;
       }
 
-      if (!is_neighbor[dst]) requires_global = 1;
+      if (MFTLDomainNeighborIndex(domain, dst) == MFTL_ERROR) requires_global = 1;
 
       int b = rank_bit[dst];
       if (b == MFTL_ERROR)
@@ -772,7 +773,6 @@ static inline int slot_of_body(MFTL_Object *const *work, int n_sorted, int n_wor
 typedef struct
 {
   int nproc;  ///< What the rank-sized arrays below were built for. 0 means "none yet".
-  char *is_neighbor;  ///< [nproc] 1 for a graph neighbour.
   mftl_int_buffer *tri_ids;  ///< [nproc] triangles bound for each destination.
   mftl_int_buffer *vert_ids;  ///< [nproc] and their vertices.
   MFTL_SendBuffer *send_tris;  ///< [nproc] packed triangle payloads.
@@ -834,9 +834,6 @@ typedef struct
    * body's id range is not allocated and freed every timestep.
    */
   mftl_gid_table ghost_tbl;
-
-  /** `[nproc]` rank -> graph slot, built once (MFTLCommWorkspaceNeighborSlots()). */
-  int *neighbor_slot;
 } comm_workspace;
 
 /**
@@ -860,7 +857,6 @@ static void ws_free_rank_arrays(comm_workspace *ws)
       free(ws->send_fields[r].buffer);
     }
   }
-  free(ws->is_neighbor);
   free(ws->tri_ids);
   free(ws->vert_ids);
   free(ws->send_tris);
@@ -941,7 +937,6 @@ static void ws_reserve(comm_workspace *ws, int nproc, int num_objects, int sum_v
     /* Only on the first call for this ensemble, when nothing is allocated yet. */
     ws_free_rank_arrays(ws);
 
-    ws->is_neighbor = (char *) MFTLCallocOrDie((size_t) nproc, 1, "redistribution neighbour map");
     ws->tri_ids = (mftl_int_buffer *) MFTLMallocOrDie((size_t) nproc * sizeof(mftl_int_buffer), "redistribution id lists");
     ws->vert_ids = (mftl_int_buffer *) MFTLMallocOrDie((size_t) nproc * sizeof(mftl_int_buffer), "redistribution id lists");
     ws->send_tris = (MFTL_SendBuffer *) MFTLCallocOrDie((size_t) nproc, sizeof(MFTL_SendBuffer), "redistribution send buffers");
@@ -956,7 +951,7 @@ static void ws_reserve(comm_workspace *ws, int nproc, int num_objects, int sum_v
       ws->rank_bit[r] = MFTL_ERROR;
     }
     ws->nproc = nproc;
-    cs_alloc((size_t) nproc * (1 + 2 * sizeof(mftl_int_buffer) + 3 * sizeof(MFTL_SendBuffer) + 2 * sizeof(int)));
+    cs_alloc((size_t) nproc * (2 * sizeof(mftl_int_buffer) + 3 * sizeof(MFTL_SendBuffer) + 2 * sizeof(int)));
   }
   else
   {
@@ -1060,7 +1055,6 @@ static void ws_free(comm_workspace *ws)
   gt_free(&s->v_tbl);
   gt_free(&s->t_tbl);
   gt_free(&ws->ghost_tbl);
-  free(ws->neighbor_slot);
 
   memset(ws, 0, sizeof *ws);
 }
@@ -1069,20 +1063,6 @@ mftl_gid_table *MFTLCommWorkspaceGhostTable(MFTL_Ensemble *ens)
 {
   if (ens->comm_workspace == MFTL_NULL) ens->comm_workspace = MFTLCallocOrDie(1, sizeof(comm_workspace), "MFTL communication workspace");
   return &((comm_workspace *) ens->comm_workspace)->ghost_tbl;
-}
-
-const int *MFTLCommWorkspaceNeighborSlots(MFTL_Ensemble *ens)
-{
-  if (ens->comm_workspace == MFTL_NULL) ens->comm_workspace = MFTLCallocOrDie(1, sizeof(comm_workspace), "MFTL communication workspace");
-  comm_workspace *const ws = (comm_workspace *) ens->comm_workspace;
-  if (ws->neighbor_slot == MFTL_NULL)
-  {
-    const MFTL_Domain *const dom = &ens->domain;
-    ws->neighbor_slot = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(dom->nproc, 1) * sizeof(int), "MFTL neighbour slots");
-    for (int r = 0; r < dom->nproc; ++r) ws->neighbor_slot[r] = MFTL_ERROR;
-    for (int i = 0; i < dom->num_neighbors; ++i) ws->neighbor_slot[dom->neighbors[i]] = i;
-  }
-  return ws->neighbor_slot;
 }
 
 void MFTLCommWorkspaceDestroy(void **p_ws)
@@ -1732,12 +1712,12 @@ double MFTLRedistributeGetShrinkSlack(void) { return g_shrink_slack; }
  *
  * @param      ws           The workspace; supplies every scratch array.
  * @param      obj          The mesh (its global id is the body name on the wire).
- * @param      my_rank      This rank.
+ * @param      domain       The domain (this rank, its graph neighbours).
  * @param      dd           Per-destination vertex de-duplication state.
  * @param[out] bs           This body's kept lists and counts.
  * @return 1 if any destination lies outside the 26-neighbourhood.
  */
-static int analyze_and_pack_body(comm_workspace *ws, MFTL_Object *obj, int my_rank, vertex_dedup *dd, body_state *bs)
+static int analyze_and_pack_body(comm_workspace *ws, MFTL_Object *obj, const MFTL_Domain *domain, vertex_dedup *dd, body_state *bs)
 {
   CS_TIMELINE(tm);
 
@@ -1748,8 +1728,9 @@ static int analyze_and_pack_body(comm_workspace *ws, MFTL_Object *obj, int my_ra
   CS_LAP(tm, t_masks);
 
   int n_touched = 0;
-  const int requires_global = collect_destinations(obj, my_rank, ws->is_neighbor, ws->tri_owner, ws->vert_owner, dd, ws->keep_t, ws->keep_v, ws->tri_ids,
-                                                   ws->vert_ids, ws->touched, &n_touched);
+  const int my_rank = domain->rank;
+  const int requires_global =
+      collect_destinations(obj, domain, ws->tri_owner, ws->vert_owner, dd, ws->keep_t, ws->keep_v, ws->tri_ids, ws->vert_ids, ws->touched, &n_touched);
 
   build_kept_lists(obj, ws->keep_v, ws->keep_t, ws->vert_owner, ws->tri_owner, my_rank, bs);
   CS_LAP(tm, t_destinations);
@@ -1924,10 +1905,6 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
   /* At least one slot: the arrival path grows the arrays from here. */
   ws_reserve(ws, nproc, MFTL_MAX(num_objects, 1), sum_verts, sum_tris, max_verts, max_tris, tri_hint, vert_hint);
 
-  char *const is_neighbor = ws->is_neighbor;
-  memset(is_neighbor, 0, (size_t) nproc);
-  for (int i = 0; i < domain->num_neighbors; ++i) is_neighbor[domain->neighbors[i]] = 1;
-
   const bool with_fields = ens->fields.stride[0] || ens->fields.stride[1];
   if (with_fields && !ws->send_fields)
   {
@@ -2001,7 +1978,7 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
     if (!dirty) continue;
 
     dirty_local[o] = 1.0;
-    requires_global |= analyze_and_pack_body(ws, obj, my_rank, &dd, bs);
+    requires_global |= analyze_and_pack_body(ws, obj, domain, &dd, bs);
   }
 
   /* ── Phase 1b: one per-body MAX over each body's HOLDERS. Not in place:
@@ -2029,7 +2006,7 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
     (void) compute_owners(obj, maps ? &maps[o] : MFTL_NULL, tri_owner, vert_owner, vert_gid, MFTL_FALSE);
     CS_LAP(tm, t_owners);
 
-    requires_global |= analyze_and_pack_body(ws, obj, my_rank, &dd, &ws->states[o]);
+    requires_global |= analyze_and_pack_body(ws, obj, domain, &dd, &ws->states[o]);
     MFTLCommStats.n_objects_reclassified++;
     if (dirty_global[o] == 0.0) MFTLCommStats.n_objects_settled++;
   }

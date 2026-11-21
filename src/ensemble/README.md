@@ -48,9 +48,10 @@ use: an early return on the local count deadlocks the other ranks.
 | Field | What it is | Why it is materialised |
 |---|---|---|
 | `comm_cart` | Cartesian communicator, no rank reordering | defines grid coordinates → ranks |
-| `rank_map` | that mapping as an `[nproc]` array | owner lookup is per entity |
+| `rank_map`, `cell` | that mapping as an `[nproc]` array, and this rank's own coordinates | owner lookup is per entity |
 | `comm_graph` | symmetric distributed graph over the distinct ranks of the 26 surrounding cells | neighbourhood collectives: message count bounded by the degree, not by $P$ |
 | `neighbor_offset` | each neighbour's cell offset in $\{-1,0,1\}^3$ | "are two cells neighbours" becomes a componentwise test |
+| `neighbor_slot` | the inverse of `neighbors`: rank → slot, one byte per rank | `MFTLDomainNeighborIndex` is per ghost, per routed block, per body: one load, and no caller rebuilds an `[nproc]` table per call |
 | `grid_factors`, `inv_domain_size` | $\mathrm{cuts}_k/L_k$, $1/L_k$ | owner lookup and minimum image without division |
 
 On thin periodic grids ($2\times1\times1$, any periodic axis with 1 or 2 cuts)

@@ -404,8 +404,16 @@ typedef struct MFTL_Domain
    */
   signed char neighbor_offset[26][3];
 
+  /**
+   * `[nproc]` rank -> its slot in `neighbors`, -1 (#MFTL_ERROR) for a rank that
+   * is not a graph neighbour. Built once, like `rank_map`; read it through
+   * MFTLDomainNeighborIndex(). A slot is at most 25, hence one byte per rank.
+   */
+  signed char *neighbor_slot;
+
   // --- Domain Decomposition ---
   int cuts[3];  ///< Process grid {nx, ny, nz}; the product is nproc.
+  int cell[3];  ///< This rank's Cartesian cell (i, j, k): `rank_map[i + j*nx + k*nx*ny] == rank`.
 
   // --- Physical Bounds ---
   double global_min[3];  ///< Lower corner of the domain box, per axis.

@@ -34,8 +34,6 @@ double MFTLCorrectionTime(void);
 /* In-place Allreduce over comm_world; op 0 MIN, 1 MAX, 2 SUM. */
 void MFTLCorrectionAllreduceDouble(const MFTL_Domain *dom, double *v, int n, int op);
 void MFTLCorrectionAllreduceLongLong(const MFTL_Domain *dom, long long *v, int n, int op);
-/* This rank's cell in the process grid. */
-void MFTLCorrectionCoords(const MFTL_Domain *dom, int coords[3]);
 
 /* ── correction_fields.c ───────────────────────────────────────────────────── */
 

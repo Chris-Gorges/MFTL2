@@ -408,9 +408,8 @@ typedef struct
  * @param dom The MPI/physical world.
  * @param r   A rank.
  * @return `num_neighbors` when @p r IS this rank, its slot when it is a graph
- *         neighbour, and #MFTL_ERROR otherwise. A linear scan over at most 26
- *         entries (MFTLDomainNeighborIndex()), which is why nothing here
- *         allocates per rank.
+ *         neighbour, and #MFTL_ERROR otherwise: MFTLDomainNeighborIndex(),
+ *         the domain's own table, so nothing here allocates per rank.
  */
 static int neighbor_slot(const MFTL_Domain *dom, int r) { return (r == dom->rank) ? dom->num_neighbors : MFTLDomainNeighborIndex(dom, r); }
 

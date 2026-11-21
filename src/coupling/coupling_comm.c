@@ -179,8 +179,6 @@ void MFTLCplBcastInt(MPI_Comm c, int *v, int n, int root) { MPI_Bcast(v, n, MPI_
 
 double MFTLCplWtime(void) { return MPI_Wtime(); }
 
-void MFTLCplCartCoords(const MFTL_Domain *d, int rank, int coords[3]) { MPI_Cart_coords(d->comm_cart, rank, 3, coords); }
-
 /* ═══════════════════════════════════════════════════════════════════════════
  * Framed, chunked messages
  * ═══════════════════════════════════════════════════════════════════════════ */

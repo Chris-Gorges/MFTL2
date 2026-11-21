@@ -44,12 +44,6 @@
 #include "mftl_constants.h"
 #include "mftl_memory.h"
 
-void MFTLTopoCommCoords(const MFTL_Domain *dom, int coords[3])
-{
-  /* comm_cart is created with reorder = 0, so its ranks are comm_world's. */
-  MPI_Cart_coords(dom->comm_cart, dom->rank, 3, coords);
-}
-
 double MFTLTopoCommTime(void) { return MPI_Wtime(); }
 
 void MFTLTopoCommAllreduceDouble(const MFTL_Domain *dom, double *v, int n, int op)

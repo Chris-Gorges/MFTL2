@@ -29,9 +29,3 @@ void MFTLCorrectionAllreduceLongLong(const MFTL_Domain *dom, long long *v, int n
   if (n <= 0) return;
   MPI_Allreduce(MPI_IN_PLACE, v, n, MPI_LONG_LONG, op == 0 ? MPI_MIN : (op == 1 ? MPI_MAX : MPI_SUM), dom->comm_world);
 }
-
-void MFTLCorrectionCoords(const MFTL_Domain *dom, int coords[3])
-{
-  /* comm_cart is created with reorder = 0, so its ranks are comm_world's. */
-  MPI_Cart_coords(dom->comm_cart, dom->rank, 3, coords);
-}

@@ -867,20 +867,11 @@ int MFTLRemeshReferenceHalo(MFTL_Ensemble *ens, double width, double **out, int 
   const int me = dom->rank;
 
   /* This rank's canonical cell. */
-  int my_cell[3] = {0, 0, 0};
-  for (int c = 0; c < dom->nproc; ++c)
-    if (dom->rank_map[c] == me)
-    {
-      my_cell[0] = c % dom->cuts[0];
-      my_cell[1] = (c / dom->cuts[0]) % dom->cuts[1];
-      my_cell[2] = c / (dom->cuts[0] * dom->cuts[1]);
-      break;
-    }
   double h[3], centre[3];
   for (int k = 0; k < 3; ++k)
   {
     h[k] = dom->domain_size[k] / (double) dom->cuts[k];
-    centre[k] = dom->global_min[k] + ((double) my_cell[k] + 0.5) * h[k];
+    centre[k] = dom->global_min[k] + ((double) dom->cell[k] + 0.5) * h[k];
   }
   /* A margin far below any length the mesh resolves, so a cell face that a
    * box only touches in exact arithmetic still counts. */

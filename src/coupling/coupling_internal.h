@@ -849,9 +849,6 @@ void MFTLCplSchedFree(cpl_sched *s);
 /** @brief Wall clock. */
 double MFTLCplWtime(void);
 
-/** @brief Cartesian cell of @p rank in the ensemble's process grid (no communication). */
-void MFTLCplCartCoords(const MFTL_Domain *d, int rank, int coords[3]);
-
 /** @brief The current chunk limit in bytes. */
 size_t MFTLCplChunkLimit(void);
 

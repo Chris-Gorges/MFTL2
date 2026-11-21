@@ -69,6 +69,7 @@ void MFTLTopoLatticeInit(MFTL_TopoLattice *lat, const MFTL_Domain *dom, double d
     lat->periodic[k] = dom->is_periodic[k];
     lat->n_global[k] = lat->periodic[k] ? lat->cells[k] : lat->cells[k] + 1;
     lat->per_rank[k] = lat->cells[k] / dom->cuts[k];
+    lat->coords[k] = dom->cell[k];
   }
 }
 

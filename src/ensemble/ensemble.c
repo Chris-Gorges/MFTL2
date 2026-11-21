@@ -26,12 +26,16 @@
  *
  * - `comm_cart`: the Cartesian communicator (no reordering), which defines the
  *   grid-coordinate-to-rank mapping;
- * - `rank_map`: that mapping as a flat array (owner lookup is per entity);
+ * - `rank_map`: that mapping as a flat array (owner lookup is per entity), and
+ *   `cell`, this rank's own coordinates;
  * - `comm_graph`: a symmetric distributed graph over the distinct ranks of the
  *   26 surrounding cells, for neighbourhood collectives whose message count is
  *   bounded by the degree rather than the process count. On thin periodic grids
  *   several offsets alias one rank (listed once, with its first offset in
- *   `neighbor_offset`), and the graph may contain this rank itself.
+ *   `neighbor_offset`), and the graph may contain this rank itself;
+ * - `neighbor_slot`: the inverse of `neighbors`, so "which slot reaches rank r"
+ *   is one load wherever it is asked (per ghost, per routed block, per body)
+ *   and no caller rebuilds an `[nproc]` table of its own.
  *
  * On failure the communicators created so far are reset to `MPI_COMM_NULL` so
  * MFTLEnsembleDestroy() can clean up.
@@ -81,6 +85,7 @@ static int domain_init_comm(MFTL_Domain *domain)
   // --- 3. Collect the (up to) 26 surrounding neighbours ---
   int my_coords[3];
   MPI_Cart_coords(domain->comm_cart, domain->rank, 3, my_coords);
+  for (int d = 0; d < 3; ++d) domain->cell[d] = my_coords[d];
 
   int unique_neighbors[26];
   signed char unique_offsets[26][3];
@@ -192,6 +197,14 @@ static int domain_init_comm(MFTL_Domain *domain)
     }
   }
 
+  /* --- 6. Rank -> slot, the inverse of `neighbors` ---
+   * One byte per rank: the slots are distinct (the list is de-duplicated
+   * above) and at most 25. */
+  MFTL_ASSERT(indegree <= 26 && "MFTL: at most 26 distinct graph neighbours");
+  domain->neighbor_slot = (signed char *) MFTLMallocOrDie((size_t) MFTL_MAX(domain->nproc, 1), "MFTL domain neighbour slots");
+  memset(domain->neighbor_slot, MFTL_ERROR, (size_t) MFTL_MAX(domain->nproc, 1));
+  for (int n = 0; n < indegree; ++n) domain->neighbor_slot[domain->neighbors[n]] = (signed char) n;
+
   return MFTL_SUCCESS;
 }
 
@@ -297,6 +310,7 @@ void MFTLEnsembleDestroy(MFTL_Ensemble **p_ens)
   if (dom->comm_cart != MPI_COMM_NULL) MPI_Comm_free(&dom->comm_cart);
   if (dom->comm_world != MPI_COMM_NULL) MPI_Comm_free(&dom->comm_world);
   free(dom->neighbors);
+  free(dom->neighbor_slot);
   free(dom->rank_map);
 
   // 3. Free the ensemble itself

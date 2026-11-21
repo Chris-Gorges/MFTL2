@@ -697,18 +697,46 @@ void *MFTLExchangeRecords(const MFTL_Domain *domain, size_t width, const void *s
   return out;
 }
 
+/**
+ * @brief Where MFTLExchangeRecordsTo() keeps the block index of destination
+ *        @p r: the entry of its graph slot, or -- for a rank outside the
+ *        neighbourhood -- its entry in a rank-indexed table made on first need.
+ * @param         domain  The domain.
+ * @param         by_slot `[num_neighbors]` block per graph slot.
+ * @param[in,out] by_rank `[nproc]` block per rank, #MFTL_NULL until a
+ *                        destination outside the neighbourhood appears.
+ * @param         r       A destination other than this rank, inside the communicator.
+ * @return The entry: a block index, or #MFTL_ERROR while @p r has none.
+ */
+static int *block_entry(const MFTL_Domain *domain, int *by_slot, int **by_rank, int r)
+{
+  const int s = MFTLDomainNeighborIndex(domain, r);
+  if (s != MFTL_ERROR) return &by_slot[s];
+  if (*by_rank == MFTL_NULL)
+  {
+    *by_rank = (int *) MFTLMallocOrDie((size_t) domain->nproc * sizeof(int), "MFTLExchangeRecordsTo table");
+    for (int q = 0; q < domain->nproc; ++q) (*by_rank)[q] = MFTL_ERROR;
+  }
+  return &(*by_rank)[r];
+}
+
 void *MFTLExchangeRecordsTo(const MFTL_Domain *domain, size_t width, const void *rec, const int *dest, int n_rec, int *n_recv)
 {
   MFTL_ASSERT(width >= 1 && "MFTLExchangeRecordsTo: a record has at least one byte");
-  const int me = domain->rank, nproc = domain->nproc;
+  const int me = domain->rank;
 
-  /* One scan: a block per distinct destination (a rank-indexed table, local
-   * memory only), the counts, and whether anything leaves the neighbourhood. */
-  int *const block_of = (int *) MFTLMallocOrDie((size_t) nproc * sizeof(int), "MFTLExchangeRecordsTo table");
-  for (int r = 0; r < nproc; ++r) block_of[r] = MFTL_ERROR;
+  /* One scan: a block per distinct destination, the counts, and whether
+   * anything leaves the neighbourhood. A neighbour's block is found through its
+   * graph slot (at most 26, on the stack); only a destination OUTSIDE the
+   * neighbourhood needs the rank-indexed table, built when the first one
+   * appears -- the call is then on the global route anyway -- so the common
+   * graph route costs O(n_rec), not O(nproc). */
+  MFTL_ASSERT(domain->num_neighbors <= 26 && "MFTLExchangeRecordsTo: at most 26 graph neighbours");
+  int block_of_slot[26];
+  for (int s = 0; s < domain->num_neighbors; ++s) block_of_slot[s] = MFTL_ERROR;
+  int *block_of_rank = MFTL_NULL;
   int n_blk = 0, cap = 8, n_self = 0;
   record_block *blk = (record_block *) MFTLMallocOrDie((size_t) cap * sizeof(record_block), "MFTLExchangeRecordsTo blocks");
-  bool far = MFTL_FALSE;
   for (int i = 0; i < n_rec; ++i)
   {
     const int r = dest[i];
@@ -718,21 +746,22 @@ void *MFTLExchangeRecordsTo(const MFTL_Domain *domain, size_t width, const void 
       ++n_self;
       continue;
     }
-    if (block_of[r] == MFTL_ERROR)
+    int *const b = block_entry(domain, block_of_slot, &block_of_rank, r);
+    if (*b == MFTL_ERROR)
     {
       if (n_blk == cap)
       {
         cap *= 2;
         blk = (record_block *) MFTLReallocOrDie(blk, (size_t) cap * sizeof(record_block), "MFTLExchangeRecordsTo blocks");
       }
-      block_of[r] = n_blk;
+      *b = n_blk;
       blk[n_blk].rank = r;
       blk[n_blk].count = 0;
       ++n_blk;
-      if (MFTLDomainNeighborIndex(domain, r) == MFTL_ERROR) far = MFTL_TRUE;
     }
-    blk[block_of[r]].count++;
+    blk[*b].count++;
   }
+  const bool far = (block_of_rank != MFTL_NULL);
 
   /* The route is agreed before packing, so every rank enters the vote after
    * the same cheap scan, not after its share of the copying. */
@@ -758,10 +787,10 @@ void *MFTLExchangeRecordsTo(const MFTL_Domain *domain, size_t width, const void 
       own_idx[k++] = i;
       continue;
     }
-    memcpy(image + (size_t) cursor[block_of[dest[i]]]++ * width, src + (size_t) i * width, width);
+    memcpy(image + (size_t) cursor[*block_entry(domain, block_of_slot, &block_of_rank, dest[i])]++ * width, src + (size_t) i * width, width);
   }
   free(cursor);
-  free(block_of);
+  free(block_of_rank);
 
   void *const out = exchange_blocks(domain, width, image, blk, n_blk, global, src, own_idx, n_self, 0, n_rec, MFTL_NULL, n_recv);
   free(image);

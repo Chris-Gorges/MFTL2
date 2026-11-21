@@ -130,6 +130,60 @@ static int test_neighbour_graph_is_symmetric(void)
   return 0;
 }
 
+/**
+ * @brief MFTLDomainNeighborIndex() is ONE table load (`MFTL_Domain::neighbor_slot`),
+ *        and every module that routes by rank reads it, so a slot it gets wrong
+ *        sends a ghost request, a routed block or a body vote to the wrong
+ *        neighbour. Checked against a brute-force scan of `neighbors` (which
+ *        shares nothing with the table) for every rank and two out-of-range
+ *        values, and `cell` against MPI_Cart_coords() and `rank_map`, on grid
+ *        shapes with and without the self-loop and with aliased offsets.
+ */
+static int test_the_neighbour_slot_table_inverts_the_neighbour_list(void)
+{
+  if (g_nproc != 8) return 0;
+  static const int shapes[4][3] = {{2, 2, 2}, {2, 2, 2}, {8, 1, 1}, {4, 2, 1}};
+  static const bool periodic[4] = {false, true, true, true};
+  int ok = 1, saw_self_loop = 0, saw_non_neighbour = 0;
+  for (int c = 0; c < 4; ++c)
+  {
+    const bool per[3] = {periodic[c], periodic[c], periodic[c]};
+    MFTL_Ensemble *e = MFTLEnsembleCreate(MPI_COMM_WORLD, shapes[c], (double[3]){0, 0, 0}, (double[3]){1, 1, 1}, per, 1);
+    if (e == MFTL_NULL)
+    {
+      ok = 0;
+      break;
+    }
+    const MFTL_Domain *d = &e->domain;
+    for (int r = -1; r <= d->nproc; ++r)
+    {
+      int expect = MFTL_ERROR, hits = 0;
+      for (int i = 0; i < d->num_neighbors; ++i)
+        if (d->neighbors[i] == r)
+        {
+          if (hits++ == 0) expect = i;
+        }
+      ok &= (hits <= 1);  // the list holds each rank once
+      ok &= (MFTLDomainNeighborIndex(d, r) == expect);
+      if (r == d->rank && expect != MFTL_ERROR) saw_self_loop = 1;
+      if (r >= 0 && r < d->nproc && r != d->rank && expect == MFTL_ERROR) saw_non_neighbour = 1;
+    }
+    int coords[3];
+    MPI_Cart_coords(d->comm_cart, d->rank, 3, coords);
+    for (int k = 0; k < 3; ++k) ok &= (d->cell[k] == coords[k]);
+    ok &= (d->rank_map[d->cell[0] + d->cuts[0] * (d->cell[1] + d->cuts[1] * d->cell[2])] == d->rank);
+    MFTLEnsembleDestroy(&e);
+  }
+  /* Non-vacuity: the periodic {8,1,1} and {4,2,1} carry the self-loop on every
+   * rank and leave ranks outside the neighbourhood (on 2x2x2 every rank is a
+   * neighbour). */
+  int seen[2] = {saw_self_loop, saw_non_neighbour};
+  MPI_Allreduce(MPI_IN_PLACE, seen, 2, MPI_INT, MPI_LAND, MPI_COMM_WORLD);
+  ok &= seen[0] && seen[1];
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  return 0;
+}
+
 /* ─────────────────────────────────────────────────────────────────────────────
  * Reductions with genuinely different values per rank
  * ─────────────────────────────────────────────────────────────────────────── */
@@ -290,6 +344,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_every_rank_agrees_on_the_rank_map);
   RUN_TEST(test_owner_lookup_is_a_partition);
   RUN_TEST(test_neighbour_graph_is_symmetric);
+  RUN_TEST(test_the_neighbour_slot_table_inverts_the_neighbour_list);
   RUN_TEST(test_global_counts_sum_unequal_ranks);
   RUN_TEST(test_update_reduces_min_and_max_across_ranks);
   RUN_TEST(test_update_ignores_ranks_that_hold_nothing);

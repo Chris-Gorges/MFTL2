@@ -477,18 +477,6 @@ static inline void gt_put(mftl_gid_table *t, int gid, int value)
  */
 mftl_gid_table *MFTLCommWorkspaceGhostTable(MFTL_Ensemble *ens);
 
-/**
- * @brief `[nproc]` rank -> slot in `domain.neighbors`, #MFTL_ERROR for a rank
- *        that is not a graph neighbour. Built on first use and kept for the
- *        ensemble's lifetime (the domain is read-only after creation), so a ghost
- *        exchange pays its O(nproc) once per ensemble instead of once per call.
- *        Internal, like MFTLCommWorkspaceGhostTable().
- *
- * @param ens The ensemble.
- * @return The table; owned by the ensemble, never freed by the caller.
- */
-const int *MFTLCommWorkspaceNeighborSlots(MFTL_Ensemble *ens);
-
 /* ═══════════════════════════════════════════════════════════════════════════
  * The routed exchange's transport (exchange.c): the route vote, the count
  * exchange and the data posts that MFTLExchangeStart(), MFTLExchangeRecords(),
