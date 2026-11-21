@@ -29,20 +29,12 @@
 #ifndef MFTL_TOPO_INTERNAL_H
 #define MFTL_TOPO_INTERNAL_H
 
+#include "mftl_communication.h"
 #include "mftl_ensemble.h"
 #include "mftl_geometry.h"
 #include "mftl_meshgen.h"
 #include "mftl_topology_change.h"
 #include "mftl_types.h"
-
-/**
- * @brief Whether @p r is this rank or one of its graph neighbours, i.e. whether
- *        a record for it can travel on `comm_graph`.
- * @param dom The MPI/physical world.
- * @param r   A rank.
- * @return `true` if the neighbourhood exchange reaches @p r.
- */
-static inline bool MFTLTopoIsNeighbour(const MFTL_Domain *dom, int r) { return r == dom->rank || MFTLDomainNeighborIndex(dom, r) != MFTL_ERROR; }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 1. The lattice and the clusters
@@ -163,15 +155,14 @@ void MFTLTopoRasterise(const MFTL_Ensemble *ens, MFTL_TopoCluster *cl, int n_cl,
  * @brief Packs every known window node that another rank needs:
  *        records `(cluster, node key, value)`, bucketed by destination rank.
  *
- * @param dom              The domain: rank map and neighbourhood.
+ * @param dom              The domain: rank map.
  * @param lat              The lattice.
  * @param cl               The clusters, with their windows rasterised.
  * @param n_cl             Their number.
  * @param[out] dest_counts `[nproc]` records per destination.
  * @param[out] records     `malloc`'d, grouped by destination in rank order.
- * @return Whether any destination lies outside this rank's graph neighbourhood.
  */
-bool MFTLTopoPackNodeExchange(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, const MFTL_TopoCluster *cl, int n_cl, int *dest_counts, double **records);
+void MFTLTopoPackNodeExchange(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, const MFTL_TopoCluster *cl, int n_cl, int *dest_counts, double **records);
 
 /** @brief Merges received `(cluster, node key, value)` records into the windows. */
 void MFTLTopoMergeNodes(const MFTL_TopoLattice *lat, MFTL_TopoCluster *cl, int n_cl, const double *records, int n_records);
@@ -299,7 +290,7 @@ int MFTLTopoBuildObjects(MFTL_Ensemble *ens, const MFTL_TopoLattice *lat, MFTL_T
 /**
  * @brief Gives every ghost vertex and triangle of the new objects its owner's
  *        densified id: a keyed MFTLGhostPull() (lattice keys, because the ids
- *        are what is being asked for) on #MFTL_GHOST_ROUTE_AUTO, then the
+ *        are what is being asked for) on #MFTL_ROUTE_AUTO, then the
  *        half-edge ids of every triangle of those objects.
  * @param ens       The ensemble, the new objects inserted and their OWNED ids dense.
  * @param created   `[n_created]` body ids of the new objects, sorted.
@@ -337,33 +328,34 @@ bool MFTLTopoCommAny(const MFTL_Domain *dom, bool local);
 double *MFTLTopoCommAllgather(const MFTL_Domain *dom, const double *mine, int n_mine, int stride, int *n_out);
 
 /**
- * @brief Personalised exchange of records of @p stride doubles.
- *
- * @param dom         The domain: communicator and neighbourhood graph.
- * @param records     Grouped by destination rank, `dest_counts[r]` records for rank r.
- * @param dest_counts `[nproc]` records per destination.
- * @param stride      Doubles per record.
- * @param global_path Whether any rank has a destination outside its neighbourhood;
- *                    agreed inside, so a local value is enough.
- * @param[out] n_recv Records received.
- * @param[out] src_counts Optional `[nproc]`: records received from each rank.
- * @return Received records, `malloc`'d, grouped by source rank in rank order.
- */
-double *MFTLTopoCommExchange(const MFTL_Domain *dom, const double *records, const int *dest_counts, int stride, bool global_path, int *n_recv, int *src_counts);
-
-/**
- * @brief Sends @p reply (one record of @p stride doubles per received request,
- *        in receive order) back to the requesters. The inverse of
- *        MFTLTopoCommExchange() with the counts swapped.
+ * @brief Personalised exchange of records of @p stride doubles:
+ *        MFTLExchangeRecords(), which agrees the route (graph, or global when
+ *        some destination is outside a neighbourhood) itself.
  *
  * @param dom         The domain.
- * @param reply       One record per received request, in receive order.
- * @param src_counts  `[nproc]` requests received from each rank, as
- *                    MFTLTopoCommExchange() reported them.
+ * @param records     Grouped by destination rank, `dest_counts[r]` records for
+ *                    rank r; never this rank.
+ * @param dest_counts `[nproc]` records per destination.
  * @param stride      Doubles per record.
- * @param global_path Whether the request exchange went global; agreed inside.
+ * @param[out] n_recv Records received.
+ * @param[out] plan   If not #MFTL_NULL, what MFTLTopoCommReply() needs; release
+ *                    with MFTLExchangePlanFree().
+ * @return Received records, `malloc`'d, one block per source in receive order
+ *         (graph neighbours in `dom->neighbors` order, global-route sources ascending).
+ *         Every consumer is independent of that order.
+ */
+double *MFTLTopoCommExchange(const MFTL_Domain *dom, const double *records, const int *dest_counts, int stride, int *n_recv, MFTL_ExchangePlan *plan);
+
+/**
+ * @brief Sends @p reply back to the requesters: MFTLExchangeReply(), no vote
+ *        and no count exchange.
+ *
+ * @param dom    The domain.
+ * @param plan   The plan of the request exchange.
+ * @param reply  One record of @p stride doubles per received request, in receive order.
+ * @param stride Doubles per record.
  * @return The replies, in the order the requests were packed.
  */
-double *MFTLTopoCommReply(const MFTL_Domain *dom, const double *reply, const int *src_counts, int stride, bool global_path);
+double *MFTLTopoCommReply(const MFTL_Domain *dom, const MFTL_ExchangePlan *plan, const double *reply, int stride);
 
 #endif  // MFTL_TOPO_INTERNAL_H

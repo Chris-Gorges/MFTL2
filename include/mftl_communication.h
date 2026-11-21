@@ -172,8 +172,91 @@ void MFTLRegisterMpiTypes(void);
 void MFTLFreeMpiTypes(void);
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 3. Generic variable-length exchange
+ * 3. The routed personalised exchange
+ *
+ * ONE engine for every "send these elements to those ranks" of the library:
+ * redistribution and the spatial halo (MFTLExchangeStart(), typed payloads),
+ * the topology change's node and label exchanges (MFTLExchangeRecords() and
+ * its reply), the remesher's routed records (MFTLExchangeRecordsTo()), and the
+ * transport of the ghost pull. A count exchange, then the data, on one of two routes:
+ *
+ *   graph   `comm_graph`'s neighbourhood collectives; every destination is a
+ *           graph neighbour (this rank only through a self-loop). Nothing
+ *           global: the per-timestep route.
+ *   global  some rank addresses a rank outside its neighbourhood. Receivers
+ *           learn their senders and counts by NBX (MFTLNbxComplete()), the data
+ *           travels point to point on `comm_world`: one message per partner
+ *           and one non-blocking barrier, O(log P), where a dense
+ *           `MPI_Alltoall` of counts and an `MPI_Alltoallv` were O(P) per rank.
+ *
+ * Which one is agreed by one `MPI_Allreduce` (LOR) under #MFTL_ROUTE_AUTO, or
+ * fixed to the graph under #MFTL_ROUTE_GRAPH. Receive order is part of the
+ * contract: graph neighbours in `domain->neighbors` order, global-route sources
+ * in ascending rank.
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Which communicator a routed exchange or ghost pull takes.
+ *
+ * A switch that changes the message pattern is COLLECTIVE STATE: every rank
+ * must pass the same route.
+ */
+typedef enum
+{
+  /**
+   * `comm_graph` only and no `comm_world` collective: the per-timestep route.
+   * A destination that is not a graph neighbour cannot be reached (the ghost
+   * pull counts such a ghost in `g_n_orphaned` and returns #MFTL_ERROR).
+   */
+  MFTL_ROUTE_GRAPH = 0,
+  /**
+   * `comm_graph` unless some rank addresses a rank outside its neighbourhood,
+   * the global route otherwise; agreed by one `MPI_Allreduce(LOR)`. For the
+   * initial scatter, a coarsened placement, a topology change's windows and
+   * anything else whose partners leave the 26-neighbourhood.
+   */
+  MFTL_ROUTE_AUTO = 1
+} MFTL_Route;
+
+/**
+ * @brief Receives ONE message that MFTLNbxComplete() probed.
+ *
+ * Must receive exactly the probed message (source and tag from @p probed), by
+ * whatever means the caller's framing needs, and may allocate what it likes.
+ *
+ * @param comm   The communicator of the exchange.
+ * @param probed The status of the matched probe.
+ * @param ctx    The caller's context.
+ */
+typedef void (*MFTL_NbxReceiveFn)(MPI_Comm comm, const MPI_Status *probed, void *ctx);
+
+/**
+ * @brief Completes a sparse dynamic exchange: Hoefler, Siebert & Lumsdaine's
+ *        NBX protocol, the library's one implementation of it.
+ *
+ * The caller has posted its messages as SYNCHRONOUS sends (`MPI_Issend`) with
+ * @p tag on @p comm; the receivers do not know they will receive. This rank
+ * probes for @p tag from any source and hands each match to @p receive; once
+ * its own sends are matched it enters a non-blocking barrier, and keeps
+ * receiving until the barrier completes. A completed barrier means every send
+ * of every rank was matched, so nothing of this exchange is left in flight.
+ * Cost: the messages plus one barrier, O(log P); no count array of size P.
+ *
+ * Two calls with the same (@p comm, @p tag) must be separated by a collective
+ * over @p comm whose result depends on every rank (an `MPI_Allreduce`), or use
+ * different tags: a rank that leaves its barrier early may otherwise post the
+ * next call's messages while another rank is still probing in this one.
+ *
+ * @param comm    The communicator; nothing else may probe or receive @p tag on it.
+ * @param tag     The tag of every message of the exchange.
+ * @param n_sends Requests in @p sends; may be zero.
+ * @param sends   The posted synchronous sends; completed on return.
+ * @param receive Called once per incoming message, in arrival order.
+ * @param ctx     Handed to @p receive.
+ *
+ * @collective Over @p comm.
+ */
+void MFTLNbxComplete(MPI_Comm comm, int tag, int n_sends, MPI_Request *sends, MFTL_NbxReceiveFn receive, void *ctx);
 
 /** @brief One destination's outgoing elements, as a typed byte blob. */
 typedef struct
@@ -192,7 +275,7 @@ typedef struct
  */
 typedef struct
 {
-  MFTL_SendBuffer *send_bufs;  ///< [nproc] indexed by DESTINATION RANK, even on the neighbour path.
+  MFTL_SendBuffer *send_bufs;  ///< [nproc] indexed by DESTINATION RANK, on either route.
   MPI_Datatype type;  ///< Committed MPI datatype of one element.
   size_t type_size;  ///< sizeof of one element, must match @c type.
 
@@ -206,35 +289,44 @@ typedef struct
  */
 typedef struct
 {
-  MPI_Request requests[MFTL_MAX_EXCHANGE_PAYLOADS];  ///< One in-flight *alltoallv per payload.
+  MPI_Request *requests[MFTL_MAX_EXCHANGE_PAYLOADS];  ///< Per payload: one neighbourhood request, or the global route's point-to-point ones.
+  int n_requests[MFTL_MAX_EXCHANGE_PAYLOADS];  ///< Entries of each `requests` array.
   char *flat_send[MFTL_MAX_EXCHANGE_PAYLOADS];  ///< Internal copies of the send buffers, freed by MFTLExchangeFree().
-  int *counts;  ///< 4 * n_payloads * n_targets ints: send/recv counts and displacements.
+  int *counts;  ///< 4 * n_payloads * n_targets ints: send/recv counts and displacements, payload-major, in receive order.
   int n_payloads;  ///< Payloads this context is carrying.
-  int n_targets;  ///< Destinations: `nproc` on the global path, `num_neighbors` on the graph path.
+  int n_targets;  ///< Peers: `num_neighbors` on the graph route; on the global route every rank sent to or received from.
+  bool global;  ///< The agreed route was the global one.
 } MFTL_ExchangeCtx;
 
 /**
- * @brief Starts a non-blocking all-to-all-v of up to four independent payloads.
+ * @brief Starts a non-blocking personalised exchange of up to four independent
+ *        typed payloads.
  *
- * One blocking count exchange carrying all payloads' counts
- * (`MPI_Alltoall` / `MPI_Neighbor_alltoall`), then one non-blocking
- * `*alltoallv` per payload, posted back to back. The send buffers are copied
- * into internal storage before return, so the caller may reuse them at once.
+ * Agrees the route (under #MFTL_ROUTE_AUTO), exchanges all payloads' counts in
+ * one blocking step (`MPI_Neighbor_alltoall`, or NBX on the global route), then
+ * posts every payload back to back (`MPI_Ineighbor_alltoallv`, or point to point)
+ * so the caller may consume one while the others are in flight. The send
+ * buffers are copied into internal storage before return, so the caller may
+ * reuse them at once. Received blocks are in receive order (graph neighbours in
+ * `domain->neighbors` order; global-route sources ascending); on the graph route this
+ * rank reaches itself only through a self-loop of `comm_graph`.
  *
- * @param domain          Supplies the communicators, rank count and neighbour list.
- * @param x               [n_payloads] payload descriptors; `recv_buf` /
- *                        `recv_count` are filled in (the caller frees `recv_buf`).
- * @param n_payloads      1..#MFTL_MAX_EXCHANGE_PAYLOADS, identical on all ranks.
- * @param use_global_path `true`: `MPI_Alltoallv` over `comm_cart` (any
- *                        destination); `false`: `MPI_Neighbor_alltoallv` over
- *                        `comm_graph` (26-neighbourhood only). Identical on all
- *                        ranks -- agree on it with a reduction first.
- * @param ctx             Out: pass to MFTLExchangeWait() / MFTLExchangeFree().
+ * @param domain     Supplies the communicators, rank count and neighbour list.
+ * @param x          [n_payloads] payload descriptors; `recv_buf` /
+ *                   `recv_count` are filled in (the caller frees `recv_buf`).
+ * @param n_payloads 1..#MFTL_MAX_EXCHANGE_PAYLOADS, identical on all ranks.
+ * @param route      #MFTL_ROUTE_GRAPH (no global collective) or
+ *                   #MFTL_ROUTE_AUTO; identical on all ranks.
+ * @param far        Whether THIS rank has data for a rank that is neither itself
+ *                   nor a graph neighbour; agreed inside under
+ *                   #MFTL_ROUTE_AUTO, ignored under #MFTL_ROUTE_GRAPH.
+ * @param ctx        Out: pass to MFTLExchangeWait() / MFTLExchangeFree(); `global`
+ *                   reports the agreed route.
  *
  * @collective The payload count and order come from the code path, never the
  *             data, as non-blocking collectives require.
  */
-void MFTLExchangeStart(const MFTL_Domain *domain, MFTL_Exchange *x, int n_payloads, bool use_global_path, MFTL_ExchangeCtx *ctx);
+void MFTLExchangeStart(const MFTL_Domain *domain, MFTL_Exchange *x, int n_payloads, MFTL_Route route, bool far, MFTL_ExchangeCtx *ctx);
 
 /**
  * @brief Blocks until payload @p payload has arrived; its `recv_buf` is then
@@ -253,6 +345,99 @@ void MFTLExchangeWait(MFTL_ExchangeCtx *ctx, int payload);
  * @param ctx Context filled in by MFTLExchangeStart(). Safe to call twice.
  */
 void MFTLExchangeFree(MFTL_ExchangeCtx *ctx);
+
+/**
+ * @struct MFTL_ExchangePlan
+ * @brief Who sent how many records to whom in one MFTLExchangeRecords(): what
+ *        its reply reuses, so the reply needs neither a vote nor a count
+ *        exchange. Treat the fields as private; release with
+ *        MFTLExchangePlanFree().
+ */
+typedef struct
+{
+  bool global;  ///< The agreed route was the global one.
+  int n_peers;  ///< Graph: `num_neighbors`; global: every rank sent to or received from.
+  int *peer;  ///< [n_peers] their ranks, in receive order.
+  int *count;  ///< [4 * n_peers] records sent | send displacement | received | receive displacement.
+  int n_self;  ///< Records this rank addressed to itself: delivered first, never on the wire.
+  int self_displ;  ///< Where they were in the send buffer.
+  int n_send;  ///< Records in the send buffer, its own included.
+  int n_recv;  ///< Records received, its own included.
+} MFTL_ExchangePlan;
+
+/**
+ * @brief Routed personalised exchange of fixed-width records, blocking.
+ *
+ * The route is agreed inside (one `MPI_Allreduce`, as #MFTL_ROUTE_AUTO): the
+ * graph when every destination of every rank is itself or a graph neighbour,
+ * the global route otherwise. Records addressed to the calling rank never
+ * touch the wire.
+ *
+ * @param      domain     The domain.
+ * @param      width      Bytes per record, at least 1.
+ * @param      send       The records, grouped by destination in the order of
+ *                        @p dest: `dest_count[0]` for `dest[0]`, and so on.
+ * @param      n_dest     Entries of @p dest.
+ * @param      dest       `[n_dest]` DISTINCT destination ranks, in any order;
+ *                        this rank allowed.
+ * @param      dest_count `[n_dest]` records for each.
+ * @param[out] plan       If not #MFTL_NULL, the plan for MFTLExchangeReply(),
+ *                        released by MFTLExchangePlanFree().
+ * @param[out] n_recv     Records received.
+ * @return `[*n_recv * width]` bytes to free(), never #MFTL_NULL: this rank's
+ *         own records first, in send order, then each source's block in receive
+ *         order, each in its sender's order.
+ *
+ * @collective
+ */
+void *MFTLExchangeRecords(const MFTL_Domain *domain, size_t width, const void *send, int n_dest, const int *dest, const int *dest_count,
+                          MFTL_ExchangePlan *plan, int *n_recv);
+
+/**
+ * @brief MFTLExchangeRecords() for records that each name their destination,
+ *        in any order: one scan counts them per destination and finds the
+ *        route, the route is agreed, and a stable counting sort packs other
+ *        ranks' records once; this rank's own are copied once, straight into
+ *        the result. Local memory `O(nproc)` (a rank-indexed table), nothing
+ *        on the wire sized by the process count.
+ *
+ * @param      domain The domain.
+ * @param      width  Bytes per record, at least 1.
+ * @param      rec    `[n_rec * width]` bytes of records.
+ * @param      dest   `[n_rec]` destination rank of each record; this rank allowed.
+ * @param      n_rec  Records.
+ * @param[out] n_recv Records received.
+ * @return `[*n_recv * width]` bytes to free(), never #MFTL_NULL: this rank's
+ *         own records first, in input order, then each source's block in
+ *         receive order, each in its sender's input order.
+ *
+ * @collective
+ */
+void *MFTLExchangeRecordsTo(const MFTL_Domain *domain, size_t width, const void *rec, const int *dest, int n_rec, int *n_recv);
+
+/**
+ * @brief Sends one reply record per record received back to its sender: the
+ *        reverse of the MFTLExchangeRecords() that made @p plan, with no vote and
+ *        no count exchange (both sides know every count).
+ *
+ * @param domain The domain.
+ * @param plan   The plan of the forward exchange.
+ * @param width  Bytes per reply record, at least 1.
+ * @param reply  `[plan->n_recv * width]` bytes, one reply per received record,
+ *               in the order the forward exchange delivered them.
+ * @return `[plan->n_send * width]` bytes to free(), never #MFTL_NULL: the
+ *         replies in the order the forward records were SENT, so reply `i`
+ *         answers forward record `i`.
+ *
+ * @collective
+ */
+void *MFTLExchangeReply(const MFTL_Domain *domain, const MFTL_ExchangePlan *plan, size_t width, const void *reply);
+
+/**
+ * @brief Releases a plan of MFTLExchangeRecords(). Safe to call twice.
+ * @param plan The plan.
+ */
+void MFTLExchangePlanFree(MFTL_ExchangePlan *plan);
 
 /**
  * @brief Variable-length allgather of doubles over `comm_graph`: this rank's
@@ -455,29 +640,6 @@ void MFTLCommWorkspaceDestroy(void **p_ws);
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Which communicator a ghost pull takes.
- *
- * A switch that changes the message pattern is COLLECTIVE STATE: every rank
- * must pass the same route.
- */
-typedef enum
-{
-  /**
-   * `comm_graph` only and no `comm_world` collective: the per-timestep route. A
-   * ghost whose owner is not a graph neighbour is skipped, keeps its value, is
-   * counted in `g_n_orphaned`, and the call returns #MFTL_ERROR on that rank.
-   */
-  MFTL_GHOST_ROUTE_GRAPH = 0,
-  /**
-   * `comm_graph` unless some rank holds a ghost whose owner is not a graph
-   * neighbour, `comm_world` otherwise; agreed by one `MPI_Allreduce(LOR)`. For
-   * the partitions the remesher makes (a coarsened placement), whose halo
-   * leaves the 26-neighbourhood.
-   */
-  MFTL_GHOST_ROUTE_AUTO = 1
-} MFTL_GhostRoute;
-
-/**
  * @brief Owner side of a ghost pull: writes the replies to @p n requests for
  *        ONE body and ONE pool.
  *
@@ -527,7 +689,7 @@ typedef struct MFTL_GhostPull
 {
   /** Reply bytes per vertex ghost and per triangle ghost; 0 leaves the pool out. */
   int row_bytes[2];
-  MFTL_GhostRoute route;  ///< Graph only, or graph with an agreed global fallback.
+  MFTL_Route route;  ///< Graph only, or graph with the agreed global route.
   /**
    * #MFTL_NULL in both entries: a ghost is named by its global id, and the owner
    * resolves it through the communication workspace's id table, keyed by the
@@ -551,9 +713,11 @@ typedef struct MFTL_GhostPull
  * Three exchanges on the chosen route -- counts (two ints per neighbour, posted
  * non-blocking and overlapped with packing), requests (8 B per ghost, 12 B when
  * keyed), replies (`row_bytes`, no count exchange: one reply per request) --
- * plus one `MPI_Allreduce` under #MFTL_GHOST_ROUTE_AUTO. Per call it allocates
- * nothing sized by the process count on the graph route (the rank-to-neighbour
- * table is built once per ensemble) and nothing sized by a large body's id
+ * plus one `MPI_Allreduce` under #MFTL_ROUTE_AUTO, all on the library's routed
+ * exchange (the global route's counts by NBX, so no exchange is sized by the
+ * process count). Per call it allocates nothing sized by the process count on
+ * the graph route (the rank-to-neighbour table is built once per ensemble;
+ * the global route counts per rank) and nothing sized by a large body's id
  * range: the owner keys its id table by the REQUESTS (direct and bounded for a
  * small body; O(requests) behind a bit filter for a large one) and reads its
  * owned ids once, sequentially. Requests are grouped per (body, pool) on the
@@ -609,13 +773,13 @@ typedef struct MFTL_GhostColumn
  *
  * @collective
  */
-int MFTLUpdateGhostColumns(MFTL_Ensemble *ens, const MFTL_GhostColumn *columns, int n_columns, MFTL_GhostRoute route);
+int MFTLUpdateGhostColumns(MFTL_Ensemble *ens, const MFTL_GhostColumn *columns, int n_columns, MFTL_Route route);
 
 /**
  * @brief Refreshes the POSITION of every ghost vertex from its owning rank.
  *
  * MFTLUpdateGhostColumns() of #MFTL_GHOST_COLUMN_POSITION on
- * #MFTL_GHOST_ROUTE_GRAPH: each rank asks the owners for the (body id,
+ * #MFTL_ROUTE_GRAPH: each rank asks the owners for the (body id,
  * vertex id) pairs it holds as ghosts (8 B each) and the owners answer with an
  * #MFTL_GhostUpdatePayload (32 B); the reply order equals the request order, so
  * replies are applied by direct index. Three neighbourhood collectives (counts,
@@ -950,8 +1114,8 @@ typedef struct
   double t_masks;  ///< Clearing the per-object keep flags and de-duplication mask. O(V+T) per body.
   double t_destinations;  ///< Destination analysis: seven candidates per owned triangle.
   /**
-   * The neighbour-vs-global route `MPI_Allreduce` (one int): pure latency, but
-   * after the vote it may still absorb load imbalance.
+   * The neighbour-vs-global route `MPI_Allreduce` (one int), the exchange
+   * engine's vote: pure latency, but it may still absorb load imbalance.
    */
   double t_route;
 
@@ -963,8 +1127,8 @@ typedef struct
   double t_skip_vote;
 
   double t_pack;  ///< Building the per-destination payloads.
-  double t_exchange_counts;  ///< The merged count exchange, (Neighbor_)Alltoall.
-  double t_exchange_data;  ///< Posting the payload Alltoallv, plus the flattening copy.
+  double t_exchange_counts;  ///< The merged count exchange: `MPI_Neighbor_alltoall`, or NBX on the global route.
+  double t_exchange_data;  ///< Posting the payloads, plus the flattening copy.
   double t_wait;  ///< Waiting for the payloads. Absorbs load imbalance; see above.
   double t_group;  ///< De-interleaving the arrival stream by body.
   double t_reserve;  ///< Pool resize: growth inside MFTLObjectSetCounts(), plus the phase 5b shrink.
@@ -1002,7 +1166,7 @@ typedef struct
   long n_bytes_sent;  ///< Payload bytes out, wire format only.
   long n_bytes_recv;  ///< Payload bytes in.
   long n_route_neighbor;  ///< Calls that took the 26-neighbour graph route.
-  long n_route_global;  ///< Calls that fell back to the global communicator.
+  long n_route_global;  ///< Calls that took the global route (NBX and point to point on `comm_world`).
   long n_objects_visited;  ///< Bodies iterated, summed over calls.
 
   /**
@@ -1107,7 +1271,7 @@ typedef struct
   long g_n_calls;  ///< Syncs performed.
   long g_n_ghosts_requested;  ///< Ghost entities asked for, summed over calls.
   long g_n_orphaned;  ///< Ghosts whose owner was not a graph neighbour, and were SKIPPED.
-  long g_n_route_global;  ///< Ghost pulls whose #MFTL_GHOST_ROUTE_AUTO went to `comm_world` (a scaling cost no answer shows).
+  long g_n_route_global;  ///< Ghost pulls whose #MFTL_ROUTE_AUTO took the global route (a cost no answer shows).
   long g_n_bytes_sent;  ///< Request bytes out plus reply bytes out.
   long g_n_bytes_recv;  ///< Request bytes in plus reply bytes in.
   long g_n_allocs;  ///< Allocation calls on the path.
@@ -1132,7 +1296,7 @@ void MFTLRedistributeGetStats(MFTL_RedistributeStats *out);
 /**
  * @brief Collectively overwrite selected vertex/triangle ghosts with owner values.
  *
- * MFTLUpdateGhostColumns() on #MFTL_GHOST_ROUTE_GRAPH with the positions (if
+ * MFTLUpdateGhostColumns() on #MFTL_ROUTE_GRAPH with the positions (if
  * asked) and the fields as columns, in one pull. The ids are checked by one
  * `MPI_Allreduce` before it and the verdict agreed by one after it, so the
  * return is the same on every rank. A ghost whose owner is not a graph

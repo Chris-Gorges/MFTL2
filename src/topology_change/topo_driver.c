@@ -45,14 +45,6 @@ MFTL_TopologyOptions MFTLTopologyDefaultOptions(void)
 /** @brief Record layout of an event on the wire. */
 #define EVENT_STRIDE 7
 
-/** @brief Whether any destination with a non-zero count is outside the neighbourhood. */
-static bool any_far(const MFTL_Domain *dom, const int *counts)
-{
-  for (int r = 0; r < dom->nproc; ++r)
-    if (counts[r] > 0 && !MFTLTopoIsNeighbour(dom, r)) return MFTL_TRUE;
-  return MFTL_FALSE;
-}
-
 /* ═══════════════════════════════════════════════════════════════════════════
  * 1. Detection
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -399,9 +391,9 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
   {
     int *const dest = (int *) MFTLMallocOrDie((size_t) dom->nproc * sizeof(int), "topology node destinations");
     double *records = MFTL_NULL;
-    const bool far = MFTLTopoPackNodeExchange(dom, &lat, cl, n_cl, dest, &records);
+    MFTLTopoPackNodeExchange(dom, &lat, cl, n_cl, dest, &records);
     int n_recv = 0;
-    double *const recv = MFTLTopoCommExchange(dom, records, dest, 3, far, &n_recv, MFTL_NULL);
+    double *const recv = MFTLTopoCommExchange(dom, records, dest, 3, &n_recv, MFTL_NULL);
     MFTLTopoMergeNodes(&lat, cl, n_cl, recv, n_recv);
     free(recv);
     free(records);
@@ -422,20 +414,20 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
   MFTLTopoBuildPieces(dom, &lat, cl, n_cl, pieces);
   for (int c = 0; c < n_cl; ++c) MFTLLevelSetSurfaceFree(&cl[c].surf);
 
-  int *const dest = (int *) MFTLMallocOrDie(2 * (size_t) dom->nproc * sizeof(int), "topology label destinations");
-  int *const src = dest + dom->nproc;
+  int *const dest = (int *) MFTLMallocOrDie((size_t) dom->nproc * sizeof(int), "topology label destinations");
   for (;;)
   {
     bool changed = MFTLTopoLabelLocal(pieces, n_cl);
 
     double *req = MFTL_NULL;
     MFTLTopoPackLabelRequests(pieces, n_cl, dom->nproc, dest, &req);
-    const bool far = any_far(dom, dest);
     int n_req = 0;
-    double *const got = MFTLTopoCommExchange(dom, req, dest, 3, far, &n_req, src);
+    MFTL_ExchangePlan plan;
+    double *const got = MFTLTopoCommExchange(dom, req, dest, 3, &n_req, &plan);
     double *const answer = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(n_req, 1) * sizeof(double), "topology label answers");
     if (MFTLTopoServeLabelRequests(pieces, n_cl, got, n_req, answer)) changed = MFTL_TRUE;
-    double *const back = MFTLTopoCommReply(dom, answer, src, 1, far);
+    double *const back = MFTLTopoCommReply(dom, &plan, answer, 1);
+    MFTLExchangePlanFree(&plan);
     if (MFTLTopoApplyLabelReplies(pieces, n_cl, dom->nproc, back)) changed = MFTL_TRUE;
     free(back);
     free(answer);

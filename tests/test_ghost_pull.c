@@ -157,7 +157,7 @@ static int test_every_ghost_takes_its_owners_rows(void)
                                     {MFTL_GHOST_COLUMN_FIELD, vfield},
                                     {MFTL_GHOST_COLUMN_FIELD, tfield}};
   MFTLRedistributeStatsReset();
-  ok &= MFTLUpdateGhostColumns(e, cols, 5, MFTL_GHOST_ROUTE_AUTO) == MFTL_SUCCESS;
+  ok &= MFTLUpdateGhostColumns(e, cols, 5, MFTL_ROUTE_AUTO) == MFTL_SUCCESS;
   MFTL_RedistributeStats st;
   MFTLRedistributeGetStats(&st);
   ok &= st.g_n_route_global == 0;
@@ -251,7 +251,7 @@ static int test_a_keyed_pull_resolves_64_bit_keys(void)
   keyed_tally tally = {0, 0};
   MFTL_GhostPull pull;
   pull.row_bytes[MFTL_FIELD_VERTEX] = pull.row_bytes[MFTL_FIELD_TRIANGLE] = (int) sizeof(int);
-  pull.route = MFTL_GHOST_ROUTE_AUTO;
+  pull.route = MFTL_ROUTE_AUTO;
   pull.keys[MFTL_FIELD_VERTEX] = by_slot;
   pull.keys[MFTL_FIELD_TRIANGLE] = by_slot + nl + 1;
   pull.serve = serve_owner_id;
@@ -342,7 +342,7 @@ static int test_the_auto_route_reaches_owners_off_the_graph(void)
                                     {MFTL_GHOST_COLUMN_FIELD, vfield},
                                     {MFTL_GHOST_COLUMN_FIELD, tfield}};
   MFTLRedistributeStatsReset();
-  ok &= MFTLUpdateGhostColumns(e, cols, 5, MFTL_GHOST_ROUTE_AUTO) == MFTL_SUCCESS;
+  ok &= MFTLUpdateGhostColumns(e, cols, 5, MFTL_ROUTE_AUTO) == MFTL_SUCCESS;
   MFTL_RedistributeStats st;
   MFTLRedistributeGetStats(&st);
   ok &= every_row_is_the_owners(e, vfield, tfield, true);
@@ -382,7 +382,7 @@ static int test_refusals_and_a_missing_column(void)
   MFTL_GhostPull pull;
   pull.row_bytes[0] = 8;
   pull.row_bytes[1] = 0;
-  pull.route = MFTL_GHOST_ROUTE_GRAPH;
+  pull.route = MFTL_ROUTE_GRAPH;
   pull.keys[0] = pull.keys[1] = MFTL_NULL;
   pull.serve = MFTL_NULL;
   pull.apply = apply_nothing;
@@ -396,15 +396,15 @@ static int test_refusals_and_a_missing_column(void)
 
   const MFTL_GhostColumn twice[2] = {{MFTL_GHOST_COLUMN_NORMAL, 0}, {MFTL_GHOST_COLUMN_NORMAL, 0}};
   const MFTL_GhostColumn no_field = {MFTL_GHOST_COLUMN_FIELD, 3};
-  ok &= MFTLUpdateGhostColumns(e, twice, 2, MFTL_GHOST_ROUTE_GRAPH) == MFTL_ERROR;
-  ok &= MFTLUpdateGhostColumns(e, &no_field, 1, MFTL_GHOST_ROUTE_GRAPH) == MFTL_ERROR;
-  ok &= MFTLUpdateGhostColumns(e, twice, 0, MFTL_GHOST_ROUTE_GRAPH) == MFTL_ERROR;
+  ok &= MFTLUpdateGhostColumns(e, twice, 2, MFTL_ROUTE_GRAPH) == MFTL_ERROR;
+  ok &= MFTLUpdateGhostColumns(e, &no_field, 1, MFTL_ROUTE_GRAPH) == MFTL_ERROR;
+  ok &= MFTLUpdateGhostColumns(e, twice, 0, MFTL_ROUTE_GRAPH) == MFTL_ERROR;
 
   /* No body has `verts.sizing`: nothing can be served or applied. */
   long ghosts = 0;
   for (int o = 0; o < e->n_local_objects; ++o) ghosts += e->local_objects[o]->verts.n - e->local_objects[o]->verts.n_local;
   const MFTL_GhostColumn sizing = {MFTL_GHOST_COLUMN_SIZING, 0};
-  const int rc = MFTLUpdateGhostColumns(e, &sizing, 1, MFTL_GHOST_ROUTE_AUTO);
+  const int rc = MFTLUpdateGhostColumns(e, &sizing, 1, MFTL_ROUTE_AUTO);
   ok &= (rc == MFTL_ERROR) == (ghosts > 0);
 
   MFTLEnsembleDestroy(&e);

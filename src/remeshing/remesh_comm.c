@@ -238,7 +238,7 @@ int MFTLRemeshMigrateShifted(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const i
     }
   }
   int n_in = 0;
-  double *in = MFTLRemeshExchangeRecords(dom, rec, dst, n_rec, 3, &n_in);
+  double *in = (double *) MFTLExchangeRecordsTo(dom, 3 * sizeof(double), rec, dst, n_rec, &n_in);
   free(rec);
   free(dst);
 
@@ -711,7 +711,7 @@ void MFTLRemeshNeighborAlltoall(const MFTL_Domain *domain, const double *send, i
  * 5. Ghost exchanges: payloads on the library's one engine
  *
  * Every ghost refresh the remesher needs is a payload on MFTLGhostPull()
- * (mftl_communication.h) over #MFTL_GHOST_ROUTE_AUTO, the route with the global
+ * (mftl_communication.h) over #MFTL_ROUTE_AUTO, the route with the global
  * fallback a coarsened placement needs. They are listed here because this file
  * is the module's inventory of network use; none of them calls MPI. Each is a
  * pair of block callbacks (once per (body, pool), never per ghost), so the
@@ -791,7 +791,7 @@ static int pull_vertex_ints(MFTL_Ensemble *ens, MFTL_GhostServeFn serve, MFTL_Gh
   MFTL_GhostPull pull;
   pull.row_bytes[MFTL_FIELD_VERTEX] = (int) sizeof(int);
   pull.row_bytes[MFTL_FIELD_TRIANGLE] = 0;
-  pull.route = MFTL_GHOST_ROUTE_AUTO;
+  pull.route = MFTL_ROUTE_AUTO;
   pull.keys[0] = pull.keys[1] = MFTL_NULL;
   pull.serve = serve;
   pull.apply = apply;
@@ -817,7 +817,7 @@ int MFTLRemeshSyncGhostSizing(MFTL_Ensemble *ens)
 {
   MFTL_ASSERT(ens != MFTL_NULL);
   const MFTL_GhostColumn c = {MFTL_GHOST_COLUMN_SIZING, 0};
-  return MFTLUpdateGhostColumns(ens, &c, 1, MFTL_GHOST_ROUTE_AUTO);
+  return MFTLUpdateGhostColumns(ens, &c, 1, MFTL_ROUTE_AUTO);
 }
 
 /** @brief Owner side of the classification exchange: its FEATURE/CORNER bits, or #MFTL_ERROR. */
@@ -855,80 +855,11 @@ int MFTLRemeshSyncGhostPositions(MFTL_Ensemble *ens)
   /* MFTLUpdateGhostPositions() on the route with the global fallback: the same
    * payload, the same invalidation of the derived geometry. */
   const MFTL_GhostColumn c = {MFTL_GHOST_COLUMN_POSITION, 0};
-  return MFTLUpdateGhostColumns(ens, &c, 1, MFTL_GHOST_ROUTE_AUTO);
+  return MFTLUpdateGhostColumns(ens, &c, 1, MFTL_ROUTE_AUTO);
 }
 /* ═══════════════════════════════════════════════════════════════════════════
- * 6. Routed records and the projection halo
+ * 6. The projection halo
  * ═══════════════════════════════════════════════════════════════════════════ */
-
-double *MFTLRemeshExchangeRecords(const MFTL_Domain *domain, const double *rec, const int *dest, int n_rec, int width, int *n_out)
-{
-  const int nproc = domain->nproc, me = domain->rank, nn = domain->num_neighbors;
-
-  int n_self = 0;
-  for (int i = 0; i < n_rec; ++i) n_self += (dest[i] == me);
-
-  if (nproc == 1)
-  {
-    double *out = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(n_self * width, 1) * sizeof(double), "remesh records");
-    if (n_self > 0) memcpy(out, rec, (size_t) n_self * width * sizeof(double)); /* rec may be NULL when empty */
-    *n_out = n_self;
-    return out;
-  }
-
-  /* The route: the graph when every destination is a neighbour, agreed. */
-  int *const rank_to_slot = (int *) MFTLMallocOrDie((size_t) nproc * sizeof(int), "remesh records slot index");
-  for (int r = 0; r < nproc; ++r) rank_to_slot[r] = MFTL_ERROR;
-  for (int i = 0; i < nn; ++i) rank_to_slot[domain->neighbors[i]] = i;
-  int needs_global = 0;
-  for (int i = 0; i < n_rec && !needs_global; ++i)
-    if (dest[i] != me && (dest[i] < 0 || dest[i] >= nproc || rank_to_slot[dest[i]] == MFTL_ERROR)) needs_global = 1;
-  MPI_Allreduce(MPI_IN_PLACE, &needs_global, 1, MPI_INT, MPI_LOR, domain->comm_world);
-
-  const int n_slots = needs_global ? nproc : nn;
-  if (needs_global)
-    for (int r = 0; r < nproc; ++r) rank_to_slot[r] = r;
-
-  int *const cnt = (int *) MFTLCallocOrDie((size_t) 4 * MFTL_MAX(n_slots, 1), sizeof(int), "remesh records counts");
-  int *const rcnt = cnt + n_slots, *const sdis = cnt + 2 * n_slots, *const rdis = cnt + 3 * n_slots;
-  for (int i = 0; i < n_rec; ++i)
-    if (dest[i] != me) cnt[rank_to_slot[dest[i]]] += width;
-  int stot = 0;
-  for (int k = 0; k < n_slots; ++k) sdis[k] = stot, stot += cnt[k];
-  double *const sbuf = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(stot, 1) * sizeof(double), "remesh records send");
-  int *const fill = (int *) MFTLCallocOrDie((size_t) MFTL_MAX(n_slots, 1), sizeof(int), "remesh records fill");
-  for (int i = 0; i < n_rec; ++i)
-  {
-    if (dest[i] == me) continue;
-    const int k = rank_to_slot[dest[i]];
-    memcpy(&sbuf[sdis[k] + fill[k]], &rec[(size_t) i * width], (size_t) width * sizeof(double));
-    fill[k] += width;
-  }
-  free(fill);
-
-  if (needs_global)
-    MPI_Alltoall(cnt, 1, MPI_INT, rcnt, 1, MPI_INT, domain->comm_world);
-  else
-    MPI_Neighbor_alltoall(cnt, 1, MPI_INT, rcnt, 1, MPI_INT, domain->comm_graph);
-  int rtot = 0;
-  for (int k = 0; k < n_slots; ++k) rdis[k] = rtot, rtot += rcnt[k];
-
-  double *const out = (double *) MFTLMallocOrDie((size_t) MFTL_MAX((size_t) n_self * width + rtot, 1) * sizeof(double), "remesh records received");
-  int w = 0;
-  for (int i = 0; i < n_rec; ++i)
-    if (dest[i] == me) memcpy(&out[(size_t) (w++) * width], &rec[(size_t) i * width], (size_t) width * sizeof(double));
-  double *const rbuf = out + (size_t) n_self * width;
-  if (needs_global)
-    MPI_Alltoallv(sbuf, cnt, sdis, MPI_DOUBLE, rbuf, rcnt, rdis, MPI_DOUBLE, domain->comm_world);
-  else
-    MPI_Neighbor_alltoallv(sbuf, cnt, sdis, MPI_DOUBLE, rbuf, rcnt, rdis, MPI_DOUBLE, domain->comm_graph);
-
-  free(sbuf);
-  free(cnt);
-  free(rank_to_slot);
-  *n_out = n_self + rtot / width;
-  return out;
-}
 
 int MFTLRemeshReferenceHalo(MFTL_Ensemble *ens, double width, double **out, int *n_out)
 {
@@ -1015,7 +946,7 @@ int MFTLRemeshReferenceHalo(MFTL_Ensemble *ens, double width, double **out, int 
     }
   }
 
-  *out = MFTLRemeshExchangeRecords(dom, rec, dst, n_rec, MFTL_REMESH_REF_HALO_WIDTH, n_out);
+  *out = (double *) MFTLExchangeRecordsTo(dom, MFTL_REMESH_REF_HALO_WIDTH * sizeof(double), rec, dst, n_rec, n_out);
   free(rec);
   free(dst);
   return MFTL_SUCCESS;

@@ -163,7 +163,7 @@ static int apply_columns(MFTL_Object *obj, int slot, MFTL_FieldEntity pool, cons
   return skipped;
 }
 
-int MFTLUpdateGhostColumns(MFTL_Ensemble *ens, const MFTL_GhostColumn *columns, int n_columns, MFTL_GhostRoute route)
+int MFTLUpdateGhostColumns(MFTL_Ensemble *ens, const MFTL_GhostColumn *columns, int n_columns, MFTL_Route route)
 {
   if (ens == MFTL_NULL || columns == MFTL_NULL || n_columns < 1) return MFTL_ERROR;
 
@@ -245,13 +245,13 @@ int MFTLUpdateGhostColumns(MFTL_Ensemble *ens, const MFTL_GhostColumn *columns, 
 int MFTLUpdateGhostPositions(MFTL_Ensemble *ens)
 {
   const MFTL_GhostColumn c = {MFTL_GHOST_COLUMN_POSITION, 0};
-  return MFTLUpdateGhostColumns(ens, &c, 1, MFTL_GHOST_ROUTE_GRAPH);
+  return MFTLUpdateGhostColumns(ens, &c, 1, MFTL_ROUTE_GRAPH);
 }
 
 int MFTLUpdateGhostVertexNormals(MFTL_Ensemble *ens)
 {
   const MFTL_GhostColumn c = {MFTL_GHOST_COLUMN_NORMAL, 0};
-  return MFTLUpdateGhostColumns(ens, &c, 1, MFTL_GHOST_ROUTE_GRAPH);
+  return MFTLUpdateGhostColumns(ens, &c, 1, MFTL_ROUTE_GRAPH);
 }
 
 int MFTLUpdateGhostFields(MFTL_Ensemble *ens, const int *ids, int nfields, bool with_positions)
@@ -276,7 +276,7 @@ int MFTLUpdateGhostFields(MFTL_Ensemble *ens, const int *ids, int nfields, bool 
   int n = 0;
   if (with_positions) cols[n++] = (MFTL_GhostColumn){MFTL_GHOST_COLUMN_POSITION, 0};
   for (int j = 0; j < nfields; ++j) cols[n++] = (MFTL_GhostColumn){MFTL_GHOST_COLUMN_FIELD, ids[j]};
-  int ok = MFTLUpdateGhostColumns(ens, cols, n, MFTL_GHOST_ROUTE_GRAPH) == MFTL_SUCCESS;
+  int ok = MFTLUpdateGhostColumns(ens, cols, n, MFTL_ROUTE_GRAPH) == MFTL_SUCCESS;
   free(cols);
 
   /* The same verdict everywhere: an unreachable ghost on one rank is a failure

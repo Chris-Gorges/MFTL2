@@ -1271,17 +1271,18 @@ both directions on a $\{P,1,1\}$ grid.
 | `MFTLRemeshAgree*` | Allreduce | a few scalars |
 | `MFTLRemeshNeighborGather` / `Allgather` / `Alltoall` | `comm_graph` | 3 doubles per body a rank speaks for or moves; 1–2 doubles per neighbour per round |
 | `MFTLRemeshMeasureBodies` | 2 × `MFTLEnsembleReduceBodies` + scalar `MPI_MAX` | 9 + 1 doubles per local body |
-| `MFTLRemeshSyncGhostIds` | `MFTLGhostPull` on `MFTL_GHOST_ROUTE_AUTO`: LOR + request/reply over `comm_graph` (global fallback) | 4 B per ghost vertex |
+| `MFTLRemeshSyncGhostIds` | `MFTLGhostPull` on `MFTL_ROUTE_AUTO`: LOR + request/reply over `comm_graph` (global route) | 4 B per ghost vertex |
 | `MFTLRemeshSyncGhostPositions` | `MFTLUpdateGhostColumns` (positions), the same route | 32 B per ghost vertex, once per smoothing sweep outside a placement (NESTED; ONCE's band) |
 | `MFTLRemeshSyncGhostSizing` | `MFTLUpdateGhostColumns` (sizing), the same route | 16 B per ghost vertex, after each migration under curvature sizing |
 | `MFTLRemeshSyncGhostClass` | `MFTLGhostPull`, the same route | the owner's corner classification, once per pass with projection |
-| `MFTLRemeshReferenceHalo` | `MFTLRemeshExchangeRecords` | 23 doubles per input triangle within $w$ of a neighbour's cell, once per pass with projection |
-| `MFTLRemeshExchangeRecords` | counts + `Neighbor_alltoallv` over `comm_graph`, or `Alltoallv` (agreed by LOR) | fixed-width records to named ranks; also carries the sizing field through migrations (3 doubles per vertex) |
+| `MFTLRemeshReferenceHalo` | the library's `MFTLExchangeRecordsTo`: LOR + counts + data over `comm_graph`, or NBX + point to point (global route) | 23 doubles per input triangle within $w$ of a neighbour's cell, once per pass with projection |
+| sizing carry (`MFTLRemeshMigrateShifted` under curvature sizing) | `MFTLExchangeRecordsTo`, the same route | 3 doubles per owned vertex, through every migration |
 | `MFTLRemeshAgreeParams` | Allreduce(MIN) | 49 doubles, once per call, at the first collective |
 
 Nothing in `src/remeshing/` allocates or sends a quantity proportional to $B$;
-proportional to $P$ are only the arrays of a ghost pull that had to take its
-global route and redistribution's own. Nothing is proportional to a body's id
+proportional to $P$ are only the local counting arrays of a ghost pull that had
+to take its global route and redistribution's own; no message is (the global
+route discovers its partners by NBX). Nothing is proportional to a body's id
 range: the owner side of every ghost pull keys its table by the requests and
 streams its owned ids past it once (the remesher's private copy used to allocate
 and clear a `next_vertex_gid`-sized array per asked body per call, i.e.

@@ -1571,7 +1571,7 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
     x[1].recv_count = 0;
 
     MFTL_ExchangeCtx ctx;
-    MFTLExchangeStart(domain, x, 2, MFTL_FALSE, &ctx);
+    MFTLExchangeStart(domain, x, 2, MFTL_ROUTE_GRAPH, MFTL_FALSE, &ctx);
     MFTLExchangeWait(&ctx, 0);
     MFTLExchangeWait(&ctx, 1);
 

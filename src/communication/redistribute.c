@@ -2034,18 +2034,9 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
     if (dirty_global[o] == 0.0) MFTLCommStats.n_objects_settled++;
   }
 
-  /* ── Phase 2: agree on the route. Collective by necessity: a non-neighbour
-   * receiver cannot know it must listen on the global path. */
-  CS_BEGIN(ts_route);
-  int global_decision = 0;
-  MPI_Allreduce(&requires_global, &global_decision, 1, MPI_INT, MPI_LOR, domain->comm_cart);
-  CS_END(ts_route, t_route);
-  if (global_decision)
-    MFTLCommStats.n_route_global++;
-  else
-    MFTLCommStats.n_route_neighbor++;
-
-  /* ── Phase 3: exchange ─────────────────────────────────────────────────── */
+  /* ── Phases 2 and 3: agree on the route and exchange. The route vote is
+   * collective by necessity -- a non-neighbour receiver cannot know it must
+   * listen -- and lives in the exchange engine (MFTL_ROUTE_AUTO). */
   MFTL_Exchange xfer[4];
   xfer[0].send_bufs = send_verts;
   xfer[0].type = MFTL_MPI_PackedVertex;
@@ -2089,7 +2080,11 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
   }
 
   MFTL_ExchangeCtx ctx;
-  MFTLExchangeStart(domain, xfer, with_fields ? 4 : 3, global_decision != 0, &ctx);
+  MFTLExchangeStart(domain, xfer, with_fields ? 4 : 3, MFTL_ROUTE_AUTO, requires_global != 0, &ctx);
+  if (ctx.global)
+    MFTLCommStats.n_route_global++;
+  else
+    MFTLCommStats.n_route_neighbor++;
 
   /* The send buffers were copied; they persist for the next call. */
 

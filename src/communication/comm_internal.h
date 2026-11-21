@@ -489,4 +489,119 @@ mftl_gid_table *MFTLCommWorkspaceGhostTable(MFTL_Ensemble *ens);
  */
 const int *MFTLCommWorkspaceNeighborSlots(MFTL_Ensemble *ens);
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * The routed exchange's transport (exchange.c): the route vote, the count
+ * exchange and the data posts that MFTLExchangeStart(), MFTLExchangeRecords(),
+ * MFTLExchangeRecordsTo() and MFTLGhostPull() are front-ends of. A caller
+ * fills in its destinations and per-destination counts, and gets back PEERS --
+ * the graph neighbours, or on the global route every rank it sends to or
+ * receives from -- with what it sends and receives from each; everything after
+ * that is indexed by peer, the same way on both routes.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/** @brief Tag of the global route's count discovery on `comm_world`. Nothing
+ *         else in the library sends point to point there (the coupler has its own
+ *         communicator). */
+#define MFTL_TAG_ROUTE_COUNTS 20800
+
+/** @brief First tag of the global route's data; a caller adds its payload index (< 16). */
+#define MFTL_TAG_ROUTE_DATA 20816
+
+/** @brief Peers and counts of one routed exchange. */
+typedef struct
+{
+  bool global;  ///< The global route; otherwise `comm_graph`.
+  int k;  ///< Count ints per peer.
+  int n;  ///< Peers.
+  const int *peer;  ///< [n] ranks: `domain->neighbors` (graph), ascending (global).
+  const int *scnt;  ///< [n * k] counts sent to each peer, peer-major.
+  int *rcnt;  ///< [n * k] counts received from each peer, peer-major.
+
+  /* private */
+  int *own;  ///< The allocation behind `rcnt` (and on the global route `peer`, `scnt`).
+  MPI_Request req;  ///< The graph route's count exchange in flight.
+  MPI_Request *sreq;  ///< The global route's discovery sends.
+  int n_sreq;  ///< Entries of `sreq`.
+  int n_dst;  ///< Global: destinations handed to begin.
+  const int *dst;  ///< Global: their ranks, ascending.
+  const int *dcnt;  ///< Global: their counts, `[n_dst * k]`.
+} mftl_route;
+
+/**
+ * @brief THE route vote of the library: `false` (graph) under #MFTL_ROUTE_GRAPH
+ *        or on one rank; under #MFTL_ROUTE_AUTO, whether ANY rank passes
+ *        @p far, by one `MPI_Allreduce(LOR)`.
+ *
+ * Every global-route discovery is preceded by its own vote, which is what keeps two
+ * consecutive NBX rounds on one tag apart (MFTLNbxComplete()).
+ *
+ * @param domain The domain.
+ * @param route  Identical on every rank.
+ * @param far    This rank addresses a rank that is neither itself nor a graph neighbour.
+ * @return The agreed route: `true` for the global one.
+ */
+bool MFTLExchangeAgreeRoute(const MFTL_Domain *domain, MFTL_Route route, bool far);
+
+/**
+ * @brief Starts the count exchange of a routed exchange.
+ *
+ * Graph route: @p dst must be `domain->neighbors` (`n_dst == num_neighbors`),
+ * @p dcnt by slot; one `MPI_(I)neighbor_alltoall` of @p k ints. Global route:
+ * @p dst ascending and distinct; a synchronous send of @p k ints to each one
+ * with a non-zero count. @p dst and @p dcnt must stay valid until
+ * MFTLRouteCountsEnd().
+ *
+ * @param domain  The domain.
+ * @param rt      Out: the route; `global` must be set by the caller.
+ * @param k       Count ints per destination.
+ * @param n_dst   Destinations.
+ * @param dst     `[n_dst]` their ranks.
+ * @param dcnt    `[n_dst * k]` counts, destination-major.
+ * @param overlap Graph route: post the count exchange non-blocking (for work
+ *                between begin and end); otherwise it completes here.
+ */
+void MFTLRouteCountsBegin(const MFTL_Domain *domain, mftl_route *rt, int k, int n_dst, const int *dst, const int *dcnt, bool overlap);
+
+/**
+ * @brief Completes the count exchange: on the global route the NBX discovery,
+ *        then the peers (the ascending union of destinations and sources).
+ * @param domain The domain.
+ * @param rt     The route of MFTLRouteCountsBegin(); `n`, `peer`, `scnt`, `rcnt` set on return.
+ */
+void MFTLRouteCountsEnd(const MFTL_Domain *domain, mftl_route *rt);
+
+/**
+ * @brief Posts one payload of a routed exchange: `sc[i]` elements from
+ *        `sbuf + sd[i]` to peer i, `rc[i]` into `rbuf + rd[i]` from peer i
+ *        (counts and displacements in elements of @p type).
+ *
+ * Graph route: `MPI_Neighbor_alltoallv`, or `MPI_Ineighbor_alltoallv` when
+ * @p reqs is given. Global route: one `MPI_Irecv` / `MPI_Isend` per non-empty
+ * direction of each peer, on `comm_world` with @p tag; completed here unless
+ * @p reqs is given.
+ *
+ * @param domain The domain.
+ * @param global The agreed route.
+ * @param n      Peers.
+ * @param peer   `[n]` their ranks (graph: `domain->neighbors`).
+ * @param type   The element type.
+ * @param sbuf   Send buffer.
+ * @param sc     `[n]` elements to each peer.
+ * @param sd     `[n]` their displacements.
+ * @param rbuf   Receive buffer.
+ * @param rc     `[n]` elements from each peer.
+ * @param rd     `[n]` their displacements.
+ * @param tag    Global route's tag, #MFTL_TAG_ROUTE_DATA plus the payload index.
+ * @param[out] reqs   #MFTL_NULL to complete here; else a `malloc`'d request array the caller waits on and frees.
+ * @param[out] n_reqs Entries of `*reqs`.
+ */
+void MFTLRoutePost(const MFTL_Domain *domain, bool global, int n, const int *peer, MPI_Datatype type, const void *sbuf, const int *sc, const int *sd,
+                   void *rbuf, const int *rc, const int *rd, int tag, MPI_Request **reqs, int *n_reqs);
+
+/**
+ * @brief Releases a route. Safe to call twice.
+ * @param rt The route.
+ */
+void MFTLRouteFree(mftl_route *rt);
+
 #endif  // MFTL_COMM_INTERNAL_H

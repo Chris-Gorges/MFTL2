@@ -728,6 +728,17 @@ mftl_add_mpi_test_at(test_ghost_pull_np4 test_ghost_pull 4)
 mftl_add_mpi_test_oversub(test_ghost_pull_np8 test_ghost_pull 8)
 mftl_add_mpi_test_oversub(test_ghost_pull_np27 test_ghost_pull 27)
 
+# The routed personalised exchange every module sends through (records and their
+# replies, typed payloads, the NBX loop): every byte against a reference each
+# rank computes for every source, in the promised receive order, on both routes;
+# forty sparse rounds back to back. Non-vacuous by count: cross-rank records from
+# np = 2, sparse rounds from np = 3 (slabs whose ends are not neighbours).
+mftl_add_mpi_test(test_exchange 1)
+mftl_add_mpi_test_at(test_exchange_np2 test_exchange 2)
+mftl_add_mpi_test_at(test_exchange_np4 test_exchange 4)
+mftl_add_mpi_test_oversub(test_exchange_np8 test_exchange 8)
+mftl_add_mpi_test_oversub(test_exchange_np27 test_exchange 27)
+
 # --- Labels of the tests registered directly with add_test ---------------------
 
 set_property(TEST test_remeshing_mpi_is_confined test_topology_change_mpi_is_confined

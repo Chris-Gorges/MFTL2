@@ -18,7 +18,7 @@
  *
  * The pools (a reply width per pool, zero leaves it out), the key (the global
  * id, or a caller's 64-bit key for entities whose ids are not agreed yet), the
- * route (graph only, or graph with an agreed global fallback) and the payload
+ * route (graph only, or graph with the agreed global route) and the payload
  * (two callbacks). The payload callbacks run once per (body, pool) BLOCK, never
  * per ghost: an earlier shared version that asked "which payload?" once per
  * ghost slowed the per-timestep position sync (remesh_comm.h), and a block call
@@ -27,9 +27,11 @@
  * ## Cost per call
  *
  * Requests 8 B per ghost (12 B keyed), replies `row_bytes`; three exchanges on
- * the route, the count exchange overlapped with packing the requests, and the
- * reply needing no count exchange because there is one reply per request. One
- * `MPI_Allreduce` more under the AUTO route, none under GRAPH. Nothing per call
+ * the library's routed exchange (comm_internal.h): the count exchange
+ * overlapped with packing the requests on the graph route (NBX on the global
+ * route), and the reply needing no count exchange because there is one reply
+ * per request. One `MPI_Allreduce` more under the AUTO route (the library's
+ * route vote), none under GRAPH. Nothing per call
  * is sized by the process count on the graph route (the rank-to-neighbour
  * table lives in the communication workspace) or by a large body's id range:
  * the owner keys its lookup by the REQUESTS and streams its owned ids past it
@@ -107,10 +109,12 @@ typedef struct
   MFTL_Ensemble *ens;
   const MFTL_GhostPull *pull;
   const int *nslot;  ///< `[nproc]` rank -> graph slot (#MFTL_ERROR: not a neighbour).
+  const int *peer;  ///< Global route: `[n_slots]` the peers, ascending.
   int nproc;
-  int n_slots;  ///< Graph degree, or nproc on the global route.
+  int n_slots;  ///< Graph degree, or the global route's peers.
   int rq;  ///< Ints per request: 2 (body, id) or 3 (body, 64-bit key).
   bool global;  ///< The global route was agreed.
+  bool by_rank;  ///< Counting per RANK, to find the global route's destinations.
   bool keyed;  ///< Ghosts are named by the caller's keys, not by global id.
 } pull_plan;
 
@@ -131,12 +135,24 @@ static inline bool takes_part(const pull_plan *pl, int o, int p)
  * @brief The exchange slot that reaches rank @p owner, or #MFTL_ERROR.
  * @param pl    The plan.
  * @param owner A ghost's `owner_proc`.
- * @return Graph slot or rank; #MFTL_ERROR if unreachable on this route or corrupt.
+ * @return Graph slot, peer index, or the rank itself while counting by rank;
+ *         #MFTL_ERROR if unreachable on this route or corrupt.
  */
 static inline int slot_of_owner(const pull_plan *pl, int owner)
 {
   if (owner < 0 || owner >= pl->nproc) return MFTL_ERROR;
-  return pl->global ? owner : pl->nslot[owner];
+  if (pl->by_rank) return owner;
+  if (!pl->global) return pl->nslot[owner];
+  int lo = 0, hi = pl->n_slots;  // the global route's peers ascend
+  while (lo < hi)
+  {
+    const int mid = (lo + hi) / 2;
+    if (pl->peer[mid] < owner)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  return (lo < pl->n_slots && pl->peer[lo] == owner) ? lo : MFTL_ERROR;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -423,7 +439,7 @@ int MFTLGhostPull(MFTL_Ensemble *ens, const MFTL_GhostPull *pull)
   /* Arguments are identical on every rank, so these refusals are unanimous. */
   if (ens == MFTL_NULL || pull == MFTL_NULL || pull->serve == MFTL_NULL || pull->apply == MFTL_NULL) return MFTL_ERROR;
   if (pull->row_bytes[0] < 0 || pull->row_bytes[1] < 0 || pull->row_bytes[0] + pull->row_bytes[1] == 0) return MFTL_ERROR;
-  if (pull->route != MFTL_GHOST_ROUTE_GRAPH && pull->route != MFTL_GHOST_ROUTE_AUTO) return MFTL_ERROR;
+  if (pull->route != MFTL_ROUTE_GRAPH && pull->route != MFTL_ROUTE_AUTO) return MFTL_ERROR;
 
   const MFTL_Domain *const dom = &ens->domain;
   const int nproc = dom->nproc;
@@ -434,7 +450,7 @@ int MFTLGhostPull(MFTL_Ensemble *ens, const MFTL_GhostPull *pull)
    * collective below. A rank without graph neighbours expects no message on the
    * graph route. */
   if (ens->n_bodies_global == 0 || nproc == 1) return MFTL_SUCCESS;
-  if (pull->route == MFTL_GHOST_ROUTE_GRAPH && nn == 0) return MFTL_SUCCESS;
+  if (pull->route == MFTL_ROUTE_GRAPH && nn == 0) return MFTL_SUCCESS;
 
   CS_BEGIN(ts_total);
   MFTLCommStats.g_n_calls++;
@@ -444,9 +460,11 @@ int MFTLGhostPull(MFTL_Ensemble *ens, const MFTL_GhostPull *pull)
   pl.ens = ens;
   pl.pull = pull;
   pl.nslot = MFTLCommWorkspaceNeighborSlots(ens);
+  pl.peer = MFTL_NULL;
   pl.nproc = nproc;
   pl.n_slots = nn;
   pl.global = MFTL_FALSE;
+  pl.by_rank = MFTL_FALSE;
   pl.keyed = (pull->keys[0] != MFTL_NULL || pull->keys[1] != MFTL_NULL);
   pl.rq = pl.keyed ? 1 + (int) (sizeof(long long) / sizeof(int)) : 2;
   const int rq = pl.rq;
@@ -456,24 +474,42 @@ int MFTLGhostPull(MFTL_Ensemble *ens, const MFTL_GhostPull *pull)
   int far = 0, bad = 0;
   count_requests(&pl, cnt, &far, &bad);
 
-  if (pull->route == MFTL_GHOST_ROUTE_AUTO)
+  mftl_route rt;
+  memset(&rt, 0, sizeof rt);
+  if (pull->route == MFTL_ROUTE_AUTO)
   {
     /* An owner outside the 26-neighbourhood (a coarsened placement, a body that
      * made redistribution go global) cannot be reached on the graph, and a
      * dropped request is silent: a stale id later tears the surface in the
-     * closing redistribution. One int decides, and only a global verdict makes
-     * any rank pay the nproc-sized arrays (and a second counting pass). */
-    int go_global = (far > 0);
-    MPI_Allreduce(MPI_IN_PLACE, &go_global, 1, MPI_INT, MPI_LOR, dom->comm_world);
-    if (go_global)
+     * closing redistribution. One int decides (the library's route vote), and
+     * only the global verdict pays a second counting pass. */
+    if (MFTLExchangeAgreeRoute(dom, MFTL_ROUTE_AUTO, far > 0))
     {
       MFTLCommStats.g_n_route_global++;
-      pl.global = MFTL_TRUE;
-      pl.n_slots = nproc;
-      free(cnt);
-      cnt = (int *) MFTLCallocOrDie((size_t) 2 * nproc, sizeof(int), "ghost pull counts");
+      /* Count per rank; the destinations are the ranks with requests, ascending,
+       * compacted in place (destination i is never after rank i). */
+      int *const by_rank = (int *) MFTLCallocOrDie((size_t) 3 * nproc, sizeof(int), "ghost pull counts by rank");
+      int *const dst = by_rank + 2 * (size_t) nproc;
+      pl.by_rank = MFTL_TRUE;
       far = bad = 0;
-      count_requests(&pl, cnt, &far, &bad);
+      count_requests(&pl, by_rank, &far, &bad);
+      pl.by_rank = MFTL_FALSE;
+      int n_dst = 0;
+      for (int r = 0; r < nproc; ++r)
+      {
+        if (by_rank[2 * r] + by_rank[2 * r + 1] == 0) continue;
+        by_rank[2 * n_dst] = by_rank[2 * r];
+        by_rank[2 * n_dst + 1] = by_rank[2 * r + 1];
+        dst[n_dst++] = r;
+      }
+      /* The discovery is not overlapped with packing: packing needs the peers. */
+      rt.global = MFTL_TRUE;
+      MFTLRouteCountsBegin(dom, &rt, 2, n_dst, dst, by_rank, MFTL_FALSE);
+      MFTLRouteCountsEnd(dom, &rt);
+      free(by_rank);
+      pl.global = MFTL_TRUE;
+      pl.peer = rt.peer;
+      pl.n_slots = rt.n;
     }
     else if (nn == 0)
     {
@@ -499,14 +535,10 @@ int MFTLGhostPull(MFTL_Ensemble *ens, const MFTL_GhostPull *pull)
   }
   CS_END(ts_collect, g_t_collect);
 
-  /* ── 2. Counts out, overlapped with packing the requests ─────────────────── */
+  /* ── 2. Counts out, overlapped with packing the requests (graph route) ───── */
   CS_BEGIN(ts_counts);
-  int *const rc = (int *) MFTLMallocOrDie((size_t) 2 * S * sizeof(int), "ghost pull receive counts");
-  MPI_Request count_req;
-  if (pl.global)
-    MPI_Ialltoall(cnt, 2, MPI_INT, rc, 2, MPI_INT, dom->comm_world, &count_req);
-  else
-    MPI_Ineighbor_alltoall(cnt, 2, MPI_INT, rc, 2, MPI_INT, dom->comm_graph, &count_req);
+  if (!pl.global) MFTLRouteCountsBegin(dom, &rt, 2, nn, dom->neighbors, cnt, MFTL_TRUE);
+  const int *const sc = rt.scnt;  // per (peer, pool)
 
   /* [send counts | send displs | recv counts | recv displs] in INTS for the
    * request exchange, then the same four in BYTES for the reply. */
@@ -521,12 +553,12 @@ int MFTLGhostPull(MFTL_Ensemble *ens, const MFTL_GhostPull *pull)
   {
     s_disp[d] = checked_count(dom, n_out_ll * rq);
     seg[2 * d] = (int) n_out_ll;
-    n_out_ll += cnt[2 * d];
+    n_out_ll += sc[2 * d];
     seg[2 * d + 1] = (int) n_out_ll;
-    n_out_ll += cnt[2 * d + 1];
-    s_ints[d] = checked_count(dom, ((long long) cnt[2 * d] + cnt[2 * d + 1]) * rq);
+    n_out_ll += sc[2 * d + 1];
+    s_ints[d] = checked_count(dom, ((long long) sc[2 * d] + sc[2 * d + 1]) * rq);
     x_disp[d] = checked_count(dom, x_total);
-    x_bytes[d] = checked_count(dom, (long long) cnt[2 * d] * w[0] + (long long) cnt[2 * d + 1] * w[1]);
+    x_bytes[d] = checked_count(dom, (long long) sc[2 * d] * w[0] + (long long) sc[2 * d + 1] * w[1]);
     x_total += x_bytes[d];
   }
   const int n_out = checked_count(dom, n_out_ll);
@@ -539,7 +571,8 @@ int MFTLGhostPull(MFTL_Ensemble *ens, const MFTL_GhostPull *pull)
   int *const tidx = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_out, 1) * sizeof(int), "ghost pull targets");
   pack_requests(&pl, cur, sreq, tslot, tidx);
 
-  MPI_Wait(&count_req, MPI_STATUS_IGNORE);
+  if (!pl.global) MFTLRouteCountsEnd(dom, &rt);
+  const int *const rc = rt.rcnt;
   CS_END(ts_counts, g_t_counts);
 
   /* ── 3. Requests out ─────────────────────────────────────────────────────── */
@@ -559,10 +592,7 @@ int MFTLGhostPull(MFTL_Ensemble *ens, const MFTL_GhostPull *pull)
   const int n_y = checked_count(dom, y_total);
 
   int *const rreq = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_in * rq, 1) * sizeof(int), "ghost pull incoming requests");
-  if (pl.global)
-    MPI_Alltoallv(sreq, s_ints, s_disp, MPI_INT, rreq, r_ints, r_disp, MPI_INT, dom->comm_world);
-  else
-    MPI_Neighbor_alltoallv(sreq, s_ints, s_disp, MPI_INT, rreq, r_ints, r_disp, MPI_INT, dom->comm_graph);
+  MFTLRoutePost(dom, pl.global, S, rt.peer, MPI_INT, sreq, s_ints, s_disp, rreq, r_ints, r_disp, MFTL_TAG_ROUTE_DATA, MFTL_NULL, MFTL_NULL);
   free(sreq);
   CS_END(ts_req, g_t_requests);
 
@@ -676,10 +706,7 @@ int MFTLGhostPull(MFTL_Ensemble *ens, const MFTL_GhostPull *pull)
   /* ── 5. Replies back: one per request, so both sides know the counts ─────── */
   CS_BEGIN(ts_rep);
   unsigned char *const incoming = (unsigned char *) MFTLMallocOrDie((size_t) MFTL_MAX(n_x, 1), "ghost pull incoming replies");
-  if (pl.global)
-    MPI_Alltoallv(reply, y_bytes, y_disp, MPI_BYTE, incoming, x_bytes, x_disp, MPI_BYTE, dom->comm_world);
-  else
-    MPI_Neighbor_alltoallv(reply, y_bytes, y_disp, MPI_BYTE, incoming, x_bytes, x_disp, MPI_BYTE, dom->comm_graph);
+  MFTLRoutePost(dom, pl.global, S, rt.peer, MPI_BYTE, reply, y_bytes, y_disp, incoming, x_bytes, x_disp, MFTL_TAG_ROUTE_DATA + 1, MFTL_NULL, MFTL_NULL);
   free(reply);
   CS_END(ts_rep, g_t_replies);
 
@@ -692,7 +719,7 @@ int MFTLGhostPull(MFTL_Ensemble *ens, const MFTL_GhostPull *pull)
     for (int p = 0; p < 2; ++p)
     {
       const int begin = seg[2 * d + p];
-      const int end = begin + cnt[2 * d + p];
+      const int end = begin + sc[2 * d + p];
       for (int k = begin; k < end;)
       {
         const int o = tslot[k];
@@ -701,7 +728,7 @@ int MFTLGhostPull(MFTL_Ensemble *ens, const MFTL_GhostPull *pull)
         skipped += pull->apply(ens->local_objects[o], o, (MFTL_FieldEntity) p, tidx + k, k1 - k, rows + (size_t) (k - begin) * w[p], pull->ctx);
         k = k1;
       }
-      rows += (size_t) cnt[2 * d + p] * w[p];
+      rows += (size_t) sc[2 * d + p] * w[p];
     }
   }
   CS_END(ts_apply, g_t_apply);
@@ -715,7 +742,7 @@ int MFTLGhostPull(MFTL_Ensemble *ens, const MFTL_GhostPull *pull)
   free(tidx);
   free(seg);
   free(ix);
-  free(rc);
+  MFTLRouteFree(&rt);
   free(cnt);
   CS_END(ts_free, g_t_teardown);
   CS_END(ts_total, g_t_total);

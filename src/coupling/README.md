@@ -240,9 +240,11 @@ window         band (routes, images, bins), pack lists, served table     (no mes
 
 **Discovery is geometric and sparse.** The ranks a box touches are enumerated
 arithmetically from the process grid — never a loop over P. Requests and directory
-entries go by Hoefler–Siebert–Lumsdaine's NBX: synchronous sends, probe and receive,
-a non-blocking barrier once this rank's sends have been matched; a phase's messages
-can never leak into the next. Nothing assumes 26 neighbours: a kernel wider than a
+entries go by Hoefler–Siebert–Lumsdaine's NBX (the library's one loop,
+`MFTLNbxComplete`; framing, chunks and the memory budget stay in `coupling_comm.c`):
+synchronous sends, probe and receive, a non-blocking barrier once this rank's sends
+have been matched; each phase has its own tag, so a phase's messages can never leak
+into the next. Nothing assumes 26 neighbours: a kernel wider than a
 rank box reaches owners several boxes away (`test_a_support_wider_than_a_rank_box`,
 nine or more peers on 3×3×3). Directory shards use compact bounds trees. A marker
 far from its rank looks up certificates in the relevant shards; it does not grow

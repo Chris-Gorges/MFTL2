@@ -14,10 +14,12 @@
  *                 registration bounds); O(1) payload, independent of P.
  *   NBX           sparse exchange to receivers that do not know they will
  *                 receive (directory publication, support requests): Hoefler,
- *                 Siebert & Lumsdaine's protocol -- synchronous sends, probe and
- *                 receive, a non-blocking barrier entered once this rank's sends
- *                 have been MATCHED, and receiving continues until it completes.
- *                 Messages of one phase therefore never leak into the next.
+ *                 Siebert & Lumsdaine's protocol, the library's one loop
+ *                 (MFTLNbxComplete()) -- synchronous sends, probe and receive, a
+ *                 non-blocking barrier entered once this rank's sends have been
+ *                 MATCHED, and receiving continues until it completes. Each
+ *                 phase has its own tag, so messages of one phase never leak
+ *                 into the next.
  *   known peers   replies: both sides know the partner set, the receiver does
  *                 not know the size, so it probes the named source.
  *   schedules     fetch and spread: sizes known on both sides, split into
@@ -39,6 +41,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "mftl_communication.h"
 #include "mftl_constants.h"
 #include "mftl_memory.h"
 
@@ -264,6 +267,30 @@ static int cmp_msg(const void *a, const void *b)
   return (x > y) - (x < y);
 }
 
+/** @brief What the NBX receive callback fills: the framed messages, in the coupler's budget. */
+typedef struct
+{
+  cpl_msg *got;  ///< Messages received.
+  int n;  ///< Held.
+  int cap;  ///< Allocated.
+  long *bytes;  ///< The caller's byte counter, or NULL.
+} nbx_inbox;
+
+/** @brief MFTL_NbxReceiveFn: one framed (possibly chunked) message. */
+static void nbx_receive(MPI_Comm c, const MPI_Status *probed, void *ctx)
+{
+  nbx_inbox *const box = (nbx_inbox *) ctx;
+  if (box->n == box->cap)
+  {
+    box->cap *= 2;
+    box->got = (cpl_msg *) MFTLCplRealloc(box->got, (size_t) box->cap * sizeof(cpl_msg), "nbx receive list");
+  }
+  MPI_Status st = *probed;
+  recv_framed(c, probed->MPI_TAG, &st, &box->got[box->n]);
+  if (box->bytes) *box->bytes += (long) box->got[box->n].bytes + 8;
+  ++box->n;
+}
+
 int MFTLCplNbx(MPI_Comm c, int tag, int n_out, const int *dest, unsigned char *const *sbuf, const size_t *sbytes, cpl_msg **in, int *n_in, long *bytes,
             long *messages)
 {
@@ -277,50 +304,18 @@ int MFTLCplNbx(MPI_Comm c, int tag, int n_out, const int *dest, unsigned char *c
     if (bytes) *bytes += (long) fb;
   }
 
-  int cap = 8, n = 0;
-  cpl_msg *got = (cpl_msg *) MFTLCplAlloc((size_t) cap * sizeof(cpl_msg), "nbx receive list");
-  MPI_Request barrier = MPI_REQUEST_NULL;
-  bool barrier_active = false;
-  for (;;)
-  {
-    int flag = 0;
-    MPI_Status st;
-    MPI_Iprobe(MPI_ANY_SOURCE, tag, c, &flag, &st);
-    if (flag)
-    {
-      if (n == cap)
-      {
-        cap *= 2;
-        got = (cpl_msg *) MFTLCplRealloc(got, (size_t) cap * sizeof(cpl_msg), "nbx receive list");
-      }
-      recv_framed(c, tag, &st, &got[n]);
-      if (bytes) *bytes += (long) got[n].bytes + 8;
-      ++n;
-      continue;
-    }
-    if (!barrier_active)
-    {
-      int done = 0;
-      MPI_Testall(q.n, q.r, &done, MPI_STATUSES_IGNORE);
-      if (done)
-      {
-        MPI_Ibarrier(c, &barrier);
-        barrier_active = true;
-      }
-    }
-    else
-    {
-      int done = 0;
-      MPI_Test(&barrier, &done, MPI_STATUS_IGNORE);
-      if (done) break;
-    }
-  }
+  /* The library's one NBX loop; receiving (framing, chunks, this module's
+   * memory budget) stays here. */
+  nbx_inbox box = {MFTL_NULL, 0, 8, bytes};
+  box.got = (cpl_msg *) MFTLCplAlloc((size_t) box.cap * sizeof(cpl_msg), "nbx receive list");
+  MFTLNbxComplete(c, tag, q.n, q.r, nbx_receive, &box);
+
   for (int i = 0; i < n_out; ++i) MFTLCplFree(framed[i]);
   MFTLCplFree(framed);
   MFTLCplFree(q.r);
-  qsort(got, (size_t) n, sizeof(cpl_msg), cmp_msg);
-  *in = got;
-  *n_in = n;
+  qsort(box.got, (size_t) box.n, sizeof(cpl_msg), cmp_msg);
+  *in = box.got;
+  *n_in = box.n;
   return MFTL_SUCCESS;
 }
 

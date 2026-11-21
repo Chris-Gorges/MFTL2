@@ -362,7 +362,12 @@ the id of the entity with its key (`MFTLTopoSyncGhostIds`: a keyed `MFTLGhostPul
 12 B of request and 4 B of reply per ghost). The component labels are NOT such a
 pull: a request carries a label the owner folds into a minimum over all requests
 and its own components before any answer exists, over per-cluster scratch meshes,
-so the label rounds keep their own exchange in `topo_comm.c`. The closing `MFTLRedistribute` then rebuilds the
+so the label rounds are a request and a reply on the library's routed exchange
+(`MFTLExchangeRecords` and `MFTLExchangeReply`, through `topo_comm.c`): the reply
+reuses the request's plan, so a round costs one route vote, one count exchange and
+two data exchanges, plus the "nothing changed" reduction. The node exchange is the
+same call; both take the graph route unless some window reaches past a
+neighbourhood, and every consumer is independent of the order records arrive in. The closing `MFTLRedistribute` then rebuilds the
 canonical halo from correct ids. `MFTLObjectSetCounts` marks every new object
 partition-dirty, so the redistribution's body skip cannot mistake one for settled.
 

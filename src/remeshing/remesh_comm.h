@@ -26,7 +26,7 @@
  *                               redistribution falls back to its global path
  *                               otherwise.
  *   MFTLRemeshSumInts           Allreduce of 3 ints per phase (certificate).
- *   MFTLRemeshSyncGhostIds      MFTLGhostPull() on #MFTL_GHOST_ROUTE_AUTO: one
+ *   MFTLRemeshSyncGhostIds      MFTLGhostPull() on #MFTL_ROUTE_AUTO: one
  *                               LOR, 3 neighbourhood collectives, 4 bytes per
  *                               ghost vertex, once per pass; global fallback
  *                               when a ghost's owner is not a graph neighbour
@@ -622,24 +622,8 @@ void MFTLRemeshNeighborAlltoall(const MFTL_Domain *domain, const double *send, i
  * Its implementation is in remesh_comm.c with the rest of the module's MPI. */
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 6. Routed records, classification, positions and the projection halo
+ * 6. Classification, positions and the projection halo
  * ═══════════════════════════════════════════════════════════════════════════ */
-
-/**
- * @brief Delivers @p n_rec records of @p width doubles each to rank `dest[i]`:
- *        over `comm_graph` when every destination of every rank is itself or a
- *        graph neighbour, over `comm_world` otherwise (agreed by one LOR).
- *        Records addressed to the calling rank never touch the wire.
- * @param      domain The domain.
- * @param      rec    `[n_rec * width]` records.
- * @param      dest   `[n_rec]` destination ranks.
- * @param      n_rec  Records.
- * @param      width  Doubles per record.
- * @param[out] n_out  Records received, own ones first.
- * @return `[*n_out * width]` records to free().
- * @collective
- */
-double *MFTLRemeshExchangeRecords(const MFTL_Domain *domain, const double *rec, const int *dest, int n_rec, int width, int *n_out);
 
 /**
  * @brief Gives every ghost vertex its owner's #MFTL_FLAG_FEATURE / #MFTL_FLAG_CORNER
@@ -657,7 +641,7 @@ int MFTLRemeshSyncGhostClass(MFTL_Ensemble *ens);
  *        remesher makes -- unlike MFTLUpdateGhostPositions(), with the global
  *        fallback a coarsened placement needs. Used by the NESTED mode's
  *        smoothing sweeps. MFTLUpdateGhostColumns() of the positions on
- *        #MFTL_GHOST_ROUTE_AUTO -- MFTLUpdateGhostPositions() with the route as
+ *        #MFTL_ROUTE_AUTO -- MFTLUpdateGhostPositions() with the route as
  *        the only difference; 32 bytes per ghost vertex.
  * @param ens The ensemble.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR if a request went unserved.

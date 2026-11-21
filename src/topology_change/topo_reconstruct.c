@@ -285,11 +285,10 @@ static int needing_cells(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, in
   return m;
 }
 
-bool MFTLTopoPackNodeExchange(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, const MFTL_TopoCluster *cl, int n_cl, int *dest_counts, double **records)
+void MFTLTopoPackNodeExchange(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, const MFTL_TopoCluster *cl, int n_cl, int *dest_counts, double **records)
 {
   const int np = dom->nproc;
   for (int r = 0; r < np; ++r) dest_counts[r] = 0;
-  bool far = MFTL_FALSE;
 
   /* Two passes over the known nodes: count per destination, then fill. The
    * node lists are short -- a band of r_cut around the surface -- so walking
@@ -349,7 +348,6 @@ bool MFTLTopoPackNodeExchange(const MFTL_Domain *dom, const MFTL_TopoLattice *la
                   if (pass == 0)
                   {
                     dest_counts[r] += n_rec;
-                    if (!MFTLTopoIsNeighbour(dom, r)) far = MFTL_TRUE;
                   }
                   else
                   {
@@ -382,7 +380,6 @@ bool MFTLTopoPackNodeExchange(const MFTL_Domain *dom, const MFTL_TopoLattice *la
 
   free(cursor);
   *records = buf;
-  return far;
 }
 
 void MFTLTopoMergeNodes(const MFTL_TopoLattice *lat, MFTL_TopoCluster *cl, int n_cl, const double *records, int n_records)

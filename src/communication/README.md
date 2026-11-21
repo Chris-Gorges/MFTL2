@@ -10,7 +10,7 @@
 | `ghost_pull.c` | *refresh my ghosts from their owners.* The one request/reply engine (`MFTLGhostPull`) every ghost refresh is a payload on |
 | `ghost_sync.c` | *the mesh deformed — refresh my ghosts.* The column payload: positions, normals, sizing, registered fields; topology untouched |
 | `spatial_halo.c` | *what of body B is near my share of body A?* A geometric halo as shadow objects |
-| `exchange.c` | MPI datatypes, the non-blocking multi-payload all-to-all-v, the neighbourhood allgather |
+| `exchange.c` | MPI datatypes, the routed personalised exchange every module sends through (typed payloads, records and their replies, the ghost pull's transport) with the library's one NBX loop, the neighbourhood allgather |
 | `comm_internal.h`, `comm_stats.c` | the lazy `int` list, the global-id table, the diagnostics accumulator |
 
 ---
@@ -104,9 +104,9 @@ copies of a vertex. Debug builds check duplicate values bitwise.
    (vertex, destination) — 32 slots suffice on the neighbour route; beyond them a
    list is sorted instead.
 3. **Route.** One `MPI_Allreduce` (LOR) decides whether any destination lies
-   outside the 26-neighbourhood. Graph route: `MPI_Neighbor_alltoallv` over
-   `comm_graph`; global route (e.g. the initial scatter from rank 0):
-   `MPI_Alltoallv` over `comm_cart`.
+   outside the 26-neighbourhood: the routed exchange's vote (@ref comm_exchange).
+   Graph route: `MPI_Neighbor_alltoallv` over `comm_graph`; global route (e.g.
+   the initial scatter from rank 0): NBX discovery and point-to-point messages.
 4. **Exchange.** `MFTLExchangeStart` sends vertices, triangles,
    a 7-int header per (body, destination), and optional persistent fields after **one** merged count
    exchange. All bodies share the messages, so the message count is independent
@@ -210,7 +210,7 @@ schedule, never a copy of it:
 |---|---|---|
 | pools | a reply width per pool; 0 leaves it out | vertices only, or vertices and triangles (fields, topology ids) |
 | key | the global id (8 B request), or a caller's 64-bit key (12 B; sort and bisect) | everything but topology change, which asks for ids that do not exist yet by lattice key |
-| route | `MFTL_GHOST_ROUTE_GRAPH`: `comm_graph`, no global collective; `MFTL_GHOST_ROUTE_AUTO`: one `MPI_Allreduce(LOR)`, `comm_world` when some owner is not a graph neighbour | the per-timestep syncs and the fields; the remesher and topology change |
+| route | `MFTL_ROUTE_GRAPH`: `comm_graph`, no global collective; `MFTL_ROUTE_AUTO`: one `MPI_Allreduce(LOR)`, the global route (@ref comm_exchange) when some owner is not a graph neighbour | the per-timestep syncs and the fields; the remesher and topology change |
 | payload | an owner callback and a requester callback, each called once per (body, pool) block | — |
 
 **The owner's lookup is keyed by the requests, not by what it owns.** Every
@@ -247,6 +247,54 @@ cheaply.
          halo leaves the 26-neighbourhood (a coarsened remeshing partition) must
          not outlive the remeshing call; both remeshing drivers end with a plain
          `MFTLRedistribute`.
+
+---
+
+## The routed exchange {#comm_exchange}
+
+Every "send these elements to those ranks" of the library goes through one
+engine in `exchange.c`: redistribution and the spatial halo
+(`MFTLExchangeStart`, up to four typed payloads, non-blocking), the topology
+change's node and label exchanges (`MFTLExchangeRecords`, records grouped by
+destination, and `MFTLExchangeReply`), the remesher's sizing carry and
+projection halo (`MFTLExchangeRecordsTo`, records that each name their
+destination), and the ghost pull's three exchanges. Each is a count exchange and then the data, on one of two routes:
+
+| Route | When | Counts | Data | Cost per call |
+|---|---|---|---|---|
+| graph | every destination of every rank is a graph neighbour (itself only through a self-loop) | `MPI_Neighbor_alltoall` | `MPI_(I)neighbor_alltoallv` | $O(\text{degree})$, no global collective |
+| global | some rank addresses a rank outside its neighbourhood | NBX: one synchronous send per partner, probe, non-blocking barrier | `MPI_Irecv`/`MPI_Isend` per partner on `comm_world` | messages $+ O(\log P)$ |
+
+The route is chosen by ONE vote, `MFTLExchangeAgreeRoute` (`MFTL_ROUTE_AUTO`:
+one `MPI_Allreduce(LOR)`; `MFTL_ROUTE_GRAPH`: none). Until 2026-11-20 the
+global route was a dense `MPI_Alltoall` of counts and an `MPI_Alltoallv` over
+`comm_world`, $O(P)$ per rank per call however few partners a rank had, and
+the library carried four copies of it and of the vote (redistribution, the
+ghost pull, the topology change, the remesher).
+
+**NBX** (Hoefler, Siebert & Lumsdaine 2010) is `MFTLNbxComplete`, the library's
+one implementation; the coupler's discovery uses the same loop with its own
+framing and memory budget. A rank posts synchronous sends, probes for and
+receives whatever arrives, enters a non-blocking barrier once its sends are
+MATCHED, and keeps receiving until the barrier completes; a completed barrier
+means every send of every rank was received. Two rounds on one (communicator,
+tag) must be separated by a collective whose result depends on every rank,
+otherwise a rank that has left its barrier can post the next round's messages
+while another is still probing in this one. In the routed exchange that
+separation is structural: every global-route discovery is preceded, in the same
+function, by its own route vote, an `MPI_Allreduce`. `comm_world` is the
+library's private duplicate and nothing else of the library sends point to
+point on it, so the probe cannot take a message it did not cause.
+
+**Receive order is part of the contract**: this rank's own records first (the
+record exchange; they never touch the wire), then one block per source, graph
+neighbours in `domain->neighbors` order, global-route sources ascending. Those
+are the orders the dense collectives produced, so redistribution's pool order,
+which follows arrival order, did not change. **A reply needs no vote and no
+count exchange**: `MFTLExchangeRecords` returns a plan (peers, counts and
+displacements both ways) and `MFTLExchangeReply` runs it backwards, delivering
+reply `i` where forward record `i` was sent from. The topology change's label
+rounds use it; they used to pay a second vote and count exchange per round.
 
 ---
 
@@ -339,11 +387,15 @@ table).
    call — $O(P)$ per rank and timestep, harmless at the tested scales but a
    candidate for the persistent workspace at $P$ in the thousands. (The ghost
    pull's rank-to-neighbour table is built once per ensemble; only its global
-   route allocates by $P$.)
+   route counts by $P$, locally; its messages are NBX's.)
 2. The ghost exchange rebuilds its schedule every call; it could be cached for a
    solver that redistributes only every $N$ steps.
 3. The geometry pass after a redistribution runs on freshly rewritten pools and is
    bound by first touch (6.4 ns/triangle against 2.9 on a resident mesh);
    fusing it into the rebuild was not attempted.
 4. Nothing has been measured above 4 ranks on real hardware; the scaling of the
-   graph against the global route at $P$ in the hundreds is unmeasured.
+   graph against the global route at $P$ in the hundreds is unmeasured. The
+   global route's NBX replaced $O(P)$ dense collectives by $O(\log P)$ plus the
+   messages, which is the asymptotic argument; the crossover against a dense
+   `MPI_Alltoall` has not been measured above 8 ranks on one node, where NBX
+   costs a few microseconds more per call (`docs/analysis.md` §2.8).

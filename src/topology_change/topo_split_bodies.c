@@ -798,7 +798,7 @@ int MFTLTopoSyncGhostIds(MFTL_Ensemble *ens, const int *created, int n_created, 
 
   MFTL_GhostPull pull;
   pull.row_bytes[MFTL_FIELD_VERTEX] = pull.row_bytes[MFTL_FIELD_TRIANGLE] = (int) sizeof(int);
-  pull.route = MFTL_GHOST_ROUTE_AUTO;
+  pull.route = MFTL_ROUTE_AUTO;
   pull.keys[MFTL_FIELD_VERTEX] = by_slot;
   pull.keys[MFTL_FIELD_TRIANGLE] = by_slot + MFTL_MAX(nl, 1);
   pull.serve = serve_topo_ids;
