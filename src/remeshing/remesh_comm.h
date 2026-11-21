@@ -25,7 +25,6 @@
  *   MFTLRemeshMigrateToRanks    26-neighbour while bodies fit a rank box;
  *                               redistribution falls back to its global path
  *                               otherwise.
- *   MFTLRemeshSumInts           Allreduce of 3 ints per phase (certificate).
  *   MFTLRemeshSyncGhostIds      MFTLGhostPull() on #MFTL_ROUTE_AUTO: one
  *                               LOR, 3 neighbourhood collectives, 4 bytes per
  *                               ghost vertex, once per pass; global fallback
@@ -36,12 +35,18 @@
  *                               under curvature sizing.
  *   MFTLRemeshMeasureBodies     per-body holder reductions (9 values, then 1)
  *                               plus one scalar MPI_MAX; once per pass.
- *   MFTLRemeshAgree*            small fixed-size Allreduces (the parameter block
- *                               once per call, profile, frozen counts, balancer
- *                               scalars, Debug checks).
+ *   MFTLRemeshAgreeParams       one Allreduce of the parameter block, once per
+ *                               call.
+ *   MFTLRemeshAgreeProfile      one Allreduce of the profile, once per pass.
  *   MFTLRemeshNeighbor*         the balancer's one-hop exchanges: O(local
  *                               bodies) or O(1) per neighbour, never sized by
  *                               n_bodies_global.
+ *
+ * The drivers' other small agreements (the spanning certificate, 3 ints per
+ * phase; the mean edge length; frozen counts; the balancer's totals and peaks;
+ * Debug checks) and their timers are the library's MFTLAllreduceInts(),
+ * MFTLAllreduceDoubles() and MFTLWallTime(): the same Allreduces, with no
+ * remesher-private wrapper around them.
  *
  * A shifted migration moves far more than the band: between shifts a and b an
  * entity changes owner on axis k iff its coordinate lies in [a_k, b_k) modulo
@@ -380,34 +385,6 @@ int MFTLRemeshMigrateToRanks(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const i
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief In-place `MPI_Allreduce(MPI_SUM)` of @p n ints over the world.
- *
- * The spanning driver's convergence certificate (3 ints per phase) and the
- * dispersed driver's gates and idle/reassigned counts. The certificate does not
- * ride the per-body id scan, which goes over each body's holders.
- *
- * @param domain The MPI/physical world.
- * @param values `[n]` values, replaced by their sums over all ranks.
- * @param n      How many; less than 1 is a no-op.
- * @collective
- */
-void MFTLRemeshSumInts(const MFTL_Domain *domain, int *values, int n);
-
-/**
- * @brief In-place `MPI_Allreduce(MPI_SUM)` of @p n doubles over the world.
- *
- * Mean edge length (sum and count), frozen-share counts, the balancer's total
- * weight. Always sums, never per-rank means, which would weight ranks rather
- * than entities.
- *
- * @param domain The MPI/physical world.
- * @param values `[n]` values, replaced by their sums over all ranks.
- * @param n      Number of values.
- * @collective
- */
-void MFTLRemeshAgreeDouble(const MFTL_Domain *domain, double *values, int n);
-
-/**
  * @brief Refuses, on EVERY rank, a parameter block that is invalid on any rank or
  *        not identical on all of them.
  *
@@ -440,33 +417,6 @@ void MFTLRemeshAgreeDouble(const MFTL_Domain *domain, double *values, int n);
 int MFTLRemeshAgreeParams(const MFTL_Domain *domain, const MFTL_RemeshParameters *params, const char *caller);
 
 /**
- * @brief In-place `MPI_Allreduce(MPI_MAX)` of @p n ints over the world.
- *
- * The dispersed driver's busiest-rank operation count and the Debug watermark
- * check. Per-body id counters go through MFTLEnsembleReduceBodies() instead.
- *
- * @param domain The MPI/physical world.
- * @param values `[n]` values, replaced by their maxima over all ranks.
- * @param n      Number of values.
- * @collective
- */
-void MFTLRemeshAgreeIntMax(const MFTL_Domain *domain, int *values, int n);
-
-/**
- * @brief In-place `MPI_Allreduce(MPI_MAX)` of @p n doubles over the world.
- *
- * The measured band, the balancer's heaviest body and peak load. `MPI_MAX` is
- * order-independent, so the result is bit-identical everywhere and safe to
- * branch on.
- *
- * @param domain The MPI/physical world.
- * @param values `[n]` values, replaced by their maxima over all ranks.
- * @param n      Number of values.
- * @collective
- */
-void MFTLRemeshAgreeDoubleMax(const MFTL_Domain *domain, double *values, int n);
-
-/**
  * @brief Replaces the six wall-clock fields of @p st, and up to two further
  *        values, by their maxima over all ranks -- in ONE MPI_Allreduce.
  *
@@ -489,13 +439,6 @@ void MFTLRemeshAgreeDoubleMax(const MFTL_Domain *domain, double *values, int n);
  * @collective
  */
 void MFTLRemeshAgreeProfile(const MFTL_Domain *domain, MFTL_RemeshStats *st, double *extra, int n_extra);
-
-/**
- * @brief `MPI_Wtime()`, wrapped so that the drivers contain no MPI call
- *        (`test_remeshing_mpi_is_confined` is a source scan).
- * @return Seconds from an arbitrary fixed origin.
- */
-double MFTLRemeshWallTime(void);
 
 /**
  * @brief Tells every ghost vertex the NEW global id its owner has just given it.

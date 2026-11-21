@@ -265,9 +265,9 @@ fail:
 
 int MFTLRemeshFitEdgePoint(const MFTL_Object *obj, int h, const MFTL_RemeshParameters *params, MFTL_RemeshPlacement placement, double out[3])
 {
-  const double t0 = MFTLRemeshWallTime();
+  const double t0 = MFTLWallTime();
   const int rc = fit_edge_point(obj, h, params, placement, out);
-  g_fit_time += MFTLRemeshWallTime() - t0;
+  g_fit_time += MFTLWallTime() - t0;
   g_fit_counts[0]++;
   if (rc != MFTL_SUCCESS) g_fit_counts[2]++;
   return rc;

@@ -163,7 +163,7 @@ static void discard_collapsed(MFTL_Ensemble *ens, MFTL_TopoComponent *comps, int
     const int slot = MFTLEnsembleFindLocalSlot(ens, comps[j].body);
     if (slot != MFTL_ERROR) n[j] = ens->local_objects[slot]->tris.n_local;
   }
-  MFTLTopoCommAllreduceDouble(&ens->domain, n, n_comps, 2);
+  MFTLAllreduceDoubles(ens->domain.comm_world, n, n_comps, MFTL_REDUCE_SUM);
 
   for (int j = 0; j < n_comps; ++j)
   {
@@ -227,7 +227,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
   if (n_bodies_in == 0) return MFTL_SUCCESS;  // identical on every rank: the list is an agreed input
 
   MFTL_Domain *const dom = &ens->domain;
-  const double t0 = MFTLTopoCommTime();
+  const double t0 = MFTLWallTime();
   st->n_events = n_events;
   for (int e = 0; e < n_events; ++e)
   {
@@ -263,7 +263,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
     MFTLBodyRimWalls(obj, &off_wall, MFTL_NULL);
     if (off_wall) sizes[nb + MFTLTopoClusterOf(cl, n_cl, bodies[i])] = 1;
   }
-  MFTLTopoCommAllreduceLongLong(dom, sizes, nb + n_cl, 2);
+  MFTLAllreduceLongLongs(dom->comm_world, sizes, nb + n_cl, MFTL_REDUCE_SUM);
   for (int c = 0; c < n_cl; ++c)
   {
     cl[c].refused = sizes[nb + c] > 0;
@@ -284,7 +284,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
     for (int b = 0; b < 6; ++b)
       if (m & (1 << b)) walls[6 * c + b] = 1;
   }
-  MFTLTopoCommAllreduceLongLong(dom, walls, 6 * n_cl, 1);
+  MFTLAllreduceLongLongs(dom->comm_world, walls, 6 * n_cl, MFTL_REDUCE_MAX);
   for (int c = 0; c < n_cl; ++c)
   {
     cl[c].rim_walls = 0;
@@ -313,7 +313,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
   MFTLTopoLocalExtents(ens, cl, n_cl, ext);
   for (int c = 0; c < n_cl; ++c)
     if (cl[c].refused) MFTLPeriodicExtentInit(&ext[MFTL_PERIODIC_EXTENT_SLOTS * c]);
-  MFTLTopoCommAllreduceDouble(dom, ext, MFTL_PERIODIC_EXTENT_SLOTS * n_cl, 0);
+  MFTLAllreduceDoubles(dom->comm_world, ext, MFTL_PERIODIC_EXTENT_SLOTS * n_cl, MFTL_REDUCE_MIN);
   MFTLTopoResolveExtents(dom, cl, n_cl, ext);
   free(ext);
 
@@ -332,7 +332,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
       MFTLBodyFluxVolume(obj, cl[c].flux_axis, cl[c].flux_ref, cl[c].centre, &v, &a);
       vol[c] += v;
     }
-    MFTLTopoCommAllreduceDouble(dom, vol, n_cl, 2);
+    MFTLAllreduceDoubles(dom->comm_world, vol, n_cl, MFTL_REDUCE_SUM);
     for (int c = 0; c < n_cl; ++c)
     {
       cl[c].volume_old = vol[c];
@@ -353,7 +353,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
       const MFTL_Object *const obj = MFTLEnsembleFindLocalObject(ens, bodies[i]);
       ref[i] = (obj == MFTL_NULL) ? -HUGE_VAL : (isfinite(obj->reference_volume) ? obj->reference_volume : HUGE_VAL);
     }
-    MFTLTopoCommAllreduceDouble(dom, ref, nb, 1);
+    MFTLAllreduceDoubles(dom->comm_world, ref, nb, MFTL_REDUCE_MAX);
     for (int c = 0; c < n_cl; ++c) cl[c].reference_old = 0.0;
     for (int i = 0; i < nb; ++i)
     {
@@ -380,7 +380,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
   lat.r_far = diag + 0.5 * dx_max;  // away from every bias; see MFTLTopoRasterise()
 
   double overhang = MFTLTopoLocalOverhang(ens, cl, n_cl, &lat);
-  MFTLTopoCommAllreduceDouble(dom, &overhang, 1, 1);
+  MFTLAllreduceDoubles(dom->comm_world, &overhang, 1, MFTL_REDUCE_MAX);
   lat.pad = (int) ceil((overhang + lat.r_cut) / dx_min) + 1;
 
   MFTLTopoMakeWindows(dom, &lat, cl, n_cl);
@@ -406,7 +406,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
   {
     MFTLSdfGridFree(&cl[c].grid);  // the field is no longer needed
   }
-  const double t_rec = MFTLTopoCommTime();
+  const double t_rec = MFTLWallTime();
 
   /* ── Components ──────────────────────────────────────────────────────────── */
   MFTL_TopoPiece *const pieces = (MFTL_TopoPiece *) MFTLCallocOrDie((size_t) MFTL_MAX(n_cl, 1), sizeof(MFTL_TopoPiece), "topology pieces");
@@ -434,7 +434,9 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
     free(req);
 
     st->n_label_rounds++;
-    if (!MFTLTopoCommAny(dom, changed)) break;
+    int any_changed = changed ? 1 : 0;
+    MFTLAllreduceInts(dom->comm_world, &any_changed, 1, MFTL_REDUCE_MAX);
+    if (!any_changed) break;
   }
 
   /* ── Every component's fate, decided identically everywhere ──────────────── */
@@ -506,14 +508,14 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
   free(dest);
   free(sizes);
   free(bodies);
-  const double t_sep = MFTLTopoCommTime();
+  const double t_sep = MFTLWallTime();
 
   /* ── Back to the canonical partition ───────────────────────────────────── */
   MFTLEnsembleComputeTriangleGeometry(ens);
   int status = MFTLRedistribute(ens);
   MFTLEnsembleComputeTriangleGeometry(ens);
   MFTLEnsembleUpdateGlobalCounts(ens);
-  const double t_red = MFTLTopoCommTime();
+  const double t_red = MFTLWallTime();
 
   if (status == MFTL_SUCCESS && opts->remesh != MFTL_NULL)
   {
@@ -566,7 +568,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
         va[2 * c] += v;
         if (iter < n_iter) va[2 * c + 1] += MFTLBodyVolumeDisplacement(obj);
       }
-      MFTLTopoCommAllreduceDouble(dom, va, 2 * n_cl, 2);
+      MFTLAllreduceDoubles(dom->comm_world, va, 2 * n_cl, MFTL_REDUCE_SUM);
 
       double total = 0.0;
       for (int c = 0; c < n_cl; ++c)
@@ -636,10 +638,10 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
   }
   free(comps);
   MFTLTopoFreeClusters(cl, n_cl);
-  const double t_end = MFTLTopoCommTime();
+  const double t_end = MFTLWallTime();
 
   double t[5] = {t_rec - t0, t_sep - t_rec, t_red - t_sep, t_end - t_red, t_end - t0};
-  MFTLTopoCommAllreduceDouble(dom, t, 5, 1);
+  MFTLAllreduceDoubles(dom->comm_world, t, 5, MFTL_REDUCE_MAX);
   st->t_reconstruct = t[0];
   st->t_separate = t[1];
   st->t_redistribute = t[2];
@@ -663,12 +665,12 @@ int MFTLEnsembleApplyTopologyChanges(MFTL_Ensemble *ens, const MFTL_TopologyOpti
   if (ens == MFTL_NULL || opts == MFTL_NULL) return MFTL_ERROR;
   if (ens->fields.stride[0] || ens->fields.stride[1]) return MFTL_ERROR;
 
-  const double t0 = MFTLTopoCommTime();
+  const double t0 = MFTLWallTime();
   MFTL_TopologyEvent *events = MFTL_NULL;
   int n_events = 0;
   if (MFTLTopologyDetectEvents(ens, opts, &events, &n_events) != MFTL_SUCCESS) return MFTL_ERROR;
-  double t_detect = MFTLTopoCommTime() - t0;
-  MFTLTopoCommAllreduceDouble(&ens->domain, &t_detect, 1, 1);
+  double t_detect = MFTLWallTime() - t0;
+  MFTLAllreduceDoubles(ens->domain.comm_world, &t_detect, 1, MFTL_REDUCE_MAX);
 
   /* No event, no change: nothing below runs, on any rank. */
   if (n_events == 0)

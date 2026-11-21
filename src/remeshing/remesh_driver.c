@@ -252,7 +252,7 @@ double MFTLEnsembleMeanEdgeLength(MFTL_Ensemble *ens)
     }
   }
 
-  MFTLRemeshAgreeDouble(&ens->domain, acc, 2);
+  MFTLAllreduceDoubles(ens->domain.comm_world, acc, 2, MFTL_REDUCE_SUM);
   return (acc[1] > 0.0) ? acc[0] / acc[1] : 0.0;
 }
 
@@ -345,10 +345,10 @@ static int iterate(MFTL_Object *obj, const MFTL_RemeshParameters *params, MFTL_R
 
     if (iter == 0 && project)
     {
-      const double t0 = MFTLRemeshWallTime();
+      const double t0 = MFTLWallTime();
       MFTLRemeshReferenceFromObject(&ref, obj, params);
       have_ref = MFTL_TRUE;
-      st->t_reference += MFTLRemeshWallTime() - t0;
+      st->t_reference += MFTLWallTime() - t0;
       st->reference_bytes = MFTL_MAX(st->reference_bytes, ref.bytes);
     }
 

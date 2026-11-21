@@ -380,7 +380,7 @@ int MFTLRemoveUndulationsObject(MFTL_Object *obj, const MFTL_UndulationParameter
   if (obj->verts.n == 0) return MFTL_SUCCESS;
   if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
 
-  const double t0 = MFTLCorrectionTime();
+  const double t0 = MFTLWallTime();
   const double tan_min = tan(p->min_angle * MFTL_PI / 180.0);
   unsigned char *const cls = (unsigned char *) MFTLMallocOrDie((size_t) obj->verts.n, "undulation: vertex classes");
   classify(obj, cls);
@@ -400,7 +400,7 @@ int MFTLRemoveUndulationsObject(MFTL_Object *obj, const MFTL_UndulationParameter
   if (stats)
   {
     to_stats(&c, stats);
-    stats->t_total = MFTLCorrectionTime() - t0;
+    stats->t_total = MFTLWallTime() - t0;
   }
   return MFTL_SUCCESS;
 }
@@ -435,7 +435,7 @@ int MFTLEnsembleRemoveUndulations(MFTL_Ensemble *ens, const MFTL_UndulationParam
   if (ens->n_bodies_global == 0 || p->sweeps == 0) return MFTL_SUCCESS;
 
   MFTL_Domain *const dom = &ens->domain;
-  const double t0 = MFTLCorrectionTime();
+  const double t0 = MFTLWallTime();
   const double tan_min = tan(p->min_angle * MFTL_PI / 180.0);
 
   MFTLUpdateGhostPositions(ens);
@@ -465,7 +465,7 @@ int MFTLEnsembleRemoveUndulations(MFTL_Ensemble *ens, const MFTL_UndulationParam
     n_col = nc[0] * nc[1] * nc[2];
     my_col = cc[0] + nc[0] * (cc[1] + nc[1] * cc[2]);
     work[my_col] = any_shared ? 1 : 0;
-    MFTLCorrectionAllreduceLongLong(dom, work, n_col, 1);
+    MFTLAllreduceLongLongs(dom->comm_world, work, n_col, MFTL_REDUCE_MAX);
   }
 
   und_counts c = {0};
@@ -496,9 +496,9 @@ int MFTLEnsembleRemoveUndulations(MFTL_Ensemble *ens, const MFTL_UndulationParam
   MFTLEnsembleMarkChanged(ens);
 
   long long counts[5] = {c.moved, c.moved_band, c.flat, c.refused, c.cross};
-  MFTLCorrectionAllreduceLongLong(dom, counts, 5, 2);
-  double mx[2] = {c.max_disp, MFTLCorrectionTime() - t0};
-  MFTLCorrectionAllreduceDouble(dom, mx, 2, 1);
+  MFTLAllreduceLongLongs(dom->comm_world, counts, 5, MFTL_REDUCE_SUM);
+  double mx[2] = {c.max_disp, MFTLWallTime() - t0};
+  MFTLAllreduceDoubles(dom->comm_world, mx, 2, MFTL_REDUCE_MAX);
   const int rounds = st->n_rounds;
   c.moved = counts[0];
   c.moved_band = counts[1];

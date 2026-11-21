@@ -11,7 +11,10 @@
  * not cause):
  *
  *   agreements    one small Allreduce per collective decision (status, hashes,
- *                 registration bounds); O(1) payload, independent of P.
+ *                 registration bounds); O(1) payload, independent of P. Plain
+ *                 MIN/MAX/SUM agreements are the library's small reductions
+ *                 (MFTLAllreduceInts() and its siblings, from coupler.c); what
+ *                 is here folds a status, a token or a hash into one message.
  *   NBX           sparse exchange to receivers that do not know they will
  *                 receive (directory publication, support requests): Hoefler,
  *                 Siebert & Lumsdaine's protocol, the library's one loop
@@ -106,13 +109,6 @@ bool MFTLCplTranslateRanks(MPI_Comm from, MPI_Comm to, int64_t n, const int *ran
   return true;
 }
 
-int MFTLCplAgreeMax(MPI_Comm c, int v)
-{
-  int g = v;
-  MPI_Allreduce(&v, &g, 1, MPI_INT, MPI_MAX, c);
-  return g;
-}
-
 int MFTLCplAgreeTransfer(MPI_Comm c, int status, uint64_t token)
 {
   uint64_t v[3] = {(uint64_t) status, token, ~token}, g[3];
@@ -128,37 +124,12 @@ int MFTLCplAgreeValidated(MPI_Comm c, int status, uint64_t signature)
   return g[1] == ~g[2] ? MFTL_COUPLING_OK : MFTL_COUPLING_INVALID;
 }
 
-void MFTLCplAgreeMaxN(MPI_Comm c, int *v, int n)
-{
-  if (n > 0) MPI_Allreduce(MPI_IN_PLACE, v, n, MPI_INT, MPI_MAX, c);
-}
-
 bool MFTLCplAgreeHash(MPI_Comm c, uint64_t h)
 {
   uint64_t v[2] = {h, ~h}, g[2];
   MPI_Allreduce(v, g, 2, MPI_UINT64_T, MPI_MAX, c);
   /* max(h) == min(h)  <=>  max(h) == ~max(~h) */
   return g[0] == ~g[1];
-}
-
-void MFTLCplAllreduceMax(MPI_Comm c, double *v, int n)
-{
-  if (n > 0) MPI_Allreduce(MPI_IN_PLACE, v, n, MPI_DOUBLE, MPI_MAX, c);
-}
-
-void MFTLCplAllreduceSum(MPI_Comm c, double *v, int n)
-{
-  if (n > 0) MPI_Allreduce(MPI_IN_PLACE, v, n, MPI_DOUBLE, MPI_SUM, c);
-}
-
-void MFTLCplAllreduceSumLong(MPI_Comm c, long *v, int n)
-{
-  if (n > 0) MPI_Allreduce(MPI_IN_PLACE, v, n, MPI_LONG, MPI_SUM, c);
-}
-
-void MFTLCplAllreduceMaxLong(MPI_Comm c, long *v, int n)
-{
-  if (n > 0) MPI_Allreduce(MPI_IN_PLACE, v, n, MPI_LONG, MPI_MAX, c);
 }
 
 void MFTLCplMaxloc(MPI_Comm c, double v, double *vmax, int *rank)
@@ -176,8 +147,6 @@ void MFTLCplMaxloc(MPI_Comm c, double v, double *vmax, int *rank)
 }
 
 void MFTLCplBcastInt(MPI_Comm c, int *v, int n, int root) { MPI_Bcast(v, n, MPI_INT, root, c); }
-
-double MFTLCplWtime(void) { return MPI_Wtime(); }
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Framed, chunked messages

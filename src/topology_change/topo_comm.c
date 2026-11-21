@@ -6,12 +6,8 @@
  *
  * @brief EVERY MPI call of the topology-change module.
  *
- * Seven shapes, and how each scales:
+ * Two shapes, and how each scales:
  *
- *   topo_comm_allreduce_*   a handful of values PER CLUSTER or per listed body.
- *                           Clusters exist only where events were detected, so
- *                           this is bounded by what happened, not by the
- *                           ensemble.
  *   MFTLTopoCommAllgather     the event list, and one record per (component,
  *                           holder). Both are paid only on a step with events,
  *                           and both are proportional to what changed. It is a
@@ -25,6 +21,12 @@
  *                           graph, or the global route when some window reaches
  *                           past it. The reply reuses the request's plan, so it
  *                           costs one data exchange and nothing else.
+ *
+ * The small reductions are not here: the handful of values reduced PER
+ * CLUSTER or per listed body, and the label rounds' "did anything change"
+ * vote, are the library's MFTLAllreduceDoubles() and its siblings, called from
+ * topo_driver.c. Clusters exist only where events were detected, so those are
+ * bounded by what happened, not by the ensemble.
  *
  * The ghost ids of the new bodies are not here: they are a keyed pull on the
  * library's one ghost engine, MFTLGhostPull() (MFTLTopoSyncGhostIds()). The
@@ -43,27 +45,6 @@
 #include "mftl_communication.h"
 #include "mftl_constants.h"
 #include "mftl_memory.h"
-
-double MFTLTopoCommTime(void) { return MPI_Wtime(); }
-
-void MFTLTopoCommAllreduceDouble(const MFTL_Domain *dom, double *v, int n, int op)
-{
-  if (n <= 0) return;
-  MPI_Allreduce(MPI_IN_PLACE, v, n, MPI_DOUBLE, op == 0 ? MPI_MIN : (op == 1 ? MPI_MAX : MPI_SUM), dom->comm_world);
-}
-
-void MFTLTopoCommAllreduceLongLong(const MFTL_Domain *dom, long long *v, int n, int op)
-{
-  if (n <= 0) return;
-  MPI_Allreduce(MPI_IN_PLACE, v, n, MPI_LONG_LONG, op == 0 ? MPI_MIN : (op == 1 ? MPI_MAX : MPI_SUM), dom->comm_world);
-}
-
-bool MFTLTopoCommAny(const MFTL_Domain *dom, bool local)
-{
-  int v = local ? 1 : 0;
-  MPI_Allreduce(MPI_IN_PLACE, &v, 1, MPI_INT, MPI_LOR, dom->comm_world);
-  return v != 0;
-}
 
 double *MFTLTopoCommAllgather(const MFTL_Domain *dom, const double *mine, int n_mine, int stride, int *n_out)
 {

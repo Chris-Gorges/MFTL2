@@ -29,8 +29,9 @@
  * carries no material across an edge; vertex fields keep their values, because
  * the vertex is the same material point.
  *
- * All of this module's MPI is in src/correction/correction_comm.c
- * (`test_correction_mpi_is_confined`). Theory, the distributed schedule and the
+ * The module makes no MPI call of its own (`test_correction_mpi_is_confined`):
+ * it communicates through the ghost sync, the per-body reductions and the
+ * library's small reductions. Theory, the distributed schedule and the
  * measurements: src/correction/README.md.
  */
 #ifndef MFTL_CORRECTION_H

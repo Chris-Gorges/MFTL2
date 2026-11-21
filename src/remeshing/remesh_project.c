@@ -731,7 +731,7 @@ void MFTLRemeshProjectOwned(MFTL_Object *obj, const MFTL_RemeshReference *ref, c
   if (nvl == 0 || obj->tris.n == 0) return;
   if (!MFTLObjectHasTopology(obj)) MFTLObjectBuildDerived(obj);
 
-  const double t0 = MFTLRemeshWallTime();
+  const double t0 = MFTLWallTime();
   const double cap = MFTLRemeshProjectionRadius(params);
 
   /* The vertex's own orientation, for the compatibility test: exact on owned
@@ -788,7 +788,7 @@ void MFTLRemeshProjectOwned(MFTL_Object *obj, const MFTL_RemeshReference *ref, c
   {
     st->n_projected += n_ok;
     st->n_projection_missed += n_missed;
-    st->t_projection += MFTLRemeshWallTime() - t0;
+    st->t_projection += MFTLWallTime() - t0;
   }
 }
 
@@ -890,7 +890,7 @@ int MFTLRemeshEnsembleReferenceBuild(MFTL_Ensemble *ens, const MFTL_RemeshParame
 {
   MFTL_ASSERT(ens != MFTL_NULL && params != MFTL_NULL && set != MFTL_NULL);
   memset(set, 0, sizeof(*set));
-  const double t0 = MFTLRemeshWallTime();
+  const double t0 = MFTLWallTime();
   int status = MFTL_SUCCESS;
 
   /* Which corners may lift is the OWNER's classification: a ghost's fan is
@@ -933,7 +933,7 @@ int MFTLRemeshEnsembleReferenceBuild(MFTL_Ensemble *ens, const MFTL_RemeshParame
   }
   if (st)
   {
-    st->t_reference += MFTLRemeshWallTime() - t0;
+    st->t_reference += MFTLWallTime() - t0;
     st->reference_bytes = MFTL_MAX(st->reference_bytes, bytes);
   }
   return status;

@@ -8,16 +8,16 @@
  *
  * ## THE FILES AND WHAT EACH MAY DO
  *
- *   correction_comm.c    EVERY MPI call of the module, and nothing else
- *                        (`test_correction_mpi_is_confined`).
  *   correction_fields.c  the amount-per-triangle rule for conservative densities
  *   undulation.c         TSUR3D: the edge operation, the local sweep and the
  *                        distributed schedule
  *   volume.c             reference volumes and the Newton correction
  *
- * The module calls MFTLUpdateGhostPositions() and MFTLEnsembleReduceBodies(),
- * which are other modules' collectives; it makes no MPI call of its own
- * outside correction_comm.c.
+ * The module makes NO MPI call of its own (`test_correction_mpi_is_confined`).
+ * Per-vertex data travels through MFTLUpdateGhostPositions(), per-body values
+ * through MFTLEnsembleReduceBodies(), and the statistics and the colour flags
+ * of the undulation schedule through the library's small reductions
+ * (MFTLAllreduceDoubles(), MFTLAllreduceLongLongs()).
  */
 
 #ifndef MFTL_CORRECTION_INTERNAL_H
@@ -26,14 +26,6 @@
 #include "mftl_correction.h"
 
 /** @cond INTERNAL */
-
-/* ── correction_comm.c ─────────────────────────────────────────────────────── */
-
-/* Wall clock, seconds. */
-double MFTLCorrectionTime(void);
-/* In-place Allreduce over comm_world; op 0 MIN, 1 MAX, 2 SUM. */
-void MFTLCorrectionAllreduceDouble(const MFTL_Domain *dom, double *v, int n, int op);
-void MFTLCorrectionAllreduceLongLong(const MFTL_Domain *dom, long long *v, int n, int op);
 
 /* ── correction_fields.c ───────────────────────────────────────────────────── */
 

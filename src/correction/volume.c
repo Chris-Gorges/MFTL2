@@ -67,7 +67,7 @@ int MFTLEnsembleCorrectVolumes(MFTL_Ensemble *ens, const MFTL_VolumeCorrectionPa
   if (ens->n_bodies_global == 0) return MFTL_SUCCESS;
 
   MFTL_Domain *const dom = &ens->domain;
-  const double t0 = MFTLCorrectionTime();
+  const double t0 = MFTLWallTime();
   const int b = ens->n_local_objects;
   const int n_iter = p->iterations;
 
@@ -168,9 +168,9 @@ int MFTLEnsembleCorrectVolumes(MFTL_Ensemble *ens, const MFTL_VolumeCorrectionPa
     if (fabs(offset[o]) > max_off) max_off = fabs(offset[o]);
   }
 
-  MFTLCorrectionAllreduceDouble(dom, stat, 2, 2);
-  double mx[4] = {stat[2], stat[3], max_off, MFTLCorrectionTime() - t0};
-  MFTLCorrectionAllreduceDouble(dom, mx, 4, 1);
+  MFTLAllreduceDoubles(dom->comm_world, stat, 2, MFTL_REDUCE_SUM);
+  double mx[4] = {stat[2], stat[3], max_off, MFTLWallTime() - t0};
+  MFTLAllreduceDoubles(dom->comm_world, mx, 4, MFTL_REDUCE_MAX);
   st->n_bodies = (int) stat[0];
   st->n_bodies_unmeasured = (int) stat[1];
   st->max_error_before = mx[0];

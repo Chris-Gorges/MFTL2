@@ -306,18 +306,6 @@ int MFTLTopoSyncGhostIds(MFTL_Ensemble *ens, const int *created, int n_created, 
  * 5. Communication (topo_comm.c -- the only file with MPI)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/** @brief Wall-clock seconds. */
-double MFTLTopoCommTime(void);
-
-/** @brief In-place Allreduce of @p n doubles. op: 0 = MIN, 1 = MAX, 2 = SUM. */
-void MFTLTopoCommAllreduceDouble(const MFTL_Domain *dom, double *v, int n, int op);
-
-/** @brief In-place Allreduce of @p n long longs. op: 0 = MIN, 1 = MAX, 2 = SUM. */
-void MFTLTopoCommAllreduceLongLong(const MFTL_Domain *dom, long long *v, int n, int op);
-
-/** @brief In-place logical OR over ranks. */
-bool MFTLTopoCommAny(const MFTL_Domain *dom, bool local);
-
 /**
  * @brief Allgatherv of records of @p stride doubles.
  * @return The gathered records, `malloc`'d, in rank order; @p n_out records.

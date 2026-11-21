@@ -623,8 +623,8 @@ static void assign_destinations(MFTL_Ensemble *ens, const MFTL_RemeshParameters 
   /* ── 2. The two scalars a cap needs: `total` for the mean and `heaviest` for
    * the floor -- no per-rank load table. */
   double total = load;
-  MFTLRemeshAgreeDouble(dom, &total, 1);
-  MFTLRemeshAgreeDoubleMax(dom, &heaviest, 1);
+  MFTLAllreduceDoubles(dom->comm_world, &total, 1, MFTL_REDUCE_SUM);
+  MFTLAllreduceDoubles(dom->comm_world, &heaviest, 1, MFTL_REDUCE_MAX);
 
   const double slack = params->dispersed_balance_slack;
   /* Every term is REPLICATED -- the slack is a checked parameter, the rank count
@@ -917,10 +917,10 @@ static void assign_destinations(MFTL_Ensemble *ens, const MFTL_RemeshParameters 
   const double post = load - shipped_out + received_in;
 
   double peak = post;
-  MFTLRemeshAgreeDoubleMax(dom, &peak, 1);
+  MFTLAllreduceDoubles(dom->comm_world, &peak, 1, MFTL_REDUCE_MAX);
 
   int counts[2] = {(post <= 0.0) ? 1 : 0, reassigned};
-  MFTLRemeshSumInts(dom, counts, 2);
+  MFTLAllreduceInts(dom->comm_world, counts, 2, MFTL_REDUCE_SUM);
 
   st->n_ranks_idle = counts[0];
   st->n_bodies_reassigned = counts[1];
@@ -1004,7 +1004,7 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
   /* Free-running per-rank accumulation, reduced once on the way out. Same six
    * sections as the spanning driver, so the two are directly comparable -- which
    * is the whole point of measuring them at all. */
-  const double t0_call = MFTLRemeshWallTime();
+  const double t0_call = MFTLWallTime();
   double t_mark;
 
   MFTL_RemeshMigrator mig;
@@ -1085,7 +1085,7 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
       if (neighbor_slot(dom, MFTLGetOwnerProc(dom, &m->centroid[3 * o])) == MFTL_ERROR) gate[1]++;
     }
   }
-  MFTLRemeshSumInts(dom, gate, 2);
+  MFTLAllreduceInts(dom->comm_world, gate, 2, MFTL_REDUCE_SUM);
   const int too_large = gate[0];
   st->n_bodies_not_centred = gate[0];
   st->n_bodies_unreachable = gate[1];
@@ -1119,10 +1119,10 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
   assign_destinations(ens, params, m, gate[1], dest, st);
 
   /* ── 3. Move each body whole ─────────────────────────────────────────────── */
-  t_mark = MFTLRemeshWallTime();
+  t_mark = MFTLWallTime();
   MFTL_RemeshMigrationReport mig_report;
   if (MFTLRemeshMigrateToRanks(&mig, ens, dest, &mig_report) != MFTL_SUCCESS) status = MFTL_ERROR;
-  st->t_migrate += MFTLRemeshWallTime() - t_mark;
+  st->t_migrate += MFTLWallTime() - t_mark;
   st->n_entities_migrated += mig_report.n_moved;
   st->n_migrations++;
 
@@ -1150,7 +1150,7 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
    * (kept entities first, then arrivals by source rank). A rank
    * holding nothing of a body enters with tris.n == 0 and returns immediately,
    * which is why this loop needs no ownership test of its own. */
-  t_mark = MFTLRemeshWallTime();
+  t_mark = MFTLWallTime();
   int local_ops = 0;
   for (int o = 0; o < ens->n_local_objects; ++o)
   {
@@ -1171,7 +1171,7 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
      * over a run. Idempotent when MFTLRemeshObject already did it. */
     MFTLRemeshRenumberGlobalIds(obj);
   }
-  st->t_sweep += MFTLRemeshWallTime() - t_mark;
+  st->t_sweep += MFTLWallTime() - t_mark;
 
   /* ── 5. Make the id counters agree ───────────────────────────────────────
    *
@@ -1196,14 +1196,14 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
    * body at this point, but a rank can still hold an EMPTY object for a body
    * and size its next arrival table from `next_*_gid`; such an empty holder
    * vetoes the neighbourhood route, and the reduction takes the global one. */
-  t_mark = MFTLRemeshWallTime();
+  t_mark = MFTLWallTime();
   MFTLEnsembleReduceBodies(ens, counters, 2, cops, MFTL_BODY_REDUCE_SCOPE_AUTO);
 
   /* One int of pure latency, and it cannot ride the per-body message: it is a
    * maximum over RANKS, not over the holders of any one body. */
   int busiest = local_ops;
-  MFTLRemeshAgreeIntMax(dom, &busiest, 1);
-  st->t_reduce += MFTLRemeshWallTime() - t_mark;
+  MFTLAllreduceInts(dom->comm_world, &busiest, 1, MFTL_REDUCE_MAX);
+  st->t_reduce += MFTLWallTime() - t_mark;
 
   for (int o = 0; o < n_held; ++o)
   {
@@ -1231,13 +1231,13 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
   st->n_edges_hidden = 0;
 
   /* ── 6. Back to the decomposition the flow solver expects ────────────────── */
-  t_mark = MFTLRemeshWallTime();
+  t_mark = MFTLWallTime();
   MFTLEnsembleComputeTriangleGeometry(ens);
-  st->t_geometry += MFTLRemeshWallTime() - t_mark;
+  st->t_geometry += MFTLWallTime() - t_mark;
 
-  t_mark = MFTLRemeshWallTime();
+  t_mark = MFTLWallTime();
   if (MFTLRedistribute(ens) != MFTL_SUCCESS) status = MFTL_ERROR;
-  st->t_migrate += MFTLRemeshWallTime() - t_mark;
+  st->t_migrate += MFTLWallTime() - t_mark;
   st->n_migrations++;
 
   MFTLEnsembleUpdateGlobalCounts(ens);
@@ -1245,15 +1245,15 @@ int MFTLRemeshEnsembleDispersedMeasured(MFTL_Ensemble *ens, const MFTL_RemeshPar
   /* Redistribution leaves `tris.area/normal/center` unspecified by design, and
    * MFTLRemeshObject promises its caller current triangle geometry. This entry
    * point promises the same thing rather than being a different contract. */
-  t_mark = MFTLRemeshWallTime();
+  t_mark = MFTLWallTime();
   MFTLEnsembleComputeTriangleGeometry(ens);
-  st->t_geometry += MFTLRemeshWallTime() - t_mark;
+  st->t_geometry += MFTLWallTime() - t_mark;
 
   /* The maximum over ranks, and unconditional -- see the same block at the end
    * of MFTLRemeshEnsembleParallel. Here the imbalance it exposes is the POINT:
    * this strategy sends every body to one rank, so at N_bodies < nproc most
    * ranks contribute a `t_sweep` of zero and the max is one rank's whole cost. */
-  st->t_total = MFTLRemeshWallTime() - t0_call;
+  st->t_total = MFTLWallTime() - t0_call;
   MFTLRemeshAgreeProfile(dom, st, MFTL_NULL, 0);
 
   return status;

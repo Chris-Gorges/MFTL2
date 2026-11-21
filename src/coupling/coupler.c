@@ -33,6 +33,7 @@
 #include <string.h>
 
 #include "mftl_arrayfunctions.h"
+#include "mftl_communication.h"
 #include "mftl_constants.h"
 #include "mftl_geometry.h"
 #include "mftl_memory.h"
@@ -159,8 +160,15 @@ struct MFTL_Coupler
   long live;  ///< windows + bindings + fetches + transfer tokens alive
 };
 
-/** @brief Status agreement: the maximum over the ranks. */
-static int agree(MFTL_Coupler *c, int local) { return MFTLCplAgreeMax(c->comm, local); }
+/** @brief Status agreement on @p comm: the maximum over the ranks. */
+static int agree_on(MPI_Comm comm, int local)
+{
+  MFTLAllreduceInts(comm, &local, 1, MFTL_REDUCE_MAX);
+  return local;
+}
+
+/** @brief Status agreement over the coupler's communicator. */
+static int agree(MFTL_Coupler *c, int local) { return agree_on(c->comm, local); }
 
 /** @brief Registration edits invalidate consumers even before UpdateGrid. */
 static bool grid_current(const MFTL_Coupler *c)
@@ -268,7 +276,7 @@ static void compute_locinfo(MFTL_Coupler *c)
       v[6 * l + 3 + k] = -hmin;
     }
   }
-  MFTLCplAllreduceMax(c->comm, v, 7 * nl);
+  MFTLAllreduceDoubles(c->comm, v, 7 * nl, MFTL_REDUCE_MAX);
 
   for (int l = 0; l < nl; ++l)
   {
@@ -672,7 +680,7 @@ int MFTLCouplerCreate(MFTL_Ensemble *ens, MFTL_SolverGrid *grid, const MFTL_Coup
 {
   if (out) *out = MFTL_NULL;
   if (ens == MFTL_NULL) return MFTL_COUPLING_INVALID;
-  if (MFTLCplAgreeMax(ens->domain.comm_world, grid == MFTL_NULL || out == MFTL_NULL ? MFTL_COUPLING_INVALID : MFTL_COUPLING_OK) != MFTL_COUPLING_OK)
+  if (agree_on(ens->domain.comm_world, grid == MFTL_NULL || out == MFTL_NULL ? MFTL_COUPLING_INVALID : MFTL_COUPLING_OK) != MFTL_COUPLING_OK)
     return MFTL_COUPLING_INVALID;
 
   MFTL_Coupler *c = (MFTL_Coupler *) MFTLCplCalloc(1, sizeof(MFTL_Coupler), "MFTLCouplerCreate");
@@ -805,7 +813,7 @@ int MFTLCouplerUpdateGrid(MFTL_Coupler *c)
   /* Two flags ride on the status agreement: did ANY rank change its layout/constraints,
    * or what it exports? One MAX over three ints carries all of it. */
   int v[3] = {local, (c->grid->version_owned != c->seen_owned) ? 1 : 0, (c->grid->version_export != c->seen_export) ? 1 : 0};
-  MFTLCplAgreeMaxN(c->comm, v, 3);
+  MFTLAllreduceInts(c->comm, v, 3, MFTL_REDUCE_MAX);
   const int st = v[0];
   if (st != MFTL_COUPLING_OK) return st;
   compute_locinfo(c);
@@ -821,7 +829,7 @@ int MFTLCouplerUpdateGrid(MFTL_Coupler *c)
     for (int i = 0; i < n_own; ++i) own[i].provider = c->rank;
     const uint64_t h = cpl_fnv(cpl_fnv(CPL_FNV_INIT, &n_own, sizeof n_own), own, (size_t) n_own * sizeof(cpl_dir_entry));
     MFTLCplFree(own);
-    rebuild = MFTLCplAgreeMax(c->comm, (h != c->own_hash) ? 1 : 0) != 0;
+    rebuild = agree(c, (h != c->own_hash) ? 1 : 0) != 0;
   }
   if (rebuild)
     build_directory(c);
@@ -4881,7 +4889,7 @@ int MFTLCouplerSpreadEnd(MFTL_Coupler *c)
     if (c->grid->loc[w->band[r->field_band[i]].location].boundary == MFTL_BOUNDARY_MIRROR) any_mirror = true;
   if (any_mirror)
   {
-    MFTLCplAllreduceSum(c->comm, c->reaction, 6 * nf);
+    MFTLAllreduceDoubles(c->comm, c->reaction, 6 * nf, MFTL_REDUCE_SUM);
     for (int i = 0; i < nf; ++i)
       if (r->fields[i].wall_reaction)
         for (int g = 0; g < 6; ++g) r->fields[i].wall_reaction[g] += c->reaction[6 * i + g];
@@ -5183,8 +5191,8 @@ int MFTLCouplerSurfaceSpacing(MFTL_Coupler *c, MFTL_SpacingResult *out)
   double rmax;
   int who;
   MFTLCplMaxloc(c->comm, r, &rmax, &who);
-  long cnt = (long) n_off;
-  MFTLCplAllreduceSumLong(c->comm, &cnt, 1);
+  long long cnt = (long long) n_off;
+  MFTLAllreduceLongLongs(c->comm, &cnt, 1, MFTL_REDUCE_SUM);
   int ids[2] = {wb, wt};
   MFTLCplBcastInt(c->comm, ids, 2, who);
   out->max_ratio = rmax;
@@ -5248,7 +5256,7 @@ int MFTLCouplerSurfaceSizing(MFTL_Coupler *c, double theta, double *sizes, doubl
   MFTLCplFree(hv);
   MFTLCplFree(got);
   double neg = -lmin;
-  MFTLCplAllreduceMax(c->comm, &neg, 1);
+  MFTLAllreduceDoubles(c->comm, &neg, 1, MFTL_REDUCE_MAX);
   *global_min = -neg;
   return MFTL_COUPLING_OK;
 }
@@ -5267,11 +5275,13 @@ int MFTLCouplerReduceStats(MFTL_Coupler *c, MFTL_CouplerStats *out)
   if (agree(c, out == MFTL_NULL ? MFTL_COUPLING_INVALID : MFTL_COUPLING_OK) != MFTL_COUPLING_OK) return MFTL_ERROR;
   MFTL_CouplerStats s;
   MFTLCouplerGetStats(c, &s);
-  long sum[19] = {s.n_directory_builds, s.n_directory_kept, s.n_requests, s.n_need_coverage, s.n_windows, s.n_binds, s.n_stage_binds, s.n_stale,
-                  s.n_fetches, s.n_spreads, s.bytes_discovery, s.bytes_fetch, s.bytes_spread, s.messages, s.bytes_memory, s.n_local_stage_binds, s.n_fetch_reused, s.n_candidate_builds, s.n_candidate_reuses};
-  long mx[7] = {s.band_self, s.band_halo, s.band_remote, s.band_images, s.served, s.fetch_peers, s.serve_peers};
-  MFTLCplAllreduceSumLong(c->comm, sum, 19);
-  MFTLCplAllreduceMaxLong(c->comm, mx, 7);
+  long long sum[19] = {s.n_directory_builds, s.n_directory_kept, s.n_requests,   s.n_need_coverage,     s.n_windows,       s.n_binds,
+                       s.n_stage_binds,      s.n_stale,          s.n_fetches,    s.n_spreads,           s.bytes_discovery, s.bytes_fetch,
+                       s.bytes_spread,       s.messages,         s.bytes_memory, s.n_local_stage_binds, s.n_fetch_reused,  s.n_candidate_builds,
+                       s.n_candidate_reuses};
+  long long mx[7] = {s.band_self, s.band_halo, s.band_remote, s.band_images, s.served, s.fetch_peers, s.serve_peers};
+  MFTLAllreduceLongLongs(c->comm, sum, 19, MFTL_REDUCE_SUM);
+  MFTLAllreduceLongLongs(c->comm, mx, 7, MFTL_REDUCE_MAX);
   out->n_directory_builds = sum[0];
   out->n_directory_kept = sum[1];
   out->n_requests = sum[2];

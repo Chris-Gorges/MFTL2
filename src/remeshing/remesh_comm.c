@@ -207,7 +207,7 @@ int MFTLRemeshMigrateShifted(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const i
    * all of its corners on the rank operating on it -- so nothing incident to one
    * of THIS rank's owned vertices can have appeared elsewhere. */
   int anyone_moved = (moved > 0);
-  if (dom->nproc > 1) MPI_Allreduce(MPI_IN_PLACE, &anyone_moved, 1, MPI_INT, MPI_LOR, dom->comm_world);
+  MFTLAllreduceInts(dom->comm_world, &anyone_moved, 1, MFTL_REDUCE_MAX);
   if (!anyone_moved) return MFTL_SUCCESS;
 
   if (report) report->performed = MFTL_TRUE;
@@ -338,32 +338,11 @@ int MFTLRemeshMigrateToRanks(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const i
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 2. Small collectives
+ * 2. The profile and the parameter check
+ *
+ * Both are one of the library's small reductions (MFTLAllreduceDoubles())
+ * over a record only the remesher knows how to build.
  * ═══════════════════════════════════════════════════════════════════════════ */
-
-void MFTLRemeshSumInts(const MFTL_Domain *domain, int *values, int n)
-{
-  if (domain->nproc < 2 || n < 1) return;
-  MPI_Allreduce(MPI_IN_PLACE, values, n, MPI_INT, MPI_SUM, domain->comm_world);
-}
-
-void MFTLRemeshAgreeIntMax(const MFTL_Domain *domain, int *values, int n)
-{
-  if (domain->nproc < 2 || n < 1) return;
-  MPI_Allreduce(MPI_IN_PLACE, values, n, MPI_INT, MPI_MAX, domain->comm_world);
-}
-
-void MFTLRemeshAgreeDouble(const MFTL_Domain *domain, double *values, int n)
-{
-  if (domain->nproc < 2 || n < 1) return;
-  MPI_Allreduce(MPI_IN_PLACE, values, n, MPI_DOUBLE, MPI_SUM, domain->comm_world);
-}
-
-void MFTLRemeshAgreeDoubleMax(const MFTL_Domain *domain, double *values, int n)
-{
-  if (domain->nproc < 2 || n < 1) return;
-  MPI_Allreduce(MPI_IN_PLACE, values, n, MPI_DOUBLE, MPI_MAX, domain->comm_world);
-}
 
 void MFTLRemeshAgreeProfile(const MFTL_Domain *domain, MFTL_RemeshStats *st, double *extra, int n_extra)
 {
@@ -372,7 +351,7 @@ void MFTLRemeshAgreeProfile(const MFTL_Domain *domain, MFTL_RemeshStats *st, dou
   double prof[8] = {st->t_total, st->t_migrate, st->t_geometry, st->t_freeze, st->t_sweep, st->t_reduce, 0.0, 0.0};
   for (int i = 0; i < n_extra; ++i) prof[6 + i] = extra[i];
 
-  MFTLRemeshAgreeDoubleMax(domain, prof, 6 + n_extra);
+  MFTLAllreduceDoubles(domain->comm_world, prof, 6 + n_extra, MFTL_REDUCE_MAX);
 
   st->t_total = prof[0];
   st->t_migrate = prof[1];
@@ -382,8 +361,6 @@ void MFTLRemeshAgreeProfile(const MFTL_Domain *domain, MFTL_RemeshStats *st, dou
   st->t_reduce = prof[5];
   for (int i = 0; i < n_extra; ++i) extra[i] = prof[6 + i];
 }
-
-double MFTLRemeshWallTime(void) { return MPI_Wtime(); }
 
 /**
  * @brief Every field of #MFTL_RemeshParameters, in declaration order. A field
@@ -432,7 +409,7 @@ int MFTLRemeshAgreeParams(const MFTL_Domain *domain, const MFTL_RemeshParameters
   v[2 * N] = band_ok ? 1.0 : 0.0;
   v[2 * N + 1] = sizing_bad ? 0.0 : 1.0;
 
-  if (domain->nproc > 1) MPI_Allreduce(MPI_IN_PLACE, v, 2 * N + 2, MPI_DOUBLE, MPI_MIN, domain->comm_world);
+  MFTLAllreduceDoubles(domain->comm_world, v, 2 * N + 2, MFTL_REDUCE_MIN);
 
   int differs = -1;
   for (int i = 0; i < N && differs < 0; ++i)
@@ -663,13 +640,9 @@ void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radiu
      * One double through MPI_MAX. */
     if (r_max != MFTL_NULL)
     {
-      double mine = 0.0;
-      for (int o = 0; o < b; ++o) mine = MFTL_MAX(mine, rad[o]);
-
-      if (dom->nproc > 1)
-        MPI_Allreduce(&mine, r_max, 1, MPI_DOUBLE, MPI_MAX, dom->comm_world);
-      else
-        *r_max = mine;
+      *r_max = 0.0;
+      for (int o = 0; o < b; ++o) *r_max = MFTL_MAX(*r_max, rad[o]);
+      MFTLAllreduceDoubles(dom->comm_world, r_max, 1, MFTL_REDUCE_MAX);
     }
 
     if (radius == MFTL_NULL) free(rad);

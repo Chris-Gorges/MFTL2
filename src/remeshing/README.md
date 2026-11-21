@@ -1267,8 +1267,8 @@ both directions on a $\{P,1,1\}$ grid.
 |---|---|---|
 | `MFTLRemeshMigrateShifted` | LOR + `MFTLRedistributeWithOwners` | up to 87.5 % of the mesh per placement change |
 | `MFTLRemeshMigrateToRanks` | `MFTLRedistributeWithOwners` | whole bodies |
-| `MFTLRemeshSumInts` | Allreduce(SUM) | 3 ints per placement; the dispersed gates |
-| `MFTLRemeshAgree*` | Allreduce | a few scalars |
+| `MFTLAllreduceInts` (the library's small reduction) | Allreduce(SUM) | 3 ints per placement; the dispersed gates |
+| `MFTLAllreduceDoubles` / `Ints`, `MFTLRemeshAgreeProfile` | Allreduce | a few scalars |
 | `MFTLRemeshNeighborGather` / `Allgather` / `Alltoall` | `comm_graph` | 3 doubles per body a rank speaks for or moves; 1–2 doubles per neighbour per round |
 | `MFTLRemeshMeasureBodies` | 2 × `MFTLEnsembleReduceBodies` + scalar `MPI_MAX` | 9 + 1 doubles per local body |
 | `MFTLRemeshSyncGhostIds` | `MFTLGhostPull` on `MFTL_ROUTE_AUTO`: LOR + request/reply over `comm_graph` (global route) | 4 B per ghost vertex |
@@ -1290,7 +1290,9 @@ $O(N_\mathrm{body})$ memory and time per rank where $O(N_\mathrm{body}/P)$ is
 due).
 
 `test_remeshing_mpi_is_confined` is a CMake source check (a scan for `MPI_*(`
-outside `remesh_comm.c`; hence the `MFTLRemeshWallTime` wrapper). It exists
+outside `remesh_comm.c`). The small reductions and the clock are the library's
+(`MFTLAllreduceInts`, `MFTLAllreduceDoubles`, `MFTLWallTime`); the scan refuses
+a private copy of them even inside `remesh_comm.c`. It exists
 because the first version broke the rule twice, each change small and correct: a
 cut-plane offset in `MFTLGetOwnerProc`, the body of `compute_owners`, cost
 **1.70×** on the per-timestep ownership loop (1.79 → 3.05 ns/entity, 42 → 89

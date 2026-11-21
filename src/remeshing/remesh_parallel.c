@@ -455,7 +455,7 @@ static void clear_frozen(MFTL_Ensemble *ens)
  */
 /**
  * @brief Slots of the convergence certificate, summed over ranks by one 3-int
- *        `MPI_Allreduce` per phase (MFTLRemeshSumInts()). Kept separate from the
+ *        `MPI_Allreduce` per phase (MFTLAllreduceInts()). Kept separate from the
  *        id prefix sums, which go over each body's holders: appending
  *        ensemble-wide counters to them would put a `comm_world` reduction back
  *        on them. Read back in place by name.
@@ -618,7 +618,7 @@ static void assign_phase_gids(MFTL_Ensemble *ens, gid_scratch *g, int *extra)
 
   /* One separate 3-int Allreduce for the certificate: appending ensemble-wide
    * counters to the per-body id scan would force it onto comm_world. */
-  MFTLRemeshSumInts(&ens->domain, extra, MFTL_REMESH_EXTRA_INTS);
+  MFTLAllreduceInts(ens->domain.comm_world, extra, MFTL_REMESH_EXTRA_INTS, MFTL_REDUCE_SUM);
 
   for (int o = 0; o < b; ++o)
   {
@@ -774,7 +774,7 @@ static int redensify_global_ids(MFTL_Ensemble *ens, gid_scratch *g)
  * worthless. Axes with cuts < 2 are skipped for the same reason they are skipped
  * in MFTLDomainGetHMin: they have no interior plane to be near.
  *
- * LOCAL, no MPI -- the caller reduces both with one MFTLRemeshAgreeDoubleMax.
+ * LOCAL, no MPI -- the caller reduces both with one MFTLAllreduceDoubles (MAX).
  *
  * @param      obj   The mesh.
  * @param      dom   The MPI/physical world.
@@ -850,7 +850,7 @@ static void local_band_probe(const MFTL_Object *obj, const MFTL_Domain *dom, con
  * and at the partition boundary those are the ranks that differ most -- which is
  * precisely the population the measurement is about.
  *
- * LOCAL, no MPI. The caller reduces both with one MFTLRemeshAgreeDouble (SUM).
+ * LOCAL, no MPI. The caller reduces both with one MFTLAllreduceDoubles (SUM).
  *
  * @param      obj The mesh, with #MFTL_FLAG_FROZEN already current.
  * @param[out] out {owned triangles, frozen owned triangles}, accumulated into.
@@ -1207,14 +1207,14 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
   /* Free-running per-rank accumulation; reduced ONCE, on the way out. Timing
    * every phase collectively would cost more than it measures and would add a
    * barrier the algorithm does not otherwise have. */
-  const double t0_call = MFTLRemeshWallTime();
+  const double t0_call = MFTLWallTime();
   double t_mark = t0_call;
 
   /* Phase 0's geometry, taken here rather than at the top of the loop: the
    * pre-pass needs it too, and nothing between here and the first migration
    * moves a vertex, so one pass serves both. */
   MFTLEnsembleComputeTriangleGeometry(ens);
-  st->t_geometry += MFTLRemeshWallTime() - t_mark;
+  st->t_geometry += MFTLWallTime() - t_mark;
 
   /* The pre-pass's local half: see "Regime C" below. */
   const bool prepass = (params->parallel_coarsen != 0 || params->serial_gather_max_triangles > 0) && dom->nproc > 1;
@@ -1273,14 +1273,14 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
   int group[3] = {1, 1, 1};
   if (prepass)
   {
-    MFTLRemeshAgreeDoubleMax(dom, probe, 2);
+    MFTLAllreduceDoubles(dom->comm_world, probe, 2, MFTL_REDUCE_MAX);
 
     /* A SECOND reduction, and a different OPERATOR -- which is why it is a
      * second one and not two more slots on the first. The band is a maximum
      * (the worst place any rank found) and the counts are sums (how much mesh
      * there is, and how much of it is frozen). Two doubles through an
      * MPI_SUM, once per pass, against several migrations. */
-    MFTLRemeshAgreeDouble(dom, counts, 2);
+    MFTLAllreduceDoubles(dom->comm_world, counts, 2, MFTL_REDUCE_SUM);
 
     st->frozen_fraction = (counts[0] > 0.0) ? (counts[1] / counts[0]) : 0.0;
 
@@ -1454,9 +1454,9 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
 
   if (params->sizing == MFTL_REMESH_SIZING_CURVATURE)
   {
-    t_mark = MFTLRemeshWallTime();
+    t_mark = MFTLWallTime();
     if (MFTLRemeshEnsemblePrepareSizing(ens, params) != MFTL_SUCCESS) status = MFTL_ERROR;
-    st->t_freeze += MFTLRemeshWallTime() - t_mark;
+    st->t_freeze += MFTLWallTime() - t_mark;
   }
 
   const bool project = (params->projection == MFTL_REMESH_PROJECT_PHONG);
@@ -1465,6 +1465,7 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
   if (project && MFTLRemeshEnsembleReferenceBuild(ens, params, &refs, st) != MFTL_SUCCESS) status = MFTL_ERROR;
 
   /* ── One placement: move the planes, move the mesh, freeze, record ids ──── */
+  // clang-format off: hand-laid statement macros (clang-format re-indents their bodies)
 #define SPANNING_ENTER_PLACEMENT(entry, first)                                                          \
   do                                                                                                    \
   {                                                                                                     \
@@ -1472,28 +1473,28 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
     MFTLRemeshPhaseShift(dom, group, MFTL_REMESH_PHASES[(entry)], shift_);                              \
     if (!(first))                                                                                       \
     {                                                                                                   \
-      t_mark = MFTLRemeshWallTime();                                                                    \
+      t_mark = MFTLWallTime();                                                                          \
       MFTLEnsembleComputeTriangleGeometry(ens);                                                         \
-      st->t_geometry += MFTLRemeshWallTime() - t_mark;                                                  \
+      st->t_geometry += MFTLWallTime() - t_mark;                                                        \
     }                                                                                                   \
-    t_mark = MFTLRemeshWallTime();                                                                      \
+    t_mark = MFTLWallTime();                                                                            \
     MFTL_RemeshMigrationReport rep_;                                                                    \
     if (MFTLRemeshMigrateShifted(&mig, ens, group, shift_, &rep_) != MFTL_SUCCESS) status = MFTL_ERROR; \
-    st->t_migrate += MFTLRemeshWallTime() - t_mark;                                                     \
+    st->t_migrate += MFTLWallTime() - t_mark;                                                           \
     st->n_entities_migrated += rep_.n_moved;                                                            \
     if (rep_.performed)                                                                                 \
       st->n_migrations++;                                                                               \
     else                                                                                                \
       st->n_migrations_skipped++;                                                                       \
     st->n_phases++;                                                                                     \
-    t_mark = MFTLRemeshWallTime();                                                                      \
+    t_mark = MFTLWallTime();                                                                            \
     for (int o_ = 0; o_ < ens->n_local_objects; ++o_)                                                   \
     {                                                                                                   \
       MFTLRemeshMarkFrozen(ens->local_objects[o_]);                                                     \
       MFTLDilateFrozenBand(ens->local_objects[o_], params->freeze_dilation_rings);                      \
       local_band_probe(ens->local_objects[o_], dom, shift_, band_probe);                                \
     }                                                                                                   \
-    st->t_freeze += MFTLRemeshWallTime() - t_mark;                                                      \
+    st->t_freeze += MFTLWallTime() - t_mark;                                                            \
     gid_scratch_reserve(&gid, ens->n_local_objects);                                                    \
     for (int o_ = 0; o_ < ens->n_local_objects; ++o_)                                                   \
     {                                                                                                   \
@@ -1511,13 +1512,14 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
     (extra)[MFTL_REMESH_EXTRA_HIDDEN_LONG] = (extra)[MFTL_REMESH_EXTRA_HIDDEN_SHORT] = 0;                                                       \
     for (int o_ = 0; o_ < ens->n_local_objects; ++o_)                                                                                           \
       count_unoffered_edges(ens->local_objects[o_], params, &(extra)[MFTL_REMESH_EXTRA_HIDDEN_LONG], &(extra)[MFTL_REMESH_EXTRA_HIDDEN_SHORT]); \
-    t_mark = MFTLRemeshWallTime();                                                                                                              \
+    t_mark = MFTLWallTime();                                                                                                                    \
     assign_phase_gids(ens, &gid, (extra));                                                                                                      \
-    st->t_reduce += MFTLRemeshWallTime() - t_mark;                                                                                              \
+    st->t_reduce += MFTLWallTime() - t_mark;                                                                                                    \
     st->n_edges_hidden_long = (extra)[MFTL_REMESH_EXTRA_HIDDEN_LONG];                                                                           \
     st->n_edges_hidden_short = (extra)[MFTL_REMESH_EXTRA_HIDDEN_SHORT];                                                                         \
     st->n_edges_hidden = st->n_edges_hidden_long + st->n_edges_hidden_short;                                                                    \
   } while (0)
+  // clang-format on
 
   if (params->spanning_mode != MFTL_REMESH_SPANNING_NESTED)
   {
@@ -1535,7 +1537,7 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
     {
       SPANNING_ENTER_PLACEMENT(distinct[p % n_distinct], MFTL_FALSE);
 
-      t_mark = MFTLRemeshWallTime();
+      t_mark = MFTLWallTime();
       int local_ops = 0;
       for (int o = 0; o < ens->n_local_objects; ++o)
       {
@@ -1544,7 +1546,7 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
         local_ops += MFTLRemeshIterateSpanning(ens->local_objects[o], params, &one, params->iterations, MFTL_TRUE);
         remesh_stats_accumulate(st, &one);
       }
-      st->t_sweep += MFTLRemeshWallTime() - t_mark;
+      st->t_sweep += MFTLWallTime() - t_mark;
 
       int extra[MFTL_REMESH_EXTRA_INTS];
       SPANNING_LEAVE_PLACEMENT(local_ops, extra);
@@ -1574,12 +1576,12 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
         const MFTL_Object *const obj = ens->local_objects[o];
         for (int v = 0; v < obj->verts.n_local; ++v) left[0] += !(obj->verts.rec[v].flags & (MFTL_FLAG_DEAD | MFTL_FLAG_DONE | MFTL_FLAG_CORNER));
       }
-      t_mark = MFTLRemeshWallTime();
-      MFTLRemeshSumInts(dom, left, 1);
-      st->t_reduce += MFTLRemeshWallTime() - t_mark;
+      t_mark = MFTLWallTime();
+      MFTLAllreduceInts(dom->comm_world, left, 1, MFTL_REDUCE_SUM);
+      st->t_reduce += MFTLWallTime() - t_mark;
       if (left[0] > 0)
       {
-        t_mark = MFTLRemeshWallTime();
+        t_mark = MFTLWallTime();
         for (int o = 0; o < ens->n_local_objects; ++o)
           MFTLDetectFeatures(ens->local_objects[o], params->feature_angle_threshold, params->feature_corner_angle, st);
         for (int sw = 0; sw < params->iterations * params->smooth_iterations && status == MFTL_SUCCESS; ++sw)
@@ -1588,7 +1590,7 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
           for (int o = 0; o < ens->n_local_objects; ++o) MFTLRemeshSmooth(ens->local_objects[o], params, 1, st);
           if (MFTLRemeshSyncGhostPositions(ens) != MFTL_SUCCESS) status = MFTL_ERROR;
         }
-        st->t_sweep += MFTLRemeshWallTime() - t_mark;
+        st->t_sweep += MFTLWallTime() - t_mark;
       }
     }
   }
@@ -1616,7 +1618,7 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
       {
         SPANNING_ENTER_PLACEMENT(distinct[(it % 2 == 0) ? q : per - 1 - q], MFTL_FALSE);
 
-        t_mark = MFTLRemeshWallTime();
+        t_mark = MFTLWallTime();
         int local_ops = 0;
         for (int o = 0; o < ens->n_local_objects; ++o)
         {
@@ -1625,7 +1627,7 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
           local_ops += MFTLRemeshEdgeSweeps(ens->local_objects[o], params, &one);
           remesh_stats_accumulate(st, &one);
         }
-        st->t_sweep += MFTLRemeshWallTime() - t_mark;
+        st->t_sweep += MFTLWallTime() - t_mark;
 
         int extra[MFTL_REMESH_EXTRA_INTS];
         SPANNING_LEAVE_PLACEMENT(local_ops, extra);
@@ -1639,7 +1641,7 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
       st->converged = covered;
 
       /* The smoothing of this iteration, everywhere at once. */
-      t_mark = MFTLRemeshWallTime();
+      t_mark = MFTLWallTime();
       clear_done(ens);
       for (int o = 0; o < ens->n_local_objects; ++o)
         MFTLDetectFeatures(ens->local_objects[o], params->feature_angle_threshold, params->feature_corner_angle, st);
@@ -1649,7 +1651,7 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
         for (int o = 0; o < ens->n_local_objects; ++o) MFTLRemeshSmooth(ens->local_objects[o], params, 1, st);
         if (MFTLRemeshSyncGhostPositions(ens) != MFTL_SUCCESS) status = MFTL_ERROR;
       }
-      st->t_sweep += MFTLRemeshWallTime() - t_mark;
+      st->t_sweep += MFTLWallTime() - t_mark;
 
       if (it_ops <= params->min_convergence_ops) break;
     }
@@ -1667,22 +1669,22 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
    * exactly what replaces them -- so it has to come after. Ghost VERTICES are
    * kept by a migration rather than re-received, which is why they need the
    * explicit exchange inside redensify_global_ids and cannot rely on this. */
-  t_mark = MFTLRemeshWallTime();
+  t_mark = MFTLWallTime();
   if (redensify_global_ids(ens, &gid) != MFTL_SUCCESS) status = MFTL_ERROR;
-  st->t_reduce += MFTLRemeshWallTime() - t_mark;
+  st->t_reduce += MFTLWallTime() - t_mark;
 
-  t_mark = MFTLRemeshWallTime();
+  t_mark = MFTLWallTime();
   MFTLEnsembleComputeTriangleGeometry(ens);
-  st->t_geometry += MFTLRemeshWallTime() - t_mark;
+  st->t_geometry += MFTLWallTime() - t_mark;
 
   /* The canonical placement is the PRODUCTION rule, so the closing migration
    * goes through MFTLRedistribute and not through the shifted path. That is not
    * a tidiness point: it is what makes "the mesh the flow solver gets back is
    * partitioned exactly as MFTLRedistribute would partition it" true by
    * construction rather than by an argument about a zero shift. */
-  t_mark = MFTLRemeshWallTime();
+  t_mark = MFTLWallTime();
   if (MFTLRedistribute(ens) != MFTL_SUCCESS) status = MFTL_ERROR;
-  st->t_migrate += MFTLRemeshWallTime() - t_mark;
+  st->t_migrate += MFTLWallTime() - t_mark;
   st->n_migrations++;
 
   clear_frozen(ens);
@@ -1702,9 +1704,9 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
    * (mftl_communication.h). MFTLRemeshObject promises its caller current
    * triangle geometry, so this one promises the same thing rather than making
    * the parallel entry point a different contract. */
-  t_mark = MFTLRemeshWallTime();
+  t_mark = MFTLWallTime();
   MFTLEnsembleComputeTriangleGeometry(ens);
-  st->t_geometry += MFTLRemeshWallTime() - t_mark;
+  st->t_geometry += MFTLWallTime() - t_mark;
 
   /* ── 7. Publish the profile ───────────────────────────────────────────────
    *
@@ -1714,7 +1716,7 @@ int MFTLRemeshSpanningPass(MFTL_Ensemble *ens, const MFTL_RemeshParameters *para
    *
    * UNCONDITIONAL, even when the caller passed no stats struct: every rank must
    * enter the collective. */
-  st->t_total = MFTLRemeshWallTime() - t0_call;
+  st->t_total = MFTLWallTime() - t0_call;
   MFTLRemeshAgreeProfile(dom, st, band_probe, 2);
 
   st->band_measured = band_probe[0];

@@ -338,5 +338,8 @@ one sweep); with a 15° threshold, 9.0 and 2.6 %. The volume correction is 4.1 a
 - **Parameters:** out-of-range parameters are refused on every rank, and an
   ensemble with no body enters no unmatched collective.
 
-`test_correction_mpi_is_confined` keeps the module's own MPI in
-`correction_comm.c`.
+`test_correction_mpi_is_confined` keeps the module free of MPI calls of its
+own: positions travel through `MFTLUpdateGhostPositions`, per-body sums through
+`MFTLEnsembleReduceBodies`, and the statistics and the undulation schedule's
+colour flags through the library's small reductions (`MFTLAllreduceDoubles`,
+`MFTLAllreduceLongLongs`).

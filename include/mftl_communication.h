@@ -1313,6 +1313,92 @@ void MFTLRedistributeGetStats(MFTL_RedistributeStats *out);
  */
 int MFTLUpdateGhostFields(MFTL_Ensemble *ens, const int *ids, int nfields, bool with_positions);
 
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 8. Small reductions and the wall clock
+ *
+ * The library's one way to reduce a few values over a communicator, and its one
+ * clock. Every module's agreements, statistics and timings go through them, so
+ * no module needs a wrapper of its own to keep MPI out of its sources: a
+ * module's confinement test (`test_*_mpi_is_confined`) then guards only the
+ * module's own traffic, and the scan refuses `MPI_Wtime` and an in-place
+ * `MPI_Allreduce` even in a module's allowed file.
+ *
+ * They reduce over a COMMUNICATOR, not over a body's holders: per-body values go
+ * through MFTLEnsembleReduceBodies(), which chooses the smaller route. A call
+ * here on `comm_world` is a global synchronisation point, so it does not
+ * belong on a per-timestep path that should not have one.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief The operator of a small reduction (MFTLAllreduceDoubles() and its
+ *        siblings).
+ *
+ * The same three operators, with the same values, as #MFTL_BodyReduceOp, which
+ * reduces over each body's holders instead of over a communicator.
+ */
+typedef enum MFTL_ReduceOp
+{
+  MFTL_REDUCE_MIN = 0,  ///< `MPI_MIN`.
+  MFTL_REDUCE_MAX = 1,  ///< `MPI_MAX`; on 0/1 flags, the logical OR.
+  MFTL_REDUCE_SUM = 2  ///< `MPI_SUM`.
+} MFTL_ReduceOp;
+
+/**
+ * @brief In-place `MPI_Allreduce` of @p n doubles over @p comm.
+ *
+ * MIN and MAX are exact and independent of order, so every rank may branch on
+ * the result. A SUM of doubles is rounded in an order MPI chooses; it is exact
+ * for integers below \f$2^{53}\f$ (counts carried as doubles).
+ *
+ * @param         comm The communicator. Every rank of it calls, with the same
+ *                     @p n and @p op.
+ * @param[in,out] v    `[n]` this rank's values in, the reduction out.
+ * @param         n    Number of values; 0 makes no MPI call, on every rank alike.
+ * @param         op   The operator.
+ *
+ * @collective Over @p comm. A communicator of one rank makes no MPI call.
+ */
+void MFTLAllreduceDoubles(MPI_Comm comm, double *v, int n, MFTL_ReduceOp op);
+
+/**
+ * @brief In-place `MPI_Allreduce` of @p n ints over @p comm: counts, flags and
+ *        statuses.
+ *
+ * @param         comm The communicator. Every rank of it calls, with the same
+ *                     @p n and @p op.
+ * @param[in,out] v    `[n]` this rank's values in, the reduction out.
+ * @param         n    Number of values; 0 makes no MPI call, on every rank alike.
+ * @param         op   The operator.
+ *
+ * @collective Over @p comm. A communicator of one rank makes no MPI call.
+ */
+void MFTLAllreduceInts(MPI_Comm comm, int *v, int n, MFTL_ReduceOp op);
+
+/**
+ * @brief In-place `MPI_Allreduce` of @p n long longs over @p comm: counts that
+ *        may pass `INT_MAX` summed over ranks.
+ *
+ * @param         comm The communicator. Every rank of it calls, with the same
+ *                     @p n and @p op.
+ * @param[in,out] v    `[n]` this rank's values in, the reduction out.
+ * @param         n    Number of values; 0 makes no MPI call, on every rank alike.
+ * @param         op   The operator.
+ *
+ * @collective Over @p comm. A communicator of one rank makes no MPI call.
+ */
+void MFTLAllreduceLongLongs(MPI_Comm comm, long long *v, int n, MFTL_ReduceOp op);
+
+/**
+ * @brief The library's wall clock, `MPI_Wtime()`.
+ *
+ * Every module's profile fields read it, so all of them share one clock. Only
+ * differences are meaningful.
+ *
+ * @return Seconds since an arbitrary origin, fixed for the process.
+ * @rank_local
+ */
+double MFTLWallTime(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -390,12 +390,26 @@ add_test(NAME test_coupling_mpi_is_confined
                  -DALLOWED=coupling_comm.c
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/check_mpi_confinement.cmake)
 
-# And for the front corrections: the only MPI of their own is a few statistics
-# and the colour flags of the undulation schedule.
+# And for the front corrections, which have NO MPI of their own: positions go
+# through the ghost sync, per-body sums through MFTLEnsembleReduceBodies, the
+# statistics and the colour flags of the undulation schedule through the
+# library's small reductions.
 add_test(NAME test_correction_mpi_is_confined
          COMMAND ${CMAKE_COMMAND}
                  -DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../src/correction
-                 -DALLOWED=correction_comm.c
+                 -DALLOWED=NONE
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/check_mpi_confinement.cmake)
+
+# The computational modules make no MPI call at all. Their functions are
+# rank-local by contract (the header tags), and the one collective among them
+# (MFTLEnsembleIntersectObjects) is built on the communication module's
+# primitives. A call slipped into a normal or curvature kernel would be a
+# deadlock the first time two ranks took different branches; at runtime only
+# test_vertex_normals_np3 would see it, and only for that one function.
+add_test(NAME test_compute_modules_have_no_mpi
+         COMMAND ${CMAKE_COMMAND}
+                 "-DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../src/arrayfunctions,${CMAKE_CURRENT_SOURCE_DIR}/../src/bvh,${CMAKE_CURRENT_SOURCE_DIR}/../src/geometry,${CMAKE_CURRENT_SOURCE_DIR}/../src/object,${CMAKE_CURRENT_SOURCE_DIR}/../src/topology"
+                 -DALLOWED=NONE
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/check_mpi_confinement.cmake)
 
 # --- Genuine multi-rank coverage ------------------------------------------
@@ -743,6 +757,7 @@ mftl_add_mpi_test_oversub(test_exchange_np27 test_exchange 27)
 
 set_property(TEST test_remeshing_mpi_is_confined test_topology_change_mpi_is_confined
                   test_coupling_mpi_is_confined test_correction_mpi_is_confined
+                  test_compute_modules_have_no_mpi
              APPEND PROPERTY LABELS serial static)
 
 if(BUILD_EXAMPLES)

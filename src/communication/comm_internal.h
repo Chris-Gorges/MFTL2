@@ -25,7 +25,7 @@
 /* ═══════════════════════════════════════════════════════════════════════════
  * 1. Instrumentation: one accumulator (comm_stats.c). Counters are always on
  * (a few integer adds per call or body). Phase TIMERS are compiled in only with
- * -DMFTL_COMM_PROFILE=ON: the per-body timeline reads MPI_Wtime at ten
+ * -DMFTL_COMM_PROFILE=ON: the per-body timeline reads MFTLWallTime at ten
  * boundaries per body (25-37 ns each on the development machine, 1.5-2 % of a
  * 10 ms phase at a thousand bodies). Every clock read is counted in
  * `n_clock_reads`, so the perturbation can be estimated.
@@ -40,7 +40,7 @@ extern MFTL_RedistributeStats MFTLCommStats;
 static inline double cs_now(void)
 {
   MFTLCommStats.n_clock_reads++;
-  return MPI_Wtime();
+  return MFTLWallTime();
 }
 
 /** @brief Opens a timed region: declares a `double` named @p v. */

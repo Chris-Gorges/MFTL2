@@ -762,26 +762,13 @@ void MFTLCplCommRankSize(MPI_Comm c, int *rank, int *size);
 bool MFTLCplCommSameGroup(MPI_Comm a, MPI_Comm b);
 /** @brief Translates only the supplied peer ranks between communicators; rejects out-of-range ranks. Local. */
 bool MFTLCplTranslateRanks(MPI_Comm from, MPI_Comm to, int64_t n, const int *ranks, int *translated);
-/** @brief The maximum of @p v over the ranks. */
-int MFTLCplAgreeMax(MPI_Comm c, int v);
-
 /** @brief Agrees status and token identity before a transfer posts messages. */
 int MFTLCplAgreeTransfer(MPI_Comm c, int status, uint64_t token);
 
 /** @brief Agree validation and, only if all ranks are valid, its signature in one reduction. */
 int MFTLCplAgreeValidated(MPI_Comm c, int status, uint64_t signature);
-/** @brief In-place MAX of @p n ints. */
-void MFTLCplAgreeMaxN(MPI_Comm c, int *v, int n);
 /** @brief Whether @p h is the same on every rank (one reduction of two values). */
 bool MFTLCplAgreeHash(MPI_Comm c, uint64_t h);
-/** @brief In-place MAX of @p n doubles. */
-void MFTLCplAllreduceMax(MPI_Comm c, double *v, int n);
-/** @brief In-place SUM of @p n doubles. */
-void MFTLCplAllreduceSum(MPI_Comm c, double *v, int n);
-/** @brief In-place SUM of @p n longs. */
-void MFTLCplAllreduceSumLong(MPI_Comm c, long *v, int n);
-/** @brief In-place MAX of @p n longs. */
-void MFTLCplAllreduceMaxLong(MPI_Comm c, long *v, int n);
 /** @brief The rank holding the global maximum of @p v (lowest on ties), and the maximum. */
 void MFTLCplMaxloc(MPI_Comm c, double v, double *vmax, int *rank);
 /** @brief Broadcasts @p n ints from @p root. */
@@ -845,9 +832,6 @@ void MFTLCplSchedSend(MPI_Comm c, cpl_sched *s, int tag, int peer, const void *b
 void MFTLCplSchedWait(cpl_sched *s);
 /** @brief Frees the request array. */
 void MFTLCplSchedFree(cpl_sched *s);
-
-/** @brief Wall clock. */
-double MFTLCplWtime(void);
 
 /** @brief The current chunk limit in bytes. */
 size_t MFTLCplChunkLimit(void);
