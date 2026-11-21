@@ -308,17 +308,6 @@ bool MFTLCplBoxSubtract(double *rem, int *n_rem, int cap, const double *sub, con
 /** @brief Integer index-box subtraction of half-open boxes; same contract. */
 bool MFTLCplIboxSubtract(int64_t *rem, int *n_rem, int cap, const int64_t *sub);
 
-/**
- * @brief The ranks whose boxes intersect the closed box `[lo, hi]`, periodic
- *        images included, deduplicated and sorted. Arithmetic on the process
- *        grid; never a loop over the ranks.
- * @return The number of such ranks. When it exceeds @p cap nothing is written:
- *         grow @p out to the returned count and call again (a caller sizes its
- *         buffer by what boxes actually touch, never by the process count).
- */
-int MFTLCplRanksTouching(const MFTL_Domain *d, const double lo[3], const double hi[3], int *out, int cap);
-
-
 /* ═══════════════════════════════════════════════════════════════════════════
  * Directory (coupling_directory.c)
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -762,13 +751,11 @@ void MFTLCplCommRankSize(MPI_Comm c, int *rank, int *size);
 bool MFTLCplCommSameGroup(MPI_Comm a, MPI_Comm b);
 /** @brief Translates only the supplied peer ranks between communicators; rejects out-of-range ranks. Local. */
 bool MFTLCplTranslateRanks(MPI_Comm from, MPI_Comm to, int64_t n, const int *ranks, int *translated);
-/** @brief Agrees status and token identity before a transfer posts messages. */
+/** @brief Agrees status and token identity before a transfer posts messages (one MFTLAgreeWords()). */
 int MFTLCplAgreeTransfer(MPI_Comm c, int status, uint64_t token);
 
-/** @brief Agree validation and, only if all ranks are valid, its signature in one reduction. */
+/** @brief Agree validation and, only if all ranks are valid, its signature in one reduction (MFTLAgreeWords()). */
 int MFTLCplAgreeValidated(MPI_Comm c, int status, uint64_t signature);
-/** @brief Whether @p h is the same on every rank (one reduction of two values). */
-bool MFTLCplAgreeHash(MPI_Comm c, uint64_t h);
 /** @brief The rank holding the global maximum of @p v (lowest on ties), and the maximum. */
 void MFTLCplMaxloc(MPI_Comm c, double v, double *vmax, int *rank);
 /** @brief Broadcasts @p n ints from @p root. */

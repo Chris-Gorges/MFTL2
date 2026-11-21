@@ -307,58 +307,6 @@ bool MFTLCplIboxSubtract(int64_t *rem, int *n_rem, int cap, const int64_t *sub)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * The process grid
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-int MFTLCplRanksTouching(const MFTL_Domain *d, const double lo[3], const double hi[3], int *out, int cap)
-{
-  int64_t c0[3], c1[3];
-  for (int k = 0; k < 3; ++k)
-  {
-    const int64_t cuts = d->cuts[k];
-    const double f = d->grid_factors[k];
-    double a = floor((lo[k] - d->global_min[k]) * f), b = floor((hi[k] - d->global_min[k]) * f);
-    if (d->is_periodic[k])
-    {
-      if (b - a + 1.0 >= (double) cuts)
-      {
-        c0[k] = 0;
-        c1[k] = cuts - 1;
-      }
-      else
-      {
-        c0[k] = (int64_t) a;
-        c1[k] = (int64_t) b;
-      }
-    }
-    else
-    {
-      if (a < 0.0) a = 0.0;
-      if (b < 0.0) b = 0.0;
-      if (a > (double) (cuts - 1)) a = (double) (cuts - 1);
-      if (b > (double) (cuts - 1)) b = (double) (cuts - 1);
-      c0[k] = (int64_t) a;
-      c1[k] = (int64_t) b;
-    }
-  }
-  /* The cell ranges never wrap onto themselves (a periodic axis spanning every
-   * cell is enumerated once), and rank_map is a bijection, so every rank
-   * appears at most once and the count is the product of the ranges. */
-  const int64_t total = (c1[0] - c0[0] + 1) * (c1[1] - c0[1] + 1) * (c1[2] - c0[2] + 1);
-  if (total > (int64_t) cap) return (int) total;
-  int n = 0;
-  for (int64_t z = c0[2]; z <= c1[2]; ++z)
-    for (int64_t y = c0[1]; y <= c1[1]; ++y)
-      for (int64_t x = c0[0]; x <= c1[0]; ++x)
-      {
-        const int64_t cx = cpl_mod(x, d->cuts[0]), cy = cpl_mod(y, d->cuts[1]), cz = cpl_mod(z, d->cuts[2]);
-        out[n++] = d->rank_map[cx + cy * d->cuts[0] + cz * d->cuts[0] * d->cuts[1]];
-      }
-  MFTLSortIds(out, n);
-  return n;
-}
-
-/* ═══════════════════════════════════════════════════════════════════════════
  * Compact bounds trees over directory certificates
  * ═══════════════════════════════════════════════════════════════════════════ */
 

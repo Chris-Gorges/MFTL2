@@ -255,3 +255,17 @@ which is how the examples total their volumes.
 narrowest rank box over the cut axes (uncut axes have no interior plane), is the
 length the distributed remesher's band condition and strategy choice are
 measured against. It is 0 for a single process and identical on every rank.
+
+**Which ranks a region reaches** is one rule, `MFTLDomainRanksOfCells`: per-axis
+ranges of UNWRAPPED cell indices, wrapped modulo `cuts` on a periodic axis (a
+range of `cuts` cells or more is the whole axis) and clipped on a wall-bounded
+one. Distinct cells are distinct ranks (`rank_map` is a bijection), so the
+answer needs no de-duplication and has no size limit; it comes back ascending.
+`MFTLDomainRanksTouching` turns a physical box into those ranges by the owner
+rule of `MFTLGetOwnerProc` (`grid_factors`, clamped at a wall), so the owner of
+every point of the box is in the answer and a box shrunk to a point reaches
+exactly its owner (`test_a_box_reaches_exactly_the_owners_of_its_points`). The
+coupler routes its requests and directory shards with it, the remesher its
+projection reference; topology change passes the exact integer need ranges of
+its lattice nodes to `MFTLDomainRanksOfCells` directly, so no rounding enters
+its np-independent surface.

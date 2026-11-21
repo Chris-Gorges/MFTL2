@@ -67,6 +67,7 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "mftl_arrayfunctions.h"
 #include "mftl_constants.h"
@@ -1387,6 +1388,44 @@ void MFTLAllreduceInts(MPI_Comm comm, int *v, int n, MFTL_ReduceOp op);
  * @collective Over @p comm. A communicator of one rank makes no MPI call.
  */
 void MFTLAllreduceLongLongs(MPI_Comm comm, long long *v, int n, MFTL_ReduceOp op);
+
+/**
+ * @brief Do the ranks of @p comm hold the same @p n words? The library's one
+ *        agreement check: the first word on which they differ, the same answer
+ *        on every rank.
+ *
+ * One `MPI_Allreduce` (MAX) of \f$2n\f$ words, each word with its complement:
+ * \f$\max w = \lnot\max(\lnot w)\f$ exactly when \f$\max w = \min w\f$, i.e.
+ * every rank passed the same bits. Complementing reverses the order of 64-bit
+ * words read as unsigned AND as two's-complement signed
+ * (\f$\lnot x = -x - 1\f$), so the check is right even where `MPI_UINT64_T` is
+ * compared as signed (MPICH 4.0); it never relies on an identity element.
+ *
+ * Words are compared bit for bit. A caller agreeing on values passes their bit
+ * patterns (exact; normalise `-0.0` first if it should equal `0.0`); a caller
+ * agreeing on something long passes a hash and accepts its collision odds.
+ * Because the verdict is reduced, a caller may branch on it, enter a further
+ * collective to describe a disagreement, or rely on any function of the agreed
+ * words being the same everywhere.
+ *
+ * A collective entry point typically validates its input locally and then
+ * agrees on what it validated: @p status carries the local verdict through the
+ * SAME reduction (its largest value over the ranks), so validation and
+ * agreement cost one round trip, not two.
+ *
+ * @param         comm   The communicator. Every rank of it calls, with the same
+ *                       @p n and the same NULL-ness of @p status.
+ * @param         words  `[n]` this rank's words.
+ * @param         n      Number of words.
+ * @param[in,out] status NULL, or this rank's status (>= 0, larger is worse) in
+ *                       and the largest over the ranks out.
+ * @return The index of the first word that differs between ranks, or -1 when
+ *         every rank passed the same words. Identical on every rank.
+ *
+ * @collective Over @p comm. No words and no @p status, or a communicator of
+ *             one rank, make no MPI call.
+ */
+int MFTLAgreeWords(MPI_Comm comm, const uint64_t *words, int n, int *status);
 
 /**
  * @brief The library's wall clock, `MPI_Wtime()`.

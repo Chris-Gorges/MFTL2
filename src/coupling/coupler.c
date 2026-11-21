@@ -35,6 +35,7 @@
 #include "mftl_arrayfunctions.h"
 #include "mftl_communication.h"
 #include "mftl_constants.h"
+#include "mftl_ensemble.h"
 #include "mftl_geometry.h"
 #include "mftl_memory.h"
 #include "mftl_object.h"
@@ -472,12 +473,12 @@ static void lookup_directory(MFTL_Coupler *c, const directory_lookup *queries, i
   cpl_buf *buf = MFTL_NULL;
   for (int64_t q = 0; q < n; ++q)
   {
-    int nr = MFTLCplRanksTouching(d, queries[q].box, queries[q].box + 3, ranks, rc);
+    int nr = MFTLDomainRanksTouching(d, queries[q].box, queries[q].box + 3, ranks, rc);
     if (nr > rc)
     {
       rc = nr;
       ranks = MFTLCplRealloc(ranks, (size_t) rc * sizeof(int), "directory routing");
-      nr = MFTLCplRanksTouching(d, queries[q].box, queries[q].box + 3, ranks, rc);
+      nr = MFTLDomainRanksTouching(d, queries[q].box, queries[q].box + 3, ranks, rc);
     }
     for (int j = 0; j < nr; ++j)
     {
@@ -602,12 +603,12 @@ static void build_directory(MFTL_Coupler *c)
       lo[k] = own[i].mlo[k] - c->params.directory_margin;
       hi[k] = own[i].mhi[k] + c->params.directory_margin;
     }
-    int nr = MFTLCplRanksTouching(d, lo, hi, ranks, cap_ranks);
+    int nr = MFTLDomainRanksTouching(d, lo, hi, ranks, cap_ranks);
     if (nr > cap_ranks)
     {
       cap_ranks = nr;
       ranks = (int *) MFTLCplRealloc(ranks, (size_t) cap_ranks * sizeof(int), "directory ranks");
-      nr = MFTLCplRanksTouching(d, lo, hi, ranks, cap_ranks);
+      nr = MFTLDomainRanksTouching(d, lo, hi, ranks, cap_ranks);
     }
     for (int j = 0; j < nr; ++j)
     {
@@ -712,15 +713,14 @@ int MFTLCouplerCreate(MFTL_Ensemble *ens, MFTL_SolverGrid *grid, const MFTL_Coup
   }
   if (local == MFTL_COUPLING_OK && MFTLCplGridValidate(grid, &ens->domain) != MFTL_SUCCESS) local = MFTL_COUPLING_INVALID;
 
-  int st = agree(c, local);
-  if (st == MFTL_COUPLING_OK)
+  /* Validated and agreed in one reduction: the definition is hashed only where
+   * it passed validation, and only compared when it passed everywhere. */
+  const uint64_t definition = (local == MFTL_COUPLING_OK) ? MFTLCplGridDefinitionHash(grid) ^ (params_hash(&c->params) * 0x9E3779B97F4A7C15ull) : 0;
+  int st = local;
+  if (MFTLAgreeWords(c->comm, &definition, 1, &st) >= 0 && st == MFTL_COUPLING_OK)
   {
-    const bool same = MFTLCplAgreeHash(c->comm, MFTLCplGridDefinitionHash(grid) ^ (params_hash(&c->params) * 0x9E3779B97F4A7C15ull));
-    if (!same)
-    {
-      if (c->rank == 0) fprintf(stderr, "MFTL coupling: locations, lattices or parameters differ between ranks\n");
-      st = MFTL_COUPLING_INVALID;
-    }
+    if (c->rank == 0) fprintf(stderr, "MFTL coupling: locations, lattices or parameters differ between ranks\n");
+    st = MFTL_COUPLING_INVALID;
   }
   if (st != MFTL_COUPLING_OK)
   {
@@ -1715,12 +1715,12 @@ static uint64_t *migration_bins(MFTL_Coupler *c, const uint64_t *keys, int64_t n
       lo[k] = d->global_min[k] + (double) ib[k] * bin[k] - mig[k];
       hi[k] = d->global_min[k] + (double) (ib[k] + 1) * bin[k] + mig[k];
     }
-    int nr = MFTLCplRanksTouching(d, lo, hi, ranks, cap_r);
+    int nr = MFTLDomainRanksTouching(d, lo, hi, ranks, cap_r);
     if (nr > cap_r)
     {
       cap_r = nr;
       ranks = (int *) MFTLCplRealloc(ranks, (size_t) cap_r * sizeof(int), "migration ranks");
-      nr = MFTLCplRanksTouching(d, lo, hi, ranks, cap_r);
+      nr = MFTLDomainRanksTouching(d, lo, hi, ranks, cap_r);
     }
     for (int j = 0; j < nr; ++j)
     {
@@ -1815,8 +1815,7 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
     sig = cpl_fnv(sig, R->skin, sizeof R->skin);
     sig = cpl_fnv(sig, migration, sizeof migration);
   }
-  int st = agree(c, local);
-  if (st == MFTL_COUPLING_OK && !MFTLCplAgreeHash(c->comm, sig)) st = MFTL_COUPLING_INVALID;
+  int st = MFTLCplAgreeValidated(c->comm, local, sig);
   if (st == MFTL_COUPLING_OK)
   {
     /* Reject impossible periodic skins even for an empty marker batch, using

@@ -66,7 +66,7 @@ int MFTLTopoCellOwner(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, long 
   const long long nx = lat->n_global[0], ny = lat->n_global[1];
   const int ci = (int) (cell % nx), cj = (int) ((cell / nx) % ny), ck = (int) (cell / (nx * ny));
   const int c[3] = {ci / lat->per_rank[0], cj / lat->per_rank[1], ck / lat->per_rank[2]};
-  return dom->rank_map[c[0] + c[1] * dom->cuts[0] + c[2] * dom->cuts[0] * dom->cuts[1]];
+  return MFTLDomainCellRank(dom, c[0], c[1], c[2]);
 }
 
 double MFTLTopoMaxBias(const MFTL_TopologyOptions *opts) { return opts->bias_factor * 0.5 * MFTL_MAX(opts->delta_breakup, opts->delta_coalescence); }
@@ -245,44 +245,30 @@ void MFTLTopoRasterise(const MFTL_Ensemble *ens, MFTL_TopoCluster *cl, int n_cl,
   free(zone);
 }
 
-/**
- * @brief The rank-cells along one axis whose NEED range -- box nodes plus one
- *        layer -- contains wrapped node @p g.
- * @return How many were written to @p out (at most 4).
- */
-static int needing_cells(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, int k, int g, int out[4])
+/** @brief \f$\lfloor a / n \rfloor\f$ for @p n > 0 and any sign of @p a (C division truncates). */
+static inline int floor_div(int a, int n)
 {
-  const int n = lat->per_rank[k], cuts = dom->cuts[k], N = lat->cells[k];
-  int m = 0;
-  for (int c = g / n - 2; c <= g / n + 2 && m < 4; ++c)
-  {
-    int cw = c;
-    if (lat->periodic[k])
-    {
-      cw %= cuts;
-      if (cw < 0) cw += cuts;
-    }
-    else if (c < 0 || c >= cuts)
-      continue;
+  const int q = a / n;
+  return (a % n != 0 && a < 0) ? q - 1 : q;
+}
 
-    const int lo = cw * n - 1, hi = (cw + 1) * n + 1;  // inclusive need range, unwrapped
-    bool in;
-    if (lat->periodic[k])
-    {
-      int d = (g - lo) % N;
-      if (d < 0) d += N;
-      in = d <= hi - lo || (hi - lo + 1 >= N);
-    }
-    else
-      in = g >= lo && g <= hi;
-    if (!in) continue;
-
-    bool dup = MFTL_FALSE;
-    for (int i = 0; i < m; ++i)
-      if (out[i] == cw) dup = MFTL_TRUE;
-    if (!dup) out[m++] = cw;
-  }
-  return m;
+/**
+ * @brief The rank-cells along axis @p k whose NEED range -- box nodes plus one
+ *        layer, \f$[cn - 1,\ (c+1)n + 1]\f$ -- contains wrapped node @p g, as an
+ *        UNWRAPPED cell range for MFTLDomainRanksOfCells().
+ *
+ * \f$cn - 1 \le g \le cn + n + 1 \iff \lceil (g-n-1)/n \rceil \le c \le \lfloor (g+1)/n \rfloor\f$,
+ * exact integer arithmetic. On a periodic axis the lattice is `cuts * n` cells,
+ * so every image of @p g gives the same cells modulo `cuts`, which is how
+ * MFTLDomainRanksOfCells() wraps them (and a range of `cuts` or more is the
+ * whole axis); on a wall-bounded axis it drops the cells off the grid. At most
+ * four cells per axis (n = 1), so at most 64 ranks.
+ */
+static inline void needing_cells(const MFTL_TopoLattice *lat, int k, int g, int *lo, int *hi)
+{
+  const int n = lat->per_rank[k];
+  *lo = -floor_div(n + 1 - g, n);
+  *hi = floor_div(g + 1, n);
 }
 
 void MFTLTopoPackNodeExchange(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, const MFTL_TopoCluster *cl, int n_cl, int *dest_counts, double **records)
@@ -315,10 +301,11 @@ void MFTLTopoPackNodeExchange(const MFTL_Domain *dom, const MFTL_TopoLattice *la
             if (v == MFTL_SDF_UNKNOWN && !has_cross) continue;
 
             const int gw[3] = {wrap_index(lat, 0, g->lo[0] + lx), wrap_index(lat, 1, g->lo[1] + ly), wrap_index(lat, 2, g->lo[2] + lz)};
-            int cx[4], cy[4], cz[4];
-            const int mx = needing_cells(dom, lat, 0, gw[0], cx);
-            const int my = needing_cells(dom, lat, 1, gw[1], cy);
-            const int mz = needing_cells(dom, lat, 2, gw[2], cz);
+            int need_lo[3], need_hi[3];
+            for (int k = 0; k < 3; ++k) needing_cells(lat, k, gw[k], &need_lo[k], &need_hi[k]);
+            int needs[64];
+            const int n_needs = MFTLDomainRanksOfCells(dom, need_lo, need_hi, needs, 64);
+            MFTL_ASSERT(n_needs <= 64 && "topology node exchange: more than four needing cells per axis");
 
             /* Records carry a TAGGED key, 4 * node + kind: kind 0 is the
              * node's value, kind 1 + k the crossing slot of its edge along k.
@@ -329,39 +316,29 @@ void MFTLTopoPackNodeExchange(const MFTL_Domain *dom, const MFTL_TopoLattice *la
             if (has_cross)
               for (int k = 0; k < 3; ++k) n_rec += (cx3[k] != MFTL_SDF_CROSS_NONE);
 
-            /* At most 64 (cell, cell, cell) combinations, few of them distinct
-             * ranks; de-duplicate so a rank is sent a node once. */
-            int sent_to[64];
-            int n_sent = 0;
-            for (int a = 0; a < mx; ++a)
-              for (int b = 0; b < my; ++b)
-                for (int d = 0; d < mz; ++d)
-                {
-                  const int r = dom->rank_map[cx[a] + cy[b] * dom->cuts[0] + cz[d] * dom->cuts[0] * dom->cuts[1]];
-                  if (r == dom->rank) continue;
-                  bool dup = MFTL_FALSE;
-                  for (int i = 0; i < n_sent; ++i)
-                    if (sent_to[i] == r) dup = MFTL_TRUE;
-                  if (dup) continue;
-                  sent_to[n_sent++] = r;
+            /* Each needing rank once (distinct cells are distinct ranks). */
+            for (int q = 0; q < n_needs; ++q)
+            {
+              const int r = needs[q];
+              if (r == dom->rank) continue;
 
-                  if (pass == 0)
-                  {
-                    dest_counts[r] += n_rec;
-                  }
-                  else
-                  {
-                    for (int kind = 0; kind < 4; ++kind)
-                    {
-                      const double val = (kind == 0) ? v : (has_cross ? cx3[kind - 1] : MFTL_SDF_CROSS_NONE);
-                      if (kind == 0 ? (val == MFTL_SDF_UNKNOWN) : (val == MFTL_SDF_CROSS_NONE)) continue;
-                      double *const rec = &buf[3 * (size_t) cursor[r]++];
-                      rec[0] = (double) c;
-                      rec[1] = (double) (4 * key + kind);
-                      rec[2] = val;
-                    }
-                  }
+              if (pass == 0)
+              {
+                dest_counts[r] += n_rec;
+              }
+              else
+              {
+                for (int kind = 0; kind < 4; ++kind)
+                {
+                  const double val = (kind == 0) ? v : (has_cross ? cx3[kind - 1] : MFTL_SDF_CROSS_NONE);
+                  if (kind == 0 ? (val == MFTL_SDF_UNKNOWN) : (val == MFTL_SDF_CROSS_NONE)) continue;
+                  double *const rec = &buf[3 * (size_t) cursor[r]++];
+                  rec[0] = (double) c;
+                  rec[1] = (double) (4 * key + kind);
+                  rec[2] = val;
                 }
+              }
+            }
           }
     }
 

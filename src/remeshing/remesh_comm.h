@@ -64,6 +64,7 @@
 
 #include "mftl_communication.h"
 #include "mftl_constants.h"
+#include "mftl_geometry.h"
 #include "mftl_remeshing.h"
 #include "mftl_types.h"
 
@@ -177,7 +178,7 @@ static inline int MFTLRemeshOwnerProc(const MFTL_Domain *domain, const double sh
   const int c0 = MFTLRemeshFineCell(domain, 0, shift, pos);
   const int c1 = MFTLRemeshFineCell(domain, 1, shift, pos);
   const int c2 = MFTLRemeshFineCell(domain, 2, shift, pos);
-  return domain->rank_map[c0 + c1 * domain->cuts[0] + c2 * domain->cuts[0] * domain->cuts[1]];
+  return MFTLDomainCellRank(domain, c0, c1, c2);
 }
 
 /**
@@ -231,7 +232,7 @@ static inline int MFTLRemeshCoarseOwnerProc(const MFTL_Domain *domain, const int
 
     c[k] = grp * g;
   }
-  return domain->rank_map[c[0] + c[1] * domain->cuts[0] + c[2] * domain->cuts[0] * domain->cuts[1]];
+  return MFTLDomainCellRank(domain, c[0], c[1], c[2]);
 }
 
 /**
@@ -401,18 +402,22 @@ int MFTLRemeshMigrateToRanks(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const i
  * - **Blocks that differ between ranks.** Different collective sequences hang;
  *   different decisions on shared entities give an inconsistent mesh.
  *
- * One `MPI_Allreduce(MIN)` over every field, every negated field and the local
- * band verdict gives each rank the extremes of every field and the worst
- * verdict, so all ranks reach the same answer; a refusal is useful only if it
- * is unanimous. The band is valid when
+ * The fields are agreed BITWISE (`-0.0` read as `0.0`) by MFTLAgreeWords(), so
+ * all ranks reach the same answer; a refusal is useful only if it is unanimous.
+ * Once the block is the same everywhere, every verdict on it is too, so the
+ * band, the sizing parameters and a NaN in any field are then judged locally
+ * with no further reduction. The band is valid when
  * \f$0 \le \ell_{\min} \le \ell_{\max}\f$ and \f$\ell_{\max} > 0\f$
- * (NaN fails). Fields must agree bitwise. Rank 0 prints the reason on stderr.
+ * (NaN fails). Rank 0 prints the reason on stderr; a disagreement names the
+ * first differing field and its range over the ranks.
  *
  * @param domain The MPI/physical world.
  * @param params This rank's parameter block.
  * @param caller Name of the public entry point, for the diagnostic.
  * @return #MFTL_SUCCESS on every rank, or #MFTL_ERROR on every rank.
- * @collective One Allreduce of 49 doubles; at `nproc == 1` only the band test.
+ * @collective One MFTLAgreeWords() of 34 words (a second, 2-double reduction
+ *             only to describe a disagreement); at `nproc == 1` only the local
+ *             verdicts.
  */
 int MFTLRemeshAgreeParams(const MFTL_Domain *domain, const MFTL_RemeshParameters *params, const char *caller);
 

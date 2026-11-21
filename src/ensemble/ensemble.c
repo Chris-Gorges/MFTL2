@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "mftl_arrayfunctions.h"
 #include "mftl_communication.h"
 #include "mftl_constants.h"
 #include "mftl_memory.h"
@@ -473,4 +474,89 @@ double MFTLDomainGetHMin(const MFTL_Domain *domain)
   }
 
   return (h_min == MFTL_DBL_MAX) ? 0.0 : h_min;
+}
+
+int MFTLDomainRanksOfCells(const MFTL_Domain *domain, const int lo[3], const int hi[3], int *out, int cap)
+{
+  MFTL_ASSERT(domain != MFTL_NULL && lo != MFTL_NULL && hi != MFTL_NULL);
+  int c0[3], c1[3];
+  long long total = 1;
+  for (int k = 0; k < 3; ++k)
+  {
+    const int cuts = domain->cuts[k];
+    long long a = lo[k], b = hi[k];
+    if (b < a) return 0;
+    if (domain->is_periodic[k])
+    {
+      if (b - a + 1 >= cuts)
+      {
+        a = 0;
+        b = cuts - 1;
+      }
+    }
+    else
+    {
+      a = MFTL_MAX(a, 0LL);
+      b = MFTL_MIN(b, (long long) cuts - 1);
+      if (b < a) return 0;
+    }
+    c0[k] = (int) a;
+    c1[k] = (int) b;
+    total *= b - a + 1;  // at most cuts[k]: the product is at most nproc
+  }
+  if (total > cap) return (int) total;
+
+  int n = 0;
+  for (int z = c0[2]; z <= c1[2]; ++z)
+    for (int y = c0[1]; y <= c1[1]; ++y)
+      for (int x = c0[0]; x <= c1[0]; ++x)
+      {
+        /* Only a periodic range can leave [0, cuts), and by less than cuts. */
+        const int i = ((x % domain->cuts[0]) + domain->cuts[0]) % domain->cuts[0];
+        const int j = ((y % domain->cuts[1]) + domain->cuts[1]) % domain->cuts[1];
+        const int k = ((z % domain->cuts[2]) + domain->cuts[2]) % domain->cuts[2];
+        out[n++] = MFTLDomainCellRank(domain, i, j, k);
+      }
+  MFTLSortIds(out, n);
+  return n;
+}
+
+int MFTLDomainRanksTouching(const MFTL_Domain *domain, const double lo[3], const double hi[3], int *out, int cap)
+{
+  MFTL_ASSERT(domain != MFTL_NULL && lo != MFTL_NULL && hi != MFTL_NULL);
+  int c0[3], c1[3];
+  for (int k = 0; k < 3; ++k)
+  {
+    const double cuts = (double) domain->cuts[k];
+    /* grid_factors, as in MFTLGetOwnerProc(): a degenerate box at a point
+     * reaches exactly that point's owner, never a neighbour across an ulp. */
+    double a = floor((lo[k] - domain->global_min[k]) * domain->grid_factors[k]);
+    double b = floor((hi[k] - domain->global_min[k]) * domain->grid_factors[k]);
+    if (domain->is_periodic[k])
+    {
+      if (!(b - a + 1.0 < cuts))  // the whole axis; a NaN corner too
+      {
+        a = 0.0;
+        b = cuts - 1.0;
+      }
+      else
+      {
+        /* Into the base image, exactly (integers below 2^53), so a box far
+         * from the domain cannot overflow an int. */
+        const double a0 = a - cuts * floor(a / cuts);
+        b = a0 + (b - a);
+        a = a0;
+      }
+    }
+    else
+    {
+      /* Negated tests, so a NaN corner clamps to cell 0 instead of reaching
+       * an undefined conversion. */
+      a = (a > 0.0) ? MFTL_MIN(a, cuts - 1.0) : 0.0;
+      b = (b > 0.0) ? MFTL_MIN(b, cuts - 1.0) : 0.0;
+    }
+    c0[k] = (int) a;
+    c1[k] = (int) b;
+  }
+  return MFTLDomainRanksOfCells(domain, c0, c1, out, cap);
 }

@@ -1277,7 +1277,7 @@ both directions on a $\{P,1,1\}$ grid.
 | `MFTLRemeshSyncGhostClass` | `MFTLGhostPull`, the same route | the owner's corner classification, once per pass with projection |
 | `MFTLRemeshReferenceHalo` | the library's `MFTLExchangeRecordsTo`: LOR + counts + data over `comm_graph`, or NBX + point to point (global route) | 23 doubles per input triangle within $w$ of a neighbour's cell, once per pass with projection |
 | sizing carry (`MFTLRemeshMigrateShifted` under curvature sizing) | `MFTLExchangeRecordsTo`, the same route | 3 doubles per owned vertex, through every migration |
-| `MFTLRemeshAgreeParams` | Allreduce(MIN) | 49 doubles, once per call, at the first collective |
+| `MFTLRemeshAgreeParams` | the library's `MFTLAgreeWords`: Allreduce(MAX) | 68 words (34 fields and their complements), once per call, at the first collective |
 
 Nothing in `src/remeshing/` allocates or sends a quantity proportional to $B$;
 proportional to $P$ are only the local counting arrays of a ghost pull that had

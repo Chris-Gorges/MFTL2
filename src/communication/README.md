@@ -11,8 +11,8 @@
 | `ghost_sync.c` | *the mesh deformed — refresh my ghosts.* The column payload: positions, normals, sizing, registered fields; topology untouched |
 | `spatial_halo.c` | *what of body B is near my share of body A?* A geometric halo as shadow objects |
 | `exchange.c` | MPI datatypes, the routed personalised exchange every module sends through (typed payloads, records and their replies, the ghost pull's transport) with the library's one NBX loop, the neighbourhood allgather |
-| `collectives.c` | the small reductions every module's agreements, statistics and timings go through (`MFTLAllreduceDoubles`/`Ints`/`LongLongs`), and the one wall clock (`MFTLWallTime`) |
-| `comm_internal.h`, `comm_stats.c` | the lazy `int` list, the global-id table, the diagnostics accumulator |
+| `collectives.c` | the small reductions every module's statistics and timings go through (`MFTLAllreduceDoubles`/`Ints`/`LongLongs`), the one agreement check (`MFTLAgreeWords`: the first word the ranks differ on, with an optional status in the same reduction) and the one wall clock (`MFTLWallTime`) |
+| `comm_internal.h`, `comm_stats.c` | the lazy `int` list, the global-id table, the entity packers both redistribution and the spatial halo send with (`append_destination`, `sb_reserve`), the diagnostics accumulator |
 
 ---
 

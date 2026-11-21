@@ -17,7 +17,10 @@
 
 #include <mpi.h>
 
+#include <stdlib.h>
+
 #include "mftl_constants.h"
+#include "mftl_memory.h"
 
 static MPI_Op mpi_op(MFTL_ReduceOp op)
 {
@@ -43,5 +46,38 @@ void MFTLAllreduceDoubles(MPI_Comm comm, double *v, int n, MFTL_ReduceOp op) { a
 void MFTLAllreduceInts(MPI_Comm comm, int *v, int n, MFTL_ReduceOp op) { allreduce_in_place(comm, v, n, MPI_INT, op); }
 
 void MFTLAllreduceLongLongs(MPI_Comm comm, long long *v, int n, MFTL_ReduceOp op) { allreduce_in_place(comm, v, n, MPI_LONG_LONG, op); }
+
+int MFTLAgreeWords(MPI_Comm comm, const uint64_t *words, int n, int *status)
+{
+  if (n < 0) n = 0;
+  const int m = 2 * n + (status != MFTL_NULL);
+  if (m == 0) return -1;
+  int nproc = 1;
+  MPI_Comm_size(comm, &nproc);
+  if (nproc == 1) return -1;
+
+  /* [words | complements | status]. A status is >= 0, so its MAX is the same
+   * read as signed or as unsigned. */
+  uint64_t small[128];
+  uint64_t *const v = (m <= 128) ? small : (uint64_t *) MFTLMallocOrDie((size_t) m * sizeof(uint64_t), "MFTLAgreeWords");
+  for (int i = 0; i < n; ++i)
+  {
+    v[i] = words[i];
+    v[n + i] = ~words[i];
+  }
+  if (status != MFTL_NULL)
+  {
+    MFTL_ASSERT(*status >= 0 && "MFTLAgreeWords: a status is non-negative");
+    v[2 * n] = (uint64_t) *status;
+  }
+  MPI_Allreduce(MPI_IN_PLACE, v, m, MPI_UINT64_T, MPI_MAX, comm);
+
+  int first = -1;
+  for (int i = 0; i < n && first < 0; ++i)
+    if (v[i] != ~v[n + i]) first = i;
+  if (status != MFTL_NULL) *status = (int) v[2 * n];
+  if (v != small) free(v);
+  return first;
+}
 
 double MFTLWallTime(void) { return MPI_Wtime(); }

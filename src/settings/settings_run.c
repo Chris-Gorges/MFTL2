@@ -28,6 +28,7 @@
 #include "mftl_communication.h"
 #include "mftl_constants.h"
 #include "mftl_ensemble.h"
+#include "mftl_memory.h"
 
 /** Capacity of the problem report a collective call prints on rank 0. */
 #define REPORT_CHARS 8192
@@ -207,9 +208,7 @@ static uint64_t fnv1a(const char *s)
  *        everywhere, and the first differing key named on rank 0.
  *
  * Each key is hashed from its TEXT form, which is exact (reals are written to
- * round-trip). The array of hashes is reduced with MIN together with the
- * bitwise complements -- the MIN of ~h is the complement of the MAX of h -- so
- * one call yields both extremes, and equal extremes mean every rank agrees.
+ * round-trip), and the hashes are agreed by MFTLAgreeWords().
  *
  * @param s      The settings.
  * @param comm   Communicator.
@@ -224,8 +223,7 @@ static int settings_agree(const MFTL_Settings *s, MPI_Comm comm, const char *cal
   if (nproc == 1) return MFTL_SUCCESS;
 
   const int n = MFTLSettingsKeyCount();
-  uint64_t *h = (uint64_t *) malloc(2 * (size_t) n * sizeof(uint64_t));
-  if (!h) abort();
+  uint64_t *h = (uint64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(n, 1) * sizeof(uint64_t), "settings agreement");
   for (int i = 0; i < n; ++i)
   {
     const MFTL_SettingInfo *k = MFTLSettingsKey(i);
@@ -233,13 +231,8 @@ static int settings_agree(const MFTL_Settings *s, MPI_Comm comm, const char *cal
     snprintf(key, sizeof key, "%s.%s", k->section, k->name);
     if (MFTLSettingsGet(s, key, value, sizeof value) != MFTL_SUCCESS) value[0] = '\0';
     h[i] = fnv1a(value);
-    h[n + i] = ~h[i];
   }
-  MPI_Allreduce(MPI_IN_PLACE, h, 2 * n, MPI_UINT64_T, MPI_MIN, comm);
-
-  int differs = -1;
-  for (int i = 0; i < n && differs < 0; ++i)
-    if (h[i] != ~h[n + i]) differs = i;
+  const int differs = MFTLAgreeWords(comm, h, n, MFTL_NULL);
   free(h);
 
   if (differs < 0) return MFTL_SUCCESS;

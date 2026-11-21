@@ -120,6 +120,21 @@ static inline void MFTLApplyPeriodicity(const MFTL_Domain *domain, double pos[3]
 }
 
 /**
+ * @brief The rank of process-grid cell (@p i, @p j, @p k): the one place the
+ *        layout of `rank_map` is read.
+ *
+ * @param domain The MPI/physical world.
+ * @param i      Cell index along x, in `[0, cuts[0])`.
+ * @param j      Cell index along y, in `[0, cuts[1])`.
+ * @param k      Cell index along z, in `[0, cuts[2])`.
+ * @return The rank that owns the cell.
+ */
+static inline int MFTLDomainCellRank(const MFTL_Domain *domain, int i, int j, int k)
+{
+  return domain->rank_map[i + j * domain->cuts[0] + k * domain->cuts[0] * domain->cuts[1]];
+}
+
+/**
  * @brief The rank whose Cartesian cell contains @p pos.
  *
  * Cell \f$i_k = \lfloor (x_k - \min_k)\,\mathrm{cuts}_k / L_k \rfloor\f$, clamped to
@@ -147,7 +162,7 @@ static inline int MFTLGetOwnerProc(const MFTL_Domain *domain, const double pos[3
     if (i >= domain->cuts[k]) i = domain->cuts[k] - 1;
     c[k] = i;
   }
-  return domain->rank_map[c[0] + c[1] * domain->cuts[0] + c[2] * domain->cuts[0] * domain->cuts[1]];
+  return MFTLDomainCellRank(domain, c[0], c[1], c[2]);
 }
 
 // -----------------------------------------------------------------------------

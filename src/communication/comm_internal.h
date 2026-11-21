@@ -7,15 +7,20 @@
  * @brief Private helpers shared by the communication module's translation units.
  *
  * Not a public header: nothing outside src/communication/ may include it, and
- * nothing here is exported. It holds the two data structures that both the
- * redistribution and the ghost synchronisation need.
+ * nothing here is exported. It holds what more than one of the module's
+ * translation units needs: the instrumentation, the growable id list, the id
+ * table, the entity packers and the routed exchange's transport.
  */
 
 #ifndef MFTL_COMM_INTERNAL_H
 #define MFTL_COMM_INTERNAL_H
 
+#include <limits.h>
 #include <mpi.h>
+#include <stdbool.h>
 #include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "mftl_communication.h"
@@ -476,6 +481,155 @@ static inline void gt_put(mftl_gid_table *t, int gid, int value)
  * @return The table; owned by the ensemble, never freed by the caller.
  */
 mftl_gid_table *MFTLCommWorkspaceGhostTable(MFTL_Ensemble *ens);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * 4. Packing: the one writer of the entity wire records (#MFTL_PackedVertex,
+ * #MFTL_PackedTriangleComplex) and of a send buffer's growth. Redistribution and
+ * the spatial halo send entities in the same format and differ only in WHICH
+ * entities they choose; both hand their choice to append_destination().
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/**
+ * @brief Grows a send buffer geometrically, in elements of @p elem bytes.
+ *
+ * An element count past `INT_MAX` aborts the job: MPI counts are ints, and a
+ * wrapped count is a silently truncated message.
+ *
+ * @param sb     The send buffer.
+ * @param needed Additional elements that must fit.
+ * @param elem   Size of one element in bytes.
+ */
+static inline void sb_reserve(MFTL_SendBuffer *sb, int needed, size_t elem)
+{
+  if (needed < 0 || sb->count > INT_MAX - needed)
+  {
+    fprintf(stderr, "MFTL send buffer count overflow\n");
+    MPI_Abort(MPI_COMM_WORLD, MFTL_ERROR);
+    abort();
+  }
+  if (sb->count + needed <= sb->capacity) return;
+
+  int cap = (sb->capacity == 0) ? MFTL_MAX(needed, 256) : sb->capacity;
+  cap = MFTLGrowCapacity(cap, sb->count + needed);
+
+  sb->buffer = MFTLReallocOrDie(sb->buffer, (size_t) cap * elem, "MFTL send buffer");
+  sb->capacity = cap;
+}
+
+/**
+ * @brief Packs one triangle and its three half-edges into a transfer unit: ten
+ *        ints, all of them information the receiver cannot derive.
+ *
+ * Read from the authoritative records only. `vertex_gid[k]` is the TARGET of
+ * half-edge `3t+k`, i.e. `he[3t+k].vertex_idx` -- the record that also holds
+ * the half-edge's flags, so the corners cost no cache line of their own beyond
+ * the vertex records, and nothing depends on `tris.verts` being current.
+ *
+ * @param obj      The mesh.
+ * @param t        Triangle index.
+ * @param[out] dst The wire record.
+ * @param body_gid #MFTL_Object::global_id of the owning body.
+ */
+static inline void pack_triangle(const MFTL_Object *obj, int t, MFTL_PackedTriangleComplex *dst, int body_gid)
+{
+  const MFTL_Triangle *const src = &obj->tris.rec[t];
+  const MFTL_HalfEdge *const he = &obj->tris.he[3 * t];
+  const MFTL_Vertex *const vr = obj->verts.rec;
+
+  dst->global_id = src->global_id;
+  dst->owner_proc = src->owner_proc;
+  dst->flags = src->flags;
+  dst->body_gid = body_gid;
+  for (int k = 0; k < 3; ++k)
+  {
+    dst->vertex_gid[k] = vr[he[k].vertex_idx].global_id;
+    dst->he_flags[k] = he[k].flags;
+  }
+
+  MFTL_ASSERT(he[0].global_id == 3 * src->global_id && he[1].global_id == 3 * src->global_id + 1 && he[2].global_id == 3 * src->global_id + 2 &&
+              "pack_triangle: half-edge global ids are not 3*triangle_gid + k -- the receiver reconstructs them from that");
+}
+
+/**
+ * @brief Packs one vertex: its position and its identity, nothing else.
+ * @param obj      The mesh.
+ * @param v        Vertex index.
+ * @param[out] dst The wire record.
+ * @param body_gid #MFTL_Object::global_id of the owning body.
+ */
+static inline void pack_vertex(const MFTL_Object *obj, int v, MFTL_PackedVertex *dst, int body_gid)
+{
+  const MFTL_Vertex *const src = &obj->verts.rec[v];
+  const double *const p = &obj->verts.pos[3 * v];
+
+  dst->pos[0] = p[0];
+  dst->pos[1] = p[1];
+  dst->pos[2] = p[2];
+  dst->global_id = src->global_id;
+  dst->owner_proc = src->owner_proc;
+  dst->flags = src->flags;
+  dst->body_gid = body_gid;
+}
+
+#ifndef NDEBUG
+/**
+ * @brief Debug-only: is the array strictly increasing (sorted and duplicate-free)?
+ *
+ * @param a Array to inspect.
+ * @param n Number of elements.
+ * @return `true` if `a[i] < a[i+1]` throughout.
+ */
+static inline bool is_strictly_increasing(const int *a, int n)
+{
+  for (int i = 1; i < n; ++i)
+    if (a[i] <= a[i - 1]) return MFTL_FALSE;
+  return MFTL_TRUE;
+}
+#endif
+
+/**
+ * @brief Packs one object's chosen entities for one REMOTE destination rank,
+ *        appending to that destination's send buffers (one reservation each).
+ *
+ * The triangle list must be strictly increasing (both callers build it in
+ * triangle order). The vertex list is packed in the order given; with
+ * @p needs_dedup it is first sorted and uniqued IN PLACE, so a caller packing
+ * per-vertex payloads alongside reads the same order from @p vert_ids.
+ *
+ * @param obj         The mesh.
+ * @param body_gid    #MFTL_Object::global_id of the owning body.
+ * @param tri_ids     Triangle indices bound for this destination.
+ * @param vert_ids    Vertex indices bound for this destination.
+ * @param out_tris    Send buffer the packed triangles are appended to.
+ * @param out_verts   Send buffer the packed vertices are appended to.
+ * @param needs_dedup `true` when the vertex list must be sorted and uniqued here.
+ */
+static inline void append_destination(const MFTL_Object *obj, int body_gid, mftl_int_buffer *tri_ids, mftl_int_buffer *vert_ids, MFTL_SendBuffer *out_tris,
+                                      MFTL_SendBuffer *out_verts, bool needs_dedup)
+{
+  MFTL_ASSERT(is_strictly_increasing(tri_ids->data, tri_ids->size) && "append_destination: triangle list is not already unique");
+
+  if (tri_ids->size > 0)
+  {
+    sb_reserve(out_tris, tri_ids->size, sizeof(MFTL_PackedTriangleComplex));
+    MFTL_PackedTriangleComplex *const buf = (MFTL_PackedTriangleComplex *) out_tris->buffer;
+    for (int i = 0; i < tri_ids->size; ++i) pack_triangle(obj, tri_ids->data[i], &buf[out_tris->count++], body_gid);
+  }
+
+  if (vert_ids->size > 0)
+  {
+    int n = vert_ids->size;
+    if (needs_dedup)
+    {
+      MFTLSortIds(vert_ids->data, n);
+      n = MFTLUniqueIntArray(vert_ids->data, n);
+    }
+
+    sb_reserve(out_verts, n, sizeof(MFTL_PackedVertex));
+    MFTL_PackedVertex *const buf = (MFTL_PackedVertex *) out_verts->buffer;
+    for (int i = 0; i < n; ++i) pack_vertex(obj, vert_ids->data[i], &buf[out_verts->count++], body_gid);
+  }
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * The routed exchange's transport (exchange.c): the route vote, the count

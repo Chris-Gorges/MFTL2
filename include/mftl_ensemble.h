@@ -608,6 +608,54 @@ static inline int MFTLDomainNeighborIndex(const MFTL_Domain *domain, int r)
 }
 
 /**
+ * @brief The ranks whose process-grid cells lie in the per-axis cell ranges
+ *        `[lo[k], hi[k]]` -- the one "which ranks does this region reach" rule.
+ *
+ * The ranges are UNWRAPPED integers. On a periodic axis a cell is taken modulo
+ * `cuts[k]`, and a range of `cuts[k]` cells or more is the whole axis, so no
+ * cell is listed twice. On a non-periodic axis cells outside `[0, cuts[k])` are
+ * dropped. Since `rank_map` is a bijection, distinct cells are distinct ranks:
+ * nothing is de-duplicated after the fact and there is no bound on the count.
+ *
+ * A caller whose ranges are exact integers (the topology lattice's need ranges)
+ * calls this directly; a physical box goes through MFTLDomainRanksTouching().
+ *
+ * @param      domain The MPI/physical world.
+ * @param      lo     First cell per axis.
+ * @param      hi     Last cell per axis (inclusive); `hi[k] < lo[k]` is empty.
+ * @param[out] out    `[cap]` the ranks, ascending; this rank included.
+ * @param      cap    Capacity of @p out.
+ * @return How many ranks the ranges reach. When that exceeds @p cap, @p out is
+ *         left unwritten: call again with at least the returned capacity.
+ *
+ * @rank_local
+ */
+int MFTLDomainRanksOfCells(const MFTL_Domain *domain, const int lo[3], const int hi[3], int *out, int cap);
+
+/**
+ * @brief The ranks whose cells the box `[lo, hi]` touches, by the owner rule of
+ *        MFTLGetOwnerProc().
+ *
+ * The cell range per axis is \f$\lfloor (x - \min_k)\,\mathrm{cuts}_k/L_k \rfloor\f$
+ * of both corners, the product MFTLGetOwnerProc() truncates, so the owner of
+ * any point of the box is in the answer. A non-periodic axis CLAMPS, as the
+ * owner rule does: a box beyond a wall belongs to the boundary cells, which
+ * own whatever lies there. A periodic axis takes the box in any image.
+ * Then MFTLDomainRanksOfCells().
+ *
+ * @param      domain The MPI/physical world.
+ * @param      lo     Lower box corner.
+ * @param      hi     Upper box corner; a box with `hi[k] < lo[k]` is empty.
+ * @param[out] out    `[cap]` the ranks, ascending; this rank included.
+ * @param      cap    Capacity of @p out.
+ * @return How many ranks the box reaches; above @p cap, call again with at
+ *         least that capacity.
+ *
+ * @rank_local
+ */
+int MFTLDomainRanksTouching(const MFTL_Domain *domain, const double lo[3], const double hi[3], int *out, int cap);
+
+/**
  * @brief Collectively register a double field before adding the first body.
  * @param ens Ensemble; every rank calls in the same order.
  * @param name Unique nonempty field name, identical on every rank.

@@ -239,7 +239,8 @@ window         band (routes, images, bins), pack lists, served table     (no mes
 ```
 
 **Discovery is geometric and sparse.** The ranks a box touches are enumerated
-arithmetically from the process grid — never a loop over P. Requests and directory
+arithmetically from the process grid (the library's `MFTLDomainRanksTouching`) —
+never a loop over P. Requests and directory
 entries go by Hoefler–Siebert–Lumsdaine's NBX (the library's one loop,
 `MFTLNbxComplete`; framing, chunks and the memory budget stay in `coupling_comm.c`):
 synchronous sends, probe and receive, a non-blocking barrier once this rank's sends

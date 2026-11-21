@@ -109,27 +109,13 @@ bool MFTLCplTranslateRanks(MPI_Comm from, MPI_Comm to, int64_t n, const int *ran
   return true;
 }
 
-int MFTLCplAgreeTransfer(MPI_Comm c, int status, uint64_t token)
-{
-  uint64_t v[3] = {(uint64_t) status, token, ~token}, g[3];
-  MPI_Allreduce(v, g, 3, MPI_UINT64_T, MPI_MAX, c);
-  return g[1] == ~g[2] ? (int) g[0] : MFTL_COUPLING_INVALID;
-}
+int MFTLCplAgreeTransfer(MPI_Comm c, int status, uint64_t token) { return (MFTLAgreeWords(c, &token, 1, &status) < 0) ? status : MFTL_COUPLING_INVALID; }
 
 int MFTLCplAgreeValidated(MPI_Comm c, int status, uint64_t signature)
 {
-  uint64_t v[3] = {(uint64_t) status, signature, ~signature}, g[3];
-  MPI_Allreduce(v, g, 3, MPI_UINT64_T, MPI_MAX, c);
-  if (g[0] != MFTL_COUPLING_OK) return (int) g[0];
-  return g[1] == ~g[2] ? MFTL_COUPLING_OK : MFTL_COUPLING_INVALID;
-}
-
-bool MFTLCplAgreeHash(MPI_Comm c, uint64_t h)
-{
-  uint64_t v[2] = {h, ~h}, g[2];
-  MPI_Allreduce(v, g, 2, MPI_UINT64_T, MPI_MAX, c);
-  /* max(h) == min(h)  <=>  max(h) == ~max(~h) */
-  return g[0] == ~g[1];
+  const int differs = MFTLAgreeWords(c, &signature, 1, &status);
+  if (status != MFTL_COUPLING_OK) return status;
+  return (differs < 0) ? MFTL_COUPLING_OK : MFTL_COUPLING_INVALID;
 }
 
 void MFTLCplMaxloc(MPI_Comm c, double v, double *vmax, int *rank)

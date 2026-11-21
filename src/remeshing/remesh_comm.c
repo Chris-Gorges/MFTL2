@@ -391,55 +391,50 @@ int MFTLRemeshAgreeParams(const MFTL_Domain *domain, const MFTL_RemeshParameters
     N = (int) (sizeof(names) / sizeof(names[0]))
   };
 
-  /* NaN fails every comparison, so it fails the band test too. */
-  const bool band_ok = (params->max_edge_length > 0.0) && (params->min_edge_length >= 0.0) && (params->min_edge_length <= params->max_edge_length);
-  const char *const sizing_bad = MFTLRemeshSizingProblem(params);
-
-  /* [values | negated values | band verdict]. A MIN of -x is a MAX of x, so one
-   * reduction yields both extremes of every field, and equal extremes mean every
-   * rank passed the same value. Broadcasting rank 0's block and comparing would
-   * let the check fire on one rank only, which is the failure being fixed. */
+  /* Agreed BIT FOR BIT, -0.0 read as 0.0, by MFTLAgreeWords(): exact, and the
+   * verdict is reduced, so it fires on every rank or on none. Broadcasting rank
+   * 0's block and comparing would let it fire on one rank only. */
   const double local[N] = {MFTL_REMESH_AGREED_FIELDS(MFTL_REMESH_FIELD_VALUE)(params->rim_project != MFTL_NULL) ? 1.0 : 0.0};
-  double v[2 * N + 2];
+  uint64_t bits[N];
   for (int i = 0; i < N; ++i)
   {
-    v[i] = local[i];
-    v[N + i] = -local[i];
+    const double x = (local[i] == 0.0) ? 0.0 : local[i];
+    memcpy(&bits[i], &x, sizeof x);
   }
-  v[2 * N] = band_ok ? 1.0 : 0.0;
-  v[2 * N + 1] = sizing_bad ? 0.0 : 1.0;
-
-  MFTLAllreduceDoubles(domain->comm_world, v, 2 * N + 2, MFTL_REDUCE_MIN);
-
-  int differs = -1;
-  for (int i = 0; i < N && differs < 0; ++i)
+  const int differs = MFTLAgreeWords(domain->comm_world, bits, N, MFTL_NULL);
+  if (differs >= 0)
   {
-    if (!(v[i] == -v[N + i])) differs = i;
+    /* The failure path only, entered by every rank: the field's range. */
+    double range[2] = {local[differs], -local[differs]};
+    MFTLAllreduceDoubles(domain->comm_world, range, 2, MFTL_REDUCE_MIN);
+    if (domain->rank == 0)
+      fprintf(stderr, "[MFTL] %s: refusing to remesh: the ranks were handed different parameter blocks (%s ranges over [%.17g, %.17g]).\n", caller,
+              names[differs], range[0], -range[1]);
+    return MFTL_ERROR;
   }
 
-  if (v[2 * N] == 1.0 && v[2 * N + 1] == 1.0 && differs < 0) return MFTL_SUCCESS;
+  /* One block on every rank, so every verdict below is the same everywhere
+   * without a reduction. NaN fails every comparison, so it fails these tests;
+   * a NaN in any other field is refused by name. */
+  const bool band_ok = (params->max_edge_length > 0.0) && (params->min_edge_length >= 0.0) && (params->min_edge_length <= params->max_edge_length);
+  const char *const sizing_bad = MFTLRemeshSizingProblem(params);
+  int nan_field = -1;
+  for (int i = 0; i < N && nan_field < 0; ++i)
+    if (local[i] != local[i]) nan_field = i;
+
+  if (band_ok && sizing_bad == MFTL_NULL && nan_field < 0) return MFTL_SUCCESS;
 
   if (domain->rank == 0)
   {
-    if (v[2 * N + 1] != 1.0)
-    {
-      /* Rank 0's own reason when it has one; otherwise another rank's block was
-       * the bad one, which the field comparison below would also name. */
-      fprintf(stderr, "[MFTL] %s: refusing to remesh: %s.\n", caller,
-              sizing_bad ? sizing_bad : "the sizing parameters are invalid on at least one rank");
-    }
-    else if (v[2 * N] != 1.0)
-    {
+    if (sizing_bad != MFTL_NULL)
+      fprintf(stderr, "[MFTL] %s: refusing to remesh: %s.\n", caller, sizing_bad);
+    else if (!band_ok)
       fprintf(stderr,
-              "[MFTL] %s: refusing to remesh: the edge-length band is invalid on at least one rank (this rank: [%.6g, %.6g]; valid is "
-              "0 <= min <= max, max > 0). Use MFTLEnsembleMeanEdgeLength for a distributed mesh.\n",
+              "[MFTL] %s: refusing to remesh: the edge-length band [%.6g, %.6g] is invalid (valid is 0 <= min <= max, max > 0). Use "
+              "MFTLEnsembleMeanEdgeLength for a distributed mesh.\n",
               caller, params->min_edge_length, params->max_edge_length);
-    }
     else
-    {
-      fprintf(stderr, "[MFTL] %s: refusing to remesh: the ranks were handed different parameter blocks (%s ranges over [%.17g, %.17g]).\n",
-              caller, names[differs], v[differs], -v[N + differs]);
-    }
+      fprintf(stderr, "[MFTL] %s: refusing to remesh: %s is not a number.\n", caller, names[nan_field]);
   }
   return MFTL_ERROR;
 }
@@ -853,6 +848,8 @@ int MFTLRemeshReferenceHalo(MFTL_Ensemble *ens, double width, double **out, int 
   int n_rec = 0, cap = 0;
   double *rec = MFTL_NULL;
   int *dst = MFTL_NULL;
+  int cap_ranks = 27;
+  int *ranks = (int *) MFTLMallocOrDie((size_t) cap_ranks * sizeof(int), "remesh reference halo ranks");
 
   for (int o = 0; o < ens->n_local_objects; ++o)
   {
@@ -871,46 +868,33 @@ int MFTLRemeshReferenceHalo(MFTL_Ensemble *ens, double width, double **out, int 
         lo[k] = MFTL_MIN(c[0][k], MFTL_MIN(c[1][k], c[2][k])) + sh - reach;
         hi[k] = MFTL_MAX(c[0][k], MFTL_MAX(c[1][k], c[2][k])) + sh + reach;
       }
-      int i0[3], i1[3];
-      for (int k = 0; k < 3; ++k)
+      /* Every rank whose cell the widened box reaches, by the owner rule (a
+       * box past a wall belongs to the boundary cells), with no bound on how
+       * many: a triangle wider than several rank cells still reaches them all. */
+      int nr = MFTLDomainRanksTouching(dom, lo, hi, ranks, cap_ranks);
+      if (nr > cap_ranks)
       {
-        i0[k] = (int) floor((lo[k] - dom->global_min[k]) / h[k]);
-        i1[k] = (int) floor((hi[k] - dom->global_min[k]) / h[k]);
+        cap_ranks = nr;
+        ranks = (int *) MFTLReallocOrDie(ranks, (size_t) cap_ranks * sizeof(int), "remesh reference halo ranks");
+        nr = MFTLDomainRanksTouching(dom, lo, hi, ranks, cap_ranks);
       }
-      int sent[64], n_sent = 0;
-      for (int a = i0[0]; a <= i1[0]; ++a)
-        for (int b = i0[1]; b <= i1[1]; ++b)
-          for (int e = i0[2]; e <= i1[2]; ++e)
-          {
-            int q[3] = {a, b, e};
-            bool inside = MFTL_TRUE;
-            for (int k = 0; k < 3; ++k)
-            {
-              if (dom->is_periodic[k])
-                q[k] = ((q[k] % dom->cuts[k]) + dom->cuts[k]) % dom->cuts[k];
-              else if (q[k] < 0 || q[k] >= dom->cuts[k])
-                inside = MFTL_FALSE;
-            }
-            if (!inside) continue;
-            const int r = dom->rank_map[q[0] + dom->cuts[0] * (q[1] + dom->cuts[1] * q[2])];
-            if (r == me) continue;
-            bool dup = MFTL_FALSE;
-            for (int j = 0; j < n_sent; ++j) dup |= (sent[j] == r);
-            if (dup || n_sent == 64) continue;
-            sent[n_sent++] = r;
-            if (n_rec == cap)
-            {
-              cap = MFTL_MAX(64, 2 * cap);
-              rec = (double *) MFTLReallocOrDie(rec, (size_t) cap * MFTL_REMESH_REF_HALO_WIDTH * sizeof(double), "remesh reference halo");
-              dst = (int *) MFTLReallocOrDie(dst, (size_t) cap * sizeof(int), "remesh reference halo destinations");
-            }
-            MFTLRemeshReferencePackTriangle(obj, t, &rec[(size_t) n_rec * MFTL_REMESH_REF_HALO_WIDTH]);
-            dst[n_rec++] = r;
-          }
+      if (n_rec + nr > cap)
+      {
+        cap = MFTLGrowCapacity(cap, n_rec + nr);
+        rec = (double *) MFTLReallocOrDie(rec, (size_t) cap * MFTL_REMESH_REF_HALO_WIDTH * sizeof(double), "remesh reference halo");
+        dst = (int *) MFTLReallocOrDie(dst, (size_t) cap * sizeof(int), "remesh reference halo destinations");
+      }
+      for (int j = 0; j < nr; ++j)
+      {
+        if (ranks[j] == me) continue;
+        MFTLRemeshReferencePackTriangle(obj, t, &rec[(size_t) n_rec * MFTL_REMESH_REF_HALO_WIDTH]);
+        dst[n_rec++] = ranks[j];
+      }
     }
   }
 
   *out = (double *) MFTLExchangeRecordsTo(dom, MFTL_REMESH_REF_HALO_WIDTH * sizeof(double), rec, dst, n_rec, n_out);
+  free(ranks);
   free(rec);
   free(dst);
   return MFTL_SUCCESS;

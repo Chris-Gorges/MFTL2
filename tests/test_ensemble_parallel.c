@@ -185,6 +185,226 @@ static int test_the_neighbour_slot_table_inverts_the_neighbour_list(void)
 }
 
 /* ─────────────────────────────────────────────────────────────────────────────
+ * Which ranks a region reaches: MFTLDomainRanksOfCells / MFTLDomainRanksTouching
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/** @brief Grid shapes for the region queries: closed, periodic, slabs, mixed. */
+static const int g_region_shapes[4][3] = {{2, 2, 2}, {2, 2, 2}, {8, 1, 1}, {4, 2, 1}};
+static const bool g_region_periodic[4][3] = {{false, false, false}, {true, true, true}, {true, true, true}, {true, false, true}};
+
+/** @brief A small deterministic generator (the queries are rank-local; every rank runs its own stream). */
+static unsigned region_rand(unsigned *s)
+{
+  *s = *s * 1664525u + 1013904223u;
+  return *s >> 8;
+}
+
+static double region_uniform(unsigned *s) { return (double) region_rand(s) / 16777216.0; }
+
+static int cmp_int(const void *a, const void *b) { return (*(const int *) a > *(const int *) b) - (*(const int *) a < *(const int *) b); }
+
+/**
+ * @brief MFTLDomainRanksOfCells() lists the ranks of exactly the cells in the
+ *        ranges, each once, ascending, and writes nothing when the capacity is
+ *        short. Reference: every cell of the grid tested axis by axis, a
+ *        periodic range by walking it cell by cell modulo cuts.
+ */
+static int test_a_cell_range_reaches_exactly_its_cells_ranks(void)
+{
+  if (g_nproc != 8) return 0;
+  int ok = 1;
+  long multi = 0, wrapped = 0, empty = 0;
+  unsigned seed = 2026u + (unsigned) g_rank;
+  for (int c = 0; c < 4; ++c)
+  {
+    MFTL_Ensemble *e = MFTLEnsembleCreate(MPI_COMM_WORLD, g_region_shapes[c], (double[3]){0, 0, 0}, (double[3]){1, 1, 1}, g_region_periodic[c], 1);
+    if (e == MFTL_NULL)
+    {
+      ok = 0;
+      break;
+    }
+    const MFTL_Domain *d = &e->domain;
+    for (int trial = 0; trial < 500; ++trial)
+    {
+      int lo[3], hi[3];
+      bool leaves = MFTL_FALSE;
+      for (int k = 0; k < 3; ++k)
+      {
+        const int cuts = d->cuts[k];
+        lo[k] = (int) (region_rand(&seed) % (unsigned) (4 * cuts + 2)) - 2 * cuts - 1;
+        hi[k] = lo[k] + (int) (region_rand(&seed) % (unsigned) (2 * cuts + 3)) - 1;
+        leaves |= d->is_periodic[k] && (lo[k] < 0 || hi[k] >= cuts) && hi[k] >= lo[k];
+      }
+
+      int expect[8], ne = 0;
+      for (int z = 0; z < d->cuts[2]; ++z)
+        for (int y = 0; y < d->cuts[1]; ++y)
+          for (int x = 0; x < d->cuts[0]; ++x)
+          {
+            const int cell[3] = {x, y, z};
+            bool member = MFTL_TRUE;
+            for (int k = 0; k < 3; ++k)
+            {
+              bool in = MFTL_FALSE;
+              if (d->is_periodic[k])
+              {
+                for (int q = lo[k]; q <= hi[k] && !in; ++q) in = (((q % d->cuts[k]) + d->cuts[k]) % d->cuts[k] == cell[k]);
+              }
+              else
+                in = (lo[k] <= cell[k] && cell[k] <= hi[k]);
+              member &= in;
+            }
+            if (member) expect[ne++] = d->rank_map[x + d->cuts[0] * (y + d->cuts[1] * z)];
+          }
+      qsort(expect, (size_t) ne, sizeof(int), cmp_int);
+
+      int got[8];
+      for (int i = 0; i < 8; ++i) got[i] = -7;
+      const int n = MFTLDomainRanksOfCells(d, lo, hi, got, 8);
+      ok &= (n == ne);
+      for (int i = 0; i < ne && n == ne; ++i) ok &= (got[i] == expect[i]);
+
+      /* Short capacity: the count comes back, nothing is written. */
+      if (ne > 1)
+      {
+        int small[8];
+        for (int i = 0; i < 8; ++i) small[i] = -7;
+        ok &= (MFTLDomainRanksOfCells(d, lo, hi, small, ne - 1) == ne);
+        for (int i = 0; i < 8; ++i) ok &= (small[i] == -7);
+      }
+      multi += (ne > 1);
+      wrapped += leaves && ne > 0;
+      empty += (ne == 0);
+    }
+    MFTLEnsembleDestroy(&e);
+  }
+  long seen[3] = {multi, wrapped, empty};
+  MPI_Allreduce(MPI_IN_PLACE, seen, 3, MPI_LONG, MPI_MIN, MPI_COMM_WORLD);
+  ok &= seen[0] > 0 && seen[1] > 0 && seen[2] > 0;  // non-vacuity on every rank
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  return 0;
+}
+
+/**
+ * @brief MFTLDomainRanksTouching() is the owner rule applied to a box: the
+ *        owner (MFTLGetOwnerProc()) of every sampled point of the box is in the
+ *        answer, every rank in it has a cell that meets the box (a wall's
+ *        boundary cells reaching to infinity, a periodic box in any image), and a
+ *        box shrunk to a point -- on a cell face too -- reaches exactly that
+ *        point's owner.
+ */
+static int test_a_box_reaches_exactly_the_owners_of_its_points(void)
+{
+  if (g_nproc != 8) return 0;
+  const double gmin[3] = {-1.0, -0.5, 0.0}, gmax[3] = {1.0, 1.5, 3.0};
+  int ok = 1;
+  long multi = 0, beyond = 0, whole = 0, faces = 0;
+  unsigned seed = 77u + 13u * (unsigned) g_rank;
+  for (int c = 0; c < 4; ++c)
+  {
+    MFTL_Ensemble *e = MFTLEnsembleCreate(MPI_COMM_WORLD, g_region_shapes[c], gmin, gmax, g_region_periodic[c], 1);
+    if (e == MFTL_NULL)
+    {
+      ok = 0;
+      break;
+    }
+    const MFTL_Domain *d = &e->domain;
+    for (int trial = 0; trial < 400; ++trial)
+    {
+      double lo[3], hi[3];
+      const bool point = (trial % 4 == 0);
+      bool out = MFTL_FALSE, spans = MFTL_FALSE;
+      for (int k = 0; k < 3; ++k)
+      {
+        const double L = gmax[k] - gmin[k], h = L / d->cuts[k];
+        if (point)
+        {
+          /* Inside the box, half of them exactly on a cell face. */
+          const double x = (trial % 8 == 0) ? gmin[k] + h * (double) (region_rand(&seed) % (unsigned) d->cuts[k]) : gmin[k] + L * region_uniform(&seed);
+          lo[k] = hi[k] = x;
+          continue;
+        }
+        const double ctr = gmin[k] - 0.5 * L + 2.0 * L * region_uniform(&seed);
+        const double hw = 0.7 * L * region_uniform(&seed);
+        lo[k] = ctr - hw;
+        hi[k] = ctr + hw;
+        out |= !d->is_periodic[k] && (lo[k] > gmax[k] || hi[k] < gmin[k]);
+        spans |= d->is_periodic[k] && hi[k] - lo[k] >= L;
+      }
+
+      int got[8];
+      const int n = MFTLDomainRanksTouching(d, lo, hi, got, 8);
+      ok &= (n >= 1 && n <= 8);
+      if (n < 1 || n > 8) continue;
+      for (int i = 1; i < n; ++i) ok &= (got[i - 1] < got[i]);
+
+      /* Complete: the owner of every sampled point. */
+      for (int s = 0; s < 125; ++s)
+      {
+        double p[3];
+        const int t[3] = {s % 5, (s / 5) % 5, s / 25};
+        for (int k = 0; k < 3; ++k)
+        {
+          p[k] = lo[k] + 0.25 * t[k] * (hi[k] - lo[k]);
+          if (d->is_periodic[k] && (p[k] < gmin[k] || p[k] >= gmax[k]))  // a point inside stays bit for bit
+          {
+            const double L = gmax[k] - gmin[k];
+            p[k] = gmin[k] + fmod(p[k] - gmin[k], L);
+            if (p[k] < gmin[k]) p[k] += L;
+            if (p[k] >= gmax[k]) p[k] = gmin[k];
+          }
+        }
+        const int owner = MFTLGetOwnerProc(d, p);
+        bool found = MFTL_FALSE;
+        for (int i = 0; i < n; ++i) found |= (got[i] == owner);
+        ok &= found;
+        if (point) ok &= (n == 1 && got[0] == owner);
+      }
+
+      /* Tight: every rank listed has a cell meeting the box. */
+      for (int i = 0; i < n; ++i)
+      {
+        int cell[3] = {-1, -1, -1};
+        for (int q = 0; q < d->nproc; ++q)
+          if (d->rank_map[q] == got[i])
+          {
+            cell[0] = q % d->cuts[0];
+            cell[1] = (q / d->cuts[0]) % d->cuts[1];
+            cell[2] = q / (d->cuts[0] * d->cuts[1]);
+          }
+        for (int k = 0; k < 3; ++k)
+        {
+          const double L = gmax[k] - gmin[k], h = L / d->cuts[k], eps = 1e-12 * L;
+          double clo = gmin[k] + cell[k] * h - eps, chi = gmin[k] + (cell[k] + 1) * h + eps;
+          bool meets = MFTL_FALSE;
+          if (d->is_periodic[k])
+          {
+            for (int m = -4; m <= 4 && !meets; ++m) meets = (lo[k] + m * L <= chi && hi[k] + m * L >= clo);
+          }
+          else
+          {
+            if (cell[k] == 0) clo = -HUGE_VAL;
+            if (cell[k] == d->cuts[k] - 1) chi = HUGE_VAL;
+            meets = (lo[k] <= chi && hi[k] >= clo);
+          }
+          ok &= meets;
+        }
+      }
+      multi += (n > 1);
+      beyond += out;
+      whole += spans;
+      faces += point && (trial % 8 == 0);
+    }
+    MFTLEnsembleDestroy(&e);
+  }
+  long seen[4] = {multi, beyond, whole, faces};
+  MPI_Allreduce(MPI_IN_PLACE, seen, 4, MPI_LONG, MPI_MIN, MPI_COMM_WORLD);
+  ok &= seen[0] > 0 && seen[1] > 0 && seen[2] > 0 && seen[3] > 0;
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  return 0;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────────
  * Reductions with genuinely different values per rank
  * ─────────────────────────────────────────────────────────────────────────── */
 
@@ -345,6 +565,8 @@ int main(int argc, char **argv)
   RUN_TEST(test_owner_lookup_is_a_partition);
   RUN_TEST(test_neighbour_graph_is_symmetric);
   RUN_TEST(test_the_neighbour_slot_table_inverts_the_neighbour_list);
+  RUN_TEST(test_a_cell_range_reaches_exactly_its_cells_ranks);
+  RUN_TEST(test_a_box_reaches_exactly_the_owners_of_its_points);
   RUN_TEST(test_global_counts_sum_unequal_ranks);
   RUN_TEST(test_update_reduces_min_and_max_across_ranks);
   RUN_TEST(test_update_ignores_ranks_that_hold_nothing);

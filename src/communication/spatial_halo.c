@@ -253,27 +253,12 @@ static void owned_interval(const MFTL_Object *obj, const MFTL_Domain *domain, do
 static void halo_reserve(MFTL_SpatialHalo *h, int need)
 {
   if (need <= h->capacity) return;
-
-  int cap = (h->capacity > 0) ? h->capacity : 8;
-  while (cap < need) cap *= 2;
-
-  int *const gid = (int *) MFTLMallocOrDie((size_t) cap * sizeof(int), "spatial halo body ids");
-  MFTL_Object **const patch = (MFTL_Object **) MFTLCallocOrDie((size_t) cap, sizeof(MFTL_Object *), "spatial halo patches");
-  double *const rad = (double *) MFTLCallocOrDie((size_t) cap, sizeof(double), "spatial halo radii");
-
-  if (h->num_objects > 0)
-  {
-    memcpy(gid, h->body_gid, (size_t) h->num_objects * sizeof(int));
-    memcpy(patch, h->patch, (size_t) h->num_objects * sizeof(MFTL_Object *));
-    memcpy(rad, h->global_radius, (size_t) h->num_objects * sizeof(double));
-  }
-
-  free(h->body_gid);
-  free(h->patch);
-  free(h->global_radius);
-  h->body_gid = gid;
-  h->patch = patch;
-  h->global_radius = rad;
+  /* One capacity for three parallel arrays; slots past num_objects are never
+   * read, and halo_entry() initialises every slot it opens. */
+  const int cap = MFTLGrowCapacity(h->capacity, need);
+  h->body_gid = (int *) MFTLReallocOrDie(h->body_gid, (size_t) cap * sizeof(int), "spatial halo body ids");
+  h->patch = (MFTL_Object **) MFTLReallocOrDie(h->patch, (size_t) cap * sizeof(MFTL_Object *), "spatial halo patches");
+  h->global_radius = (double *) MFTLReallocOrDie(h->global_radius, (size_t) cap * sizeof(double), "spatial halo radii");
   h->capacity = cap;
 }
 
@@ -329,15 +314,7 @@ static void halo_sync_bodies(MFTL_SpatialHalo *h, const MFTL_Ensemble *ens)
  */
 static void halo_pair_add(MFTL_SpatialHalo *h, int a, int b)
 {
-  if (h->n_pairs == h->cap_pairs)
-  {
-    h->cap_pairs = (h->cap_pairs > 0) ? h->cap_pairs * 2 : 64;
-    MFTL_SpatialHaloPair *const grown =
-        (MFTL_SpatialHaloPair *) MFTLMallocOrDie((size_t) h->cap_pairs * sizeof(MFTL_SpatialHaloPair), "spatial halo pairs");
-    if (h->n_pairs > 0) memcpy(grown, h->pair, (size_t) h->n_pairs * sizeof(MFTL_SpatialHaloPair));
-    free(h->pair);
-    h->pair = grown;
-  }
+  MFTL_ENSURE_CAPACITY(h->pair, &h->n_pairs, &h->cap_pairs, 1, MFTL_SpatialHaloPair);
   h->pair[h->n_pairs].body_a = a;
   h->pair[h->n_pairs].body_b = b;
   h->n_pairs++;
@@ -949,14 +926,7 @@ static int sorted_insert(int **list, int *n, int *cap, int gid)
       hi = mid - 1;
   }
 
-  if (*n == *cap)
-  {
-    *cap = (*cap > 0) ? *cap * 2 : 16;
-    int *const grown = (int *) MFTLMallocOrDie((size_t) *cap * sizeof(int), "spatial halo arrival bodies");
-    if (*n > 0) memcpy(grown, *list, (size_t) *n * sizeof(int));
-    free(*list);
-    *list = grown;
-  }
+  MFTL_ENSURE_CAPACITY(*list, n, cap, 1, int);
 
   if (lo < *n) memmove(&(*list)[lo + 1], &(*list)[lo], (size_t) (*n - lo) * sizeof(int));
   (*list)[lo] = gid;
@@ -1322,6 +1292,9 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
     ib_init(&matched, 64);
     mftl_int_buffer grouped;
     ib_init(&grouped, 64);
+    mftl_int_buffer pack_t, pack_v;  // one (body, destination)'s triangles and vertices
+    ib_init(&pack_t, 256);
+    ib_init(&pack_v, 256);
 
     int max_nv = 0;
     for (int o = 0; o < nb; ++o) max_nv = MFTL_MAX(max_nv, ens->local_objects[o]->verts.n);
@@ -1459,6 +1432,8 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
           }
         }
 
+        ib_reset(&pack_t);
+        ib_reset(&pack_v);
         vepoch++;
         if (vepoch == 0u)
         {
@@ -1479,65 +1454,25 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
           }
           if (!wanted) continue;
 
-          /* --- the triangle --- */
-          MFTL_SendBuffer *const sbt = &send_t[dest];
-          if (sbt->count == sbt->capacity)
-          {
-            sbt->capacity = (sbt->capacity > 0) ? sbt->capacity * 2 : 256;
-            MFTL_PackedTriangleComplex *const grown =
-                (MFTL_PackedTriangleComplex *) MFTLMallocOrDie((size_t) sbt->capacity * sizeof(MFTL_PackedTriangleComplex), "spatial halo triangle send");
-            if (sbt->count > 0) memcpy(grown, sbt->buffer, (size_t) sbt->count * sizeof(MFTL_PackedTriangleComplex));
-            free(sbt->buffer);
-            sbt->buffer = grown;
-          }
-
-          MFTL_PackedTriangleComplex *const pt = &((MFTL_PackedTriangleComplex *) sbt->buffer)[sbt->count++];
-          pt->global_id = obj->tris.rec[t].global_id;
-          pt->owner_proc = obj->tris.rec[t].owner_proc;
-          pt->flags = obj->tris.rec[t].flags;
-          pt->body_gid = gb;
-          for (int k = 0; k < 3; ++k)
-          {
-            const MFTL_HalfEdge *const he = &obj->tris.he[3 * t + k];
-            /* The TARGET of half-edge 3t+k (not tris.verts[3t+k], its origin). */
-            pt->vertex_gid[k] = obj->verts.rec[he->vertex_idx].global_id;
-            pt->he_flags[k] = he->flags;
-          }
-
-          /* --- its three vertices, each at most once per destination --- */
+          /* The triangle, and its three vertices each at most once per
+           * destination; packed below by the writer redistribution uses. */
+          ib_add(&pack_t, t);
           for (int k = 0; k < 3; ++k)
           {
             const int v = obj->tris.he[3 * t + k].vertex_idx;
             if (vstamp[v] == vepoch) continue;
             vstamp[v] = vepoch;
-
-            MFTL_SendBuffer *const sbv = &send_v[dest];
-            if (sbv->count == sbv->capacity)
-            {
-              sbv->capacity = (sbv->capacity > 0) ? sbv->capacity * 2 : 512;
-              MFTL_PackedVertex *const grown =
-                  (MFTL_PackedVertex *) MFTLMallocOrDie((size_t) sbv->capacity * sizeof(MFTL_PackedVertex), "spatial halo vertex send");
-              if (sbv->count > 0) memcpy(grown, sbv->buffer, (size_t) sbv->count * sizeof(MFTL_PackedVertex));
-              free(sbv->buffer);
-              sbv->buffer = grown;
-            }
-
-            MFTL_PackedVertex *const pv = &((MFTL_PackedVertex *) sbv->buffer)[sbv->count++];
-            const double *const src = &obj->verts.pos[3 * v];
-            pv->pos[0] = src[0];
-            pv->pos[1] = src[1];
-            pv->pos[2] = src[2];
-            pv->global_id = obj->verts.rec[v].global_id;
-            pv->owner_proc = obj->verts.rec[v].owner_proc;
-            pv->flags = obj->verts.rec[v].flags;
-            pv->body_gid = gb;
+            ib_add(&pack_v, v);
           }
         }
+        append_destination(obj, gb, &pack_t, &pack_v, &send_t[dest], &send_v[dest], MFTL_FALSE);
       }
     }
 
     free(ph);
     free(vstamp);
+    ib_free(&pack_v);
+    ib_free(&pack_t);
     ib_free(&grouped);
     ib_free(&matched);
     ib_free(&cand);

@@ -14,6 +14,7 @@
  * makes them possible, so a decomposition that kept everything local, or never
  * left the neighbourhood, fails instead of passing vacuously.
  */
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -470,6 +471,74 @@ static int test_nbx_delivers_every_message_exactly_once(void)
   return 0;
 }
 
+/** @brief Word @p i of rank @p r in agreement case @p c (see the test). */
+static uint64_t agree_word(int c, int r, int i)
+{
+  const uint64_t base = 0x9E3779B97F4A7C15ull * (uint64_t) (i + 1);
+  const int last = nproc - 1;
+  switch (c)
+  {
+    case 0: return base;  // everyone agrees
+    case 1: return base + (uint64_t) (r == last && i == 0);  // the first word, on one rank
+    case 2: return base + (uint64_t) (r == last && i == 2);  // a later word, on one rank
+    case 3: return (i == 1) ? ((r == last) ? 0x8000000000000000ull : 0x7FFFFFFFFFFFFFFFull) : base;  // neighbours unsigned, extremes signed
+    case 4: return (i == 1) ? ((r == last) ? ~0ull : 0ull) : base;  // the two "identities"
+    case 5: return (uint64_t) r;  // every rank its own
+    default: return base + (uint64_t) (r == last && i == 69);  // the heap path, last word
+  }
+}
+
+/**
+ * @brief MFTLAgreeWords(), the library's one agreement check, names the FIRST
+ *        word on which any two ranks differ, identically on every rank, and
+ *        MAX-reduces the optional status in the same call.
+ *
+ * Reference: every rank's words gathered to every rank (no complement trick),
+ * scanned for the first column that is not constant. Cases 3 and 4 put the
+ * difference where a signed comparison of `MPI_UINT64_T` (MPICH 4.0) would
+ * misorder it and where 0 / `UINT64_MAX` would pass for identities; case 6 has
+ * more words than the stack buffer. At np = 1 every case agrees, which is also
+ * checked; a difference is only produced, and asserted, at np >= 2.
+ */
+static int test_agreement_names_the_first_differing_word_on_every_rank(void)
+{
+  enum
+  {
+    N_CASES = 7
+  };
+  static const int len[N_CASES] = {3, 3, 3, 3, 3, 1, 70};
+  int ok = 1, differences = 0;
+  for (int c = 0; c < N_CASES; ++c)
+  {
+    const int n = len[c];
+    uint64_t *mine = (uint64_t *) malloc((size_t) n * sizeof(uint64_t));
+    uint64_t *all = (uint64_t *) malloc((size_t) n * (size_t) nproc * sizeof(uint64_t));
+    for (int i = 0; i < n; ++i) mine[i] = agree_word(c, rank, i);
+    MPI_Allgather(mine, n, MPI_UINT64_T, all, n, MPI_UINT64_T, MPI_COMM_WORLD);
+    int expect = -1;
+    for (int i = 0; i < n && expect < 0; ++i)
+      for (int r = 1; r < nproc; ++r)
+        if (all[(size_t) r * n + i] != all[i]) expect = i;
+    differences += (expect >= 0);
+
+    /* With and without a status; the status is (rank * 7) % 5 on each rank. */
+    int status = (rank * 7) % 5, expect_status = 0;
+    for (int r = 0; r < nproc; ++r) expect_status = MFTL_MAX(expect_status, (r * 7) % 5);
+    ok &= (MFTLAgreeWords(MPI_COMM_WORLD, mine, n, MFTL_NULL) == expect);
+    ok &= (MFTLAgreeWords(MPI_COMM_WORLD, mine, n, &status) == expect);
+    ok &= (status == expect_status);
+    free(all);
+    free(mine);
+  }
+  /* No words: only the status travels. */
+  int status = (rank == nproc - 1) ? 3 : 1;  // the last rank's is the largest at every np
+  ok &= (MFTLAgreeWords(MPI_COMM_WORLD, MFTL_NULL, 0, &status) == -1);
+  ok &= (status == 3);
+  ok &= (differences == ((nproc > 1) ? 6 : 0));  // cases 1-6 differ, case 0 never
+  TEST_ASSERT(agreed(ok));
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
@@ -479,6 +548,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_typed_payloads_are_the_same_bits_on_both_routes);
   RUN_TEST(test_back_to_back_global_exchanges_keep_their_messages_apart);
   RUN_TEST(test_nbx_delivers_every_message_exactly_once);
+  RUN_TEST(test_agreement_names_the_first_differing_word_on_every_rank);
   if (rank == 0) TEST_REPORT();
   const int fail = g_tests_failed;
   MPI_Finalize();

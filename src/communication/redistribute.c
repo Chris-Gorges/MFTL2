@@ -74,30 +74,6 @@ static void calc_buffer_hints(int n_tris_global, int n_verts_global, int nproc, 
 }
 
 /**
- * @brief Grows a send buffer geometrically, in elements of @p elem bytes.
- *
- * @param sb     The send buffer.
- * @param needed Additional elements that must fit.
- * @param elem   Size of one element in bytes.
- */
-static void sb_reserve(MFTL_SendBuffer *sb, int needed, size_t elem)
-{
-  if (needed < 0 || sb->count > INT_MAX - needed)
-  {
-    fprintf(stderr, "MFTL redistribution send count overflow\n");
-    MPI_Abort(MPI_COMM_WORLD, MFTL_ERROR);
-    abort();
-  }
-  if (sb->count + needed <= sb->capacity) return;
-
-  int cap = (sb->capacity == 0) ? MFTL_MAX(needed, 256) : sb->capacity;
-  cap = MFTLGrowCapacity(cap, sb->count + needed);
-
-  sb->buffer = MFTLReallocOrDie(sb->buffer, (size_t) cap * elem, "MFTL redistribution send buffer");
-  sb->capacity = cap;
-}
-
-/**
  * @brief Grows a scratch int array, discarding its contents.
  *
  * @param p    Address of the array pointer. Replaced if it grows.
@@ -202,14 +178,11 @@ static void refresh_geometry_before_routing(MFTL_Object *obj)
  * @param      map          Explicit owner map, or NULL for the geometric rule.
  * @param[out] tri_owner    `[tris.n]` destination rank per triangle.
  * @param[out] vert_owner   `[verts.n]` destination rank per vertex.
- * @param[out] vert_gid     `[verts.n]` vertex global ids, gathered contiguously
- *                          for the packing loops.
  * @param      record_stats `false` on a re-classification, so counters describe
  *                          each entity once.
  * @return Non-zero if any entity of @p obj changed owner.
  */
-static int compute_owners(MFTL_Object *obj, const MFTL_OwnerMap *map, int *restrict tri_owner, int *restrict vert_owner, int *restrict vert_gid,
-                          bool record_stats)
+static int compute_owners(MFTL_Object *obj, const MFTL_OwnerMap *map, int *restrict tri_owner, int *restrict vert_owner, bool record_stats)
 {
   const MFTL_Domain *const dom = obj->domain;
 
@@ -234,7 +207,6 @@ static int compute_owners(MFTL_Object *obj, const MFTL_OwnerMap *map, int *restr
       const int owner = vo[v];
       MFTL_ASSERT(owner >= 0 && owner < dom->nproc && "redistribute: owner map names a rank outside the communicator");
       vert_owner[v] = owner;
-      vert_gid[v] = vr[v].global_id;
       changed_v += (vr[v].owner_proc != owner);
       vr[v].owner_proc = owner;
     }
@@ -261,7 +233,6 @@ static int compute_owners(MFTL_Object *obj, const MFTL_OwnerMap *map, int *restr
   {
     const int owner = MFTLGetOwnerProc(dom, &pos[3 * v]);
     vert_owner[v] = owner;
-    vert_gid[v] = vr[v].global_id;
     /* Unconditional: the answer decides whether this body is rebuilt at all. */
     changed_v += (vr[v].owner_proc != owner);
     vr[v].owner_proc = owner;
@@ -439,128 +410,9 @@ static int collect_destinations(const MFTL_Object *obj, const MFTL_Domain *domai
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 3. Packing
+ * 3. Packing: append_destination() and its record writers live in
+ * comm_internal.h, shared with the spatial halo.
  * ═══════════════════════════════════════════════════════════════════════════ */
-
-/**
- * @brief Packs one triangle and its three half-edges into a transfer unit: ten
- *        ints, all of them information the receiver cannot derive.
- *
- * @param obj      The mesh.
- * @param t        Triangle index.
- * @param tv       `obj->tris.verts`.
- * @param vgid     `[verts.n]` vertex global ids, contiguous, from compute_owners().
- * @param[out] dst The wire record.
- * @param body_gid #MFTL_Object::global_id of the owning body.
- */
-static inline void pack_triangle(const MFTL_Object *obj, int t, const int *restrict tv, const int *restrict vgid, MFTL_PackedTriangleComplex *dst, int body_gid)
-{
-  const MFTL_Triangle *const src = &obj->tris.rec[t];
-  const MFTL_HalfEdge *const he = &obj->tris.he[3 * t];
-  const int base = 3 * t;
-
-  dst->global_id = src->global_id;
-  dst->owner_proc = src->owner_proc;
-  dst->flags = src->flags;
-  dst->body_gid = body_gid;
-
-  /* tris.verts[3t+k] is the ORIGIN of half-edge k; the wire carries its TARGET,
-   * target(k) == origin((k+1)%3). */
-  dst->vertex_gid[0] = vgid[tv[base + 1]];
-  dst->vertex_gid[1] = vgid[tv[base + 2]];
-  dst->vertex_gid[2] = vgid[tv[base + 0]];
-
-  dst->he_flags[0] = he[0].flags;
-  dst->he_flags[1] = he[1].flags;
-  dst->he_flags[2] = he[2].flags;
-
-  MFTL_ASSERT(dst->vertex_gid[0] == obj->verts.rec[he[0].vertex_idx].global_id && "pack_triangle: half-edge target rotation is wrong");
-  MFTL_ASSERT(he[0].global_id == 3 * src->global_id && he[1].global_id == 3 * src->global_id + 1 && he[2].global_id == 3 * src->global_id + 2 &&
-              "pack_triangle: half-edge global ids are not 3*triangle_gid + k -- the receiver reconstructs them from that");
-}
-
-/**
- * @brief Packs one vertex: its position and its identity, nothing else.
- * @param obj      The mesh.
- * @param v        Vertex index.
- * @param[out] dst The wire record.
- * @param body_gid #MFTL_Object::global_id of the owning body.
- */
-static inline void pack_vertex(const MFTL_Object *obj, int v, MFTL_PackedVertex *dst, int body_gid)
-{
-  const MFTL_Vertex *const src = &obj->verts.rec[v];
-  const double *const p = &obj->verts.pos[3 * v];
-
-  dst->pos[0] = p[0];
-  dst->pos[1] = p[1];
-  dst->pos[2] = p[2];
-  dst->global_id = src->global_id;
-  dst->owner_proc = src->owner_proc;
-  dst->flags = src->flags;
-  dst->body_gid = body_gid;
-}
-
-#ifndef NDEBUG
-/**
- * @brief Debug-only: is the array strictly increasing (sorted and duplicate-free)?
- *
- * @param a Array to inspect.
- * @param n Number of elements.
- * @return `true` if `a[i] < a[i+1]` throughout.
- */
-static bool is_strictly_increasing(const int *a, int n)
-{
-  for (int i = 1; i < n; ++i)
-    if (a[i] <= a[i - 1]) return MFTL_FALSE;
-  return MFTL_TRUE;
-}
-#endif
-
-/**
- * @brief Packs one object's contribution for one REMOTE destination rank,
- *        appending to that destination's send buffers.
- *
- * Triangle lists need no de-duplication (each triangle is appended at most once
- * per distinct destination, in ascending order); vertex lists do only for a
- * destination without a de-duplication bit.
- *
- * @param obj         The mesh.
- * @param body_gid    #MFTL_Object::global_id of the owning body.
- * @param vgid        `[verts.n]` vertex global ids.
- * @param tri_ids     Triangle indices bound for this destination.
- * @param vert_ids    Vertex indices bound for this destination.
- * @param out_tris    Send buffer the packed triangles are appended to.
- * @param out_verts   Send buffer the packed vertices are appended to.
- * @param needs_dedup `true` when the vertex list must be sorted and uniqued here.
- */
-static void append_destination(const MFTL_Object *obj, int body_gid, const int *restrict vgid, mftl_int_buffer *tri_ids, mftl_int_buffer *vert_ids,
-                               MFTL_SendBuffer *out_tris, MFTL_SendBuffer *out_verts, bool needs_dedup)
-{
-  /* Already strictly increasing: see collect_destinations(). */
-  MFTL_ASSERT(is_strictly_increasing(tri_ids->data, tri_ids->size) && "append_destination: triangle list is not already unique");
-
-  if (tri_ids->size > 0)
-  {
-    sb_reserve(out_tris, tri_ids->size, sizeof(MFTL_PackedTriangleComplex));
-    MFTL_PackedTriangleComplex *const buf = (MFTL_PackedTriangleComplex *) out_tris->buffer;
-    const int *const restrict tv = obj->tris.verts;
-    for (int i = 0; i < tri_ids->size; ++i) pack_triangle(obj, tri_ids->data[i], tv, vgid, &buf[out_tris->count++], body_gid);
-  }
-
-  if (vert_ids->size > 0)
-  {
-    int n = vert_ids->size;
-    if (needs_dedup)
-    {
-      MFTLSortIds(vert_ids->data, n);
-      n = MFTLUniqueIntArray(vert_ids->data, n);
-    }
-
-    sb_reserve(out_verts, n, sizeof(MFTL_PackedVertex));
-    MFTL_PackedVertex *const buf = (MFTL_PackedVertex *) out_verts->buffer;
-    for (int i = 0; i < n; ++i) pack_vertex(obj, vert_ids->data[i], &buf[out_verts->count++], body_gid);
-  }
-}
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 4. Per-object state carried across the exchange
@@ -812,7 +664,6 @@ typedef struct
 
   int cap_verts;  ///< Largest body's vertex count seen so far.
   int *vert_owner;  ///< [cap_verts]
-  int *vert_gid;  ///< [cap_verts]
   char *keep_v;  ///< [cap_verts]
   uint32_t *dedup_mask;  ///< [cap_verts]
 
@@ -976,15 +827,13 @@ static void ws_reserve(comm_workspace *ws, int nproc, int num_objects, int sum_v
   {
     const int c = MFTLGrowCapacity(ws->cap_verts, max_verts);
     free(ws->vert_owner);
-    free(ws->vert_gid);
     free(ws->keep_v);
     free(ws->dedup_mask);
     ws->vert_owner = (int *) MFTLMallocOrDie((size_t) c * sizeof(int), "redistribution vertex owners");
-    ws->vert_gid = (int *) MFTLMallocOrDie((size_t) c * sizeof(int), "redistribution vertex gids");
     ws->keep_v = (char *) MFTLMallocOrDie((size_t) c, "redistribution vertex keep flags");
     ws->dedup_mask = (uint32_t *) MFTLMallocOrDie((size_t) c * sizeof(uint32_t), "redistribution vertex dedup mask");
     ws->cap_verts = c;
-    cs_alloc((size_t) c * (2 * sizeof(int) + 1 + sizeof(uint32_t)));
+    cs_alloc((size_t) c * (sizeof(int) + 1 + sizeof(uint32_t)));
   }
 
   if (max_tris > ws->cap_tris)
@@ -1009,7 +858,7 @@ static void ws_reserve(comm_workspace *ws, int nproc, int num_objects, int sum_v
                                             (size_t) ws->cap_votes * 2 * sizeof(double));
 
   MFTLCommStats.ws_bytes_per_entity = (long) ((size_t) ws->cap_arena_v * sizeof(int) + (size_t) ws->cap_arena_t * sizeof(int) +
-                                              (size_t) ws->cap_verts * (2 * sizeof(int) + 1 + sizeof(uint32_t)) + (size_t) ws->cap_tris * (sizeof(int) + 1));
+                                              (size_t) ws->cap_verts * (sizeof(int) + 1 + sizeof(uint32_t)) + (size_t) ws->cap_tris * (sizeof(int) + 1));
 }
 
 /** @brief Releases everything the workspace holds. */
@@ -1025,7 +874,6 @@ static void ws_free(comm_workspace *ws)
   free(ws->kept_arena_t);
   free(ws->dirty_votes);
   free(ws->vert_owner);
-  free(ws->vert_gid);
   free(ws->keep_v);
   free(ws->dedup_mask);
   free(ws->tri_owner);
@@ -1745,8 +1593,7 @@ static int analyze_and_pack_body(comm_workspace *ws, MFTL_Object *obj, const MFT
     const int tri_before = ws->send_tris[r].count;
     const int vert_before = ws->send_verts[r].count;
 
-    append_destination(obj, obj->global_id, ws->vert_gid, &ws->tri_ids[r], &ws->vert_ids[r], &ws->send_tris[r], &ws->send_verts[r],
-                       dd->rank_bit[r] == MFTL_DEDUP_NO_BIT);
+    append_destination(obj, obj->global_id, &ws->tri_ids[r], &ws->vert_ids[r], &ws->send_tris[r], &ws->send_verts[r], dd->rank_bit[r] == MFTL_DEDUP_NO_BIT);
 
     if (ws->send_fields)
       for (int e = 0; e < 2; ++e)
@@ -1791,21 +1638,20 @@ static int analyze_and_pack_body(comm_workspace *ws, MFTL_Object *obj, const MFT
  * Equal id spaces are the observable consequence of "every rank added the same
  * bodies in the same order"; disagreement would merge entities into the wrong
  * body. The skip switch changes the number of collectives, so disagreement
- * would deadlock. `{sig, ~sig}` under one `MPI_MIN` detects a difference in
- * either direction. The local body count legitimately differs and is excluded.
+ * would deadlock. One MFTLAgreeWords() of both. The local body count
+ * legitimately differs and is excluded.
  *
  * @param dom             Supplies the communicator.
  * @param n_bodies_global Size of the body-id space.
  */
 static void check_object_lists_agree(const MFTL_Domain *dom, int n_bodies_global)
 {
-  unsigned sig = (unsigned) n_bodies_global * 2u + (g_skip_unchanged ? 1u : 0u);
-
-  unsigned v[2] = {sig, ~sig};
-  MPI_Allreduce(MPI_IN_PLACE, v, 2, MPI_UNSIGNED, MPI_MIN, dom->comm_world);
-  MFTL_ASSERT(v[0] == sig && v[1] == ~sig &&
+  const uint64_t sig = (uint64_t) n_bodies_global * 2u + (g_skip_unchanged ? 1u : 0u);
+  const int differs = MFTLAgreeWords(dom->comm_world, &sig, 1, MFTL_NULL);
+  MFTL_ASSERT(differs < 0 &&
               "redistribute: ranks disagree about the body-id space or about the skip switch -- every rank must add the same bodies in the same "
               "order, and MFTLRedistributeSetSkipUnchangedBodies is collective");
+  (void) differs;
 }
 #endif
 
@@ -1919,7 +1765,6 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
   int *const kept_arena_t = ws->kept_arena_t;
   int *const tri_owner = ws->tri_owner;
   int *const vert_owner = ws->vert_owner;
-  int *const vert_gid = ws->vert_gid;
 
   /* The work list: bodies held now; phase 4 appends first-time arrivals. */
   const int n_pre = num_objects;
@@ -1967,7 +1812,7 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
 
     CS_TIMELINE(tm);
     if (maps == MFTL_NULL && (obj->derived & MFTL_DERIVED_GEOMETRY) == 0u) refresh_geometry_before_routing(obj);
-    int dirty = compute_owners(obj, maps ? &maps[o] : MFTL_NULL, tri_owner, vert_owner, vert_gid, MFTL_TRUE);
+    int dirty = compute_owners(obj, maps ? &maps[o] : MFTL_NULL, tri_owner, vert_owner, MFTL_TRUE);
     CS_LAP(tm, t_owners);
 
     /* The dirty stamp, and a body never given derived arrays, force a rebuild. */
@@ -2003,7 +1848,7 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
 
     /* Idempotent re-classification; counters not updated twice. */
     CS_TIMELINE(tm);
-    (void) compute_owners(obj, maps ? &maps[o] : MFTL_NULL, tri_owner, vert_owner, vert_gid, MFTL_FALSE);
+    (void) compute_owners(obj, maps ? &maps[o] : MFTL_NULL, tri_owner, vert_owner, MFTL_FALSE);
     CS_LAP(tm, t_owners);
 
     requires_global |= analyze_and_pack_body(ws, obj, domain, &dd, &ws->states[o]);
