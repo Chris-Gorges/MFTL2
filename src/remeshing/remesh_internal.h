@@ -469,18 +469,6 @@ void MFTLRemeshSizingFinish(MFTL_Object *obj, const MFTL_RemeshParameters *param
 double MFTLRemeshMergedTarget(const MFTL_Object *obj, int a, int b, const double pm[3]);
 
 /**
- * @brief Carries the curvature target to a vertex an operator just made or
- *        moved: `sizing[dest]` = the targets of @p a and @p b interpolated at
- *        @p fraction. A no-op without `verts.sizing`.
- * @param obj      The mesh.
- * @param a        First edge end.
- * @param b        Second edge end.
- * @param dest     The vertex written (the split's new vertex, a collapse's survivor).
- * @param fraction Position along a->b in [0, 1].
- */
-void MFTLRemeshSizingCarry(MFTL_Object *obj, int a, int b, int dest, double fraction);
-
-/**
  * @brief The collapse's STRETCH clause for one new edge: would it be longer
  *        than the split threshold, so that the next split sweep undoes the
  *        collapse?

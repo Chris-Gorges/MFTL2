@@ -268,13 +268,6 @@ double MFTLRemeshMergedTarget(const MFTL_Object *obj, int a, int b, const double
   return (1.0 - f) * obj->verts.sizing[a] + f * obj->verts.sizing[b];
 }
 
-void MFTLRemeshSizingCarry(MFTL_Object *obj, int a, int b, int dest, double fraction)
-{
-  if (!obj->verts.has_sizing) return;
-  double *const size = obj->verts.sizing;
-  size[dest] = (1.0 - fraction) * size[a] + fraction * size[b];
-}
-
 /* ═══════════════════════════════════════════════════════════════════════════
  * 3. The predicates
  * ═══════════════════════════════════════════════════════════════════════════ */

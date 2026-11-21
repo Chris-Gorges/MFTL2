@@ -429,10 +429,9 @@ int MFTLSplitEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *params)
   if (f_ab & MFTL_FLAG_FEATURE) obj->verts.rec[vm].flags |= MFTL_FLAG_FEATURE;
 
   if (triangle_fields) MFTLRemeshFieldCommit(obj, new_ids, new_area, 2 * nparent, field_values);
-  if (MFTLFieldsStride(obj, 0)) MFTLRemeshFieldVertex(obj, va, vb, vm, MFTLRemeshFieldEdgeParameter(obj, va, vb, pm));
   /* The curvature target is CARRIED, not recomputed: M lies on the chord, so
    * its own discrete curvature would describe the polyline. */
-  if (obj->verts.has_sizing) MFTLRemeshSizingCarry(obj, va, vb, vm, MFTLRemeshFieldEdgeParameter(obj, va, vb, pm));
+  if (MFTLRemeshCarriesVertexValues(obj)) MFTLRemeshFieldVertex(obj, va, vb, vm, MFTLRemeshFieldEdgeParameter(obj, va, vb, pm));
   MFTLObjectInvalidateDerived(obj);
   return vm;
 }
@@ -910,8 +909,8 @@ int MFTLCollapseEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *param
   const bool triangle_fields = MFTLFieldsStride(obj, 1) != 0;
   const bool vertex_fields = MFTLFieldsStride(obj, 0) != 0;
   if ((triangle_fields || vertex_fields) && freeze_blocks_collapse(obj, h)) return MFTL_ERROR;
-  const double fraction = vertex_fields ? MFTLRemeshFieldEdgeParameter(obj, a, b, pm) : 0.0;
-  const double size_fraction = obj->verts.has_sizing ? MFTLRemeshFieldEdgeParameter(obj, a, b, pm) : 0.0;
+  const bool vertex_values = MFTLRemeshCarriesVertexValues(obj);
+  const double fraction = vertex_values ? MFTLRemeshFieldEdgeParameter(obj, a, b, pm) : 0.0;
   int patch[2 * MFTL_REMESH_RING_MAX], npatch = 0;
   double old_area[2 * MFTL_REMESH_RING_MAX], new_area[2 * MFTL_REMESH_RING_MAX];
   double *field_values = NULL;
@@ -1002,8 +1001,7 @@ int MFTLCollapseEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *param
   }
 
   if (triangle_fields) MFTLRemeshFieldCommit(obj, patch, new_area, npatch, field_values);
-  if (vertex_fields) MFTLRemeshFieldVertex(obj, a, b, b, fraction);
-  MFTLRemeshSizingCarry(obj, a, b, b, size_fraction);
+  if (vertex_values) MFTLRemeshFieldVertex(obj, a, b, b, fraction);
   MFTLObjectInvalidateDerived(obj);
   return MFTL_SUCCESS;
 }

@@ -42,6 +42,11 @@ double MFTLRemeshFieldEdgeParameter(const MFTL_Object *obj, int a, int b, const 
 
 void MFTLRemeshFieldVertex(MFTL_Object *obj, int a, int b, int dest, double fraction)
 {
+  if (obj->verts.has_sizing)
+  {
+    double *const size = obj->verts.sizing;
+    size[dest] = (1.0 - fraction) * size[a] + fraction * size[b];
+  }
   if (!MFTLFieldsStride(obj, 0)) return;
   for (int f = 0; f < obj->fields->n; ++f)
   {

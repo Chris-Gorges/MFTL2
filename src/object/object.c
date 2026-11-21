@@ -6,12 +6,15 @@
  *
  * @brief Object lifecycle and the single allocation authority for both pools.
  *
- * `*_layout_compute` decides where each sub-array starts inside a pool's one
- * block, `*_pool_bind` publishes those addresses, and `*_pool_resize` is the
- * only function that allocates, copies or frees a block (`*_pool_reserve` is
+ * Each pool's sub-arrays are ONE list (MFTL_VERTEX_POOL_COLUMNS,
+ * MFTL_TRIANGLE_POOL_COLUMNS). `pool_layout` decides where each starts inside the
+ * pool's one block, `pool_bind` publishes those addresses, and `pool_resize` is
+ * the only function that allocates, copies or frees a block (`pool_reserve` is
  * its grow-only wrapper, MFTLObjectReleasePools() is a resize to zero, and
  * MFTLObjectShrinkToFit() is the only way down). Hence the AoS records and every
  * SoA array of a pool always share one capacity: they are the same `malloc`.
+ * Code elsewhere that moves rows walks the same list through
+ * MFTLObjectNextMovedRows().
  */
 
 #include "mftl_object.h"
@@ -72,243 +75,239 @@ static void field_release(MFTL_Object *obj, int entity)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Vertex pool
- * ═══════════════════════════════════════════════════════════════════════════ */
+ * The sub-arrays of a pool: ONE list each
+ * ═══════════════════════════════════════════════════════════════════════════
+ *
+ * Every built-in sub-array is one line below: member, bytes per entity, how its
+ * rows move, and whether it is laid out. The layout, the binding of the
+ * pointers, the resize copy, the consistency check, the byte count and
+ * MFTLObjectNextMovedRows() -- the iterator compaction and both permutations
+ * walk -- are all expanded from that line, so a sub-array that one of them
+ * forgets cannot exist. Registered fields follow the built-ins
+ * (field_layout()).
+ *
+ *   MOVED    the row belongs to its entity: a permutation, a compaction or the
+ *            ownership swap carries it. A triangle's row of `he` is its three
+ *            half-edges, so they move as one unit and both the implicit
+ *            indexing and the implicit half-edge ids survive by construction.
+ *            `normal`, `area` and `center` are computed, but moved so a reorder
+ *            never discards values the caller just computed.
+ *   REBUILT  a cache re-derived after any of those (MFTLObjectBuildDerived()):
+ *            copied by a resize, never moved.
+ *
+ * Layout order: `rec` and `pos`, which every pass touches, first; the optional
+ * `sizing` last among the built-ins, so a pool without it is laid out exactly
+ * as before it existed.
+ */
+#define MFTL_VERTEX_POOL_COLUMNS(X)                 \
+  X(rec, sizeof(MFTL_Vertex), COLUMN_MOVED, true)   \
+  X(pos, 3 * sizeof(double), COLUMN_MOVED, true)    \
+  X(normal, 3 * sizeof(double), COLUMN_MOVED, true) \
+  X(sizing, sizeof(double), COLUMN_MOVED, p->has_sizing)
 
-/** @brief Byte offsets of every vertex sub-array inside one block. */
+#define MFTL_TRIANGLE_POOL_COLUMNS(X)                  \
+  X(rec, sizeof(MFTL_Triangle), COLUMN_MOVED, true)    \
+  X(he, 3 * sizeof(MFTL_HalfEdge), COLUMN_MOVED, true) \
+  X(area, sizeof(double), COLUMN_MOVED, true)          \
+  X(normal, 3 * sizeof(double), COLUMN_MOVED, true)    \
+  X(center, 3 * sizeof(double), COLUMN_MOVED, true)    \
+  X(verts, 3 * sizeof(int), COLUMN_REBUILT, true)      \
+  X(neighbors, 3 * sizeof(int), COLUMN_REBUILT, true)
+
+/** @brief How a built-in sub-array's rows move (see the lists above). */
+typedef enum
+{
+  COLUMN_MOVED,  ///< Carried by every permutation, compaction and ownership swap.
+  COLUMN_REBUILT  ///< Re-derived instead; only a resize copies it.
+} column_motion;
+
+/** @brief One built-in sub-array of a pool, as raw rows. */
 typedef struct
 {
-  size_t rec;  ///< [capacity]   MFTL_Vertex records.
-  size_t pos;  ///< [3*capacity] AUTHORITATIVE positions, xyz interleaved.
-  size_t normal;  ///< [3*capacity] vertex normals, xyz interleaved.
-  size_t sizing;  ///< [capacity]   optional remeshing target lengths; 0 when absent.
-} vertex_layout;
+  unsigned char *base;  ///< Current address; NULL when not laid out, or laid out for the first time.
+  size_t row;  ///< Bytes per entity.
+  column_motion motion;  ///< How its rows move.
+  bool present;  ///< Part of the layout.
+} pool_column;
+
+/** @brief Upper bound on the built-in sub-arrays of either pool. */
+#define MAX_POOL_COLUMNS 8
+
+#define COLUMN_COUNT(m, row, motion, present) +1
+MFTL_STATIC_ASSERT(0 MFTL_VERTEX_POOL_COLUMNS(COLUMN_COUNT) <= MAX_POOL_COLUMNS, "MAX_POOL_COLUMNS is too small for the vertex pool");
+MFTL_STATIC_ASSERT(0 MFTL_TRIANGLE_POOL_COLUMNS(COLUMN_COUNT) <= MAX_POOL_COLUMNS, "MAX_POOL_COLUMNS is too small for the triangle pool");
+#undef COLUMN_COUNT
 
 /**
- * @brief Lays out a vertex block for @p cap vertices: `rec`, `pos`, `normal`,
- *        and `sizing` when @p sizing is set.
+ * @brief The built-in sub-arrays of one pool, in layout order.
  *
- * `rec` and `pos`, which every pass touches, come first. The optional array
- * comes last among the built-in ones, so a pool without it is laid out exactly
- * as before it existed.
- *
- * @param[out] l      Receives one byte offset per field.
- * @param      cap    Vertices the block must hold.
- * @param      sizing Whether the block carries `sizing` (MFTL_VertexPool::has_sizing).
- * @return Total block size in bytes.
+ * @param      obj  The mesh.
+ * @param      pool #MFTL_FIELD_VERTEX or #MFTL_FIELD_TRIANGLE.
+ * @param[out] c    Receives one entry per sub-array.
+ * @return The number of entries written.
  */
-static size_t vertex_layout_compute(vertex_layout *l, int cap, bool sizing)
+static int pool_columns(const MFTL_Object *obj, MFTL_FieldEntity pool, pool_column c[MAX_POOL_COLUMNS])
 {
-  const size_t n = (size_t) cap;
+  int k = 0;
+#define COLUMN(m, row_bytes, how, laid_out) c[k++] = (pool_column){(unsigned char *) (void *) p->m, (row_bytes), (how), (laid_out)};
+  if (pool == MFTL_FIELD_VERTEX)
+  {
+    const MFTL_VertexPool *const p = &obj->verts;
+    MFTL_VERTEX_POOL_COLUMNS(COLUMN)
+  }
+  else
+  {
+    const MFTL_TrianglePool *const p = &obj->tris;
+    MFTL_TRIANGLE_POOL_COLUMNS(COLUMN)
+  }
+#undef COLUMN
+  return k;
+}
+
+/**
+ * @brief Lays the built-in sub-arrays out in one block of @p cap entities.
+ *
+ * @param      c   The sub-arrays, from pool_columns().
+ * @param      nc  Their number.
+ * @param      cap Entities the block must hold.
+ * @param[out] off Byte offset of each present sub-array (0 for an absent one).
+ * @return Bytes of the built-in part; registered fields follow it.
+ */
+static size_t pool_layout(const pool_column *c, int nc, int cap, size_t *off)
+{
   size_t cursor = 0;
-  l->rec = MFTLLayoutAdd(&cursor, n, sizeof(MFTL_Vertex));
-  l->pos = MFTLLayoutAdd(&cursor, 3 * n, sizeof(double));
-  l->normal = MFTLLayoutAdd(&cursor, 3 * n, sizeof(double));
-  l->sizing = sizing ? MFTLLayoutAdd(&cursor, n, sizeof(double)) : 0;
+  for (int k = 0; k < nc; ++k) off[k] = c[k].present ? MFTLLayoutAdd(&cursor, (size_t) cap, c[k].row) : 0;
   return cursor;
 }
 
 /**
- * @brief Points every field of @p p into @p blk according to @p l.
+ * @brief Points every built-in sub-array of @p pool into @p blk (NULL when not
+ *        laid out). The one place a pool pointer is written.
  *
- * @param[out] p   The pool whose pointers are set.
- * @param      blk Base of the allocation.
- * @param      l   Offsets from vertex_layout_compute().
+ * @param obj  The mesh.
+ * @param pool #MFTL_FIELD_VERTEX or #MFTL_FIELD_TRIANGLE.
+ * @param blk  Base of the allocation.
+ * @param off  Offsets from pool_layout().
  */
-static void vertex_pool_bind(MFTL_VertexPool *p, unsigned char *blk, const vertex_layout *l)
+static void pool_bind(MFTL_Object *obj, MFTL_FieldEntity pool, unsigned char *blk, const size_t *off)
 {
-  p->rec = (MFTL_Vertex *) (void *) (blk + l->rec);
-  p->pos = (double *) (void *) (blk + l->pos);
-  p->normal = (double *) (void *) (blk + l->normal);
-  p->sizing = p->has_sizing ? (double *) (void *) (blk + l->sizing) : MFTL_NULL;
+  int k = 0;
+#define BIND(m, row_bytes, how, laid_out)                  \
+  p->m = (laid_out) ? (void *) (blk + off[k]) : MFTL_NULL; \
+  ++k;
+  if (pool == MFTL_FIELD_VERTEX)
+  {
+    MFTL_VertexPool *const p = &obj->verts;
+    MFTL_VERTEX_POOL_COLUMNS(BIND)
+  }
+  else
+  {
+    MFTL_TrianglePool *const p = &obj->tris;
+    MFTL_TRIANGLE_POOL_COLUMNS(BIND)
+  }
+#undef BIND
 }
 
 /**
- * @brief Resizes the vertex pool to exactly @p capacity vertices, up or down.
+ * @brief Resizes one pool to exactly @p capacity entities, up or down.
  *
  * Lays out a new block, zeroes it (so flags and never-written slots start
- * defined), copies the live prefix of every array and frees the old block --
- * one code path for growth and shrink. Capacity 0 releases the block and zeroes
- * the struct (NULL pointers, not a dangling allocation of nothing).
+ * defined), copies the live prefix of every sub-array and frees the old block --
+ * one code path for growth, shrink and both pools. Capacity 0 releases the
+ * block and zeroes the struct (NULL pointers, not a dangling allocation of
+ * nothing).
  *
  * @param obj      The mesh owning the pool.
- * @param capacity Vertices it must hold afterwards; at least `obj->verts.n` (asserted:
- *                 this moves storage and never discards entities).
- * @param force    Relayout even at unchanged capacity when attaching a registry.
+ * @param pool     #MFTL_FIELD_VERTEX or #MFTL_FIELD_TRIANGLE (which also holds every half-edge).
+ * @param capacity Entities it must hold afterwards; at least the pool's `n`
+ *                 (asserted: this moves storage and never discards entities).
+ * @param force    Relayout even at unchanged capacity (a registry or `sizing` attached).
  */
-static void vertex_pool_resize(MFTL_Object *obj, int capacity, bool force)
+static void pool_resize(MFTL_Object *obj, MFTL_FieldEntity pool, int capacity, bool force)
 {
-  MFTL_VertexPool *p = &obj->verts;
-  MFTL_ASSERT(capacity >= p->n && "vertex_pool_resize: would discard live entities");
+  const bool vertex = (pool == MFTL_FIELD_VERTEX);
+  const int n = vertex ? obj->verts.n : obj->tris.n;
+  int *const cap = vertex ? &obj->verts.capacity : &obj->tris.capacity;
+  void **const block = vertex ? &obj->verts.block : &obj->tris.block;
+  MFTL_ASSERT(capacity >= n && "pool_resize: would discard live entities");
 
-  if (capacity == p->capacity && !force) return;
+  if (capacity == *cap && !force) return;
 
   /* Zero capacity is a release: free, and zero the struct so every pointer is
    * NULL (the state MFTLObjectPoolsAreConsistent() expects of an empty pool). */
   if (capacity == 0)
   {
-    field_release(obj, MFTL_FIELD_VERTEX);
-    free(p->block);
-    memset(p, 0, sizeof *p);
+    field_release(obj, pool);
+    free(*block);
+    if (vertex)
+      memset(&obj->verts, 0, sizeof obj->verts);
+    else
+      memset(&obj->tris, 0, sizeof obj->tris);
     return;
   }
 
-  vertex_layout l;
-  const size_t bytes = field_layout(obj, MFTL_FIELD_VERTEX, capacity, vertex_layout_compute(&l, capacity, p->has_sizing), NULL, 0);
-  unsigned char *blk = (unsigned char *) MFTLAlignedAllocOrDie(bytes, "MFTL vertex pool");
+  pool_column c[MAX_POOL_COLUMNS];
+  size_t off[MAX_POOL_COLUMNS];
+  const int nc = pool_columns(obj, pool, c);
+  const size_t built_in = pool_layout(c, nc, capacity, off);
+  const size_t bytes = field_layout(obj, pool, capacity, built_in, NULL, 0);
+  unsigned char *blk = (unsigned char *) MFTLAlignedAllocOrDie(bytes, vertex ? "MFTL vertex pool" : "MFTL triangle pool");
 
   /* Zeroed so never-written fields (flags in particular) start defined. */
   memset(blk, 0, bytes);
 
-  const size_t n = (size_t) p->n;
+  /* A present sub-array whose pointer is still NULL is being laid out for the
+   * first time (MFTLObjectEnableSizing()): nothing to carry over, and the zeroed
+   * block is what it starts as. */
   if (n > 0)
-  {
-    memcpy(blk + l.rec, p->rec, n * sizeof(MFTL_Vertex));
-    memcpy(blk + l.pos, p->pos, 3 * n * sizeof(double));
-    memcpy(blk + l.normal, p->normal, 3 * n * sizeof(double));
-    /* NULL while MFTLObjectEnableSizing() lays the array out for the first time:
-     * there is nothing to carry over, and the zeroed block is what it starts as. */
-    if (p->has_sizing && p->sizing != MFTL_NULL) memcpy(blk + l.sizing, p->sizing, n * sizeof(double));
-  }
+    for (int k = 0; k < nc; ++k)
+      if (c[k].present && c[k].base != MFTL_NULL) memcpy(blk + off[k], c[k].base, (size_t) n * c[k].row);
 
-  field_layout(obj, MFTL_FIELD_VERTEX, capacity, vertex_layout_compute(&l, capacity, p->has_sizing), blk, p->n);
-  free(p->block);
-  p->block = blk;
-  vertex_pool_bind(p, blk, &l);
-  p->capacity = capacity;
+  field_layout(obj, pool, capacity, built_in, blk, n);
+  free(*block);
+  *block = blk;
+  pool_bind(obj, pool, blk, off);
+  *cap = capacity;
 }
 
 /**
- * @brief Grows the vertex pool to @p capacity vertices; a no-op if it already
- *        holds that many (the ratchet MFTLObjectReserve() publishes).
+ * @brief Grows one pool to @p capacity entities; a no-op if it already holds
+ *        that many (the ratchet MFTLObjectReserve() publishes).
  *
  * @param obj      The mesh owning the pool.
- * @param capacity Vertices the pool must hold afterwards.
+ * @param pool     #MFTL_FIELD_VERTEX or #MFTL_FIELD_TRIANGLE.
+ * @param capacity Entities the pool must hold afterwards.
  */
-static void vertex_pool_reserve(MFTL_Object *obj, int capacity)
+static void pool_reserve(MFTL_Object *obj, MFTL_FieldEntity pool, int capacity)
 {
-  MFTL_VertexPool *p = &obj->verts;
-  if (capacity <= p->capacity) return;
-  vertex_pool_resize(obj, capacity, false);
+  if (capacity <= (pool == MFTL_FIELD_VERTEX ? obj->verts.capacity : obj->tris.capacity)) return;
+  pool_resize(obj, pool, capacity, false);
 }
 
-/* ═══════════════════════════════════════════════════════════════════════════
- * Triangle pool (which also holds every half-edge)
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/** @brief Byte offsets of every triangle/half-edge sub-array inside one block. */
-typedef struct
+bool MFTLObjectNextMovedRows(const MFTL_Object *obj, MFTL_FieldEntity pool, int *cursor, MFTL_PoolRows *rows)
 {
-  size_t rec;  ///< [capacity]   MFTL_Triangle records.
-  size_t he;  ///< [3*capacity] MFTL_HalfEdge records. Three per triangle, always.
-  size_t area;  ///< [capacity]   triangle areas.
-  size_t normal;  ///< [3*capacity] unit normals, xyz interleaved.
-  size_t center;  ///< [3*capacity] centroids, wrapped into the domain.
-  size_t verts;  ///< [3*capacity] derived: vertex index per corner.
-  size_t neighbors;  ///< [3*capacity] derived: triangle across each half-edge.
-} triangle_layout;
+  pool_column c[MAX_POOL_COLUMNS];
+  const int nc = pool_columns(obj, pool, c);
+  const int nf = obj->fields ? obj->fields->n : 0;
 
-/**
- * @brief Lays out a triangle block for @p cap triangles and 3 @p cap half-edges:
- *        `rec`, `he`, `area`, `normal`, `center`, `verts`, `neighbors`.
- *
- * The half-edges live in this block because a triangle has exactly three, at
- * 3t..3t+2; a separate half-edge capacity would describe an impossible mesh.
- *
- * @param[out] l   Receives one byte offset per field.
- * @param      cap Triangles the block must hold.
- * @return Total block size in bytes.
- */
-static size_t triangle_layout_compute(triangle_layout *l, int cap)
-{
-  const size_t n = (size_t) cap;
-  size_t cursor = 0;
-  l->rec = MFTLLayoutAdd(&cursor, n, sizeof(MFTL_Triangle));
-  l->he = MFTLLayoutAdd(&cursor, 3 * n, sizeof(MFTL_HalfEdge));
-  l->area = MFTLLayoutAdd(&cursor, n, sizeof(double));
-  l->normal = MFTLLayoutAdd(&cursor, 3 * n, sizeof(double));
-  l->center = MFTLLayoutAdd(&cursor, 3 * n, sizeof(double));
-  l->verts = MFTLLayoutAdd(&cursor, 3 * n, sizeof(int));
-  l->neighbors = MFTLLayoutAdd(&cursor, 3 * n, sizeof(int));
-  return cursor;
-}
-
-/**
- * @brief Points every field of @p p into @p blk according to @p l.
- *
- * @param[out] p   The pool whose pointers are set.
- * @param      blk Base of the allocation.
- * @param      l   Offsets from triangle_layout_compute().
- */
-static void triangle_pool_bind(MFTL_TrianglePool *p, unsigned char *blk, const triangle_layout *l)
-{
-  p->rec = (MFTL_Triangle *) (void *) (blk + l->rec);
-  p->he = (MFTL_HalfEdge *) (void *) (blk + l->he);
-  p->area = (double *) (void *) (blk + l->area);
-  p->normal = (double *) (void *) (blk + l->normal);
-  p->center = (double *) (void *) (blk + l->center);
-  p->verts = (int *) (void *) (blk + l->verts);
-  p->neighbors = (int *) (void *) (blk + l->neighbors);
-}
-
-/**
- * @brief Resizes the triangle pool (and its half-edges) to exactly @p capacity
- *        triangles, up or down. Same contract as vertex_pool_resize().
- *
- * @param obj      The mesh owning the pool.
- * @param capacity Triangles it must hold afterwards; at least `obj->tris.n`.
- * @param force    Relayout even at unchanged capacity when attaching a registry.
- */
-static void triangle_pool_resize(MFTL_Object *obj, int capacity, bool force)
-{
-  MFTL_TrianglePool *p = &obj->tris;
-  MFTL_ASSERT(capacity >= p->n && "triangle_pool_resize: would discard live entities");
-
-  if (capacity == p->capacity && !force) return;
-
-  if (capacity == 0)
+  /* The cursor counts the built-ins, then the registered fields. */
+  while (*cursor < nc + nf)
   {
-    field_release(obj, MFTL_FIELD_TRIANGLE);
-    free(p->block);
-    memset(p, 0, sizeof *p);
-    return;
+    const int k = (*cursor)++;
+    if (k < nc)
+    {
+      if (c[k].motion != COLUMN_MOVED || !c[k].present) continue;
+      rows->base = c[k].base;
+      rows->row_bytes = c[k].row;
+      return MFTL_TRUE;
+    }
+    const MFTL_FieldDescriptor *const d = &obj->fields->entries[k - nc];
+    if (d->entity != pool || d->mode == MFTL_FIELD_RECOMPUTED) continue;
+    rows->base = (unsigned char *) (void *) obj->field_data[k - nc];
+    rows->row_bytes = (size_t) d->ncomp * sizeof(double);
+    return MFTL_TRUE;
   }
-
-  triangle_layout l;
-  const size_t bytes = field_layout(obj, MFTL_FIELD_TRIANGLE, capacity, triangle_layout_compute(&l, capacity), NULL, 0);
-  unsigned char *blk = (unsigned char *) MFTLAlignedAllocOrDie(bytes, "MFTL triangle pool");
-  memset(blk, 0, bytes);
-
-  const size_t n = (size_t) p->n;
-  if (n > 0)
-  {
-    memcpy(blk + l.rec, p->rec, n * sizeof(MFTL_Triangle));
-    memcpy(blk + l.he, p->he, 3 * n * sizeof(MFTL_HalfEdge));
-    memcpy(blk + l.area, p->area, n * sizeof(double));
-    memcpy(blk + l.normal, p->normal, 3 * n * sizeof(double));
-    memcpy(blk + l.center, p->center, 3 * n * sizeof(double));
-    memcpy(blk + l.verts, p->verts, 3 * n * sizeof(int));
-    memcpy(blk + l.neighbors, p->neighbors, 3 * n * sizeof(int));
-  }
-
-  field_layout(obj, MFTL_FIELD_TRIANGLE, capacity, triangle_layout_compute(&l, capacity), blk, p->n);
-  free(p->block);
-  p->block = blk;
-  triangle_pool_bind(p, blk, &l);
-  p->capacity = capacity;
-}
-
-/**
- * @brief Grows the triangle pool to @p capacity triangles; never shrinks.
- *
- * @param obj      The mesh owning the pool.
- * @param capacity Triangles the pool must hold afterwards.
- */
-static void triangle_pool_reserve(MFTL_Object *obj, int capacity)
-{
-  MFTL_TrianglePool *p = &obj->tris;
-  if (capacity <= p->capacity) return;
-  triangle_pool_resize(obj, capacity, false);
+  return MFTL_FALSE;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -369,8 +368,8 @@ void MFTLObjectReserve(MFTL_Object *obj, int n_vertices, int n_triangles)
   MFTL_ASSERT(obj != MFTL_NULL);
   MFTL_ASSERT(n_vertices >= 0 && n_triangles >= 0);
 
-  vertex_pool_reserve(obj, n_vertices);
-  triangle_pool_reserve(obj, n_triangles);
+  pool_reserve(obj, MFTL_FIELD_VERTEX, n_vertices);
+  pool_reserve(obj, MFTL_FIELD_TRIANGLE, n_triangles);
 }
 
 void MFTLObjectReserveAdditional(MFTL_Object *obj, int extra_vertices, int extra_triangles)
@@ -378,8 +377,8 @@ void MFTLObjectReserveAdditional(MFTL_Object *obj, int extra_vertices, int extra
   MFTL_ASSERT(obj != MFTL_NULL);
   MFTL_ASSERT(extra_vertices >= 0 && extra_triangles >= 0);
 
-  vertex_pool_reserve(obj, MFTLGrowCapacity(obj->verts.capacity, obj->verts.n + extra_vertices));
-  triangle_pool_reserve(obj, MFTLGrowCapacity(obj->tris.capacity, obj->tris.n + extra_triangles));
+  pool_reserve(obj, MFTL_FIELD_VERTEX, MFTLGrowCapacity(obj->verts.capacity, obj->verts.n + extra_vertices));
+  pool_reserve(obj, MFTL_FIELD_TRIANGLE, MFTLGrowCapacity(obj->tris.capacity, obj->tris.n + extra_triangles));
 }
 
 void MFTLObjectSetCounts(MFTL_Object *obj, int n_vertices, int n_local_vertices, int n_triangles, int n_local_triangles)
@@ -445,16 +444,15 @@ size_t MFTLObjectPoolBytes(const MFTL_Object *obj)
   /* Re-derived from the layout functions, so it cannot drift from them. */
   size_t bytes = 0;
 
-  if (obj->verts.capacity > 0)
+  for (int e = MFTL_FIELD_VERTEX; e <= MFTL_FIELD_TRIANGLE; ++e)
   {
-    vertex_layout vl;
-    const size_t built_in = vertex_layout_compute(&vl, obj->verts.capacity, obj->verts.has_sizing);
-    bytes += field_layout((MFTL_Object *) obj, MFTL_FIELD_VERTEX, obj->verts.capacity, built_in, NULL, 0);
-  }
-  if (obj->tris.capacity > 0)
-  {
-    triangle_layout tl;
-    bytes += field_layout((MFTL_Object *) obj, MFTL_FIELD_TRIANGLE, obj->tris.capacity, triangle_layout_compute(&tl, obj->tris.capacity), NULL, 0);
+    const MFTL_FieldEntity pool = (MFTL_FieldEntity) e;
+    const int cap = (pool == MFTL_FIELD_VERTEX) ? obj->verts.capacity : obj->tris.capacity;
+    if (cap == 0) continue;
+    pool_column c[MAX_POOL_COLUMNS];
+    size_t off[MAX_POOL_COLUMNS];
+    const int nc = pool_columns(obj, pool, c);
+    bytes += field_layout((MFTL_Object *) obj, pool, cap, pool_layout(c, nc, cap, off), NULL, 0);
   }
 
   return bytes;
@@ -478,13 +476,13 @@ bool MFTLObjectShrinkToFit(MFTL_Object *obj, double slack)
    * on every call. */
   if ((double) obj->verts.capacity > slack * (double) obj->verts.n && v_target < obj->verts.capacity)
   {
-    vertex_pool_resize(obj, v_target, false);
+    pool_resize(obj, MFTL_FIELD_VERTEX, v_target, false);
     moved = MFTL_TRUE;
   }
 
   if ((double) obj->tris.capacity > slack * (double) obj->tris.n && t_target < obj->tris.capacity)
   {
-    triangle_pool_resize(obj, t_target, false);
+    pool_resize(obj, MFTL_FIELD_TRIANGLE, t_target, false);
     moved = MFTL_TRUE;
   }
 
@@ -499,8 +497,8 @@ void MFTLObjectReleasePools(MFTL_Object *obj)
 
   /* A release is a resize to capacity 0, which also re-NULLs every sub-array
    * pointer, so the object is indistinguishable from a fresh one. */
-  vertex_pool_resize(obj, 0, false);
-  triangle_pool_resize(obj, 0, false);
+  pool_resize(obj, MFTL_FIELD_VERTEX, 0, false);
+  pool_resize(obj, MFTL_FIELD_TRIANGLE, 0, false);
 }
 
 bool MFTLObjectPoolsAreConsistent(const MFTL_Object *obj)
@@ -516,50 +514,31 @@ bool MFTLObjectPoolsAreConsistent(const MFTL_Object *obj)
   if (vp->n_local < 0 || vp->n_local > vp->n) return MFTL_FALSE;
   if (tp->n_local < 0 || tp->n_local > tp->n) return MFTL_FALSE;
 
-  /* An empty pool owns nothing and points nowhere. */
-  if (vp->capacity == 0)
+  /* An empty pool owns nothing and points nowhere; otherwise every pointer must
+   * sit exactly where the layout for this capacity puts it -- the strongest form
+   * of "all arrays were sized by the same call". `cursor` is where each pool's
+   * registered fields begin. */
+  size_t cursor[2] = {0, 0};
+  for (int e = MFTL_FIELD_VERTEX; e <= MFTL_FIELD_TRIANGLE; ++e)
   {
-    if (vp->block != MFTL_NULL || vp->rec != MFTL_NULL || vp->pos != MFTL_NULL) return MFTL_FALSE;
-  }
-  else
-  {
-    /* Every pointer must sit exactly where the layout for this capacity puts
-     * it -- the strongest form of "all arrays were sized by the same call". */
-    vertex_layout l;
-    (void) vertex_layout_compute(&l, vp->capacity, vp->has_sizing);
-    const unsigned char *blk = (const unsigned char *) vp->block;
-    if (blk == MFTL_NULL) return MFTL_FALSE;
-    if ((const unsigned char *) vp->rec != blk + l.rec) return MFTL_FALSE;
-    if ((const unsigned char *) vp->pos != blk + l.pos) return MFTL_FALSE;
-    if ((const unsigned char *) vp->normal != blk + l.normal) return MFTL_FALSE;
-    if (vp->has_sizing ? (const unsigned char *) vp->sizing != blk + l.sizing : vp->sizing != MFTL_NULL) return MFTL_FALSE;
-  }
-
-  if (tp->capacity == 0)
-  {
-    if (tp->block != MFTL_NULL || tp->rec != MFTL_NULL || tp->he != MFTL_NULL) return MFTL_FALSE;
-  }
-  else
-  {
-    triangle_layout l;
-    (void) triangle_layout_compute(&l, tp->capacity);
-    const unsigned char *blk = (const unsigned char *) tp->block;
-    if (blk == MFTL_NULL) return MFTL_FALSE;
-    if ((const unsigned char *) tp->rec != blk + l.rec) return MFTL_FALSE;
-    if ((const unsigned char *) tp->he != blk + l.he) return MFTL_FALSE;
-    if ((const unsigned char *) tp->area != blk + l.area) return MFTL_FALSE;
-    if ((const unsigned char *) tp->normal != blk + l.normal) return MFTL_FALSE;
-    if ((const unsigned char *) tp->center != blk + l.center) return MFTL_FALSE;
-    if ((const unsigned char *) tp->verts != blk + l.verts) return MFTL_FALSE;
-    if ((const unsigned char *) tp->neighbors != blk + l.neighbors) return MFTL_FALSE;
+    const MFTL_FieldEntity pool = (MFTL_FieldEntity) e;
+    const int cap = (pool == MFTL_FIELD_VERTEX) ? vp->capacity : tp->capacity;
+    const unsigned char *const blk = (const unsigned char *) ((pool == MFTL_FIELD_VERTEX) ? vp->block : tp->block);
+    pool_column c[MAX_POOL_COLUMNS];
+    size_t off[MAX_POOL_COLUMNS];
+    const int nc = pool_columns(obj, pool, c);
+    cursor[e] = pool_layout(c, nc, cap, off);
+    if ((cap == 0) != (blk == MFTL_NULL)) return MFTL_FALSE;
+    for (int k = 0; k < nc; ++k)
+    {
+      const unsigned char *const want = (cap > 0 && c[k].present) ? blk + off[k] : MFTL_NULL;
+      if (c[k].base != want) return MFTL_FALSE;
+    }
   }
 
   if (obj->fields && obj->fields->n)
   {
     if (!obj->field_data) return MFTL_FALSE;
-    vertex_layout vl;
-    triangle_layout tl;
-    size_t cursor[2] = {vertex_layout_compute(&vl, vp->capacity, vp->has_sizing), triangle_layout_compute(&tl, tp->capacity)};
     for (int f = 0; f < obj->fields->n; ++f)
     {
       const MFTL_FieldDescriptor *d = &obj->fields->entries[f];
@@ -581,7 +560,7 @@ void MFTLObjectEnableSizing(MFTL_Object *obj)
    * every other vertex array and grows with it from here on. An empty pool only
    * records the flag; its first reserve lays the array out. */
   obj->verts.has_sizing = MFTL_TRUE;
-  if (obj->verts.capacity > 0) vertex_pool_resize(obj, obj->verts.capacity, true);
+  if (obj->verts.capacity > 0) pool_resize(obj, MFTL_FIELD_VERTEX, obj->verts.capacity, true);
 }
 
 void MFTLObjectAttachFields(MFTL_Object *obj, MFTL_FieldRegistry *fields)
@@ -592,8 +571,8 @@ void MFTLObjectAttachFields(MFTL_Object *obj, MFTL_FieldRegistry *fields)
   if (!fields->n) return;
   obj->fields = fields;
   obj->field_data = MFTLCallocOrDie((size_t) fields->n, sizeof(double *), "field pointers");
-  if (obj->verts.capacity) vertex_pool_resize(obj, obj->verts.capacity, true);
-  if (obj->tris.capacity) triangle_pool_resize(obj, obj->tris.capacity, true);
+  if (obj->verts.capacity) pool_resize(obj, MFTL_FIELD_VERTEX, obj->verts.capacity, true);
+  if (obj->tris.capacity) pool_resize(obj, MFTL_FIELD_TRIANGLE, obj->tris.capacity, true);
 }
 
 double *MFTLObjectField(MFTL_Object *obj, int field_id)

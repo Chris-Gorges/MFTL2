@@ -77,6 +77,11 @@ interleaved within a row. Values follow the same deduplicated entity lists as th
 built-in records. With no persistent fields, the original three-payload exchange
 is unchanged; recomputed fields consume no wire bytes. The byte statistics
 include the optional values, which cost eight bytes per component per sent row.
+`MFTLRedistributeWithOwnersCarrying(..., MFTL_REDISTRIBUTE_CARRY_SIZING)` appends
+`verts.sizing` to the vertex rows (the spanning remesher's migrations); like the
+fields, every copy must hold the owner's value, and ghosts then need no exchange.
+The bits fix every message's length, so they are collective (checked in Debug);
+the per-timestep redistribution passes none.
 
 `MFTLUpdateGhostFields` requests both vertex and triangle global ids and returns
 the selected fields in one pull (the column payload, @ref comm_ghost), optionally
@@ -257,9 +262,9 @@ Every "send these elements to those ranks" of the library goes through one
 engine in `exchange.c`: redistribution and the spatial halo
 (`MFTLExchangeStart`, up to four typed payloads, non-blocking), the topology
 change's node and label exchanges (`MFTLExchangeRecords`, records grouped by
-destination, and `MFTLExchangeReply`), the remesher's sizing carry and
-projection halo (`MFTLExchangeRecordsTo`, records that each name their
-destination), and the ghost pull's three exchanges. Each is a count exchange and then the data, on one of two routes:
+destination, and `MFTLExchangeReply`), the remesher's projection halo
+(`MFTLExchangeRecordsTo`, records that each name their destination), and the
+ghost pull's three exchanges. Each is a count exchange and then the data, on one of two routes:
 
 | Route | When | Counts | Data | Cost per call |
 |---|---|---|---|---|

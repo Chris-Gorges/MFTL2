@@ -404,11 +404,24 @@ refines further: five repeated serial remeshes of an ellipsoid went
 from the sixth call on — within 4 % of the first.
 
 **The field is computed once per kernel call and then carried.** A split
-interpolates it to the new vertex, a collapse to the survivor, compaction and
-reordering permute it (`verts.sizing`, an optional array of the vertex pool's one
-block: zero bytes unless enabled). Recomputing after every operation (what the
-old mftl did) would feed the chord midpoints the operators create straight back
-into the curvature.
+interpolates it to the new vertex, a collapse to the survivor (one call with the
+persistent vertex fields, `MFTLRemeshFieldVertex`), compaction and reordering
+move it (`verts.sizing`, an optional line of the vertex pool's sub-array list:
+zero bytes unless enabled), and each migration of a spanning pass carries it in
+its vertex records (`MFTL_REDISTRIBUTE_CARRY_SIZING`, 8 B per vertex record
+sent, no exchange of its own). Recomputing after every operation (what the old
+mftl did) would feed the chord midpoints the operators create straight back into
+the curvature.
+
+**It is not a registered field, deliberately.** A persistent field
+(@ref object_fields) would ride every per-timestep redistribution, for a value
+meaningful only inside a pass; an interpolated vertex field is resampled at its
+new position by every smoothing sweep (a closest-point search per moved vertex,
+and a different mesh: the field is carried with the vertex here, as in the
+measured LeVeque runs); the registry is ensemble-wide, fixed at the first body
+and refused by topology change; and a serial `MFTLRemeshObject` on a standalone
+object has no registry at all. What the two share is the storage: both are lines
+of the one list every pool is laid out, resized, permuted and compacted from.
 
 **Smoothing** moves a free vertex to
 $\sum_t |t|\rho_t\mathbf b_t / \sum_t |t|\rho_t$ with the density
@@ -733,8 +746,9 @@ placement on its own is the cheaper partial remedy: 2.3 µs (positions) or
 
 A collapse cannot free anything, so compaction is the deallocator. Half-edges
 move as triples with their triangle, which preserves implicit indexing and the
-implicit half-edge ids, and one allocation per pool means no sub-array can be
-forgotten. `out_he_idx` is **re-derived** from the surviving half-edges rather
+implicit half-edge ids, and compaction walks the list each pool is laid out from
+(`MFTLObjectNextMovedRows`), so no sub-array can be forgotten. Survivors between
+two removals keep one shift, so each sub-array moves as one `memmove` per run. `out_he_idx` is **re-derived** from the surviving half-edges rather
 than remapped, so an index an operator failed to repair cannot survive.
 
 During a parallel sweep appended entities sit past the ghosts,
@@ -1265,18 +1279,17 @@ both directions on a $\{P,1,1\}$ grid.
 
 | Function | Collective | Volume |
 |---|---|---|
-| `MFTLRemeshMigrateShifted` | LOR + `MFTLRedistributeWithOwners` | up to 87.5 % of the mesh per placement change |
-| `MFTLRemeshMigrateToRanks` | `MFTLRedistributeWithOwners` | whole bodies |
+| `MFTLRemeshMigrateShifted` | LOR + `MFTLRedistributeWithOwnersCarrying` | up to 87.5 % of the mesh per placement change; under curvature sizing 8 B more per vertex record |
+| `MFTLRemeshMigrateToRanks` | `MFTLRedistributeWithOwnersCarrying` | whole bodies |
 | `MFTLAllreduceInts` (the library's small reduction) | Allreduce(SUM) | 3 ints per placement; the dispersed gates |
 | `MFTLAllreduceDoubles` / `Ints`, `MFTLRemeshAgreeProfile` | Allreduce | a few scalars |
 | `MFTLRemeshNeighborGather` / `Allgather` / `Alltoall` | `comm_graph` | 3 doubles per body a rank speaks for or moves; 1–2 doubles per neighbour per round |
 | `MFTLRemeshMeasureBodies` | 2 × `MFTLEnsembleReduceBodies` + scalar `MPI_MAX` | 9 + 1 doubles per local body |
 | `MFTLRemeshSyncGhostIds` | `MFTLGhostPull` on `MFTL_ROUTE_AUTO`: LOR + request/reply over `comm_graph` (global route) | 4 B per ghost vertex |
 | `MFTLRemeshSyncGhostPositions` | `MFTLUpdateGhostColumns` (positions), the same route | 32 B per ghost vertex, once per smoothing sweep outside a placement (NESTED; ONCE's band) |
-| `MFTLRemeshSyncGhostSizing` | `MFTLUpdateGhostColumns` (sizing), the same route | 16 B per ghost vertex, after each migration under curvature sizing |
+| `MFTLRemeshSyncGhostSizing` | `MFTLUpdateGhostColumns` (sizing), the same route | 16 B per ghost vertex, twice per pass under curvature sizing |
 | `MFTLRemeshSyncGhostClass` | `MFTLGhostPull`, the same route | the owner's corner classification, once per pass with projection |
 | `MFTLRemeshReferenceHalo` | the library's `MFTLExchangeRecordsTo`: LOR + counts + data over `comm_graph`, or NBX + point to point (global route) | 23 doubles per input triangle within $w$ of a neighbour's cell, once per pass with projection |
-| sizing carry (`MFTLRemeshMigrateShifted` under curvature sizing) | `MFTLExchangeRecordsTo`, the same route | 3 doubles per owned vertex, through every migration |
 | `MFTLRemeshAgreeParams` | the library's `MFTLAgreeWords`: Allreduce(MAX) | 68 words (34 fields and their complements), once per call, at the first collective |
 
 Nothing in `src/remeshing/` allocates or sends a quantity proportional to $B$;

@@ -43,6 +43,18 @@ triangle has exactly three, at $3t\ldots3t+2$ (@ref arch_inv_implicit); a
 separate half-edge capacity would describe an impossible mesh. Cache-line
 alignment keeps arrays written by different kernels on different lines.
 
+The sub-arrays of each pool are **one list** in `object.c`
+(`MFTL_VERTEX_POOL_COLUMNS`, `MFTL_TRIANGLE_POOL_COLUMNS`): member, bytes per
+entity, and whether its rows MOVE with their entity or are a REBUILT cache
+(`tris.verts`, `tris.neighbors`). The layout, the pointer binding, the resize
+copy, `MFTLObjectPoolsAreConsistent` and `MFTLObjectPoolBytes` are expanded from
+it, and every other mover — both permutations and the remesher's compaction —
+walks it through `MFTLObjectNextMovedRows` (private), registered persistent
+fields after the built-ins. A sub-array a mover forgets would have to be missing
+from the layout too. The remesher's optional `verts.sizing` (8 B per vertex once
+`MFTLObjectEnableSizing` lays it out, zero bytes before) is one line of that
+list; why it is not a registered field: @ref rem_sizing_curvature.
+
 An icosphere of refinement $r$ ($F = 20\cdot4^r$, $V = 10\cdot4^r+2$) therefore
 occupies $140F + 64V = 3440\cdot4^r + 128$ bytes, padding aside.
 

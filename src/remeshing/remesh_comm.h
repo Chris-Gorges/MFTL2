@@ -31,8 +31,9 @@
  *                               when a ghost's owner is not a graph neighbour
  *                               (normal under coarsening).
  *   MFTLRemeshSyncGhostSizing   MFTLUpdateGhostColumns() on the same route, 16
- *                               bytes per ghost vertex, twice per phase -- only
- *                               under curvature sizing.
+ *                               bytes per ghost vertex, twice per pass -- only
+ *                               under curvature sizing (the migrations carry
+ *                               the field in their vertex records).
  *   MFTLRemeshMeasureBodies     per-body holder reductions (9 values, then 1)
  *                               plus one scalar MPI_MAX; once per pass.
  *   MFTLRemeshAgreeParams       one Allreduce of the parameter block, once per
@@ -291,11 +292,11 @@ typedef struct MFTL_RemeshMigrator
   int cap_objects;  ///< LOCAL bodies the `maps` array can describe. Never the id space -- see migrator_reserve().
   int cap_entities;  ///< Total entity slots the arena holds. Grown monotonically.
   /**
-   * MFTLRemeshMigrateShifted() hands every owned vertex's `verts.sizing` to its
-   * new owner and then the ghosts theirs, so a curvature field computed ONCE per
-   * pass survives the pass's migrations (a redistribution does not keep the
-   * array). Set by the spanning driver under curvature sizing; 12 bytes per
-   * owned vertex of each migration, self-destined records included.
+   * Every migration carries `verts.sizing` in its vertex records
+   * (#MFTL_REDISTRIBUTE_CARRY_SIZING), so a curvature field computed ONCE per
+   * pass survives the pass's migrations (a plain redistribution does not keep
+   * the array). Set by the spanning driver under curvature sizing; 8 bytes per
+   * vertex record the migration sends, no exchange of its own.
    */
   bool carry_sizing;
 } MFTL_RemeshMigrator;

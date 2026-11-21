@@ -556,6 +556,34 @@ typedef struct MFTL_OwnerMap
 int MFTLRedistributeWithOwners(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps);
 
 /**
+ * @brief MFTLRedistributeWithOwnersCarrying() bit: carry `verts.sizing`, the
+ *        remesher's target lengths, with every vertex.
+ */
+#define MFTL_REDISTRIBUTE_CARRY_SIZING 0x1u
+
+/**
+ * @brief MFTLRedistributeWithOwners() that also carries optional per-entity
+ *        arrays a plain redistribution leaves unspecified.
+ *
+ * #MFTL_REDISTRIBUTE_CARRY_SIZING appends `verts.sizing` to each vertex's
+ * persistent-field row (one double per vertex record sent, kept rows copied in
+ * place) and enables the array on every body that lacks it, arrivals included.
+ * Every copy of a vertex must hold its owner's value before the call (asserted
+ * in Debug), as for persistent fields; afterwards owned vertices and ghosts
+ * both hold it, so no ghost exchange is needed. A per-timestep redistribution
+ * does not carry it: the array is only meaningful inside a remeshing pass.
+ *
+ * @param ens   The ensemble.
+ * @param maps  As for MFTLRedistributeWithOwners(); #MFTL_NULL for the geometric rule.
+ * @param carry 0 (exactly MFTLRedistributeWithOwners()) or #MFTL_REDISTRIBUTE_CARRY_SIZING.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR on an invalid ensemble or an unknown bit.
+ *
+ * @collective Every rank passes the same @p carry: it fixes the length of every
+ *             message (checked in Debug).
+ */
+int MFTLRedistributeWithOwnersCarrying(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps, unsigned carry);
+
+/**
  * @brief Allows redistribution to skip bodies nobody saw change (default ON).
  *
  * A rank's state after a redistribution is a function of (global topology,

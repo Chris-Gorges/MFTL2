@@ -175,8 +175,9 @@ typedef struct MFTL_VertexPool
   /**
    * [capacity] OPTIONAL target edge length of a curvature-adaptive remesh, or
    * #MFTL_NULL. Laid out only after MFTLObjectEnableSizing() -- zero bytes
-   * otherwise -- and written by MFTLRemeshPrepareSizing(). Permuted by
-   * compaction and reordering like `normal`, never sent by a redistribution, so
+   * otherwise -- and written by MFTLRemeshPrepareSizing(). Moved by compaction
+   * and reordering like `normal`; sent only by a redistribution asked to carry
+   * it (#MFTL_REDISTRIBUTE_CARRY_SIZING: the spanning remesher's migrations), so
    * its values are unspecified outside a remeshing pass.
    */
   double *sizing;

@@ -521,12 +521,46 @@ static void build_kept_lists(const MFTL_Object *obj, const char *restrict keep_v
  * in which `n_local` remains a prefix.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
+/**
+ * @brief What each entity record carries this call besides its wire record:
+ *        the persistent registered fields and, when the caller asks
+ *        (#MFTL_REDISTRIBUTE_CARRY_SIZING), `verts.sizing` after them.
+ *
+ * Collective state: it fixes the length of every message's double payload, so
+ * every rank derives it from the same registry and the same argument.
+ */
+typedef struct
+{
+  int stride[2];  ///< Doubles per vertex / per triangle; 0 sends no payload.
+  bool sizing;  ///< The last vertex double is `verts.sizing`.
+} carried_rows;
+
+/**
+ * @brief Packs or unpacks the doubles one entity carries (carried_rows).
+ * @param obj    Mesh; its `verts.sizing` exists when `c->sizing`.
+ * @param c      What is carried this call.
+ * @param entity #MFTL_FIELD_VERTEX or #MFTL_FIELD_TRIANGLE.
+ * @param slot   Pool index.
+ * @param wire   `c->stride[entity]` doubles.
+ * @param unpack True writes the mesh, false writes the wire.
+ */
+static inline void carried_record(const MFTL_Object *obj, const carried_rows *c, int entity, int slot, double *wire, bool unpack)
+{
+  MFTLFieldsRecord(obj, entity, slot, wire, unpack);
+  if (entity != MFTL_FIELD_VERTEX || !c->sizing) return;
+  double *const last = wire + c->stride[MFTL_FIELD_VERTEX] - 1;
+  if (unpack)
+    obj->verts.sizing[slot] = *last;
+  else
+    *last = obj->verts.sizing[slot];
+}
+
 /** @brief Scratch reused by every object's rebuild; grown, never shrunk. */
 typedef struct
 {
   void *v_rec;  ///< kept vertex records
   size_t v_rec_cap;  ///< Its allocated size in bytes.
-  void *v_fields, *t_fields;  ///< Retained persistent field records.
+  void *v_fields, *t_fields;  ///< Retained carried rows (carried_rows) of the kept entities.
   size_t v_fields_cap, t_fields_cap;  ///< Their allocated byte counts.
   void *v_pos;  ///< kept vertex positions
   size_t v_pos_cap;  ///< Its allocated size in bytes.
@@ -630,6 +664,7 @@ typedef struct
   MFTL_SendBuffer *send_tris;  ///< [nproc] packed triangle payloads.
   MFTL_SendBuffer *send_verts;  ///< [nproc] packed vertex payloads.
   MFTL_SendBuffer *send_counts;  ///< [nproc] per-body run lengths, multi-body only.
+  carried_rows carry;  ///< What this call's records carry; set at the start of each call.
   MFTL_SendBuffer *send_fv, *send_ft, *send_fields;  ///< Optional double payloads, allocated together.
   double *recv_fv, *recv_ft;  ///< Received fields in entity record order.
   int cap_recv_fv, cap_recv_ft;  ///< Receive capacities in doubles.
@@ -990,15 +1025,16 @@ static void repair_twins(MFTL_Object *obj, const int *restrict u_list, int n_u, 
  *                positions, #MFTL_DERIVED_TOPOLOGY set, cached geometry
  *                unspecified, `partition_dirty` cleared.
  * @param bs      Per-body state from build_kept_lists().
- * @param recv_fv Persistent field rows aligned with recv_v, or NULL.
- * @param recv_ft Persistent field rows aligned with recv_t, or NULL.
+ * @param recv_fv Carried vertex rows aligned with recv_v, or NULL.
+ * @param recv_ft Carried triangle rows aligned with recv_t, or NULL.
+ * @param carry   What a record carries this call (carried_rows).
  * @param recv_v  Received vertex records.
  * @param recv_t  Received triangle records.
  * @param my_rank This rank.
  * @param s       Reusable scratch, grown monotonically across calls.
  */
 static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_PackedVertex *recv_v, const MFTL_PackedTriangleComplex *recv_t, int my_rank,
-                           rebuild_scratch *s, const double *recv_fv, const double *recv_ft)
+                           rebuild_scratch *s, const double *recv_fv, const double *recv_ft, const carried_rows *carry)
 {
   const int n_old_v = obj->verts.n;
   const int n_old_t = obj->tris.n;
@@ -1074,17 +1110,17 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
 
   CS_LAP(tm, t_kept_gather);
 
-  const int fv = MFTLFieldsStride(obj, MFTL_FIELD_VERTEX);
-  const int ft = MFTLFieldsStride(obj, MFTL_FIELD_TRIANGLE);
+  const int fv = carry->stride[MFTL_FIELD_VERTEX];
+  const int ft = carry->stride[MFTL_FIELD_TRIANGLE];
   if (fv)
   {
     ensure_bytes(&s->v_fields, &s->v_fields_cap, (size_t) MFTL_MAX(n_kept_v, 1) * fv * sizeof(double));
-    for (int i = 0; i < n_kept_v; ++i) MFTLFieldsRecord(obj, 0, bs->kept_v[i], (double *) s->v_fields + (size_t) i * fv, false);
+    for (int i = 0; i < n_kept_v; ++i) carried_record(obj, carry, MFTL_FIELD_VERTEX, bs->kept_v[i], (double *) s->v_fields + (size_t) i * fv, false);
   }
   if (ft)
   {
     ensure_bytes(&s->t_fields, &s->t_fields_cap, (size_t) MFTL_MAX(n_kept_t, 1) * ft * sizeof(double));
-    for (int i = 0; i < n_kept_t; ++i) MFTLFieldsRecord(obj, 1, bs->kept_t[i], (double *) s->t_fields + (size_t) i * ft, false);
+    for (int i = 0; i < n_kept_t; ++i) carried_record(obj, carry, MFTL_FIELD_TRIANGLE, bs->kept_t[i], (double *) s->t_fields + (size_t) i * ft, false);
   }
 
   /* ── 2. Classify the arrivals against the kept entities ──────────────────── */
@@ -1203,35 +1239,36 @@ static void rebuild_object(MFTL_Object *obj, const body_state *bs, const MFTL_Pa
   CS_LAP(tm, t_reserve);
   if (fv)
   {
-    for (int i = 0; i < n_kept_v; ++i) MFTLFieldsRecord(obj, 0, s->v_final_of_logical[i], (double *) s->v_fields + (size_t) i * fv, true);
+    for (int i = 0; i < n_kept_v; ++i) carried_record(obj, carry, MFTL_FIELD_VERTEX, s->v_final_of_logical[i], (double *) s->v_fields + (size_t) i * fv, true);
     for (int i = 0; i < bs->n_recv_v; ++i)
       if (s->recv_v_logical[i] != MFTL_ERROR)
-        MFTLFieldsRecord(obj, 0, s->v_final_of_logical[s->recv_v_logical[i]], (double *) recv_fv + (size_t) bs->recv_v_idx[i] * fv, true);
+        carried_record(obj, carry, MFTL_FIELD_VERTEX, s->v_final_of_logical[s->recv_v_logical[i]], (double *) recv_fv + (size_t) bs->recv_v_idx[i] * fv, true);
   }
   if (ft)
   {
-    for (int i = 0; i < n_kept_t; ++i) MFTLFieldsRecord(obj, 1, s->t_final_of_logical[i], (double *) s->t_fields + (size_t) i * ft, true);
+    for (int i = 0; i < n_kept_t; ++i)
+      carried_record(obj, carry, MFTL_FIELD_TRIANGLE, s->t_final_of_logical[i], (double *) s->t_fields + (size_t) i * ft, true);
     for (int i = 0; i < bs->n_recv_t; ++i)
       if (s->recv_t_logical[i] != MFTL_ERROR)
-        MFTLFieldsRecord(obj, 1, s->t_final_of_logical[s->recv_t_logical[i]], (double *) recv_ft + (size_t) bs->recv_t_idx[i] * ft, true);
+        carried_record(obj, carry, MFTL_FIELD_TRIANGLE, s->t_final_of_logical[s->recv_t_logical[i]], (double *) recv_ft + (size_t) bs->recv_t_idx[i] * ft,
+                       true);
   }
 #ifndef NDEBUG
+  /* Every copy of a vertex carries the owner's values, or the row this rank
+   * keeps depends on which copy arrived first. */
   if (fv)
+  {
+    double *const row = (double *) MFTLMallocOrDie((size_t) fv * sizeof(double), "redistribute carried row check");
     for (int i = 0; i < bs->n_recv_v; ++i)
     {
       const int ri = bs->recv_v_idx[i];
       const int logical = gt_get(&s->v_tbl, recv_v[ri].global_id);
-      int off = 0;
-      for (int f = 0; f < obj->fields->n; ++f)
-      {
-        const MFTL_FieldDescriptor *d = &obj->fields->entries[f];
-        if (d->entity != MFTL_FIELD_VERTEX || d->mode == MFTL_FIELD_RECOMPUTED) continue;
-        MFTL_ASSERT(memcmp(obj->field_data[f] + (size_t) s->v_final_of_logical[logical] * d->ncomp, recv_fv + (size_t) ri * fv + off,
-                           (size_t) d->ncomp * sizeof(double)) == 0 &&
-                    "persistent vertex ghosts must be synced before redistribution");
-        off += d->ncomp;
-      }
+      carried_record(obj, carry, MFTL_FIELD_VERTEX, s->v_final_of_logical[logical], row, false);
+      MFTL_ASSERT(memcmp(row, recv_fv + (size_t) ri * fv, (size_t) fv * sizeof(double)) == 0 &&
+                  "carried vertex rows (persistent fields, verts.sizing) must agree on every copy: sync the ghosts before redistribution");
     }
+    free(row);
+  }
 #endif
 
   {
@@ -1598,14 +1635,14 @@ static int analyze_and_pack_body(comm_workspace *ws, MFTL_Object *obj, const MFT
     if (ws->send_fields)
       for (int e = 0; e < 2; ++e)
       {
-        const int stride = MFTLFieldsStride(obj, e);
+        const int stride = ws->carry.stride[e];
         const int n = e ? ws->send_tris[r].count - tri_before : ws->send_verts[r].count - vert_before;
         const int *indices = e ? ws->tri_ids[r].data : ws->vert_ids[r].data;
         MFTL_SendBuffer *out = e ? &ws->send_ft[r] : &ws->send_fv[r];
         if (!stride || !n) continue;
         if ((size_t) n * stride > (size_t) INT_MAX - out->count) MPI_Abort(obj->domain->comm_world, MFTL_ERROR);
         sb_reserve(out, n * stride, sizeof(double));
-        for (int j = 0; j < n; ++j) MFTLFieldsRecord(obj, e, indices[j], (double *) out->buffer + out->count + (size_t) j * stride, false);
+        for (int j = 0; j < n; ++j) carried_record(obj, &ws->carry, e, indices[j], (double *) out->buffer + out->count + (size_t) j * stride, false);
         out->count += n * stride;
       }
 
@@ -1637,20 +1674,22 @@ static int analyze_and_pack_body(comm_workspace *ws, MFTL_Object *obj, const MFT
  *
  * Equal id spaces are the observable consequence of "every rank added the same
  * bodies in the same order"; disagreement would merge entities into the wrong
- * body. The skip switch changes the number of collectives, so disagreement
- * would deadlock. One MFTLAgreeWords() of both. The local body count
- * legitimately differs and is excluded.
+ * body. The skip switch changes the number of collectives and the carry bits
+ * the length of every message, so disagreement would deadlock. One
+ * MFTLAgreeWords() of all three. The local body count legitimately differs and
+ * is excluded.
  *
  * @param dom             Supplies the communicator.
  * @param n_bodies_global Size of the body-id space.
+ * @param carry           The `carry` bits of this call.
  */
-static void check_object_lists_agree(const MFTL_Domain *dom, int n_bodies_global)
+static void check_object_lists_agree(const MFTL_Domain *dom, int n_bodies_global, unsigned carry)
 {
-  const uint64_t sig = (uint64_t) n_bodies_global * 2u + (g_skip_unchanged ? 1u : 0u);
-  const int differs = MFTLAgreeWords(dom->comm_world, &sig, 1, MFTL_NULL);
+  const uint64_t sig[2] = {(uint64_t) n_bodies_global * 2u + (g_skip_unchanged ? 1u : 0u), (uint64_t) carry};
+  const int differs = MFTLAgreeWords(dom->comm_world, sig, 2, MFTL_NULL);
   MFTL_ASSERT(differs < 0 &&
-              "redistribute: ranks disagree about the body-id space or about the skip switch -- every rank must add the same bodies in the same "
-              "order, and MFTLRedistributeSetSkipUnchangedBodies is collective");
+              "redistribute: ranks disagree about the body-id space, the skip switch or the carry bits -- every rank must add the same bodies in the "
+              "same order, and MFTLRedistributeSetSkipUnchangedBodies and the carry bits are collective");
   (void) differs;
 }
 #endif
@@ -1666,11 +1705,12 @@ static void check_object_lists_agree(const MFTL_Domain *dom, int n_bodies_global
  *
  * @param ens  The ensemble: its domain, local object list and persistent
  *             workspace.
- * @param maps `[ens->n_local_objects]` explicit owner maps in local-slot order,
- *             or NULL for the geometric rule.
+ * @param maps  `[ens->n_local_objects]` explicit owner maps in local-slot order,
+ *              or NULL for the geometric rule.
+ * @param carry #MFTL_REDISTRIBUTE_CARRY_SIZING or 0.
  * @return #MFTL_SUCCESS.
  */
-static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
+static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps, unsigned carry)
 {
   MFTL_ASSERT(MFTL_MPI_PackedVertex != MPI_DATATYPE_NULL && "MFTLRedistribute: MPI datatypes not registered (MFTLFreeMpiTypes() while an ensemble is in use?)");
 
@@ -1686,7 +1726,7 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
   const int my_rank = domain->rank;
 
 #ifndef NDEBUG
-  check_object_lists_agree(domain, ens->n_bodies_global);
+  check_object_lists_agree(domain, ens->n_bodies_global, carry);
 #endif
 
   if (nproc < 2)
@@ -1751,7 +1791,12 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
   /* At least one slot: the arrival path grows the arrays from here. */
   ws_reserve(ws, nproc, MFTL_MAX(num_objects, 1), sum_verts, sum_tris, max_verts, max_tris, tri_hint, vert_hint);
 
-  const bool with_fields = ens->fields.stride[0] || ens->fields.stride[1];
+  ws->carry.sizing = (carry & MFTL_REDISTRIBUTE_CARRY_SIZING) != 0u;
+  ws->carry.stride[MFTL_FIELD_VERTEX] = ens->fields.stride[MFTL_FIELD_VERTEX] + (ws->carry.sizing ? 1 : 0);
+  ws->carry.stride[MFTL_FIELD_TRIANGLE] = ens->fields.stride[MFTL_FIELD_TRIANGLE];
+  if (ws->carry.sizing)
+    for (int o = 0; o < num_objects; ++o) MFTLObjectEnableSizing(objects[o]);
+  const bool with_fields = ws->carry.stride[MFTL_FIELD_VERTEX] || ws->carry.stride[MFTL_FIELD_TRIANGLE];
   if (with_fields && !ws->send_fields)
   {
     ws->send_fv = MFTLCallocOrDie((size_t) nproc, sizeof(MFTL_SendBuffer), "vertex field buffers");
@@ -1940,6 +1985,7 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
       MFTL_Object *const arrived = MFTLObjectCreate(gid);
       arrived->domain = domain;
       MFTLObjectAttachFields(arrived, &ens->fields);
+      if (ws->carry.sizing) MFTLObjectEnableSizing(arrived);
       arrived->derived = MFTL_DERIVED_TOPOLOGY;  // an empty mesh is trivially described
 
       /* The persistent slot may hold the previous call's state: clear it. */
@@ -1984,7 +2030,7 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
   if (with_fields)
   {
     MFTLExchangeWait(&ctx, 3);
-    const int fv = ens->fields.stride[0], ft = ens->fields.stride[1];
+    const int fv = ws->carry.stride[MFTL_FIELD_VERTEX], ft = ws->carry.stride[MFTL_FIELD_TRIANGLE];
     if ((size_t) xfer[0].recv_count * fv > INT_MAX || (size_t) xfer[1].recv_count * ft > INT_MAX) MPI_Abort(domain->comm_world, MFTL_ERROR);
     ws_bytes((void **) &ws->recv_fv, &ws->cap_recv_fv, MFTL_MAX(xfer[0].recv_count * fv, 1), sizeof(double), "received vertex fields");
     ws_bytes((void **) &ws->recv_ft, &ws->cap_recv_ft, MFTL_MAX(xfer[1].recv_count * ft, 1), sizeof(double), "received triangle fields");
@@ -2058,7 +2104,7 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
     }
 
     rebuild_object(obj, &ws->states[o], (const MFTL_PackedVertex *) xfer[0].recv_buf, (const MFTL_PackedTriangleComplex *) xfer[1].recv_buf, my_rank, scratch,
-                   ws->recv_fv, ws->recv_ft);
+                   ws->recv_fv, ws->recv_ft, &ws->carry);
   }
 
   /* ── Phase 5b: optional shrink, after every rebuild (no pool pointer is live
@@ -2131,15 +2177,18 @@ static int redistribute_core(MFTL_Ensemble *ens, const MFTL_OwnerMap *maps)
   return MFTL_SUCCESS;
 }
 
-int MFTLRedistributeWithOwners(MFTL_Ensemble *ensemble, const MFTL_OwnerMap *maps)
+int MFTLRedistributeWithOwnersCarrying(MFTL_Ensemble *ensemble, const MFTL_OwnerMap *maps, unsigned carry)
 {
   if (ensemble == MFTL_NULL || ensemble->local_objects == MFTL_NULL) return MFTL_ERROR;
+  if ((carry & ~MFTL_REDISTRIBUTE_CARRY_SIZING) != 0u) return MFTL_ERROR;
 
   /* No bodies anywhere: a no-op. The test is GLOBAL -- a rank holding no bodies
    * must still enter the exchange, since another rank may send it one. */
   if (ensemble->n_bodies_global == 0) return MFTL_SUCCESS;
 
-  return redistribute_core(ensemble, maps);
+  return redistribute_core(ensemble, maps, carry);
 }
 
-int MFTLRedistribute(MFTL_Ensemble *ensemble) { return MFTLRedistributeWithOwners(ensemble, MFTL_NULL); }
+int MFTLRedistributeWithOwners(MFTL_Ensemble *ensemble, const MFTL_OwnerMap *maps) { return MFTLRedistributeWithOwnersCarrying(ensemble, maps, 0u); }
+
+int MFTLRedistribute(MFTL_Ensemble *ensemble) { return MFTLRedistributeWithOwnersCarrying(ensemble, MFTL_NULL, 0u); }

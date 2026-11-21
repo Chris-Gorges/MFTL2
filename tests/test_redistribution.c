@@ -1752,6 +1752,142 @@ static int test_a_body_arrives_leaves_and_returns(void)
   return 0;
 }
 
+/* ─────────────────────────────────────────────────────────────────────────────
+ * Carried target lengths
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/** @brief What vertex @p g of body @p b carries, on every copy: exact in a double. */
+static double carried_value(int b, int g) { return 1.0 + 1048576.0 * b + (double) g; }
+
+/** @brief Two bodies (one across the grid, one in a corner cell), partitioned, every copy given its target. */
+static MFTL_Ensemble *carry_fixture(void)
+{
+  MFTL_Ensemble *ens = make_ensemble(MFTL_TRUE, 2);
+  add_sphere(ens, 0, 0.1, -0.05, 0.02, 0.6, 3);
+  add_sphere(ens, 1, -0.7, -0.7, -0.7, 0.1, 2);
+  MFTLRedistribute(ens);
+  refresh_geometry(ens);
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    MFTL_Object *obj = ens->local_objects[o];
+    MFTLObjectEnableSizing(obj);
+    for (int v = 0; v < obj->verts.n; ++v) obj->verts.sizing[v] = carried_value(obj->global_id, obj->verts.rec[v].global_id);
+  }
+  return ens;
+}
+
+/** @brief Every copy, owned and ghost, holds its carried value; counts the ghosts. */
+static int every_copy_carries(const MFTL_Ensemble *ens, long *n_ghosts)
+{
+  int ok = 1;
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    const MFTL_Object *obj = ens->local_objects[o];
+    ok &= obj->verts.has_sizing && MFTLObjectPoolsAreConsistent(obj);
+    if (!obj->verts.has_sizing) continue;
+    for (int v = 0; v < obj->verts.n; ++v) ok &= obj->verts.sizing[v] == carried_value(obj->global_id, obj->verts.rec[v].global_id);
+    *n_ghosts += obj->verts.n - obj->verts.n_local;
+  }
+  return ok;
+}
+
+/**
+ * @brief Two redistributions: an advection step under the geometric rule, then
+ *        an owner map that sends every other entity across the grid.
+ * @param ens   The fixture.
+ * @param carry The carry bits of both calls.
+ * @param[out] stats Totals over both calls, this rank: bytes sent, vertex records received, bodies created.
+ * @param[out] n_ghosts Ghost vertices after each call that carried, summed.
+ * @return 1 if both calls succeeded and (when carrying) every copy held its value after each.
+ */
+static int carried_moves(MFTL_Ensemble *ens, unsigned carry, long stats[3], long *n_ghosts)
+{
+  int ok = 1;
+  stats[0] = stats[1] = stats[2] = 0;
+  MFTL_RedistributeStats st;
+
+  for (int o = 0; o < ens->n_local_objects; ++o)
+  {
+    MFTL_Object *obj = ens->local_objects[o];
+    MFTL_FOREACH_OWNED_VERTEX(obj, pos[0] += 0.13; pos[1] -= 0.07; MFTLApplyPeriodicity(&ens->domain, pos););
+  }
+  ok &= MFTLUpdateGhostPositions(ens) == MFTL_SUCCESS;
+  refresh_geometry(ens);
+  MFTLRedistributeStatsReset();
+  ok &= MFTLRedistributeWithOwnersCarrying(ens, MFTL_NULL, carry) == MFTL_SUCCESS;
+  MFTLRedistributeGetStats(&st);
+  stats[0] += st.n_bytes_sent;
+  stats[1] += st.n_verts_received;
+  stats[2] += st.n_objects_created;
+  if (carry) ok &= every_copy_carries(ens, n_ghosts);
+  refresh_geometry(ens);
+
+  /* A function of the id, so every holder names the same destination. */
+  const int far = g_nproc / 2, held = ens->n_local_objects;
+  MFTL_OwnerMap *maps = (MFTL_OwnerMap *) calloc((size_t) held + 1, sizeof(MFTL_OwnerMap));
+  int **arrays = (int **) calloc(2 * (size_t) held + 2, sizeof(int *));
+  for (int o = 0; o < held; ++o)
+  {
+    const MFTL_Object *obj = ens->local_objects[o];
+    int *vo = (int *) malloc(((size_t) obj->verts.n + 1) * sizeof(int)), *to = (int *) malloc(((size_t) obj->tris.n + 1) * sizeof(int));
+    for (int v = 0; v < obj->verts.n; ++v) vo[v] = (obj->verts.rec[v].global_id % 2) ? far : 0;
+    for (int t = 0; t < obj->tris.n; ++t) to[t] = (obj->tris.rec[t].global_id % 2) ? 0 : far;
+    maps[o].vert_owner = arrays[2 * o] = vo;
+    maps[o].tri_owner = arrays[2 * o + 1] = to;
+  }
+  MFTLRedistributeStatsReset();
+  ok &= MFTLRedistributeWithOwnersCarrying(ens, maps, carry) == MFTL_SUCCESS;
+  MFTLRedistributeGetStats(&st);
+  stats[0] += st.n_bytes_sent;
+  stats[1] += st.n_verts_received;
+  stats[2] += st.n_objects_created;
+  for (int i = 0; i < 2 * held + 2; ++i) free(arrays[i]);
+  free(arrays);
+  free(maps);
+  if (carry) ok &= every_copy_carries(ens, n_ghosts);
+  return ok;
+}
+
+/**
+ * @brief #MFTL_REDISTRIBUTE_CARRY_SIZING hands every copy of a vertex its
+ *        owner's target -- kept and received, owned and ghost, on a body that
+ *        arrives where this rank held nothing -- under the geometric rule and
+ *        under an owner map; it changes nothing else and costs exactly one
+ *        double per vertex record sent.
+ *
+ * The reference is the same two moves on an identical ensemble without the
+ * bit: the partitions must agree (set and order digests), and the byte counts
+ * must differ by 8 bytes per vertex record. Unknown bits are refused before any
+ * communication.
+ */
+static int test_a_carried_sizing_reaches_every_copy(void)
+{
+  MFTL_Ensemble *with = carry_fixture();
+  MFTL_Ensemble *without = carry_fixture();
+  int ok = MFTLRedistributeWithOwnersCarrying(with, MFTL_NULL, 0x80u) == MFTL_ERROR;
+
+  long a[3], b[3], ghosts = 0, unused = 0;
+  ok &= carried_moves(with, MFTL_REDISTRIBUTE_CARRY_SIZING, a, &ghosts);
+  ok &= carried_moves(without, 0u, b, &unused);
+  for (int o = 0; o < with->n_local_objects; ++o) ok &= inv_partition_is_sound(with->local_objects[o], g_rank);
+
+  uint64_t dw[2], dn[2];
+  partition_digest(with, dw);
+  partition_digest(without, dn);
+  ok &= dw[0] == dn[0] && dw[1] == dn[1];
+
+  long sum[5] = {a[0] - b[0], a[1], a[2], ghosts, a[1] - b[1]};
+  MPI_Allreduce(MPI_IN_PLACE, sum, 5, MPI_LONG, MPI_SUM, MPI_COMM_WORLD);
+  ok &= sum[4] == 0 && sum[0] == 8 * sum[1];
+
+  MFTLEnsembleDestroy(&with);
+  MFTLEnsembleDestroy(&without);
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  /* Non-vacuity: records crossed ranks, a body arrived somewhere new, ghosts held values. */
+  TEST_ASSERT(agreed(g_nproc < 2 || (sum[1] > 0 && sum[2] > 0 && sum[3] > 0), MPI_COMM_WORLD));
+  return 0;
+}
+
 /** @brief An ensemble with no objects at all is a no-op, not an error. */
 static int test_empty_ensemble_is_a_no_op(void)
 {
@@ -1772,6 +1908,7 @@ static int test_invalid_arguments(void)
 {
   TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLRedistribute(MFTL_NULL));
   TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLRedistributeWithOwners(MFTL_NULL, MFTL_NULL));
+  TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLRedistributeWithOwnersCarrying(MFTL_NULL, MFTL_NULL, MFTL_REDISTRIBUTE_CARRY_SIZING));
   TEST_ASSERT_EQUAL_INT(MFTL_ERROR, MFTLUpdateGhostPositions(MFTL_NULL));
   return 0;
 }
@@ -1814,6 +1951,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_shrinking_does_not_change_the_mesh);
   RUN_TEST(test_a_body_arrives_leaves_and_returns);
   RUN_TEST(test_empty_object_is_a_no_op);
+  RUN_TEST(test_a_carried_sizing_reaches_every_copy);
   RUN_TEST(test_empty_ensemble_is_a_no_op);
   RUN_TEST(test_invalid_arguments);
 

@@ -24,6 +24,8 @@
 #include "mftl_core.h"
 #include "test_utils.h"
 
+#include "../src/object/fields_internal.h"
+
 static MFTL_Ensemble *g_ens = MFTL_NULL;
 
 /* ─────────────────────────────────────────────────────────────────────────────
@@ -786,6 +788,47 @@ static int test_a_reorder_carries_the_sizing(void)
   return 0;
 }
 
+/**
+ * @brief The rows a permutation or compaction moves are exactly the pool's
+ *        sub-arrays minus its rebuilt caches: the records, the half-edge
+ *        TRIPLES, positions and computed geometry, and `verts.sizing` once laid
+ *        out -- in layout order, each at its pool pointer.
+ *
+ * Pins the classification of the one list (src/object/object.c): moving
+ * `tris.verts` would be work thrown away, and dropping `normal` or `sizing`
+ * from it would leave stale rows behind every reorder and compaction.
+ */
+static int test_the_moved_rows_are_the_pool_minus_its_caches(void)
+{
+  MFTL_Object *obj = MFTLObjectCreate(2);
+  MFTLObjectSetCounts(obj, 30, 30, 20, 20);
+
+  for (int with_sizing = 0; with_sizing < 2; ++with_sizing)
+  {
+    if (with_sizing) MFTLObjectEnableSizing(obj);
+    const void *vbase[4] = {obj->verts.rec, obj->verts.pos, obj->verts.normal, obj->verts.sizing};
+    const size_t vrow[4] = {sizeof(MFTL_Vertex), 3 * sizeof(double), 3 * sizeof(double), sizeof(double)};
+    const void *tbase[5] = {obj->tris.rec, obj->tris.he, obj->tris.area, obj->tris.normal, obj->tris.center};
+    const size_t trow[5] = {sizeof(MFTL_Triangle), 3 * sizeof(MFTL_HalfEdge), sizeof(double), 3 * sizeof(double), 3 * sizeof(double)};
+
+    MFTL_PoolRows r;
+    int n = 0;
+    for (int it = 0; MFTLObjectNextMovedRows(obj, MFTL_FIELD_VERTEX, &it, &r); ++n)
+      TEST_ASSERT(n < 4 && (const void *) r.base == vbase[n] && r.row_bytes == vrow[n]);
+    TEST_ASSERT_EQUAL_INT(with_sizing ? 4 : 3, n);
+    TEST_ASSERT(MFTLObjectWidestMovedRow(obj, MFTL_FIELD_VERTEX) == 3 * sizeof(double));
+
+    n = 0;
+    for (int it = 0; MFTLObjectNextMovedRows(obj, MFTL_FIELD_TRIANGLE, &it, &r); ++n)
+      TEST_ASSERT(n < 5 && (const void *) r.base == tbase[n] && r.row_bytes == trow[n]);
+    TEST_ASSERT_EQUAL_INT(5, n);
+    TEST_ASSERT(MFTLObjectWidestMovedRow(obj, MFTL_FIELD_TRIANGLE) == 3 * sizeof(MFTL_HalfEdge));
+  }
+
+  MFTLObjectDestroy(&obj);
+  return 0;
+}
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv);
@@ -821,6 +864,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_update_global_counts_counts_the_owned_prefix);
   RUN_TEST(test_the_sizing_array_is_optional_and_part_of_the_block);
   RUN_TEST(test_a_reorder_carries_the_sizing);
+  RUN_TEST(test_the_moved_rows_are_the_pool_minus_its_caches);
 
   TEST_REPORT();
 

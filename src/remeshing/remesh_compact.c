@@ -21,10 +21,10 @@
  *   Compacting half-edges as an independent array with a map of their own is
  *   what forces `next_idx` and `triangle_idx` to be remapped as well.
  *
- *   ONE ALLOCATION PER POOL. Compacting a pool is a loop over its sub-arrays,
- *   and a sub-array that someone forgot cannot exist -- it would have to have
- *   been allocated separately, and nothing outside src/object/object.c can do
- *   that.
+ *   ONE ALLOCATION PER POOL, ONE LIST OF ITS SUB-ARRAYS. Compacting a pool is
+ *   a loop over MFTLObjectNextMovedRows(), which walks the list
+ *   src/object/object.c lays the pool out from, so a sub-array the compaction
+ *   forgot cannot exist: it would have to be absent from the layout too.
  *
  * ## out_he_idx IS RE-DERIVED, NOT REMAPPED
  *
@@ -104,6 +104,50 @@ static void swap_adjacent_blocks(void *base, size_t elem, int first, int n1, int
     memmove(p + (size_t) n2 * elem, p, (size_t) n1 * elem);
     memcpy(p, scratch, (size_t) n2 * elem);
   }
+}
+
+/**
+ * @brief Moves every row a forward compaction keeps to its new index, in every
+ *        sub-array of @p pool that moves with its entity.
+ *
+ * The survivors between two removed entities keep one shift, so they move as
+ * one RUN: the runs are found once from @p map, and then each sub-array
+ * (MFTLObjectNextMovedRows(): records, half-edge triples, geometry,
+ * `verts.sizing`, persistent fields) moves as one bulk `memmove` per run --
+ * as many moves as removals, whatever the row width.
+ *
+ * @param obj  The mesh.
+ * @param pool #MFTL_FIELD_VERTEX or #MFTL_FIELD_TRIANGLE.
+ * @param map  `[n]` new index of each old entity (never above it), or #MFTL_ERROR if removed.
+ * @param n    Entities before the compaction.
+ * @param runs Scratch of at least 3 ints per removed entity.
+ */
+static void compact_pool(MFTL_Object *obj, MFTL_FieldEntity pool, const int *map, int n, int *runs)
+{
+  int n_runs = 0;
+  for (int i = 0; i < n;)
+  {
+    if (map[i] == MFTL_ERROR || map[i] == i)
+    {
+      ++i;
+      continue;
+    }
+    const int src = i, dst = map[i];
+    while (i < n && map[i] == dst + (i - src)) ++i;
+    runs[3 * n_runs + 0] = src;
+    runs[3 * n_runs + 1] = dst;
+    runs[3 * n_runs + 2] = i - src;
+    ++n_runs;
+  }
+  if (n_runs == 0) return;
+
+  MFTL_PoolRows r;
+  for (int it = 0; MFTLObjectNextMovedRows(obj, pool, &it, &r);)
+    for (int k = 0; k < n_runs; ++k)
+    {
+      const size_t row = r.row_bytes;
+      memmove(r.base + (size_t) runs[3 * k + 1] * row, r.base + (size_t) runs[3 * k] * row, (size_t) runs[3 * k + 2] * row);
+    }
 }
 
 /**
@@ -259,102 +303,42 @@ int MFTLRemeshCompactObject(MFTL_Object *obj, MFTL_RemeshStats *stats)
 
   /* ── 3. Compact the pools ────────────────────────────────────────────────
    *
-   * Forward scan, so the destination index never exceeds the source index and
-   * the moves cannot overlap destructively. */
+   * Forward, so the destination index never exceeds the source index. Every
+   * sub-array of a pool moves the same way, because each pool walks the one
+   * list it was laid out from (MFTLObjectNextMovedRows()). The derived arrays
+   * (`verts`, `neighbors`) are not on it: they are rebuilt at the end of this
+   * function, so moving them would be work thrown away.
+   *
+   * Every run is preceded by a removed entity, so a pool has at most as many
+   * runs as removals. */
   MFTL_VertexPool *const vp = &obj->verts;
-  for (int v = 0; v < n_v_old; ++v)
-  {
-    const int nv = v_map[v];
-    if (nv == MFTL_ERROR || nv == v) continue;
-
-    vp->rec[nv] = vp->rec[v];
-    for (int k = 0; k < 3; ++k)
-    {
-      vp->pos[3 * nv + k] = vp->pos[3 * v + k];
-      vp->normal[3 * nv + k] = vp->normal[3 * v + k];
-    }
-    if (vp->has_sizing) vp->sizing[nv] = vp->sizing[v];
-  }
-
   MFTL_TrianglePool *const tp = &obj->tris;
-  for (int t = 0; t < n_t_old; ++t)
   {
-    const int nt = t_map[t];
-    if (nt == MFTL_ERROR || nt == t) continue;
-
-    tp->rec[nt] = tp->rec[t];
-    for (int k = 0; k < 3; ++k) tp->he[3 * nt + k] = tp->he[3 * t + k];
-
-    tp->area[nt] = tp->area[t];
-    for (int k = 0; k < 3; ++k)
-    {
-      tp->normal[3 * nt + k] = tp->normal[3 * t + k];
-      tp->center[3 * nt + k] = tp->center[3 * t + k];
-    }
+    int *const runs = (int *) MFTLMallocOrDie(3 * ((size_t) MFTL_MAX(n_v_old - n_v_new, n_t_old - n_t_new) + 1) * sizeof(int), "remesh compaction runs");
+    compact_pool(obj, MFTL_FIELD_VERTEX, v_map, n_v_old, runs);
+    compact_pool(obj, MFTL_FIELD_TRIANGLE, t_map, n_t_old, runs);
+    free(runs);
   }
-
-  if (obj->fields)
-    for (int f = 0; f < obj->fields->n; ++f)
-    {
-      const MFTL_FieldDescriptor *d = &obj->fields->entries[f];
-      if (d->mode == MFTL_FIELD_RECOMPUTED) continue;
-      const int *map = d->entity == MFTL_FIELD_VERTEX ? v_map : t_map;
-      const int n = d->entity == MFTL_FIELD_VERTEX ? n_v_old : n_t_old;
-      for (int i = 0; i < n; ++i)
-        if (map[i] != MFTL_ERROR && map[i] != i)
-          memmove(obj->field_data[f] + (size_t) map[i] * d->ncomp, obj->field_data[f] + (size_t) i * d->ncomp, (size_t) d->ncomp * sizeof(double));
-    }
 
   /* ── 3b. Restore the ownership prefix ─────────────────────────────────────
    *
    * The survivors are now [owned][ghost][created]; exchanging the last two
-   * blocks makes the owned entities a prefix again. Every sub-array of a pool is
-   * permuted the same way. Built-in rows are listed below; optional rows are
-   * traversed through the field registry, including arbitrary component widths.
-   *
-   * The derived arrays (`verts`, `neighbors`) are deliberately
-   * absent: they are rebuilt at the end of this function, so moving them would be
-   * work thrown away. */
+   * blocks makes the owned entities a prefix again, in every sub-array the
+   * compaction just moved. */
   if (swap_v || swap_t)
   {
-    const size_t need_v = swap_v ? (size_t) MFTL_MIN(vpart.n_ghost, vpart.n_created) * MFTLFieldsWidth(obj, 3 * sizeof(double)) : 0;
-    const size_t need_t = swap_t ? (size_t) MFTL_MIN(tpart.n_ghost, tpart.n_created) * MFTLFieldsWidth(obj, 3 * sizeof(MFTL_HalfEdge)) : 0;
+    const size_t need_v = swap_v ? (size_t) MFTL_MIN(vpart.n_ghost, vpart.n_created) * MFTLObjectWidestMovedRow(obj, MFTL_FIELD_VERTEX) : 0;
+    const size_t need_t = swap_t ? (size_t) MFTL_MIN(tpart.n_ghost, tpart.n_created) * MFTLObjectWidestMovedRow(obj, MFTL_FIELD_TRIANGLE) : 0;
 
     void *const tmp = MFTLMallocOrDie(MFTL_MAX(MFTL_MAX(need_v, need_t), (size_t) 1), "remesh partition scratch");
 
+    MFTL_PoolRows r;
     if (swap_v)
-    {
-      const int f = vpart.n_kept_owned, a = vpart.n_ghost, b = vpart.n_created;
-      swap_adjacent_blocks(vp->rec, sizeof(MFTL_Vertex), f, a, b, tmp);
-      swap_adjacent_blocks(vp->pos, 3 * sizeof(double), f, a, b, tmp);
-      swap_adjacent_blocks(vp->normal, 3 * sizeof(double), f, a, b, tmp);
-      if (vp->has_sizing) swap_adjacent_blocks(vp->sizing, sizeof(double), f, a, b, tmp);
-    }
-
+      for (int it = 0; MFTLObjectNextMovedRows(obj, MFTL_FIELD_VERTEX, &it, &r);)
+        swap_adjacent_blocks(r.base, r.row_bytes, vpart.n_kept_owned, vpart.n_ghost, vpart.n_created, tmp);
     if (swap_t)
-    {
-      const int f = tpart.n_kept_owned, a = tpart.n_ghost, b = tpart.n_created;
-      swap_adjacent_blocks(tp->rec, sizeof(MFTL_Triangle), f, a, b, tmp);
-      /* Half-edges move as TRIPLES, which is what preserves both the implicit
-       * indexing invariant and the implicit half-edge global ids. Expressing that
-       * as an element size of three records rather than as three separate swaps
-       * makes it impossible to get the grouping wrong. */
-      swap_adjacent_blocks(tp->he, 3 * sizeof(MFTL_HalfEdge), f, a, b, tmp);
-      swap_adjacent_blocks(tp->area, sizeof(double), f, a, b, tmp);
-      swap_adjacent_blocks(tp->normal, 3 * sizeof(double), f, a, b, tmp);
-      swap_adjacent_blocks(tp->center, 3 * sizeof(double), f, a, b, tmp);
-    }
-
-    if (obj->fields)
-      for (int f = 0; f < obj->fields->n; ++f)
-      {
-        const MFTL_FieldDescriptor *d = &obj->fields->entries[f];
-        if (d->mode == MFTL_FIELD_RECOMPUTED) continue;
-        if (d->entity == MFTL_FIELD_VERTEX && swap_v)
-          swap_adjacent_blocks(obj->field_data[f], (size_t) d->ncomp * sizeof(double), vpart.n_kept_owned, vpart.n_ghost, vpart.n_created, tmp);
-        if (d->entity == MFTL_FIELD_TRIANGLE && swap_t)
-          swap_adjacent_blocks(obj->field_data[f], (size_t) d->ncomp * sizeof(double), tpart.n_kept_owned, tpart.n_ghost, tpart.n_created, tmp);
-      }
+      for (int it = 0; MFTLObjectNextMovedRows(obj, MFTL_FIELD_TRIANGLE, &it, &r);)
+        swap_adjacent_blocks(r.base, r.row_bytes, tpart.n_kept_owned, tpart.n_ghost, tpart.n_created, tmp);
 
     free(tmp);
 

@@ -195,8 +195,9 @@ size_t MFTLObjectPoolBytes(const MFTL_Object *obj);
 /**
  * @brief Adds the optional `verts.sizing` array to the vertex pool's layout.
  *
- * One double per vertex, cut from the same block as every other vertex array,
- * so it grows with the pool and cannot be forgotten by a growth site. Only a
+ * One double per vertex, cut from the same block as every other vertex array
+ * and one line of the list every resize, permutation and compaction walks, so
+ * it grows and moves with the pool and cannot be forgotten by any of them. Only a
  * curvature-adaptive remesh needs it (MFTLRemeshPrepareSizing() calls this);
  * a pool that never enables it carries zero bytes for it. Live rows of every
  * other array are preserved. A no-op when the array is already present. A

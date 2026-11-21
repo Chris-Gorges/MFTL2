@@ -117,6 +117,18 @@ static void migrator_reserve(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens)
   }
 }
 
+/**
+ * @brief The redistribution's carry bits for this migrator.
+ *
+ * The curvature field is computed once per pass (the spanning driver), so it
+ * must outlive the pass's migrations; it rides in each vertex's record, which
+ * hands owned vertices and ghosts alike their owner's value.
+ *
+ * @param m The migrator.
+ * @return #MFTL_REDISTRIBUTE_CARRY_SIZING under MFTL_RemeshMigrator::carry_sizing, else 0.
+ */
+static unsigned migrator_carry(const MFTL_RemeshMigrator *m) { return m->carry_sizing ? MFTL_REDISTRIBUTE_CARRY_SIZING : 0u; }
+
 int MFTLRemeshMigrateShifted(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const int group[3], const double shift[3], MFTL_RemeshMigrationReport *report)
 {
   MFTL_ASSERT(m != MFTL_NULL && ens != MFTL_NULL && group != MFTL_NULL && shift != MFTL_NULL);
@@ -209,73 +221,7 @@ int MFTLRemeshMigrateShifted(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const i
   if (!anyone_moved) return MFTL_SUCCESS;
 
   if (report) report->performed = MFTL_TRUE;
-  if (!m->carry_sizing) return MFTLRedistributeWithOwners(ens, m->maps);
-
-  /* ── The curvature field rides along ────────────────────────────────────
-   * Computed once per pass (the spanning driver), so it must outlive the pass's
-   * migrations; a redistribution keeps positions and topology, not this array.
-   * Every owned vertex sends (body, id, target) to the rank the owner map names,
-   * itself included, and the ghosts then ask their owners. Ids are unique
-   * during the pass, so the lookup on arrival is exact. */
-  int n_rec = 0;
-  for (int o = 0; o < ens->n_local_objects; ++o)
-    if (ens->local_objects[o]->verts.has_sizing) n_rec += ens->local_objects[o]->verts.n_local;
-  double *rec = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(3 * n_rec, 1) * sizeof(double), "remesh sizing carry");
-  int *dst = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_rec, 1) * sizeof(int), "remesh sizing carry destinations");
-  int r = 0;
-  for (int o = 0; o < ens->n_local_objects; ++o)
-  {
-    const MFTL_Object *const obj = ens->local_objects[o];
-    if (!obj->verts.has_sizing) continue;
-    for (int v = 0; v < obj->verts.n_local; ++v, ++r)
-    {
-      rec[3 * r + 0] = (double) obj->global_id;
-      rec[3 * r + 1] = (double) obj->verts.rec[v].global_id;
-      rec[3 * r + 2] = obj->verts.sizing[v];
-      dst[r] = m->maps[o].vert_owner[v];
-    }
-  }
-  int n_in = 0;
-  double *in = (double *) MFTLExchangeRecordsTo(dom, 3 * sizeof(double), rec, dst, n_rec, &n_in);
-  free(rec);
-  free(dst);
-
-  int status = MFTLRedistributeWithOwners(ens, m->maps);
-
-  /* Owned vertices by id: one sorted id list per held body. */
-  const int b = ens->n_local_objects;
-  int **ids = (int **) MFTLCallocOrDie((size_t) MFTL_MAX(b, 1), sizeof(int *), "remesh sizing carry ids");
-  for (int o = 0; o < b; ++o)
-  {
-    MFTL_Object *const obj = ens->local_objects[o];
-    MFTLObjectEnableSizing(obj);
-    const int nl = obj->verts.n_local;
-    ids[o] = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(2 * nl, 1) * sizeof(int), "remesh sizing carry ids");
-    for (int v = 0; v < nl; ++v) ids[o][v] = obj->verts.rec[v].global_id, ids[o][nl + v] = v;
-    MFTLSortPairs32(ids[o], ids[o] + nl, nl);
-  }
-  int missed = 0;
-  for (int i = 0; i < n_in; ++i)
-  {
-    const int body = (int) in[3 * i], gid = (int) in[3 * i + 1];
-    const int o = MFTLEnsembleFindLocalSlot(ens, body);
-    MFTL_Object *const obj = (o >= 0) ? ens->local_objects[o] : MFTL_NULL;
-    const int k = obj ? MFTLSortedIndexOf(ids[o], obj->verts.n_local, gid) : -1;
-    if (k < 0)
-    {
-      missed++;
-      continue;
-    }
-    obj->verts.sizing[ids[o][obj->verts.n_local + k]] = in[3 * i + 2];
-  }
-  for (int o = 0; o < b; ++o) free(ids[o]);
-  free(ids);
-  free(in);
-  MFTL_ASSERT(missed == 0 && "MFTLRemeshMigrateShifted: a carried target length found no owned vertex on arrival");
-  if (missed) status = MFTL_ERROR;
-
-  if (MFTLRemeshSyncGhostSizing(ens) != MFTL_SUCCESS) status = MFTL_ERROR;
-  return status;
+  return MFTLRedistributeWithOwnersCarrying(ens, m->maps, migrator_carry(m));
 }
 
 int MFTLRemeshMigrateToRanks(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const int *dest, MFTL_RemeshMigrationReport *report)
@@ -318,7 +264,7 @@ int MFTLRemeshMigrateToRanks(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const i
   }
 
   if (report) report->n_moved = moved;
-  return MFTLRedistributeWithOwners(ens, m->maps);
+  return MFTLRedistributeWithOwnersCarrying(ens, m->maps, migrator_carry(m));
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

@@ -92,78 +92,68 @@ void MFTLObjectBuildDerived(MFTL_Object *obj)
  * 2. Morton renumbering of the pools
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/* Permutation helpers: gather into scratch in the new order, copy back. O(n),
- * sequential writes and one random read stream. */
+/* Permutation: gather into scratch in the new order, copy back. O(n),
+ * sequential writes and one random read stream per sub-array. */
 
 /**
- * @brief Permutes an interleaved double array by gather-then-copy-back.
+ * @brief Permutes one sub-array by gather-then-copy-back.
  *
- * @param field      The array, permuted in place.
- * @param scratch    Buffer of at least `n * comp` doubles.
+ * Each case is a constant row size, so every copy is a fixed-size move the
+ * compiler inlines -- the typed loops this replaces, one per row width.
+ *
+ * @param base       Row 0 of the sub-array, permuted in place.
+ * @param row        Bytes per entity.
+ * @param scratch    Buffer of at least `n * row` bytes.
  * @param old_of_new `old_of_new[i]` is the OLD index of the entity that belongs
  *                   at new position `i`.
  * @param n          Number of entities.
- * @param comp       Components per entity: 1 for a scalar, 3 for a vector.
  */
-static void permute_doubles(double *field, double *scratch, const int *old_of_new, int n, int comp)
+static void permute_rows(unsigned char *restrict base, size_t row, unsigned char *restrict scratch, const int *restrict old_of_new, int n)
 {
-  for (int i = 0; i < n; ++i)
+#define GATHER(R)                                                                                           \
+  for (int i = 0; i < n; ++i) memcpy(scratch + (size_t) i * (R), base + (size_t) old_of_new[i] * (R), (R)); \
+  break
+  switch (row)
   {
-    const double *restrict s = &field[(size_t) comp * old_of_new[i]];
-    double *restrict d = &scratch[(size_t) comp * i];
-    for (int c = 0; c < comp; ++c) d[c] = s[c];
+    case 8: GATHER(8);
+    case 12: GATHER(12);
+    case 16: GATHER(16);
+    case 24: GATHER(24);
+    case 48: GATHER(48);
+    default: GATHER(row);
   }
-  memcpy(field, scratch, (size_t) n * (size_t) comp * sizeof(double));
+#undef GATHER
+  memcpy(base, scratch, (size_t) n * row);
 }
 
 /**
- * @brief Permutes the vertex AoS records.
- * @param field      The record array, permuted in place.
- * @param scratch    Buffer of at least @p n records.
- * @param old_of_new Old index of the record belonging at each new position.
- * @param n          Number of vertices.
- */
-static void permute_vertex_recs(MFTL_Vertex *field, MFTL_Vertex *scratch, const int *old_of_new, int n)
-{
-  for (int i = 0; i < n; ++i) scratch[i] = field[old_of_new[i]];
-  memcpy(field, scratch, (size_t) n * sizeof(MFTL_Vertex));
-}
-
-/**
- * @brief Permutes the triangle AoS records.
- * @param field      The record array, permuted in place.
- * @param scratch    Buffer of at least @p n records.
- * @param old_of_new Old index of the record belonging at each new position.
- * @param n          Number of triangles.
- */
-static void permute_triangle_recs(MFTL_Triangle *field, MFTL_Triangle *scratch, const int *old_of_new, int n)
-{
-  for (int i = 0; i < n; ++i) scratch[i] = field[old_of_new[i]];
-  memcpy(field, scratch, (size_t) n * sizeof(MFTL_Triangle));
-}
-
-/**
- * @brief Moves each triangle's three half-edges as one unit, preserving 3t+k.
+ * @brief Applies one permutation to every sub-array of @p pool whose rows belong
+ *        to their entity (MFTLObjectNextMovedRows(): records, half-edge TRIPLES,
+ *        positions, computed geometry, `verts.sizing`, persistent fields).
  *
- * @param field      The half-edge array, permuted in place.
- * @param scratch    Buffer of at least `3 * n_tris` half-edges.
- * @param old_of_new Old TRIANGLE index belonging at each new triangle position.
- * @param n_tris     Number of triangles.
+ * The derived connectivity is not among them; the caller rebuilds it.
  *
- * @note Moving the triples as units is what preserves BOTH the implicit
- *       indexing invariant and the implicit half-edge global ids.
+ * @param obj        The mesh.
+ * @param pool       #MFTL_FIELD_VERTEX or #MFTL_FIELD_TRIANGLE.
+ * @param old_of_new Old index of the entity belonging at each new position.
+ * @param n          Entities in the pool.
+ * @param scratch    Buffer of at least `n` widest rows (MFTLObjectWidestMovedRow()).
  */
-static void permute_he_triples(MFTL_HalfEdge *field, MFTL_HalfEdge *scratch, const int *old_of_new, int n_tris)
+static void permute_pool(MFTL_Object *obj, MFTL_FieldEntity pool, const int *old_of_new, int n, void *scratch)
 {
-  for (int i = 0; i < n_tris; ++i)
-  {
-    const MFTL_HalfEdge *restrict s = &field[3 * old_of_new[i]];
-    MFTL_HalfEdge *restrict d = &scratch[3 * i];
-    d[0] = s[0];
-    d[1] = s[1];
-    d[2] = s[2];
-  }
-  memcpy(field, scratch, 3 * (size_t) n_tris * sizeof(MFTL_HalfEdge));
+  MFTL_PoolRows r;
+  for (int it = 0; MFTLObjectNextMovedRows(obj, pool, &it, &r);) permute_rows(r.base, r.row_bytes, (unsigned char *) scratch, old_of_new, n);
+}
+
+/** @brief Scratch for permuting either pool of @p obj: its larger entity count times its widest row.
+ * @param obj The mesh.
+ * @return The buffer; the caller frees it.
+ */
+static void *permutation_scratch(const MFTL_Object *obj)
+{
+  const int n_max = MFTL_MAX(obj->verts.n, obj->tris.n);
+  const size_t widest = MFTL_MAX(MFTLObjectWidestMovedRow(obj, MFTL_FIELD_VERTEX), MFTLObjectWidestMovedRow(obj, MFTL_FIELD_TRIANGLE));
+  return MFTLMallocOrDie((size_t) MFTL_MAX(n_max, 1) * widest, "pool permutation scratch");
 }
 
 /**
@@ -225,19 +215,7 @@ static bool reorder_vertices(MFTL_Object *obj, int *old_of_new, int *new_of_old,
 
   for (int i = 0; i < nv; ++i) new_of_old[old_of_new[i]] = i;
 
-  /* `normal` is computed geometry but is permuted too, so a reorder never
-   * discards values the caller just computed. */
-  permute_vertex_recs(obj->verts.rec, (MFTL_Vertex *) scratch, old_of_new, nv);
-  permute_doubles(obj->verts.pos, (double *) scratch, old_of_new, nv, 3);
-  permute_doubles(obj->verts.normal, (double *) scratch, old_of_new, nv, 3);
-  if (obj->verts.has_sizing) permute_doubles(obj->verts.sizing, (double *) scratch, old_of_new, nv, 1);
-  if (MFTLFieldsStride(obj, MFTL_FIELD_VERTEX))
-    for (int f = 0; f < obj->fields->n; ++f)
-    {
-      const MFTL_FieldDescriptor *d = &obj->fields->entries[f];
-      if (d->entity == MFTL_FIELD_VERTEX && d->mode != MFTL_FIELD_RECOMPUTED)
-        permute_doubles(obj->field_data[f], (double *) scratch, old_of_new, obj->verts.n, d->ncomp);
-    }
+  permute_pool(obj, MFTL_FIELD_VERTEX, old_of_new, nv, scratch);
 
   /* Every reference INTO the vertex pool. (`out_he_idx` is a half-edge index;
    * it is remapped with the triangles.) */
@@ -291,19 +269,7 @@ static bool reorder_triangles(MFTL_Object *obj, int *old_of_new, int *new_of_old
 
   for (int i = 0; i < nt; ++i) new_of_old[old_of_new[i]] = i;
 
-  /* `verts` and `neighbors` are not permuted; the caller rebuilds them. */
-  permute_triangle_recs(obj->tris.rec, (MFTL_Triangle *) scratch, old_of_new, nt);
-  permute_he_triples(obj->tris.he, (MFTL_HalfEdge *) scratch, old_of_new, nt);
-  permute_doubles(obj->tris.area, (double *) scratch, old_of_new, nt, 1);
-  permute_doubles(obj->tris.normal, (double *) scratch, old_of_new, nt, 3);
-  permute_doubles(obj->tris.center, (double *) scratch, old_of_new, nt, 3);
-  if (MFTLFieldsStride(obj, MFTL_FIELD_TRIANGLE))
-    for (int f = 0; f < obj->fields->n; ++f)
-    {
-      const MFTL_FieldDescriptor *d = &obj->fields->entries[f];
-      if (d->entity == MFTL_FIELD_TRIANGLE && d->mode != MFTL_FIELD_RECOMPUTED)
-        permute_doubles(obj->field_data[f], (double *) scratch, old_of_new, obj->tris.n, d->ncomp);
-    }
+  permute_pool(obj, MFTL_FIELD_TRIANGLE, old_of_new, nt, scratch);
 
   /* Every reference INTO the half-edge array: keep the corner h % 3, remap the
    * triangle h / 3 (implicit indexing survives the permutation). */
@@ -336,10 +302,8 @@ void MFTLObjectReorderMorton(MFTL_Object *obj)
 
   const int n_max = (nv > nt) ? nv : nt;
 
-  /* One scratch block for every permutation, sized for the widest element moved:
-   * a triangle's three half-edge records, 48 bytes. */
-  const size_t widest = MFTLFieldsWidth(obj, 48);
-  void *scratch = MFTLMallocOrDie((size_t) n_max * widest, "MFTLObjectReorderMorton scratch");
+  /* One scratch block for every permutation, sized for the widest row moved. */
+  void *scratch = permutation_scratch(obj);
 
   int *old_of_new = (int *) MFTLMallocOrDie(2 * (size_t) n_max * sizeof(int), "MFTLObjectReorderMorton maps");
   int *new_of_old = old_of_new + n_max;
@@ -409,16 +373,7 @@ static void sort_vertices_by_id(MFTL_Object *obj, int *old_of_new, int *new_of_o
   MFTLSortPairs32(keys + n_local, old_of_new + n_local, nv - n_local);
   for (int i = 0; i < nv; ++i) new_of_old[old_of_new[i]] = i;
 
-  permute_vertex_recs(obj->verts.rec, (MFTL_Vertex *) scratch, old_of_new, nv);
-  permute_doubles(obj->verts.pos, (double *) scratch, old_of_new, nv, 3);
-  permute_doubles(obj->verts.normal, (double *) scratch, old_of_new, nv, 3);
-  if (obj->verts.has_sizing) permute_doubles(obj->verts.sizing, (double *) scratch, old_of_new, nv, 1);
-  if (MFTLFieldsStride(obj, MFTL_FIELD_VERTEX))
-    for (int f = 0; f < obj->fields->n; ++f)
-    {
-      const MFTL_FieldDescriptor *d = &obj->fields->entries[f];
-      if (d->entity == MFTL_FIELD_VERTEX && d->mode != MFTL_FIELD_RECOMPUTED) permute_doubles(obj->field_data[f], (double *) scratch, old_of_new, nv, d->ncomp);
-    }
+  permute_pool(obj, MFTL_FIELD_VERTEX, old_of_new, nv, scratch);
 
   MFTL_HalfEdge *restrict he = obj->tris.he;
   const int n_he = 3 * obj->tris.n;
@@ -450,18 +405,7 @@ static void sort_triangles_by_id(MFTL_Object *obj, int *old_of_new, int *new_of_
   MFTLSortPairs32(keys + n_local, old_of_new + n_local, nt - n_local);
   for (int i = 0; i < nt; ++i) new_of_old[old_of_new[i]] = i;
 
-  permute_triangle_recs(obj->tris.rec, (MFTL_Triangle *) scratch, old_of_new, nt);
-  permute_he_triples(obj->tris.he, (MFTL_HalfEdge *) scratch, old_of_new, nt);
-  permute_doubles(obj->tris.area, (double *) scratch, old_of_new, nt, 1);
-  permute_doubles(obj->tris.normal, (double *) scratch, old_of_new, nt, 3);
-  permute_doubles(obj->tris.center, (double *) scratch, old_of_new, nt, 3);
-  if (MFTLFieldsStride(obj, MFTL_FIELD_TRIANGLE))
-    for (int f = 0; f < obj->fields->n; ++f)
-    {
-      const MFTL_FieldDescriptor *d = &obj->fields->entries[f];
-      if (d->entity == MFTL_FIELD_TRIANGLE && d->mode != MFTL_FIELD_RECOMPUTED)
-        permute_doubles(obj->field_data[f], (double *) scratch, old_of_new, nt, d->ncomp);
-    }
+  permute_pool(obj, MFTL_FIELD_TRIANGLE, old_of_new, nt, scratch);
 
   /* Keep the corner h % 3, remap the triangle h / 3 (implicit indexing). */
   MFTL_HalfEdge *restrict he = obj->tris.he;
@@ -486,7 +430,7 @@ bool MFTLObjectCanonicalOrder(MFTL_Object *obj)
   if (sort_v || sort_t)
   {
     const int n_max = (nv > nt) ? nv : nt;
-    void *scratch = MFTLMallocOrDie((size_t) n_max * MFTLFieldsWidth(obj, 48), "MFTLObjectCanonicalOrder scratch");
+    void *scratch = permutation_scratch(obj);
     int *maps = (int *) MFTLMallocOrDie(3 * (size_t) n_max * sizeof(int), "MFTLObjectCanonicalOrder maps");
 
     if (sort_v) sort_vertices_by_id(obj, maps, maps + n_max, maps + 2 * n_max, scratch);
