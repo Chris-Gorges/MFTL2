@@ -310,19 +310,6 @@ bool MFTLCplIboxSubtract(int64_t *rem, int *n_rem, int cap, const int64_t *sub)
  * Compact bounds trees over directory certificates
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-typedef struct
-{
-  uint64_t key;
-  int entry;
-} dir_order;
-
-static int cmp_dir_order(const void *a, const void *b)
-{
-  const dir_order *x = a, *y = b;
-  if (x->key != y->key) return (x->key > y->key) - (x->key < y->key);
-  return (x->entry > y->entry) - (x->entry < y->entry);
-}
-
 void MFTLCplDirIndexBuild(cpl_dir_index *ix, const cpl_dir_entry *e, int n, int location)
 {
   memset(ix, 0, sizeof *ix);
@@ -337,7 +324,10 @@ void MFTLCplDirIndexBuild(cpl_dir_index *ix, const cpl_dir_entry *e, int n, int 
         hi[k] = fmax(hi[k], e[i].mhi[k]);
       }
     }
-  dir_order *order = MFTLCplAlloc((size_t) MFTL_MAX(ix->n, 1) * sizeof *order, "directory index");
+  /* Entries are appended in ascending index, so the STABLE sort by Morton key
+   * orders ties by entry: the order is (key, entry), on every rank alike. */
+  uint64_t *code = MFTLCplAlloc((size_t) MFTL_MAX(ix->n, 1) * sizeof *code, "directory index");
+  ix->ent = MFTLCplAlloc((size_t) MFTL_MAX(ix->n, 1) * sizeof(int), "directory index");
   int at = 0;
   for (int i = 0; i < n; ++i)
     if (e[i].location == location)
@@ -349,14 +339,14 @@ void MFTLCplDirIndexBuild(cpl_dir_index *ix, const cpl_dir_entry *e, int n, int 
         const double f = hi[k] > lo[k] ? (x - lo[k]) / (hi[k] - lo[k]) : 0.0;
         u[k] = (uint64_t) (fmax(0.0, fmin(1.0, f)) * MFTL_MORTON_MAX);
       }
-      order[at++] = (dir_order) {MFTLMorton3D(u[0], u[1], u[2]), i};
+      code[at] = MFTLMorton3D(u[0], u[1], u[2]);
+      ix->ent[at++] = i;
     }
-  if (ix->n > 1) qsort(order, (size_t) ix->n, sizeof *order, cmp_dir_order);
-  ix->ent = MFTLCplAlloc((size_t) MFTL_MAX(ix->n, 1) * sizeof(int), "directory index");
+  MFTLCplSortPairs64(code, ix->ent, ix->n, "directory index");
+  MFTLCplFree(code);
   double *boxes = MFTLCplAlloc(6 * (size_t) MFTL_MAX(ix->n, 1) * sizeof(double), "directory index");
   for (int i = 0; i < ix->n; ++i)
   {
-    ix->ent[i] = order[i].entry;
     for (int k = 0; k < 3; ++k)
     {
       boxes[6 * i + k] = e[ix->ent[i]].mlo[k];
@@ -365,7 +355,6 @@ void MFTLCplDirIndexBuild(cpl_dir_index *ix, const cpl_dir_entry *e, int n, int 
   }
   MFTLCplBoxTreeBuild(&ix->tree, boxes, ix->n, 4, false);
   MFTLCplFree(boxes);
-  MFTLCplFree(order);
 }
 
 void MFTLCplDirIndexFree(cpl_dir_index *ix)
@@ -387,7 +376,7 @@ static int directory_query(cpl_dir_index *ix, const cpl_dir_entry *e, const doub
       if (!cpl_box_overlap(metric ? e[i].mlo : e[i].lo, metric ? e[i].mhi : e[i].hi, lo, hi)) continue;
       if (n == *cap)
       {
-        *cap = *cap ? 2 * *cap : 32;
+        *cap = MFTLGrowCapacityFrom(*cap, n + 1, 32);
         *out = MFTLCplRealloc(*out, (size_t) *cap * sizeof(int), "directory query");
       }
       (*out)[n++] = i;
@@ -409,15 +398,15 @@ int MFTLCplDirectoryOwnEntries(const MFTL_SolverGrid *g, const MFTL_Domain *d, d
 {
   int cap = 16, n = 0;
   cpl_dir_entry *e = (cpl_dir_entry *) MFTLCplAlloc((size_t) cap * sizeof(cpl_dir_entry), "directory entries");
-#define CPL_PUSH()                                                                                              \
-  do                                                                                                            \
-  {                                                                                                             \
-    if (n == cap)                                                                                               \
-    {                                                                                                           \
-      cap *= 2;                                                                                                 \
-      e = (cpl_dir_entry *) MFTLCplRealloc(e, (size_t) cap * sizeof(cpl_dir_entry), "directory entries");      \
-    }                                                                                                           \
-    memset(&e[n], 0, sizeof e[n]);                                                                              \
+#define CPL_PUSH()                                                                                        \
+  do                                                                                                      \
+  {                                                                                                       \
+    if (n == cap)                                                                                         \
+    {                                                                                                     \
+      cap = MFTLGrowCapacityFrom(cap, n + 1, 16);                                                         \
+      e = (cpl_dir_entry *) MFTLCplRealloc(e, (size_t) cap * sizeof(cpl_dir_entry), "directory entries"); \
+    }                                                                                                     \
+    memset(&e[n], 0, sizeof e[n]);                                                                        \
   } while (0)
 
   for (int i = 0; i < g->n_blocks; ++i)

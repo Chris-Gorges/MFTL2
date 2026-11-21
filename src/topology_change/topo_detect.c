@@ -88,7 +88,7 @@ static void push_event(MFTL_TopoEventList *l, const MFTL_TopologyEvent *e)
 {
   if (l->n == l->cap)
   {
-    l->cap = l->cap ? 2 * l->cap : 64;
+    l->cap = MFTLGrowCapacityFrom(l->cap, l->n + 1, 64);
     l->e = (MFTL_TopologyEvent *) MFTLReallocOrDie(l->e, (size_t) l->cap * sizeof(MFTL_TopologyEvent), "topology events");
   }
   l->e[l->n++] = *e;

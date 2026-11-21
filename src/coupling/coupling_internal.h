@@ -33,11 +33,27 @@ void *MFTLCplAlloc(size_t bytes, const char *what);
 void *MFTLCplCalloc(size_t count, size_t size, const char *what);
 void *MFTLCplRealloc(void *ptr, size_t bytes, const char *what);
 void MFTLCplFree(void *ptr);
+
+/* The library's radix sorts (mftl_arrayfunctions.h) with their scratch on the
+ * coupler's budget. A count past INT_MAX, the sorts' per-rank index range, is
+ * fatal (MFTLCplMemoryAbort) rather than narrowed. @p what names the caller. */
+/** @brief Stable sort of int keys, scratch on the budget. */
+void MFTLCplRadixSort32(int *keys, int64_t n, const char *what);
+/** @brief Stable sort of uint64 keys (unsigned order), scratch on the budget. */
+void MFTLCplRadixSort64(uint64_t *keys, int64_t n, const char *what);
+/** @brief Stable (int key, int value) pair sort, scratch on the budget. */
+void MFTLCplSortPairs32(int *keys, int *values, int64_t n, const char *what);
+/** @brief Stable (uint64 key, int value) pair sort, scratch on the budget. */
+void MFTLCplSortPairs64(uint64_t *keys, int *values, int64_t n, const char *what);
 /** @brief Fatal allocation/budget failure; terminates the MPI job if MPI is active. */
 _Noreturn void MFTLCplMemoryAbort(const char *what, size_t bytes, size_t current, size_t limit);
 
 /** @brief Longest location name, terminating NUL included. */
 #define CPL_NAME_MAX 32
+
+/** @brief Most samples of one point location one rank may register: the sorts
+ *         and the key index use int indices (MFTLSolverGridAddPoints()). */
+#define CPL_MAX_RANK_SAMPLES INT64_C(2000000000)
 
 /** @brief Routes of a band sample. */
 enum

@@ -140,14 +140,8 @@ static void sb_addf(sbuf *b, const char *fmt, ...)
   {
     if (b->len + (size_t) need + 1u > b->cap)
     {
-      while (b->cap < b->len + (size_t) need + 1u) b->cap *= 2u;
-      char *grown = (char *) realloc(b->s, b->cap);
-      if (!grown)
-      {
-        fprintf(stderr, "FATAL ERROR: MFTL vtu header allocation failed.\n");
-        exit(EXIT_FAILURE);
-      }
-      b->s = grown;
+      b->cap = MFTLGrowSize(b->cap, b->len + (size_t) need + 1u, 4096);
+      b->s = (char *) MFTLReallocOrDie(b->s, b->cap, "MFTL vtu header");
     }
     vsnprintf(b->s + b->len, b->cap - b->len, fmt, ap2);
     b->len += (size_t) need;

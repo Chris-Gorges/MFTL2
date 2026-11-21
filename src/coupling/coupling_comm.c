@@ -235,7 +235,7 @@ static void nbx_receive(MPI_Comm c, const MPI_Status *probed, void *ctx)
   nbx_inbox *const box = (nbx_inbox *) ctx;
   if (box->n == box->cap)
   {
-    box->cap *= 2;
+    box->cap = MFTLGrowCapacityFrom(box->cap, box->n + 1, 1);
     box->got = (cpl_msg *) MFTLCplRealloc(box->got, (size_t) box->cap * sizeof(cpl_msg), "nbx receive list");
   }
   MPI_Status st = *probed;

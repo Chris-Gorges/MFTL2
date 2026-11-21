@@ -79,8 +79,7 @@ static void migrator_reserve(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens)
   if (n_slots > m->cap_objects)
   {
     free(m->maps);
-    m->cap_objects = (m->cap_objects > 0) ? m->cap_objects : 1;
-    while (m->cap_objects < n_slots) m->cap_objects *= 2;
+    m->cap_objects = MFTLGrowCapacityFrom(m->cap_objects, n_slots, 1);
     m->maps = (MFTL_OwnerMap *) MFTLMallocOrDie((size_t) m->cap_objects * sizeof(MFTL_OwnerMap), "remesh owner maps");
   }
 
@@ -103,8 +102,7 @@ static void migrator_reserve(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens)
   if (need > m->cap_entities || m->arena == MFTL_NULL)
   {
     free(m->arena);
-    m->cap_entities = (m->cap_entities > 0) ? m->cap_entities : 1024;
-    while (m->cap_entities < need) m->cap_entities *= 2;
+    m->cap_entities = MFTLGrowCapacityFrom(m->cap_entities, MFTL_MAX(need, 1), 1024);
     m->arena = (int *) MFTLMallocOrDie((size_t) m->cap_entities * sizeof(int), "remesh owner arena");
   }
 
@@ -260,21 +258,7 @@ int MFTLRemeshMigrateShifted(MFTL_RemeshMigrator *m, MFTL_Ensemble *ens, const i
   for (int i = 0; i < n_in; ++i)
   {
     const int body = (int) in[3 * i], gid = (int) in[3 * i + 1];
-    /* The local list is ordered by body id, so the slot is a bisection. */
-    int o = -1, lo = 0, hi = b - 1;
-    while (lo <= hi)
-    {
-      const int mid = (lo + hi) / 2, g = ens->local_objects[mid]->global_id;
-      if (g == body)
-      {
-        o = mid;
-        break;
-      }
-      if (g < body)
-        lo = mid + 1;
-      else
-        hi = mid - 1;
-    }
+    const int o = MFTLEnsembleFindLocalSlot(ens, body);
     MFTL_Object *const obj = (o >= 0) ? ens->local_objects[o] : MFTL_NULL;
     const int k = obj ? MFTLSortedIndexOf(ids[o], obj->verts.n_local, gid) : -1;
     if (k < 0)

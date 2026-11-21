@@ -186,7 +186,7 @@ static void receive_counts(MPI_Comm comm, const MPI_Status *probed, void *ctx)
   const size_t w = (size_t) (1 + d->k);
   if (d->n == d->cap)
   {
-    d->cap = MFTL_MAX(8, 2 * d->cap);
+    d->cap = MFTLGrowCapacityFrom(d->cap, d->n + 1, 8);
     d->rec = (int *) MFTLReallocOrDie(d->rec, (size_t) d->cap * w * sizeof(int), "routed exchange discovery");
   }
   int *const r = d->rec + (size_t) d->n++ * w;
@@ -751,7 +751,7 @@ void *MFTLExchangeRecordsTo(const MFTL_Domain *domain, size_t width, const void 
     {
       if (n_blk == cap)
       {
-        cap *= 2;
+        cap = MFTLGrowCapacityFrom(cap, n_blk + 1, 8);
         blk = (record_block *) MFTLReallocOrDie(blk, (size_t) cap * sizeof(record_block), "MFTLExchangeRecordsTo blocks");
       }
       *b = n_blk;

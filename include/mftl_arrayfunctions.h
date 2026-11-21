@@ -62,6 +62,40 @@ void MFTLRadixSort32(int *keys_in, int *keys_temp, int size);
 void MFTLRadixSort64(uint64_t *keys_in, uint64_t *keys_temp, int size);
 
 /**
+ * @brief Low-level pair sort: 32-bit signed keys with int values, caller-managed
+ *        scratch.
+ *
+ * The same sort as MFTLSortPairs32(); the scratch is the caller's, so a caller
+ * that sorts repeatedly reuses one buffer and a caller with its own allocator
+ * (the coupler's budget) accounts for every byte. The result is always left in
+ * @p keys / @p values.
+ *
+ * @param keys        Keys, sorted in place.
+ * @param values      Values, permuted alongside the keys.
+ * @param keys_temp   Scratch of at least @p count elements, not aliasing
+ *                    @p keys or @p values. Contents unspecified afterwards.
+ * @param values_temp Scratch of at least @p count elements, likewise.
+ * @param count       Number of pairs. Values < 2 are a no-op.
+ */
+void MFTLRadixSortPairs32(int *keys, int *values, int *keys_temp, int *values_temp, int count);
+
+/**
+ * @brief Low-level pair sort: 64-bit unsigned keys with int values, caller-managed
+ *        scratch.
+ *
+ * The same sort as MFTLSortPairs64(), scratch as in MFTLRadixSortPairs32().
+ *
+ * @param keys        Keys, sorted in place.
+ * @param values      Values, permuted alongside the keys.
+ * @param keys_temp   Scratch of at least @p count elements, not aliasing
+ *                    @p keys. Contents unspecified afterwards.
+ * @param values_temp Scratch of at least @p count elements, not aliasing
+ *                    @p values.
+ * @param count       Number of pairs. Values < 2 are a no-op.
+ */
+void MFTLRadixSortPairs64(uint64_t *keys, int *values, uint64_t *keys_temp, int *values_temp, int count);
+
+/**
  * @brief High-level wrapper: sorts an int array in place, temp buffer internal.
  *
  * 32-bit signed keys. Allocation failure aborts the process.
@@ -76,7 +110,7 @@ void MFTLSortIds(int *data, int count);
  *
  * Keys and values live in two arrays and are permuted together. Scratch is
  * allocated internally (only when a pass actually runs); allocation failure
- * aborts.
+ * aborts. MFTLRadixSortPairs32() is the same sort with the caller's scratch.
  *
  * @param keys   Signed keys. Sorted in place.
  * @param values Associated values, permuted to match the sorted keys.
@@ -89,6 +123,7 @@ void MFTLSortPairs32(int *keys, int *values, int count);
  *
  * The Morton-code case: 64-bit spatial keys carrying an entity index as the
  * value. Scratch is allocated internally; allocation failure aborts.
+ * MFTLRadixSortPairs64() is the same sort with the caller's scratch.
  *
  * @param keys   64-bit unsigned keys. Sorted in place.
  * @param values Associated int indices, permuted to match the sorted keys.
@@ -185,27 +220,54 @@ static inline int MFTLGetUniqueIntegers(const int *input_array, int input_count,
  * @brief Binary search for @p key in an ascending int array.
  *
  * Sparse id-keyed directories in the library are sorted arrays, so an
- * `id -> slot` lookup is this binary search rather than a hash map.
+ * `id -> slot` lookup is this binary search rather than a hash map. It is a
+ * lower bound: with duplicate keys it returns the FIRST of them, which after a
+ * stable sort is the entry that came first.
  *
  * @param sorted Ascending array.
  * @param n      Number of elements.
  * @param key    The value.
- * @return An index `i` with `sorted[i] == key`, or -1 (#MFTL_ERROR) if absent.
- *         With duplicate keys it is one of their indices.
+ * @return The smallest `i` with `sorted[i] == key`, or -1 (#MFTL_ERROR) if absent.
  */
 static inline int MFTLSortedIndexOf(const int *sorted, int n, int key)
 {
-  int lo = 0, hi = n - 1;
-  while (lo <= hi)
+  int lo = 0, hi = n;
+  while (lo < hi)
   {
     const int mid = lo + ((hi - lo) >> 1);
-    if (sorted[mid] == key) return mid;
     if (sorted[mid] < key)
       lo = mid + 1;
     else
-      hi = mid - 1;
+      hi = mid;
   }
-  return -1;
+  return (lo < n && sorted[lo] == key) ? lo : -1;
+}
+
+/**
+ * @brief Binary search for @p key in an ascending `uint64_t` array.
+ *
+ * MFTLSortedIndexOf() for 64-bit keys (lattice keys, Morton cells, solver
+ * sample keys), in UNSIGNED order, the order MFTLRadixSort64() and
+ * MFTLSortPairs64() produce. The count is 64-bit because the coupler's sample
+ * arrays are; an `int` count converts implicitly.
+ *
+ * @param sorted Ascending array.
+ * @param n      Number of elements.
+ * @param key    The value.
+ * @return The smallest `i` with `sorted[i] == key`, or -1 if absent.
+ */
+static inline int64_t MFTLSortedIndexOf64(const uint64_t *sorted, int64_t n, uint64_t key)
+{
+  int64_t lo = 0, hi = n;
+  while (lo < hi)
+  {
+    const int64_t mid = lo + ((hi - lo) >> 1);
+    if (sorted[mid] < key)
+      lo = mid + 1;
+    else
+      hi = mid;
+  }
+  return (lo < n && sorted[lo] == key) ? lo : -1;
 }
 
 /**
@@ -222,6 +284,27 @@ static inline int MFTLUniqueIntArray(int *arr, int n)
   if (n <= 0) return 0;
   int dest = 0;
   for (int src = 1; src < n; ++src)
+  {
+    if (arr[src] != arr[dest]) arr[++dest] = arr[src];
+  }
+  return dest + 1;
+}
+
+/**
+ * @brief Removes adjacent duplicates from a SORTED `uint64_t` array, in place.
+ *
+ * MFTLUniqueIntArray() for 64-bit keys; the count is 64-bit as in
+ * MFTLSortedIndexOf64().
+ *
+ * @param arr Sorted array, compacted in place.
+ * @param n   Number of elements on entry.
+ * @return The new element count; elements beyond it are left as garbage.
+ */
+static inline int64_t MFTLUniqueU64Array(uint64_t *arr, int64_t n)
+{
+  if (n <= 0) return 0;
+  int64_t dest = 0;
+  for (int64_t src = 1; src < n; ++src)
   {
     if (arr[src] != arr[dest]) arr[++dest] = arr[src];
   }

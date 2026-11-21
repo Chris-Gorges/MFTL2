@@ -511,19 +511,7 @@ void MFTLRemeshReferenceFree(MFTL_RemeshReference *ref)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /** @brief The occupied cell with key @p key, or -1. */
-static inline int find_cell(const MFTL_RemeshReference *ref, uint64_t key)
-{
-  int lo = 0, hi = ref->n_cells;
-  while (lo < hi)
-  {
-    const int mid = lo + (hi - lo) / 2;
-    if (ref->cell_key[mid] < key)
-      lo = mid + 1;
-    else
-      hi = mid;
-  }
-  return (lo < ref->n_cells && ref->cell_key[lo] == key) ? lo : -1;
-}
+static inline int find_cell(const MFTL_RemeshReference *ref, uint64_t key) { return (int) MFTLSortedIndexOf64(ref->cell_key, ref->n_cells, key); }
 
 /** @brief The best candidate of one query so far, and the triangles it has tested. */
 typedef struct
@@ -847,17 +835,8 @@ void MFTLRemeshProjectObject(MFTL_Object *obj, const MFTL_RemeshReference *ref, 
 /** @brief The reference of body @p body in @p set, or MFTL_NULL. */
 static MFTL_RemeshReference *set_find(const MFTL_RemeshReferenceSet *set, int body)
 {
-  int lo = 0, hi = set->n - 1;
-  while (lo <= hi)
-  {
-    const int mid = (lo + hi) / 2;
-    if (set->body[mid] == body) return &set->ref[mid];
-    if (set->body[mid] < body)
-      lo = mid + 1;
-    else
-      hi = mid - 1;
-  }
-  return MFTL_NULL;
+  const int at = MFTLSortedIndexOf(set->body, set->n, body);
+  return (at >= 0) ? &set->ref[at] : MFTL_NULL;
 }
 
 /** @brief The reference of body @p body, created (empty) if absent; keeps `body` ascending. */
@@ -867,7 +846,7 @@ static MFTL_RemeshReference *set_get(MFTL_RemeshReferenceSet *set, int body, con
   if (r) return r;
   if (set->n == set->cap)
   {
-    set->cap = MFTL_MAX(4, 2 * set->cap);
+    set->cap = MFTLGrowCapacityFrom(set->cap, set->n + 1, 4);
     set->body = (int *) MFTLReallocOrDie(set->body, (size_t) set->cap * sizeof(int), "remesh reference set");
     set->ref = (MFTL_RemeshReference *) MFTLReallocOrDie(set->ref, (size_t) set->cap * sizeof(MFTL_RemeshReference), "remesh reference set");
   }

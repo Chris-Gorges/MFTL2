@@ -632,7 +632,16 @@ Each allocation carries a small aligned size header, also counted. This measures
 module-owned capacity, not process RSS: solver arrays, MFTL surface storage, MPI
 buffers and the C allocator's internal storage are excluded. The older
 `MFTL_CouplerStats.bytes_memory` remains an estimate of directory/window payload;
-use the new API for allocation totals.
+use the new API for allocation totals. "Temporary buffers" includes the scratch
+of every sort: the coupler sorts through `MFTLCplRadixSort32/64` and
+`MFTLCplSortPairs32/64` (`coupling_memory.c`), the library's radix sorts with
+their scratch on this budget.
+
+The library's sorts and the coupler's key index use `int` indices, so one rank
+registers at most 2e9 samples of one point location, summed over its point sets
+(`MFTLSolverGridAddPoints` refuses the set that would pass it). A sort past
+`INT_MAX` elements anywhere else in the module aborts like a budget failure,
+with its name, instead of being narrowed into a silent mis-sort.
 
 For example, before grid registration, set a 256 MiB limit on every rank:
 

@@ -14,7 +14,15 @@ from Cameron Hart's zlib-licensed radix sort (notice preserved in the file).
 | `MFTLObjectReorderMorton` | 63-bit Morton code; min vertex index | space-filling-curve renumbering of the pools |
 | `MFTLGenerateLBVH` | 63-bit Morton code | the sorted order *is* the LBVH leaf order |
 | `src/communication/redistribute.c` | vertex index | de-duplicate a destination's vertex list |
-| `src/topology_change/` | body id | canonical body sets of a cluster |
+| `src/topology_change/` | body id; lattice triangle key | canonical body sets of a cluster; owner-side label lookup |
+| `src/remeshing/` | vertex id; Morton cell; body id | id &rarr; slot directories, the projection's cell grid, dispersed verdicts |
+| `src/coupling/` | Morton code; sample key; bin key; rank | directory and point-set order, the key index, marker bins, window peers |
+
+The coupler counts in `int64_t` and allocates on its own budget, so it sorts
+through `MFTLCplRadixSort32/64` and `MFTLCplSortPairs32/64`
+(`coupling_memory.c`): the low-level forms below with the scratch on the budget,
+and a count past `INT_MAX` -- the sorts' per-rank index range, as for every
+pool -- fatal instead of narrowed.
 
 **Stability is a correctness requirement.** Primitives with equal Morton codes
 must come out in a deterministic order, or two runs build different trees; and
@@ -77,14 +85,29 @@ neighbour rank, so the small path is the common one there.
 
 ## Interface notes {#arr_interface}
 
+- Two levels. `MFTLRadixSort32/64` and `MFTLRadixSortPairs32/64` take the
+  caller's scratch (reused across calls, or on a module's own budget);
+  `MFTLSortIds` and `MFTLSortPairs32/64` allocate it, and only once a pass is
+  known to run, so sorted or constant input never touches the allocator. Both
+  levels run the same core.
 - `MFTLRadixSort(keys, temp, n)` and `MFTLSortPairs(keys, vals, n)` dispatch on
   the key type with C11 `_Generic`; under C99 they fall back to the 32-bit
   variants so that 64-bit keys fail to compile instead of mis-sorting.
 - The key type is the ordering contract: `int` sorts signed, `uint64_t` sorts
   unsigned.
-- `MFTLUniqueIntArray` / `MFTLUniquePairs` compact sorted input in one scan;
-  `MFTLSortedIndexOf` is the binary search behind every sparse id-keyed
-  directory in the library (no hash maps); `MFTLGetUniqueIntegers` is an
-  $O(n\,u)$ first-seen-order collector for tiny sets such as destination ranks.
+- `MFTLUniqueIntArray` / `MFTLUniqueU64Array` / `MFTLUniquePairs` compact sorted
+  input in one scan; `MFTLSortedIndexOf` / `MFTLSortedIndexOf64` are the binary
+  search behind every sparse id-keyed directory in the library (no hash maps).
+  Both are lower bounds: of equal keys they return the FIRST, which after a
+  stable sort is the entry that came first, on every rank alike.
+  `MFTLGetUniqueIntegers` is an $O(n\,u)$ first-seen-order collector for tiny
+  sets such as destination ranks.
+- What stays a comparison sort, and why: records ordered by a composite key
+  wider than 64 bits or by a double (the coupler's sample records, topology
+  change's component and event lists), and a sort carrying `int64_t` values
+  (the coupler's constraint rows). Counting sorts by a dense small index
+  (redistribution, the routed exchange, the ghost pull) and the bounded
+  insertion sorts over at most 26 neighbour slots use what a general sort would
+  have to rediscover.
 - Two compile-time checks guard the 32-bit path, which reinterprets `int` as
   `uint32_t` (permitted by C11 §6.5p7): `int` is 32 bits and two's complement.

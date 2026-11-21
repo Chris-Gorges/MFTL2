@@ -199,8 +199,8 @@ typedef struct MFTL_TopoPiece
   long long *label;  ///< [n_tris] component label (smallest triangle key in the component).
   int *comp;  ///< [n_tris] local component index.
   int n_comp;  ///< Local components.
-  long long *owned_key;  ///< Sorted keys of the OWNED triangles.
-  int *owned_idx;  ///< Their triangle index, parallel to owned_key.
+  uint64_t *owned_key;  ///< [n_owned] lattice keys of the OWNED triangles, ascending.
+  int *owned_idx;  ///< [n_owned] their triangle index, parallel to owned_key.
   int n_owned;  ///< Owned triangles.
 } MFTL_TopoPiece;
 

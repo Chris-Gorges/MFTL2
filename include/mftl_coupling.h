@@ -514,10 +514,15 @@ int MFTLSolverGridAddBlock(MFTL_SolverGrid *grid, const MFTL_BlockDesc *desc);
 
 /**
  * @brief Registers owned point samples of a point location.
+ *
+ * One rank holds at most 2e9 samples of one location, summed over its sets
+ * (the per-rank index range of the sorts and the key index).
+ *
  * @param grid The grid.
  * @param desc The samples; every array is copied.
  * @return The set's piece index within its location on this rank, or
- *         #MFTL_ERROR on an invalid description (reported on stderr).
+ *         #MFTL_ERROR on an invalid description or a set past that bound
+ *         (reported on stderr).
  * @rank_local
  */
 int MFTLSolverGridAddPoints(MFTL_SolverGrid *grid, const MFTL_PointSetDesc *desc);

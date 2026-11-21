@@ -10,6 +10,7 @@
  * two SoA arrays sharing memory.
  */
 
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -68,6 +69,59 @@ static int test_grow_capacity_is_amortised_logarithmic(void)
   }
   TEST_ASSERT(cap >= 100000);
   TEST_ASSERT(reallocs <= 20);
+  return 0;
+}
+
+/** @brief The pre-MFTLGrowSize() int ladder, kept here as the reference. */
+static int reference_grow_capacity(int current, int needed)
+{
+  if (needed <= current) return current;
+  int cap = (current > 0) ? current : MFTL_INIT_CAPACITY;
+  while (cap < needed)
+  {
+    if (cap > (2147483647 / 2)) return needed;
+    cap *= 2;
+  }
+  return cap;
+}
+
+static int test_grow_capacity_is_the_old_ladder_to_the_last_int(void)
+{
+  /* The int forms are now MFTLGrowSize() underneath. Every capacity a pool or a
+   * growth macro ever had must be unchanged, near INT_MAX included (where the
+   * ladder saturates to the request instead of overflowing). */
+  const int currents[] = {-5, 0, 1, 3, 100, 128, 1000, 1 << 20, (1 << 30) - 1, 1 << 30, (1 << 30) + 7, INT_MAX - 1, INT_MAX};
+  const int needs[] = {-1, 0, 1, 2, 127, 128, 129, 1001, 5000, 1 << 29, (1 << 30) + 1, INT_MAX - 1, INT_MAX};
+  for (size_t i = 0; i < sizeof currents / sizeof currents[0]; ++i)
+    for (size_t j = 0; j < sizeof needs / sizeof needs[0]; ++j)
+      TEST_ASSERT_EQUAL_INT(reference_grow_capacity(currents[i], needs[j]), MFTLGrowCapacity(currents[i], needs[j]));
+  return 0;
+}
+
+static int test_grow_size_doubles_from_its_own_initial_size(void)
+{
+  TEST_ASSERT(MFTLGrowSize(0, 1, 256) == 256);
+  TEST_ASSERT(MFTLGrowSize(0, 257, 256) == 512);
+  TEST_ASSERT(MFTLGrowSize(0, 5, 0) == 8);  // initial 0 is 1
+  TEST_ASSERT(MFTLGrowSize(300, 200, 16) == 300);  // never shrinks
+  TEST_ASSERT(MFTLGrowSize(300, 601, 16) == 1200);
+  /* Past half of size_t it hands out exactly the request instead of wrapping. */
+  const size_t big = SIZE_MAX / 2 + 2;
+  TEST_ASSERT(MFTLGrowSize(SIZE_MAX / 2 + 1, big, 16) == big);
+  TEST_ASSERT(MFTLGrowSize(SIZE_MAX / 4, SIZE_MAX - 1, 16) == SIZE_MAX - 1);
+
+  TEST_ASSERT_EQUAL_INT(64, MFTLGrowCapacityFrom(0, 1, 64));
+  TEST_ASSERT_EQUAL_INT(128, MFTLGrowCapacityFrom(64, 65, 8));
+  TEST_ASSERT_EQUAL_INT(1, MFTLGrowCapacityFrom(0, 1, 0));
+  TEST_ASSERT_EQUAL_INT(INT_MAX - 3, MFTLGrowCapacityFrom(1 << 30, INT_MAX - 3, 8));  // saturates, never negative
+  return 0;
+}
+
+static int test_checked_count_adds_inside_the_int_range(void)
+{
+  TEST_ASSERT_EQUAL_INT(7, MFTLCheckedCount(3, 4, "test"));
+  TEST_ASSERT_EQUAL_INT(INT_MAX, MFTLCheckedCount(INT_MAX - 1, 1, "test"));
+  TEST_ASSERT_EQUAL_INT(0, MFTLCheckedCount(0, 0, "test"));
   return 0;
 }
 
@@ -182,6 +236,9 @@ int main(void)
   RUN_TEST(test_align_up_rounds_to_the_next_multiple);
   RUN_TEST(test_grow_capacity_doubles_from_the_initial_size);
   RUN_TEST(test_grow_capacity_is_amortised_logarithmic);
+  RUN_TEST(test_grow_capacity_is_the_old_ladder_to_the_last_int);
+  RUN_TEST(test_grow_size_doubles_from_its_own_initial_size);
+  RUN_TEST(test_checked_count_adds_inside_the_int_range);
   RUN_TEST(test_layout_offsets_are_aligned_and_disjoint);
   RUN_TEST(test_layout_of_zero_sized_pool_is_empty);
   RUN_TEST(test_aligned_alloc_is_cache_line_aligned_and_writable);

@@ -22,7 +22,9 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "mftl_arrayfunctions.h"
 #include "mftl_constants.h"
+#include "mftl_ensemble.h"
 #include "mftl_geometry.h"
 #include "mftl_memory.h"
 #include "mftl_topology.h"
@@ -253,18 +255,6 @@ static int cmp_qghost(const void *a, const void *b)
   return (x->occ > y->occ) - (x->occ < y->occ);
 }
 
-/** @brief (vertex id, slot) of owned vertices, sorted by id: an owner's lookup. */
-typedef struct
-{
-  int gid, slot;
-} qvid_t;
-
-static int cmp_qvid(const void *a, const void *b)
-{
-  const qvid_t *x = (const qvid_t *) a, *y = (const qvid_t *) b;
-  return (x->gid > y->gid) - (x->gid < y->gid);
-}
-
 void MFTLCplQuadFree(cpl_quad **pq)
 {
   if (pq == MFTL_NULL || *pq == MFTL_NULL) return;
@@ -381,7 +371,9 @@ int MFTLCplQuadBuild(MPI_Comm comm, const MFTL_Ensemble *ens, const cpl_markers 
   int64_t total = 0;
   for (int r = 0; r < n_in; ++r) total += (int64_t) (in[r].bytes / (2 * sizeof(int32_t)));
   q->req_vt = (int64_t *) MFTLCplAlloc((size_t) MFTL_MAX(total, 1) * sizeof(int64_t), "quadrature requesters");
-  qvid_t **lookup = (qvid_t **) MFTLCplCalloc((size_t) MFTL_MAX(nb, 1), sizeof(qvid_t *), "quadrature lookup");
+  /* Per body, built on first use: the owned vertex ids ascending, then the slot
+   * of each ([2 * n_local]). */
+  int **lookup = (int **) MFTLCplCalloc((size_t) MFTL_MAX(nb, 1), sizeof(int *), "quadrature lookup");
   int64_t at = 0;
   for (int r = 0; r < n_in; ++r)
   {
@@ -392,38 +384,24 @@ int MFTLCplQuadBuild(MPI_Comm comm, const MFTL_Ensemble *ens, const cpl_markers 
     {
       int32_t rec[2];
       memcpy(rec, in[r].data + (size_t) e * sizeof rec, sizeof rec);
-      int slot = -1;
-      for (int lo = 0, hi = nb; lo < hi;)
-      {
-        const int mid = lo + (hi - lo) / 2;
-        const int gid = ens->local_objects[mid]->global_id;
-        if (gid == rec[0])
-        {
-          slot = mid;
-          break;
-        }
-        if (gid < rec[0])
-          lo = mid + 1;
-        else
-          hi = mid;
-      }
+      const int slot = MFTLEnsembleFindLocalSlot(ens, rec[0]);
       int64_t vt = -1;
       if (slot >= 0)
       {
         const MFTL_Object *obj = ens->local_objects[slot];
+        const int nl = obj->verts.n_local;
         if (lookup[slot] == MFTL_NULL)
         {
-          lookup[slot] = (qvid_t *) MFTLCplAlloc((size_t) MFTL_MAX(obj->verts.n_local, 1) * sizeof(qvid_t), "quadrature lookup");
-          for (int v = 0; v < obj->verts.n_local; ++v)
+          lookup[slot] = (int *) MFTLCplAlloc(2 * (size_t) MFTL_MAX(nl, 1) * sizeof(int), "quadrature lookup");
+          for (int v = 0; v < nl; ++v)
           {
-            lookup[slot][v].gid = obj->verts.rec[v].global_id;
-            lookup[slot][v].slot = v;
+            lookup[slot][v] = obj->verts.rec[v].global_id;
+            lookup[slot][nl + v] = v;
           }
-          if (obj->verts.n_local > 1) qsort(lookup[slot], (size_t) obj->verts.n_local, sizeof(qvid_t), cmp_qvid);
+          MFTLCplSortPairs32(lookup[slot], lookup[slot] + nl, nl, "quadrature lookup");
         }
-        const qvid_t key = {rec[1], 0};
-        const qvid_t *hit = (const qvid_t *) bsearch(&key, lookup[slot], (size_t) obj->verts.n_local, sizeof(qvid_t), cmp_qvid);
-        if (hit) vt = body_off[slot] + hit->slot;
+        const int k = MFTLSortedIndexOf(lookup[slot], nl, rec[1]);
+        if (k >= 0) vt = body_off[slot] + lookup[slot][nl + k];
       }
       if (vt < 0)
       {

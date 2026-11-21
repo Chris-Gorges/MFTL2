@@ -383,7 +383,7 @@ static void tile_points(cpl_points *p)
       code[i] = MFTLMorton3D(c[0], c[1], c[2]);
       perm[i] = (int) i;
     }
-    MFTLSortPairs64(code, perm, (int) n);
+    MFTLCplSortPairs64(code, perm, n, "point morton");
     MFTLCplFree(code);
 
     /* Apply the permutation to every array. */
@@ -453,7 +453,7 @@ static void tile_points(cpl_points *p)
     }
     if (p->n_tiles == tile_cap)
     {
-      tile_cap *= 2;
+      tile_cap = MFTLGrowCapacityFrom(tile_cap, p->n_tiles + 1, 16);
       p->tile_off = MFTLCplRealloc(p->tile_off, (size_t) (tile_cap + 1) * sizeof(int64_t), "point tiles");
     }
     p->tile_off[p->n_tiles++] = a;
@@ -512,9 +512,19 @@ int MFTLSolverGridAddPoints(MFTL_SolverGrid *g, const MFTL_PointSetDesc *desc)
     return MFTL_ERROR;
   }
   const int64_t n = desc->n;
-  if (n < 0 || n > (int64_t) 2000000000 || (n > 0 && (desc->keys == MFTL_NULL || desc->pos == MFTL_NULL || desc->measure == MFTL_NULL)))
+  if (n < 0 || (n > 0 && (desc->keys == MFTL_NULL || desc->pos == MFTL_NULL || desc->measure == MFTL_NULL)))
   {
     complain("points: need keys, positions and measures");
+    return MFTL_ERROR;
+  }
+  /* A location's samples on this rank are sorted and indexed together (key
+   * check, key index, Morton tiles), with int indices: bound their SUM, not
+   * each set, so no later step narrows a count. */
+  int64_t held = 0;
+  for (int pc = 0; pc < l->n_pieces; ++pc) held += g->points[l->piece_ref[pc]].n;
+  if (n > CPL_MAX_RANK_SAMPLES - held)
+  {
+    complain("points: more than 2e9 samples of one location on one rank");
     return MFTL_ERROR;
   }
   if (l->anisotropic)
@@ -741,31 +751,8 @@ int MFTLSolverGridSetConstraints(MFTL_SolverGrid *g, const MFTL_ConstraintDesc *
 
 int64_t MFTLCplConstraintFind(const cpl_location *l, uint64_t key)
 {
-  int64_t lo = 0, hi = l->n_con;
-  while (lo < hi)
-  {
-    const int64_t m = lo + (hi - lo) / 2;
-    if (l->con_sorted[m] < key)
-      lo = m + 1;
-    else
-      hi = m;
-  }
-  return (lo < l->n_con && l->con_sorted[lo] == key) ? l->con_order[lo] : -1;
-}
-
-/** @brief One point sample in a key index under construction. */
-typedef struct
-{
-  uint64_t key;
-  int piece;
-  int64_t elem;
-  double meas;
-} kidx_t;
-
-static int cmp_kidx(const void *a, const void *b)
-{
-  const uint64_t x = ((const kidx_t *) a)->key, y = ((const kidx_t *) b)->key;
-  return (x > y) - (x < y);
+  const int64_t at = MFTLSortedIndexOf64(l->con_sorted, l->n_con, key);
+  return (at >= 0) ? l->con_order[at] : -1;
 }
 
 bool MFTLCplSampleFind(MFTL_SolverGrid *g, int location, uint64_t key, int *piece, int64_t *elem, double *measure)
@@ -804,51 +791,48 @@ bool MFTLCplSampleFind(MFTL_SolverGrid *g, int location, uint64_t key, int *piec
   }
   if (g->kidx_n[location] < 0)
   {
+    /* Keys are unique per location on this rank (checked at validation), so
+     * the order is the keys' alone; at most CPL_MAX_RANK_SAMPLES of them. */
     int64_t total = 0;
     for (int pc = 0; pc < l->n_pieces; ++pc) total += g->points[l->piece_ref[pc]].n;
-    kidx_t *t = (kidx_t *) MFTLCplAlloc((size_t) MFTL_MAX(total, 1) * sizeof(kidx_t), "key index");
-    int64_t at = 0;
+    const size_t nn = (size_t) MFTL_MAX(total, 1);
+    uint64_t *keys = (uint64_t *) MFTLCplAlloc(nn * sizeof(uint64_t), "key index");
+    int *at = (int *) MFTLCplAlloc(nn * sizeof(int), "key index");
+    int *src = (int *) MFTLCplAlloc(2 * nn * sizeof(int), "key index");  // (piece, sample) of each pre-sort position
+    int64_t m = 0;
     for (int pc = 0; pc < l->n_pieces; ++pc)
     {
       const cpl_points *p = &g->points[l->piece_ref[pc]];
-      for (int64_t i = 0; i < p->n; ++i, ++at)
+      for (int64_t i = 0; i < p->n; ++i, ++m)
       {
-        t[at].key = p->key[i];
-        t[at].piece = pc;
-        t[at].elem = p->aidx[i];
-        t[at].meas = p->measure[i];
+        keys[m] = p->key[i];
+        at[m] = (int) m;
+        src[2 * m] = pc;
+        src[2 * m + 1] = (int) i;
       }
     }
-    if (total > 1) qsort(t, (size_t) total, sizeof(kidx_t), cmp_kidx);
-    const size_t nn = (size_t) MFTL_MAX(total, 1);
-    g->kidx_key[location] = (uint64_t *) MFTLCplAlloc(nn * sizeof(uint64_t), "key index");
+    MFTLCplSortPairs64(keys, at, total, "key index");
+    g->kidx_key[location] = keys;
     g->kidx_piece[location] = (int *) MFTLCplAlloc(nn * sizeof(int), "key index");
     g->kidx_elem[location] = (int64_t *) MFTLCplAlloc(nn * sizeof(int64_t), "key index");
     g->kidx_meas[location] = (double *) MFTLCplAlloc(nn * sizeof(double), "key index");
     for (int64_t i = 0; i < total; ++i)
     {
-      g->kidx_key[location][i] = t[i].key;
-      g->kidx_piece[location][i] = t[i].piece;
-      g->kidx_elem[location][i] = t[i].elem;
-      g->kidx_meas[location][i] = t[i].meas;
+      const int pc = src[2 * (size_t) at[i]], j = src[2 * (size_t) at[i] + 1];
+      const cpl_points *p = &g->points[l->piece_ref[pc]];
+      g->kidx_piece[location][i] = pc;
+      g->kidx_elem[location][i] = p->aidx[j];
+      g->kidx_meas[location][i] = p->measure[j];
     }
-    MFTLCplFree(t);
+    MFTLCplFree(src);
+    MFTLCplFree(at);
     g->kidx_n[location] = total;
   }
-  int64_t lo = 0, hi = g->kidx_n[location];
-  const uint64_t *k = g->kidx_key[location];
-  while (lo < hi)
-  {
-    const int64_t m = lo + (hi - lo) / 2;
-    if (k[m] < key)
-      lo = m + 1;
-    else
-      hi = m;
-  }
-  if (lo >= g->kidx_n[location] || k[lo] != key) return false;
-  *piece = g->kidx_piece[location][lo];
-  *elem = g->kidx_elem[location][lo];
-  *measure = g->kidx_meas[location][lo];
+  const int64_t at = MFTLSortedIndexOf64(g->kidx_key[location], g->kidx_n[location], key);
+  if (at < 0) return false;
+  *piece = g->kidx_piece[location][at];
+  *elem = g->kidx_elem[location][at];
+  *measure = g->kidx_meas[location][at];
   return true;
 }
 
@@ -983,19 +967,15 @@ int MFTLCplGridValidate(const MFTL_SolverGrid *g, const MFTL_Domain *d)
     for (int pc = 0; pc < l->n_pieces; ++pc) total += g->points[l->piece_ref[pc]].n;
     if (total < 2) continue;
     uint64_t *k = (uint64_t *) MFTLCplAlloc((size_t) total * sizeof(uint64_t), "key check");
-    uint64_t *tmp = (uint64_t *) MFTLCplAlloc((size_t) total * sizeof(uint64_t), "key check");
     int64_t m = 0;
     for (int pc = 0; pc < l->n_pieces; ++pc)
     {
       const cpl_points *p = &g->points[l->piece_ref[pc]];
       for (int64_t j = 0; j < p->n; ++j) k[m++] = p->key[j];
     }
-    MFTLRadixSort64(k, tmp, (int) total);
-    int dup = 0;
-    for (int64_t j = 1; j < total; ++j)
-      if (k[j] == k[j - 1]) dup = 1;
+    MFTLCplRadixSort64(k, total, "key check");
+    const bool dup = MFTLUniqueU64Array(k, total) != total;
     MFTLCplFree(k);
-    MFTLCplFree(tmp);
     if (dup)
     {
       fprintf(stderr, "MFTL coupling: location '%s': duplicate point keys on one rank\n", l->name);

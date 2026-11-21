@@ -18,6 +18,13 @@
  *   scratch) use MFTLMallocOrDie() / MFTLCallocOrDie() / MFTLReallocOrDie() and
  *   the growth macros #MFTL_ENSURE_CAPACITY and #MFTL_RESERVE_ADDITIONAL.
  *
+ * Every growable buffer is sized by ONE doubling rule, MFTLGrowSize() (`int`
+ * forms MFTLGrowCapacity() and MFTLGrowCapacityFrom()), whatever its counter
+ * type and whichever allocator it then calls (the coupler's budget included).
+ * A bulk append that may jump far past its capacity can size itself exactly to
+ * the request instead (`max(need, 2 * cap)`), so a large buffer is never
+ * over-allocated by a jump.
+ *
  * Allocation failure is fatal everywhere: in an MPI job an out-of-memory rank
  * cannot recover, and a NULL buffer carried on corrupts data far from the cause.
  */
@@ -25,6 +32,8 @@
 #ifndef MFTL_MEMORY_H
 #define MFTL_MEMORY_H
 
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -167,8 +176,63 @@ static inline size_t MFTLLayoutAdd(size_t *cursor, size_t count, size_t elem_siz
 }
 
 /**
- * @brief Geometric growth policy: at least @p needed, at least MFTL_INIT_CAPACITY,
- *        otherwise double until it fits.
+ * @brief The library's ONE growth rule: at least @p needed, otherwise @p current
+ *        (or @p initial when empty) doubled until it fits.
+ *
+ * Every growable buffer follows it, whatever its counter type: byte buffers and
+ * the coupler's 64-bit counts call it directly, `int` capacities through
+ * MFTLGrowCapacity(). Appending \f$n\f$ elements one at a time therefore
+ * costs \f$O(\log n)\f$ reallocations.
+ *
+ * @param current Present capacity. May be 0.
+ * @param needed  Capacity that must fit afterwards.
+ * @param initial First capacity of an empty buffer; 0 is treated as 1.
+ * @return @p current if it already suffices, otherwise the smallest
+ *         \f$c_0 2^k \ge\f$ @p needed, with \f$c_0\f$ = @p current, or
+ *         @p initial when @p current is 0. Saturates to exactly @p needed where
+ *         doubling would leave `size_t` instead of wrapping to a small size.
+ */
+static inline size_t MFTLGrowSize(size_t current, size_t needed, size_t initial)
+{
+  if (needed <= current) return current;
+  size_t cap = (current > 0) ? current : ((initial > 0) ? initial : 1);
+  while (cap < needed)
+  {
+    if (cap > SIZE_MAX / 2) return needed;
+    cap *= 2;
+  }
+  return cap;
+}
+
+/**
+ * @brief MFTLGrowSize() for an `int` capacity.
+ *
+ * For the short lists whose first capacity is their own (ranks, blocks, events);
+ * everything else uses MFTLGrowCapacity().
+ *
+ * @param current Present capacity. May be 0.
+ * @param needed  Capacity that must fit afterwards.
+ * @param initial First capacity of an empty list; 0 is treated as 1.
+ * @return @p current if it already suffices, otherwise the smallest
+ *         \f$c_0 2^k \ge\f$ @p needed, with \f$c_0\f$ = @p current, or
+ *         @p initial when @p current is 0. Saturates to exactly @p needed near
+ *         `INT_MAX` instead of overflowing to a negative size.
+ */
+static inline int MFTLGrowCapacityFrom(int current, int needed, int initial)
+{
+  if (needed <= current) return current;
+  const size_t init = (initial > 0) ? (size_t) initial : 1u;
+  if (needed <= 0) return (int) init;
+  const size_t cap = MFTLGrowSize((current > 0) ? (size_t) current : 0u, (size_t) needed, init);
+  /* int overflow would turn a huge request into a negative capacity, i.e. a
+   * silently undersized allocation. Saturate instead and let the allocator
+   * report the real problem. */
+  return (cap > (size_t) INT_MAX) ? needed : (int) cap;
+}
+
+/**
+ * @brief MFTLGrowCapacityFrom() starting at #MFTL_INIT_CAPACITY: the growth
+ *        ladder of the pools and of every growth macro.
  *
  * A mesh that grows entity by entity therefore performs \f$O(\log n)\f$
  * reallocations.
@@ -180,19 +244,30 @@ static inline size_t MFTLLayoutAdd(size_t *cursor, size_t count, size_t elem_siz
  *         #MFTL_INIT_CAPACITY when @p current is 0. Saturates to exactly
  *         @p needed near `INT_MAX` instead of overflowing to a negative size.
  */
-static inline int MFTLGrowCapacity(int current, int needed)
+static inline int MFTLGrowCapacity(int current, int needed) { return MFTLGrowCapacityFrom(current, needed, MFTL_INIT_CAPACITY); }
+
+/**
+ * @brief `count + more` for an `int` element count, or a fatal error if the sum
+ *        leaves the `int` range.
+ *
+ * The growth macros call it before sizing anything, so a request past
+ * `INT_MAX` elements stops with a message instead of wrapping to a negative
+ * count (undefined behaviour) and a silently undersized buffer.
+ *
+ * @param count Elements already present.
+ * @param more  Elements to add.
+ * @param what  Human-readable name of the caller, printed in the fatal message.
+ * @return `count + more`.
+ */
+static inline int MFTLCheckedCount(int count, int more, const char *what)
 {
-  if (needed <= current) return current;
-  int cap = (current > 0) ? current : MFTL_INIT_CAPACITY;
-  while (cap < needed)
+  const long long sum = (long long) count + (long long) more;
+  if (sum > INT_MAX || sum < 0)
   {
-    /* int overflow would turn a huge request into a negative capacity, i.e. a
-     * silently undersized allocation. Saturate instead and let the allocator
-     * report the real problem. */
-    if (cap > (2147483647 / 2)) return needed;
-    cap *= 2;
+    fprintf(stderr, "FATAL ERROR: %s: %d + %d elements leave the int index range.\n", what, count, more);
+    exit(EXIT_FAILURE);
   }
-  return cap;
+  return (int) sum;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -203,8 +278,8 @@ static inline int MFTLGrowCapacity(int current, int needed)
 /**
  * @brief Implementation shared by #MFTL_ENSURE_CAPACITY and #MFTL_RESERVE_ADDITIONAL.
  *
- * Reallocates only when @p target_cap exceeds the present capacity, aborts on
- * failure, and writes the new capacity back through @p capacity.
+ * Reallocates (MFTLReallocOrDie()) only when @p target_cap exceeds the present
+ * capacity, and writes the new capacity back through @p capacity.
  *
  * @param ptr        Lvalue holding the array pointer. Updated in place.
  * @param capacity   Pointer to the capacity counter. Updated in place.
@@ -213,21 +288,15 @@ static inline int MFTLGrowCapacity(int current, int needed)
  *
  * @internal Not part of the public API; use one of the two wrappers.
  */
-#define _MFTL_REALLOC_CORE(ptr, capacity, target_cap, type)                                                             \
-  do                                                                                                                    \
-  {                                                                                                                     \
-    int _req_cap = (target_cap);                                                                                        \
-    if (_req_cap > (*(capacity)))                                                                                       \
-    {                                                                                                                   \
-      void *_new_ptr = realloc((ptr), (size_t) _req_cap * sizeof(type));                                                \
-      if (!_new_ptr && _req_cap > 0)                                                                                    \
-      {                                                                                                                 \
-        fprintf(stderr, "FATAL ERROR: MFTL Alloc failed for %lu bytes.\n", (unsigned long) ((size_t) _req_cap * sizeof(type))); \
-        exit(EXIT_FAILURE);                                                                                             \
-      }                                                                                                                 \
-      (ptr) = (type *) _new_ptr;                                                                                        \
-      (*(capacity)) = _req_cap;                                                                                         \
-    }                                                                                                                   \
+#define _MFTL_REALLOC_CORE(ptr, capacity, target_cap, type)                                            \
+  do                                                                                                   \
+  {                                                                                                    \
+    const int _req_cap = (target_cap);                                                                 \
+    if (_req_cap > (*(capacity)))                                                                      \
+    {                                                                                                  \
+      (ptr) = (type *) MFTLReallocOrDie((ptr), (size_t) _req_cap * sizeof(type), "MFTL array growth"); \
+      (*(capacity)) = _req_cap;                                                                        \
+    }                                                                                                  \
   } while (0)
 
 /**
@@ -235,7 +304,9 @@ static inline int MFTLGrowCapacity(int current, int needed)
  *
  * Grows only when `*count + needed` exceeds `*capacity`, following
  * MFTLGrowCapacity()'s doubling schedule, so \f$n\f$ appends cost
- * \f$O(\log n)\f$ reallocations.
+ * \f$O(\log n)\f$ reallocations. The test is `needed > *capacity - *count`,
+ * which cannot overflow (`*count <= *capacity`); the sum itself is formed only
+ * on the growth path, by MFTLCheckedCount().
  *
  * @param ptr      Lvalue holding the array pointer. Updated in place.
  * @param count    Pointer to the element counter. Read, never written.
@@ -245,21 +316,21 @@ static inline int MFTLGrowCapacity(int current, int needed)
  *
  * @warning Independent arrays only; never pool storage (see mftl_object.h).
  */
-#define MFTL_ENSURE_CAPACITY(ptr, count, capacity, needed, type)                  \
-  do                                                                              \
-  {                                                                               \
-    if ((*(count)) + (needed) > (*(capacity)))                                    \
-    {                                                                             \
-      int _new_cap = MFTLGrowCapacity(*(capacity), (*(count)) + (needed));        \
-      _MFTL_REALLOC_CORE(ptr, capacity, _new_cap, type);                          \
-    }                                                                             \
+#define MFTL_ENSURE_CAPACITY(ptr, count, capacity, needed, type)                                                        \
+  do                                                                                                                    \
+  {                                                                                                                     \
+    if ((needed) > (*(capacity)) - (*(count)))                                                                          \
+    {                                                                                                                   \
+      const int _new_cap = MFTLGrowCapacity(*(capacity), MFTLCheckedCount(*(count), (needed), "MFTL_ENSURE_CAPACITY")); \
+      _MFTL_REALLOC_CORE(ptr, capacity, _new_cap, type);                                                                \
+    }                                                                                                                   \
   } while (0)
 
 /**
  * @brief Exact growth. For bulk loads where the final count is known up front.
  *
  * Allocates precisely `*count + needed` elements: a bulk load knows its size, and
- * geometric slack would never be reclaimed.
+ * geometric slack would never be reclaimed. Overflow-safe as #MFTL_ENSURE_CAPACITY.
  *
  * @param ptr      Lvalue holding the array pointer. Updated in place.
  * @param count    Pointer to the element counter. Read, never written.
@@ -269,14 +340,14 @@ static inline int MFTLGrowCapacity(int current, int needed)
  *
  * @warning Independent arrays only. See #MFTL_ENSURE_CAPACITY.
  */
-#define MFTL_RESERVE_ADDITIONAL(ptr, count, capacity, needed, type) \
-  do                                                                \
-  {                                                                 \
-    if ((*(count)) + (needed) > (*(capacity)))                      \
-    {                                                               \
-      int _new_cap = (*(count)) + (needed);                         \
-      _MFTL_REALLOC_CORE(ptr, capacity, _new_cap, type);            \
-    }                                                               \
+#define MFTL_RESERVE_ADDITIONAL(ptr, count, capacity, needed, type)                         \
+  do                                                                                        \
+  {                                                                                         \
+    if ((needed) > (*(capacity)) - (*(count)))                                              \
+    {                                                                                       \
+      const int _new_cap = MFTLCheckedCount(*(count), (needed), "MFTL_RESERVE_ADDITIONAL"); \
+      _MFTL_REALLOC_CORE(ptr, capacity, _new_cap, type);                                    \
+    }                                                                                       \
   } while (0)
 
 #ifdef __cplusplus

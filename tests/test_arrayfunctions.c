@@ -665,9 +665,114 @@ static int test_generic_dispatch(void)
   return 0;
 }
 
+static int test_scratch_pair_sorts_are_the_allocating_ones(void)
+{
+  /* MFTLRadixSortPairs* and MFTLSortPairs* share one core; with caller scratch
+   * the result must be the same pairs bit for bit, ties (stability) included.
+   * Narrow masks make an odd number of passes run, so the result is copied back
+   * out of the caller's scratch. */
+  const int lengths[] = {2, 32, 33, 5000};
+  const uint32_t masks[] = {0x3u, 0xffu, 0xffffu, 0x7fffffffu};
+  int failed = 0;
+
+  rng_seed(0x5C2A7u);
+  for (size_t c = 0; c < sizeof lengths / sizeof lengths[0]; ++c)
+    for (size_t m = 0; m < sizeof masks / sizeof masks[0]; ++m)
+    {
+      const int n = lengths[c];
+      int *k1 = (int *) malloc(sizeof(int) * (size_t) n), *k2 = (int *) malloc(sizeof(int) * (size_t) n);
+      int *v1 = (int *) malloc(sizeof(int) * (size_t) n), *v2 = (int *) malloc(sizeof(int) * (size_t) n);
+      int *kt = (int *) malloc(sizeof(int) * (size_t) n), *vt = (int *) malloc(sizeof(int) * (size_t) n);
+      uint64_t *q1 = (uint64_t *) malloc(sizeof(uint64_t) * (size_t) n), *q2 = (uint64_t *) malloc(sizeof(uint64_t) * (size_t) n);
+      uint64_t *qt = (uint64_t *) malloc(sizeof(uint64_t) * (size_t) n);
+
+      fill_random_ints(k1, n, masks[m], 1);
+      for (int i = 0; i < n; ++i)
+      {
+        k2[i] = k1[i];
+        v1[i] = v2[i] = i;
+        q1[i] = q2[i] = (rng_next() & (uint64_t) masks[m]) | ((m == 3) ? (rng_next() << 32) : 0u);
+      }
+
+      MFTLSortPairs32(k1, v1, n);
+      MFTLRadixSortPairs32(k2, v2, kt, vt, n);
+      failed |= memcmp(k1, k2, sizeof(int) * (size_t) n) != 0 || memcmp(v1, v2, sizeof(int) * (size_t) n) != 0;
+
+      for (int i = 0; i < n; ++i) v1[i] = v2[i] = i;
+      MFTLSortPairs64(q1, v1, n);
+      MFTLRadixSortPairs64(q2, v2, qt, vt, n);
+      failed |= memcmp(q1, q2, sizeof(uint64_t) * (size_t) n) != 0 || memcmp(v1, v2, sizeof(int) * (size_t) n) != 0;
+      for (int i = 1; i < n; ++i)
+        if (q2[i - 1] > q2[i] || (q2[i - 1] == q2[i] && v2[i - 1] > v2[i])) failed = 1;  // sorted, ties by input order
+
+      free(k1), free(k2), free(v1), free(v2), free(kt), free(vt), free(q1), free(q2), free(qt);
+    }
+  TEST_ASSERT(failed == 0);
+  return 0;
+}
+
 /* ═══════════════════════════════════════════════════════════════════════════
- * 4. Duplicate removal
+ * 4. Lookup and duplicate removal
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+static int test_sorted_index_of_finds_the_first_of_equal_keys(void)
+{
+  const int a[9] = {-7, -7, 0, 3, 3, 3, 8, 9, 9};
+  TEST_ASSERT_EQUAL_INT(0, MFTLSortedIndexOf(a, 9, -7));
+  TEST_ASSERT_EQUAL_INT(2, MFTLSortedIndexOf(a, 9, 0));
+  TEST_ASSERT_EQUAL_INT(3, MFTLSortedIndexOf(a, 9, 3));
+  TEST_ASSERT_EQUAL_INT(7, MFTLSortedIndexOf(a, 9, 9));
+  TEST_ASSERT_EQUAL_INT(-1, MFTLSortedIndexOf(a, 9, -8));  // before the first
+  TEST_ASSERT_EQUAL_INT(-1, MFTLSortedIndexOf(a, 9, 4));  // in a gap
+  TEST_ASSERT_EQUAL_INT(-1, MFTLSortedIndexOf(a, 9, 10));  // past the last
+  TEST_ASSERT_EQUAL_INT(-1, MFTLSortedIndexOf(a, 0, -7));
+  TEST_ASSERT_EQUAL_INT(-1, MFTLSortedIndexOf(NULL, 0, 1));
+
+  /* Unsigned order: a key with the top bit set sorts last. */
+  const uint64_t b[7] = {0u, 5u, 5u, 1ull << 40, UINT64_MAX - 1u, UINT64_MAX, UINT64_MAX};
+  TEST_ASSERT(MFTLSortedIndexOf64(b, 7, 0u) == 0);
+  TEST_ASSERT(MFTLSortedIndexOf64(b, 7, 5u) == 1);
+  TEST_ASSERT(MFTLSortedIndexOf64(b, 7, 1ull << 40) == 3);
+  TEST_ASSERT(MFTLSortedIndexOf64(b, 7, UINT64_MAX) == 5);
+  TEST_ASSERT(MFTLSortedIndexOf64(b, 7, 6u) == -1);
+  TEST_ASSERT(MFTLSortedIndexOf64(b + 1, 6, 0u) == -1);
+  TEST_ASSERT(MFTLSortedIndexOf64(NULL, 0, 0u) == -1);
+
+  /* Against a linear scan, on a sorted list with many runs. */
+  enum
+  {
+    N = 3000
+  };
+  int *k = (int *) malloc(sizeof(int) * N);
+  uint64_t *q = (uint64_t *) malloc(sizeof(uint64_t) * N);
+  rng_seed(99u);
+  for (int i = 0; i < N; ++i) k[i] = (int) (rng_next() % 1000u) - 500;
+  MFTLSortIds(k, N);
+  for (int i = 0; i < N; ++i) q[i] = (uint64_t) (k[i] + 500) << 40;
+  int failed = 0;
+  for (int key = -502; key <= 502; ++key)
+  {
+    int first = -1;
+    for (int i = 0; i < N && first < 0; ++i)
+      if (k[i] == key) first = i;
+    failed |= MFTLSortedIndexOf(k, N, key) != first;
+    failed |= MFTLSortedIndexOf64(q, N, (uint64_t) (key + 500) << 40) != (int64_t) first;
+  }
+  free(k);
+  free(q);
+  TEST_ASSERT(failed == 0);
+  return 0;
+}
+
+static int test_unique_u64_array(void)
+{
+  uint64_t a[8] = {1u, 1u, 7u, 1ull << 63, 1ull << 63, UINT64_MAX, UINT64_MAX, UINT64_MAX};
+  TEST_ASSERT(MFTLUniqueU64Array(a, 8) == 4);
+  TEST_ASSERT(a[0] == 1u && a[1] == 7u && a[2] == (1ull << 63) && a[3] == UINT64_MAX);
+  TEST_ASSERT(MFTLUniqueU64Array(a, 1) == 1);
+  TEST_ASSERT(MFTLUniqueU64Array(NULL, 0) == 0);
+  return 0;
+}
 
 static int test_unique_int_array(void)
 {
@@ -787,6 +892,10 @@ int main(void)
   RUN_TEST(test_sort_pairs64_moves_values);
   RUN_TEST(test_sort_pairs64_is_stable);
   RUN_TEST(test_generic_dispatch);
+  RUN_TEST(test_scratch_pair_sorts_are_the_allocating_ones);
+
+  RUN_TEST(test_sorted_index_of_finds_the_first_of_equal_keys);
+  RUN_TEST(test_unique_u64_array);
 
   RUN_TEST(test_unique_int_array);
   RUN_TEST(test_unique_pairs_keeps_first_value);

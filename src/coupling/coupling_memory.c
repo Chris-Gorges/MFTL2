@@ -4,9 +4,12 @@
  * @brief Per-rank module allocation accounting and hard capacity budget.
  */
 #include "coupling_internal.h"
+#include <limits.h>
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "mftl_arrayfunctions.h"
 
 /* A header preserves malloc's alignment for every C type. No allocation map,
  * per-object walk or caller-maintained capacity estimate is needed. */
@@ -106,3 +109,56 @@ void MFTLCouplerGetMemoryStats(MFTL_CouplingMemoryStats *stats)
 }
 
 void MFTLCouplerResetMemoryPeak(void) { atomic_store(&peak_bytes, atomic_load(&live_bytes)); }
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Sorting: the library's radix sorts with the scratch on this budget
+ *
+ * The coupler counts in int64_t, the sorts in int (the library's per-rank index
+ * range, as for every pool). A count past INT_MAX stops the job here with a
+ * message instead of being narrowed into a silent mis-sort.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+/** @brief @p n as the sorts' int count, or a fatal error naming @p what. */
+static int sort_count(int64_t n, size_t bytes_per_element, const char *what)
+{
+  if (n > INT_MAX) MFTLCplMemoryAbort(what, (size_t) n * bytes_per_element, atomic_load(&live_bytes), atomic_load(&memory_limit));
+  return (int) n;
+}
+
+void MFTLCplRadixSort32(int *keys, int64_t n, const char *what)
+{
+  if (n < 2) return;
+  const int m = sort_count(n, sizeof(int), what);
+  int *tmp = (int *) MFTLCplAlloc((size_t) m * sizeof(int), what);
+  MFTLRadixSort32(keys, tmp, m);
+  MFTLCplFree(tmp);
+}
+
+void MFTLCplRadixSort64(uint64_t *keys, int64_t n, const char *what)
+{
+  if (n < 2) return;
+  const int m = sort_count(n, sizeof(uint64_t), what);
+  uint64_t *tmp = (uint64_t *) MFTLCplAlloc((size_t) m * sizeof(uint64_t), what);
+  MFTLRadixSort64(keys, tmp, m);
+  MFTLCplFree(tmp);
+}
+
+void MFTLCplSortPairs32(int *keys, int *values, int64_t n, const char *what)
+{
+  if (n < 2) return;
+  const int m = sort_count(n, 2 * sizeof(int), what);
+  int *tmp = (int *) MFTLCplAlloc(2 * (size_t) m * sizeof(int), what);
+  MFTLRadixSortPairs32(keys, values, tmp, tmp + m, m);
+  MFTLCplFree(tmp);
+}
+
+void MFTLCplSortPairs64(uint64_t *keys, int *values, int64_t n, const char *what)
+{
+  if (n < 2) return;
+  const int m = sort_count(n, sizeof(uint64_t) + sizeof(int), what);
+  uint64_t *kt = (uint64_t *) MFTLCplAlloc((size_t) m * sizeof(uint64_t), what);
+  int *vt = (int *) MFTLCplAlloc((size_t) m * sizeof(int), what);
+  MFTLRadixSortPairs64(keys, values, kt, vt, m);
+  MFTLCplFree(vt);
+  MFTLCplFree(kt);
+}

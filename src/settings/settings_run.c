@@ -62,14 +62,12 @@ static int broadcast_and_parse(MFTL_Settings *s, const char *text, const char *o
     return MFTL_ERROR;
   }
 
-  char *buf = (char *) malloc((size_t) len + 1);
-  if (!buf) abort();
+  char *buf = (char *) MFTLMallocOrDie((size_t) len + 1, "settings text");
   if (rank == 0) memcpy(buf, text, (size_t) len);
   MPI_Bcast(buf, (int) len, MPI_CHAR, 0, comm);
   buf[len] = '\0';
 
-  char *message = (char *) malloc(REPORT_CHARS);
-  if (!message) abort();
+  char *message = (char *) MFTLMallocOrDie(REPORT_CHARS, "settings report");
   const int rc = MFTLSettingsParse(s, buf, origin, message, REPORT_CHARS);
   if (rc != MFTL_SUCCESS && rank == 0) fprintf(stderr, "[MFTL] invalid settings:\n%s", message);
 
@@ -92,18 +90,15 @@ int MFTLSettingsLoad(MFTL_Settings *s, const char *path, MPI_Comm comm)
     else
     {
       size_t cap = 1 << 14, len = 0;
-      text = (char *) malloc(cap);
-      if (!text) abort();
+      text = (char *) MFTLMallocOrDie(cap, "MFTLSettingsLoad file text");
       size_t got;
       while ((got = fread(text + len, 1, cap - len - 1, f)) > 0)
       {
         len += got;
         if (cap - len - 1 == 0)
         {
-          cap *= 2;
-          char *grown = (char *) realloc(text, cap);
-          if (!grown) abort();
-          text = grown;
+          cap = MFTLGrowSize(cap, cap + 1, 0);
+          text = (char *) MFTLReallocOrDie(text, cap, "MFTLSettingsLoad file text");
         }
       }
       const bool failed = ferror(f) != 0;
@@ -159,8 +154,7 @@ int MFTLSettingsLoadArgs(MFTL_Settings *s, int argc, char **argv, MPI_Comm comm)
     size_t cap = 1, len = 0;
     for (int i = 1; i < argc; ++i)
       if (MFTLSettingsIsOverride(argv[i])) cap += strlen(argv[i]) + 4;
-    text = (char *) malloc(cap);
-    if (!text) abort();
+    text = (char *) MFTLMallocOrDie(cap, "MFTLSettingsLoadArgs text");
     text[0] = '\0';
 
     /* One argument per line, "key = value", so a problem is reported against
@@ -319,8 +313,7 @@ MFTL_Ensemble *MFTLSettingsCreateEnsemble(const MFTL_Settings *s, MPI_Comm comm)
 
   if (settings_agree(s, comm, "MFTLSettingsCreateEnsemble") != MFTL_SUCCESS) return MFTL_NULL;
 
-  char *message = (char *) malloc(REPORT_CHARS);
-  if (!message) abort();
+  char *message = (char *) MFTLMallocOrDie(REPORT_CHARS, "settings report");
   const int ok = MFTLSettingsCheck(s, message, REPORT_CHARS);
   if (ok != MFTL_SUCCESS && rank == 0) fprintf(stderr, "[MFTL] MFTLSettingsCreateEnsemble: invalid settings:\n%s", message);
   free(message);

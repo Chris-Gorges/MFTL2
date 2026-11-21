@@ -470,23 +470,23 @@ void MFTLSortIds(int *data, int count)
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Public: key/value pair sorts (SoA). The histogram is built before any scratch
- * is allocated, so sorted or constant input never touches the allocator.
+ * Key/value pair sorts (SoA). One core per key width; the scratch is the
+ * caller's (MFTLRadixSortPairs*) or allocated here (MFTLSortPairs*). The
+ * histogram is built before any scratch is allocated, so sorted or constant
+ * input never touches the allocator.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-void MFTLSortPairs32(int *keys, int *values, int count)
+/**
+ * @brief The 32-bit pair sort, scratch from the caller or, when @p kt is NULL,
+ *        allocated here once a pass is known to run.
+ * @param keys   Keys, sorted in place.
+ * @param values Values, permuted alongside.
+ * @param kt     Key scratch of @p n elements, or NULL.
+ * @param vt     Value scratch of @p n elements (ignored when @p kt is NULL).
+ * @param n      Number of pairs, at least INSERTION_CUTOFF + 1.
+ */
+static void sort_pairs32(int *keys, int *values, int *kt, int *vt, size_t n)
 {
-  if (count < 2) return;
-  if (count <= INSERTION_CUTOFF)
-  {
-    insertion_sort_pairs32(keys, values, (size_t) count);
-    return;
-  }
-
-  MFTL_ASSERT(keys != MFTL_NULL);
-  MFTL_ASSERT(values != MFTL_NULL);
-
-  const size_t n = (size_t) count;
   uint32_t *ki = (uint32_t *) keys;
   uint32_t *vi = (uint32_t *) values;
 
@@ -496,11 +496,15 @@ void MFTLSortPairs32(int *keys, int *values, int count)
   const uint32_t active = prefix_sum_histograms(hist, PASSES_32, n, (uint64_t) ki[0], true);
   if (active == 0u) return; /* no pass to run; guards against allocating for a no-op */
 
-  uint32_t *kt = (uint32_t *) MFTLMallocOrDie(sizeof(int) * n, "MFTLSortPairs32 keys");
-  uint32_t *vt = (uint32_t *) MFTLMallocOrDie(sizeof(int) * n, "MFTLSortPairs32 values");
+  const bool own = (kt == MFTL_NULL);
+  if (own)
+  {
+    kt = (int *) MFTLMallocOrDie(sizeof(int) * n, "MFTLSortPairs32 keys");
+    vt = (int *) MFTLMallocOrDie(sizeof(int) * n, "MFTLSortPairs32 values");
+  }
 
-  uint32_t *kb[2] = {ki, kt};
-  uint32_t *vb[2] = {vi, vt};
+  uint32_t *kb[2] = {ki, (uint32_t *) kt};
+  uint32_t *vb[2] = {vi, (uint32_t *) vt};
   uint32_t cur = 0u;
   for (uint32_t b = 0; b < PASSES_32; ++b)
   {
@@ -514,26 +518,24 @@ void MFTLSortPairs32(int *keys, int *values, int count)
     memcpy(vi, vt, n * sizeof *vi);
   }
 
-  free(kt);
-  free(vt);
+  if (own)
+  {
+    free(kt);
+    free(vt);
+  }
 }
 
-/* MFTLSortPairs64 -- the Morton sort case:
- *   keys   : uint64_t Morton codes     (8 bytes each, up to 8 passes)
- *   values : int original entity index (4 bytes each, shuffled with the keys) */
-void MFTLSortPairs64(uint64_t *keys, int *values, int count)
+/**
+ * @brief The 64-bit-key pair sort (the Morton case: 63-bit codes carrying an
+ *        entity index), scratch as in sort_pairs32().
+ * @param keys   Keys, sorted in place.
+ * @param values Values, permuted alongside.
+ * @param kt     Key scratch of @p n elements, or NULL.
+ * @param vt     Value scratch of @p n elements (ignored when @p kt is NULL).
+ * @param n      Number of pairs, at least INSERTION_CUTOFF + 1.
+ */
+static void sort_pairs64(uint64_t *keys, int *values, uint64_t *kt, int *vt, size_t n)
 {
-  if (count < 2) return;
-  if (count <= INSERTION_CUTOFF)
-  {
-    insertion_sort_pairs64(keys, values, (size_t) count);
-    return;
-  }
-
-  MFTL_ASSERT(keys != MFTL_NULL);
-  MFTL_ASSERT(values != MFTL_NULL);
-
-  const size_t n = (size_t) count;
   uint32_t *vi = (uint32_t *) values;
 
   _Alignas(64) uint32_t hist[PASSES_64 * HIST_SIZE]; /* 8 KB stack */
@@ -542,11 +544,15 @@ void MFTLSortPairs64(uint64_t *keys, int *values, int count)
   const uint32_t active = prefix_sum_histograms(hist, PASSES_64, n, keys[0], false);
   if (active == 0u) return; /* no pass to run; guards against allocating for a no-op */
 
-  uint64_t *kt = (uint64_t *) MFTLMallocOrDie(sizeof(uint64_t) * n, "MFTLSortPairs64 keys");
-  uint32_t *vt = (uint32_t *) MFTLMallocOrDie(sizeof(int) * n, "MFTLSortPairs64 values");
+  const bool own = (kt == MFTL_NULL);
+  if (own)
+  {
+    kt = (uint64_t *) MFTLMallocOrDie(sizeof(uint64_t) * n, "MFTLSortPairs64 keys");
+    vt = (int *) MFTLMallocOrDie(sizeof(int) * n, "MFTLSortPairs64 values");
+  }
 
   uint64_t *kb[2] = {keys, kt};
-  uint32_t *vb[2] = {vi, vt};
+  uint32_t *vb[2] = {vi, (uint32_t *) vt};
   uint32_t cur = 0u;
   for (uint32_t b = 0; b < PASSES_64; ++b)
   {
@@ -560,6 +566,59 @@ void MFTLSortPairs64(uint64_t *keys, int *values, int count)
     memcpy(vi, vt, n * sizeof *vi);
   }
 
-  free(kt);
-  free(vt);
+  if (own)
+  {
+    free(kt);
+    free(vt);
+  }
+}
+
+void MFTLRadixSortPairs32(int *keys, int *values, int *keys_temp, int *values_temp, int count)
+{
+  if (count < 2) return;
+  if (count <= INSERTION_CUTOFF)
+  {
+    insertion_sort_pairs32(keys, values, (size_t) count);
+    return;
+  }
+  MFTL_ASSERT(keys != MFTL_NULL && values != MFTL_NULL);
+  MFTL_ASSERT(keys_temp != MFTL_NULL && values_temp != MFTL_NULL);
+  sort_pairs32(keys, values, keys_temp, values_temp, (size_t) count);
+}
+
+void MFTLRadixSortPairs64(uint64_t *keys, int *values, uint64_t *keys_temp, int *values_temp, int count)
+{
+  if (count < 2) return;
+  if (count <= INSERTION_CUTOFF)
+  {
+    insertion_sort_pairs64(keys, values, (size_t) count);
+    return;
+  }
+  MFTL_ASSERT(keys != MFTL_NULL && values != MFTL_NULL);
+  MFTL_ASSERT(keys_temp != MFTL_NULL && values_temp != MFTL_NULL);
+  sort_pairs64(keys, values, keys_temp, values_temp, (size_t) count);
+}
+
+void MFTLSortPairs32(int *keys, int *values, int count)
+{
+  if (count < 2) return;
+  if (count <= INSERTION_CUTOFF)
+  {
+    insertion_sort_pairs32(keys, values, (size_t) count);
+    return;
+  }
+  MFTL_ASSERT(keys != MFTL_NULL && values != MFTL_NULL);
+  sort_pairs32(keys, values, MFTL_NULL, MFTL_NULL, (size_t) count);
+}
+
+void MFTLSortPairs64(uint64_t *keys, int *values, int count)
+{
+  if (count < 2) return;
+  if (count <= INSERTION_CUTOFF)
+  {
+    insertion_sort_pairs64(keys, values, (size_t) count);
+    return;
+  }
+  MFTL_ASSERT(keys != MFTL_NULL && values != MFTL_NULL);
+  sort_pairs64(keys, values, MFTL_NULL, MFTL_NULL, (size_t) count);
 }

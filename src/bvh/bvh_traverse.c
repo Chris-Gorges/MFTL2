@@ -66,14 +66,7 @@ typedef struct
  */
 static inline void stack_push(pair_stack *s, int a, int b)
 {
-  if (s->size == s->capacity)
-  {
-    s->capacity *= 2;
-    node_pair *const grown = (node_pair *) MFTLMallocOrDie((size_t) s->capacity * sizeof(node_pair), "BVH traversal stack");
-    for (int i = 0; i < s->size; ++i) grown[i] = s->data[i];
-    free(s->data);
-    s->data = grown;
-  }
+  MFTL_ENSURE_CAPACITY(s->data, &s->size, &s->capacity, 1, node_pair);
   s->data[s->size].a = a;
   s->data[s->size].b = b;
   s->size++;

@@ -34,6 +34,7 @@
 #include <string.h>
 
 #include "mftl_constants.h"
+#include "mftl_memory.h"
 
 /** Longest line of settings text; a longer one is an error rather than a silent truncation. */
 #define LINE_MAX_CHARS 4096
@@ -1010,8 +1011,7 @@ int MFTLSettingsParse(MFTL_Settings *s, const char *text, const char *origin, ch
   ps.rep = &rep;
   ps.origin = origin;
   ps.section_ok = MFTL_TRUE;
-  ps.seen = (int *) calloc((size_t) MFTLSettingsKeyCount(), sizeof(int));
-  if (!ps.seen) abort();
+  ps.seen = (int *) MFTLCallocOrDie((size_t) MFTLSettingsKeyCount(), sizeof(int), "settings keys seen");
 
   const char *p = text;
   if ((unsigned char) p[0] == 0xEF && (unsigned char) p[1] == 0xBB && (unsigned char) p[2] == 0xBF) p += 3; /* UTF-8 BOM */

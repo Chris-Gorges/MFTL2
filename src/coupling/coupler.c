@@ -49,10 +49,8 @@ void MFTLCplBufPut(cpl_buf *b, const void *src, size_t n)
 {
   if (b->n + n > b->cap)
   {
-    size_t cap = b->cap ? b->cap : 256;
-    while (cap < b->n + n) cap *= 2;
-    b->data = (unsigned char *) MFTLCplRealloc(b->data, cap, "coupling buffer");
-    b->cap = cap;
+    b->cap = MFTLGrowSize(b->cap, b->n + n, 256);
+    b->data = (unsigned char *) MFTLCplRealloc(b->data, b->cap, "coupling buffer");
   }
   if (n > 0) memcpy(b->data + b->n, src, n);
   b->n += n;
@@ -61,17 +59,21 @@ void MFTLCplBufPut(cpl_buf *b, const void *src, size_t n)
 #define PUT(buf, v) MFTLCplBufPut((buf), &(v), sizeof(v))
 #define GET(data, bytes, off, v) cpl_get((data), (bytes), (off), &(v), sizeof(v))
 
-/** @brief Grows an array of @p type to hold @p need elements. */
-#define GROW(ptr, cap, need, type)                                                         \
-  do                                                                                       \
-  {                                                                                        \
-    if ((int64_t) (need) > (int64_t) (cap))                                                \
-    {                                                                                      \
-      int64_t _c = (cap) ? (cap) : 16;                                                     \
-      while (_c < (int64_t) (need)) _c *= 2;                                               \
-      (ptr) = (type *) MFTLCplRealloc((ptr), (size_t) _c * sizeof(type), "coupling"); \
-      (cap) = _c;                                                                          \
-    }                                                                                      \
+/** @brief The largest value the capacity counter @p cap can hold (`int` or `int64_t`). */
+#define CPL_CAP_MAX(cap) _Generic((cap), int: (size_t) INT_MAX, default: (size_t) INT64_MAX)
+
+/** @brief Grows an array of @p type to hold @p need elements, by MFTLGrowSize()
+ *         from 16, on the coupler's budget; never past what @p cap can count. */
+#define GROW(ptr, cap, need, type)                                           \
+  do                                                                         \
+  {                                                                          \
+    if ((int64_t) (need) > (int64_t) (cap))                                  \
+    {                                                                        \
+      size_t _c = MFTLGrowSize((size_t) (cap), (size_t) (need), 16);         \
+      if (_c > CPL_CAP_MAX(cap)) _c = (size_t) (need);                       \
+      (ptr) = (type *) MFTLCplRealloc((ptr), _c * sizeof(type), "coupling"); \
+      (cap) = _c;                                                            \
+    }                                                                        \
   } while (0)
 
 /** @brief A 63-bit bin key from three signed bin indices. */
@@ -79,20 +81,6 @@ static inline uint64_t bin_key3(int64_t x, int64_t y, int64_t z)
 {
   const int64_t off = INT64_C(1) << 20;
   return ((uint64_t) (x + off) << 42) | ((uint64_t) (y + off) << 21) | (uint64_t) (z + off);
-}
-
-static int64_t find_u64(const uint64_t *a, int64_t n, uint64_t key)
-{
-  int64_t lo = 0, hi = n;
-  while (lo < hi)
-  {
-    const int64_t m = lo + (hi - lo) / 2;
-    if (a[m] < key)
-      lo = m + 1;
-    else
-      hi = m;
-  }
-  return (lo < n && a[lo] == key) ? lo : -1;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -488,7 +476,7 @@ static void lookup_directory(MFTL_Coupler *c, const directory_lookup *queries, i
       {
         if (nd == dc)
         {
-          dc = dc ? 2 * dc : 16;
+          dc = MFTLGrowCapacityFrom(dc, nd + 1, 16);
           dest = MFTLCplRealloc(dest, (size_t) dc * sizeof(int), "directory routing");
           buf = MFTLCplRealloc(buf, (size_t) dc * sizeof(cpl_buf), "directory routing");
         }
@@ -1018,7 +1006,7 @@ static void pack_push(pack_t *pk, uint64_t key, int piece, int64_t elem, int64_t
 {
   if (pk->n == pk->cap)
   {
-    pk->cap = (pk->cap == 0) ? 64 : 2 * pk->cap;
+    pk->cap = (int64_t) MFTLGrowSize((size_t) pk->cap, (size_t) pk->n + 1, 64);
     pk->key = (uint64_t *) MFTLCplRealloc(pk->key, (size_t) pk->cap * sizeof(uint64_t), "pack");
     pk->piece = (int *) MFTLCplRealloc(pk->piece, (size_t) pk->cap * sizeof(int), "pack");
     pk->elem = (int64_t *) MFTLCplRealloc(pk->elem, (size_t) pk->cap * sizeof(int64_t), "pack");
@@ -1562,7 +1550,7 @@ static void serve(MFTL_Coupler *c, MFTL_SupportRequest *R, int requester, const 
         perm[i] = (int) i;
         k2[i] = pk.key[i];
       }
-      MFTLSortPairs64(k2, perm, (int) pk.n);
+      MFTLCplSortPairs64(k2, perm, pk.n, "pack sort");
       for (int pass = 0; pass < 2; ++pass)
       {
         for (int64_t i = 0; i < pk.n; ++i)
@@ -1856,17 +1844,14 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
   window_bin(c, R->n_loc, R->locs, R->bin);
   {
     uint64_t *keys = (uint64_t *) MFTLCplAlloc((size_t) MFTL_MAX(m.n, 1) * sizeof(uint64_t), "marker bins");
-    uint64_t *tmp = (uint64_t *) MFTLCplAlloc((size_t) MFTL_MAX(m.n, 1) * sizeof(uint64_t), "marker bins");
     for (int64_t i = 0; i < m.n; ++i)
     {
       int64_t ib[3];
       for (int k = 0; k < 3; ++k) ib[k] = (int64_t) floor((m.pos[3 * i + k] - d->global_min[k]) / R->bin[k]);
       keys[i] = bin_key3(ib[0], ib[1], ib[2]);
     }
-    MFTLRadixSort64(keys, tmp, (int) m.n);
-    int64_t nb = 0;
-    for (int64_t i = 0; i < m.n; ++i)
-      if (i == 0 || keys[i] != keys[i - 1]) keys[nb++] = keys[i];
+    MFTLCplRadixSort64(keys, m.n, "marker bins");
+    int64_t nb = MFTLUniqueU64Array(keys, m.n);
     if (migration[0] > 0.0 || migration[1] > 0.0 || migration[2] > 0.0)
     {
       /* send every bin to the ranks whose box lies within the migration
@@ -1877,13 +1862,9 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
       if (n_recv > 0)
       {
         keys = (uint64_t *) MFTLCplRealloc(keys, (size_t) (nb + n_recv) * sizeof(uint64_t), "marker bins");
-        tmp = (uint64_t *) MFTLCplRealloc(tmp, (size_t) (nb + n_recv) * sizeof(uint64_t), "marker bins");
         memcpy(keys + nb, recv, (size_t) n_recv * sizeof(uint64_t));
-        MFTLRadixSort64(keys, tmp, (int) (nb + n_recv));
-        int64_t u = 0;
-        for (int64_t i = 0; i < nb + n_recv; ++i)
-          if (i == 0 || keys[i] != keys[i - 1]) keys[u++] = keys[i];
-        nb = u;
+        MFTLCplRadixSort64(keys, nb + n_recv, "marker bins");
+        nb = MFTLUniqueU64Array(keys, nb + n_recv);
       }
       MFTLCplFree(recv);
     }
@@ -1897,7 +1878,6 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
       R->bin_idx[3 * i + 1] = (int64_t) ((keys[i] >> 21) & (uint64_t) mask) - off;
       R->bin_idx[3 * i + 2] = (int64_t) (keys[i] & (uint64_t) mask) - off;
     }
-    MFTLCplFree(tmp);
   }
   MFTLCplMarkersFree(&m);
   /* Resolution certificates over every movement envelope, then ownership
@@ -2674,12 +2654,12 @@ static int build_band(MFTL_Coupler *c, const MFTL_SupportRequest *R, int wl, rec
       while (split < n && B->route[split] != CPL_ROUTE_HALO) ++split;
       for (int64_t r = i; r < j; ++r)
       {
-        int64_t x = find_u64(B->key + seg_off, split - seg_off, recs[r].key);
+        int64_t x = MFTLSortedIndexOf64(B->key + seg_off, split - seg_off, recs[r].key);
         if (x >= 0)
           x += seg_off;
         else
         {
-          x = find_u64(B->key + split, n - split, recs[r].key);
+          x = MFTLSortedIndexOf64(B->key + split, n - split, recs[r].key);
           if (x >= 0) x += split;
         }
         dof_of_rec[r] = x;
@@ -2938,12 +2918,6 @@ static size_t band_bytes(const cpl_band *b)
   return bytes;
 }
 
-static int cmp_int(const void *a, const void *b)
-{
-  const int x = *(const int *) a, y = *(const int *) b;
-  return (x > y) - (x < y);
-}
-
 int MFTLCouplerPrepareWindow(MFTL_Coupler *c, const MFTL_SupportRequest *Rc, MFTL_CouplingWindow **out)
 {
   if (out) *out = MFTL_NULL;
@@ -2976,8 +2950,11 @@ int MFTLCouplerPrepareWindow(MFTL_Coupler *c, const MFTL_SupportRequest *Rc, MFT
     memcpy(w->reach, R->reach, 3 * (size_t) R->n_loc * (size_t) R->n_bins * sizeof(double));
     w->band = (cpl_band *) MFTLCplCalloc((size_t) R->n_loc, sizeof(cpl_band), "window bands");
 
-    /* records are sorted by (wl, key, provider, q) from the request */
-    if (R->n_rec > 1) qsort(R->rec, (size_t) R->n_rec, sizeof(rec_t), cmp_rec_key_provider);
+    /* MFTLCouplerRequestSupport() sorted the records by (wl, key, provider) and
+     * an OK status says it got that far; build_band() reorders only inside one
+     * wl slice, so they stay grouped by wl for every window built from them.
+     * Duplicates within a slice are copies of one sample, so the slice's own
+     * sort makes the band independent of the order it finds them in. */
     int64_t i = 0;
     for (int wl = 0; wl < R->n_loc && local == MFTL_COUPLING_OK; ++wl)
     {
@@ -3006,16 +2983,10 @@ int MFTLCouplerPrepareWindow(MFTL_Coupler *c, const MFTL_SupportRequest *Rc, MFT
             w->serve_peer[ns++] = B->dst_rank[s];
           }
       }
-      if (nf > 1) qsort(w->fetch_peer, (size_t) nf, sizeof(int), cmp_int);
-      if (ns > 1) qsort(w->serve_peer, (size_t) ns, sizeof(int), cmp_int);
-      int u = 0;
-      for (int x = 0; x < nf; ++x)
-        if (x == 0 || w->fetch_peer[x] != w->fetch_peer[x - 1]) w->fetch_peer[u++] = w->fetch_peer[x];
-      w->n_fetch_peers = u;
-      u = 0;
-      for (int x = 0; x < ns; ++x)
-        if (x == 0 || w->serve_peer[x] != w->serve_peer[x - 1]) w->serve_peer[u++] = w->serve_peer[x];
-      w->n_serve_peers = u;
+      MFTLCplRadixSort32(w->fetch_peer, nf, "window peers");
+      MFTLCplRadixSort32(w->serve_peer, ns, "window peers");
+      w->n_fetch_peers = MFTLUniqueIntArray(w->fetch_peer, nf);
+      w->n_serve_peers = MFTLUniqueIntArray(w->serve_peer, ns);
     }
   }
 
@@ -3151,7 +3122,7 @@ static void gather_candidates(const cpl_band *B, const MFTL_Domain *d, const dou
     for (int64_t y = b0[1]; y <= b1[1]; ++y)
       for (int64_t x = b0[0]; x <= b1[0]; ++x)
       {
-        const int64_t bi = find_u64(B->ibin_key, B->n_ibins, bin_key3(x, y, z));
+        const int64_t bi = MFTLSortedIndexOf64(B->ibin_key, B->n_ibins, bin_key3(x, y, z));
         if (bi < 0) continue;
         for (int64_t e = B->ibin_off[bi]; e < B->ibin_off[bi + 1]; ++e)
         {
@@ -3236,7 +3207,7 @@ static bool contain(const MFTL_CouplingWindow *w, const MFTL_Domain *d, const do
          * [min + i b, min + (i+1) b] can round to exclude a position an ulp
          * below its upper face that floor() put in bin i, and with no skin
          * that marker would be STALE in the window requested for it, forever. */
-        const int64_t direct_bin = find_u64(w->bin_key, w->n_bins, bin_key3(ib[0], ib[1], ib[2]));
+        const int64_t direct_bin = MFTLSortedIndexOf64(w->bin_key, w->n_bins, bin_key3(ib[0], ib[1], ib[2]));
         if (direct_bin >= 0)
         {
           *which = direct_bin;
@@ -3249,7 +3220,7 @@ static bool contain(const MFTL_CouplingWindow *w, const MFTL_Domain *d, const do
             for (int dx = 0; dx < 3; ++dx)
             {
               const int64_t cb[3] = {ib[0] + ((dx == 2) ? -1 : dx), ib[1] + ((dy == 2) ? -1 : dy), ib[2] + ((dz == 2) ? -1 : dz)};
-              const int64_t near_bin = find_u64(w->bin_key, w->n_bins, bin_key3(cb[0], cb[1], cb[2]));
+              const int64_t near_bin = MFTLSortedIndexOf64(w->bin_key, w->n_bins, bin_key3(cb[0], cb[1], cb[2]));
               if (near_bin < 0) continue;
               bool in = true;
               double lo[3];
@@ -3515,6 +3486,18 @@ static int64_t mirror_images(const MFTL_Domain *d, const cpl_location *L, const 
   return n;
 }
 
+/**
+ * @brief Room for @p need entries in the rows of a binding's location @p lp:
+ *        columns and weights, one capacity, grown by MFTLGrowSize() from 1024.
+ */
+static void reserve_row_entries(MFTL_CouplingBinding *b, int lp, int64_t *cap, int64_t need)
+{
+  if (need <= *cap) return;
+  *cap = (int64_t) MFTLGrowSize((size_t) *cap, (size_t) need, 1024);
+  b->col[lp] = (int64_t *) MFTLCplRealloc(b->col[lp], (size_t) *cap * sizeof(int64_t), "rows");
+  b->w[lp] = (double *) MFTLCplRealloc(b->w[lp], (size_t) *cap * sizeof(double), "rows");
+}
+
 /** @brief Builds every row of a binding. Local; returns the local status. */
 static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_CouplingWindow *w)
 {
@@ -3759,12 +3742,7 @@ static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_Co
       for (int64_t e = 0; e < n_real; ++e)
       {
         if (wt[e] == 0.0) continue;
-        if (ne == cap_e)
-        {
-          cap_e = (cap_e == 0) ? 1024 : 2 * cap_e;
-          b->col[lp] = (int64_t *) MFTLCplRealloc(b->col[lp], (size_t) cap_e * sizeof(int64_t), "rows");
-          b->w[lp] = (double *) MFTLCplRealloc(b->w[lp], (size_t) cap_e * sizeof(double), "rows");
-        }
+        reserve_row_entries(b, lp, &cap_e, ne + 1);
         b->col[lp][ne] = B->idof[sel[e]];
         b->w[lp][ne] = wt[e];
         ++ne;
@@ -3786,12 +3764,7 @@ static int assemble_rows(MFTL_Coupler *c, MFTL_CouplingBinding *b, const MFTL_Co
             if (b->col[lp][r] == col) at = r;
           if (at < 0)
           {
-            if (ne == cap_e)
-            {
-              cap_e = (cap_e == 0) ? 1024 : 2 * cap_e;
-              b->col[lp] = (int64_t *) MFTLCplRealloc(b->col[lp], (size_t) cap_e * sizeof(int64_t), "rows");
-              b->w[lp] = (double *) MFTLCplRealloc(b->w[lp], (size_t) cap_e * sizeof(double), "rows");
-            }
+            reserve_row_entries(b, lp, &cap_e, ne + 1);
             at = ne++;
             b->col[lp][at] = col;
             b->w[lp][at] = 0.0;
@@ -4103,7 +4076,7 @@ static int bind_stage_core(MFTL_Coupler *c, const MFTL_CouplingBinding *base, co
         const double lo = d->global_min[k] + (double) ib[k] * w->bin[k];
         if (xs[k] < lo - w->skin[k] || xs[k] > lo + w->bin[k] + w->skin[k]) in = false;
       }
-      const int64_t base_bin = find_u64(w->bin_key, w->n_bins, bin_key3(ib[0], ib[1], ib[2]));
+      const int64_t base_bin = MFTLSortedIndexOf64(w->bin_key, w->n_bins, bin_key3(ib[0], ib[1], ib[2]));
       if (in && base_bin >= 0)
       {
         memcpy(&b->pos[3 * i], xs, sizeof xs);

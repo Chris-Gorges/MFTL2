@@ -42,6 +42,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "mftl_arrayfunctions.h"
 #include "mftl_communication.h"
 #include "mftl_constants.h"
 #include "mftl_ensemble.h"
@@ -79,29 +80,6 @@ static int wall_mask(const MFTL_TopoLattice *lat, long long vkey)
   return m;
 }
 
-static int cmp_pair_ll(const void *a, const void *b)
-{
-  const long long x = ((const long long *) a)[0], y = ((const long long *) b)[0];
-  return (x > y) - (x < y);
-}
-
-/** @brief Value paired with @p key in sorted (key, value) pairs, or -1. */
-static long long find_pair(const long long *pairs, int n, long long key)
-{
-  int lo = 0, hi = n - 1;
-  while (lo <= hi)
-  {
-    const int mid = (lo + hi) / 2;
-    const long long k = pairs[2 * mid];
-    if (k == key) return pairs[2 * mid + 1];
-    if (k < key)
-      lo = mid + 1;
-    else
-      hi = mid - 1;
-  }
-  return -1;
-}
-
 /* ═══════════════════════════════════════════════════════════════════════════
  * 2. Pieces: one cluster's local soup as a scratch mesh
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -123,7 +101,8 @@ void MFTLTopoBuildPieces(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, MF
     p->vkey = (long long *) MFTLMallocOrDie((size_t) MFTL_MAX(nv, 1) * sizeof(long long), "topology piece vertex keys");
     p->label = (long long *) MFTLMallocOrDie((size_t) MFTL_MAX(nt, 1) * sizeof(long long), "topology piece labels");
     p->comp = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(nt, 1) * sizeof(int), "topology piece components");
-    p->owned_key = (long long *) MFTLMallocOrDie(2 * (size_t) MFTL_MAX(nt, 1) * sizeof(long long), "topology owned keys");
+    p->owned_key = (uint64_t *) MFTLMallocOrDie((size_t) MFTL_MAX(nt, 1) * sizeof(uint64_t), "topology owned keys");
+    p->owned_idx = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(nt, 1) * sizeof(int), "topology owned triangles");
     if (nt == 0) continue;
 
     MFTL_Object *const m = p->mesh;
@@ -167,12 +146,12 @@ void MFTLTopoBuildPieces(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, MF
     for (int t = 0; t < nt; ++t)
       if (p->tri_owner[t] == dom->rank)
       {
-        p->owned_key[2 * w] = p->tkey[t];
-        p->owned_key[2 * w + 1] = t;
+        p->owned_key[w] = (uint64_t) p->tkey[t];  // keys are unique; any total order serves the lookup
+        p->owned_idx[w] = t;
         w++;
       }
     p->n_owned = w;
-    qsort(p->owned_key, (size_t) w, 2 * sizeof(long long), cmp_pair_ll);
+    MFTLSortPairs64(p->owned_key, p->owned_idx, w);
   }
 }
 
@@ -189,6 +168,7 @@ void MFTLTopoFreePieces(MFTL_TopoPiece *pieces, int n)
     free(pieces[c].label);
     free(pieces[c].comp);
     free(pieces[c].owned_key);
+    free(pieces[c].owned_idx);
   }
 }
 
@@ -293,7 +273,8 @@ bool MFTLTopoServeLabelRequests(MFTL_TopoPiece *pieces, int n_cl, const double *
     const long long lab = (long long) req[3 * i + 2];
     tri_of[i] = -1;
     if (c < 0 || c >= n_cl || cmin[c] == MFTL_NULL) continue;
-    const int t = (int) find_pair(pieces[c].owned_key, pieces[c].n_owned, key);
+    const int64_t k = MFTLSortedIndexOf64(pieces[c].owned_key, pieces[c].n_owned, (uint64_t) key);
+    const int t = (k >= 0) ? pieces[c].owned_idx[k] : -1;
     MFTL_ASSERT(t >= 0 && "topology labelling: asked about a triangle this rank does not own");
     if (t < 0) continue;
     tri_of[i] = t;
@@ -694,7 +675,7 @@ int MFTLTopoBuildObjects(MFTL_Ensemble *ens, const MFTL_TopoLattice *lat, MFTL_T
 
       if (n_new == cap)
       {
-        cap *= 2;
+        cap = MFTLGrowCapacityFrom(cap, n_new + 1, 8);
         created = (int *) MFTLReallocOrDie(created, (size_t) cap * sizeof(int), "topology created bodies");
         vkeys = (long long **) MFTLReallocOrDie(vkeys, (size_t) cap * sizeof(long long *), "topology created vertex keys");
         tkeys = (long long **) MFTLReallocOrDie(tkeys, (size_t) cap * sizeof(long long *), "topology created triangle keys");

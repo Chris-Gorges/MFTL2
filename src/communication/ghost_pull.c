@@ -143,16 +143,7 @@ static inline int slot_of_owner(const pull_plan *pl, int owner)
   if (owner < 0 || owner >= pl->nproc) return MFTL_ERROR;
   if (pl->by_rank) return owner;
   if (!pl->global) return pl->nslot[owner];  // MFTLDomainNeighborIndex(), its range test already made
-  int lo = 0, hi = pl->n_slots;  // the global route's peers ascend
-  while (lo < hi)
-  {
-    const int mid = (lo + hi) / 2;
-    if (pl->peer[mid] < owner)
-      lo = mid + 1;
-    else
-      hi = mid;
-  }
-  return (lo < pl->n_slots && pl->peer[lo] == owner) ? lo : MFTL_ERROR;
+  return MFTLSortedIndexOf(pl->peer, pl->n_slots, owner);  // the global route's peers ascend
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -394,22 +385,8 @@ static void resolve_keys(key_index *ki, const long long *key, const pool_view *v
   {
     long long sk;
     memcpy(&sk, &rreq[(size_t) rk[j] * rq + 1], sizeof sk);
-    const uint64_t want = (uint64_t) sk;
-    int lo = 0, hi = m - 1, hit = MFTL_ERROR;
-    while (lo <= hi)
-    {
-      const int mid = lo + (hi - lo) / 2;
-      if (ki->key[mid] == want)
-      {
-        hit = ki->idx[mid];
-        break;
-      }
-      if (ki->key[mid] < want)
-        lo = mid + 1;
-      else
-        hi = mid - 1;
-    }
-    idx[j] = hit;
+    const int64_t at = MFTLSortedIndexOf64(ki->key, m, (uint64_t) sk);
+    idx[j] = (at >= 0) ? ki->idx[at] : MFTL_ERROR;
   }
 }
 

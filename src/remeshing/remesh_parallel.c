@@ -500,8 +500,7 @@ static void gid_scratch_reserve(gid_scratch *g, int b)
   if (b < 1) b = 1;
   if (b <= g->cap) return;
 
-  int cap = (g->cap > 0) ? g->cap : 8;
-  while (cap < b) cap *= 2;
+  const int cap = MFTLGrowCapacityFrom(g->cap, b, 8);
 
   free(g->local);
   free(g->base);

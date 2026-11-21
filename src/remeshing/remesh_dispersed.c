@@ -47,6 +47,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "mftl_arrayfunctions.h"
 #include "mftl_communication.h"
 #include "mftl_constants.h"
 #include "mftl_ensemble.h"
@@ -339,27 +340,13 @@ static int by_weight_desc(const void *a, const void *b)
   return (x->gid < y->gid) ? -1 : ((x->gid > y->gid) ? 1 : 0);
 }
 
-/** @brief A `(gid, dest, weight)` verdict, sorted so a holder can binary-search it. */
+/** @brief A `(gid, dest, weight)` verdict, as home publishes it. */
 typedef struct
 {
   double w;  ///< The body's balancing weight, so the receiver can price its inflow.
   int gid;  ///< Body global id.
   int dest;  ///< The rank home(gid) chose.
 } verdict;
-
-/**
- * @brief Orders verdicts by ascending body id.
- *
- * @param a First element.
- * @param b Second element.
- * @return Negative, zero or positive in the usual qsort sense.
- */
-static int by_gid_asc(const void *a, const void *b)
-{
-  const verdict *const x = (const verdict *) a;
-  const verdict *const y = (const verdict *) b;
-  return (x->gid < y->gid) ? -1 : ((x->gid > y->gid) ? 1 : 0);
-}
 
 /**
  * @brief A body's weight as the balancer counts it: the global triangle count,
@@ -860,49 +847,39 @@ static void assign_destinations(MFTL_Ensemble *ens, const MFTL_RemeshParameters 
     double *const recv = MFTLRemeshNeighborGather(dom, send, 3 * reassigned, rcount, rdispl, &n_recv);
 
     /* Everything this rank must apply: its own verdicts plus its neighbours'. A
-     * body appears at most once -- only home publishes it -- so the sorted list
-     * is a strictly increasing key and a binary search per local body resolves
-     * it in `O(local log moved)`. */
+     * body appears at most once -- only home publishes it -- so the sorted ids
+     * are strictly increasing and a binary search per local body resolves it
+     * in `O(local log moved)`. Only `(gid, dest)` is read here. */
     const int cap_all = reassigned + n_recv / 3;
-    verdict *const all = (verdict *) MFTLMallocOrDie((size_t) MFTL_MAX(cap_all, 1) * sizeof(verdict), "dispersed verdict table");
+    int *const all_gid = (int *) MFTLMallocOrDie(2 * (size_t) MFTL_MAX(cap_all, 1) * sizeof(int), "dispersed verdict table");
+    int *const all_dest = all_gid + MFTL_MAX(cap_all, 1);
     int n_all = 0;
 
-    for (int i = 0; i < reassigned; ++i) all[n_all++] = moved[i];
+    for (int i = 0; i < reassigned; ++i, ++n_all)
+    {
+      all_gid[n_all] = moved[i].gid;
+      all_dest[n_all] = moved[i].dest;
+    }
 
     for (int i = 0; i < nh.d; ++i)
     {
       if (i == nh.self) continue;  // own verdicts, already in
-      for (int j = rdispl[i]; j + 2 < rdispl[i] + rcount[i]; j += 3)
+      for (int j = rdispl[i]; j + 2 < rdispl[i] + rcount[i]; j += 3, ++n_all)
       {
-        all[n_all].gid = (int) recv[j];
-        all[n_all].dest = (int) recv[j + 1];
-        all[n_all].w = recv[j + 2];
-        n_all++;
+        all_gid[n_all] = (int) recv[j];
+        all_dest[n_all] = (int) recv[j + 1];
       }
     }
 
-    qsort(all, (size_t) n_all, sizeof(verdict), by_gid_asc);
+    MFTLSortPairs32(all_gid, all_dest, n_all);
 
     for (int o = 0; o < m->n_local; ++o)
     {
-      const int g = ens->local_objects[o]->global_id;
-      int lo = 0, hi = n_all - 1;
-      while (lo <= hi)
-      {
-        const int mid = lo + (hi - lo) / 2;
-        if (all[mid].gid == g)
-        {
-          dest[o] = all[mid].dest;
-          break;
-        }
-        if (all[mid].gid < g)
-          lo = mid + 1;
-        else
-          hi = mid - 1;
-      }
+      const int k = MFTLSortedIndexOf(all_gid, n_all, ens->local_objects[o]->global_id);
+      if (k >= 0) dest[o] = all_dest[k];
     }
 
-    free(all);
+    free(all_gid);
     free(recv);
     free(rdispl);
     free(rcount);
