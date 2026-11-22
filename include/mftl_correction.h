@@ -183,7 +183,7 @@ typedef struct MFTL_VolumeCorrectionParameters
    *        same contract as #MFTL_RemeshParameters::rim_project. #MFTL_NULL for
    *        none -- a rim vertex then only slides within the wall it lies on.
    */
-  int (*rim_project)(const MFTL_Domain *dom, double pos[3], void *user);
+  MFTL_RimProjector rim_project;
   void *rim_project_user;  ///< Passed to `rim_project`.
 } MFTL_VolumeCorrectionParameters;
 

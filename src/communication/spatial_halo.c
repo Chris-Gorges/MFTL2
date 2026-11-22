@@ -26,6 +26,7 @@
 #include "mftl_communication.h"
 
 #include <limits.h>
+#include <math.h>
 #include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,42 +43,18 @@
 #include "mftl_topology.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 1. Small helpers
- * ═══════════════════════════════════════════════════════════════════════════ */
-
-/**
- * @brief Sets a box to the empty state, i.e. the identity of a min/max merge.
- * @param[out] lo Receives +DBL_MAX on every axis.
- * @param[out] hi Receives -DBL_MAX on every axis.
- */
-static void box_clear(double *lo, double *hi)
-{
-  for (int k = 0; k < 3; ++k)
-  {
-    lo[k] = MFTL_DBL_MAX;
-    hi[k] = -MFTL_DBL_MAX;
-  }
-}
-
-/**
- * @brief Has anything been merged into this box?
- * @param lo Lower corner.
- * @param hi Upper corner.
- * @return `true` if the box is still in the state box_clear() left it in.
- */
-static inline bool box_is_empty(const double *lo, const double *hi) { return lo[0] > hi[0]; }
-
-/* ═══════════════════════════════════════════════════════════════════════════
- * EXTENTS ARE CENTRE + HALF-WIDTH, NOT MIN + MAX
+ * 1. EXTENTS ARE CENTRE + HALF-WIDTH, NOT MIN + MAX
  *
  * "Near" is the minimum-image distance between centres against the sum of
  * half-widths. A (lo, hi) box fails both ways on a periodic domain: two shares
  * touching across the seam are a domain length apart in stored coordinates (a
  * MISSED contact, decided before the BVH ever sees the triangles), and a share
  * containing one seam-straddling triangle has a box spanning the whole domain
- * (every neighbour then ships everything). A share wider than half the domain
- * degrades to a half-width above L/2, which accepts everything -- extra traffic,
- * never a miss. On a non-periodic axis the test is the plain interval test.
+ * (every neighbour then ships everything). Extents are the library's periodic
+ * extent (src/geometry/periodic_extent.c), exact for a share narrower than 3L/4;
+ * one no frame sees contiguous degrades to a half-width near L/2, which accepts
+ * everything -- extra traffic, never a miss. On a non-periodic axis the test is
+ * the plain interval test.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
@@ -112,130 +89,34 @@ static inline bool interval_overlap(const MFTL_Domain *domain, const double *ca,
 }
 
 /**
- * @brief Wraps a scalar back into [global_min, global_max) on a periodic axis.
+ * @brief The owned extent of @p obj as a centre and half-width per axis: the
+ *        library's periodic extent (MFTLPeriodicExtentAddObject(),
+ *        MFTLPeriodicExtentResolve()) of the OWNED triangles -- ghosts would
+ *        inflate it by a halo layer that their owners publish themselves.
  *
- * @param domain Supplies the bounds and sizes.
- * @param k      Axis, 0..2.
- * @param v      A coordinate.
- * @return @p v brought into `[global_min[k], global_max[k])`.
- */
-static inline double wrap_axis(const MFTL_Domain *domain, int k, double v)
-{
-  if (!domain->is_periodic[k] || domain->domain_size[k] <= 0.0) return v;
-  if (v >= domain->global_max[k]) return v - domain->domain_size[k];
-  if (v < domain->global_min[k]) return v + domain->domain_size[k];
-  return v;
-}
-
-/**
- * @brief Bounds of the OWNED triangles of @p obj (ghosts would inflate the
- *        extent by a halo layer that their owners publish themselves).
+ * Measured in four frames, so a share narrower than 3L/4 is contiguous in one of
+ * them wherever it sits on the seam; the centre comes back out of that frame
+ * and is wrapped into the box, which a (lo, hi) pair could not survive.
  *
- * @param      obj   The mesh.
- * @param[out] lo    Lower corner over the owned triangles.
- * @param[out] hi    Upper corner.
- * @param      shift Optional per-axis offset applied (with wrap) before
- *                   measuring, for the half-domain-shifted frame. May be NULL.
- */
-static void owned_bounds(const MFTL_Object *obj, double *lo, double *hi, const double *shift)
-{
-  box_clear(lo, hi);
-  if (obj == MFTL_NULL) return;
-
-  const MFTL_Domain *const domain = obj->domain;
-  const int nt = obj->tris.n_local;
-
-  for (int t = 0; t < nt; ++t)
-  {
-    double tlo[3], thi[3];
-    MFTLGetTriangleBounds(obj, t, tlo, thi);
-
-    if (shift != MFTL_NULL && domain != MFTL_NULL)
-    {
-      for (int k = 0; k < 3; ++k)
-      {
-        if (!domain->is_periodic[k] || domain->domain_size[k] <= 0.0) continue;
-
-        double moved = tlo[k] + shift[k];
-        if (moved >= domain->global_max[k])
-          moved -= domain->domain_size[k];
-        else if (moved < domain->global_min[k])
-          moved += domain->domain_size[k];
-
-        const double d = moved - tlo[k];  // what the wrap actually applied
-        tlo[k] = moved;
-        thi[k] += d;
-      }
-    }
-
-    for (int k = 0; k < 3; ++k)
-    {
-      if (tlo[k] < lo[k]) lo[k] = tlo[k];
-      if (thi[k] > hi[k]) hi[k] = thi[k];
-    }
-  }
-}
-
-/**
- * @brief The owned extent of @p obj as a centre and half-width per axis.
- *
- * Measured in two frames -- raw and displaced by half a domain -- keeping the
- * tighter per axis: a share straddling the seam is contiguous in the shifted
- * frame, one straddling the middle in the raw frame, and none can straddle both
- * while its extent is under L/2 (the minimum-image assumption). The centre of
- * the shifted frame is mapped back through the shift, which a (lo, hi) pair
- * could not survive.
- *
- * @param      obj    The mesh.
+ * @param      obj    The mesh, or #MFTL_NULL (empty).
  * @param      domain Supplies the periodicity and the domain sizes.
- * @param[out] c      Per-axis centre.
+ * @param[out] c      Per-axis centre, in the domain box.
  * @param[out] h      Per-axis half-width; negative on every axis when this rank
  *                    owns nothing of the body.
  */
 static void owned_interval(const MFTL_Object *obj, const MFTL_Domain *domain, double *c, double *h)
 {
-  double lo[3], hi[3];
-  owned_bounds(obj, lo, hi, MFTL_NULL);
-
-  if (box_is_empty(lo, hi))
-  {
-    for (int k = 0; k < 3; ++k)
-    {
-      c[k] = 0.0;
-      h[k] = -1.0;
-    }
-    return;
-  }
-
-  double half[3];
-  bool any_periodic = MFTL_FALSE;
+  double acc[MFTL_PERIODIC_EXTENT_SLOTS];
+  MFTLPeriodicExtentInit(acc);
+  if (obj != MFTL_NULL) MFTLPeriodicExtentAddObject(obj, acc);
+  MFTL_PeriodicExtent x;
+  MFTLPeriodicExtentResolve(domain, acc, &x);
   for (int k = 0; k < 3; ++k)
   {
-    half[k] = 0.5 * domain->domain_size[k];
-    if (domain->is_periodic[k] && domain->domain_size[k] > 0.0) any_periodic = MFTL_TRUE;
+    c[k] = x.empty ? 0.0 : x.centre[k];
+    h[k] = x.empty ? -1.0 : x.half[k];
   }
-
-  double slo[3], shi[3];
-  if (any_periodic) owned_bounds(obj, slo, shi, half);
-
-  for (int k = 0; k < 3; ++k)
-  {
-    double cc = 0.5 * (lo[k] + hi[k]);
-    double hh = 0.5 * (hi[k] - lo[k]);
-
-    if (any_periodic && domain->is_periodic[k] && domain->domain_size[k] > 0.0)
-    {
-      const double sh = 0.5 * (shi[k] - slo[k]);
-      if (sh < hh)
-      {
-        hh = sh;
-        cc = wrap_axis(domain, k, 0.5 * (slo[k] + shi[k]) - half[k]);  // back out of the shifted frame
-      }
-    }
-
-    c[k] = wrap_axis(domain, k, cc);
-    h[k] = hh;
-  }
+  if (!x.empty) MFTLApplyPeriodicity(domain, c);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -396,77 +277,42 @@ int MFTLSpatialHaloResolveRadii(MFTL_Ensemble *ens, MFTL_SpatialHalo *halo)
 
   const int b = ens->n_local_objects;
 
-  /* Twelve MIN slots per body: [0..2] lo, [3..5] -hi in the raw frame, [6..8]
-   * lo, [9..11] -hi in the half-domain-shifted frame (upper corners negated so
-   * every slot is a MIN). The smaller extent per axis wins, so a body on the
-   * seam does not measure as domain-wide -- which would inflate every envelope
-   * scaled by its radius and declare contacts between distant surfaces. One
-   * per-body reduction over the holders (MFTLEnsembleReduceBodies()). */
+  /* The body's periodic extent (MFTLPeriodicExtentAddObject() over the owned
+   * triangles, all MIN slots), one per-body reduction over the holders
+   * (MFTLEnsembleReduceBodies()), resolved alike on every holder. A body on the
+   * seam then does not measure as domain-wide -- which would inflate every
+   * envelope scaled by its radius and declare contacts between distant
+   * surfaces. */
   enum
   {
-    STRIDE = 12  /* [0..2] lo, [3..5] -hi, raw | [6..8] lo, [9..11] -hi, shifted */
+    STRIDE = MFTL_PERIODIC_EXTENT_SLOTS
   };
 
   MFTL_BodyReduceOp ops[STRIDE];
   for (int j = 0; j < STRIDE; ++j) ops[j] = MFTL_BODY_REDUCE_MIN;
 
   double *const val = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(b * STRIDE, 1) * sizeof(double), "spatial halo extents");
-
-  double half_domain[3];
-  for (int k = 0; k < 3; ++k) half_domain[k] = 0.5 * ens->domain.domain_size[k];
-
   for (int o = 0; o < b; ++o)
   {
-    double *const v = &val[(size_t) o * STRIDE];
-    for (int j = 0; j < STRIDE; ++j) v[j] = MFTL_DBL_MAX;
-
-    double lo[3], hi[3];
-
-    owned_bounds(ens->local_objects[o], lo, hi, MFTL_NULL);
-    if (box_is_empty(lo, hi)) continue;  /* an identity row: this rank owns nothing of it */
-    for (int k = 0; k < 3; ++k)
-    {
-      v[k] = lo[k];
-      v[3 + k] = -hi[k];
-    }
-
-    owned_bounds(ens->local_objects[o], lo, hi, half_domain);
-    for (int k = 0; k < 3; ++k)
-    {
-      v[6 + k] = lo[k];
-      v[9 + k] = -hi[k];
-    }
+    MFTLPeriodicExtentInit(&val[(size_t) o * STRIDE]);
+    MFTLPeriodicExtentAddObject(ens->local_objects[o], &val[(size_t) o * STRIDE]);  // an identity row when this rank owns nothing of it
   }
 
   MFTLEnsembleReduceBodies(ens, val, STRIDE, ops, MFTL_BODY_REDUCE_SCOPE_AUTO);
 
   for (int o = 0; o < b; ++o)
   {
-    const double *const v = &val[(size_t) o * STRIDE];
     const int e = MFTLSpatialHaloFindBody(halo, ens->local_objects[o]->global_id);
     MFTL_ASSERT(e != MFTL_ERROR && "MFTLSpatialHaloResolveRadii: halo_sync_bodies did not enter a held body");
 
-    if (v[0] == MFTL_DBL_MAX)
-    {
-      halo->global_radius[e] = 0.0;  /* every holder that reached the reduction owns nothing of it */
-      continue;
-    }
-
-    /* Half the LONGEST SIDE (not the diagonal): R for a sphere of radius R. */
-    double longest = 0.0;
-    for (int k = 0; k < 3; ++k)
-    {
-      double d = (-v[3 + k]) - v[k];
-
-      if (ens->domain.is_periodic[k] && ens->domain.domain_size[k] > 0.0)
-      {
-        const double d_shifted = (-v[9 + k]) - v[6 + k];
-        if (d_shifted < d) d = d_shifted;
-      }
-
-      if (d > longest) longest = d;
-    }
-    halo->global_radius[e] = 0.5 * longest;
+    /* Half the LONGEST SIDE (not the diagonal): R for a sphere of radius R; 0
+     * when every holder that reached the reduction owns nothing of it. */
+    MFTL_PeriodicExtent x;
+    MFTLPeriodicExtentResolve(&ens->domain, &val[(size_t) o * STRIDE], &x);
+    double radius = 0.0;
+    if (!x.empty)
+      for (int k = 0; k < 3; ++k) radius = fmax(radius, x.half[k]);
+    halo->global_radius[e] = radius;
   }
 
   free(val);
@@ -1107,11 +953,14 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
   /* ── 0. One record per held body with an owned share, ascending by id (so a
    * neighbour's block can be binary-searched). */
   double *const my_rec = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(nb, 1) * MFTL_HALO_REC * sizeof(double), "spatial halo body records");
+  /* Each body's owned extent, [centre | half] per local slot: measured once here
+   * and read again in step 5; nothing moves in between. */
+  double *const own_ext = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(nb, 1) * 6 * sizeof(double), "spatial halo owned extents");
   int n_my = 0;
 
   for (int o = 0; o < nb; ++o)
   {
-    double c[3], h[3];
+    double *const c = &own_ext[6 * (size_t) o], *const h = c + 3;
     owned_interval(ens->local_objects[o], domain, c, h);
     if (interval_is_empty(h)) continue;  // owns nothing of it: there is nothing to send and nothing to be near
 
@@ -1231,13 +1080,15 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
 
       for (int t = 0; t < nt; ++t)
       {
-        double lo[3], hi[3];
+        double lo[3], hi[3], centre[3];
         MFTLGetTriangleBounds(obj, t, lo, hi);
         for (int k = 0; k < 3; ++k)
         {
-          bx[6 * t + k] = wrap_axis(domain, k, 0.5 * (lo[k] + hi[k]));
+          centre[k] = 0.5 * (lo[k] + hi[k]);
           bx[6 * t + 3 + k] = 0.5 * (hi[k] - lo[k]);
         }
+        MFTLApplyPeriodicity(domain, centre);
+        for (int k = 0; k < 3; ++k) bx[6 * t + k] = centre[k];
       }
     }
     MPI_Wait(&rec_req, MPI_STATUS_IGNORE);
@@ -1316,8 +1167,7 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
 
       const int gb = obj->global_id;
 
-      double my_c[3], my_h[3];
-      owned_interval(obj, domain, my_c, my_h);
+      const double *const my_c = &own_ext[6 * (size_t) o], *const my_h = my_c + 3;
       if (interval_is_empty(my_h)) continue;
 
       /* Partners. NEAR: arriving records of SMALLER ids (or the same id with
@@ -1605,6 +1455,7 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
   free(nb_rec);
   free(rdispl);
   free(rcount);
+  free(own_ext);
   free(my_rec);
 
   /* Keep only bodies held here or with a patch. */

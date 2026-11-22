@@ -986,11 +986,11 @@ void MFTLSpatialHaloDestroy(MFTL_SpatialHalo **p_halo);
  *        body this rank holds, and for the bodies its graph neighbours hold.
  *
  * The GLOBAL box, so that envelopes scaled by it do not depend on the process
- * count. Each holder contributes the box of its OWNED triangles in two frames,
- * raw and shifted by half a domain, and the tighter extent per axis wins: a body
- * straddling a periodic seam is contiguous in the shifted frame and would
- * otherwise measure as domain-wide. Twelve MIN slots per body go through
- * MFTLEnsembleReduceBodies(). The result is then published one hop along
+ * count. Each holder contributes the periodic extent of its OWNED triangles
+ * (MFTLPeriodicExtentAddObject(), #MFTL_PERIODIC_EXTENT_SLOTS MIN slots per body
+ * through MFTLEnsembleReduceBodies()), resolved alike on every holder
+ * (MFTLPeriodicExtentResolve()): a body straddling a periodic seam is measured
+ * contiguous, exactly below 3L/4, instead of as domain-wide. The result is then published one hop along
  * `comm_graph`, because a rank deciding what to SEND needs the size of the body
  * it sends TOWARDS, which it may hold nothing of.
  *
@@ -1022,8 +1022,8 @@ int MFTLSpatialHaloResolveRadii(MFTL_Ensemble *ens, MFTL_SpatialHalo *halo);
  * distance between centres; a (lo, hi) box would miss contacts across a
  * periodic seam and, for any share containing one seam-straddling triangle,
  * span the whole domain and ship everything (measured at np = 27: 314 triangles
- * with boxes against 56). A rank's own extent is measured in the raw and the
- * half-domain-shifted frame and the tighter kept. The per-triangle test is
+ * with boxes against 56). A rank's own extent is the periodic extent of its
+ * owned triangles (MFTLPeriodicExtentResolve()). The per-triangle test is
  * widened by the margin and so is the body-level pre-filter, which keeps the
  * pre-filter strictly more permissive than the test it short-cuts.
  *

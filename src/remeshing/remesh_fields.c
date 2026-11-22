@@ -403,7 +403,7 @@ bool MFTLRemeshFieldSmooth(MFTL_Object *obj, const double *new_pos)
       weights[3 * v] = 1.0;
       if (memcmp(obj->verts.pos + 3 * v, new_pos + 3 * v, 3 * sizeof(double)) == 0) continue;
       int fan[MFTL_REMESH_RING_MAX];
-      const int n = MFTLGetVertexOneRingHalfedges(obj, v, fan, MFTL_REMESH_RING_MAX, false);
+      const int n = MFTLGetVertexOneRingHalfedges(obj, v, fan, MFTL_REMESH_RING_MAX, false, MFTL_NULL);
       double best = DBL_MAX;
       int best_gid = INT_MAX;
       for (int j = 0; j < n; ++j)

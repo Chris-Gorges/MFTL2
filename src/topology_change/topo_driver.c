@@ -28,6 +28,8 @@
 #include "mftl_remeshing.h"
 #include "topo_internal.h"
 
+#include "../correction/correction_internal.h"
+
 MFTL_TopologyOptions MFTLTopologyDefaultOptions(void)
 {
   MFTL_TopologyOptions o;
@@ -202,15 +204,9 @@ static void discard_collapsed(MFTL_Ensemble *ens, MFTL_TopoComponent *comps, int
 static void project_rim(MFTL_Object *obj, const MFTL_TopologyOptions *opts)
 {
   if (opts->remesh == MFTL_NULL || opts->remesh->rim_project == MFTL_NULL) return;
-  const MFTL_Domain *const dom = obj->domain;
   for (int v = 0; v < obj->verts.n; ++v)
-  {
-    if (!(obj->verts.rec[v].flags & MFTL_FLAG_BOUNDARY)) continue;
-    double q[3] = {obj->verts.pos[3 * v + 0], obj->verts.pos[3 * v + 1], obj->verts.pos[3 * v + 2]};
-    if (opts->remesh->rim_project(dom, q, opts->remesh->rim_project_user) != MFTL_SUCCESS) continue;
-    MFTLApplyPeriodicity(dom, q);
-    for (int k = 0; k < 3; ++k) obj->verts.pos[3 * v + k] = q[k];
-  }
+    if (obj->verts.rec[v].flags & MFTL_FLAG_BOUNDARY)
+      MFTLApplyRimProjector(opts->remesh->rim_project, opts->remesh->rim_project_user, obj->domain, &obj->verts.pos[3 * v]);
   MFTLObjectMarkChanged(obj);
 }
 
@@ -546,56 +542,52 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
    * after two / three Newton steps; the pinched dumbbell reaches 1e-14 after
    * three. A fixed count, so every rank runs the same collectives: a stopping
    * test on a reduced double is two ranks disagreeing in the last ulp about
-   * whether to enter another. */
+   * whether to enter another. It is MFTLEnsembleCorrectVolumes()'s Newton core
+   * (MFTLCorrectionNewtonVolumes()) with a group per cluster. */
   {
     /* The rim onto its constraint first, so the correction measures and
      * restores the volume of the surface the caller will keep. */
     for (int o = 0; o < ens->n_local_objects; ++o)
       if (came_from(comps, n_comps, ens->local_objects[o]->global_id) >= 0) project_rim(ens->local_objects[o], opts);
 
-    double *const va = (double *) MFTLMallocOrDie(2 * (size_t) MFTL_MAX(n_cl, 1) * sizeof(double), "topology volume and derivative");
-    const int n_iter = opts->conserve_volume ? 3 : 0;
-    for (int iter = 0; iter <= n_iter; ++iter)
+    const int nl = ens->n_local_objects;
+    int *const group = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(nl, 1) * sizeof(int), "topology volume groups");
+    int *const axis = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_cl, 1) * sizeof(int), "topology flux axes");
+    double *const real = (double *) MFTLMallocOrDie(7 * (size_t) MFTL_MAX(n_cl, 1) * sizeof(double), "topology volume correction");
+    double *const ref = real, *const centre = real + n_cl, *const target = real + 4 * n_cl, *const offset = real + 5 * n_cl;
+    double *const va = (double *) MFTLMallocOrDie(2 * (size_t) MFTL_MAX(n_cl, 1) * sizeof(double), "topology volumes");
+    for (int o = 0; o < nl; ++o)
     {
-      for (int i = 0; i < 2 * n_cl; ++i) va[i] = 0.0;
-      for (int o = 0; o < ens->n_local_objects; ++o)
-      {
-        MFTL_Object *const obj = ens->local_objects[o];
-        const int c = came_from(comps, n_comps, obj->global_id);
-        if (c < 0 || cl[c].flux_axis < 0) continue;
-        double v = 0.0, a = 0.0;
-        MFTLBodyFluxVolume(obj, cl[c].flux_axis, cl[c].flux_ref, cl[c].centre, &v, &a);
-        va[2 * c] += v;
-        if (iter < n_iter) va[2 * c + 1] += MFTLBodyVolumeDisplacement(obj);
-      }
-      MFTLAllreduceDoubles(dom->comm_world, va, 2 * n_cl, MFTL_REDUCE_SUM);
-
-      double total = 0.0;
-      for (int c = 0; c < n_cl; ++c)
-        if (!cl[c].refused) total += va[2 * c];
-      if (iter == 0) st->volume_raw = total;
-      st->volume_after = total;
-      if (iter == n_iter) break;
-
-      for (int o = 0; o < ens->n_local_objects; ++o)
-      {
-        MFTL_Object *const obj = ens->local_objects[o];
-        const int c = came_from(comps, n_comps, obj->global_id);
-        if (c < 0 || cl[c].flux_axis < 0 || !(va[2 * c + 1] > 0.0)) continue;
-        const double d = (cl[c].volume_old - va[2 * c]) / va[2 * c + 1];
-        for (int v = 0; v < obj->verts.n_local; ++v)
-        {
-          double *const p = &obj->verts.pos[3 * v];
-          for (int k = 0; k < 3; ++k) p[k] += d * obj->verts.normal[3 * v + k];
-          MFTLApplyPeriodicity(dom, p);
-        }
-        /* A rim vertex slid within its wall; back onto the constraint. Newton's
-         * next step measures what the projection did, so the volume still
-         * converges, at a rate the projection's share of the field sets. */
-        project_rim(obj, opts);
-      }
-      MFTLUpdateGhostPositions(ens);
+      const int c = came_from(comps, n_comps, ens->local_objects[o]->global_id);
+      group[o] = (c >= 0 && cl[c].flux_axis >= 0) ? c : -1;
     }
+    for (int c = 0; c < n_cl; ++c)
+    {
+      axis[c] = cl[c].flux_axis;
+      ref[c] = cl[c].flux_ref;
+      for (int k = 0; k < 3; ++k) centre[3 * c + k] = cl[c].centre[k];
+      target[c] = cl[c].volume_old;
+    }
+    MFTL_VolumeNewton nw = {.n_groups = n_cl, .per_body = MFTL_FALSE, .group = group, .axis = axis, .reference = ref, .centre = centre, .target = target};
+    nw.iterations = opts->conserve_volume ? 3 : 0;
+    if (opts->remesh != MFTL_NULL)
+    {
+      nw.rim_project = opts->remesh->rim_project;
+      nw.rim_project_user = opts->remesh->rim_project_user;
+    }
+    MFTLCorrectionNewtonVolumes(ens, &nw, va, offset);
+    free(real);
+    free(axis);
+    free(group);
+
+    /* va[2c]: before, va[2c+1]: after. */
+    st->volume_raw = st->volume_after = 0.0;
+    for (int c = 0; c < n_cl; ++c)
+      if (!cl[c].refused)
+      {
+        st->volume_raw += va[2 * c];
+        st->volume_after += va[2 * c + 1];
+      }
 
     /* Reference volumes handed on: each body out of a cluster gets the
      * cluster's reference total in proportion to its volume now, so the total
@@ -605,7 +597,6 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
      * only when some cluster carries a reference (agreed: the totals are). */
     if (any_reference)
     {
-      const int nl = ens->n_local_objects;
       double *const vb = (double *) MFTLCallocOrDie((size_t) MFTL_MAX(nl, 1), sizeof(double), "topology body volumes");
       for (int o = 0; o < nl; ++o)
       {
@@ -623,8 +614,8 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
         MFTL_Object *const obj = ens->local_objects[o];
         const int c = came_from(comps, n_comps, obj->global_id);
         if (c < 0) continue;
-        const bool ok = cl[c].flux_axis >= 0 && isfinite(cl[c].reference_old) && va[2 * c] != 0.0;
-        obj->reference_volume = ok ? cl[c].reference_old * (vb[o] / va[2 * c]) : NAN;
+        const bool ok = cl[c].flux_axis >= 0 && isfinite(cl[c].reference_old) && va[2 * c + 1] != 0.0;
+        obj->reference_volume = ok ? cl[c].reference_old * (vb[o] / va[2 * c + 1]) : NAN;
       }
       free(vb);
     }

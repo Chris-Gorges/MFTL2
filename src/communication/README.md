@@ -368,14 +368,15 @@ Why an extent is a centre and a half-width. One periodic axis, unrolled.
 (a) Two shares touching across the seam have disjoint $(\mathrm{lo},\mathrm{hi})$
 boxes, so the contact is missed before any triangle is compared. (b) A share
 straddling the seam has a box spanning the whole domain, so every neighbour
-ships it everything. Measured in the raw frame and in one shifted by half a
-period, keeping the tighter, the centre and half-width are right in both cases
-under the minimum image.
+ships it everything. Measured as the library's periodic extent (frames cut at
+0 and half a period, quarter frames past that), the centre and half-width are
+right in both cases under the minimum image.
 -->
 
 `MFTLSpatialHaloResolveRadii` computes each body's radius — half the longest side
 of its **global** box (so envelopes do not depend on the process count; $R$ for a
-sphere) — over the holders in two frames, and publishes it one hop further,
+sphere) — from the library's periodic extent reduced over the holders (exact below
+$3L/4$, `src/geometry/README.md`), and publishes it one hop further,
 because a rank deciding what to send needs the size of the body it sends
 *towards*. A rank two hops from a body neither receives it nor can report a
 contact with it — the same reach as the exchange.

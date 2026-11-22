@@ -97,18 +97,8 @@ static void push_event(MFTL_TopoEventList *l, const MFTL_TopologyEvent *e)
 /** @brief Unit normal and centroid of corners @p T; returns false for a degenerate triangle. */
 static bool normal_and_centre(const double T[3][3], double n[3], double c[3])
 {
-  const double e1[3] = {T[1][0] - T[0][0], T[1][1] - T[0][1], T[1][2] - T[0][2]};
-  const double e2[3] = {T[2][0] - T[0][0], T[2][1] - T[0][1], T[2][2] - T[0][2]};
-  n[0] = e1[1] * e2[2] - e1[2] * e2[1];
-  n[1] = e1[2] * e2[0] - e1[0] * e2[2];
-  n[2] = e1[0] * e2[1] - e1[1] * e2[0];
-  const double mag = sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-  if (!(mag > 0.0)) return MFTL_FALSE;
-  for (int k = 0; k < 3; ++k)
-  {
-    n[k] /= mag;
-    c[k] = (T[0][k] + T[1][k] + T[2][k]) / 3.0;
-  }
+  if (!(MFTLTriangleNormalFromCorners(T, n) > 0.0)) return MFTL_FALSE;
+  for (int k = 0; k < 3; ++k) c[k] = (T[0][k] + T[1][k] + T[2][k]) / 3.0;
   return MFTL_TRUE;
 }
 

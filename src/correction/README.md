@@ -200,9 +200,11 @@ next step measures what it did. The count is fixed so that every rank enters the
 same collectives: a stopping test on a reduced double is two ranks disagreeing in
 the last ulp.
 
-This is the topology change's cluster correction as a standalone call; both use
-MFTLBodyVolumeDisplacement(), so the arithmetic is shared and the topology digests
-are unchanged.
+This is the topology change's cluster correction as a standalone call: both run one
+Newton core over groups of bodies, a group per body here (reduced over its holders,
+against its reference volume) and a group per cluster there (reduced over all ranks,
+against the cluster's volume before the reconstruction). The step, the rim
+projection and the density rescale are therefore one implementation.
 
 ## Against mftl's `VolumeRecovery`
 

@@ -667,52 +667,6 @@ int MFTLRemeshReferenceProjectPoint(const MFTL_RemeshReference *ref, const doubl
  * 3. Projecting a mesh
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/** @brief Does @p obj carry a conservative triangle density, whose amounts a moved corner must keep? */
-static bool has_density(const MFTL_Object *obj)
-{
-  if (!obj->fields) return MFTL_FALSE;
-  for (int f = 0; f < obj->fields->n; ++f)
-    if (obj->fields->entries[f].entity == MFTL_FIELD_TRIANGLE && obj->fields->entries[f].mode == MFTL_FIELD_CONSERVATIVE_DENSITY) return MFTL_TRUE;
-  return MFTL_FALSE;
-}
-
-/** @brief Area of triangle @p t from seam-consistent corners. */
-static double triangle_area(const MFTL_Object *obj, int t)
-{
-  double T[3][3];
-  MFTLGetTriangleCorners(obj, t, T);
-  const double e1[3] = {T[1][0] - T[0][0], T[1][1] - T[0][1], T[1][2] - T[0][2]};
-  const double e2[3] = {T[2][0] - T[0][0], T[2][1] - T[0][1], T[2][2] - T[0][2]};
-  const double c[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
-  return 0.5 * sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
-}
-
-double *MFTLRemeshSnapshotDensityAreas(const MFTL_Object *obj)
-{
-  if (!has_density(obj)) return MFTL_NULL;
-  double *a = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(obj->tris.n, 1) * sizeof(double), "remesh projection areas");
-  for (int t = 0; t < obj->tris.n; ++t) a[t] = triangle_area(obj, t);
-  return a;
-}
-
-void MFTLRemeshRescaleDensities(MFTL_Object *obj, const double *area_before)
-{
-  if (area_before == MFTL_NULL) return;
-  for (int t = 0; t < obj->tris.n; ++t)
-  {
-    const double a1 = triangle_area(obj, t);
-    if (a1 == area_before[t] || !(a1 > 0.0)) continue;
-    const double factor = area_before[t] / a1;
-    for (int f = 0; f < obj->fields->n; ++f)
-    {
-      const MFTL_FieldDescriptor *const d = &obj->fields->entries[f];
-      if (d->entity != MFTL_FIELD_TRIANGLE || d->mode != MFTL_FIELD_CONSERVATIVE_DENSITY) continue;
-      double *const row = MFTLObjectField(obj, f) + (size_t) t * d->ncomp;
-      for (int c = 0; c < d->ncomp; ++c) row[c] *= factor;
-    }
-  }
-}
-
 void MFTLRemeshProjectOwned(MFTL_Object *obj, const MFTL_RemeshReference *ref, const MFTL_RemeshParameters *params, MFTL_RemeshStats *st)
 {
   const int nvl = obj->verts.n_local;
@@ -822,9 +776,9 @@ void MFTLRemeshReferenceFromObject(MFTL_RemeshReference *ref, MFTL_Object *obj, 
 
 void MFTLRemeshProjectObject(MFTL_Object *obj, const MFTL_RemeshReference *ref, const MFTL_RemeshParameters *params, MFTL_RemeshStats *st)
 {
-  double *const area0 = MFTLRemeshSnapshotDensityAreas(obj);
+  double *const area0 = MFTLObjectSnapshotDensityAreas(obj);
   MFTLRemeshProjectOwned(obj, ref, params, st);
-  MFTLRemeshRescaleDensities(obj, area0);
+  MFTLObjectRescaleDensities(obj, area0);
   free(area0);
 }
 
@@ -927,7 +881,7 @@ int MFTLRemeshEnsembleProject(MFTL_Ensemble *ens, const MFTL_RemeshReferenceSet 
   for (int o = 0; o < b; ++o)
   {
     MFTL_Object *const obj = ens->local_objects[o];
-    area0[o] = MFTLRemeshSnapshotDensityAreas(obj);
+    area0[o] = MFTLObjectSnapshotDensityAreas(obj);
     const MFTL_RemeshReference *ref = set_find(set, obj->global_id);
     if (ref == MFTL_NULL)
     {
@@ -944,7 +898,7 @@ int MFTLRemeshEnsembleProject(MFTL_Ensemble *ens, const MFTL_RemeshReferenceSet 
   const int status = MFTLUpdateGhostPositions(ens);
   for (int o = 0; o < b; ++o)
   {
-    MFTLRemeshRescaleDensities(ens->local_objects[o], area0[o]);
+    MFTLObjectRescaleDensities(ens->local_objects[o], area0[o]);
     free(area0[o]);
   }
   free(area0);

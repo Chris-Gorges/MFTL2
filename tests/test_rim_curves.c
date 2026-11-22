@@ -574,6 +574,31 @@ static int test_a_refusing_projector_freezes_the_rim(void)
   return 0;
 }
 
+/** @brief A projector that scribbles on the position, then refuses. */
+static int scribble_and_refuse(const MFTL_Domain *dom, double pos[3], void *user)
+{
+  (void) dom;
+  (void) user;
+  pos[0] = pos[1] = pos[2] = NAN;
+  return MFTL_ERROR;
+}
+
+/* Every module calls a projector through MFTLApplyRimProjector(), on a copy: a
+ * refusal leaves the caller's position as it was, whatever the function wrote,
+ * and no projector at all is a success that changes nothing. Local, no MPI, so
+ * every rank asserts it alone. */
+static int test_a_refusal_leaves_the_position_as_it_was(void)
+{
+  MFTL_Ensemble *ens = make_ens(MPI_COMM_SELF);
+  double q[3] = {0.25, -0.5, 0.125};
+  TEST_ASSERT(MFTLApplyRimProjector(scribble_and_refuse, MFTL_NULL, &ens->domain, q) == MFTL_ERROR);
+  TEST_ASSERT(q[0] == 0.25 && q[1] == -0.5 && q[2] == 0.125);
+  TEST_ASSERT(MFTLApplyRimProjector(MFTL_NULL, MFTL_NULL, &ens->domain, q) == MFTL_SUCCESS);
+  TEST_ASSERT(q[0] == 0.25 && q[1] == -0.5 && q[2] == 0.125);
+  MFTLEnsembleDestroy(&ens);
+  return 0;
+}
+
 static int test_a_closed_surface_never_reaches_the_rim(void)
 {
   MFTL_Ensemble *ens = make_ens(MPI_COMM_SELF);
@@ -678,6 +703,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_uneven_spacing_does_not_overshoot);
   RUN_TEST(test_a_rim_split_next_to_a_sliver_falls_back_to_the_chord);
   RUN_TEST(test_a_refusing_projector_freezes_the_rim);
+  RUN_TEST(test_a_refusal_leaves_the_position_as_it_was);
   RUN_TEST(test_a_closed_surface_never_reaches_the_rim);
   RUN_TEST(test_a_distributed_rim_stays_on_its_circle);
   RUN_TEST(test_ranks_disagreeing_about_the_projector_refuse_to_remesh);

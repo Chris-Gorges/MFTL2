@@ -27,6 +27,7 @@
 #include <string.h>
 
 #include "mftl_constants.h"
+#include "mftl_geometry.h"
 #include "mftl_memory.h"
 #include "mftl_topology.h"
 
@@ -579,6 +580,42 @@ double *MFTLObjectField(MFTL_Object *obj, int field_id)
 {
   if (!obj || !obj->fields || field_id < 0 || field_id >= obj->fields->n) return NULL;
   return obj->field_data[field_id];
+}
+
+/** @brief Does @p obj carry a conservative triangle density? */
+static bool has_conservative_density(const MFTL_Object *obj)
+{
+  if (!obj->fields) return MFTL_FALSE;
+  for (int f = 0; f < obj->fields->n; ++f)
+    if (obj->fields->entries[f].entity == MFTL_FIELD_TRIANGLE && obj->fields->entries[f].mode == MFTL_FIELD_CONSERVATIVE_DENSITY) return MFTL_TRUE;
+  return MFTL_FALSE;
+}
+
+double *MFTLObjectSnapshotDensityAreas(const MFTL_Object *obj)
+{
+  if (!has_conservative_density(obj)) return MFTL_NULL;
+  const int nt = obj->tris.n;
+  double *const a = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(nt, 1) * sizeof(double), "density areas");
+  for (int t = 0; t < nt; ++t) a[t] = MFTLGetTriangleArea(obj, t);
+  return a;
+}
+
+void MFTLObjectRescaleDensities(MFTL_Object *obj, const double *area_before)
+{
+  if (area_before == MFTL_NULL) return;
+  for (int t = 0; t < obj->tris.n; ++t)
+  {
+    const double a1 = MFTLGetTriangleArea(obj, t);
+    if (a1 == area_before[t] || !(a1 > 0.0)) continue;  // unmoved, or degenerate: nothing to divide by
+    const double factor = area_before[t] / a1;
+    for (int f = 0; f < obj->fields->n; ++f)
+    {
+      const MFTL_FieldDescriptor *const d = &obj->fields->entries[f];
+      if (d->entity != MFTL_FIELD_TRIANGLE || d->mode != MFTL_FIELD_CONSERVATIVE_DENSITY) continue;
+      double *const row = obj->field_data[f] + (size_t) t * d->ncomp;
+      for (int c = 0; c < d->ncomp; ++c) row[c] *= factor;
+    }
+  }
 }
 
 int MFTLObjectFieldComponents(const MFTL_Object *obj, int field_id)

@@ -121,7 +121,9 @@ static int test_one_ring_on_a_closed_mesh(void)
 
     const int nt = MFTLGetVertexOneRing(obj, v, tris, MFTL_MAX_VALENCE, MFTL_TRUE);
     const int nv = MFTLGetVertexOneRingVertices(obj, v, verts, MFTL_MAX_VALENCE, MFTL_TRUE);
-    const int nh = MFTLGetVertexOneRingHalfedges(obj, v, tris, MFTL_MAX_VALENCE, MFTL_TRUE);
+    bool open = MFTL_TRUE;
+    const int nh = MFTLGetVertexOneRingHalfedges(obj, v, tris, MFTL_MAX_VALENCE, MFTL_TRUE, &open);
+    TEST_ASSERT(!open);
 
     // Every vertex of a tetrahedron touches the three faces that are not opposite it.
     TEST_ASSERT_EQUAL_INT(3, nt);
@@ -248,10 +250,18 @@ static int test_one_ring_at_a_boundary_vertex_has_one_extra_neighbour(void)
 
     const int nt = MFTLGetVertexOneRing(obj, v, tris, MFTL_MAX_VALENCE, MFTL_FALSE);
     const int nv = MFTLGetVertexOneRingVertices(obj, v, verts, MFTL_MAX_VALENCE, MFTL_FALSE);
-    const int nh = MFTLGetVertexOneRingHalfedges(obj, v, hes, MFTL_MAX_VALENCE, MFTL_FALSE);
+    bool open = MFTL_FALSE;
+    const int nh = MFTLGetVertexOneRingHalfedges(obj, v, hes, MFTL_MAX_VALENCE, MFTL_FALSE, &open);
 
     TEST_ASSERT_EQUAL_INT(nt + 1, nv);  // one MORE neighbour than triangles
     TEST_ASSERT_EQUAL_INT(nt, nh);  // outgoing half-edges: one per triangle
+    TEST_ASSERT(open);  // every vertex of a quad is on its rim
+
+    // The is_inner shortcut walks from out_he_idx and may stop mid-fan, but
+    // still reports the fan open: what a caller refusing open fans relies on.
+    bool open_inner = MFTL_FALSE;
+    MFTLGetVertexOneRingHalfedges(obj, v, hes, MFTL_MAX_VALENCE, MFTL_TRUE, &open_inner);
+    TEST_ASSERT(open_inner);
 
     // No duplicates and no self-reference in the neighbour set.
     for (int i = 0; i < nv; ++i)

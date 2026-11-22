@@ -120,6 +120,33 @@ static inline void MFTLApplyPeriodicity(const MFTL_Domain *domain, double pos[3]
 }
 
 /**
+ * @brief Moves a rim position onto the application's constraint and wraps it:
+ *        the one place the library calls an #MFTL_RimProjector.
+ *
+ * The projector works on a copy, so a refusal leaves @p pos exactly as it was.
+ * Being pure, it gives an owner and every ghost copy of a vertex the same bits,
+ * so no ghost exchange is needed after it.
+ *
+ * @param      project The projector, or #MFTL_NULL for none.
+ * @param      user    Passed to @p project unchanged.
+ * @param      domain  The domain.
+ * @param[in,out] pos  A position on or near the rim, wrapped into the domain.
+ * @return #MFTL_SUCCESS (also without a projector), or #MFTL_ERROR when the
+ *         projector refused.
+ */
+static inline int MFTLApplyRimProjector(MFTL_RimProjector project, void *user, const MFTL_Domain *domain, double pos[3])
+{
+  if (project == MFTL_NULL) return MFTL_SUCCESS;
+  double q[3] = {pos[0], pos[1], pos[2]};
+  if (project(domain, q, user) != MFTL_SUCCESS) return MFTL_ERROR;
+  MFTLApplyPeriodicity(domain, q);
+  pos[0] = q[0];
+  pos[1] = q[1];
+  pos[2] = q[2];
+  return MFTL_SUCCESS;
+}
+
+/**
  * @brief The rank of process-grid cell (@p i, @p j, @p k): the one place the
  *        layout of `rank_map` is read.
  *
@@ -321,6 +348,36 @@ static inline void MFTLGetTriangleCorners(const MFTL_Object *obj, int t, double 
     out[1][k] = p0[k] + e1[k];
     out[2][k] = p0[k] + e2[k];
   }
+}
+
+/**
+ * @brief Unit normal of the triangle with corners @p T, counter-clockwise from
+ *        outside: \f$(\vect{e}_1\times\vect{e}_2)/\norm{\vect{e}_1\times\vect{e}_2}\f$,
+ *        with \f$\vect{e}_i = T_i - T_0\f$.
+ *
+ * For corners already in hand (MFTLGetTriangleCorners(), a BVH primitive);
+ * from a triangle index, MFTLGetTriangleNormal() saves the round trip through
+ * absolute coordinates. The normalisation is MFTLGetTriangleProperties()'s:
+ * the magnitude unclamped, the reciprocal guarded against zero only.
+ *
+ * @param      T The three corners, mutually unwrapped.
+ * @param[out] n The unit normal, or the zero vector for a zero-area triangle.
+ * @return \f$\norm{\vect{e}_1\times\vect{e}_2}\f$, twice the area: zero exactly
+ *         when @p n is.
+ */
+static inline double MFTLTriangleNormalFromCorners(const double T[3][3], double n[3])
+{
+  const double e1[3] = {T[1][0] - T[0][0], T[1][1] - T[0][1], T[1][2] - T[0][2]};
+  const double e2[3] = {T[2][0] - T[0][0], T[2][1] - T[0][1], T[2][2] - T[0][2]};
+  n[0] = e1[1] * e2[2] - e1[2] * e2[1];
+  n[1] = e1[2] * e2[0] - e1[0] * e2[2];
+  n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+  const double mag = MFTL_SQRT(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+  const double inv = (mag > 0.0) ? 1.0 / mag : 0.0;
+  n[0] *= inv;
+  n[1] *= inv;
+  n[2] *= inv;
+  return mag;
 }
 
 /**

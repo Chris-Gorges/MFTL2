@@ -58,45 +58,6 @@
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Outgoing half-edges of @p v in rotational order, plus fan openness.
- *
- * MFTLGetVertexOneRingHalfedges does the walk but does not report whether the
- * fan closed, and every caller here needs to know: on an OPEN fan there is one
- * more incident EDGE than there are outgoing half-edges, and it is reachable only
- * as the incoming half-edge prev(first). A consumer that iterates edges and does
- * not account for it silently drops one, and then misclassifies every boundary
- * vertex.
- *
- * @param      obj  The mesh.
- * @param      v    Vertex index.
- * @param[out] out  `[MFTL_REMESH_RING_MAX]` outgoing half-edges, rotational order.
- * @param[out] open Set when the fan is open, i.e. @p v is on a boundary.
- * @return Number of half-edges written, or 0 if the walk was truncated.
- */
-static int fan_halfedges(const MFTL_Object *obj, int v, int *out, bool *open)
-{
-  const int first = obj->verts.rec[v].out_he_idx;
-  *open = MFTL_FALSE;
-  if (first == MFTL_ERROR) return 0;
-
-  const int start = MFTLVertexFanStart(obj, first, open);
-
-  int count = 0;
-  int curr = start;
-  do
-  {
-    if (count >= MFTL_REMESH_RING_MAX) return MFTL_ERROR;
-    out[count++] = curr;
-
-    const int twin = obj->tris.he[curr].twin_idx;
-    if (twin == MFTL_ERROR) break;
-    curr = MFTLHeNextIdx(twin);
-  } while (curr != start);
-
-  return count;
-}
-
-/**
  * @brief The neighbour an outgoing-half-edge walk cannot reach: the closing edge
  *        of an open fan.
  *
@@ -319,7 +280,7 @@ int MFTLDetectFeatures(MFTL_Object *obj, double angle_degrees, double corner_ang
  * @param      obj         The mesh.
  * @param      v           A ridge vertex: exactly two feature edges that continue
  *                         roughly straight through it.
- * @param      fan         Outgoing half-edges of @p v, from fan_halfedges().
+ * @param      fan         Outgoing half-edges of @p v, from MFTLGetVertexOneRingHalfedges().
  * @param      n_fan       Their count.
  * @param      open        `true` when the fan is open.
  * @param      sized       Curvature sizing: the 1D form of Dunyach's rule.
@@ -411,7 +372,7 @@ static bool ridge_displacement(const MFTL_Object *obj, int v, const int *fan, in
  *
  * @param      obj    The mesh.
  * @param      v      A ridge vertex on the mesh boundary.
- * @param      fan    Outgoing half-edges of @p v, from fan_halfedges(); the last
+ * @param      fan    Outgoing half-edges of @p v, from MFTLGetVertexOneRingHalfedges(); the last
  *                    of an open fan is the outgoing rim half-edge.
  * @param      n_fan  Their count.
  * @param      params Relaxation, step fraction, corner angle, rim projector.
@@ -481,7 +442,7 @@ static bool rim_smooth_position(const MFTL_Object *obj, int v, const int *fan, i
  *
  * @param      obj         The mesh.
  * @param      v           A vertex with no feature edges.
- * @param      fan         Outgoing half-edges of @p v, from fan_halfedges().
+ * @param      fan         Outgoing half-edges of @p v, from MFTLGetVertexOneRingHalfedges().
  * @param      n_fan       Their count.
  * @param      open        `true` when the fan is open.
  * @param      mode        Which neighbourhood the target point is built from.
@@ -699,8 +660,8 @@ void MFTLRemeshSmooth(MFTL_Object *obj, const MFTL_RemeshParameters *params, int
 
       int fan[MFTL_REMESH_RING_MAX];
       bool open = MFTL_FALSE;
-      const int n_fan = fan_halfedges(obj, v, fan, &open);
-      if (n_fan <= 0) continue;  // isolated, or a fan too large to traverse
+      const int n_fan = MFTLGetVertexOneRingHalfedges(obj, v, fan, MFTL_REMESH_RING_MAX, MFTL_FALSE, &open);
+      if (n_fan <= 0 || n_fan >= MFTL_REMESH_RING_MAX) continue;  // isolated, or a fan too large to traverse
 
       /* A rim vertex moves along the rim curve, and that move is already the
        * relaxed, clamped one. */

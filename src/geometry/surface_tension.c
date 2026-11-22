@@ -138,21 +138,6 @@ static int edge_walls(const MFTL_Domain *dom, const double *a, const double *b)
   return mask;
 }
 
-/** @brief Unit normal of triangle @p t from the current positions; zero for a degenerate one. */
-static void triangle_unit_normal(const MFTL_Object *obj, int t, double u[3])
-{
-  double T[3][3];
-  MFTLGetTriangleCorners(obj, t, T);
-  const double e1[3] = {T[1][0] - T[0][0], T[1][1] - T[0][1], T[1][2] - T[0][2]};
-  const double e2[3] = {T[2][0] - T[0][0], T[2][1] - T[0][1], T[2][2] - T[0][2]};
-  const double n[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
-  const double mag = MFTL_SQRT(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
-  const double inv = (mag > 0.0) ? 1.0 / mag : 0.0;
-  u[0] = n[0] * inv;
-  u[1] = n[1] * inv;
-  u[2] = n[2] * inv;
-}
-
 /**
  * @brief \f$L\hat{\vect{m}}\f$, the length of a piece of contour times its unit
  *        outward conormal: \f$(L/|\vect{c}|)\,\vect{c}\f$ with \f$\vect{c} =
@@ -196,7 +181,7 @@ static int rim_pull(const MFTL_Object *obj, int h, MFTL_ContourNormal mode, doub
   const int walls = edge_walls(dom, xa, xb);
   if (walls == 0) return 0;
   double u[3], e[3];
-  triangle_unit_normal(obj, MFTLHeTriIdx(h), u);
+  MFTLGetTriangleNormal(obj, MFTLHeTriIdx(h), u);
   edge_vector(dom, xa, xb, e);
   if (mode == MFTL_CONTOUR_NORMAL_VERTICES)
   {

@@ -200,7 +200,7 @@ static bool rim_split_folds(const MFTL_Object *obj, int h, const double pm[3], d
   if (n_old[0] == 0.0 && n_old[1] == 0.0 && n_old[2] == 0.0) return MFTL_FALSE;  // no orientation to turn over
   tri_area_vector_substituted(obj, t, MFTLHeTarget(obj, h), MFTL_ERROR, pm, n_amc);  // B -> M: (A, M, C)
   tri_area_vector_substituted(obj, t, MFTLHeOrigin(obj, h), MFTL_ERROR, pm, n_mbc);  // A -> M: (M, B, C)
-  return area_vector_cos(n_old, n_amc) < cos_min || area_vector_cos(n_old, n_mbc) < cos_min;
+  return MFTLAreaVectorCos(n_old, n_amc) < cos_min || MFTLAreaVectorCos(n_old, n_mbc) < cos_min;
 }
 
 /**
@@ -683,7 +683,7 @@ static bool collapse_geometry_refused(const MFTL_Object *obj, int h, int a, int 
       tri_area_vector_substituted(obj, t, MFTL_ERROR, MFTL_ERROR, MFTL_NULL, n_old);
       tri_area_vector_substituted(obj, t, a, b, pm, n_new);
 
-      if (area_vector_cos(n_old, n_new) < params->max_normal_deviation_cos) return MFTL_TRUE;
+      if (MFTLAreaVectorCos(n_old, n_new) < params->max_normal_deviation_cos) return MFTL_TRUE;
     }
   }
 
@@ -898,8 +898,8 @@ int MFTLCollapseEdge(MFTL_Object *obj, int h, const MFTL_RemeshParameters *param
    * what makes the out_he repair at the end bounded and complete. */
   int fan_a[MFTL_REMESH_RING_MAX];
   int fan_b[MFTL_REMESH_RING_MAX];
-  const int n_fan_a = MFTLGetVertexOneRingHalfedges(obj, a, fan_a, MFTL_REMESH_RING_MAX, MFTL_FALSE);
-  const int n_fan_b = MFTLGetVertexOneRingHalfedges(obj, b, fan_b, MFTL_REMESH_RING_MAX, MFTL_FALSE);
+  const int n_fan_a = MFTLGetVertexOneRingHalfedges(obj, a, fan_a, MFTL_REMESH_RING_MAX, MFTL_FALSE, MFTL_NULL);
+  const int n_fan_b = MFTLGetVertexOneRingHalfedges(obj, b, fan_b, MFTL_REMESH_RING_MAX, MFTL_FALSE, MFTL_NULL);
   if (n_fan_a <= 0 || n_fan_a >= MFTL_REMESH_RING_MAX) return MFTL_ERROR;
   if (n_fan_b <= 0 || n_fan_b >= MFTL_REMESH_RING_MAX) return MFTL_ERROR;
 
@@ -1117,7 +1117,7 @@ bool MFTLFlipApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParameters
   {
     const double ref_sq = n_ref[0] * n_ref[0] + n_ref[1] * n_ref[1] + n_ref[2] * n_ref[2];
     const double parts_sq = (n1[0] * n1[0] + n1[1] * n1[1] + n1[2] * n1[2]) + (n2[0] * n2[0] + n2[1] * n2[1] + n2[2] * n2[2]);
-    if (!(ref_sq > MFTL_REMESH_DEGENERATE_SIN2 * parts_sq)) n_ref[0] = n_ref[1] = n_ref[2] = 0.0;
+    if (!(ref_sq > MFTL_VERYVERYSMALL * parts_sq)) n_ref[0] = n_ref[1] = n_ref[2] = 0.0;
   }
 
   const double *pa = MFTLVertexPos(obj, va);
@@ -1137,10 +1137,10 @@ bool MFTLFlipApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParameters
 
   double m1[3];
   double m2[3];
-  fold_area_vector(ad, ac, m1);
-  fold_area_vector(db, dc, m2);
+  MFTLFoldAreaVector(ad, ac, m1);
+  MFTLFoldAreaVector(db, dc, m2);
 
-  if (area_vector_cos(n_ref, m1) < params->max_normal_deviation_cos || area_vector_cos(n_ref, m2) < params->max_normal_deviation_cos)
+  if (MFTLAreaVectorCos(n_ref, m1) < params->max_normal_deviation_cos || MFTLAreaVectorCos(n_ref, m2) < params->max_normal_deviation_cos)
   {
     if (reject_reason) *reject_reason = MFTL_REMESH_REJECT_FOLD;
     return MFTL_FALSE;

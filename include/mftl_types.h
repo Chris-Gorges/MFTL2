@@ -428,6 +428,32 @@ typedef struct MFTL_Domain
   double grid_factors[3];  ///< cuts[i] / domain_size[i], so owner lookup is a multiply.
 } MFTL_Domain;
 
+/**
+ * @brief Moves a position onto the constraint of an open surface's rim.
+ *
+ * Supplied by the application through MFTL_RemeshParameters::rim_project (and
+ * the same function through MFTL_VolumeCorrectionParameters::rim_project) when
+ * its rim lies on something the rim's own vertices describe only approximately
+ * -- a nozzle circle (which the rim curve already reproduces), a curved support.
+ * Without one the remesher already places rim vertices on the curve through the
+ * rim's own vertices, and on any planar domain wall to the bit; the projector
+ * removes what interpolating the rim's own vertices cannot know.
+ *
+ * Contract: a PURE function of its arguments and the same function on every
+ * rank. Owner and ghost copies are then projected to the same bits with no
+ * message, which is what lets the library apply it wherever it places a rim
+ * vertex. The library calls it only through MFTLApplyRimProjector(), on a copy:
+ * a refusal leaves the caller's position as it was, whatever the function wrote.
+ *
+ * @param dom      The domain.
+ * @param[in,out] pos A position on or near the rim, wrapped into the domain;
+ *                 moved onto the constraint in place.
+ * @param user     MFTL_RemeshParameters::rim_project_user.
+ * @return #MFTL_SUCCESS, or #MFTL_ERROR to refuse: the split or collapse that
+ *         wanted the position is not made, the smoothing move not taken.
+ */
+typedef int (*MFTL_RimProjector)(const MFTL_Domain *dom, double pos[3], void *user);
+
 //------------------------------------------------------------------------------
 // The Ensemble (the library handle)
 //------------------------------------------------------------------------------

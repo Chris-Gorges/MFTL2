@@ -1100,9 +1100,9 @@ static void plain_ensemble(double side, bool periodic)
  * contact would be declared between surfaces nowhere near each other, and the
  * error grows with the domain rather than staying bounded.
  *
- * MFTLSpatialHaloResolveRadii measures each body in two frames, raw and shifted
- * by half a domain, and keeps the smaller extent. This asserts the straddling
- * body comes out the same size as the identical body in the interior.
+ * MFTLSpatialHaloResolveRadii measures each body's periodic extent (frames cut
+ * at 0, L/2 and the quarters, MFTLPeriodicExtentResolve()). This asserts the
+ * straddling body comes out the same size as the identical body in the interior.
  */
 static int test_a_seam_straddling_body_is_not_measured_as_domain_sized(void)
 {

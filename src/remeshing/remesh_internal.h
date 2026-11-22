@@ -32,6 +32,7 @@
 #include "mftl_object.h"
 #include "mftl_topology.h"
 #include "mftl_types.h"
+#include "mftl_vectoroperations.h"
 
 /**
  * @brief One-ring scratch buffer size.
@@ -225,41 +226,6 @@ static inline int remesh_new_triangle(MFTL_Object *obj)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 /**
- * @brief Squared sine of a corner angle at or below which a fold test treats the
- *        triangle as degenerate.
- *
- * DIMENSIONLESS, so the verdict is the same at every length scale. An absolute
- * threshold on the squared area vector (dimension L^4, compared with 1e-15)
- * refused every collapse and flip for edges below about 1.8e-4 -- a millimetre
- * droplet in SI units -- so the mesh could only be refined
- * (`test_remeshing_is_independent_of_the_length_unit`). 1e-15 as a ratio is the
- * floor below which the cross product is rounding noise.
- */
-#define MFTL_REMESH_DEGENERATE_SIN2 MFTL_VERYVERYSMALL
-
-/**
- * @brief \f$\vect{e}_1 \times \vect{e}_2\f$, or the zero vector when the
- *        triangle the two edges span is degenerate.
- *
- * The zero vector is the "not computable" sentinel area_vector_cos() rejects, so
- * a degenerate triangle fails a fold test exactly as an inverted one does.
- *
- * @param      e1  First edge vector.
- * @param      e2  Second edge vector, from the same corner.
- * @param[out] out The cross product, or zero.
- */
-static inline void fold_area_vector(const double e1[3], const double e2[3], double out[3])
-{
-  out[0] = e1[1] * e2[2] - e1[2] * e2[1];
-  out[1] = e1[2] * e2[0] - e1[0] * e2[2];
-  out[2] = e1[0] * e2[1] - e1[1] * e2[0];
-
-  const double cr_sq = out[0] * out[0] + out[1] * out[1] + out[2] * out[2];
-  const double ref = (e1[0] * e1[0] + e1[1] * e1[1] + e1[2] * e1[2]) * (e2[0] * e2[0] + e2[1] * e2[1] + e2[2] * e2[2]);
-  if (!(cr_sq > MFTL_REMESH_DEGENERATE_SIN2 * ref)) out[0] = out[1] = out[2] = 0.0;
-}
-
-/**
  * @brief Twice the area vector of triangle @p t, optionally with one or two of
  *        its corners moved to @p sub_pos.
  *
@@ -270,7 +236,7 @@ static inline void fold_area_vector(const double e1[3], const double e2[3], doub
  * @param      sub_pos Position both substituted corners take.
  * @param[out] out     \f$\vect{e}_1 \times \vect{e}_2\f$, un-normalised, so its
  *                     magnitude is twice the area -- or zero when the
- *                     triangle is degenerate (fold_area_vector()).
+ *                     triangle is degenerate (MFTLFoldAreaVector()).
  *
  * The substitution is what makes a fold-over test possible without editing the
  * mesh first: an operator asks "what would this triangle's normal be afterwards"
@@ -295,27 +261,7 @@ static inline void tri_area_vector_substituted(const MFTL_Object *obj, int t, in
   double e2[3];
   MFTLGetMinimumImageVector(obj->domain, e1, p[0], p[1]);
   MFTLGetMinimumImageVector(obj->domain, e2, p[0], p[2]);
-  fold_area_vector(e1, e2, out);
-}
-
-/**
- * @brief cos of the angle between two area vectors, 0 if either is zero.
- *
- * Returning 0 rather than 1 for a degenerate input is what makes this usable as
- * a rejection test: an operation that produces a zero-area triangle should fail
- * the same threshold an inverting one fails, not pass it by accident. WHAT counts
- * as degenerate is decided where the vector is built, relative to its own edges
- * (fold_area_vector()); here the test is against zero, which has no length scale.
- *
- * @param a First area vector.
- * @param b Second area vector.
- * @return \f$\cos\theta\f$ between them, or 0 if either is zero.
- */
-static inline double area_vector_cos(const double a[3], const double b[3])
-{
-  const double den = MFTL_SQRT((a[0] * a[0] + a[1] * a[1] + a[2] * a[2]) * (b[0] * b[0] + b[1] * b[1] + b[2] * b[2]));
-  if (!(den > 0.0)) return 0.0;
-  return (a[0] * b[0] + a[1] * b[1] + a[2] * b[2]) / den;
+  MFTLFoldAreaVector(e1, e2, out);
 }
 
 /**
@@ -393,18 +339,16 @@ double MFTLRemeshRimStraightDot(const MFTL_RemeshParameters *params);
 bool MFTLRemeshRimCurvePoint(const MFTL_Object *obj, int h, double f, double straight_dot, double out[3]);
 
 /**
- * @brief Applies the caller's rim projector, if any, and wraps.
+ * @brief MFTLApplyRimProjector() with the projector of @p params.
  * @param      params The parameters, or #MFTL_NULL.
  * @param      dom    The domain.
- * @param[in,out] pos A rim position.
+ * @param[in,out] pos A rim position; unchanged when the projector refuses.
  * @return #MFTL_SUCCESS, or #MFTL_ERROR when the projector refused.
  */
 static inline int rim_project(const MFTL_RemeshParameters *params, const MFTL_Domain *dom, double pos[3])
 {
-  if (params == MFTL_NULL || params->rim_project == MFTL_NULL) return MFTL_SUCCESS;
-  if (params->rim_project(dom, pos, params->rim_project_user) != MFTL_SUCCESS) return MFTL_ERROR;
-  MFTLApplyPeriodicity(dom, pos);
-  return MFTL_SUCCESS;
+  if (params == MFTL_NULL) return MFTL_SUCCESS;
+  return MFTLApplyRimProjector(params->rim_project, params->rim_project_user, dom, pos);
 }
 
 /**
@@ -675,21 +619,6 @@ void MFTLRemeshReferenceFromObject(MFTL_RemeshReference *ref, MFTL_Object *obj, 
  * @param[in,out] st     Statistics; may be #MFTL_NULL.
  */
 void MFTLRemeshProjectObject(MFTL_Object *obj, const MFTL_RemeshReference *ref, const MFTL_RemeshParameters *params, MFTL_RemeshStats *st);
-
-/**
- * @brief Areas of every triangle, if @p obj carries a conservative density.
- * @param obj The mesh.
- * @return `[tris.n]` areas to free, or #MFTL_NULL when there is no density.
- */
-double *MFTLRemeshSnapshotDensityAreas(const MFTL_Object *obj);
-
-/**
- * @brief Rescales every conservative density by old area over new area, so each
- *        triangle keeps its amount. A no-op for #MFTL_NULL.
- * @param obj         The mesh.
- * @param area_before From MFTLRemeshSnapshotDensityAreas().
- */
-void MFTLRemeshRescaleDensities(MFTL_Object *obj, const double *area_before);
 
 /**
  * @brief The distributed reference of one spanning call, on the canonical

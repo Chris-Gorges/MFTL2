@@ -22,8 +22,10 @@
  * One vertex (MFTLComputeVertexNormalAt()) is that gather, for a caller that
  * edits the mesh between two normals and would find a whole-pool pass stale
  * after its first edit (the remesher's placement fit). Both take a corner's
- * angle from corner_angle() and the fit from fit_normal(), so each rule is
- * written once; the two differ only in the order of the sum.
+ * angle from MFTLGeomCornerAngle() and the fit from fit_normal(), so each rule
+ * is written once; the two differ only in the order of the sum. The face term
+ * of the scatter, the frame and the ring samples of the fit are
+ * geometry_internal.h's, shared with the curvature (vertex_curvature.c).
  *
  * The FIT normal gathers in both: a least-squares system is per vertex by
  * nature. Its frame is the area-weighted normal, the cheapest: which weighting
@@ -38,38 +40,19 @@
 #include <stdbool.h>
 #include <string.h>
 
+#include "geometry_internal.h"
 #include "mftl_constants.h"
 #include "mftl_object.h"
 #include "mftl_topology.h"
 #include "mftl_types.h"
+#include "mftl_vectoroperations.h"
 
 /** Longest fan a walk follows: the remesher's ring bound, since a vertex under edit can exceed a finished mesh's valence. */
 #define FAN_WALK_MAX (2 * MFTL_MAX_VALENCE)
 
 /**
- * @brief The interior angle of a corner whose two edges have cross product of
- *        length @p mag and dot product @p dot: `atan2(mag, dot)`.
- *
- * Both arguments carry the same factor |e1||e2|, so the edges need no
- * normalising, and `atan2` is well conditioned for every angle, unlike `acos`
- * of the normalised dot product near 0 and \f$\pi\f$.
- *
- * @param mag \f$\norm{\vect{e}_1\times\vect{e}_2}\f$, positive.
- * @param dot \f$\vect{e}_1\cdot\vect{e}_2\f$.
- * @return The angle in \f$(0, \pi)\f$.
- */
-static inline double corner_angle(double mag, double dot) { return atan2(mag, dot); }
-
-/**
- * @brief Scatters every face's weighted normal into its three corners.
- *
- * AREA adds the unnormalised normal \f$\vect{e}_1\times\vect{e}_2 =
- * 2A\hat{\vect{n}}\f$ itself. ANGLE adds \f$\alpha\hat{\vect{n}}\f$; all three
- * corners share \f$s = \norm{\vect{e}_1\times\vect{e}_2}\f$, and with
- * \f$d_{ij} = \vect{e}_i\cdot\vect{e}_j\f$ the dot products of the two edges
- * at corners 0, 1, 2 are \f$d_{12}\f$, \f$d_{11} - d_{12}\f$ and
- * \f$d_{22} - d_{12}\f$. A zero-area face has no unit normal and is skipped
- * (under AREA it adds zero).
+ * @brief Scatters every face's weighted normal into its three corners, by
+ *        MFTLGeomFaceNormalTerm().
  *
  * @param obj       The mesh. `verts.normal` is accumulated into; the caller zeroes it.
  * @param weighting #MFTL_NORMAL_WEIGHT_AREA or #MFTL_NORMAL_WEIGHT_ANGLE.
@@ -83,41 +66,18 @@ static void scatter_face_normals(MFTL_Object *obj, MFTL_NormalWeighting weightin
   // clang-format off
   MFTL_FOREACH_TRIANGLE_GEOMETRY(
       obj, n_tris,
-    double nx = e1y * e2z - e1z * e2y;
-    double ny = e1z * e2x - e1x * e2z;
-    double nz = e1x * e2y - e1y * e2x;
-    double a0 = 1.0, a1 = 1.0, a2 = 1.0;
-    if (angle)
-    {
-      const double mag = MFTL_SQRT(nx * nx + ny * ny + nz * nz);
-      if (!(mag > 0.0)) continue;
-      const double inv = 1.0 / mag;
-      nx *= inv, ny *= inv, nz *= inv;
-      const double d12 = e1x * e2x + e1y * e2y + e1z * e2z;
-      const double d11 = e1x * e1x + e1y * e1y + e1z * e1z;
-      const double d22 = e2x * e2x + e2y * e2y + e2z * e2z;
-      a0 = corner_angle(mag, d12);
-      a1 = corner_angle(mag, d11 - d12);
-      a2 = corner_angle(mag, d22 - d12);
-    }
-
-    vn[3 * v0 + 0] += a0 * nx;
-    vn[3 * v0 + 1] += a0 * ny;
-    vn[3 * v0 + 2] += a0 * nz;
-
-    vn[3 * v1 + 0] += a1 * nx;
-    vn[3 * v1 + 1] += a1 * ny;
-    vn[3 * v1 + 2] += a1 * nz;
-
-    vn[3 * v2 + 0] += a2 * nx;
-    vn[3 * v2 + 1] += a2 * ny;
-    vn[3 * v2 + 2] += a2 * nz;);
+    const double e1[3] = {e1x, e1y, e1z};
+    const double e2[3] = {e2x, e2y, e2z};
+    double n[3], w[3];
+    MFTLVectorCrossVector(n, e1, e2);
+    if (!MFTLGeomFaceNormalTerm(angle, e1, e2, n, w)) continue;
+    MFTLGeomAddFaceNormal(vn, 3, v0, v1, v2, n, w););
   // clang-format on
 }
 
 /**
  * @brief Adds what the face (v, a, b) contributes to the normal of its corner
- *        v, by the rule of scatter_face_normals().
+ *        v: corner 0 of MFTLGeomFaceNormalTerm(), one `atan2` instead of three.
  *
  * @param obj   The mesh.
  * @param p     Position of v.
@@ -138,36 +98,20 @@ static void add_face(const MFTL_Object *obj, const double p[3], int a, int b, bo
   else
     for (int k = 0; k < 3; ++k) d1[k] = pa[k] - p[k], d2[k] = pb[k] - p[k];
 
-  double c[3] = {d1[1] * d2[2] - d1[2] * d2[1], d1[2] * d2[0] - d1[0] * d2[2], d1[0] * d2[1] - d1[1] * d2[0]};
+  double c[3];
+  MFTLVectorCrossVector(c, d1, d2);
   double s = 1.0;
   if (angle)
   {
-    const double mag = MFTL_SQRT(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+    const double mag = MFTL_SQRT(MFTLVectorNormSq(c));
     if (!(mag > 0.0)) return;
     const double inv = 1.0 / mag;
     c[0] *= inv, c[1] *= inv, c[2] *= inv;
-    s = corner_angle(mag, d1[0] * d2[0] + d1[1] * d2[1] + d1[2] * d2[2]);
+    s = MFTLGeomCornerAngle(mag, MFTLVectorInProd(d1, d2));
   }
   n[0] += s * c[0];
   n[1] += s * c[1];
   n[2] += s * c[2];
-}
-
-/**
- * @brief Scales a vector to unit length in place; the zero vector stays zero.
- *
- * The guard is a test against ZERO, not a small constant, so that no length
- * unit can zero the normals of a valid mesh.
- *
- * @param n The vector.
- */
-static inline void normalise(double n[3])
-{
-  const double len_sq = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
-  const double inv = (len_sq > 0.0) ? 1.0 / MFTL_SQRT(len_sq) : 0.0;
-  n[0] *= inv;
-  n[1] *= inv;
-  n[2] *= inv;
 }
 
 /** Relative rank tolerance of the fit (the placement's value, src/remeshing/remesh_fit.c). */
@@ -191,43 +135,18 @@ static inline void normalise(double n[3])
  */
 static void fit_normal(const MFTL_Object *obj, int v, double n[3])
 {
-  if (!(n[0] * n[0] + n[1] * n[1] + n[2] * n[2] > 0.0)) return;
+  if (!(MFTLVectorNormSq(n) > 0.0)) return;
 
   int ring[MFTL_MAX_VALENCE + 1];
   const int nr = MFTLGetVertexOneRingVertices(obj, v, ring, MFTL_MAX_VALENCE + 1, MFTL_FALSE);
   if (nr < 3) return;
 
-  /* Tangent frame from the axis n is least aligned with: depends on n only. */
-  int a = 0;
-  if (fabs(n[1]) < fabs(n[a])) a = 1;
-  if (fabs(n[2]) < fabs(n[a])) a = 2;
-  double t1[3] = {-n[a] * n[0], -n[a] * n[1], -n[a] * n[2]};
-  t1[a] += 1.0;
-  normalise(t1);
-  const double t2[3] = {n[1] * t1[2] - n[2] * t1[1], n[2] * t1[0] - n[0] * t1[2], n[0] * t1[1] - n[1] * t1[0]};
+  double t1[3], t2[3];
+  MFTLGeomTangentFrame(n, t1, t2);
 
   double pts[3 * (MFTL_MAX_VALENCE + 2)], w[MFTL_MAX_VALENCE + 2];
-  pts[0] = pts[1] = pts[2] = 0.0;
-  w[0] = 1.0;
-  const double *const xv = MFTLVertexPos(obj, v);
-  double h2 = 0.0;
-  for (int i = 0; i < nr; ++i)
-  {
-    double d[3];
-    const double *const xj = MFTLVertexPos(obj, ring[i]);
-    if (obj->domain != MFTL_NULL)
-      MFTLGetMinimumImageVector(obj->domain, d, xv, xj);
-    else
-      d[0] = xj[0] - xv[0], d[1] = xj[1] - xv[1], d[2] = xj[2] - xv[2];
-    h2 += d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-    pts[3 * (i + 1) + 0] = d[0] * t1[0] + d[1] * t1[1] + d[2] * t1[2];
-    pts[3 * (i + 1) + 1] = d[0] * t2[0] + d[1] * t2[1] + d[2] * t2[2];
-    pts[3 * (i + 1) + 2] = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
-    w[i + 1] = 1.0;
-  }
-  if (!(h2 > 0.0)) return;
-  const double hinv = 1.0 / MFTL_SQRT(h2 / (double) nr);
-  for (int i = 3; i < 3 * (nr + 1); ++i) pts[i] *= hinv;
+  if (!(MFTLGeomRingSamples(obj, v, n, t1, t2, ring, nr, pts) > 0.0)) return;
+  for (int i = 0; i <= nr; ++i) w[i] = 1.0;
 
   double c[6];
   unsigned char kept[6];
@@ -236,8 +155,8 @@ static void fit_normal(const MFTL_Object *obj, int v, double n[3])
 
   /* Slopes are dimensionless: the scaling of the coordinates does not reach them. */
   double m[3] = {n[0] - c[1] * t1[0] - c[2] * t2[0], n[1] - c[1] * t1[1] - c[2] * t2[1], n[2] - c[1] * t1[2] - c[2] * t2[2]};
-  normalise(m);
-  if (!(m[0] * n[0] + m[1] * n[1] + m[2] * n[2] > FIT_NORMAL_MIN_COS)) return;  // also refuses a zero m
+  MFTLNormalizeVector(m);
+  if (!(MFTLVectorInProd(m, n) > FIT_NORMAL_MIN_COS)) return;  // also refuses a zero m
   n[0] = m[0];
   n[1] = m[1];
   n[2] = m[2];
@@ -258,7 +177,7 @@ void MFTLComputeVertexNormals(MFTL_Object *obj, MFTL_NormalWeighting weighting)
 
   /* FIT starts from the area weighting: its frame. */
   scatter_face_normals(obj, (weighting == MFTL_NORMAL_WEIGHT_ANGLE) ? MFTL_NORMAL_WEIGHT_ANGLE : MFTL_NORMAL_WEIGHT_AREA);
-  for (int v = 0; v < obj->verts.n; ++v) normalise(&vn[3 * v]);
+  for (int v = 0; v < obj->verts.n; ++v) MFTLNormalizeVector(&vn[3 * v]);
   if (weighting == MFTL_NORMAL_WEIGHT_FIT)
     for (int v = 0; v < obj->verts.n; ++v) fit_normal(obj, v, &vn[3 * v]);
 }
@@ -302,7 +221,7 @@ bool MFTLComputeVertexNormalAt(const MFTL_Object *obj, int v, MFTL_NormalWeighti
     }
   }
 
-  normalise(n);
+  MFTLNormalizeVector(n);
   if (weighting == MFTL_NORMAL_WEIGHT_FIT) fit_normal(obj, v, n);
   return closed;
 }

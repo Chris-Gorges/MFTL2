@@ -49,6 +49,8 @@
 
 #include "correction_internal.h"
 
+#include "../object/fields_internal.h"
+
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,6 +62,7 @@
 #include "mftl_memory.h"
 #include "mftl_object.h"
 #include "mftl_topology.h"
+#include "mftl_vectoroperations.h"
 
 /** @cond INTERNAL */
 
@@ -86,17 +89,6 @@ typedef struct
   double max_disp;
 } und_counts;
 
-/* ── Small vector helpers ──────────────────────────────────────────────────── */
-
-static inline void cross3(double out[3], const double u[3], const double v[3])
-{
-  out[0] = u[1] * v[2] - u[2] * v[1];
-  out[1] = u[2] * v[0] - u[0] * v[2];
-  out[2] = u[0] * v[1] - u[1] * v[0];
-}
-
-static inline double dot3(const double u[3], const double v[3]) { return u[0] * v[0] + u[1] * v[1] + u[2] * v[2]; }
-
 /* ── Classification ────────────────────────────────────────────────────────── */
 
 static void classify(const MFTL_Object *obj, unsigned char *cls)
@@ -120,21 +112,13 @@ static void classify(const MFTL_Object *obj, unsigned char *cls)
   }
 }
 
-/* The outgoing half-edges of v, and whether its fan is closed. */
+/* The outgoing half-edges of v if its fan is closed and fits, else 0. A closed
+ * fan needs no rewind: the walk starts at out_he_idx. */
 static int closed_fan(const MFTL_Object *obj, int v, int *fan)
 {
-  const int start = obj->verts.rec[v].out_he_idx;
-  if (start == MFTL_ERROR) return 0;
-  int n = 0, h = start;
-  do
-  {
-    if (n >= MFTL_UND_RING_MAX) return 0;
-    fan[n++] = h;
-    const int twin = obj->tris.he[h].twin_idx;
-    if (twin == MFTL_ERROR) return 0;
-    h = MFTLHeNextIdx(twin);
-  } while (h != start);
-  return n;
+  bool open = MFTL_FALSE;
+  const int n = MFTLGetVertexOneRingHalfedges(obj, v, fan, MFTL_UND_RING_MAX, MFTL_TRUE, &open);
+  return (open || n >= MFTL_UND_RING_MAX) ? 0 : n;
 }
 
 /* ── The edge operation ────────────────────────────────────────────────────── */
@@ -145,8 +129,9 @@ static inline void rel(const MFTL_Object *obj, const double *origin, int x, doub
   MFTLGetMinimumImageVector(obj->domain, out, origin, &obj->verts.pos[3 * x]);
 }
 
-/* Sum of the fan normals of the vertex whose outgoing half-edges are `fan`,
- * with the vertex at P0 and the other end `other` at Q (all relative to a). */
+/* Sum of the fan's cross products (X - P0) x (Y - P0) -- twice its vector area --
+ * for the vertex whose outgoing half-edges are `fan`, with the vertex at P0 and
+ * the other end `other` (MFTL_ERROR for none) at Q, all relative to a. */
 static void fan_normal(const MFTL_Object *obj, const double *pa, const int *fan, int n, const double P0[3], int other, const double Q[3], double out[3])
 {
   out[0] = out[1] = out[2] = 0.0;
@@ -167,13 +152,16 @@ static void fan_normal(const MFTL_Object *obj, const double *pa, const int *fan,
       e1[k] = X[k] - P0[k];
       e2[k] = Y[k] - P0[k];
     }
-    cross3(c, e1, e2);
+    MFTLVectorCrossVector(c, e1, e2);
     for (int k = 0; k < 3; ++k) out[k] += c[k];
   }
 }
 
 /* Whether moving the fan's apex from P to P + dP n, and `other` from Q to
- * Q + dQ n, turns any triangle of the fan over. */
+ * Q + dQ n, turns any triangle of the fan over -- or leaves it, or finds it,
+ * degenerate relative to its own edges: the remesher's fold rule
+ * (MFTLFoldAreaVector(), zero for a degenerate triangle) at zero deviation,
+ * where the sign of MFTLAreaVectorCos() is the sign of the dot product. */
 static bool fan_folds(const MFTL_Object *obj, const double *pa, const int *fan, int n, const double P[3], double dP, int other, const double Q[3], double dQ,
                       const double nrm[3])
 {
@@ -200,35 +188,25 @@ static bool fan_folds(const MFTL_Object *obj, const double *pa, const int *fan, 
       e1[k] = X[k] - P[k];
       e2[k] = Y[k] - P[k];
     }
-    cross3(c0, e1, e2);
+    MFTLFoldAreaVector(e1, e2, c0);
     for (int k = 0; k < 3; ++k)
     {
       e1[k] = X1[k] - P1[k];
       e2[k] = Y1[k] - P1[k];
     }
-    cross3(c1, e1, e2);
-    if (!(dot3(c0, c1) > 0.0)) return MFTL_TRUE;
+    MFTLFoldAreaVector(e1, e2, c1);
+    if (!(MFTLVectorInProd(c0, c1) > 0.0)) return MFTL_TRUE;
   }
   return MFTL_FALSE;
 }
 
-/* Vector area of a closed fan: half the sum of (X - P) x (Y - P) over its link edges. */
+/* Vector area of a closed fan with its apex at P: half of fan_normal() with
+ * nothing substituted (the halving is exact, so it is the same bits as summing
+ * halves). */
 static void fan_area_vector(const MFTL_Object *obj, const double *pa, const int *fan, int n, const double P[3], double out[3])
 {
-  out[0] = out[1] = out[2] = 0.0;
-  for (int j = 0; j < n; ++j)
-  {
-    double X[3], Y[3], e1[3], e2[3], c[3];
-    rel(obj, pa, MFTLHeTarget(obj, fan[j]), X);
-    rel(obj, pa, MFTLHeTarget(obj, MFTLHeNextIdx(fan[j])), Y);
-    for (int k = 0; k < 3; ++k)
-    {
-      e1[k] = X[k] - P[k];
-      e2[k] = Y[k] - P[k];
-    }
-    cross3(c, e1, e2);
-    for (int k = 0; k < 3; ++k) out[k] += 0.5 * c[k];
-  }
+  fan_normal(obj, pa, fan, n, P, MFTL_ERROR, P, out);
+  for (int k = 0; k < 3; ++k) out[k] *= 0.5;
 }
 
 static int tsur_edge(MFTL_Object *obj, int h, double tan_min, double relaxation, double *disp)
@@ -268,25 +246,25 @@ static int tsur_edge(MFTL_Object *obj, int h, double tan_min, double relaxation,
   double nA[3], nB[3], n[3];
   fan_normal(obj, pa, fa, na, cA, b, cB, nA);
   fan_normal(obj, pa, fb, nb, cB, a, cA, nB);
-  const double lA = sqrt(dot3(nA, nA)), lB = sqrt(dot3(nB, nB));
+  const double lA = sqrt(MFTLVectorInProd(nA, nA)), lB = sqrt(MFTLVectorInProd(nB, nB));
   if (!(lA > 0.0) || !(lB > 0.0)) return OP_REFUSED;
   for (int k = 0; k < 3; ++k) n[k] = nA[k] / lA + nB[k] / lB;
-  const double ln = sqrt(dot3(n, n));
+  const double ln = sqrt(MFTLVectorInProd(n, n));
   if (!(ln > 0.0)) return OP_REFUSED;
   for (int k = 0; k < 3; ++k) n[k] /= ln;
 
   /* Heights about the midpoint, and the kink. */
-  const double bn = dot3(B, n);
+  const double bn = MFTLVectorInProd(B, n);
   double bt[3];
   for (int k = 0; k < 3; ++k) bt[k] = B[k] - bn * n[k];
-  if (!(fabs(bn) > tan_min * sqrt(dot3(bt, bt)))) return OP_FLAT;
+  if (!(fabs(bn) > tan_min * sqrt(MFTLVectorInProd(bt, bt)))) return OP_FLAT;
   const double hA = -0.5 * bn, hB = 0.5 * bn;
 
   /* Projected fan areas; positive unless a fan is folded against n. */
   double SA[3], SB[3];
   fan_area_vector(obj, pa, fa, na, A, SA);
   fan_area_vector(obj, pa, fb, nb, B, SB);
-  const double PA = dot3(n, SA), PB = dot3(n, SB);
+  const double PA = MFTLVectorInProd(n, SA), PB = MFTLVectorInProd(n, SB);
   if (!(PA > 0.0) || !(PB > 0.0)) return OP_REFUSED;
 
   const double hc = (hA * PA + hB * PB) / (PA + PB);
@@ -384,12 +362,12 @@ int MFTLRemoveUndulationsObject(MFTL_Object *obj, const MFTL_UndulationParameter
   const double tan_min = tan(p->min_angle * MFTL_PI / 180.0);
   unsigned char *const cls = (unsigned char *) MFTLMallocOrDie((size_t) obj->verts.n, "undulation: vertex classes");
   classify(obj, cls);
-  double *const area0 = MFTLCorrectionSnapshotAreas(obj);
+  double *const area0 = MFTLObjectSnapshotDensityAreas(obj);
 
   und_counts c = {0};
   for (int s = 0; s < p->sweeps; ++s) sweep_pass(obj, cls, 0, tan_min, p->relaxation, &c);
 
-  MFTLCorrectionRescaleDensities(obj, area0);
+  MFTLObjectRescaleDensities(obj, area0);
   free(area0);
   free(cls);
   if (c.moved > 0)
@@ -452,7 +430,7 @@ int MFTLEnsembleRemoveUndulations(MFTL_Ensemble *ens, const MFTL_UndulationParam
     cls[o] = (unsigned char *) MFTLMallocOrDie((size_t) MFTL_MAX(obj->verts.n, 1), "undulation: vertex classes");
     classify(obj, cls[o]);
     for (int v = 0; v < obj->verts.n_local && !any_shared; ++v) any_shared = cls[o][v] == CLS_SHARED;
-    area0[o] = MFTLCorrectionSnapshotAreas(obj);
+    area0[o] = MFTLObjectSnapshotDensityAreas(obj);
   }
 
   /* The colours, and which of them have work anywhere: one Allreduce per call. */
@@ -486,7 +464,7 @@ int MFTLEnsembleRemoveUndulations(MFTL_Ensemble *ens, const MFTL_UndulationParam
   for (int o = 0; o < nb; ++o)
   {
     MFTL_Object *const obj = ens->local_objects[o];
-    MFTLCorrectionRescaleDensities(obj, area0[o]);
+    MFTLObjectRescaleDensities(obj, area0[o]);
     free(area0[o]);
     free(cls[o]);
     obj->derived &= ~MFTL_DERIVED_GEOMETRY;

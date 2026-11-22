@@ -95,6 +95,54 @@ static inline void MFTLVectorCrossVector(double out[3], const double v1[3], cons
   out[2] = v1[0] * v2[1] - v1[1] * v2[0];
 }
 
+/**
+ * @brief \f$\vect{e}_1 \times \vect{e}_2\f$ for a fold test, or the zero vector
+ *        when the triangle the two edges span is degenerate.
+ *
+ * Degenerate means \f$\norm{\vect{e}_1\times\vect{e}_2}^2 \le
+ * \varepsilon\,\norm{\vect{e}_1}^2\norm{\vect{e}_2}^2\f$ with
+ * \f$\varepsilon\f$ = #MFTL_VERYVERYSMALL: a squared sine, DIMENSIONLESS, so
+ * the verdict is the same at every length scale. An absolute threshold on the
+ * squared area vector (dimension L^4) refused every remeshing collapse and flip
+ * for edges below about 1.8e-4 -- a millimetre droplet in SI units
+ * (`test_remeshing_is_independent_of_the_length_unit`); 1e-15 as a ratio is the
+ * floor below which the cross product is rounding noise.
+ *
+ * The zero vector is the "not computable" sentinel MFTLAreaVectorCos() rejects,
+ * so a degenerate triangle fails a fold test exactly as an inverted one does.
+ * The remesher's operators and the undulation removal test folds with it.
+ *
+ * @param      e1  First edge vector.
+ * @param      e2  Second edge vector, from the same corner.
+ * @param[out] out The cross product, or zero. Must not alias @p e1 or @p e2.
+ */
+static inline void MFTLFoldAreaVector(const double e1[3], const double e2[3], double out[3])
+{
+  MFTLVectorCrossVector(out, e1, e2);
+  if (!(MFTLVectorNormSq(out) > MFTL_VERYVERYSMALL * (MFTLVectorNormSq(e1) * MFTLVectorNormSq(e2)))) out[0] = out[1] = out[2] = 0.0;
+}
+
+/**
+ * @brief cos of the angle between two area vectors, 0 if either is zero.
+ *
+ * Returning 0 rather than 1 for a degenerate input is what makes this usable as
+ * a rejection test: an operation that produces a zero-area triangle fails the
+ * same threshold an inverting one fails, not passes it by accident. WHAT counts
+ * as degenerate is decided where the vector is built, relative to its own edges
+ * (MFTLFoldAreaVector()); here the test is against zero, which has no length
+ * scale.
+ *
+ * @param a First area vector.
+ * @param b Second area vector.
+ * @return \f$\cos\theta\f$ between them, or 0 if either is zero.
+ */
+static inline double MFTLAreaVectorCos(const double a[3], const double b[3])
+{
+  const double den = MFTL_SQRT(MFTLVectorNormSq(a) * MFTLVectorNormSq(b));
+  if (!(den > 0.0)) return 0.0;
+  return MFTLVectorInProd(a, b) / den;
+}
+
 #ifdef __cplusplus
 }
 #endif

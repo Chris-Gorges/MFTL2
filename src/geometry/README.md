@@ -421,7 +421,7 @@ less than $3L/4$, so every extent that code got right is reproduced to the bit
 | topology change (`MFTLTopoResolveExtents`) | window, nearest-image volume | exact | covering: whole-axis window, axis not used for the flux; no axis left = `n_clusters_unmeasured` |
 | `MFTLEnsembleCheckPeriodicExtents` | the rule | reported, `MFTL_ERROR` | counted in `n_covering` |
 | remesher (`MFTLRemeshMeasureBodies`) | circular-mean centre, strategy choice only | unaffected: operators are local | unaffected |
-| spatial halo | two-frame share extents, a CONSERVATIVE send decision | over-sends, never misses | over-sends |
+| spatial halo (`MFTLSpatialHaloResolveRadii`, the share extents) | envelope radius; a CONSERVATIVE send decision | exact | over-sends, never misses |
 
 The two-frame measurement silently skipped the topology change's volume
 correction for a closed body straddling both of its cuts on every axis: every

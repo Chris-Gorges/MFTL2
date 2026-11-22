@@ -84,6 +84,37 @@ static inline void MFTLFieldsRecord(const MFTL_Object *obj, int entity, int slot
   }
 }
 
+/**
+ * @brief The area of every triangle of @p obj, owned and ghost, before a NORMAL
+ *        motion of its vertices -- or #MFTL_NULL when it carries no
+ *        conservative triangle density, and then MFTLObjectRescaleDensities()
+ *        does nothing.
+ *
+ * A motion that changes no connectivity carries no material across an edge, so
+ * a #MFTL_FIELD_CONSERVATIVE_DENSITY keeps its AMOUNT per triangle,
+ * rho_new A_new = rho A. Each operation of a call conserves it, so the
+ * composite is one rescale at the end, however many operations touched a
+ * triangle. The volume corrections and the remesher's projection use it.
+ *
+ * @param obj The mesh; current `tris.verts` or half-edges.
+ * @return `[tris.n]` areas (MFTLGetTriangleArea()), to be freed with free().
+ */
+double *MFTLObjectSnapshotDensityAreas(const MFTL_Object *obj);
+
+/**
+ * @brief Density *= A_before / A_now on every triangle whose area changed.
+ *
+ * Owned and ghost alike: every holder gathers a triangle's corners in the same
+ * order from the same (synchronised) positions, so the factor has the same bits
+ * on the owner and on every copy, and no field exchange is needed. A triangle
+ * whose corners did not move has the same area to the bit and is left alone;
+ * one with zero area now is left alone too (nothing to divide by).
+ *
+ * @param obj         The mesh.
+ * @param area_before From MFTLObjectSnapshotDensityAreas(); #MFTL_NULL does nothing.
+ */
+void MFTLObjectRescaleDensities(MFTL_Object *obj, const double *area_before);
+
 /** @brief Maximum persistent row width, for existing permutation scratch.
  * @param obj Mesh.
  * @param minimum Built-in row width in bytes.

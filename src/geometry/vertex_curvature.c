@@ -39,6 +39,7 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
+#include "geometry_internal.h"
 #include "mftl_constants.h"
 #include "mftl_memory.h"
 #include "mftl_object.h"
@@ -53,7 +54,7 @@
 enum
 {
   ACC_LAP = 0,  // [3] sum (cot alpha + cot beta)(x_i - x_j) = 2 grad A
-  ACC_NRM = 3,  // [3] sum (e1 x e2): the area-weighted normal, unnormalised
+  ACC_NRM = 3,  // [3] the AREA vertex normal, unnormalised: MFTLComputeVertexNormals()'s sum, to the bit
   ACC_ANGLE = 6,  // sum of the corner angles
   ACC_AREA = 7,  // the MIXED area
   ACC_STRIDE = 8
@@ -63,6 +64,11 @@ enum
  * @brief One pass over every triangle the rank holds: the cotangent
  *        Laplacian, the area-weighted normal, the angle sum and the mixed area
  *        of every vertex.
+ *
+ * The normal and the corner angles are the vertex normals' rules
+ * (MFTLGeomFaceNormalTerm(), MFTLGeomCornerAngle(), geometry_internal.h),
+ * fused into this pass because a second scatter over the triangles for the
+ * normal alone costs a third of the kappa-only pass.
  *
  * @param obj    The mesh; current `tris.verts`.
  * @param angles Whether to accumulate the angle sums (three `atan2` per
@@ -78,22 +84,22 @@ static void scatter_cotan(const MFTL_Object *obj, bool angles, double *restrict 
     /* Corner 0 at p0, edges e1 = p1 - p0 and e2 = p2 - p0; c = p2 - p1 is the
      * edge opposite corner 0. Every corner shares |e1 x e2| = 2A, so a
      * cotangent is a dot product over it. */
+    const double e1[3] = {e1x, e1y, e1z};
+    const double e2[3] = {e2x, e2y, e2z};
     const double cx = e2x - e1x, cy = e2y - e1y, cz = e2z - e1z;
-    const double nx = e1y * e2z - e1z * e2y;
-    const double ny = e1z * e2x - e1x * e2z;
-    const double nz = e1x * e2y - e1y * e2x;
-    const double mag = MFTL_SQRT(nx * nx + ny * ny + nz * nz);
+    double nrm[3];
+    MFTLVectorCrossVector(nrm, e1, e2);
+    const double mag = MFTL_SQRT(MFTLVectorNormSq(nrm));
     if (!(mag > 0.0)) continue;  // a degenerate face has no angles to give
 
     const double l1 = e1x * e1x + e1y * e1y + e1z * e1z;  // |p1 - p0|^2
     const double l2 = e2x * e2x + e2y * e2y + e2z * e2z;  // |p2 - p0|^2
     const double lc = cx * cx + cy * cy + cz * cz;  // |p2 - p1|^2
 
-    /* Dot products of the two edges AT each corner: 0 (e1, e2), 1 (-e1, c),
-     * 2 (-e2, -c). Negative means obtuse there -- an exact sign test. */
-    const double d0 = e1x * e2x + e1y * e2y + e1z * e2z;
-    const double d1 = -(e1x * cx + e1y * cy + e1z * cz);
-    const double d2 = e2x * cx + e2y * cy + e2z * cz;
+    /* Dot products of the two edges AT each corner. */
+    double dc[3];
+    MFTLGeomCornerDots(e1, e2, dc);
+    const double d0 = dc[0], d1 = dc[1], d2 = dc[2];
 
     const double inv = 1.0 / mag;
     const double cot0 = d0 * inv, cot1 = d1 * inv, cot2 = d2 * inv;
@@ -114,22 +120,16 @@ static void scatter_cotan(const MFTL_Object *obj, bool angles, double *restrict 
     a2[ACC_LAP + 1] += cot0 * cy + cot1 * e2y;
     a2[ACC_LAP + 2] += cot0 * cz + cot1 * e2z;
 
-    /* e1 x e2 = 2 A n_hat: accumulating it raw IS area weighting. */
-    a0[ACC_NRM + 0] += nx;
-    a0[ACC_NRM + 1] += ny;
-    a0[ACC_NRM + 2] += nz;
-    a1[ACC_NRM + 0] += nx;
-    a1[ACC_NRM + 1] += ny;
-    a1[ACC_NRM + 2] += nz;
-    a2[ACC_NRM + 0] += nx;
-    a2[ACC_NRM + 1] += ny;
-    a2[ACC_NRM + 2] += nz;
+    /* The AREA vertex normal's own term and scatter. */
+    double w[3];
+    MFTLGeomFaceNormalTerm(MFTL_FALSE, e1, e2, nrm, w);
+    MFTLGeomAddFaceNormal(acc + ACC_NRM, ACC_STRIDE, v0, v1, v2, nrm, w);
 
     if (angles)
     {
-      a0[ACC_ANGLE] += atan2(mag, d0);
-      a1[ACC_ANGLE] += atan2(mag, d1);
-      a2[ACC_ANGLE] += atan2(mag, d2);
+      a0[ACC_ANGLE] += MFTLGeomCornerAngle(mag, d0);
+      a1[ACC_ANGLE] += MFTLGeomCornerAngle(mag, d1);
+      a2[ACC_ANGLE] += MFTLGeomCornerAngle(mag, d2);
     }
 
     /* The MIXED area (Meyer et al., Fig. 4): the Voronoi share where the
@@ -177,30 +177,6 @@ static inline void min_image(const MFTL_Domain *dom, const double *a, const doub
     out[1] = b[1] - a[1];
     out[2] = b[2] - a[2];
   }
-}
-
-/**
- * @brief An orthonormal tangent frame for the unit normal @p n: @p t1 is the
- *        coordinate axis @p n is least aligned with, made orthogonal to it,
- *        and @p t2 = n x t1. Depends on the direction of @p n only.
- */
-static void tangent_frame(const double n[3], double t1[3], double t2[3])
-{
-  int a = 0;
-  if (fabs(n[1]) < fabs(n[a])) a = 1;
-  if (fabs(n[2]) < fabs(n[a])) a = 2;
-  t1[0] = -n[a] * n[0];
-  t1[1] = -n[a] * n[1];
-  t1[2] = -n[a] * n[2];
-  t1[a] += 1.0;
-  const double m = MFTL_SQRT(t1[0] * t1[0] + t1[1] * t1[1] + t1[2] * t1[2]);
-  const double inv = (m > 0.0) ? 1.0 / m : 0.0;
-  t1[0] *= inv;
-  t1[1] *= inv;
-  t1[2] *= inv;
-  t2[0] = n[1] * t1[2] - n[2] * t1[1];
-  t2[1] = n[2] * t1[0] - n[0] * t1[2];
-  t2[2] = n[0] * t1[1] - n[1] * t1[0];
 }
 
 /**
@@ -253,7 +229,7 @@ static void write_scalars(double *rec, int ncomp, double kappa, double gauss)
 static void cotan_direction(const MFTL_Object *obj, int v, const double n[3], double kappa, double dir[3])
 {
   double t1[3], t2[3];
-  tangent_frame(n, t1, t2);
+  MFTLGeomTangentFrame(n, t1, t2);
   dir[0] = t1[0];
   dir[1] = t1[1];
   dir[2] = t1[2];
@@ -391,7 +367,7 @@ static bool fit_record(const MFTL_Object *obj, int v, int ncomp, double *rec)
   if (nr < 3) return MFTL_FALSE;
 
   double t1[3], t2[3];
-  tangent_frame(n, t1, t2);
+  MFTLGeomTangentFrame(n, t1, t2);
 
   enum
   {
@@ -400,28 +376,18 @@ static bool fit_record(const MFTL_Object *obj, int v, int ncomp, double *rec)
   double pts[3 * MAX_SAMPLES], slopes[2 * MAX_SAMPLES], w[MAX_SAMPLES];
   unsigned char use[MAX_SAMPLES];
 
-  /* Sample 0: the vertex, on its own tangent plane. */
-  pts[0] = pts[1] = pts[2] = 0.0;
+  /* Sample 0: the vertex, on its own tangent plane; positions in units of the
+   * ring's RMS edge, so heights and slopes are both O(1). */
+  const double hinv = MFTLGeomRingSamples(obj, v, n, t1, t2, ring, nr, pts);
+  if (!(hinv > 0.0)) return MFTL_FALSE;
   slopes[0] = slopes[1] = 0.0;
   use[0] = 1;
   w[0] = 1.0;
 
-  const MFTL_Domain *const dom = obj->domain;
-  const double *const xv = MFTLVertexPos(obj, v);
-  double h2 = 0.0;
   int n_slopes = 0;
   for (int i = 0; i < nr; ++i)
   {
-    const int j = ring[i];
-    double d[3];
-    min_image(dom, xv, MFTLVertexPos(obj, j), d);
-    h2 += d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-    double *const p = &pts[3 * (i + 1)];
-    p[0] = d[0] * t1[0] + d[1] * t1[1] + d[2] * t1[2];
-    p[1] = d[0] * t2[0] + d[1] * t2[1] + d[2] * t2[2];
-    p[2] = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
-
-    const double *const nj = &obj->verts.normal[3 * j];
+    const double *const nj = &obj->verts.normal[3 * ring[i]];
     const double nz = nj[0] * n[0] + nj[1] * n[1] + nj[2] * n[2];
     const double nn = MFTL_SQRT(nj[0] * nj[0] + nj[1] * nj[1] + nj[2] * nj[2]);
     use[i + 1] = (unsigned char) (nz > CURVATURE_FIT_MIN_COS * nn);
@@ -437,11 +403,7 @@ static bool fit_record(const MFTL_Object *obj, int v, int ncomp, double *rec)
   }
   /* Neighbours whose normals turn away from this vertex's by more than 75
    * degrees say the frame is wrong (a fold), not that the surface is curved. */
-  if (!(h2 > 0.0) || n_slopes < 3) return MFTL_FALSE;
-
-  /* Lengths in units of the RMS edge: heights and slopes both O(1). */
-  const double hs = MFTL_SQRT(h2 / (double) nr), hinv = 1.0 / hs;
-  for (int i = 3; i < 3 * (nr + 1); ++i) pts[i] *= hinv;
+  if (n_slopes < 3) return MFTL_FALSE;
 
   double c[6];
   unsigned char kept[6];

@@ -583,21 +583,32 @@ static inline int MFTLGetVertexOneRingVertices(const MFTL_Object *obj, int v, in
 }
 
 /**
- * @brief The OUTGOING half-edges of vertex @p v, one per incident triangle.
+ * @brief The OUTGOING half-edges of vertex @p v, one per incident triangle, and
+ *        whether its fan is open.
  *
  * @param      obj      The mesh.
  * @param      v        Vertex pool index.
  * @param[out] out_he   Buffer for the outgoing half-edge indices.
- * @param      max_he   Capacity of @p out_he.
- * @param      is_inner `true` if the 1-ring is known to be closed: skips the rewind.
- * @return One index per incident triangle.
+ * @param      max_he   Capacity of @p out_he. Overflow asserts in Debug and
+ *                      truncates in Release: a return of @p max_he means the fan
+ *                      may not have fitted.
+ * @param      is_inner `true` if the 1-ring is known to be closed: skips the
+ *                      rewind. On an open fan the walk then starts mid-fan and
+ *                      stops at its first boundary, so the list is partial --
+ *                      but @p open_fan still says the fan is open, which is all
+ *                      a caller refusing open fans needs.
+ * @param[out] open_fan Set to whether the walk ended at a half-edge without a
+ *                      twin, i.e. the fan is open (@p v is on a boundary of this
+ *                      partition). May be #MFTL_NULL.
+ * @return One index per incident triangle (a partial list, see @p is_inner).
  *
  * @warning On an open fan this is one FEWER than the incident EDGES: the closing
  *          edge exists only as the incoming half-edge `MFTLHePrevIdx(first)`.
  *          Edge iterations must use MFTLGetVertexOneRingVertices() or add it.
  */
-static inline int MFTLGetVertexOneRingHalfedges(const MFTL_Object *obj, int v, int *out_he, int max_he, bool is_inner)
+static inline int MFTLGetVertexOneRingHalfedges(const MFTL_Object *obj, int v, int *out_he, int max_he, bool is_inner, bool *open_fan)
 {
+  if (open_fan) *open_fan = MFTL_FALSE;
   int start = obj->verts.rec[v].out_he_idx;
   if (start == MFTL_ERROR) return 0;
 
@@ -613,7 +624,11 @@ static inline int MFTLGetVertexOneRingHalfedges(const MFTL_Object *obj, int v, i
     out_he[count++] = curr;
 
     const int twin = obj->tris.he[curr].twin_idx;
-    if (twin == MFTL_ERROR) break;
+    if (twin == MFTL_ERROR)
+    {
+      if (open_fan) *open_fan = MFTL_TRUE;
+      break;
+    }
     curr = MFTLHeNextIdx(twin);
   } while (curr != start);
 
