@@ -21,6 +21,7 @@
 #include <string.h>
 
 #include "mftl_constants.h"
+#include "mftl_communication.h"
 #include "mftl_geometry.h"
 #include "mftl_memory.h"
 #include "mftl_object.h"
@@ -259,11 +260,10 @@ static int publish_bodies(MFTL_Domain *domain, MFTL_Object *const *objects, int 
   if (domain == MFTL_NULL || (n > 0 && objects == MFTL_NULL)) return MFTL_ERROR;
   if (n <= 0) return MFTL_SUCCESS;
 
-  /* One allocation, two slices: [3n counters | 2n local counts | 2n global]. */
-  int *const buf = (int *) MFTLMallocOrDie((size_t) (7 * n) * sizeof(int), "generated body publication");
+  /* One allocation, two slices: [3n counters | 2n counts, local in, global out]. */
+  int *const buf = (int *) MFTLMallocOrDie((size_t) (5 * n) * sizeof(int), "generated body publication");
   int *const gids = buf;
-  int *const local_counts = buf + 3 * n;
-  int *const global_counts = buf + 5 * n;
+  int *const counts = buf + 3 * n;
 
   for (int o = 0; o < n; ++o)
   {
@@ -274,12 +274,12 @@ static int publish_bodies(MFTL_Domain *domain, MFTL_Object *const *objects, int 
     gids[3 * o + 2] = obj->next_halfedge_gid;
 
     /* Ownership is a prefix: n_local is the owned count. */
-    local_counts[2 * o + 0] = obj->tris.n_local;
-    local_counts[2 * o + 1] = obj->verts.n_local;
+    counts[2 * o + 0] = obj->tris.n_local;
+    counts[2 * o + 1] = obj->verts.n_local;
   }
 
   MPI_Bcast(gids, 3 * n, MPI_INT, 0, domain->comm_world);
-  MPI_Allreduce(local_counts, global_counts, 2 * n, MPI_INT, MPI_SUM, domain->comm_world);
+  MFTLAllreduceInts(domain->comm_world, counts, 2 * n, MFTL_REDUCE_SUM);
 
   for (int o = 0; o < n; ++o)
   {
@@ -288,8 +288,8 @@ static int publish_bodies(MFTL_Domain *domain, MFTL_Object *const *objects, int 
     obj->next_triangle_gid = gids[3 * o + 1];
     obj->next_halfedge_gid = gids[3 * o + 2];
 
-    obj->global_n_triangles = global_counts[2 * o + 0];
-    obj->global_n_vertices = global_counts[2 * o + 1];
+    obj->global_n_triangles = counts[2 * o + 0];
+    obj->global_n_vertices = counts[2 * o + 1];
   }
 
   free(buf);

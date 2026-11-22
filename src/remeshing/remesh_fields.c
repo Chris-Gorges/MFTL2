@@ -16,8 +16,9 @@ static double area_points(const MFTL_Object *obj, const double *a, const double 
   double u[3], v[3];
   MFTLGetMinimumImageVector(obj->domain, u, a, b);
   MFTLGetMinimumImageVector(obj->domain, v, a, c);
-  const double x = u[1] * v[2] - u[2] * v[1], y = u[2] * v[0] - u[0] * v[2], z = u[0] * v[1] - u[1] * v[0];
-  return 0.5 * sqrt(x * x + y * y + z * z);
+  double cr[3];
+  MFTLVectorCrossVector(cr, u, v);
+  return 0.5 * MFTLVectorNorm(cr);
 }
 
 double MFTLRemeshFieldArea(const MFTL_Object *obj, const int corners[3], const double point[3])

@@ -34,6 +34,17 @@
 #include "mftl_topology.h"
 #include "mftl_types.h"
 
+/** @cond INTERNAL */
+/** @brief The area vector \f$\tfrac12(T_1-T_0)\times(T_2-T_0)\f$ of mutually unwrapped corners. */
+static inline void area_vector(const double T[3][3], double S[3])
+{
+  const double e1[3] = {T[1][0] - T[0][0], T[1][1] - T[0][1], T[1][2] - T[0][2]};
+  const double e2[3] = {T[2][0] - T[0][0], T[2][1] - T[0][1], T[2][2] - T[0][2]};
+  MFTLVectorCrossVector(S, e1, e2);
+  for (int k = 0; k < 3; ++k) S[k] *= 0.5;
+}
+/** @endcond */
+
 int MFTLBodyRimWalls(const MFTL_Object *obj, bool *off_wall, int *n_rim)
 {
   const MFTL_Domain *const dom = obj->domain;
@@ -74,10 +85,9 @@ void MFTLBodyShape(const MFTL_Object *obj, double extent[MFTL_PERIODIC_EXTENT_SL
     double T[3][3];
     MFTLGetTriangleCorners(obj, t, T);
     MFTLPeriodicExtentAddTriangle(obj->domain, T, extent);
-    const double e1[3] = {T[1][0] - T[0][0], T[1][1] - T[0][1], T[1][2] - T[0][2]};
-    const double e2[3] = {T[2][0] - T[0][0], T[2][1] - T[0][1], T[2][2] - T[0][2]};
-    const double n[3] = {0.5 * (e1[1] * e2[2] - e1[2] * e2[1]), 0.5 * (e1[2] * e2[0] - e1[0] * e2[2]), 0.5 * (e1[0] * e2[1] - e1[1] * e2[0])};
-    a += sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    double n[3];
+    area_vector(T, n);
+    a += MFTLVectorNorm(n);
     for (int k = 0; k < 3; ++k) s[k] += n[k];
   }
   for (int k = 0; k < 3; ++k) S[k] += s[k];
@@ -93,10 +103,9 @@ void MFTLBodyFluxVolume(const MFTL_Object *obj, int k, double ref, const double 
   {
     double T[3][3];
     MFTLGetTriangleCorners(obj, t, T);
-    const double e1[3] = {T[1][0] - T[0][0], T[1][1] - T[0][1], T[1][2] - T[0][2]};
-    const double e2[3] = {T[2][0] - T[0][0], T[2][1] - T[0][1], T[2][2] - T[0][2]};
-    const double n[3] = {0.5 * (e1[1] * e2[2] - e1[2] * e2[1]), 0.5 * (e1[2] * e2[0] - e1[0] * e2[2]), 0.5 * (e1[0] * e2[1] - e1[1] * e2[0])};
-    a += sqrt(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    double n[3];
+    area_vector(T, n);
+    a += MFTLVectorNorm(n);
     if (k < 0) continue;
 
     double x = (T[0][k] + T[1][k] + T[2][k]) / 3.0;
@@ -182,15 +191,14 @@ double MFTLBodyVolumeDisplacement(MFTL_Object *obj)
   {
     double T[3][3];
     MFTLGetTriangleCorners(obj, t, T);
-    const double e1[3] = {T[1][0] - T[0][0], T[1][1] - T[0][1], T[1][2] - T[0][2]};
-    const double e2[3] = {T[2][0] - T[0][0], T[2][1] - T[0][1], T[2][2] - T[0][2]};
-    const double S[3] = {0.5 * (e1[1] * e2[2] - e1[2] * e2[1]), 0.5 * (e1[2] * e2[0] - e1[0] * e2[2]), 0.5 * (e1[0] * e2[1] - e1[1] * e2[0])};
+    double S[3];
+    area_vector(T, S);
     for (int k = 0; k < 3; ++k)
     {
       const int v = obj->tris.verts[3 * t + k];
       if (v >= obj->verts.n_local) continue;
       const double *const u = &obj->verts.normal[3 * v];
-      dvdd += (S[0] * u[0] + S[1] * u[1] + S[2] * u[2]) / 3.0;
+      dvdd += MFTLVectorInProd(S, u) / 3.0;
     }
   }
   return dvdd;

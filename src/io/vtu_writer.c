@@ -50,6 +50,7 @@
 #include <mpi.h>
 
 #include "mftl_constants.h"
+#include "mftl_communication.h"
 #include "mftl_geometry.h"
 #include "mftl_memory.h"
 #include "mftl_object.h"
@@ -937,9 +938,8 @@ static int write_shared_file(MPI_Comm comm, int rank, const char *prefix, io_blo
   if (np < 0 || (size_t) np >= sizeof path) local_bad = 1;
 
   /* Local checks, agreed before the collective MPI_File_open. */
-  int any_bad = 0;
-  MPI_Allreduce(&local_bad, &any_bad, 1, MPI_INT, MPI_MAX, comm);
-  if (any_bad) return MFTL_ERROR;
+  MFTLAllreduceInts(comm, &local_bad, 1, MFTL_REDUCE_MAX);
+  if (local_bad) return MFTL_ERROR;
 
   sbuf h;
   sb_init(&h);
@@ -1140,7 +1140,6 @@ int MFTLWriteVtu(MFTL_Ensemble *ensemble, const char *filename_prefix, const MFT
   db_free(&wpos);
 
   /* Agree on the outcome (the .pvtu promised every piece). */
-  int worst = status;
-  MPI_Allreduce(&status, &worst, 1, MPI_INT, MPI_MIN, dom->comm_world);
-  return worst;
+  MFTLAllreduceInts(dom->comm_world, &status, 1, MFTL_REDUCE_MIN);
+  return status;
 }

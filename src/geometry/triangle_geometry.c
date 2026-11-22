@@ -141,8 +141,8 @@ static double closest_on_segment(const double p[3], const double a[3], const dou
 {
   const double ab[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
   const double ap[3] = {p[0] - a[0], p[1] - a[1], p[2] - a[2]};
-  const double len_sq = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
-  const double proj = ab[0] * ap[0] + ab[1] * ap[1] + ab[2] * ap[2];
+  const double len_sq = MFTLVectorNormSq(ab);
+  const double proj = MFTLVectorInProd(ab, ap);
 
   double s;
   if (proj <= 0.0 || len_sq <= 0.0)
@@ -243,7 +243,7 @@ static bool frame_init(const double tri[3][3], plane_frame *f)
   {
     const double *a = tri[i], *b = tri[(i + 1) % 3];
     const double d[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
-    len[i] = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    len[i] = MFTLVectorNormSq(d);
   }
   int k = 0;
   if (len[1] > len[k]) k = 1;
@@ -258,15 +258,15 @@ static bool frame_init(const double tri[3][3], plane_frame *f)
     f->e[j] = p1[j] - p0[j];
     fv[j] = p2[j] - p0[j];
   }
-  f->ee = f->e[0] * f->e[0] + f->e[1] * f->e[1] + f->e[2] * f->e[2];
+  f->ee = MFTLVectorNormSq(f->e);
   if (!(f->ee > 0.0))
   {
     f->gg = 0.0;
     return MFTL_FALSE;
   }
-  f->c = (fv[0] * f->e[0] + fv[1] * f->e[1] + fv[2] * f->e[2]) / f->ee;
+  f->c = MFTLVectorInProd(fv, f->e) / f->ee;
   for (int j = 0; j < 3; ++j) f->g[j] = fv[j] - f->c * f->e[j];
-  f->gg = f->g[0] * f->g[0] + f->g[1] * f->g[1] + f->g[2] * f->g[2];
+  f->gg = MFTLVectorNormSq(f->g);
   return f->gg > 0.0;
 }
 
@@ -291,9 +291,9 @@ static inline void frame_locate(const plane_frame *f, const double p[3], double 
 {
   const double *const p0 = f->p0;
   const double d[3] = {p[0] - p0[0], p[1] - p0[1], p[2] - p0[2]};
-  const double s = (d[0] * f->e[0] + d[1] * f->e[1] + d[2] * f->e[2]) / f->ee;
+  const double s = MFTLVectorInProd(d, f->e) / f->ee;
   for (int j = 0; j < 3; ++j) r[j] = d[j] - s * f->e[j];
-  const double t = (r[0] * f->g[0] + r[1] * f->g[1] + r[2] * f->g[2]) / f->gg;
+  const double t = MFTLVectorInProd(r, f->g) / f->gg;
 
   st[0] = s;
   st[1] = t;
@@ -315,7 +315,7 @@ static inline void frame_locate(const plane_frame *f, const double p[3], double 
 static inline double frame_offset(const plane_frame *f, double t, const double r[3], double off[3])
 {
   for (int j = 0; j < 3; ++j) off[j] = r[j] - t * f->g[j];
-  return off[0] * off[0] + off[1] * off[1] + off[2] * off[2];
+  return MFTLVectorNormSq(off);
 }
 
 /**
@@ -347,12 +347,11 @@ double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], dou
   /* Degeneracy, scale-free: |ab x ac|^2 = |ab|^2 |ac|^2 sin^2(angle at a), so
    * the test is on sin^2 alone. Below it the face normal a caller would sign
    * with is unreliable, so the triangle is answered as its three edges. */
-  const double cx = ab[1] * ac[2] - ab[2] * ac[1];
-  const double cy = ab[2] * ac[0] - ab[0] * ac[2];
-  const double cz = ab[0] * ac[1] - ab[1] * ac[0];
-  const double cross_sq = cx * cx + cy * cy + cz * cz;
-  const double ab_sq = ab[0] * ab[0] + ab[1] * ab[1] + ab[2] * ab[2];
-  const double ac_sq = ac[0] * ac[0] + ac[1] * ac[1] + ac[2] * ac[2];
+  double cr[3];
+  MFTLVectorCrossVector(cr, ab, ac);
+  const double cross_sq = MFTLVectorNormSq(cr);
+  const double ab_sq = MFTLVectorNormSq(ab);
+  const double ac_sq = MFTLVectorNormSq(ac);
   if (!(cross_sq > MFTL_VERYVERYSMALL * ab_sq * ac_sq)) return closest_on_degenerate(p, tri, q, f);
 
   /* Ericson's region test (Real-Time Collision Detection, §5.1.5). The vertex
@@ -361,8 +360,8 @@ double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], dou
    * taken from the frame rather than from Ericson's va, vb, vc (differences of
    * products of dot products, the normal equations in disguise). */
   const double ap[3] = {p[0] - a[0], p[1] - a[1], p[2] - a[2]};
-  const double d1 = ab[0] * ap[0] + ab[1] * ap[1] + ab[2] * ap[2];
-  const double d2 = ac[0] * ap[0] + ac[1] * ap[1] + ac[2] * ap[2];
+  const double d1 = MFTLVectorInProd(ab, ap);
+  const double d2 = MFTLVectorInProd(ac, ap);
 
   double off[3];  // p - q, from local differences
   if (d1 <= 0.0 && d2 <= 0.0)
@@ -373,8 +372,8 @@ double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], dou
   else
   {
     const double bp[3] = {p[0] - b[0], p[1] - b[1], p[2] - b[2]};
-    const double d3 = ab[0] * bp[0] + ab[1] * bp[1] + ab[2] * bp[2];
-    const double d4 = ac[0] * bp[0] + ac[1] * bp[1] + ac[2] * bp[2];
+    const double d3 = MFTLVectorInProd(ab, bp);
+    const double d4 = MFTLVectorInProd(ac, bp);
 
     if (d3 >= 0.0 && d4 <= d3)
     {
@@ -384,8 +383,8 @@ double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], dou
     else
     {
       const double cp[3] = {p[0] - c[0], p[1] - c[1], p[2] - c[2]};
-      const double d5 = ab[0] * cp[0] + ab[1] * cp[1] + ab[2] * cp[2];
-      const double d6 = ac[0] * cp[0] + ac[1] * cp[1] + ac[2] * cp[2];
+      const double d5 = MFTLVectorInProd(ab, cp);
+      const double d6 = MFTLVectorInProd(ac, cp);
 
       plane_frame fr;
       if (!frame_init(tri, &fr)) return closest_on_degenerate(p, tri, q, f);
@@ -429,7 +428,7 @@ double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], dou
     }
   }
 
-  return off[0] * off[0] + off[1] * off[1] + off[2] * off[2];
+  return MFTLVectorNormSq(off);
 }
 
 /**
@@ -454,13 +453,13 @@ static inline double segments_kernel(const double p0[3], const double u[3], doub
                                      double *t_out)
 {
   const double w[3] = {p0[0] - q0[0], p0[1] - q0[1], p0[2] - q0[2]};
-  const double d = u[0] * w[0] + u[1] * w[1] + u[2] * w[2];
-  const double e = v[0] * w[0] + v[1] * w[1] + v[2] * w[2];
+  const double d = MFTLVectorInProd(u, w);
+  const double e = MFTLVectorInProd(v, w);
 
   double s = 0.0, t = 0.0;
   if (a > 0.0 && c > 0.0)
   {
-    const double b = u[0] * v[0] + u[1] * v[1] + u[2] * v[2];
+    const double b = MFTLVectorInProd(u, v);
 
     /* The stationary point of |w + s u - t v|^2 by Cramer's rule, with
      * D = ac - b^2 = |u x v|^2 and the numerator b e - c d = (u x v).(v x w).
@@ -468,12 +467,14 @@ static inline double segments_kernel(const double p0[3], const double u[3], doub
      * the error runs along, and the clamped cascade below costs at most a few
      * ulps of the configuration. Exactly parallel segments (D = 0) pin s = 0;
      * the cascade then finds the closest point of their overlap. */
-    const double n[3] = {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]};
-    const double D = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+    double n[3];
+    MFTLVectorCrossVector(n, u, v);
+    const double D = MFTLVectorNormSq(n);
     if (D > 0.0)
     {
-      const double vw[3] = {v[1] * w[2] - v[2] * w[1], v[2] * w[0] - v[0] * w[2], v[0] * w[1] - v[1] * w[0]};
-      s = clamp01((n[0] * vw[0] + n[1] * vw[1] + n[2] * vw[2]) / D);
+      double vw[3];
+      MFTLVectorCrossVector(vw, v, w);
+      s = clamp01(MFTLVectorInProd(n, vw) / D);
     }
 
     /* Ericson's cascade (§5.1.9): the best t for this s; if it leaves [0, 1],
@@ -525,8 +526,8 @@ double MFTLClosestPointsOnSegments(const double p0[3], const double p1[3], const
 {
   const double u[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
   const double v[3] = {q1[0] - q0[0], q1[1] - q0[1], q1[2] - q0[2]};
-  const double a = u[0] * u[0] + u[1] * u[1] + u[2] * u[2];
-  const double c = v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+  const double a = MFTLVectorNormSq(u);
+  const double c = MFTLVectorNormSq(v);
 
   double s, t;
   const double d_sq = segments_kernel(p0, u, a, q0, v, c, &s, &t);
@@ -605,8 +606,8 @@ double MFTLClosestPointsBetweenTriangles(const double A[3][3], const double B[3]
       ue[i][k] = a1[k] - a0[k];
       ve[i][k] = b1[k] - b0[k];
     }
-    ua[i] = ue[i][0] * ue[i][0] + ue[i][1] * ue[i][1] + ue[i][2] * ue[i][2];
-    vc[i] = ve[i][0] * ve[i][0] + ve[i][1] * ve[i][1] + ve[i][2] * ve[i][2];
+    ua[i] = MFTLVectorNormSq(ue[i]);
+    vc[i] = MFTLVectorNormSq(ve[i]);
   }
   for (int i = 0; i < 3; ++i)
     for (int j = 0; j < 3; ++j)

@@ -150,7 +150,7 @@ long MFTLRasterizeSignedDistanceBanded(MFTL_SdfGrid *grid, const MFTL_Object *ob
     }
     const double rad = sqrt(rad_sq);
     const double slack = 1e-12 * (mag + reach + fabs(grid->origin[0]) + fabs(grid->origin[1]) + fabs(grid->origin[2]));
-    const double plane = n_face[0] * T[0][0] + n_face[1] * T[0][1] + n_face[2] * T[0][2];
+    const double plane = MFTLVectorInProd(n_face, T[0]);
 
     for (int gz = g_lo[2]; gz <= g_hi[2]; ++gz)
     {
@@ -176,7 +176,7 @@ long MFTLRasterizeSignedDistanceBanded(MFTL_SdfGrid *grid, const MFTL_Object *ob
           /* The distance that would still be written here: within this node's
            * cutoff, and not beaten by what it holds. */
           const double limit = fmin((band != MFTL_NULL && !band[idx]) ? cutoff : reach, fabs(*node)) + slack;
-          if (fabs(n_face[0] * x[0] + n_face[1] * x[1] + n_face[2] * x[2] - plane) > limit) continue;
+          if (fabs(MFTLVectorInProd(n_face, x) - plane) > limit) continue;
           const double cx = x[0] - ctr[0], cy = x[1] - ctr[1], cz = x[2] - ctr[2];
           if (cx * cx + cy * cy + cz * cz > (rad + limit) * (rad + limit)) continue;
 

@@ -149,20 +149,28 @@ static int edge_walls(const MFTL_Domain *dom, const double *a, const double *b)
  * normals). A vanishing cross product -- @p s along the piece, a fold -- falls
  * back to the unit normal @p u, and to zero if that vanishes too. The same
  * bits in (e negated) give the same bits out, negated.
+ *
+ * The zero case leaves early instead of selecting `scale = 0`: a select puts
+ * the comparison into the dependency chain of every pull, and the Frenet vertex
+ * form with vertex normals measured 3 % slower with it, 5 % faster without
+ * (docs/analysis.md §16.12). It writes `0 * c`, the bits the select gave.
  */
 static void contour_pull(const double e[3], const double s[3], const double u[3], double out[3])
 {
-  double c[3] = {e[1] * s[2] - e[2] * s[1], e[2] * s[0] - e[0] * s[2], e[0] * s[1] - e[1] * s[0]};
-  double cm = MFTL_SQRT(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+  double c[3];
+  MFTLVectorCrossVector(c, e, s);
+  double cm = MFTLVectorNorm(c);
   if (!(cm > 0.0))
   {
-    c[0] = e[1] * u[2] - e[2] * u[1];
-    c[1] = e[2] * u[0] - e[0] * u[2];
-    c[2] = e[0] * u[1] - e[1] * u[0];
-    cm = MFTL_SQRT(c[0] * c[0] + c[1] * c[1] + c[2] * c[2]);
+    MFTLVectorCrossVector(c, e, u);
+    cm = MFTLVectorNorm(c);
+    if (!(cm > 0.0))
+    {
+      for (int k = 0; k < 3; ++k) out[k] = 0.0 * c[k];
+      return;
+    }
   }
-  const double len = MFTL_SQRT(e[0] * e[0] + e[1] * e[1] + e[2] * e[2]);
-  const double scale = (cm > 0.0) ? len / cm : 0.0;
+  const double scale = MFTLVectorNorm(e) / cm;
   out[0] = scale * c[0];
   out[1] = scale * c[1];
   out[2] = scale * c[2];
@@ -192,9 +200,7 @@ static int rim_pull(const MFTL_Object *obj, int h, MFTL_ContourNormal mode, doub
   else
   {
     /* The free edge's pull in the area gradient: (b - a) x n_T, of length L. */
-    pull[0] = e[1] * u[2] - e[2] * u[1];
-    pull[1] = e[2] * u[0] - e[0] * u[2];
-    pull[2] = e[0] * u[1] - e[1] * u[0];
+    MFTLVectorCrossVector(pull, e, u);
   }
   return walls;
 }

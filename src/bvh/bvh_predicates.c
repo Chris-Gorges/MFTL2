@@ -1047,9 +1047,8 @@ static int coplanar_tri_tri(const double A[3][3], const double B[3][3])
     double *const n = (s == 0) ? nA : nB;
     const double e1[3] = {T[1][0] - T[0][0], T[1][1] - T[0][1], T[1][2] - T[0][2]};
     const double e2[3] = {T[2][0] - T[0][0], T[2][1] - T[0][1], T[2][2] - T[0][2]};
-    n[0] = fabs(e1[1] * e2[2] - e1[2] * e2[1]);
-    n[1] = fabs(e1[2] * e2[0] - e1[0] * e2[2]);
-    n[2] = fabs(e1[0] * e2[1] - e1[1] * e2[0]);
+    MFTLVectorCrossVector(n, e1, e2);
+    for (int k = 0; k < 3; ++k) n[k] = fabs(n[k]);
   }
   const double *const n = (nA[0] + nA[1] + nA[2] >= nB[0] + nB[1] + nB[2]) ? nA : nB;
   int first = 0;

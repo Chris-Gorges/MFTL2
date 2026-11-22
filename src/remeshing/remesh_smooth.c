@@ -151,7 +151,7 @@ int MFTLDetectFeatures(MFTL_Object *obj, double angle_degrees, double corner_ang
     const int t1 = MFTLHeTriIdx(h);
     const int t2 = MFTLHeTriIdx(tw);
 
-    const double dot = tn[3 * t1 + 0] * tn[3 * t2 + 0] + tn[3 * t1 + 1] * tn[3 * t2 + 1] + tn[3 * t1 + 2] * tn[3 * t2 + 2];
+    const double dot = MFTLVectorInProd(&tn[3 * t1], &tn[3 * t2]);
 
     if (dot < threshold_dot)
     {
@@ -228,12 +228,12 @@ int MFTLDetectFeatures(MFTL_Object *obj, double angle_degrees, double corner_ang
       MFTLGetMinimumImageVector(obj->domain, d1, p, MFTLVertexPos(obj, feat_nbr[2 * v]));
       MFTLGetMinimumImageVector(obj->domain, d2, p, MFTLVertexPos(obj, feat_nbr[2 * v + 1]));
 
-      const double l1 = d1[0] * d1[0] + d1[1] * d1[1] + d1[2] * d1[2];
-      const double l2 = d2[0] * d2[0] + d2[1] * d2[1] + d2[2] * d2[2];
+      const double l1 = MFTLVectorNormSq(d1);
+      const double l2 = MFTLVectorNormSq(d2);
 
       if (l1 > 0.0 && l2 > 0.0)
       {
-        const double dot = (d1[0] * d2[0] + d1[1] * d2[1] + d1[2] * d2[2]) / MFTL_SQRT(l1 * l2);
+        const double dot = MFTLVectorInProd(d1, d2) / MFTL_SQRT(l1 * l2);
         is_ridge = (dot <= straight_dot);
       }
     }
@@ -315,8 +315,8 @@ static bool ridge_displacement(const MFTL_Object *obj, int v, const int *fan, in
   MFTLGetMinimumImageVector(obj->domain, d1, p, MFTLVertexPos(obj, nbr[0]));
   MFTLGetMinimumImageVector(obj->domain, d2, p, MFTLVertexPos(obj, nbr[1]));
 
-  const double l1 = d1[0] * d1[0] + d1[1] * d1[1] + d1[2] * d1[2];
-  const double l2 = d2[0] * d2[0] + d2[1] * d2[1] + d2[2] * d2[2];
+  const double l1 = MFTLVectorNormSq(d1);
+  const double l2 = MFTLVectorNormSq(d2);
   *min_edge_sq = MFTL_MIN(l1, l2);
 
   /* tau spans the curve; delta is the Laplacian pull towards the chord midpoint.
@@ -326,7 +326,7 @@ static bool ridge_displacement(const MFTL_Object *obj, int v, const int *fan, in
    * discarded component is the whole difference between this and a chord cut, and
    * it is the one that erodes ridges. */
   const double tau[3] = {d2[0] - d1[0], d2[1] - d1[1], d2[2] - d1[2]};
-  const double tau_len_sq = tau[0] * tau[0] + tau[1] * tau[1] + tau[2] * tau[2];
+  const double tau_len_sq = MFTLVectorNormSq(tau);
   /* Relative to the two edges, not to 1: the test has to mean "the neighbours
    * coincide" at a millimetre as much as at a metre. */
   if (!(tau_len_sq > MFTL_VERYVERYSMALL * (l1 + l2))) return MFTL_FALSE;
@@ -349,7 +349,7 @@ static bool ridge_displacement(const MFTL_Object *obj, int v, const int *fan, in
     for (int k = 0; k < 3; ++k) delta[k] = (w1 * d1[k] + w2 * d2[k]) * inv;
   }
 
-  const double s = (delta[0] * tau[0] + delta[1] * tau[1] + delta[2] * tau[2]) / tau_len_sq;
+  const double s = MFTLVectorInProd(delta, tau) / tau_len_sq;
 
   disp[0] = s * tau[0];
   disp[1] = s * tau[1];
@@ -397,8 +397,8 @@ static bool rim_smooth_position(const MFTL_Object *obj, int v, const int *fan, i
   double d1[3], d2[3];
   MFTLGetMinimumImageVector(obj->domain, d1, p, MFTLVertexPos(obj, MFTLHeOrigin(obj, h_in)));
   MFTLGetMinimumImageVector(obj->domain, d2, p, MFTLVertexPos(obj, MFTLHeTarget(obj, h_out)));
-  const double l1 = MFTL_SQRT(d1[0] * d1[0] + d1[1] * d1[1] + d1[2] * d1[2]);
-  const double l2 = MFTL_SQRT(d2[0] * d2[0] + d2[1] * d2[1] + d2[2] * d2[2]);
+  const double l1 = MFTLVectorNorm(d1);
+  const double l2 = MFTLVectorNorm(d2);
   if (!(l1 > 0.0 && l2 > 0.0)) return MFTL_FALSE;
 
   /* Arc length to move towards the successor (negative: the predecessor). */
@@ -471,7 +471,8 @@ static bool free_displacement(const MFTL_Object *obj, int v, const int *fan, int
       target[1] += d[1];
       target[2] += d[2];
       weight_sum += 1.0;
-      min_sq = MFTL_MIN(min_sq, d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+      const double sq = MFTLVectorNormSq(d);  // once: MFTL_MIN evaluates its arguments twice
+      min_sq = MFTL_MIN(min_sq, sq);
     }
 
     if (open && n_fan > 0)
@@ -483,7 +484,8 @@ static bool free_displacement(const MFTL_Object *obj, int v, const int *fan, int
       target[1] += d[1];
       target[2] += d[2];
       weight_sum += 1.0;
-      min_sq = MFTL_MIN(min_sq, d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+      const double sq = MFTLVectorNormSq(d);
+      min_sq = MFTL_MIN(min_sq, sq);
     }
   }
   else if (sizing == MFTL_REMESH_SIZING_CURVATURE)
@@ -507,23 +509,26 @@ static bool free_displacement(const MFTL_Object *obj, int v, const int *fan, int
       MFTLGetMinimumImageVector(obj->domain, d1, p, MFTLVertexPos(obj, w1));
       MFTLGetMinimumImageVector(obj->domain, d2, p, MFTLVertexPos(obj, w2));
 
-      const double cr[3] = {d1[1] * d2[2] - d1[2] * d2[1], d1[2] * d2[0] - d1[0] * d2[2], d1[0] * d2[1] - d1[1] * d2[0]};
+      double cr[3];
+      MFTLVectorCrossVector(cr, d1, d2);
       const double lbar = MFTL_ONE_THIRD * (size[v] + size[w1] + size[w2]);
-      const double w = MFTL_SQRT(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]) / (lbar * lbar);
+      const double w = MFTLVectorNorm(cr) / (lbar * lbar);
 
       target[0] += w * (d1[0] + d2[0]) * MFTL_ONE_THIRD;
       target[1] += w * (d1[1] + d2[1]) * MFTL_ONE_THIRD;
       target[2] += w * (d1[2] + d2[2]) * MFTL_ONE_THIRD;
       weight_sum += w;
 
-      min_sq = MFTL_MIN(min_sq, d1[0] * d1[0] + d1[1] * d1[1] + d1[2] * d1[2]);
+      const double sq = MFTLVectorNormSq(d1);
+      min_sq = MFTL_MIN(min_sq, sq);
     }
 
     if (open && n_fan > 0)
     {
       double d[3];
       MFTLGetMinimumImageVector(obj->domain, d, p, MFTLVertexPos(obj, open_fan_last_neighbour(obj, fan[0])));
-      min_sq = MFTL_MIN(min_sq, d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+      const double sq = MFTLVectorNormSq(d);
+      min_sq = MFTL_MIN(min_sq, sq);
     }
   }
   else
@@ -542,22 +547,25 @@ static bool free_displacement(const MFTL_Object *obj, int v, const int *fan, int
       MFTLGetMinimumImageVector(obj->domain, d1, p, MFTLVertexPos(obj, MFTLHeTarget(obj, o)));
       MFTLGetMinimumImageVector(obj->domain, d2, p, MFTLVertexPos(obj, MFTLHeTarget(obj, MFTLHeNextIdx(o))));
 
-      const double cr[3] = {d1[1] * d2[2] - d1[2] * d2[1], d1[2] * d2[0] - d1[0] * d2[2], d1[0] * d2[1] - d1[1] * d2[0]};
-      const double area2 = MFTL_SQRT(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+      double cr[3];
+      MFTLVectorCrossVector(cr, d1, d2);
+      const double area2 = MFTLVectorNorm(cr);
 
       target[0] += area2 * (d1[0] + d2[0]) * MFTL_ONE_THIRD;
       target[1] += area2 * (d1[1] + d2[1]) * MFTL_ONE_THIRD;
       target[2] += area2 * (d1[2] + d2[2]) * MFTL_ONE_THIRD;
       weight_sum += area2;
 
-      min_sq = MFTL_MIN(min_sq, d1[0] * d1[0] + d1[1] * d1[1] + d1[2] * d1[2]);
+      const double sq = MFTLVectorNormSq(d1);
+      min_sq = MFTL_MIN(min_sq, sq);
     }
 
     if (open && n_fan > 0)
     {
       double d[3];
       MFTLGetMinimumImageVector(obj->domain, d, p, MFTLVertexPos(obj, open_fan_last_neighbour(obj, fan[0])));
-      min_sq = MFTL_MIN(min_sq, d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+      const double sq = MFTLVectorNormSq(d);
+      min_sq = MFTL_MIN(min_sq, sq);
     }
   }
 
@@ -575,10 +583,10 @@ static bool free_displacement(const MFTL_Object *obj, int v, const int *fan, int
    * Laplacian displacement, which is the shrinking operator this function exists
    * to avoid. Leaving the vertex alone is the right answer. */
   const double *const n = &obj->verts.normal[3 * v];
-  const double n_len_sq = n[0] * n[0] + n[1] * n[1] + n[2] * n[2];
+  const double n_len_sq = MFTLVectorNormSq(n);
   if (n_len_sq < 0.5) return MFTL_FALSE;
 
-  const double dn = delta[0] * n[0] + delta[1] * n[1] + delta[2] * n[2];
+  const double dn = MFTLVectorInProd(delta, n);
   disp[0] = delta[0] - dn * n[0];
   disp[1] = delta[1] - dn * n[1];
   disp[2] = delta[2] - dn * n[2];
@@ -695,7 +703,7 @@ void MFTLRemeshSmooth(MFTL_Object *obj, const MFTL_RemeshParameters *params, int
        * one-ring has already degenerated, which is exactly where a large step
        * would do the most damage. The clamp costs one comparison against a length
        * the displacement functions have already computed. */
-      const double disp_sq = disp[0] * disp[0] + disp[1] * disp[1] + disp[2] * disp[2];
+      const double disp_sq = MFTLVectorNormSq(disp);
       const double limit_sq = step_frac * step_frac * min_edge_sq;
 
       if (disp_sq * relax * relax > limit_sq && disp_sq > 0.0) scale = MFTL_SQRT(limit_sq / disp_sq);

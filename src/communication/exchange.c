@@ -164,7 +164,7 @@ bool MFTLExchangeAgreeRoute(const MFTL_Domain *domain, MFTL_Route route, bool fa
 {
   if (route != MFTL_ROUTE_AUTO || domain->nproc < 2) return MFTL_FALSE;
   int g = far ? 1 : 0;
-  MPI_Allreduce(MPI_IN_PLACE, &g, 1, MPI_INT, MPI_LOR, domain->comm_world);
+  MFTLAllreduceInts(domain->comm_world, &g, 1, MFTL_REDUCE_MAX);  // the OR of 0/1
   return g != 0;
 }
 

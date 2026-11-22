@@ -22,6 +22,7 @@
 #include "mftl_constants.h"
 #include "mftl_topology.h"
 #include "mftl_types.h"
+#include "mftl_vectoroperations.h"
 
 #ifdef __cplusplus
 extern "C"
@@ -219,7 +220,7 @@ static inline double MFTLGetEdgeLengthSquared(const MFTL_Object *obj, int h)
 {
   double e[3];
   MFTLGetEdgeVector(obj, h, e);
-  return e[0] * e[0] + e[1] * e[1] + e[2] * e[2];
+  return MFTLVectorNormSq(e);
 }
 
 /**
@@ -282,11 +283,8 @@ static inline void MFTLGetTriangleProperties(const MFTL_Object *obj, int t, doub
    * MFTLNormalizeVector()). The expression must be identical in every geometry
    * kernel: test_triangle_geometry_paths_are_bit_identical compares them. */
   double cr[3];
-  cr[0] = e1[1] * e2[2] - e1[2] * e2[1];
-  cr[1] = e1[2] * e2[0] - e1[0] * e2[2];
-  cr[2] = e1[0] * e2[1] - e1[1] * e2[0];
-
-  const double mag = MFTL_SQRT(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+  MFTLVectorCrossVector(cr, e1, e2);
+  const double mag = MFTLVectorNorm(cr);
 
   if (area_out) *area_out = 0.5 * mag;
 
@@ -369,10 +367,8 @@ static inline double MFTLTriangleNormalFromCorners(const double T[3][3], double 
 {
   const double e1[3] = {T[1][0] - T[0][0], T[1][1] - T[0][1], T[1][2] - T[0][2]};
   const double e2[3] = {T[2][0] - T[0][0], T[2][1] - T[0][1], T[2][2] - T[0][2]};
-  n[0] = e1[1] * e2[2] - e1[2] * e2[1];
-  n[1] = e1[2] * e2[0] - e1[0] * e2[2];
-  n[2] = e1[0] * e2[1] - e1[1] * e2[0];
-  const double mag = MFTL_SQRT(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+  MFTLVectorCrossVector(n, e1, e2);
+  const double mag = MFTLVectorNorm(n);
   const double inv = (mag > 0.0) ? 1.0 / mag : 0.0;
   n[0] *= inv;
   n[1] *= inv;

@@ -7,6 +7,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include "mftl_communication.h"
 #include "mftl_memory.h"
 
 int MFTLEnsembleFindField(const MFTL_Ensemble *ens, const char *name)
@@ -27,24 +28,22 @@ int MFTLEnsembleRegisterField(MFTL_Ensemble *ens, const char *name, MFTL_FieldEn
               (mode == MFTL_FIELD_RECOMPUTED || mode == MFTL_FIELD_INTERPOLATED || mode == MFTL_FIELD_CONSERVATIVE_DENSITY) &&
               !(mode == MFTL_FIELD_CONSERVATIVE_DENSITY && entity != MFTL_FIELD_TRIANGLE) && MFTLEnsembleFindField(ens, name) == MFTL_ERROR && r->n < INT_MAX;
   if (valid && mode != MFTL_FIELD_RECOMPUTED) valid = ncomp <= INT_MAX - r->stride[entity];
-  int all_valid;
-  MPI_Allreduce(&valid, &all_valid, 1, MPI_INT, MPI_MIN, ens->domain.comm_world);
-  if (!all_valid) return MFTL_ERROR;
 
-  /* Compare exact descriptors, not pointer identities or a probabilistic hash.
-   * All ranks have entered before any variable-sized broadcast is posted. */
-  int root[5] = {(int) len, (int) entity, ncomp, (int) mode, r->n};
-  MPI_Bcast(root, 5, MPI_INT, 0, ens->domain.comm_world);
-  char *agreed_name = MFTLMallocOrDie((size_t) root[0] + 1, "field registration name");
-  if (ens->domain.rank == 0) memcpy(agreed_name, name, len + 1);
-  MPI_Bcast(agreed_name, root[0] + 1, MPI_CHAR, 0, ens->domain.comm_world);
-  valid = root[0] == (int) len && root[1] == (int) entity && root[2] == ncomp && root[3] == (int) mode && root[4] == r->n && strcmp(agreed_name, name) == 0;
-  MPI_Allreduce(&valid, &all_valid, 1, MPI_INT, MPI_MIN, ens->domain.comm_world);
-  if (!all_valid)
-  {
-    free(agreed_name);
-    return MFTL_ERROR;
-  }
+  /* Exact descriptors, not pointer identities or a probabilistic hash: the
+   * local verdict rides the first agreement, which also fixes the name length,
+   * so every rank packs the name into the same number of words for the second. */
+  int status = valid ? 0 : 1;
+  const uint64_t desc[5] = {(uint64_t) len, (uint64_t) entity, (uint64_t) ncomp, (uint64_t) mode, (uint64_t) r->n};
+  if (MFTLAgreeWords(ens->domain.comm_world, desc, 5, &status) >= 0 || status != 0) return MFTL_ERROR;
+  const int n_words = (int) (len / sizeof(uint64_t)) + 1;  // with the terminator, zero-padded
+  uint64_t *const words = (uint64_t *) MFTLCallocOrDie((size_t) n_words, sizeof(uint64_t), "field registration name");
+  memcpy(words, name, len);
+  const int differs = MFTLAgreeWords(ens->domain.comm_world, words, n_words, MFTL_NULL);
+  free(words);
+  if (differs >= 0) return MFTL_ERROR;
+
+  char *const agreed_name = (char *) MFTLMallocOrDie(len + 1, "field registration name");
+  memcpy(agreed_name, name, len + 1);
 
   r->entries = MFTLReallocOrDie(r->entries, ((size_t) r->n + 1) * sizeof(*r->entries), "field descriptors");
   r->entries[r->n] = (MFTL_FieldDescriptor) {agreed_name, entity, mode, ncomp};

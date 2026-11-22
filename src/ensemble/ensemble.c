@@ -430,14 +430,14 @@ void MFTLEnsembleUpdateGlobalCounts(MFTL_Ensemble *ensemble)
   double *const counts = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(2 * n_local, 1) * sizeof(double), "MFTLEnsembleUpdateGlobalCounts");
 
   /* The local half is `n_local`, thanks to the ownership prefix. */
-  long local_tris = 0;
+  long long total = 0;
   for (int o = 0; o < n_local; ++o)
   {
     MFTL_Object *const obj = ensemble->local_objects[o];
     MFTL_ASSERT(obj != MFTL_NULL);
     counts[2 * o + 0] = (double) obj->tris.n_local;
     counts[2 * o + 1] = (double) obj->verts.n_local;
-    local_tris += obj->tris.n_local;
+    total += obj->tris.n_local;
   }
 
   MFTLEnsembleReduceBodies(ensemble, counts, 2, ops, MFTL_BODY_REDUCE_SCOPE_AUTO);
@@ -452,8 +452,7 @@ void MFTLEnsembleUpdateGlobalCounts(MFTL_Ensemble *ensemble)
   free(counts);
 
   /* The ensemble total is one scalar reduction. */
-  long total = 0;
-  MPI_Allreduce(&local_tris, &total, 1, MPI_LONG, MPI_SUM, ensemble->domain.comm_world);
+  MFTLAllreduceLongLongs(ensemble->domain.comm_world, &total, 1, MFTL_REDUCE_SUM);
   ensemble->total_global_triangles = (int) total;
 }
 

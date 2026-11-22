@@ -89,18 +89,15 @@ double MFTLRemeshRimStraightDot(const MFTL_RemeshParameters *params)
   return -MFTL_COS(angle * MFTL_PI / 180.0);
 }
 
-/** @brief Squared length. */
-static inline double len2(const double d[3]) { return d[0] * d[0] + d[1] * d[1] + d[2] * d[2]; }
-
 /**
  * @brief Does the rim curve continue straight enough through a vertex, given its
  *        two edge directions OUT of it? MFTLDetectFeatures()'s own test.
  */
 static bool passes_through(const double d1[3], const double d2[3], double straight_dot)
 {
-  const double l = len2(d1) * len2(d2);
+  const double l = MFTLVectorNormSq(d1) * MFTLVectorNormSq(d2);
   if (!(l > 0.0)) return MFTL_FALSE;
-  return (d1[0] * d2[0] + d1[1] * d2[1] + d1[2] * d2[2]) / MFTL_SQRT(l) <= straight_dot;
+  return MFTLVectorInProd(d1, d2) / MFTL_SQRT(l) <= straight_dot;
 }
 
 /**
@@ -119,11 +116,12 @@ static bool passes_through(const double d1[3], const double d2[3], double straig
  */
 static void arc_offset(const double u[3], const double v[3], double f, double out[3])
 {
-  const double L2 = len2(v), u2 = len2(u);
+  const double L2 = MFTLVectorNormSq(v), u2 = MFTLVectorNormSq(u);
   const double w[3] = {u[0] - v[0], u[1] - v[1], u[2] - v[2]};
-  const double cr[3] = {u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]};
-  const double cr2 = len2(cr);
-  const double den = MFTL_SQRT(u2 * L2 * len2(w));
+  double cr[3];
+  MFTLVectorCrossVector(cr, u, v);
+  const double cr2 = MFTLVectorNormSq(cr);
+  const double den = MFTL_SQRT(u2 * L2 * MFTLVectorNormSq(w));
 
   double along = 2.0 * f - 1.0, across = 0.0;  // in units of L/2: the chord
   double n[3] = {0.0, 0.0, 0.0};
@@ -138,9 +136,9 @@ static void arc_offset(const double u[3], const double v[3], double f, double ou
     across = 2.0 * sin(0.5 * (phi + psi)) * sin(0.5 * (phi - psi)) / s_phi;
 
     /* n: unit, in the plane of the three, perpendicular to v, away from q. */
-    const double t = (u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / L2;
+    const double t = MFTLVectorInProd(u, v) / L2;
     const double q_side[3] = {u[0] - t * v[0], u[1] - t * v[1], u[2] - t * v[2]};
-    const double ql = MFTL_SQRT(len2(q_side));
+    const double ql = MFTLVectorNorm(q_side);
     if (ql > 0.0)
       for (int k = 0; k < 3; ++k) n[k] = -q_side[k] / ql;
     else

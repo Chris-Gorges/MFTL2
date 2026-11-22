@@ -371,7 +371,7 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
 
   const double dx_max = fmax(lat.spacing[0], fmax(lat.spacing[1], lat.spacing[2]));
   const double dx_min = fmin(lat.spacing[0], fmin(lat.spacing[1], lat.spacing[2]));
-  const double diag = sqrt(lat.spacing[0] * lat.spacing[0] + lat.spacing[1] * lat.spacing[1] + lat.spacing[2] * lat.spacing[2]);
+  const double diag = MFTLVectorNorm(lat.spacing);
   lat.r_cut = diag + MFTLTopoMaxBias(opts) + 0.5 * dx_max;
   lat.r_far = diag + 0.5 * dx_max;  // away from every bias; see MFTLTopoRasterise()
 

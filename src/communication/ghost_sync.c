@@ -268,9 +268,8 @@ int MFTLUpdateGhostFields(MFTL_Ensemble *ens, const int *ids, int nfields, bool 
     for (int k = 0; k < j; ++k)
       if (ids[k] == ids[j]) valid = 0;
   }
-  int agreed = 0;
-  MPI_Allreduce(&valid, &agreed, 1, MPI_INT, MPI_MIN, ens->domain.comm_world);
-  if (!agreed) return MFTL_ERROR;
+  MFTLAllreduceInts(ens->domain.comm_world, &valid, 1, MFTL_REDUCE_MIN);
+  if (!valid) return MFTL_ERROR;
 
   MFTL_GhostColumn *const cols = (MFTL_GhostColumn *) MFTLMallocOrDie(((size_t) nfields + 1) * sizeof(MFTL_GhostColumn), "field ghost columns");
   int n = 0;
@@ -281,6 +280,6 @@ int MFTLUpdateGhostFields(MFTL_Ensemble *ens, const int *ids, int nfields, bool 
 
   /* The same verdict everywhere: an unreachable ghost on one rank is a failure
    * of the call, not of that rank. */
-  MPI_Allreduce(&ok, &agreed, 1, MPI_INT, MPI_MIN, ens->domain.comm_world);
-  return agreed ? MFTL_SUCCESS : MFTL_ERROR;
+  MFTLAllreduceInts(ens->domain.comm_world, &ok, 1, MFTL_REDUCE_MIN);
+  return ok ? MFTL_SUCCESS : MFTL_ERROR;
 }

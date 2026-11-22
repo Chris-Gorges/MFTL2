@@ -386,7 +386,7 @@ static bool holders_span_one_cell(const MFTL_Ensemble *ens, const holder_records
 }
 
 /**
- * @brief Agrees, with one `MPI_LAND` of an int, whether the gathered records may
+ * @brief Agrees, with one MIN (the logical AND) of an int, whether the gathered records may
  *        be folded. The fallback is a `comm_world` collective, so the route must
  *        be a collective decision.
  *
@@ -398,10 +398,9 @@ static bool holders_span_one_cell(const MFTL_Ensemble *ens, const holder_records
  */
 static bool holder_route_certified(MFTL_Ensemble *ens, const holder_records *h, int n, bool pre_ok)
 {
-  int mine = (pre_ok && holders_span_one_cell(ens, h, n)) ? 1 : 0;
-  int agreed = 0;
-  MPI_Allreduce(&mine, &agreed, 1, MPI_INT, MPI_LAND, ens->domain.comm_world);
-  return agreed != 0;
+  int ok = (pre_ok && holders_span_one_cell(ens, h, n)) ? 1 : 0;
+  MFTLAllreduceInts(ens->domain.comm_world, &ok, 1, MFTL_REDUCE_MIN);
+  return ok != 0;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

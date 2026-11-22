@@ -98,7 +98,7 @@ int MFTLEnsembleBodyIntegrals(MFTL_Ensemble *ens, MFTL_BodyIntegrals *out)
     bi->volume_status = MFTL_INTEGRAL_UNSUPPORTED;
 
     const double *const S = &r[MFTL_INT_S];
-    const double s_mag = sqrt(S[0] * S[0] + S[1] * S[1] + S[2] * S[2]);
+    const double s_mag = MFTLVectorNorm(S);
     const bool encloses = bi->closed && s_mag <= MFTL_INT_ENCLOSED_TOL * bi->area;
 
     if (!bi->closed && r[MFTL_INT_OFF] > 0.0)

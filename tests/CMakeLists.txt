@@ -412,6 +412,16 @@ add_test(NAME test_compute_modules_have_no_mpi
                  -DALLOWED=NONE
                  -P ${CMAKE_CURRENT_SOURCE_DIR}/check_mpi_confinement.cmake)
 
+# The modules whose every file may call MPI still share ONE set of small
+# reductions and one clock: a blocking MPI_Allreduce or an MPI_Wtime is refused
+# outside src/communication/collectives.c. With the scans above, this covers
+# every directory of src/.
+add_test(NAME test_small_reductions_are_the_library_ones
+         COMMAND ${CMAKE_COMMAND}
+                 "-DSRC_DIR=${CMAKE_CURRENT_SOURCE_DIR}/../src/communication,${CMAKE_CURRENT_SOURCE_DIR}/../src/ensemble,${CMAKE_CURRENT_SOURCE_DIR}/../src/io,${CMAKE_CURRENT_SOURCE_DIR}/../src/mesh_creation,${CMAKE_CURRENT_SOURCE_DIR}/../src/settings"
+                 -DALLOWED=ALL
+                 -P ${CMAKE_CURRENT_SOURCE_DIR}/check_mpi_confinement.cmake)
+
 # --- Genuine multi-rank coverage ------------------------------------------
 #
 # At nproc == 1 the collectives are called correctly but most cross-rank
@@ -757,7 +767,7 @@ mftl_add_mpi_test_oversub(test_exchange_np27 test_exchange 27)
 
 set_property(TEST test_remeshing_mpi_is_confined test_topology_change_mpi_is_confined
                   test_coupling_mpi_is_confined test_correction_mpi_is_confined
-                  test_compute_modules_have_no_mpi
+                  test_compute_modules_have_no_mpi test_small_reductions_are_the_library_ones
              APPEND PROPERTY LABELS serial static)
 
 if(BUILD_EXAMPLES)

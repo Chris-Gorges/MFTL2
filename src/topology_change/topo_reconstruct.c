@@ -198,7 +198,7 @@ static unsigned char *wide_triangles(const MFTL_Domain *dom, const MFTL_Object *
       const double r = reach + event_radius(e, opts, dx_max);
       double d[3];
       MFTLGetMinimumImageVector(dom, d, ctr, e->point);
-      if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2] <= r * r)
+      if (MFTLVectorNormSq(d) <= r * r)
       {
         flag[t] = 1;
         any = MFTL_TRUE;
@@ -218,7 +218,7 @@ void MFTLTopoRasterise(const MFTL_Ensemble *ens, MFTL_TopoCluster *cl, int n_cl,
                        const MFTL_TopologyOptions *opts)
 {
   const double dx_max = fmax(lat->spacing[0], fmax(lat->spacing[1], lat->spacing[2]));
-  const double diag = sqrt(lat->spacing[0] * lat->spacing[0] + lat->spacing[1] * lat->spacing[1] + lat->spacing[2] * lat->spacing[2]);
+  const double diag = MFTLVectorNorm(lat->spacing);
 
   unsigned char **const zone = (unsigned char **) MFTLCallocOrDie((size_t) MFTL_MAX(n_cl, 1), sizeof(unsigned char *), "topology wide-band zones");
   for (int c = 0; c < n_cl; ++c)

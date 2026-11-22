@@ -13,11 +13,11 @@
 
 #include "mftl_ensemble.h"
 
-#include <mpi.h>
 #include <stdio.h>
 #include <stdlib.h>
 
 #include "mftl_constants.h"
+#include "mftl_communication.h"
 #include "mftl_geometry.h"
 #include "mftl_memory.h"
 #include "mftl_types.h"
@@ -95,7 +95,7 @@ int MFTLEnsembleCheckPeriodicExtents(MFTL_Ensemble *ens, MFTL_PeriodicExtentRepo
   }
   free(acc);
 
-  if (dom->nproc > 1) MPI_Allreduce(MPI_IN_PLACE, count, 2, MPI_LONG_LONG, MPI_SUM, dom->comm_world);
+  MFTLAllreduceLongLongs(dom->comm_world, count, 2, MFTL_REDUCE_SUM);
   rep->n_violations = (int) count[0];
   rep->n_covering = (int) count[1];
   if (count[0] == 0) return MFTL_SUCCESS;
@@ -103,10 +103,9 @@ int MFTLEnsembleCheckPeriodicExtents(MFTL_Ensemble *ens, MFTL_PeriodicExtentRepo
   /* The first offender, then its extent from the ranks holding it: every holder
    * resolved the same reduced record, so the MIN is that value. */
   double first = key;
-  if (dom->nproc > 1) MPI_Allreduce(&key, &first, 1, MPI_DOUBLE, MPI_MIN, dom->comm_world);
-  double mine = (key == first) ? extent : MFTL_DBL_MAX;
-  double ext = mine;
-  if (dom->nproc > 1) MPI_Allreduce(&mine, &ext, 1, MPI_DOUBLE, MPI_MIN, dom->comm_world);
+  MFTLAllreduceDoubles(dom->comm_world, &first, 1, MFTL_REDUCE_MIN);
+  double ext = (key == first) ? extent : MFTL_DBL_MAX;
+  MFTLAllreduceDoubles(dom->comm_world, &ext, 1, MFTL_REDUCE_MIN);
 
   rep->first_body_gid = (int) (first / 3.0);
   rep->first_axis = (int) (first - 3.0 * (double) rep->first_body_gid);

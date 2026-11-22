@@ -549,7 +549,7 @@ void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radiu
         {
           double d[3];
           MFTLGetMinimumImageVector(dom, d, &ctr[3 * o], corner[j]);
-          const double l2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+          const double l2 = MFTLVectorNormSq(d);
           if (l2 > best) best = l2;
         }
       }

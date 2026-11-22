@@ -1349,8 +1349,10 @@ int MFTLUpdateGhostFields(MFTL_Ensemble *ens, const int *ids, int nfields, bool 
  * clock. Every module's agreements, statistics and timings go through them, so
  * no module needs a wrapper of its own to keep MPI out of its sources: a
  * module's confinement test (`test_*_mpi_is_confined`) then guards only the
- * module's own traffic, and the scan refuses `MPI_Wtime` and an in-place
- * `MPI_Allreduce` even in a module's allowed file.
+ * module's own traffic, and the scan refuses `MPI_Wtime` and any blocking
+ * `MPI_Allreduce` outside this set, in every directory of `src/`, a module's
+ * allowed file included (`MPI_MAXLOC`/`MPI_MINLOC` and the nonblocking
+ * `MPI_Iallreduce` have no helper and stay legal).
  *
  * They reduce over a COMMUNICATOR, not over a body's holders: per-body values go
  * through MFTLEnsembleReduceBodies(), which chooses the smaller route. A call

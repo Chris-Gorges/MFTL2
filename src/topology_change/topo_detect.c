@@ -119,7 +119,7 @@ static void detect_pair(const MFTL_BVH *bvhA, int pa, const MFTL_BVH *bvhB, int 
   for (int j = 0; j < 3; ++j)
     for (int k = 0; k < 3; ++k) TB[j][k] += shift[k];
 
-  if (nA[0] * nB[0] + nA[1] * nB[1] + nA[2] * nB[2] > -ctx->cos_tol) return;
+  if (MFTLVectorInProd(nA, nB) > -ctx->cos_tol) return;
 
   /* The side is read along the segment that IS the gap -- closest point to
    * closest point -- and only when that segment runs along both normals. See
@@ -130,8 +130,8 @@ static void detect_pair(const MFTL_BVH *bvhA, int pa, const MFTL_BVH *bvhB, int 
   const double gap = sqrt(MFTLClosestPointsBetweenTriangles(TA, TB, qa, qb));
   if (!(gap > 0.0) || gap > ctx->delta_max) return;
   const double g[3] = {(qb[0] - qa[0]) / gap, (qb[1] - qa[1]) / gap, (qb[2] - qa[2]) / gap};
-  const double sA = nA[0] * g[0] + nA[1] * g[1] + nA[2] * g[2];
-  const double sB = -(nB[0] * g[0] + nB[1] * g[1] + nB[2] * g[2]);
+  const double sA = MFTLVectorInProd(nA, g);
+  const double sB = -MFTLVectorInProd(nB, g);
 
   int kind;
   double delta;
@@ -178,7 +178,7 @@ static bool opposing_normals(const MFTL_BVH *bvhA, int pa, const MFTL_BVH *bvhB,
   MFTLBVHPrimVerts(bvhA, pa, TA);
   MFTLBVHPrimVerts(bvhB, pb, TB);
   if (!normal_and_centre(TA, nA, cA) || !normal_and_centre(TB, nB, cB)) return MFTL_FALSE;
-  return nA[0] * nB[0] + nA[1] * nB[1] + nA[2] * nB[2] <= -ctx->cos_tol;
+  return MFTLVectorInProd(nA, nB) <= -ctx->cos_tol;
 }
 
 int MFTLTopoDetectLocal(MFTL_Ensemble *ens, const MFTL_TopologyOptions *opts, MFTL_TopoEventList *out)

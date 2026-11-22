@@ -89,7 +89,7 @@ static void scatter_cotan(const MFTL_Object *obj, bool angles, double *restrict 
     const double cx = e2x - e1x, cy = e2y - e1y, cz = e2z - e1z;
     double nrm[3];
     MFTLVectorCrossVector(nrm, e1, e2);
-    const double mag = MFTL_SQRT(MFTLVectorNormSq(nrm));
+    const double mag = MFTLVectorNorm(nrm);
     if (!(mag > 0.0)) continue;  // a degenerate face has no angles to give
 
     const double l1 = e1x * e1x + e1y * e1y + e1z * e1z;  // |p1 - p0|^2
@@ -258,13 +258,14 @@ static void cotan_direction(const MFTL_Object *obj, int v, const double n[3], do
     double e[2][3];
     min_image(dom, xv, MFTLVertexPos(obj, j), e[0]);
     min_image(dom, xv, MFTLVertexPos(obj, k), e[1]);
-    const double cr[3] = {e[0][1] * e[1][2] - e[0][2] * e[1][1], e[0][2] * e[1][0] - e[0][0] * e[1][2], e[0][0] * e[1][1] - e[0][1] * e[1][0]};
-    const double mag = MFTL_SQRT(cr[0] * cr[0] + cr[1] * cr[1] + cr[2] * cr[2]);
+    double cr[3];
+    MFTLVectorCrossVector(cr, e[0], e[1]);
+    const double mag = MFTLVectorNorm(cr);
     if (!(mag > 0.0)) continue;
 
-    const double ljj = e[0][0] * e[0][0] + e[0][1] * e[0][1] + e[0][2] * e[0][2];
-    const double lkk = e[1][0] * e[1][0] + e[1][1] * e[1][1] + e[1][2] * e[1][2];
-    const double ljk = e[0][0] * e[1][0] + e[0][1] * e[1][1] + e[0][2] * e[1][2];
+    const double ljj = MFTLVectorNormSq(e[0]);
+    const double lkk = MFTLVectorNormSq(e[1]);
+    const double ljk = MFTLVectorInProd(e[0], e[1]);
     /* The angle at k faces the edge v-j: its edges are -e_k and e_j - e_k. */
     const double cot_k = (lkk - ljk) / mag;
     const double cot_j = (ljj - ljk) / mag;
@@ -275,10 +276,10 @@ static void cotan_direction(const MFTL_Object *obj, int v, const double n[3], do
       if (!(w[s] > 0.0)) continue;
       const double *const d = e[s];
       const double l2 = (s == 0) ? ljj : lkk;
-      const double dn = d[0] * n[0] + d[1] * n[1] + d[2] * n[2];
+      const double dn = MFTLVectorInProd(d, n);
       const double kn = -2.0 * dn / l2;  // normal curvature along the edge
-      const double a = d[0] * t1[0] + d[1] * t1[1] + d[2] * t1[2];
-      const double b = d[0] * t2[0] + d[1] * t2[1] + d[2] * t2[2];
+      const double a = MFTLVectorInProd(d, t1);
+      const double b = MFTLVectorInProd(d, t2);
       const double ab = a * a + b * b;
       if (!(ab > 0.0)) continue;
       const double sw = MFTL_SQRT(w[s]);
@@ -313,7 +314,7 @@ static void cotan_record(const MFTL_Object *obj, int v, const double *r, int nco
 {
   const double a = r[ACC_AREA];
   const double *const N = &r[ACC_NRM];
-  const double nm = MFTL_SQRT(N[0] * N[0] + N[1] * N[1] + N[2] * N[2]);
+  const double nm = MFTLVectorNorm(N);
   if (!(a > 0.0) || !(nm > 0.0))
   {
     for (int c = 0; c < ncomp; ++c) rec[c] = 0.0;
@@ -322,7 +323,7 @@ static void cotan_record(const MFTL_Object *obj, int v, const double *r, int nco
   const double inv = 1.0 / nm;
   const double n[3] = {N[0] * inv, N[1] * inv, N[2] * inv};
   const double *const L = &r[ACC_LAP];
-  const double kappa = 0.5 * (L[0] * n[0] + L[1] * n[1] + L[2] * n[2]) / a;
+  const double kappa = 0.5 * MFTLVectorInProd(L, n) / a;
   const double gauss = (MFTL_TWO_PI - r[ACC_ANGLE]) / a;
   write_scalars(rec, ncomp, kappa, gauss);
   if (ncomp >= MFTL_CURVATURE_COMPONENTS) cotan_direction(obj, v, n, kappa, &rec[MFTL_CURVATURE_DIR1]);
@@ -357,7 +358,7 @@ static void cotan_record(const MFTL_Object *obj, int v, const double *r, int nco
 static bool fit_record(const MFTL_Object *obj, int v, int ncomp, double *rec)
 {
   const double *const nv = &obj->verts.normal[3 * v];
-  const double nm = MFTL_SQRT(nv[0] * nv[0] + nv[1] * nv[1] + nv[2] * nv[2]);
+  const double nm = MFTLVectorNorm(nv);
   if (!(nm > 0.0)) return MFTL_FALSE;
   const double ninv = 1.0 / nm;
   const double n[3] = {nv[0] * ninv, nv[1] * ninv, nv[2] * ninv};
@@ -388,14 +389,14 @@ static bool fit_record(const MFTL_Object *obj, int v, int ncomp, double *rec)
   for (int i = 0; i < nr; ++i)
   {
     const double *const nj = &obj->verts.normal[3 * ring[i]];
-    const double nz = nj[0] * n[0] + nj[1] * n[1] + nj[2] * n[2];
-    const double nn = MFTL_SQRT(nj[0] * nj[0] + nj[1] * nj[1] + nj[2] * nj[2]);
+    const double nz = MFTLVectorInProd(nj, n);
+    const double nn = MFTLVectorNorm(nj);
     use[i + 1] = (unsigned char) (nz > CURVATURE_FIT_MIN_COS * nn);
     if (use[i + 1])
     {
       ++n_slopes;
-      slopes[2 * (i + 1) + 0] = -(nj[0] * t1[0] + nj[1] * t1[1] + nj[2] * t1[2]) / nz;
-      slopes[2 * (i + 1) + 1] = -(nj[0] * t2[0] + nj[1] * t2[1] + nj[2] * t2[2]) / nz;
+      slopes[2 * (i + 1) + 0] = -MFTLVectorInProd(nj, t1) / nz;
+      slopes[2 * (i + 1) + 1] = -MFTLVectorInProd(nj, t2) / nz;
     }
     else
       slopes[2 * (i + 1) + 0] = slopes[2 * (i + 1) + 1] = 0.0;
@@ -441,7 +442,7 @@ static bool fit_record(const MFTL_Object *obj, int v, int ncomp, double *rec)
   /* Parameter direction (u, q) to a tangent vector u x_u + q x_v. */
   double *const dir = &rec[MFTL_CURVATURE_DIR1];
   for (int k = 0; k < 3; ++k) dir[k] = u * t1[k] + q * t2[k] + (u * hx + q * hy) * n[k];
-  const double dm = MFTL_SQRT(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+  const double dm = MFTL_SQRT(MFTLVectorNormSq(dir));  // not MFTLVectorNorm: here it turned the branch below into a slower select
   const double dinv = (dm > 0.0) ? 1.0 / dm : 0.0;
   for (int k = 0; k < 3; ++k) dir[k] *= dinv;
   return MFTL_TRUE;

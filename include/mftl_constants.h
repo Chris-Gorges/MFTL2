@@ -155,9 +155,15 @@
  * expression with a side effect.
  * @{
  */
-/** @brief Smaller of @p a and @p b. Both are evaluated twice. */
+/**
+ * @brief Smaller of @p a and @p b. Both are evaluated twice.
+ *
+ * Pass a computed value through a local first, not a call such as
+ * `MFTLVectorNormSq(d)`: the compiler may then branch and recompute instead of
+ * selecting (it did in the tangential smoother's fan loops).
+ */
 #define MFTL_MIN(a, b) (((a) < (b)) ? (a) : (b))
-/** @brief Larger of @p a and @p b. Both are evaluated twice. */
+/** @brief Larger of @p a and @p b. Both are evaluated twice: see MFTL_MIN(). */
 #define MFTL_MAX(a, b) (((a) > (b)) ? (a) : (b))
 /** @brief @p x squared. @p x is evaluated twice. */
 #define MFTL_SQ(x) ((x) * (x))

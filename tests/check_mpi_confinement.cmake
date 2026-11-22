@@ -3,8 +3,10 @@
 # Used for the modules with networking of their own -- src/remeshing/ (ALLOWED
 # defaults to remesh_comm.{c,h}), src/topology_change/ (topo_comm.c),
 # src/coupling/ (coupling_comm.c) -- and for modules that have none:
-# src/correction/ and the computational modules, with ALLOWED=NONE. SRC_DIR may
-# be a comma-separated list. What follows was written for the remesher and holds
+# src/correction/ and the computational modules, with ALLOWED=NONE -- and, with
+# ALLOWED=ALL, for the modules whose every file may call MPI (communication,
+# ensemble, io, mesh_creation, settings), where only the shared-primitive rule at
+# the end of this comment applies. SRC_DIR may be a comma-separated list. What follows was written for the remesher and holds
 # for the others for the same reason.
 #
 # The remeshing module reaches the network through exactly one file. Everything
@@ -26,8 +28,13 @@
 # The rule once bred wrappers: four modules each kept a private in-place
 # Allreduce and a private MPI_Wtime, only to keep them out of their drivers. The
 # library has one of each (MFTLAllreduceDoubles/Ints/LongLongs and MFTLWallTime,
-# src/communication/collectives.c), so those two spellings are refused in EVERY
-# scanned file, the allowed ones included.
+# src/communication/collectives.c), so a BLOCKING MPI_Allreduce and MPI_Wtime are
+# refused in EVERY scanned file, the allowed ones included, except in
+# collectives.c itself. Two shapes have no helper and stay legal: MPI_MAXLOC /
+# MPI_MINLOC on a pair type (the coupler's), and the nonblocking MPI_Iallreduce,
+# whose name the pattern does not match. Until 2026-11-22 only the in-place
+# spelling was refused and five modules were not scanned at all; thirteen raw
+# calls, eleven of them out of place, had grown there.
 
 # A `cmake -P` script starts with every policy unset, so under CMake 3.x the
 # IN_LIST operator below is not an operator at all and the script errors out;
@@ -57,8 +64,12 @@ if(DEFINED ALLOWED)
 else()
   set(_allowed "remesh_comm.c" "remesh_comm.h")
 endif()
+set(_all_allowed FALSE)
 if(_allowed STREQUAL "NONE")
   set(_allowed "")
+elseif(_allowed STREQUAL "ALL")
+  set(_allowed "")
+  set(_all_allowed TRUE)
 endif()
 
 set(_offenders "")
@@ -67,16 +78,20 @@ set(_shared "")
 foreach(_f IN LISTS _sources)
   get_filename_component(_name "${_f}" NAME)
 
-  # The library's shared primitives, spelled privately: refused everywhere.
-  file(STRINGS "${_f}" _private REGEX "MPI_Wtime[ \t]*\\(|MPI_Allreduce[ \t]*\\([ \t]*MPI_IN_PLACE")
-  foreach(_line IN LISTS _private)
-    string(REGEX MATCH "^[ \t]*(\\*|//|/\\*)" _is_comment "${_line}")
-    if(_is_comment STREQUAL "")
-      list(APPEND _shared "${_name}: ${_line}")
-    endif()
-  endforeach()
+  # The library's shared primitives, spelled privately: refused everywhere but
+  # in their one home.
+  if(NOT _name STREQUAL "collectives.c")
+    file(STRINGS "${_f}" _private REGEX "MPI_Wtime[ \t]*\\(|MPI_Allreduce[ \t]*\\(")
+    foreach(_line IN LISTS _private)
+      string(REGEX MATCH "^[ \t]*(\\*|//|/\\*)" _is_comment "${_line}")
+      string(REGEX MATCH "MPI_(MAX|MIN)LOC" _no_helper "${_line}")
+      if(_is_comment STREQUAL "" AND _no_helper STREQUAL "")
+        list(APPEND _shared "${_name}: ${_line}")
+      endif()
+    endforeach()
+  endif()
 
-  if(_name IN_LIST _allowed)
+  if(_all_allowed OR _name IN_LIST _allowed)
     continue()
   endif()
 
@@ -96,7 +111,7 @@ if(_shared)
     message("  ${_o}")
   endforeach()
   message(FATAL_ERROR
-          "A private wall clock or in-place Allreduce in ${SRC_DIR}. Use the library's "
+          "A private wall clock or blocking Allreduce in ${SRC_DIR}. Use the library's "
           "MFTLWallTime() and MFTLAllreduceDoubles/Ints/LongLongs() (mftl_communication.h).")
 endif()
 

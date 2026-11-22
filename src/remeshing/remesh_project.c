@@ -563,12 +563,13 @@ static void scan_cell(const MFTL_RemeshReference *ref, int cell, const double p[
     /* A face whose normal points against the vertex's is the other side of a
      * sheet, or a fold: never the surface this vertex belongs to. */
     const double *f = &ref->frame[9 * t], *e1 = &f[3], *e2 = &f[6];
-    const double fn[3] = {e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]};
-    if (!(fn[0] * n_v[0] + fn[1] * n_v[1] + fn[2] * n_v[2] > 0.0)) continue;
+    double fn[3];
+    MFTLVectorCrossVector(fn, e1, e2);
+    if (!(MFTLVectorInProd(fn, n_v) > 0.0)) continue;
 
     /* The plane: no point of the triangle is closer than it. */
-    const double h = fn[0] * rel[0][0] + fn[1] * rel[0][1] + fn[2] * rel[0][2];
-    if (h * h > reach * reach * (fn[0] * fn[0] + fn[1] * fn[1] + fn[2] * fn[2])) continue;
+    const double h = MFTLVectorInProd(fn, rel[0]);
+    if (h * h > reach * reach * MFTLVectorNormSq(fn)) continue;
 
     for (int c = 0; c < 3; ++c)
     {
@@ -700,7 +701,7 @@ void MFTLRemeshProjectOwned(MFTL_Object *obj, const MFTL_RemeshReference *ref, c
       if (a >= nvl && b >= nvl) continue;
       double d[3];
       MFTLGetMinimumImageVector(obj->domain, d, &obj->verts.pos[3 * a], &obj->verts.pos[3 * b]);
-      const double sq = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+      const double sq = MFTLVectorNormSq(d);
       if (a < nvl) min_sq[a] = MFTL_MIN(min_sq[a], sq);
       if (b < nvl) min_sq[b] = MFTL_MIN(min_sq[b], sq);
     }
@@ -711,7 +712,7 @@ void MFTLRemeshProjectOwned(MFTL_Object *obj, const MFTL_RemeshReference *ref, c
     if (!corner_lifts(obj, v)) continue;  // free vertices only: a ridge or rim vertex keeps its curve
     if (min_sq[v] == MFTL_DBL_MAX) continue;  // no incident edge
     const double *nv = &obj->verts.normal[3 * v];
-    if (!(nv[0] * nv[0] + nv[1] * nv[1] + nv[2] * nv[2] > 0.5)) continue;  // degenerate fan: no orientation to compare
+    if (!(MFTLVectorNormSq(nv) > 0.5)) continue;  // degenerate fan: no orientation to compare
 
     const double radius = MFTL_MIN(0.5 * sqrt(min_sq[v]), cap);
     if (MFTLRemeshReferenceProjectPoint(ref, &obj->verts.pos[3 * v], nv, radius, &out[3 * v]) == MFTL_SUCCESS)

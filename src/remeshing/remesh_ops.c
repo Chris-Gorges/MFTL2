@@ -641,7 +641,7 @@ static bool collapse_geometry_refused(const MFTL_Object *obj, int h, int a, int 
 
       double d[3];
       MFTLGetMinimumImageVector(obj->domain, d, pm, MFTLVertexPos(obj, ring[i]));
-      if (MFTLRemeshCollapseStretches(obj, d[0] * d[0] + d[1] * d[1] + d[2] * d[2], merged_target, ring[i], params)) return MFTL_TRUE;
+      if (MFTLRemeshCollapseStretches(obj, MFTLVectorNormSq(d), merged_target, ring[i], params)) return MFTL_TRUE;
     }
   }
 
@@ -1115,8 +1115,8 @@ bool MFTLFlipApproved(const MFTL_Object *obj, int h, const MFTL_RemeshParameters
    * two it is built from, so the fold test refuses rather than guesses. */
   double n_ref[3] = {n1[0] + n2[0], n1[1] + n2[1], n1[2] + n2[2]};
   {
-    const double ref_sq = n_ref[0] * n_ref[0] + n_ref[1] * n_ref[1] + n_ref[2] * n_ref[2];
-    const double parts_sq = (n1[0] * n1[0] + n1[1] * n1[1] + n1[2] * n1[2]) + (n2[0] * n2[0] + n2[1] * n2[1] + n2[2] * n2[2]);
+    const double ref_sq = MFTLVectorNormSq(n_ref);
+    const double parts_sq = MFTLVectorNormSq(n1) + MFTLVectorNormSq(n2);
     if (!(ref_sq > MFTL_VERYVERYSMALL * parts_sq)) n_ref[0] = n_ref[1] = n_ref[2] = 0.0;
   }
 
