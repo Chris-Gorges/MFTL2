@@ -843,21 +843,6 @@ size_t MFTLCplChunkLimit(void);
  * Small helpers
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/** @brief FNV-1a, folding @p n bytes into @p h. */
-static inline uint64_t cpl_fnv(uint64_t h, const void *data, size_t n)
-{
-  const unsigned char *p = (const unsigned char *) data;
-  for (size_t i = 0; i < n; ++i)
-  {
-    h ^= p[i];
-    h *= 0x100000001b3ull;
-  }
-  return h;
-}
-
-/** @brief The FNV-1a offset basis. */
-#define CPL_FNV_INIT 0xcbf29ce484222325ull
-
 /** @brief A growable byte buffer for message packing. */
 typedef struct cpl_buf
 {

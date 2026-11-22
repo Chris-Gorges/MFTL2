@@ -5,8 +5,9 @@
  * @ingroup mftl_geometry
  *
  * @brief What the vertex-normal and curvature kernels share, written once:
- *        the corner angle, a face's term in a vertex-normal sum, the tangent
- *        frame of a normal and the one-ring samples of a height fit.
+ *        the edge vector with or without a domain, the corner angle, a face's
+ *        term in a vertex-normal sum, the tangent frame of a normal and the
+ *        one-ring samples of a height fit.
  *
  * vertex_geometry.c (the normals) and vertex_curvature.c (COTAN and FIT) both
  * scatter faces into vertex sums and both fit a paraboloid to a one-ring; each
@@ -27,6 +28,57 @@
 #include "mftl_vectoroperations.h"
 
 /** @cond INTERNAL */
+
+/**
+ * @brief `out = b - a` under the minimum image of @p dom, or the plain
+ *        difference for an object without a domain: the one edge vector of the
+ *        vertex kernels (normals, curvature, surface tension), which accept both.
+ *
+ * A DIRECT difference, so `b - a` is exactly `-(a - b)` (`nearbyint` rounds
+ * half to even, symmetrically): both sides of a contour piece get the same bits.
+ *
+ * @param      dom The domain, or #MFTL_NULL.
+ * @param[out] out The offset from @p a to @p b.
+ * @param      a   Start position.
+ * @param      b   End position.
+ */
+static inline void MFTLGeomMinimumImage(const MFTL_Domain *dom, double out[3], const double a[3], const double b[3])
+{
+  if (dom != MFTL_NULL)
+    MFTLGetMinimumImageVector(dom, out, a, b);
+  else
+  {
+    out[0] = b[0] - a[0];
+    out[1] = b[1] - a[1];
+    out[2] = b[2] - a[2];
+  }
+}
+
+/**
+ * @brief The two edges `a - p` and `b - p` of the corner at @p p, as
+ *        MFTLGeomMinimumImage() takes each, with ONE test of the domain.
+ *
+ * For the gathers that build a face from one corner (the one-vertex normal, the
+ * principal-direction fit): two MFTLGeomMinimumImage() calls test the domain
+ * and load its periodic flags twice per face.
+ *
+ * @param      dom The domain, or #MFTL_NULL.
+ * @param      p   The corner.
+ * @param      a   The next corner.
+ * @param      b   The corner after it.
+ * @param[out] e1  `a - p`.
+ * @param[out] e2  `b - p`.
+ */
+static inline void MFTLGeomCornerEdges(const MFTL_Domain *dom, const double p[3], const double a[3], const double b[3], double e1[3], double e2[3])
+{
+  if (dom != MFTL_NULL)
+  {
+    MFTLGetMinimumImageVector(dom, e1, p, a);
+    MFTLGetMinimumImageVector(dom, e2, p, b);
+  }
+  else
+    for (int k = 0; k < 3; ++k) e1[k] = a[k] - p[k], e2[k] = b[k] - p[k];
+}
 
 /**
  * @brief The interior angle of a corner whose two edges have cross product of
@@ -73,18 +125,27 @@ static inline void MFTLGeomCornerDots(const double e1[3], const double e2[3], do
  * the unit normal times each corner's angle (MFTLGeomCornerAngle(),
  * MFTLGeomCornerDots()); a zero-area face has no unit normal and adds nothing.
  * MFTLComputeVertexNormals() and the area-weighted normal of the COTAN
- * curvature both scatter with it, so the two are the same sum to the bit.
+ * curvature both scatter with it, so the two are the same sum to the bit; the
+ * one-vertex gather (MFTLComputeVertexNormalAt()) takes corner 0 of the same
+ * term, one `atan2` instead of three.
  *
- * @param         angle ANGLE weights, else AREA.
- * @param         e1    p1 - p0.
- * @param         e2    p2 - p0.
- * @param[in,out] n     On entry \f$\vect{e}_1\times\vect{e}_2\f$; on return the
- *                      vector to add.
- * @param[out]    w     Its weight at corners 0, 1, 2.
+ * @param         angle   ANGLE weights, else AREA.
+ * @param         corners 3 for every corner (a scatter), 1 for corner 0 only
+ *                        (a gather over p0's fan): `w[1]`, `w[2]` are then
+ *                        1 and meaningless. A constant at every call, so the
+ *                        unused angles are not computed.
+ * @param         e1      p1 - p0.
+ * @param         e2      p2 - p0.
+ * @param[in,out] n       On entry \f$\vect{e}_1\times\vect{e}_2\f$; on
+ *                        return the vector to add.
+ * @param[out]    w       Its weight at corners 0, 1, 2.
  * @return `false` when the face adds nothing.
  */
-static inline bool MFTLGeomFaceNormalTerm(bool angle, const double e1[3], const double e2[3], double n[3], double w[3])
+static inline bool MFTLGeomFaceNormalTerm(bool angle, int corners, const double e1[3], const double e2[3], double n[3], double w[3])
 {
+  /* No loop bounded by `corners`: clang turned one into a memset_pattern16
+   * call per face before the constant folded it away. With corners == 3 what
+   * is left after folding is the scatters' code as it always was. */
   w[0] = w[1] = w[2] = 1.0;
   if (!angle) return MFTL_TRUE;
   const double mag = MFTL_SQRT(MFTLVectorNormSq(n));
@@ -95,7 +156,10 @@ static inline bool MFTLGeomFaceNormalTerm(bool angle, const double e1[3], const 
   n[2] *= inv;
   double d[3];
   MFTLGeomCornerDots(e1, e2, d);
-  for (int k = 0; k < 3; ++k) w[k] = MFTLGeomCornerAngle(mag, d[k]);
+  if (corners == 1)
+    w[0] = MFTLGeomCornerAngle(mag, d[0]);
+  else
+    for (int k = 0; k < 3; ++k) w[k] = MFTLGeomCornerAngle(mag, d[k]);
   return MFTL_TRUE;
 }
 
@@ -173,11 +237,7 @@ static inline double MFTLGeomRingSamples(const MFTL_Object *obj, int v, const do
   for (int i = 0; i < nr; ++i)
   {
     double d[3];
-    const double *const xj = MFTLVertexPos(obj, ring[i]);
-    if (obj->domain != MFTL_NULL)
-      MFTLGetMinimumImageVector(obj->domain, d, xv, xj);
-    else
-      d[0] = xj[0] - xv[0], d[1] = xj[1] - xv[1], d[2] = xj[2] - xv[2];
+    MFTLGeomMinimumImage(obj->domain, d, xv, MFTLVertexPos(obj, ring[i]));
     h2 += MFTLVectorNormSq(d);
     double *const p = &pts[3 * (i + 1)];
     p[0] = MFTLVectorInProd(d, t1);

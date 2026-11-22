@@ -118,7 +118,7 @@ static double nearest_dist2(const corner_list *c, const double x[3], double slac
     if (best < MFTL_DBL_MAX && box_dist2(c, t, x) > best + slack) continue;
     double q[3];
     MFTL_TriangleFeature f;
-    const double d2 = MFTLClosestPointOnTriangle(x, c->T[t], q, &f);
+    const double d2 = MFTLClosestPointOnTriangle(x, c->T[t], q, &f, MFTL_NULL);
     if (d2 < best)
     {
       best = d2;
@@ -140,7 +140,7 @@ static bool on_the_mesh(const corner_list *c, const double x[3])
   {
     if (box_dist2(c, t, x) > 1e-18) continue;
     double q[3];
-    if (sqrt(MFTLClosestPointOnTriangle(x, c->T[t], q, MFTL_NULL)) <= 1e-12) return MFTL_TRUE;
+    if (sqrt(MFTLClosestPointOnTriangle(x, c->T[t], q, MFTL_NULL, MFTL_NULL)) <= 1e-12) return MFTL_TRUE;
   }
   return MFTL_FALSE;
 }

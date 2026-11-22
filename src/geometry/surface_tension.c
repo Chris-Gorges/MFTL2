@@ -50,6 +50,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "geometry_internal.h"
 #include "mftl_constants.h"
 #include "mftl_memory.h"
 #include "mftl_object.h"
@@ -103,19 +104,6 @@ static inline double sigma_triangle(const sigma_source *s, int t, int v0, int v1
   if (s->tri != MFTL_NULL) return s->tri[t];
   if (s->vtx != MFTL_NULL) return (s->vtx[v0] + s->vtx[v1] + s->vtx[v2]) / 3.0;
   return s->uniform;
-}
-
-/** @brief `out = b - a` under the minimum image of @p dom: a DIRECT difference, so `b - a` is exactly `-(a - b)`. */
-static inline void edge_vector(const MFTL_Domain *dom, const double *a, const double *b, double out[3])
-{
-  if (dom != MFTL_NULL)
-    MFTLGetMinimumImageVector(dom, out, a, b);
-  else
-  {
-    out[0] = b[0] - a[0];
-    out[1] = b[1] - a[1];
-    out[2] = b[2] - a[2];
-  }
 }
 
 /**
@@ -190,7 +178,7 @@ static int rim_pull(const MFTL_Object *obj, int h, MFTL_ContourNormal mode, doub
   if (walls == 0) return 0;
   double u[3], e[3];
   MFTLGetTriangleNormal(obj, MFTLHeTriIdx(h), u);
-  edge_vector(dom, xa, xb, e);
+  MFTLGeomMinimumImage(dom, e, xa, xb);
   if (mode == MFTL_CONTOUR_NORMAL_VERTICES)
   {
     const double *const na = &obj->verts.normal[3 * a], *const nb = &obj->verts.normal[3 * b];
@@ -450,7 +438,7 @@ static void frenet_element(const MFTL_Object *obj, const sigma_source *s, const 
       }
 
       double e[3], sn[3];
-      edge_vector(dom, MFTLVertexPos(obj, a), MFTLVertexPos(obj, b), e);
+      MFTLGeomMinimumImage(dom, e, MFTLVertexPos(obj, a), MFTLVertexPos(obj, b));
       if (vertex_normals)
       {
         sn[0] = vn[3 * a + 0] + vn[3 * b + 0];

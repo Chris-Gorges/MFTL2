@@ -245,11 +245,7 @@ double MFTLTopoLocalOverhang(const MFTL_Ensemble *ens, const MFTL_TopoCluster *c
         {
           /* The corner in the image nearest the box centre. */
           double x = T[j][k];
-          if (dom->is_periodic[k])
-          {
-            const double L = dom->domain_size[k], mid = 0.5 * (box_lo[k] + box_hi[k]);
-            x -= L * nearbyint((x - mid) / L);
-          }
+          if (dom->is_periodic[k]) x += MFTLPeriodicImageShift(x, 0.5 * (box_lo[k] + box_hi[k]), dom->domain_size[k]);
           const double out = fmax(box_lo[k] - x, x - box_hi[k]);
           if (out > worst) worst = out;
         }
@@ -338,45 +334,20 @@ void MFTLTopoMakeWindows(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, MF
  * for a closed surface it IS the enclosed volume. For an open surface whose rim
  * lies on walls it is the volume enclosed together with those walls, provided
  * no wall contributes: a wall perpendicular to another axis has F . n = 0, and
- * the wall x_k = ref has F = 0. So k is a non-periodic axis whose far wall
- * carries no rim -- the jet's nozzle wall is x_min and k = x; a sheet with its
- * rim on the four side walls takes k = z. A closed cluster takes any axis it
- * does not wrap around, with x_k unwrapped about its centre.
+ * the wall x_k = ref has F = 0 -- the jet's nozzle wall is x_min and k = x; a
+ * sheet with its rim on the four side walls takes k = z; a drop hanging from
+ * the ceiling is measured from it.
  *
- * Where the rims lie (MFTLBodyRimWalls()) and the flux itself
- * (MFTLBodyFluxVolume()) are the per-body integrals' local kernels in
- * src/geometry/body_integrals.c, with the arithmetic this module always used.
- * The choice per CLUSTER stays here: a cluster of several bodies is measured
- * as one, before and after, along the same axis.
+ * Which axis and which reference is the body integrals' rule,
+ * MFTLBodyFluxAxis(), applied to the CLUSTER (several bodies measured as one,
+ * before and after, along the same axis). A closed cluster is measured as
+ * enclosing, about its centre: for a sheet across periodic axes that is its
+ * volume up to a constant, which the before/after comparison does not see, and
+ * it needs no wall. Where the rims lie (MFTLBodyRimWalls()) and the flux itself
+ * (MFTLBodyFluxVolume()) are the body integrals' local kernels too.
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 void MFTLTopoChooseFlux(const MFTL_Domain *dom, MFTL_TopoCluster *cl, int n_cl)
 {
-  for (int c = 0; c < n_cl; ++c)
-  {
-    cl[c].flux_axis = -1;
-    cl[c].flux_ref = 0.0;
-
-    if (cl[c].rim_walls == 0)
-    {
-      /* Closed: any axis the cluster does not wrap, measured about its centre. */
-      for (int k = 0; k < 3 && cl[c].flux_axis < 0; ++k)
-        if (!cl[c].full[k])
-        {
-          cl[c].flux_axis = k;
-          cl[c].flux_ref = cl[c].centre[k];
-        }
-      continue;
-    }
-
-    /* Open: a non-periodic axis with no rim on its FAR wall. The near wall, if
-     * a rim is on it, is where F vanishes. */
-    for (int k = 0; k < 3 && cl[c].flux_axis < 0; ++k)
-    {
-      if (dom->is_periodic[k]) continue;
-      if (cl[c].rim_walls & (1 << (2 * k + 1))) continue;
-      cl[c].flux_axis = k;
-      cl[c].flux_ref = dom->global_min[k];
-    }
-  }
+  for (int c = 0; c < n_cl; ++c) cl[c].flux_axis = MFTLBodyFluxAxis(dom, cl[c].rim_walls, cl[c].full, cl[c].centre, MFTL_NULL, &cl[c].flux_ref);
 }

@@ -485,7 +485,7 @@ static int order_neighbours(const MFTL_Domain *dom, const double *key, int d, in
  * @param[out] n_out Bodies homed here.
  * @return A newly allocated `[*n_out]` array, sorted heaviest-first. The caller
  *         frees it. Never #MFTL_NULL.
- * @collective One MFTLRemeshNeighborGather().
+ * @collective One MFTLNeighborAllgatherDoubles().
  */
 static homed_body *gather_homed_bodies(MFTL_Ensemble *ens, const MFTL_RemeshMeasurement *m, const nbhood *nh, int *n_out)
 {
@@ -514,7 +514,7 @@ static homed_body *gather_homed_bodies(MFTL_Ensemble *ens, const MFTL_RemeshMeas
   g_balancer_payload += n_send;
 
   int n_recv = 0;
-  double *const recv = MFTLRemeshNeighborGather(dom, send, n_send, rcount, rdispl, &n_recv);
+  double *const recv = MFTLNeighborAllgatherDoubles(dom, send, n_send, rcount, rdispl, &n_recv, MFTL_NULL);
 
   /* Capacity: everything this rank published plus everything it received could
    * in principle be homed here. Bounded by `local + degree * their locals`, i.e.
@@ -844,7 +844,7 @@ static void assign_destinations(MFTL_Ensemble *ens, const MFTL_RemeshParameters 
     g_balancer_payload += 3 * reassigned;
 
     int n_recv = 0;
-    double *const recv = MFTLRemeshNeighborGather(dom, send, 3 * reassigned, rcount, rdispl, &n_recv);
+    double *const recv = MFTLNeighborAllgatherDoubles(dom, send, 3 * reassigned, rcount, rdispl, &n_recv, MFTL_NULL);
 
     /* Everything this rank must apply: its own verdicts plus its neighbours'. A
      * body appears at most once -- only home publishes it -- so the sorted ids

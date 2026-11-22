@@ -276,7 +276,7 @@ typedef struct
  */
 typedef struct
 {
-  MFTL_SendBuffer *send_bufs;  ///< [nproc] indexed by DESTINATION RANK, on either route.
+  MFTL_SendBuffer *send_bufs;  ///< One per destination: `[num_neighbors]` by GRAPH SLOT under #MFTL_ROUTE_GRAPH, `[nproc]` by RANK under #MFTL_ROUTE_AUTO.
   MPI_Datatype type;  ///< Committed MPI datatype of one element.
   size_t type_size;  ///< sizeof of one element, must match @c type.
 
@@ -315,6 +315,10 @@ typedef struct
  * @param domain     Supplies the communicators, rank count and neighbour list.
  * @param x          [n_payloads] payload descriptors; `recv_buf` /
  *                   `recv_count` are filled in (the caller frees `recv_buf`).
+ *                   Their `send_bufs` follow @p route: one per graph slot
+ *                   under #MFTL_ROUTE_GRAPH, which reaches no other rank, so
+ *                   nothing per call is sized by the process count; one per
+ *                   rank under #MFTL_ROUTE_AUTO, which may go global.
  * @param n_payloads 1..#MFTL_MAX_EXCHANGE_PAYLOADS, identical on all ranks.
  * @param route      #MFTL_ROUTE_GRAPH (no global collective) or
  *                   #MFTL_ROUTE_AUTO; identical on all ranks.
@@ -399,8 +403,12 @@ void *MFTLExchangeRecords(const MFTL_Domain *domain, size_t width, const void *s
  *        in any order: one scan counts them per destination and finds the
  *        route, the route is agreed, and a stable counting sort packs other
  *        ranks' records once; this rank's own are copied once, straight into
- *        the result. Local memory `O(nproc)` (a rank-indexed table), nothing
- *        on the wire sized by the process count.
+ *        the result.
+ *
+ * A destination is found through its graph slot, so on the graph route nothing
+ * is sized by the process count; only a destination outside the neighbourhood
+ * (the call is then on the global route anyway) builds a rank-indexed table.
+ * Nothing on the wire is sized by the process count.
  *
  * @param      domain The domain.
  * @param      width  Bytes per record, at least 1.
@@ -415,6 +423,30 @@ void *MFTLExchangeRecords(const MFTL_Domain *domain, size_t width, const void *s
  * @collective
  */
 void *MFTLExchangeRecordsTo(const MFTL_Domain *domain, size_t width, const void *rec, const int *dest, int n_rec, int *n_recv);
+
+/**
+ * @brief The grouping of MFTLExchangeRecordsTo(), for a caller that writes its
+ *        records in place: the destinations, their counts, and where each
+ *        record goes in the send buffer of MFTLExchangeRecords(), whose reply
+ *        then answers record `i` at `pos[i]`, with no copy either way.
+ *
+ * The same scan as MFTLExchangeRecordsTo(): a destination's block is found
+ * through its graph slot, so nothing is sized by the process count unless some
+ * destination is outside the neighbourhood. Blocks are in order of first
+ * appearance, this rank's own records last; within a block records keep their
+ * input order (a stable counting sort).
+ *
+ * @param      domain The domain.
+ * @param      dest   `[n_rec]` destination rank of each record; this rank allowed.
+ * @param      n_rec  Records.
+ * @param[out] pos    `[n_rec]` each record's position in the grouped send buffer.
+ * @param[out] ranks  `malloc`'d `[return]` distinct destinations: the `dest` of MFTLExchangeRecords().
+ * @param[out] counts `malloc`'d `[return]` records for each: its `dest_count`.
+ * @return The number of destinations.
+ *
+ * @rank_local
+ */
+int MFTLExchangeGroupRecords(const MFTL_Domain *domain, const int *dest, int n_rec, int *pos, int **ranks, int **counts);
 
 /**
  * @brief Sends one reply record per record received back to its sender: the
@@ -449,18 +481,27 @@ void MFTLExchangePlanFree(MFTL_ExchangePlan *plan);
  * `O(held data x degree)`. If `comm_graph` has a self-loop this rank's own block
  * comes back once; callers folding their own contribution locally skip it.
  *
- * @param      domain The MPI/physical world.
- * @param      send   `[n_send]` this rank's block.
- * @param      n_send Doubles in @p send. May be zero.
- * @param[out] rcount `[num_neighbors]` doubles received from each neighbour.
- * @param[out] rdispl `[num_neighbors]` offset of each neighbour's block.
- * @param[out] n_recv Total doubles received.
+ * The counts are always exchanged before returning. With a @p request the
+ * payload is only STARTED, so the caller can overlap work that does not need
+ * the answer (the spatial halo does); it then completes it with `MPI_Wait`
+ * before reading the buffer, and leaves @p send, @p rcount and @p rdispl
+ * untouched until then.
+ *
+ * @param      domain  The MPI/physical world.
+ * @param      send    `[n_send]` this rank's block.
+ * @param      n_send  Doubles in @p send. May be zero.
+ * @param[out] rcount  `[num_neighbors]` doubles received from each neighbour.
+ * @param[out] rdispl  `[num_neighbors]` offset of each neighbour's block.
+ * @param[out] n_recv  Total doubles received.
+ * @param[out] request #MFTL_NULL for a blocking call; else set to the pending
+ *                     payload's request (`MPI_REQUEST_NULL` when there is
+ *                     nothing to exchange).
  * @return A newly allocated buffer of @p n_recv doubles in neighbour order
  *         (never #MFTL_NULL); the caller frees it.
  *
  * @collective Over `comm_graph`; a serial run makes no MPI call.
  */
-double *MFTLNeighborAllgatherDoubles(const MFTL_Domain *domain, const double *send, int n_send, int *rcount, int *rdispl, int *n_recv);
+double *MFTLNeighborAllgatherDoubles(const MFTL_Domain *domain, const double *send, int n_send, int *rcount, int *rdispl, int *n_recv, MPI_Request *request);
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * 4. Redistribution

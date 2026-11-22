@@ -25,6 +25,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "mftl_arrayfunctions.h"
 #include "mftl_communication.h"
 #include "mftl_constants.h"
 #include "mftl_ensemble.h"
@@ -185,18 +186,6 @@ int MFTLSettingsLoadArgs(MFTL_Settings *s, int argc, char **argv, MPI_Comm comm)
  * 2. Agreement
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-/** FNV-1a, 64 bit. Only equality is asked of it. */
-static uint64_t fnv1a(const char *s)
-{
-  uint64_t h = 1469598103934665603ull;
-  for (; *s; ++s)
-  {
-    h ^= (unsigned char) *s;
-    h *= 1099511628211ull;
-  }
-  return h;
-}
-
 /**
  * @brief Do all ranks hold the same settings? One reduction, same verdict
  *        everywhere, and the first differing key named on rank 0.
@@ -224,7 +213,7 @@ static int settings_agree(const MFTL_Settings *s, MPI_Comm comm, const char *cal
     char key[160], value[2 * MFTL_SETTINGS_STRING_MAX + 16];
     snprintf(key, sizeof key, "%s.%s", k->section, k->name);
     if (MFTLSettingsGet(s, key, value, sizeof value) != MFTL_SUCCESS) value[0] = '\0';
-    h[i] = fnv1a(value);
+    h[i] = MFTLHashBytes(MFTL_HASH_SEED, value, strlen(value));
   }
   const int differs = MFTLAgreeWords(comm, h, n, MFTL_NULL);
   free(h);

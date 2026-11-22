@@ -185,11 +185,12 @@ typedef struct MFTL_TopologyOptions
    * ruptures does not create any.
    *
    * The volume of an open surface is measured together with the walls its rims
-   * lie on, as the flux of (x_k - x_k,min) e_k along an axis whose far wall
-   * carries no rim. A cluster for which no such axis exists -- rims on both
-   * walls of every non-periodic axis, or a closed cluster covering all three
-   * periodic axes (MFTL_PeriodicExtent::covers) -- is left uncorrected and
-   * counted in MFTL_TopologyStats::n_clusters_unmeasured.
+   * lie on, as the flux of (x_k - r_k) e_k along the axis MFTLBodyFluxAxis()
+   * picks for the cluster: one with rims on exactly one of its walls, from that
+   * wall, else one whose walls carry no rim. A cluster for which no such axis
+   * exists -- rims on both walls of every non-periodic axis, or a closed
+   * cluster covering all three periodic axes (MFTL_PeriodicExtent::covers) --
+   * is left uncorrected and counted in MFTL_TopologyStats::n_clusters_unmeasured.
    */
   bool conserve_volume;
 

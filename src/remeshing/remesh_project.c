@@ -520,6 +520,7 @@ typedef struct
   double best_d;  ///< Its squared distance; the radius squared before.
   double best_rel[3][3];  ///< Its corners relative to the query point.
   double best_foot[3];  ///< Its closest point, relative to the query point.
+  double best_w[3];  ///< The closest point's barycentric weights.
   int seen[64];  ///< Triangles evaluated: a triangle filed under several visited cells is met several times.
   int n_seen;
 } query_state;
@@ -576,15 +577,15 @@ static void scan_cell(const MFTL_RemeshReference *ref, int cell, const double p[
       rel[1][c] = rel[0][c] + e1[c];
       rel[2][c] = rel[0][c] + e2[c];
     }
-    double foot[3];
-    MFTL_TriangleFeature feature;
-    const double d = MFTLClosestPointOnTriangle(origin, rel, foot, &feature);
+    double foot[3], w[3];
+    const double d = MFTLClosestPointOnTriangle(origin, rel, foot, MFTL_NULL, w);
     if (d < q->best_d || (d == q->best_d && (q->best_t < 0 || ref->tgid[t] < ref->tgid[q->best_t])))
     {
       q->best_t = t;
       q->best_d = d;
       memcpy(q->best_rel, rel, sizeof rel);
       memcpy(q->best_foot, foot, sizeof foot);
+      memcpy(q->best_w, w, sizeof w);
     }
   }
 }
@@ -639,23 +640,16 @@ int MFTLRemeshReferenceProjectPoint(const MFTL_RemeshReference *ref, const doubl
   const double *best_foot = q.best_foot;
 
   /* ── The Phong lift over the closest point ──────────────────────────── */
-  const double *e1 = &ref->frame[9 * best_t + 3], *e2 = &ref->frame[9 * best_t + 6];
-  double r[3];
-  for (int c = 0; c < 3; ++c) r[c] = best_foot[c] - best_rel[0][c];
-  const double d11 = MFTLVectorInProd(e1, e1), d12 = MFTLVectorInProd(e1, e2), d22 = MFTLVectorInProd(e2, e2);
-  const double r1 = MFTLVectorInProd(r, e1), r2 = MFTLVectorInProd(r, e2);
-  const double den = d11 * d22 - d12 * d12;
-  if (!(den > 0.0)) return MFTL_ERROR;
-
-  const double u1 = (d22 * r1 - d12 * r2) / den;
-  const double u2 = (d11 * r2 - d12 * r1) / den;
-  const double u[3] = {1.0 - u1 - u2, u1, u2};
+  /* Its barycentric weights are the closest-point evaluation's own, not the
+   * 2x2 normal equations of the foot, which cancel on a sliver. */
+  const double *const u = q.best_w;
 
   double f[3] = {best_foot[0], best_foot[1], best_foot[2]};
   for (int i = 0; i < 3; ++i)
   {
     const double *n = &ref->nrm[3 * ref->tv[3 * best_t + i]];
-    const double hgt = (best_foot[0] - best_rel[i][0]) * n[0] + (best_foot[1] - best_rel[i][1]) * n[1] + (best_foot[2] - best_rel[i][2]) * n[2];
+    const double d[3] = {best_foot[0] - best_rel[i][0], best_foot[1] - best_rel[i][1], best_foot[2] - best_rel[i][2]};
+    const double hgt = MFTLVectorInProd(d, n);
     for (int c = 0; c < 3; ++c) f[c] -= 0.5 * u[i] * hgt * n[c];
   }
 

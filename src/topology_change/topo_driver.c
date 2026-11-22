@@ -384,11 +384,11 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
   /* ── The field ───────────────────────────────────────────────────────────── */
   MFTLTopoRasterise(ens, cl, n_cl, &lat, events, opts);
   {
-    int *const dest = (int *) MFTLMallocOrDie((size_t) dom->nproc * sizeof(int), "topology node destinations");
+    int *dest = MFTL_NULL;
     double *records = MFTL_NULL;
-    MFTLTopoPackNodeExchange(dom, &lat, cl, n_cl, dest, &records);
+    const int n_out = MFTLTopoPackNodeExchange(dom, &lat, cl, n_cl, &dest, &records);
     int n_recv = 0;
-    double *const recv = MFTLTopoCommExchange(dom, records, dest, 3, &n_recv, MFTL_NULL);
+    double *const recv = MFTLTopoCommExchangeTo(dom, records, dest, n_out, 3, &n_recv);
     MFTLTopoMergeNodes(&lat, cl, n_cl, recv, n_recv);
     free(recv);
     free(records);
@@ -409,25 +409,28 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
   MFTLTopoBuildPieces(dom, &lat, cl, n_cl, pieces);
   for (int c = 0; c < n_cl; ++c) MFTLLevelSetSurfaceFree(&cl[c].surf);
 
-  int *const dest = (int *) MFTLMallocOrDie((size_t) dom->nproc * sizeof(int), "topology label destinations");
   for (;;)
   {
     bool changed = MFTLTopoLabelLocal(pieces, n_cl);
 
+    int *pos = MFTL_NULL, *owners = MFTL_NULL, *counts = MFTL_NULL;
     double *req = MFTL_NULL;
-    MFTLTopoPackLabelRequests(pieces, n_cl, dom->nproc, dest, &req);
+    const int n_owners = MFTLTopoPackLabelRequests(dom, pieces, n_cl, &pos, &owners, &counts, &req);
     int n_req = 0;
     MFTL_ExchangePlan plan;
-    double *const got = MFTLTopoCommExchange(dom, req, dest, 3, &n_req, &plan);
+    double *const got = MFTLTopoCommExchange(dom, req, n_owners, owners, counts, 3, &n_req, &plan);
     double *const answer = (double *) MFTLMallocOrDie((size_t) MFTL_MAX(n_req, 1) * sizeof(double), "topology label answers");
     if (MFTLTopoServeLabelRequests(pieces, n_cl, got, n_req, answer)) changed = MFTL_TRUE;
     double *const back = MFTLTopoCommReply(dom, &plan, answer, 1);
     MFTLExchangePlanFree(&plan);
-    if (MFTLTopoApplyLabelReplies(pieces, n_cl, dom->nproc, back)) changed = MFTL_TRUE;
+    if (MFTLTopoApplyLabelReplies(pieces, n_cl, pos, back)) changed = MFTL_TRUE;
     free(back);
     free(answer);
     free(got);
     free(req);
+    free(counts);
+    free(owners);
+    free(pos);
 
     st->n_label_rounds++;
     int any_changed = changed ? 1 : 0;
@@ -501,7 +504,6 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
   free(tkeys);
 
   free(created);
-  free(dest);
   free(sizes);
   free(bodies);
   const double t_sep = MFTLWallTime();
@@ -631,17 +633,19 @@ int MFTLEnsembleReconstructBodies(MFTL_Ensemble *ens, const int *bodies_in, int 
   MFTLTopoFreeClusters(cl, n_cl);
   const double t_end = MFTLWallTime();
 
-  double t[5] = {t_rec - t0, t_sep - t_rec, t_red - t_sep, t_end - t_red, t_end - t0};
-  MFTLAllreduceDoubles(dom->comm_world, t, 5, MFTL_REDUCE_MAX);
+  /* The verdict rides in the timing reduction as one more MAX slot, so every
+   * rank returns the same status with no collective of its own. A ghost that
+   * kept its provisional id is known only to its rank, and is reported only
+   * here, after every collective: the remesh above must be entered (or
+   * skipped) by every rank alike. */
+  double t[6] = {t_rec - t0, t_sep - t_rec, t_red - t_sep, t_end - t_red, t_end - t0, (ids_ok && status == MFTL_SUCCESS) ? 0.0 : 1.0};
+  MFTLAllreduceDoubles(dom->comm_world, t, 6, MFTL_REDUCE_MAX);
   st->t_reconstruct = t[0];
   st->t_separate = t[1];
   st->t_redistribute = t[2];
   st->t_remesh = t[3];
   st->t_total = t[4];
-  /* A ghost that kept its provisional id is reported only here, after every
-   * collective: the verdict is this rank's, and the remesh above must be
-   * entered (or skipped) by every rank alike. */
-  return ids_ok ? status : MFTL_ERROR;
+  return (t[5] == 0.0) ? MFTL_SUCCESS : MFTL_ERROR;
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════

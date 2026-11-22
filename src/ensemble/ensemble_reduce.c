@@ -272,7 +272,7 @@ static void holder_records_gather(MFTL_Ensemble *ens, const double *values, int 
 
   const int scount = b * rec;
   int n_recv = 0;
-  h->recv = MFTLNeighborAllgatherDoubles(dom, send, scount, h->rcount, h->rdispl, &n_recv);
+  h->recv = MFTLNeighborAllgatherDoubles(dom, send, scount, h->rcount, h->rdispl, &n_recv, MFTL_NULL);
   free(send);
 
   g_stats.n_bytes += (long) (scount + n_recv) * (long) sizeof(double);

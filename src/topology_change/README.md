@@ -363,11 +363,13 @@ the id of the entity with its key (`MFTLTopoSyncGhostIds`: a keyed `MFTLGhostPul
 pull: a request carries a label the owner folds into a minimum over all requests
 and its own components before any answer exists, over per-cluster scratch meshes,
 so the label rounds are a request and a reply on the library's routed exchange
-(`MFTLExchangeRecords` and `MFTLExchangeReply`, through `topo_comm.c`): the reply
+(`MFTLExchangeRecordsTo` and `MFTLExchangeReply`, through `topo_comm.c`): the reply
 reuses the request's plan, so a round costs one route vote, one count exchange and
 two data exchanges, plus the "nothing changed" reduction. The node exchange is the
 same call; both take the graph route unless some window reaches past a
-neighbourhood, and every consumer is independent of the order records arrive in. The closing `MFTLRedistribute` then rebuilds the
+neighbourhood, and every consumer is independent of the order records arrive in.
+Each record names its destination, so nothing per round is sized by the process
+count. The closing `MFTLRedistribute` then rebuilds the
 canonical halo from correct ids. `MFTLObjectSetCounts` marks every new object
 partition-dirty, so the redistribution's body skip cannot mistake one for settled.
 
@@ -404,8 +406,10 @@ bias moves liquid, and the remesh that cleans the slivers up smooths some away o
 own; on the liquid jet, without the correction, 60 of a final 81 volume units were
 lost over 45 reconstructions. Per cluster, the enclosed volume is measured before and
 after (a closed body directly; an open one together with the walls its rims are on,
-as the flux of $(x_k - x_{k,\min})\,\mathbf e_k$ along an axis whose far wall carries
-no rim), and restored by a uniform offset $d$ along a displacement field $\mathbf u$:
+as the flux of $(x_k - r_k)\,\mathbf e_k$ chosen by the body integrals' rule,
+`MFTLBodyFluxAxis` (@ref geom_body_integrals): an axis with rims on one of its walls,
+from that wall, else an axis whose walls carry no rim), and restored by a uniform
+offset $d$ along a displacement field $\mathbf u$:
 the area-weighted vertex normals, with a rim vertex's wall-normal component removed.
 The step is Newton's, on the exact first variation of the volume,
 
@@ -431,7 +435,9 @@ both the seam and the middle of the box as covering, and a closed one doing so o
 three axes then had no flux axis and was silently left uncorrected. A cluster with no
 admissible axis -- rims on both walls of every non-periodic axis, or a closed cluster
 covering all three periodic axes -- is still left uncorrected, and now counted:
-`MFTL_TopologyStats::n_clusters_unmeasured`.
+`MFTL_TopologyStats::n_clusters_unmeasured`. (Until the rule was shared, an open
+cluster could only be measured from a LOWER wall, so a drop hanging from the
+ceiling of a box periodic across it was left uncorrected too.)
 
 **A rim constraint is applied to the reconstructed rim.** Marching cubes puts a rim
 ON its wall but only at lattice resolution within it, so a nozzle circle comes back

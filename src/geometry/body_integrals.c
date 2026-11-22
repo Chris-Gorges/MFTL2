@@ -18,8 +18,9 @@
  *   Q_kj   = sum_t S_t,k / 12 (sum_i y_k,i y_j,i + sum_i y_k,i sum_i y_j,i)
  *
  * where Q_kk = 2 V (C_k - r_k) (field y_k^2 / 2 e_k) and, for j != k,
- * Q_kj = V (C_j - r_j) (field y_k y_j e_k). The collective assembly and the
- * rules for which axis and which reference are MFTLEnsembleBodyIntegrals().
+ * Q_kj = V (C_j - r_j) (field y_k y_j e_k). Which axis and which reference is
+ * MFTLBodyFluxAxis(), for a body and for a topology-change cluster alike; the
+ * collective assembly is MFTLEnsembleBodyIntegrals().
  *
  * The VOLUME is accumulated with exactly the arithmetic the topology change's
  * volume correction always used, so that module can call it and stay
@@ -94,6 +95,54 @@ void MFTLBodyShape(const MFTL_Object *obj, double extent[MFTL_PERIODIC_EXTENT_SL
   *area += a;
 }
 
+int MFTLBodyFluxAxis(const MFTL_Domain *dom, int walls, const bool covers[3], const double centre[3], const double sheet[3], double *ref)
+{
+  *ref = 0.0;
+  if (walls == 0 && sheet == MFTL_NULL)
+  {
+    /* Enclosing: about its own centre, along any axis it does not cover. */
+    for (int k = 0; k < 3; ++k)
+      if (!(dom->is_periodic[k] && covers[k]))
+      {
+        *ref = centre[k];
+        return k;
+      }
+    return -1;
+  }
+  if (walls == 0)
+  {
+    /* A closed sheet across periodic axes separates the box along the one its
+     * area vector points along; that axis needs a wall to measure from. */
+    int k = 0;
+    for (int j = 1; j < 3; ++j)
+      if (fabs(sheet[j]) > fabs(sheet[k])) k = j;
+    if (dom->is_periodic[k]) return -1;
+    *ref = dom->global_min[k];
+    return k;
+  }
+
+  /* Open, every rim on a wall. The field must vanish or be tangent on every
+   * wall patch that closes the region: walls across the other axes are
+   * tangent, and on the flux axis only the reference wall may carry a rim. */
+  for (int pass = 0; pass < 2; ++pass)
+    for (int k = 0; k < 3; ++k)
+    {
+      if (dom->is_periodic[k]) continue;
+      const bool lo = (walls >> (2 * k)) & 1, hi = (walls >> (2 * k + 1)) & 1;
+      if (pass == 0 && lo != hi)
+      {
+        *ref = lo ? dom->global_min[k] : dom->global_max[k];
+        return k;
+      }
+      if (pass == 1 && !lo && !hi)
+      {
+        *ref = dom->global_min[k];
+        return k;
+      }
+    }
+  return -1;
+}
+
 void MFTLBodyFluxVolume(const MFTL_Object *obj, int k, double ref, const double centre[3], double *volume, double *area)
 {
   const MFTL_Domain *const dom = obj->domain;
@@ -113,8 +162,7 @@ void MFTLBodyFluxVolume(const MFTL_Object *obj, int k, double ref, const double 
     {
       /* The image nearest the body's centre: a body crossing the seam on this
        * axis is measured in one piece. */
-      const double L = dom->domain_size[k];
-      x -= L * nearbyint((x - centre[k]) / L);
+      x += MFTLPeriodicImageShift(x, centre[k], dom->domain_size[k]);
     }
     v += (x - ref) * n[k];
   }
@@ -143,12 +191,7 @@ void MFTLBodyFluxMoments(const MFTL_Object *obj, int k, double ref, const double
     {
       const double r = (j == k) ? ref : centre[j];
       double shift = 0.0;
-      if (dom != MFTL_NULL && dom->is_periodic[j])
-      {
-        const double L = dom->domain_size[j];
-        const double xbar = (T[0][j] + T[1][j] + T[2][j]) / 3.0;
-        shift = -L * nearbyint((xbar - centre[j]) / L);
-      }
+      if (dom != MFTL_NULL && dom->is_periodic[j]) shift = MFTLPeriodicImageShift((T[0][j] + T[1][j] + T[2][j]) / 3.0, centre[j], dom->domain_size[j]);
       sum[j] = 0.0;
       for (int i = 0; i < 3; ++i)
       {

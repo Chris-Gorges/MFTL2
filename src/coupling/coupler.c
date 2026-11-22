@@ -199,16 +199,16 @@ static bool window_current(const MFTL_CouplingWindow *wc)
 /** @brief Hash of the parameter fields every rank must share. */
 static uint64_t params_hash(const MFTL_CouplerParams *p)
 {
-  uint64_t h = CPL_FNV_INIT;
+  uint64_t h = MFTL_HASH_SEED;
   const int ints[4] = {(int) p->kernel, (int) p->reproduction, p->failure, (int) p->sampling};
-  h = cpl_fnv(h, ints, sizeof ints);
+  h = MFTLHashBytes(h, ints, sizeof ints);
   const double ds[10] = {p->max_growth, p->growth_step, p->support_scale, p->pilot_factor, p->max_condition, p->max_amplification, p->moment_tolerance,
                          p->sampling_ratio, p->directory_margin, (p->kernel == MFTL_KERNEL_USER) ? p->user_kernel.half_width : 0.0};
-  h = cpl_fnv(h, ds, sizeof ds);
+  h = MFTLHashBytes(h, ds, sizeof ds);
   if (p->kernel == MFTL_KERNEL_USER)
   {
     const int u[3] = {p->user_kernel.moment_order, p->user_kernel.radial ? 1 : 0, p->user_kernel.nonnegative ? 1 : 0};
-    h = cpl_fnv(h, u, sizeof u);
+    h = MFTLHashBytes(h, u, sizeof u);
   }
   return h;
 }
@@ -570,7 +570,7 @@ static void build_directory(MFTL_Coupler *c)
   cpl_dir_entry *own = MFTL_NULL;
   const int n_own = MFTLCplDirectoryOwnEntries(c->grid, d, c->params.pilot_factor, &own);
   for (int i = 0; i < n_own; ++i) own[i].provider = c->rank;
-  c->own_hash = cpl_fnv(cpl_fnv(CPL_FNV_INIT, &n_own, sizeof n_own), own, (size_t) n_own * sizeof(cpl_dir_entry));
+  c->own_hash = MFTLHashBytes(MFTLHashBytes(MFTL_HASH_SEED, &n_own, sizeof n_own), own, (size_t) n_own * sizeof(cpl_dir_entry));
 
   /* One buffer per destination rank, in a sparse list. */
   int n_dest = 0, cap_dest = 0;
@@ -815,7 +815,7 @@ int MFTLCouplerUpdateGrid(MFTL_Coupler *c)
     cpl_dir_entry *own = MFTL_NULL;
     const int n_own = MFTLCplDirectoryOwnEntries(c->grid, &c->ens->domain, c->params.pilot_factor, &own);
     for (int i = 0; i < n_own; ++i) own[i].provider = c->rank;
-    const uint64_t h = cpl_fnv(cpl_fnv(CPL_FNV_INIT, &n_own, sizeof n_own), own, (size_t) n_own * sizeof(cpl_dir_entry));
+    const uint64_t h = MFTLHashBytes(MFTLHashBytes(MFTL_HASH_SEED, &n_own, sizeof n_own), own, (size_t) n_own * sizeof(cpl_dir_entry));
     MFTLCplFree(own);
     rebuild = agree(c, (h != c->own_hash) ? 1 : 0) != 0;
   }
@@ -1795,13 +1795,13 @@ int MFTLCouplerRequestSupport(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, cons
   if (local == MFTL_COUPLING_OK) local = gather_markers(c, spec, R->locs, R->n_loc, &m, MFTL_NULL);
 
   /* Every rank must ask for the same locations with the same skin. */
-  uint64_t sig = CPL_FNV_INIT;
+  uint64_t sig = MFTL_HASH_SEED;
   if (local == MFTL_COUPLING_OK)
   {
-    sig = cpl_fnv(sig, &R->n_loc, sizeof R->n_loc);
-    sig = cpl_fnv(sig, R->locs, (size_t) R->n_loc * sizeof(int));
-    sig = cpl_fnv(sig, R->skin, sizeof R->skin);
-    sig = cpl_fnv(sig, migration, sizeof migration);
+    sig = MFTLHashBytes(sig, &R->n_loc, sizeof R->n_loc);
+    sig = MFTLHashBytes(sig, R->locs, (size_t) R->n_loc * sizeof(int));
+    sig = MFTLHashBytes(sig, R->skin, sizeof R->skin);
+    sig = MFTLHashBytes(sig, migration, sizeof migration);
   }
   int st = MFTLCplAgreeValidated(c->comm, local, sig);
   if (st == MFTL_COUPLING_OK)
@@ -3907,20 +3907,20 @@ static int finish_bind(MFTL_Coupler *c, MFTL_CouplingBinding *b, int local, MFTL
  */
 static uint64_t bind_signature(const MFTL_MarkerSpec *spec)
 {
-  uint64_t h = CPL_FNV_INIT;
+  uint64_t h = MFTL_HASH_SEED;
   if (spec == MFTL_NULL) return h;
   const int kind = (int) spec->kind, nl = spec->n_locations;
-  h = cpl_fnv(h, &kind, sizeof kind);
-  h = cpl_fnv(h, &nl, sizeof nl);
-  if (nl > 0 && spec->locations) h = cpl_fnv(h, spec->locations, (size_t) nl * sizeof(int));
+  h = MFTLHashBytes(h, &kind, sizeof kind);
+  h = MFTLHashBytes(h, &nl, sizeof nl);
+  if (nl > 0 && spec->locations) h = MFTLHashBytes(h, spec->locations, (size_t) nl * sizeof(int));
   if (spec->kind == MFTL_MARKERS_QUADRATURE)
   {
     const int ql[2] = {spec->quadrature_level, spec->quadrature_max_level};
-    h = cpl_fnv(h, ql, sizeof ql);
-    h = cpl_fnv(h, &spec->quadrature_ratio, sizeof spec->quadrature_ratio);
+    h = MFTLHashBytes(h, ql, sizeof ql);
+    h = MFTLHashBytes(h, &spec->quadrature_ratio, sizeof spec->quadrature_ratio);
   }
   const int io = spec->interpolation_only ? 1 : 0;
-  return cpl_fnv(h, &io, sizeof io);
+  return MFTLHashBytes(h, &io, sizeof io);
 }
 
 int MFTLCouplerBind(MFTL_Coupler *c, const MFTL_MarkerSpec *spec, const MFTL_CouplingWindow *w, MFTL_CouplingBinding **out)
@@ -4228,7 +4228,7 @@ static int prepare_transfer(MFTL_Coupler *c, const MFTL_TransferSpec *spec, MFTL
   }
 
   MFTL_TransferReady *r = MFTL_NULL;
-  uint64_t sig = CPL_FNV_INIT;
+  uint64_t sig = MFTL_HASH_SEED;
   if (local == MFTL_COUPLING_OK)
   {
     r = (MFTL_TransferReady *) MFTLCplCalloc(1, sizeof(MFTL_TransferReady), "transfer");
@@ -4242,10 +4242,10 @@ static int prepare_transfer(MFTL_Coupler *c, const MFTL_TransferSpec *spec, MFTL
     r->fields = (MFTL_SolverField *) MFTLCplAlloc((size_t) MFTL_MAX(spec->n_fields, 1) * sizeof(MFTL_SolverField), "transfer");
     r->field_band = (int *) MFTLCplAlloc((size_t) MFTL_MAX(spec->n_fields, 1) * sizeof(int), "transfer");
     const int dir = (int) spec->direction, form = (int) spec->form;
-    sig = cpl_fnv(sig, &dir, sizeof dir);
-    sig = cpl_fnv(sig, &form, sizeof form);
-    sig = cpl_fnv(sig, &spec->n_fields, sizeof spec->n_fields);
-    sig = cpl_fnv(sig, &w->id, sizeof w->id);
+    sig = MFTLHashBytes(sig, &dir, sizeof dir);
+    sig = MFTLHashBytes(sig, &form, sizeof form);
+    sig = MFTLHashBytes(sig, &spec->n_fields, sizeof spec->n_fields);
+    sig = MFTLHashBytes(sig, &w->id, sizeof w->id);
     for (int f = 0; f < spec->n_fields && local == MFTL_COUPLING_OK; ++f)
     {
       const MFTL_SolverField *F = &spec->fields[f];
@@ -4276,7 +4276,7 @@ static int prepare_transfer(MFTL_Coupler *c, const MFTL_TransferSpec *spec, MFTL
         if (!bound) local = MFTL_COUPLING_INVALID;
       }
       const int fl[3] = {F->location, F->halo_valid ? 1 : 0, F->halo_transpose ? 1 : 0};
-      sig = cpl_fnv(sig, fl, sizeof fl);
+      sig = MFTLHashBytes(sig, fl, sizeof fl);
     }
   }
   int st = MFTLCplAgreeValidated(c->comm, local, sig);
@@ -5105,7 +5105,7 @@ static uint64_t quad_signature(const MFTL_CouplingBinding *b, int ncomp, bool to
 {
   const uint64_t id = (b && b->quad) ? b->quad->id : 0;
   const int args[3] = {ncomp, to_vertices ? 1 : 0, (int) form};
-  return cpl_fnv(cpl_fnv(CPL_FNV_INIT, &id, sizeof id), args, sizeof args);
+  return MFTLHashBytes(MFTLHashBytes(MFTL_HASH_SEED, &id, sizeof id), args, sizeof args);
 }
 
 int MFTLCouplerQuadratureToVertices(MFTL_Coupler *c, const MFTL_CouplingBinding *b, int ncomp, const double *Uq, double *Uv)

@@ -887,26 +887,26 @@ int MFTLSolverGridSetProviderRegions(MFTL_SolverGrid *g, const MFTL_ProviderRegi
 
 uint64_t MFTLCplGridDefinitionHash(const MFTL_SolverGrid *g)
 {
-  uint64_t h = CPL_FNV_INIT;
-  h = cpl_fnv(h, &g->n_loc, sizeof g->n_loc);
+  uint64_t h = MFTL_HASH_SEED;
+  h = MFTLHashBytes(h, &g->n_loc, sizeof g->n_loc);
   for (int i = 0; i < g->n_loc; ++i)
   {
     const cpl_location *l = &g->loc[i];
-    h = cpl_fnv(h, l->name, strlen(l->name));
+    h = MFTLHashBytes(h, l->name, strlen(l->name));
     const int kind = (int) l->kind, bnd = (int) l->boundary;
-    h = cpl_fnv(h, &kind, sizeof kind);
-    h = cpl_fnv(h, &bnd, sizeof bnd);
-    h = cpl_fnv(h, l->wall, sizeof l->wall);
+    h = MFTLHashBytes(h, &kind, sizeof kind);
+    h = MFTLHashBytes(h, &bnd, sizeof bnd);
+    h = MFTLHashBytes(h, l->wall, sizeof l->wall);
     const int an = l->anisotropic ? 1 : 0;
-    h = cpl_fnv(h, &an, sizeof an);
-    h = cpl_fnv(h, l->dims, sizeof l->dims);
-    h = cpl_fnv(h, l->origin, sizeof l->origin);
-    h = cpl_fnv(h, l->spacing, sizeof l->spacing);
+    h = MFTLHashBytes(h, &an, sizeof an);
+    h = MFTLHashBytes(h, l->dims, sizeof l->dims);
+    h = MFTLHashBytes(h, l->origin, sizeof l->origin);
+    h = MFTLHashBytes(h, l->spacing, sizeof l->spacing);
     if (l->kind == MFTL_LATTICE_RECTILINEAR)
       for (int k = 0; k < 3; ++k)
       {
-        h = cpl_fnv(h, l->coords[k], (size_t) l->dims[k] * sizeof(double));
-        h = cpl_fnv(h, l->faces[k], (size_t) (l->dims[k] + 1) * sizeof(double));
+        h = MFTLHashBytes(h, l->coords[k], (size_t) l->dims[k] * sizeof(double));
+        h = MFTLHashBytes(h, l->faces[k], (size_t) (l->dims[k] + 1) * sizeof(double));
       }
   }
   return h;

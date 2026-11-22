@@ -51,8 +51,7 @@ void MFTLPeriodicExtentAddTriangle(const MFTL_Domain *dom, const double T[3][3],
     {
       /* Shift corner 0 by the frame's offset and wrap it back into the box; the
        * other corners follow rigidly, so the triangle keeps its shape. */
-      double c0 = T[0][k] + frame_shift[f] * L;
-      c0 -= L * floor((c0 - dom->global_min[k]) / L);
+      const double c0 = MFTLPeriodicWrapCoordinate(T[0][k] + frame_shift[f] * L, dom->global_min[k], L);
       const double d = c0 - T[0][k];
       acc[6 * f + k] = fmin(acc[6 * f + k], lo + d);
       acc[6 * f + 3 + k] = fmin(acc[6 * f + 3 + k], -(hi + d));

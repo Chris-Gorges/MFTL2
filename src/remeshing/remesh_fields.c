@@ -103,10 +103,10 @@ double *MFTLRemeshFieldPrepare(const MFTL_Object *obj, const int *old_ids, const
       donor[j] = -1;
       for (int i = 0; i < nold; ++i)
       {
-        double delta[3], p[3], q[3];
+        double delta[3], p[3];
         MFTLGetMinimumImageVector(obj->domain, delta, triangles[i][0], center);
         for (int k = 0; k < 3; ++k) p[k] = triangles[i][0][k] + delta[k];
-        const double distance = MFTLClosestPointOnTriangle(p, triangles[i], q, NULL);
+        const double distance = MFTLClosestPointOnTriangle(p, triangles[i], MFTL_NULL, MFTL_NULL, MFTL_NULL);
         if (!isfinite(distance)) return NULL;
         const int candidate_gid = obj->tris.rec[old_ids[i]].global_id;
         /* Squared-distance round-off at an old shared edge must not decide
@@ -191,53 +191,6 @@ void MFTLRemeshFieldCommit(MFTL_Object *obj, const int *new_ids, const double *n
   for (int j = 0; j < nnew; ++j)
     if (new_area[j] > 0.0) MFTLFieldsRecord(obj, MFTL_FIELD_TRIANGLE, new_ids[j], values + (size_t) j * stride, true);
   free(values);
-}
-
-/* ClosestPoint already classifies degenerate triangles as edges or vertices. */
-static void barycentric(const double tri[3][3], const double q[3], MFTL_TriangleFeature feature, double w[3])
-{
-  w[0] = w[1] = w[2] = 0.0;
-  if (feature >= MFTL_TRI_FEATURE_VERTEX0 && feature <= MFTL_TRI_FEATURE_VERTEX2)
-  {
-    w[feature - MFTL_TRI_FEATURE_VERTEX0] = 1.0;
-    return;
-  }
-  if (feature >= MFTL_TRI_FEATURE_EDGE0)
-  {
-    const int a = feature - MFTL_TRI_FEATURE_EDGE0, b = (a + 1) % 3;
-    double dot = 0.0, norm = 0.0;
-    for (int k = 0; k < 3; ++k)
-    {
-      const double e = tri[b][k] - tri[a][k];
-      dot += (q[k] - tri[a][k]) * e;
-      norm += e * e;
-    }
-    const double t = norm > 0.0 ? fmax(0.0, fmin(1.0, dot / norm)) : 0.0;
-    w[a] = 1.0 - t;
-    w[b] = t;
-    return;
-  }
-  double aa = 0.0, ab = 0.0, bb = 0.0, aq = 0.0, bq = 0.0;
-  for (int k = 0; k < 3; ++k)
-  {
-    const double a = tri[1][k] - tri[0][k], b = tri[2][k] - tri[0][k], p = q[k] - tri[0][k];
-    aa += a * a;
-    ab += a * b;
-    bb += b * b;
-    aq += a * p;
-    bq += b * p;
-  }
-  const double det = aa * bb - ab * ab;
-  if (!(det > 0.0))
-  {
-    w[0] = 1.0;
-    return;
-  }
-  w[1] = fmax(0.0, (bb * aq - ab * bq) / det);
-  w[2] = fmax(0.0, (aa * bq - ab * aq) / det);
-  w[0] = fmax(0.0, 1.0 - w[1] - w[2]);
-  const double sum = w[0] + w[1] + w[2];
-  for (int k = 0; k < 3; ++k) w[k] /= sum;
 }
 
 typedef struct
@@ -410,18 +363,17 @@ bool MFTLRemeshFieldSmooth(MFTL_Object *obj, const double *new_pos)
       for (int j = 0; j < n; ++j)
       {
         const int t = MFTLHeTriIdx(fan[j]);
-        double tri[3][3], delta[3], p[3], q[3];
-        MFTL_TriangleFeature feature;
+        double tri[3][3], delta[3], p[3], w[3];
         MFTLGetTriangleCorners(obj, t, tri);
         MFTLGetMinimumImageVector(obj->domain, delta, tri[0], new_pos + 3 * v);
         for (int k = 0; k < 3; ++k) p[k] = tri[0][k] + delta[k];
-        const double distance = MFTLClosestPointOnTriangle(p, tri, q, &feature);
+        const double distance = MFTLClosestPointOnTriangle(p, tri, MFTL_NULL, MFTL_NULL, w);
         if (distance < best || (distance == best && obj->tris.rec[t].global_id < best_gid))
         {
           best = distance;
           best_gid = obj->tris.rec[t].global_id;
           MFTLGetTriangleVertices(obj, t, donors + 3 * v);
-          barycentric(tri, q, feature, weights + 3 * v);
+          memcpy(weights + 3 * v, w, sizeof w);
         }
       }
     }

@@ -826,7 +826,7 @@ static void count_on_the_original(const census *c, const double e[3], double r_i
       }
       if (g2 > 1e-16) continue;
       double q[3];
-      on = sqrt(MFTLClosestPointOnTriangle(x, T[t], q, MFTL_NULL)) <= 1e-10;
+      on = sqrt(MFTLClosestPointOnTriangle(x, T[t], q, MFTL_NULL, MFTL_NULL)) <= 1e-10;
     }
     if (de < r_in)
     {

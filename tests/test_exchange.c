@@ -183,9 +183,13 @@ static int run_records(const MFTL_Domain *dom, int pat, int width, long *cross, 
 
   /* The same records, each naming its destination, dealt round-robin over the
    * destinations so no two neighbours share one: MFTLExchangeRecordsTo() must
-   * deliver exactly the stream above, on the same route. */
+   * deliver exactly the stream above, on the same route; and so must
+   * MFTLExchangeRecords() of the same records written where
+   * MFTLExchangeGroupRecords() puts them, whose reply then answers record w at
+   * pos[w]. */
   {
     double *mixed = (double *) malloc((size_t) (n_send > 0 ? n_send : 1) * width * sizeof(double));
+    double *mixed_seq = (double *) malloc((size_t) (n_send > 0 ? n_send : 1) * sizeof(double));
     int *to = (int *) malloc((size_t) (n_send > 0 ? n_send : 1) * sizeof(int));
     int *next = (int *) calloc((size_t) (n_dest > 0 ? n_dest : 1), sizeof(int));
     for (int w = 0; w < n_send;)
@@ -193,6 +197,7 @@ static int run_records(const MFTL_Domain *dom, int pat, int width, long *cross, 
         if (next[i] < count[i])
         {
           for (int k = 0; k < width; ++k) mixed[(size_t) w * width + k] = record_value(me, dest[i], next[i], k);
+          mixed_seq[w] = dest[i] * 64.0 + next[i];
           to[w++] = dest[i];
           next[i]++;
         }
@@ -201,8 +206,34 @@ static int run_records(const MFTL_Domain *dom, int pat, int width, long *cross, 
     ok &= (got != MFTL_NULL) && (n_got == n_recv);
     for (int i = 0; ok && i < n_recv * width; ++i) ok &= (got[i] == recv[i]);
     free(got);
+
+    int *pos = (int *) malloc((size_t) (n_send > 0 ? n_send : 1) * sizeof(int));
+    int *g_rank = MFTL_NULL, *g_count = MFTL_NULL;
+    const int n_g = MFTLExchangeGroupRecords(dom, to, n_send, pos, &g_rank, &g_count);
+    int g_total = 0;
+    for (int b = 0; b < n_g; ++b) g_total += g_count[b];
+    ok &= (g_total == n_send);
+    for (int b = 0; b < n_g; ++b)
+      for (int c = 0; c < b; ++c) ok &= (g_rank[b] != g_rank[c]);
+    double *grouped = (double *) malloc((size_t) (n_send > 0 ? n_send : 1) * width * sizeof(double));
+    for (int w = 0; w < n_send; ++w) memcpy(&grouped[(size_t) pos[w] * width], &mixed[(size_t) w * width], (size_t) width * sizeof(double));
+    MFTL_ExchangePlan plan_g;
+    n_got = -1;
+    got = (double *) MFTLExchangeRecords(dom, (size_t) width * sizeof(double), grouped, n_g, g_rank, g_count, &plan_g, &n_got);
+    ok &= (got != MFTL_NULL) && (n_got == n_recv) && (plan_g.global == plan.global);
+    for (int i = 0; ok && i < n_recv * width; ++i) ok &= (got[i] == recv[i]);
+    double *back_g = (double *) MFTLExchangeReply(dom, &plan_g, sizeof(double), answer);  // got == recv, so the same answers
+    for (int w = 0; w < n_send; ++w) ok &= (back_g[pos[w]] == mixed_seq[w]);
+    MFTLExchangePlanFree(&plan_g);
+    free(back_g);
+    free(got);
+    free(grouped);
+    free(g_count);
+    free(g_rank);
+    free(pos);
     free(next);
     free(to);
+    free(mixed_seq);
     free(mixed);
   }
 
@@ -289,14 +320,26 @@ static int run_typed(const MFTL_Domain *dom, MFTL_Route route, bool far, long *c
     }
   }
 
+  /* The pinned graph route takes one buffer per graph SLOT, AUTO one per rank:
+   * the same buffers, seen through the neighbour list. */
+  const bool by_slot = (route == MFTL_ROUTE_GRAPH);
+  MFTL_SendBuffer *view[3];
+  for (int p = 0; p < 3; ++p)
+  {
+    view[p] = sb[p];
+    if (!by_slot) continue;
+    view[p] = (MFTL_SendBuffer *) calloc((size_t) (dom->num_neighbors > 0 ? dom->num_neighbors : 1), sizeof(MFTL_SendBuffer));
+    for (int i = 0; i < dom->num_neighbors; ++i) view[p][i] = sb[p][dom->neighbors[i]];
+  }
+
   MFTL_Exchange x[3];
-  x[0].send_bufs = sb[0];
+  x[0].send_bufs = view[0];
   x[0].type = MPI_INT;
   x[0].type_size = sizeof(int);
-  x[1].send_bufs = sb[1];
+  x[1].send_bufs = view[1];
   x[1].type = MPI_DOUBLE;
   x[1].type_size = sizeof(double);
-  x[2].send_bufs = sb[2];
+  x[2].send_bufs = view[2];
   x[2].type = MFTL_MPI_PackedVertex;  // a resized struct type: its extent, not a byte count, must step the buffer
   x[2].type_size = sizeof(MFTL_PackedVertex);
 
@@ -344,6 +387,7 @@ static int run_typed(const MFTL_Domain *dom, MFTL_Route route, bool far, long *c
   {
     free(x[p].recv_buf);
     for (int d = 0; d < nproc; ++d) free(sb[p][d].buffer);
+    if (view[p] != sb[p]) free(view[p]);
     free(sb[p]);
   }
   free(src);

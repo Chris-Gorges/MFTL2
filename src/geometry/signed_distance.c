@@ -144,8 +144,8 @@ long MFTLRasterizeSignedDistanceBanded(MFTL_SdfGrid *grid, const MFTL_Object *ob
     for (int k = 0; k < 3; ++k) ctr[k] = (T[0][k] + T[1][k] + T[2][k]) / 3.0;
     for (int j = 0; j < 3; ++j)
     {
-      const double ex = T[j][0] - ctr[0], ey = T[j][1] - ctr[1], ez = T[j][2] - ctr[2];
-      rad_sq = fmax(rad_sq, ex * ex + ey * ey + ez * ez);
+      const double e[3] = {T[j][0] - ctr[0], T[j][1] - ctr[1], T[j][2] - ctr[2]};
+      rad_sq = fmax(rad_sq, MFTLVectorNormSq(e));
       for (int k = 0; k < 3; ++k) mag = fmax(mag, fabs(T[j][k]));
     }
     const double rad = sqrt(rad_sq);
@@ -177,12 +177,12 @@ long MFTLRasterizeSignedDistanceBanded(MFTL_SdfGrid *grid, const MFTL_Object *ob
            * cutoff, and not beaten by what it holds. */
           const double limit = fmin((band != MFTL_NULL && !band[idx]) ? cutoff : reach, fabs(*node)) + slack;
           if (fabs(MFTLVectorInProd(n_face, x) - plane) > limit) continue;
-          const double cx = x[0] - ctr[0], cy = x[1] - ctr[1], cz = x[2] - ctr[2];
-          if (cx * cx + cy * cy + cz * cz > (rad + limit) * (rad + limit)) continue;
+          const double c[3] = {x[0] - ctr[0], x[1] - ctr[1], x[2] - ctr[2]};
+          if (MFTLVectorNormSq(c) > (rad + limit) * (rad + limit)) continue;
 
           double q[3];
           MFTL_TriangleFeature f;
-          const double d_sq = MFTLClosestPointOnTriangle(x, T, q, &f);
+          const double d_sq = MFTLClosestPointOnTriangle(x, T, q, &f, MFTL_NULL);
           if (d_sq > reach_sq) continue;
           if (band != MFTL_NULL && !band[idx] && d_sq > cut_sq) continue;
           const double d = sqrt(d_sq);
@@ -213,7 +213,8 @@ long MFTLRasterizeSignedDistanceBanded(MFTL_SdfGrid *grid, const MFTL_Object *ob
             n = &obj->verts.normal[3 * obj->tris.verts[3 * t + (f - MFTL_TRI_FEATURE_VERTEX0)]];
           }
 
-          const double dot = (x[0] - q[0]) * n[0] + (x[1] - q[1]) * n[1] + (x[2] - q[2]) * n[2];
+          const double xq[3] = {x[0] - q[0], x[1] - q[1], x[2] - q[2]};
+          const double dot = MFTLVectorInProd(xq, n);
           const double value = (dot < 0.0) ? -d : d;
           const double merged = MFTLSdfMerge(*node, value);
           if (merged != *node)

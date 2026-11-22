@@ -29,7 +29,7 @@
 #include "mftl_memory.h"
 #include "mftl_topology.h"
 
-uint64_t MFTLCplPositionsChecksum(const double *pos, int64_t n) { return cpl_fnv(CPL_FNV_INIT, pos, 3 * (size_t) n * sizeof(double)); }
+uint64_t MFTLCplPositionsChecksum(const double *pos, int64_t n) { return MFTLHashBytes(MFTL_HASH_SEED, pos, 3 * (size_t) n * sizeof(double)); }
 
 static void snapshot_bodies(const MFTL_Ensemble *ens, cpl_markers *m)
 {

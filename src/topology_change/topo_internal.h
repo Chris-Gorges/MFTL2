@@ -153,16 +153,19 @@ void MFTLTopoRasterise(const MFTL_Ensemble *ens, MFTL_TopoCluster *cl, int n_cl,
 
 /**
  * @brief Packs every known window node that another rank needs:
- *        records `(cluster, node key, value)`, bucketed by destination rank.
+ *        records `(cluster, node key, value)`, each naming its destination.
  *
- * @param dom              The domain: rank map.
- * @param lat              The lattice.
- * @param cl               The clusters, with their windows rasterised.
- * @param n_cl             Their number.
- * @param[out] dest_counts `[nproc]` records per destination.
- * @param[out] records     `malloc`'d, grouped by destination in rank order.
+ * @param dom          The domain: rank map.
+ * @param lat          The lattice.
+ * @param cl           The clusters, with their windows rasterised.
+ * @param n_cl         Their number.
+ * @param[out] dest    `malloc`'d `[return]` destination rank of each record,
+ *                     never this rank.
+ * @param[out] records `malloc`'d `[3 * return]` records, in the order the
+ *                     windows are walked.
+ * @return The number of records.
  */
-void MFTLTopoPackNodeExchange(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, const MFTL_TopoCluster *cl, int n_cl, int *dest_counts, double **records);
+int MFTLTopoPackNodeExchange(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, const MFTL_TopoCluster *cl, int n_cl, int **dest, double **records);
 
 /** @brief Merges received `(cluster, node key, value)` records into the windows. */
 void MFTLTopoMergeNodes(const MFTL_TopoLattice *lat, MFTL_TopoCluster *cl, int n_cl, const double *records, int n_records);
@@ -216,8 +219,23 @@ void MFTLTopoFreePieces(MFTL_TopoPiece *pieces, int n);
  */
 bool MFTLTopoLabelLocal(MFTL_TopoPiece *pieces, int n_cl);
 
-/** @brief Packs `(cluster, triangle key, label)` for every GHOST triangle, by owner. */
-void MFTLTopoPackLabelRequests(const MFTL_TopoPiece *pieces, int n_cl, int nproc, int *dest_counts, double **records);
+/**
+ * @brief Packs `(cluster, triangle key, label)` for every GHOST triangle,
+ *        grouped by owner (MFTLExchangeGroupRecords()); within an owner,
+ *        (cluster, triangle) ascending.
+ *
+ * @param dom          The domain.
+ * @param pieces       The pieces.
+ * @param n_cl         Their number.
+ * @param[out] pos     `malloc`'d: for the i-th ghost triangle in (cluster,
+ *                     triangle) order, where its request is in @p records,
+ *                     and so where its reply will be.
+ * @param[out] ranks   `malloc`'d `[return]` the owners.
+ * @param[out] counts  `malloc`'d `[return]` requests for each.
+ * @param[out] records `malloc`'d requests, grouped as @p ranks.
+ * @return The number of owners.
+ */
+int MFTLTopoPackLabelRequests(const MFTL_Domain *dom, const MFTL_TopoPiece *pieces, int n_cl, int **pos, int **ranks, int **counts, double **records);
 
 /**
  * @brief Owner side of one labelling round: lowers the labels of the owned
@@ -226,8 +244,8 @@ void MFTLTopoPackLabelRequests(const MFTL_TopoPiece *pieces, int n_cl, int nproc
  */
 bool MFTLTopoServeLabelRequests(MFTL_TopoPiece *pieces, int n_cl, const double *req, int n_req, double *reply);
 
-/** @brief Holder side: takes the owners' replies for its ghost triangles, in request order. */
-bool MFTLTopoApplyLabelReplies(MFTL_TopoPiece *pieces, int n_cl, int nproc, const double *reply);
+/** @brief Holder side: takes the owners' replies for its ghost triangles, the i-th at `pos[i]` (MFTLTopoPackLabelRequests()). */
+bool MFTLTopoApplyLabelReplies(MFTL_TopoPiece *pieces, int n_cl, const int *pos, const double *reply);
 
 /**
  * @brief Records `(cluster, label, owned triangles, open)` for every distinct
@@ -313,23 +331,42 @@ int MFTLTopoSyncGhostIds(MFTL_Ensemble *ens, const int *created, int n_created, 
 double *MFTLTopoCommAllgather(const MFTL_Domain *dom, const double *mine, int n_mine, int stride, int *n_out);
 
 /**
- * @brief Personalised exchange of records of @p stride doubles:
- *        MFTLExchangeRecords(), which agrees the route (graph, or global when
- *        some destination is outside a neighbourhood) itself.
+ * @brief Personalised exchange of records of @p stride doubles that each name
+ *        their destination: MFTLExchangeRecordsTo(), which groups them and
+ *        agrees the route (graph, or global when some destination is outside a
+ *        neighbourhood) itself.
  *
  * @param dom         The domain.
- * @param records     Grouped by destination rank, `dest_counts[r]` records for
- *                    rank r; never this rank.
- * @param dest_counts `[nproc]` records per destination.
+ * @param records     `[n_records * stride]` doubles, in any order.
+ * @param dest        `[n_records]` destination rank of each; never this rank.
+ * @param n_records   Records.
  * @param stride      Doubles per record.
  * @param[out] n_recv Records received.
- * @param[out] plan   If not #MFTL_NULL, what MFTLTopoCommReply() needs; release
- *                    with MFTLExchangePlanFree().
  * @return Received records, `malloc`'d, one block per source in receive order
- *         (graph neighbours in `dom->neighbors` order, global-route sources ascending).
- *         Every consumer is independent of that order.
+ *         (graph neighbours in `dom->neighbors` order, global-route sources
+ *         ascending), each in its sender's order. Every consumer is independent
+ *         of that order.
  */
-double *MFTLTopoCommExchange(const MFTL_Domain *dom, const double *records, const int *dest_counts, int stride, int *n_recv, MFTL_ExchangePlan *plan);
+double *MFTLTopoCommExchangeTo(const MFTL_Domain *dom, const double *records, const int *dest, int n_records, int stride, int *n_recv);
+
+/**
+ * @brief Personalised exchange of records of @p stride doubles grouped by
+ *        destination: MFTLExchangeRecords(), which agrees the route itself.
+ *
+ * @param dom         The domain.
+ * @param records     Grouped by destination in the order of @p ranks; never this rank.
+ * @param n_dest      Destinations.
+ * @param ranks       `[n_dest]` distinct destination ranks.
+ * @param counts      `[n_dest]` records for each.
+ * @param stride      Doubles per record.
+ * @param[out] n_recv Records received.
+ * @param[out] plan   What MFTLTopoCommReply() needs; release with
+ *                    MFTLExchangePlanFree().
+ * @return Received records, `malloc`'d, in the receive order of
+ *         MFTLTopoCommExchangeTo().
+ */
+double *MFTLTopoCommExchange(const MFTL_Domain *dom, const double *records, int n_dest, const int *ranks, const int *counts, int stride, int *n_recv,
+                             MFTL_ExchangePlan *plan);
 
 /**
  * @brief Sends @p reply back to the requesters: MFTLExchangeReply(), no vote

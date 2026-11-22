@@ -15,12 +15,15 @@
  *                           agree on the event list, including a rank two boxes
  *                           away that will reconstruct part of a body it does
  *                           not yet hold.
- *   MFTLTopoCommExchange /    personalised exchanges of the lattice overlap and
- *   MFTLTopoCommReply         the component labels, on the library's routed
- *                           exchange (MFTLExchangeRecords()): the neighbourhood
- *                           graph, or the global route when some window reaches
- *                           past it. The reply reuses the request's plan, so it
- *                           costs one data exchange and nothing else.
+ *   MFTLTopoCommExchangeTo /  personalised exchanges of the lattice overlap (each
+ *   MFTLTopoCommExchange /    record names its destination) and of the component
+ *   MFTLTopoCommReply         labels (grouped in place by the library's grouping,
+ *                           MFTLExchangeGroupRecords()), on the library's routed
+ *                           exchange: the neighbourhood graph, or the global
+ *                           route when some window reaches past it. Nothing per
+ *                           call is sized by the process count. The reply
+ *                           reuses the request's plan, so it costs one data
+ *                           exchange and nothing else.
  *
  * The small reductions are not here: the handful of values reduced PER
  * CLUSTER or per listed body, and the label rounds' "did anything change"
@@ -70,22 +73,15 @@ double *MFTLTopoCommAllgather(const MFTL_Domain *dom, const double *mine, int n_
   return all;
 }
 
-double *MFTLTopoCommExchange(const MFTL_Domain *dom, const double *records, const int *dest_counts, int stride, int *n_recv, MFTL_ExchangePlan *plan)
+double *MFTLTopoCommExchangeTo(const MFTL_Domain *dom, const double *records, const int *dest, int n_records, int stride, int *n_recv)
 {
-  /* The packers group by rank in rank order; the engine takes the non-empty
-   * groups as its destination list. */
-  int *const list = (int *) MFTLMallocOrDie(2 * (size_t) MFTL_MAX(dom->nproc, 1) * sizeof(int), "topology destinations");
-  int *const count = list + dom->nproc;
-  int n_dest = 0;
-  for (int r = 0; r < dom->nproc; ++r)
-  {
-    if (dest_counts[r] == 0) continue;
-    list[n_dest] = r;
-    count[n_dest++] = dest_counts[r];
-  }
-  double *const recv = (double *) MFTLExchangeRecords(dom, (size_t) stride * sizeof(double), records, n_dest, list, count, plan, n_recv);
-  free(list);
-  return recv;
+  return (double *) MFTLExchangeRecordsTo(dom, (size_t) stride * sizeof(double), records, dest, n_records, n_recv);
+}
+
+double *MFTLTopoCommExchange(const MFTL_Domain *dom, const double *records, int n_dest, const int *ranks, const int *counts, int stride, int *n_recv,
+                             MFTL_ExchangePlan *plan)
+{
+  return (double *) MFTLExchangeRecords(dom, (size_t) stride * sizeof(double), records, n_dest, ranks, counts, plan, n_recv);
 }
 
 double *MFTLTopoCommReply(const MFTL_Domain *dom, const MFTL_ExchangePlan *plan, const double *reply, int stride)

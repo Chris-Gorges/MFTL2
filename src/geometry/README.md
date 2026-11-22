@@ -248,7 +248,11 @@ products select one of seven regions (face, three edges, three corners) and only
 that region's formula is evaluated. It also returns the **feature**; edge $k$
 is half-edge $3t+k$. The side-of-an-edge decisions and the face point come from
 an orthogonalised frame, not from Ericson's determinants of dot products
-(@ref geom_closest_accuracy). A triangle with $\sin^2\theta \le 10^{-15}$ at
+(@ref geom_closest_accuracy). So do the closest point's **barycentric weights**,
+an optional output: one-hot at a corner, the edge parameter on an edge, the
+frame's coordinates on the face. Recovering them from the point afterwards
+through the 2x2 normal equations would bring the Gram determinant back; the
+remesher's Phong projection and its field transfer read these instead. A triangle with $\sin^2\theta \le 10^{-15}$ at
 corner 0 is treated as its three edges, because the face normal a signed
 distance would read is not trustworthy there; that answer can be up to the
 triangle's height too far.
@@ -478,8 +482,10 @@ every other part of the region's boundary contributes nothing:
 The open rule picks what every open-surface example hand-coded: Rayleigh–Taylor
 and the travelling waves from the floor along $z$, the jet from the nozzle wall
 along $x$; a drop hanging from the ceiling is measured from the ceiling. The
-topology change keeps its own choice per CLUSTER (`MFTLTopoChooseFlux`), which
-agrees on all of them, and shares the kernels. A body whose rim leaves the walls has no region
+table is ONE function, `MFTLBodyFluxAxis`, which the topology change applies per
+CLUSTER too, without the sheet row: it measures a closed cluster as enclosing,
+which for a sheet is its volume up to a constant -- invisible to the before/after
+comparison it needs, and possible without a wall. A body whose rim leaves the walls has no region
 (UNDEFINED); one with rims on both walls of every non-periodic axis, or a sheet
 across a fully periodic box, has one but no wall to measure it from
 (UNSUPPORTED). A centroid component along an axis the body COVERS

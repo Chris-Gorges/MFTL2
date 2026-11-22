@@ -70,7 +70,7 @@ static void scatter_face_normals(MFTL_Object *obj, MFTL_NormalWeighting weightin
     const double e2[3] = {e2x, e2y, e2z};
     double n[3], w[3];
     MFTLVectorCrossVector(n, e1, e2);
-    if (!MFTLGeomFaceNormalTerm(angle, e1, e2, n, w)) continue;
+    if (!MFTLGeomFaceNormalTerm(angle, 3, e1, e2, n, w)) continue;
     MFTLGeomAddFaceNormal(vn, 3, v0, v1, v2, n, w););
   // clang-format on
 }
@@ -88,30 +88,13 @@ static void scatter_face_normals(MFTL_Object *obj, MFTL_NormalWeighting weightin
  */
 static void add_face(const MFTL_Object *obj, const double p[3], int a, int b, bool angle, double n[3])
 {
-  double d1[3], d2[3];
-  const double *const pa = MFTLVertexPos(obj, a), *const pb = MFTLVertexPos(obj, b);
-  if (obj->domain != MFTL_NULL)
-  {
-    MFTLGetMinimumImageVector(obj->domain, d1, p, pa);
-    MFTLGetMinimumImageVector(obj->domain, d2, p, pb);
-  }
-  else
-    for (int k = 0; k < 3; ++k) d1[k] = pa[k] - p[k], d2[k] = pb[k] - p[k];
-
-  double c[3];
-  MFTLVectorCrossVector(c, d1, d2);
-  double s = 1.0;
-  if (angle)
-  {
-    const double mag = MFTL_SQRT(MFTLVectorNormSq(c));
-    if (!(mag > 0.0)) return;
-    const double inv = 1.0 / mag;
-    c[0] *= inv, c[1] *= inv, c[2] *= inv;
-    s = MFTLGeomCornerAngle(mag, MFTLVectorInProd(d1, d2));
-  }
-  n[0] += s * c[0];
-  n[1] += s * c[1];
-  n[2] += s * c[2];
+  double e1[3], e2[3], c[3], w[3];
+  MFTLGeomCornerEdges(obj->domain, p, MFTLVertexPos(obj, a), MFTLVertexPos(obj, b), e1, e2);
+  MFTLVectorCrossVector(c, e1, e2);
+  if (!MFTLGeomFaceNormalTerm(angle, 1, e1, e2, c, w)) return;
+  n[0] += w[0] * c[0];
+  n[1] += w[0] * c[1];
+  n[2] += w[0] * c[2];
 }
 
 /** Relative rank tolerance of the fit (the placement's value, src/remeshing/remesh_fit.c). */
@@ -193,7 +176,12 @@ bool MFTLComputeVertexNormalAt(const MFTL_Object *obj, int v, MFTL_NormalWeighti
   const double *const p = MFTLVertexPos(obj, v);
   bool closed = MFTL_FALSE;
 
-  /* Forward: the outgoing v->w1 of the face (v, w1, w2), then the outgoing
+  /* Its own walk, not MFTLGetVertexOneRingHalfedges(): clockwise, the step of
+   * MFTLVertexFanStart(), summing each face as it is reached. Per call on one
+   * mesh, the ring list and then the faces measured 1 % slower, and a
+   * counter-clockwise walk summing as it steps 10 % (about 3 % of a placement fit);
+   * both also change the order of the sum (docs/analysis.md §16.13). Forward:
+   * the outgoing v->w1 of the face (v, w1, w2), then the outgoing
    * v->w2 = twin(prev). */
   int h = start;
   for (int guard = 0; guard < FAN_WALK_MAX; ++guard)

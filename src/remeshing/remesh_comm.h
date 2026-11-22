@@ -504,7 +504,8 @@ int MFTLRemeshSyncGhostIds(MFTL_Ensemble *ens, const int *vertex_gid_base);
 int MFTLRemeshSyncGhostSizing(MFTL_Ensemble *ens);
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * 4. Neighbourhood exchange -- the three shapes the dispersed balancer needs
+ * 4. Neighbourhood exchange -- the fixed-length shapes the dispersed balancer
+ *    needs (its variable-length gather is MFTLNeighborAllgatherDoubles())
  *
  * Each moves a payload proportional to `num_neighbors` (<= 26) and to what THIS
  * rank holds; none can carry an array indexed by body id or by rank.
@@ -515,26 +516,6 @@ int MFTLRemeshSyncGhostSizing(MFTL_Ensemble *ens);
  * caller that also folds in its own contribution locally must skip the slot
  * `MFTLDomainNeighborIndex(domain, domain->rank)` reports, or every SUM doubles.
  * ═══════════════════════════════════════════════════════════════════════════ */
-
-/**
- * @brief Variable-length allgatherv of doubles over `comm_graph`.
- *
- * MFTLNeighborAllgatherDoubles() (mftl_communication.h), routed through this
- * file so that remesh_comm.c stays the complete inventory of the module's
- * network use.
- *
- * @param      domain The MPI/physical world.
- * @param      send   `[n_send]` this rank's block, delivered to every neighbour.
- * @param      n_send Doubles in @p send. May be zero.
- * @param[out] rcount `[num_neighbors]` doubles received from each neighbour.
- * @param[out] rdispl `[num_neighbors]` offset of each neighbour's block.
- * @param[out] n_recv Total doubles received.
- * @return A newly allocated buffer of @p n_recv doubles; the caller frees it.
- *         Never #MFTL_NULL, so that an empty result still frees cleanly.
- * @collective Over `comm_graph`, so a rank with no neighbours does not
- *             communicate at all.
- */
-double *MFTLRemeshNeighborGather(const MFTL_Domain *domain, const double *send, int n_send, int *rcount, int *rdispl, int *n_recv);
 
 /**
  * @brief Fixed-length allgather of @p n doubles over `comm_graph`.

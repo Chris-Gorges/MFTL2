@@ -122,7 +122,7 @@ static void scatter_cotan(const MFTL_Object *obj, bool angles, double *restrict 
 
     /* The AREA vertex normal's own term and scatter. */
     double w[3];
-    MFTLGeomFaceNormalTerm(MFTL_FALSE, e1, e2, nrm, w);
+    MFTLGeomFaceNormalTerm(MFTL_FALSE, 3, e1, e2, nrm, w);
     MFTLGeomAddFaceNormal(acc + ACC_NRM, ACC_STRIDE, v0, v1, v2, nrm, w);
 
     if (angles)
@@ -165,19 +165,6 @@ static void scatter_cotan(const MFTL_Object *obj, bool angles, double *restrict 
  * diverges as the normal turns into the tangent plane. Dimensionless.
  */
 #define CURVATURE_FIT_MIN_COS 0.25
-
-/** @brief `out = b - a` under the minimum image of @p dom (plain difference without a domain). */
-static inline void min_image(const MFTL_Domain *dom, const double *a, const double *b, double out[3])
-{
-  if (dom != MFTL_NULL)
-    MFTLGetMinimumImageVector(dom, out, a, b);
-  else
-  {
-    out[0] = b[0] - a[0];
-    out[1] = b[1] - a[1];
-    out[2] = b[2] - a[2];
-  }
-}
 
 /**
  * @brief Writes the record from kappa and the Gaussian curvature: the
@@ -235,7 +222,7 @@ static void cotan_direction(const MFTL_Object *obj, int v, const double n[3], do
   dir[2] = t1[2];
 
   int ring[MFTL_MAX_VALENCE];
-  const int nt = MFTLGetVertexOneRing(obj, v, ring, MFTL_MAX_VALENCE, MFTL_FALSE);
+  const int nt = MFTLGetVertexOneRingHalfedges(obj, v, ring, MFTL_MAX_VALENCE, MFTL_FALSE, MFTL_NULL);
 
   enum
   {
@@ -245,19 +232,14 @@ static void cotan_direction(const MFTL_Object *obj, int v, const double n[3], do
   int m = 0;
   const MFTL_Domain *const dom = obj->domain;
   const double *const xv = MFTLVertexPos(obj, v);
-  const int *const tv = obj->tris.verts;
 
   for (int i = 0; i < nt; ++i)
   {
-    const int t = ring[i];
-    int c = 0;
-    while (c < 3 && tv[3 * t + c] != v) ++c;
-    if (c == 3) continue;
-    const int j = tv[3 * t + (c + 1) % 3], k = tv[3 * t + (c + 2) % 3];
+    /* The face of the outgoing half-edge v -> j is (v, j, k). */
+    const int j = MFTLHeTarget(obj, ring[i]), k = MFTLHeTarget(obj, MFTLHeNextIdx(ring[i]));
 
     double e[2][3];
-    min_image(dom, xv, MFTLVertexPos(obj, j), e[0]);
-    min_image(dom, xv, MFTLVertexPos(obj, k), e[1]);
+    MFTLGeomCornerEdges(dom, xv, MFTLVertexPos(obj, j), MFTLVertexPos(obj, k), e[0], e[1]);
     double cr[3];
     MFTLVectorCrossVector(cr, e[0], e[1]);
     const double mag = MFTLVectorNorm(cr);
@@ -265,10 +247,15 @@ static void cotan_direction(const MFTL_Object *obj, int v, const double n[3], do
 
     const double ljj = MFTLVectorNormSq(e[0]);
     const double lkk = MFTLVectorNormSq(e[1]);
-    const double ljk = MFTLVectorInProd(e[0], e[1]);
-    /* The angle at k faces the edge v-j: its edges are -e_k and e_j - e_k. */
-    const double cot_k = (lkk - ljk) / mag;
-    const double cot_j = (ljj - ljk) / mag;
+    /* Corner 1 is j and corner 2 is k; the angle at k faces the edge v-j. Each
+     * cotangent from its corner's own edges (MFTLGeomCornerDots()), never as
+     * lkk - ljk, which cancels at a sliver's near-right corners, and over
+     * |e_j x e_k| as the cotangent scatter takes it: by its reciprocal. */
+    double dc[3];
+    MFTLGeomCornerDots(e[0], e[1], dc);
+    const double inv = 1.0 / mag;
+    const double cot_j = dc[1] * inv;
+    const double cot_k = dc[2] * inv;
     const double w[2] = {cot_k * ljj, cot_j * lkk};
 
     for (int s = 0; s < 2; ++s)

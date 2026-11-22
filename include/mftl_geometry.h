@@ -95,6 +95,52 @@ static inline void MFTLGetMinimumImageVector(const MFTL_Domain *domain, double v
 }
 
 /**
+ * @brief The whole number of periods that moves the coordinate @p x into the
+ *        image nearest @p centre: `x + shift` lies within half a period of it.
+ *
+ * \f$-L\,\mathrm{nearbyint}((x - c)/L)\f$, for any distance, ties to even:
+ * MFTLGetMinimumImageVector()'s rule for one coordinate about a centre. It lifts
+ * a body narrower than half a period into one image (#MFTL_PeriodicExtent), and
+ * the corners of a lattice polygon into the image of its first corner. Adding
+ * the shift is bit for bit `x - L nearbyint((x - c)/L)`.
+ *
+ * @param x      The coordinate.
+ * @param centre The coordinate whose image is wanted.
+ * @param period The period \f$L > 0\f$.
+ * @return The shift, a multiple of @p period (zero when @p x is already nearest).
+ */
+static inline double MFTLPeriodicImageShift(double x, double centre, double period) { return -period * nearbyint((x - centre) / period); }
+
+/**
+ * @brief The coordinate @p x wrapped into `[lo, lo + period)` from any
+ *        distance: \f$x - L\lfloor (x - \mathrm{lo})/L\rfloor\f$.
+ *
+ * For a value that may be many periods out (a centre or centroid computed in
+ * an unwrapped frame). A position wrapped every step is at most one period out,
+ * and MFTLApplyPeriodicity() is cheaper for it.
+ *
+ * @param x      The coordinate.
+ * @param lo     Lower end of the box.
+ * @param period The period \f$L > 0\f$.
+ * @return The wrapped coordinate.
+ */
+static inline double MFTLPeriodicWrapCoordinate(double x, double lo, double period) { return x - period * floor((x - lo) / period); }
+
+/**
+ * @brief An index wrapped into `[0, n)` from any distance (a floor modulo): a
+ *        lattice node, a cell or a rank coordinate on a periodic axis.
+ *
+ * @param i The index, unwrapped.
+ * @param n The number of indices on the axis, positive.
+ * @return The wrapped index.
+ */
+static inline int MFTLWrapIndex(int i, int n)
+{
+  const int w = i % n;
+  return (w < 0) ? w + n : w;
+}
+
+/**
  * @brief Wraps a position into the periodic domain box by at most one period.
  *
  * Correct when the position is less than one period outside the box, which a
@@ -530,18 +576,27 @@ typedef enum MFTL_TriangleFeature
  * \f$\sqrt{10^{-15}}\f$ of its two edges at corner 0;
  * MFTLClosestPointsBetweenTriangles() has no such threshold.
  *
+ * The closest point's barycentric weights come from the same evaluation: one at
+ * a corner, the edge parameter on an edge, the frame's coordinates on the face
+ * -- never from the 2x2 normal equations of the point, whose Gram determinant
+ * cancels on a sliver. They interpolate a corner quantity at @p closest (the
+ * remesher's Phong projection, its field transfer).
+ *
  * @param      p       Query point.
  * @param      tri     The three corners, in one periodic image (the caller
  *                     applies any minimum-image shift).
  * @param[out] closest The closest point, or #MFTL_NULL.
  * @param[out] feature Its feature, or #MFTL_NULL.
+ * @param[out] weights The barycentric weights of the closest point, indexed by
+ *                     corner, or #MFTL_NULL. Zero off its feature, in [0, 1]
+ *                     and summing to one up to rounding.
  * @return The SQUARED distance from @p p to the triangle, evaluated from local
  *         differences (not from @p closest), so it keeps its accuracy far from
  *         the origin.
  *
  * @rank_local Pure function.
  */
-double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], double closest[3], MFTL_TriangleFeature *feature);
+double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], double closest[3], MFTL_TriangleFeature *feature, double weights[3]);
 
 /**
  * @brief Closest points of two closed segments, and their squared distance.
@@ -1070,7 +1125,8 @@ long MFTLRasterizeEdgeCrossings(MFTL_SdfGrid *grid, const MFTL_Object *obj, int 
  * A `(lo, hi)` box cannot describe a body straddling a periodic seam: its stored
  * coordinates span the whole domain. A centre and a half-width can, and the
  * centre is the point every vertex of the body is within half a period of, so
- * `x - L nearbyint((x - centre) / L)` lifts the whole body into one image.
+ * `x - L nearbyint((x - centre) / L)` (MFTLPeriodicImageShift()) lifts the whole
+ * body into one image.
  */
 typedef struct MFTL_PeriodicExtent
 {
@@ -1171,6 +1227,40 @@ void MFTLPeriodicExtentResolve(const MFTL_Domain *dom, const double acc[MFTL_PER
  * @rank_local
  */
 int MFTLBodyRimWalls(const MFTL_Object *obj, bool *off_wall, int *n_rim);
+
+/**
+ * @brief Which flux \f$(x_k - r_k)\,\vect{e}_k\f$ measures the region a
+ *        surface bounds: THE choice, for a body (MFTLEnsembleBodyIntegrals())
+ *        and for a cluster of bodies (the topology change's volume correction).
+ *
+ * The flux through the surface is the region's volume only if every other part
+ * of the region's boundary contributes nothing (src/geometry/README.md, "Which
+ * region"):
+ * - closed and enclosing: the first axis it does not cover, about its centre;
+ * - a closed sheet across periodic axes (@p sheet given): the axis its area
+ *   vector points along, from that axis' lower wall, if it has walls;
+ * - open, every rim on a wall: first an axis with rims on exactly one of its
+ *   walls, from that wall (a jet's nozzle, a drop on the floor or hanging from
+ *   the ceiling); then an axis whose walls carry no rim, from its lower wall.
+ *
+ * Given REDUCED data, every rank holding the surface decides alike.
+ *
+ * @param      dom    The domain.
+ * @param      walls  The walls its rims lie on, MFTLBodyRimWalls()'s bits
+ *                    reduced over the holders: 0 for a closed surface. A surface
+ *                    with a rim off the walls bounds no region; do not ask.
+ * @param      covers Per axis, whether it covers that periodic axis
+ *                    (MFTL_PeriodicExtent::covers).
+ * @param      centre Its centre (MFTL_PeriodicExtent::centre).
+ * @param      sheet  A closed surface's total area vector when it does not
+ *                    vanish (a sheet); #MFTL_NULL to measure a closed surface
+ *                    as enclosing -- for a sheet that is its volume up to a
+ *                    constant, which is all a before/after comparison needs.
+ * @param[out] ref    \f$r_k\f$; 0 without an axis.
+ * @return The axis \f$k\f$, or -1 when no axis measures the region.
+ * @rank_local Pure function.
+ */
+int MFTLBodyFluxAxis(const MFTL_Domain *dom, int walls, const bool covers[3], const double centre[3], const double sheet[3], double *ref);
 
 /**
  * @brief The extent accumulator and the area vector of the OWNED triangles of

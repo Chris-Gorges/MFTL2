@@ -52,14 +52,8 @@
  * 1. Lattice arithmetic
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static inline int wrap_index(const MFTL_TopoLattice *lat, int k, int g)
-{
-  if (!lat->periodic[k]) return g;
-  const int n = lat->n_global[k];
-  int w = g % n;
-  if (w < 0) w += n;
-  return w;
-}
+/** @brief Global node index @p g wrapped into [0, n_global) on a periodic axis, unchanged on another. */
+static inline int wrap_index(const MFTL_TopoLattice *lat, int k, int g) { return lat->periodic[k] ? MFTLWrapIndex(g, lat->n_global[k]) : g; }
 
 int MFTLTopoCellOwner(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, long long cell)
 {
@@ -187,8 +181,8 @@ static unsigned char *wide_triangles(const MFTL_Domain *dom, const MFTL_Object *
     for (int k = 0; k < 3; ++k) ctr[k] = (T[0][k] + T[1][k] + T[2][k]) / 3.0;
     for (int j = 0; j < 3; ++j)
     {
-      const double dx = T[j][0] - ctr[0], dy = T[j][1] - ctr[1], dz = T[j][2] - ctr[2];
-      rad_sq = fmax(rad_sq, dx * dx + dy * dy + dz * dz);
+      const double d[3] = {T[j][0] - ctr[0], T[j][1] - ctr[1], T[j][2] - ctr[2]};
+      rad_sq = fmax(rad_sq, MFTLVectorNormSq(d));
     }
     const double reach = sqrt(rad_sq) + diag + r_cut + 0.01 * dx_max;
 
@@ -271,92 +265,81 @@ static inline void needing_cells(const MFTL_TopoLattice *lat, int k, int g, int 
   *hi = floor_div(g + 1, n);
 }
 
-void MFTLTopoPackNodeExchange(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, const MFTL_TopoCluster *cl, int n_cl, int *dest_counts, double **records)
+/** @brief One node record on the wire: (cluster, tagged node key, value). */
+typedef struct
 {
-  const int np = dom->nproc;
-  for (int r = 0; r < np; ++r) dest_counts[r] = 0;
+  double v[3];
+} node_record;
 
-  /* Two passes over the known nodes: count per destination, then fill. The
-   * node lists are short -- a band of r_cut around the surface -- so walking
-   * twice beats a growable buffer per destination. */
-  int *cursor = MFTL_NULL;
-  double *buf = MFTL_NULL;
+int MFTLTopoPackNodeExchange(const MFTL_Domain *dom, const MFTL_TopoLattice *lat, const MFTL_TopoCluster *cl, int n_cl, int **dest, double **records)
+{
+  /* ONE walk over the windows, each record appended with its destination; the
+   * exchange groups them by destination (MFTLExchangeRecordsTo(), a stable
+   * counting sort over graph slots), so nothing here is sized by the process
+   * count and each destination still gets its records in walk order. */
+  int n = 0, cap_to = 0, cap_rec = 0;
+  int *to = MFTL_NULL;
+  node_record *buf = MFTL_NULL;
+  MFTL_ENSURE_CAPACITY(to, &n, &cap_to, 1, int);  // never NULL, even with nothing to send
+  MFTL_ENSURE_CAPACITY(buf, &n, &cap_rec, 1, node_record);
 
-  for (int pass = 0; pass < 2; ++pass)
+  for (int c = 0; c < n_cl; ++c)
   {
-    for (int c = 0; c < n_cl; ++c)
-    {
-      if (!cl[c].has_window) continue;
-      const MFTL_SdfGrid *const g = &cl[c].grid;
-      const int nx = g->dims[0], ny = g->dims[1], nz = g->dims[2];
+    if (!cl[c].has_window) continue;
+    const MFTL_SdfGrid *const g = &cl[c].grid;
+    const int nx = g->dims[0], ny = g->dims[1], nz = g->dims[2];
 
-      for (int lz = 0; lz < nz; ++lz)
-        for (int ly = 0; ly < ny; ++ly)
-          for (int lx = 0; lx < nx; ++lx)
+    for (int lz = 0; lz < nz; ++lz)
+      for (int ly = 0; ly < ny; ++ly)
+        for (int lx = 0; lx < nx; ++lx)
+        {
+          const size_t idx = ((size_t) lz * ny + ly) * nx + lx;
+          const double v = g->phi[idx];
+          const double *const cx3 = (g->cross != MFTL_NULL) ? &g->cross[3 * idx] : MFTL_NULL;
+          const bool has_cross = cx3 != MFTL_NULL && (cx3[0] != MFTL_SDF_CROSS_NONE || cx3[1] != MFTL_SDF_CROSS_NONE || cx3[2] != MFTL_SDF_CROSS_NONE);
+          if (v == MFTL_SDF_UNKNOWN && !has_cross) continue;
+
+          const int gw[3] = {wrap_index(lat, 0, g->lo[0] + lx), wrap_index(lat, 1, g->lo[1] + ly), wrap_index(lat, 2, g->lo[2] + lz)};
+          int need_lo[3], need_hi[3];
+          for (int k = 0; k < 3; ++k) needing_cells(lat, k, gw[k], &need_lo[k], &need_hi[k]);
+          int needs[64];
+          const int n_needs = MFTLDomainRanksOfCells(dom, need_lo, need_hi, needs, 64);
+          MFTL_ASSERT(n_needs <= 64 && "topology node exchange: more than four needing cells per axis");
+
+          /* Records carry a TAGGED key, 4 * node + kind: kind 0 is the
+           * node's value, kind 1 + k the crossing slot of its edge along k.
+           * An edge travels with its lower node, whose need range contains
+           * that of every rank extracting a cell of the edge. */
+          const long long key = ((long long) gw[2] * lat->n_global[1] + gw[1]) * lat->n_global[0] + gw[0];
+          int n_rec = (v != MFTL_SDF_UNKNOWN);
+          if (has_cross)
+            for (int k = 0; k < 3; ++k) n_rec += (cx3[k] != MFTL_SDF_CROSS_NONE);
+          MFTL_ENSURE_CAPACITY(to, &n, &cap_to, n_needs * n_rec, int);
+          MFTL_ENSURE_CAPACITY(buf, &n, &cap_rec, n_needs * n_rec, node_record);
+
+          /* Each needing rank once (distinct cells are distinct ranks). */
+          for (int q = 0; q < n_needs; ++q)
           {
-            const size_t idx = ((size_t) lz * ny + ly) * nx + lx;
-            const double v = g->phi[idx];
-            const double *const cx3 = (g->cross != MFTL_NULL) ? &g->cross[3 * idx] : MFTL_NULL;
-            const bool has_cross = cx3 != MFTL_NULL && (cx3[0] != MFTL_SDF_CROSS_NONE || cx3[1] != MFTL_SDF_CROSS_NONE || cx3[2] != MFTL_SDF_CROSS_NONE);
-            if (v == MFTL_SDF_UNKNOWN && !has_cross) continue;
+            const int r = needs[q];
+            if (r == dom->rank) continue;
 
-            const int gw[3] = {wrap_index(lat, 0, g->lo[0] + lx), wrap_index(lat, 1, g->lo[1] + ly), wrap_index(lat, 2, g->lo[2] + lz)};
-            int need_lo[3], need_hi[3];
-            for (int k = 0; k < 3; ++k) needing_cells(lat, k, gw[k], &need_lo[k], &need_hi[k]);
-            int needs[64];
-            const int n_needs = MFTLDomainRanksOfCells(dom, need_lo, need_hi, needs, 64);
-            MFTL_ASSERT(n_needs <= 64 && "topology node exchange: more than four needing cells per axis");
-
-            /* Records carry a TAGGED key, 4 * node + kind: kind 0 is the
-             * node's value, kind 1 + k the crossing slot of its edge along k.
-             * An edge travels with its lower node, whose need range contains
-             * that of every rank extracting a cell of the edge. */
-            const long long key = ((long long) gw[2] * lat->n_global[1] + gw[1]) * lat->n_global[0] + gw[0];
-            int n_rec = (v != MFTL_SDF_UNKNOWN);
-            if (has_cross)
-              for (int k = 0; k < 3; ++k) n_rec += (cx3[k] != MFTL_SDF_CROSS_NONE);
-
-            /* Each needing rank once (distinct cells are distinct ranks). */
-            for (int q = 0; q < n_needs; ++q)
+            for (int kind = 0; kind < 4; ++kind)
             {
-              const int r = needs[q];
-              if (r == dom->rank) continue;
-
-              if (pass == 0)
-              {
-                dest_counts[r] += n_rec;
-              }
-              else
-              {
-                for (int kind = 0; kind < 4; ++kind)
-                {
-                  const double val = (kind == 0) ? v : (has_cross ? cx3[kind - 1] : MFTL_SDF_CROSS_NONE);
-                  if (kind == 0 ? (val == MFTL_SDF_UNKNOWN) : (val == MFTL_SDF_CROSS_NONE)) continue;
-                  double *const rec = &buf[3 * (size_t) cursor[r]++];
-                  rec[0] = (double) c;
-                  rec[1] = (double) (4 * key + kind);
-                  rec[2] = val;
-                }
-              }
+              const double val = (kind == 0) ? v : (has_cross ? cx3[kind - 1] : MFTL_SDF_CROSS_NONE);
+              if (kind == 0 ? (val == MFTL_SDF_UNKNOWN) : (val == MFTL_SDF_CROSS_NONE)) continue;
+              double *const rec = buf[n].v;
+              rec[0] = (double) c;
+              rec[1] = (double) (4 * key + kind);
+              rec[2] = val;
+              to[n++] = r;
             }
           }
-    }
-
-    if (pass == 0)
-    {
-      int total = 0;
-      cursor = (int *) MFTLMallocOrDie((size_t) np * sizeof(int), "topology node cursors");
-      for (int r = 0; r < np; ++r)
-      {
-        cursor[r] = total;
-        total += dest_counts[r];
-      }
-      buf = (double *) MFTLMallocOrDie(3 * (size_t) MFTL_MAX(total, 1) * sizeof(double), "topology node records");
-    }
+        }
   }
 
-  free(cursor);
-  *records = buf;
+  *dest = to;
+  *records = (double *) buf;
+  return n;
 }
 
 void MFTLTopoMergeNodes(const MFTL_TopoLattice *lat, MFTL_TopoCluster *cl, int n_cl, const double *records, int n_records)

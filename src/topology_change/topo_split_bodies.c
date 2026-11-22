@@ -202,51 +202,46 @@ bool MFTLTopoLabelLocal(MFTL_TopoPiece *pieces, int n_cl)
   return changed;
 }
 
-/**
- * @brief Offsets of each owner's block of ghost triangles, in the order the
- *        requests are packed: (cluster, triangle) ascending within an owner.
- */
-static void ghost_triangle_offsets(const MFTL_TopoPiece *pieces, int n_cl, int nproc, int *counts, int *offsets)
+int MFTLTopoPackLabelRequests(const MFTL_Domain *dom, const MFTL_TopoPiece *pieces, int n_cl, int **pos, int **ranks, int **counts, double **records)
 {
-  for (int r = 0; r < nproc; ++r) counts[r] = 0;
+  /* The owners in walk order, grouped by the library's one grouping (graph
+   * slots, nothing sized by the process count); each request is then written
+   * straight to its place in the send buffer, and its reply read from there. */
+  int total = 0;
+  for (int c = 0; c < n_cl; ++c)
+  {
+    const MFTL_TopoPiece *const p = &pieces[c];
+    for (int t = 0; t < piece_tris(p); ++t) total += (p->tri_owner[t] != p->rank);
+  }
+  int *const to = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(total, 1) * sizeof(int), "topology label owners");
+  int n = 0;
   for (int c = 0; c < n_cl; ++c)
   {
     const MFTL_TopoPiece *const p = &pieces[c];
     for (int t = 0; t < piece_tris(p); ++t)
-      if (p->tri_owner[t] != p->rank) counts[p->tri_owner[t]]++;
+      if (p->tri_owner[t] != p->rank) to[n++] = p->tri_owner[t];
   }
-  int total = 0;
-  for (int r = 0; r < nproc; ++r)
-  {
-    offsets[r] = total;
-    total += counts[r];
-  }
-}
+  int *const at = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(total, 1) * sizeof(int), "topology label positions");
+  const int n_dest = MFTLExchangeGroupRecords(dom, to, total, at, ranks, counts);
+  free(to);
 
-void MFTLTopoPackLabelRequests(const MFTL_TopoPiece *pieces, int n_cl, int nproc, int *dest_counts, double **records)
-{
-  int *const cursor = (int *) MFTLMallocOrDie((size_t) nproc * sizeof(int), "topology label cursors");
-  ghost_triangle_offsets(pieces, n_cl, nproc, dest_counts, cursor);
-
-  int total = 0;
-  for (int r = 0; r < nproc; ++r) total += dest_counts[r];
   double *const buf = (double *) MFTLMallocOrDie(3 * (size_t) MFTL_MAX(total, 1) * sizeof(double), "topology label requests");
-
+  n = 0;
   for (int c = 0; c < n_cl; ++c)
   {
     const MFTL_TopoPiece *const p = &pieces[c];
     for (int t = 0; t < piece_tris(p); ++t)
     {
-      const int r = p->tri_owner[t];
-      if (r == p->rank) continue;
-      double *const rec = &buf[3 * (size_t) cursor[r]++];
+      if (p->tri_owner[t] == p->rank) continue;
+      double *const rec = &buf[3 * (size_t) at[n++]];
       rec[0] = (double) c;
       rec[1] = (double) p->tkey[t];
       rec[2] = (double) p->label[t];
     }
   }
-  free(cursor);
+  *pos = at;
   *records = buf;
+  return n_dest;
 }
 
 bool MFTLTopoServeLabelRequests(MFTL_TopoPiece *pieces, int n_cl, const double *req, int n_req, double *reply)
@@ -306,21 +301,17 @@ bool MFTLTopoServeLabelRequests(MFTL_TopoPiece *pieces, int n_cl, const double *
   return changed;
 }
 
-bool MFTLTopoApplyLabelReplies(MFTL_TopoPiece *pieces, int n_cl, int nproc, const double *reply)
+bool MFTLTopoApplyLabelReplies(MFTL_TopoPiece *pieces, int n_cl, const int *pos, const double *reply)
 {
-  int *const counts = (int *) MFTLMallocOrDie(2 * (size_t) nproc * sizeof(int), "topology reply cursors");
-  int *const cursor = counts + nproc;
-  ghost_triangle_offsets(pieces, n_cl, nproc, counts, cursor);
-
   bool changed = MFTL_FALSE;
+  int i = 0;  // the packer's walk: its i-th request's reply is at pos[i]
   for (int c = 0; c < n_cl; ++c)
   {
     MFTL_TopoPiece *const p = &pieces[c];
     for (int t = 0; t < piece_tris(p); ++t)
     {
-      const int r = p->tri_owner[t];
-      if (r == p->rank) continue;
-      const long long lab = (long long) reply[cursor[r]++];
+      if (p->tri_owner[t] == p->rank) continue;
+      const long long lab = (long long) reply[pos[i++]];
       if (lab < p->label[t])
       {
         p->label[t] = lab;
@@ -328,7 +319,6 @@ bool MFTLTopoApplyLabelReplies(MFTL_TopoPiece *pieces, int n_cl, int nproc, cons
       }
     }
   }
-  free(counts);
   return changed;
 }
 

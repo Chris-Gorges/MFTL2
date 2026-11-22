@@ -128,6 +128,22 @@ void MFTLComputeTriangleGeometry(MFTL_Object *obj, int count)
 static inline double clamp01(double x) { return fmin(fmax(x, 0.0), 1.0); }
 
 /**
+ * @brief Barycentric weights of a point on the edge from corner @p from to
+ *        corner @p to, at parameter @p t from @p from.
+ *
+ * @param      from First corner.
+ * @param      to   Second corner.
+ * @param      t    Parameter in [0, 1].
+ * @param[out] w    The weights, zero at the third corner.
+ */
+static inline void edge_weights(int from, int to, double t, double w[3])
+{
+  w[0] = w[1] = w[2] = 0.0;
+  w[from] = 1.0 - t;
+  w[to] = t;
+}
+
+/**
  * @brief Closest point on the SEGMENT [a, b] to @p p.
  *
  * @param      p       Query point.
@@ -135,9 +151,10 @@ static inline double clamp01(double x) { return fmin(fmax(x, 0.0), 1.0); }
  * @param      b       Segment end.
  * @param[out] out     Closest point; an endpoint is returned bit-exactly.
  * @param[out] where   0 at @p a, 1 at @p b, 2 strictly inside.
+ * @param[out] s_out   The point's parameter from @p a, in [0, 1].
  * @return Squared distance, from local differences.
  */
-static double closest_on_segment(const double p[3], const double a[3], const double b[3], double out[3], int *where)
+static double closest_on_segment(const double p[3], const double a[3], const double b[3], double out[3], int *where, double *s_out)
 {
   const double ab[3] = {b[0] - a[0], b[1] - a[1], b[2] - a[2]};
   const double ap[3] = {p[0] - a[0], p[1] - a[1], p[2] - a[2]};
@@ -168,6 +185,7 @@ static double closest_on_segment(const double p[3], const double a[3], const dou
     const double d = (*where == 1) ? p[k] - b[k] : ap[k] - s * ab[k];
     d_sq += d * d;
   }
+  *s_out = s;
   return d_sq;
 }
 
@@ -179,22 +197,24 @@ static double closest_on_segment(const double p[3], const double a[3], const dou
  * @param      tri     The three corners.
  * @param[out] closest Closest point.
  * @param[out] feature Feature of the closest point.
+ * @param[out] weights Its barycentric weights, or #MFTL_NULL.
  * @return Squared distance.
  */
-static double closest_on_degenerate(const double p[3], const double tri[3][3], double closest[3], MFTL_TriangleFeature *feature)
+static double closest_on_degenerate(const double p[3], const double tri[3][3], double closest[3], MFTL_TriangleFeature *feature, double weights[3])
 {
   double best = MFTL_DBL_MAX;
   for (int e = 0; e < 3; ++e)
   {
-    double q[3];
+    double q[3], s = 0.0;
     int where = 0;
-    const double d_sq = closest_on_segment(p, tri[e], tri[(e + 1) % 3], q, &where);
+    const double d_sq = closest_on_segment(p, tri[e], tri[(e + 1) % 3], q, &where, &s);
     if (d_sq < best)
     {
       best = d_sq;
       closest[0] = q[0];
       closest[1] = q[1];
       closest[2] = q[2];
+      if (weights != MFTL_NULL) edge_weights(e, (e + 1) % 3, s, weights);
       if (where == 0)
         *feature = (MFTL_TriangleFeature) (MFTL_TRI_FEATURE_VERTEX0 + e);
       else if (where == 1)
@@ -330,7 +350,7 @@ static inline void frame_point(const plane_frame *f, const double st[2], double 
   for (int j = 0; j < 3; ++j) q[j] = f->p0[j] + st[0] * f->e[j] + st[1] * f->g[j];
 }
 
-double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], double closest[3], MFTL_TriangleFeature *feature)
+double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], double closest[3], MFTL_TriangleFeature *feature, double weights[3])
 {
   double q_sink[3];
   MFTL_TriangleFeature f_sink;
@@ -352,7 +372,7 @@ double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], dou
   const double cross_sq = MFTLVectorNormSq(cr);
   const double ab_sq = MFTLVectorNormSq(ab);
   const double ac_sq = MFTLVectorNormSq(ac);
-  if (!(cross_sq > MFTL_VERYVERYSMALL * ab_sq * ac_sq)) return closest_on_degenerate(p, tri, q, f);
+  if (!(cross_sq > MFTL_VERYVERYSMALL * ab_sq * ac_sq)) return closest_on_degenerate(p, tri, q, f, weights);
 
   /* Ericson's region test (Real-Time Collision Detection, §5.1.5). The vertex
    * and edge-end conditions are single dot products and well conditioned; the
@@ -368,6 +388,7 @@ double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], dou
   {
     *f = MFTL_TRI_FEATURE_VERTEX0;
     for (int k = 0; k < 3; ++k) q[k] = a[k], off[k] = ap[k];
+    if (weights != MFTL_NULL) edge_weights(0, 1, 0.0, weights);
   }
   else
   {
@@ -379,6 +400,7 @@ double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], dou
     {
       *f = MFTL_TRI_FEATURE_VERTEX1;
       for (int k = 0; k < 3; ++k) q[k] = b[k], off[k] = bp[k];
+      if (weights != MFTL_NULL) edge_weights(0, 1, 1.0, weights);
     }
     else
     {
@@ -387,7 +409,7 @@ double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], dou
       const double d6 = MFTLVectorInProd(ac, cp);
 
       plane_frame fr;
-      if (!frame_init(tri, &fr)) return closest_on_degenerate(p, tri, q, f);
+      if (!frame_init(tri, &fr)) return closest_on_degenerate(p, tri, q, f, weights);
       double bary[3], st[2], r[3];
       frame_locate(&fr, p, st, r, bary);
 
@@ -396,17 +418,20 @@ double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], dou
         const double w = d1 / (d1 - d3);
         *f = MFTL_TRI_FEATURE_EDGE0;
         for (int k = 0; k < 3; ++k) q[k] = a[k] + w * ab[k], off[k] = ap[k] - w * ab[k];
+        if (weights != MFTL_NULL) edge_weights(0, 1, w, weights);
       }
       else if (d6 >= 0.0 && d5 <= d6)
       {
         *f = MFTL_TRI_FEATURE_VERTEX2;
         for (int k = 0; k < 3; ++k) q[k] = c[k], off[k] = cp[k];
+        if (weights != MFTL_NULL) edge_weights(0, 2, 1.0, weights);
       }
       else if (bary[1] <= 0.0 && d2 >= 0.0 && d6 <= 0.0)
       {
         const double w = d2 / (d2 - d6);
         *f = MFTL_TRI_FEATURE_EDGE2;
         for (int k = 0; k < 3; ++k) q[k] = a[k] + w * ac[k], off[k] = ap[k] - w * ac[k];
+        if (weights != MFTL_NULL) edge_weights(0, 2, w, weights);
       }
       else if (bary[0] <= 0.0 && (d4 - d3) >= 0.0 && (d5 - d6) >= 0.0)
       {
@@ -418,12 +443,14 @@ double MFTLClosestPointOnTriangle(const double p[3], const double tri[3][3], dou
           q[k] = b[k] + w * bc;
           off[k] = bp[k] - w * bc;
         }
+        if (weights != MFTL_NULL) edge_weights(1, 2, w, weights);
       }
       else
       {
         *f = MFTL_TRI_FEATURE_FACE;
         frame_offset(&fr, st[1], r, off);
         frame_point(&fr, st, q);
+        if (weights != MFTL_NULL) weights[0] = bary[0], weights[1] = bary[1], weights[2] = bary[2];
       }
     }
   }

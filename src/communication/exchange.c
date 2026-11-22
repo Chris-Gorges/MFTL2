@@ -376,6 +376,10 @@ void MFTLExchangeStart(const MFTL_Domain *domain, MFTL_Exchange *x, int n_payloa
   const bool global = MFTLExchangeAgreeRoute(domain, route, far);
   CS_END(ts_route, t_route);
   ctx->global = global;
+  /* A pinned graph route reaches graph neighbours only, so its buffers are one
+   * per graph SLOT; a route that may go global takes one per RANK. */
+  const bool by_slot = (route == MFTL_ROUTE_GRAPH);
+  MFTL_ASSERT(!(by_slot && global) && "MFTLExchangeStart: a pinned graph route went global");
 
   /* ── 1. ONE count exchange for all payloads (latency, not volume, is its
    * cost), staged [destination][payload]. Graph: every neighbour by slot.
@@ -396,7 +400,7 @@ void MFTLExchangeStart(const MFTL_Domain *domain, MFTL_Exchange *x, int n_payloa
   const int *const dst = global ? dst_own : domain->neighbors;
   int *const stage = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_dst * np, 1) * sizeof(int), "MFTLExchangeStart staging");
   for (int i = 0; i < n_dst; ++i)
-    for (int p = 0; p < np; ++p) stage[(size_t) i * np + p] = x[p].send_bufs[dst[i]].count;
+    for (int p = 0; p < np; ++p) stage[(size_t) i * np + p] = x[p].send_bufs[by_slot ? i : dst[i]].count;
 
   mftl_route rt;
   rt.global = global;
@@ -453,7 +457,7 @@ void MFTLExchangeStart(const MFTL_Domain *domain, MFTL_Exchange *x, int n_payloa
     for (int i = 0; i < nt; ++i)
     {
       if (sc[i] <= 0) continue;
-      memcpy(ctx->flat_send[p] + (size_t) sd[i] * x[p].type_size, x[p].send_bufs[rt.peer[i]].buffer, (size_t) sc[i] * x[p].type_size);
+      memcpy(ctx->flat_send[p] + (size_t) sd[i] * x[p].type_size, x[p].send_bufs[by_slot ? i : rt.peer[i]].buffer, (size_t) sc[i] * x[p].type_size);
     }
   }
 
@@ -697,71 +701,139 @@ void *MFTLExchangeRecords(const MFTL_Domain *domain, size_t width, const void *s
   return out;
 }
 
-/**
- * @brief Where MFTLExchangeRecordsTo() keeps the block index of destination
- *        @p r: the entry of its graph slot, or -- for a rank outside the
- *        neighbourhood -- its entry in a rank-indexed table made on first need.
- * @param         domain  The domain.
- * @param         by_slot `[num_neighbors]` block per graph slot.
- * @param[in,out] by_rank `[nproc]` block per rank, #MFTL_NULL until a
- *                        destination outside the neighbourhood appears.
- * @param         r       A destination other than this rank, inside the communicator.
- * @return The entry: a block index, or #MFTL_ERROR while @p r has none.
- */
-static int *block_entry(const MFTL_Domain *domain, int *by_slot, int **by_rank, int r)
+/** @brief The destinations outside the neighbourhood seen by one grouping scan. */
+typedef struct
 {
-  const int s = MFTLDomainNeighborIndex(domain, r);
-  if (s != MFTL_ERROR) return &by_slot[s];
-  if (*by_rank == MFTL_NULL)
+  int *of_rank;  ///< `[nproc]` index of a rank in this list, #MFTL_ERROR if absent; #MFTL_NULL until the first.
+  int *rank;  ///< `[n]` the ranks, in order of first appearance.
+  int *count;  ///< `[n]` records for each.
+  int n, cap;
+} far_list;
+
+/**
+ * @brief Counts one record for @p r, a rank outside the neighbourhood: out of
+ *        line, so the graph-slot path of the scan stays a byte load and an
+ *        increment.
+ * @param         domain The domain.
+ * @param[in,out] f      The list; its rank-indexed table is made on first need.
+ * @param         r      The destination.
+ * @return The index of @p r in the list.
+ */
+static int far_count_record(const MFTL_Domain *domain, far_list *f, int r)
+{
+  if (f->of_rank == MFTL_NULL)
   {
-    *by_rank = (int *) MFTLMallocOrDie((size_t) domain->nproc * sizeof(int), "MFTLExchangeRecordsTo table");
-    for (int q = 0; q < domain->nproc; ++q) (*by_rank)[q] = MFTL_ERROR;
+    f->of_rank = (int *) MFTLMallocOrDie((size_t) domain->nproc * sizeof(int), "routed exchange far ranks");
+    for (int q = 0; q < domain->nproc; ++q) f->of_rank[q] = MFTL_ERROR;
   }
-  return &(*by_rank)[r];
+  int k = f->of_rank[r];
+  if (k == MFTL_ERROR)
+  {
+    if (f->n == f->cap)
+    {
+      f->cap = MFTLGrowCapacityFrom(f->cap, f->n + 1, 8);
+      f->rank = (int *) MFTLReallocOrDie(f->rank, (size_t) f->cap * sizeof(int), "routed exchange far ranks");
+      f->count = (int *) MFTLReallocOrDie(f->count, (size_t) f->cap * sizeof(int), "routed exchange far counts");
+    }
+    k = f->n++;
+    f->of_rank[r] = k;
+    f->rank[k] = r;
+    f->count[k] = 0;
+  }
+  f->count[k]++;
+  return k;
 }
 
-void *MFTLExchangeRecordsTo(const MFTL_Domain *domain, size_t width, const void *rec, const int *dest, int n_rec, int *n_recv)
+/**
+ * @brief THE grouping of records by destination, for MFTLExchangeRecordsTo()
+ *        and MFTLExchangeGroupRecords(): one scan counts the records per
+ *        destination other than this rank and notes each record's group.
+ *
+ * A neighbour is counted in its graph slot (at most 26, on the stack): a byte
+ * load and an increment per record (about 0.6 ns per record more than a
+ * rank-indexed count array at np = 4, which costs O(nproc) per call instead;
+ * docs/analysis.md §16.14). Only a destination OUTSIDE the neighbourhood needs
+ * a rank-indexed table, built when
+ * the first one appears -- the call is then on the global route anyway -- so
+ * the common graph route costs O(n_rec), not O(nproc). Group ids are the graph
+ * slots, then `num_neighbors + k` for the k-th rank outside.
+ *
+ * @param      domain The domain.
+ * @param      dest   `[n_rec]` destination ranks, inside the communicator.
+ * @param      n_rec  Records.
+ * @param[out] grp    `[n_rec]` each record's group id, #MFTL_ERROR for this rank's own.
+ * @param[out] blk    `malloc`'d non-empty blocks, contiguous in the send
+ *                    buffer: graph slots in order, then the other ranks in
+ *                    order of first appearance.
+ * @param[out] cursor `malloc`'d, by group id: where its block starts (the
+ *                    cursors of a stable counting sort).
+ * @param[out] n_self Records addressed to this rank.
+ * @param[out] far    Whether some destination is outside the neighbourhood.
+ * @return The number of blocks.
+ */
+static int group_by_destination(const MFTL_Domain *domain, const int *dest, int n_rec, int *grp, record_block **blk, int **cursor, int *n_self, bool *far)
 {
-  MFTL_ASSERT(width >= 1 && "MFTLExchangeRecordsTo: a record has at least one byte");
   const int me = domain->rank;
-
-  /* One scan: a block per distinct destination, the counts, and whether
-   * anything leaves the neighbourhood. A neighbour's block is found through its
-   * graph slot (at most 26, on the stack); only a destination OUTSIDE the
-   * neighbourhood needs the rank-indexed table, built when the first one
-   * appears -- the call is then on the global route anyway -- so the common
-   * graph route costs O(n_rec), not O(nproc). */
-  MFTL_ASSERT(domain->num_neighbors <= 26 && "MFTLExchangeRecordsTo: at most 26 graph neighbours");
-  int block_of_slot[26];
-  for (int s = 0; s < domain->num_neighbors; ++s) block_of_slot[s] = MFTL_ERROR;
-  int *block_of_rank = MFTL_NULL;
-  int n_blk = 0, cap = 8, n_self = 0;
-  record_block *blk = (record_block *) MFTLMallocOrDie((size_t) cap * sizeof(record_block), "MFTLExchangeRecordsTo blocks");
+  const int nn = domain->num_neighbors;
+  MFTL_ASSERT(nn <= 26 && "routed exchange: at most 26 graph neighbours");
+  int count_of_slot[26];
+  for (int s = 0; s < nn; ++s) count_of_slot[s] = 0;
+  far_list f = {MFTL_NULL, MFTL_NULL, MFTL_NULL, 0, 0};
+  int own = 0;
   for (int i = 0; i < n_rec; ++i)
   {
     const int r = dest[i];
     check_rank(domain, r);
     if (r == me)
     {
-      ++n_self;
+      grp[i] = MFTL_ERROR;
+      ++own;
       continue;
     }
-    int *const b = block_entry(domain, block_of_slot, &block_of_rank, r);
-    if (*b == MFTL_ERROR)
+    const int s = domain->neighbor_slot[r];
+    if (s != MFTL_ERROR)
     {
-      if (n_blk == cap)
-      {
-        cap = MFTLGrowCapacityFrom(cap, n_blk + 1, 8);
-        blk = (record_block *) MFTLReallocOrDie(blk, (size_t) cap * sizeof(record_block), "MFTLExchangeRecordsTo blocks");
-      }
-      *b = n_blk;
-      blk[n_blk].rank = r;
-      blk[n_blk].count = 0;
-      ++n_blk;
+      count_of_slot[s]++;
+      grp[i] = s;
     }
-    blk[*b].count++;
+    else
+      grp[i] = nn + far_count_record(domain, &f, r);
   }
-  const bool far = (block_of_rank != MFTL_NULL);
+
+  record_block *const b_list = (record_block *) MFTLMallocOrDie((size_t) MFTL_MAX(nn + f.n, 1) * sizeof(record_block), "routed exchange blocks");
+  int *const cur = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(nn + f.n, 1) * sizeof(int), "routed exchange cursors");
+  int n_blk = 0, at = 0;
+  for (int g = 0; g < nn + f.n; ++g)
+  {
+    const int c = (g < nn) ? count_of_slot[g] : f.count[g - nn];
+    cur[g] = at;
+    if (c == 0) continue;
+    b_list[n_blk].rank = (g < nn) ? domain->neighbors[g] : f.rank[g - nn];
+    b_list[n_blk].count = c;
+    b_list[n_blk].displ = at;
+    ++n_blk;
+    at += c;
+  }
+  *far = (f.n > 0);
+  free(f.of_rank);
+  free(f.rank);
+  free(f.count);
+  *blk = b_list;
+  *cursor = cur;
+  *n_self = own;
+  return n_blk;
+}
+
+void *MFTLExchangeRecordsTo(const MFTL_Domain *domain, size_t width, const void *rec, const int *dest, int n_rec, int *n_recv)
+{
+  MFTL_ASSERT(width >= 1 && "MFTLExchangeRecordsTo: a record has at least one byte");
+
+  record_block *blk = MFTL_NULL;
+  int *cursor = MFTL_NULL;
+  int n_self = 0;
+  bool far = MFTL_FALSE;
+  int *const grp = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_rec, 1) * sizeof(int), "MFTLExchangeRecordsTo groups");
+  const int n_blk = group_by_destination(domain, dest, n_rec, grp, &blk, &cursor, &n_self, &far);
 
   /* The route is agreed before packing, so every rank enters the vote after
    * the same cheap scan, not after its share of the copying. */
@@ -769,34 +841,59 @@ void *MFTLExchangeRecordsTo(const MFTL_Domain *domain, size_t width, const void 
 
   /* Pack: a stable counting sort, every other rank's record copied once; this
    * rank's own stay where they are and are copied once, into the result. */
-  int packed = 0;
-  for (int b = 0; b < n_blk; ++b)
-  {
-    blk[b].displ = packed;
-    packed += blk[b].count;
-  }
-  int *const cursor = (int *) MFTLMallocOrDie((size_t) (n_blk + 1) * sizeof(int), "MFTLExchangeRecordsTo cursors");
-  for (int b = 0; b < n_blk; ++b) cursor[b] = blk[b].displ;
+  const int packed = n_rec - n_self;
   int *const own_idx = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_self, 1) * sizeof(int), "MFTLExchangeRecordsTo own");
   unsigned char *const image = (unsigned char *) MFTLMallocOrDie(MFTL_MAX((size_t) packed * width, 1), "MFTLExchangeRecordsTo send");
   const unsigned char *const src = (const unsigned char *) rec;
   for (int i = 0, k = 0; i < n_rec; ++i)
   {
-    if (dest[i] == me)
+    if (grp[i] == MFTL_ERROR)
     {
       own_idx[k++] = i;
       continue;
     }
-    memcpy(image + (size_t) cursor[*block_entry(domain, block_of_slot, &block_of_rank, dest[i])]++ * width, src + (size_t) i * width, width);
+    memcpy(image + (size_t) cursor[grp[i]]++ * width, src + (size_t) i * width, width);
   }
   free(cursor);
-  free(block_of_rank);
+  free(grp);
 
   void *const out = exchange_blocks(domain, width, image, blk, n_blk, global, src, own_idx, n_self, 0, n_rec, MFTL_NULL, n_recv);
   free(image);
   free(own_idx);
   free(blk);
   return out;
+}
+
+int MFTLExchangeGroupRecords(const MFTL_Domain *domain, const int *dest, int n_rec, int *pos, int **ranks, int **counts)
+{
+  /* The blocks of the one grouping, and this rank's own records as one more
+   * block at the end; `pos` holds each record's group until it is a position. */
+  record_block *blk = MFTL_NULL;
+  int *cursor = MFTL_NULL;
+  int n_self = 0;
+  bool far = MFTL_FALSE;
+  const int n_blk = group_by_destination(domain, dest, n_rec, pos, &blk, &cursor, &n_self, &far);
+  const int n_out = n_blk + (n_self > 0);
+
+  int *const r = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_out, 1) * sizeof(int), "MFTLExchangeGroupRecords ranks");
+  int *const c = (int *) MFTLMallocOrDie((size_t) MFTL_MAX(n_out, 1) * sizeof(int), "MFTLExchangeGroupRecords counts");
+  for (int b = 0; b < n_blk; ++b)
+  {
+    r[b] = blk[b].rank;
+    c[b] = blk[b].count;
+  }
+  if (n_self > 0)
+  {
+    r[n_blk] = domain->rank;
+    c[n_blk] = n_self;
+  }
+  int own_at = n_rec - n_self;  // the own block, last
+  for (int i = 0; i < n_rec; ++i) pos[i] = (pos[i] == MFTL_ERROR) ? own_at++ : cursor[pos[i]]++;  // stable: input order within a block
+  free(cursor);
+  free(blk);
+  *ranks = r;
+  *counts = c;
+  return n_out;
 }
 
 void *MFTLExchangeReply(const MFTL_Domain *domain, const MFTL_ExchangePlan *plan, size_t width, const void *reply)
@@ -830,11 +927,12 @@ void MFTLExchangePlanFree(MFTL_ExchangePlan *plan)
  * 3. Neighbourhood allgather
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-double *MFTLNeighborAllgatherDoubles(const MFTL_Domain *domain, const double *send, int n_send, int *rcount, int *rdispl, int *n_recv)
+double *MFTLNeighborAllgatherDoubles(const MFTL_Domain *domain, const double *send, int n_send, int *rcount, int *rdispl, int *n_recv, MPI_Request *request)
 {
   const int d = domain->num_neighbors;
 
   *n_recv = 0;
+  if (request != MFTL_NULL) *request = MPI_REQUEST_NULL;
   if (domain->nproc < 2 || d < 1) return (double *) MFTLMallocOrDie(sizeof(double), "MFTLNeighborAllgatherDoubles (empty)");
 
   MPI_Neighbor_allgather(&n_send, 1, MPI_INT, rcount, 1, MPI_INT, domain->comm_graph);
@@ -850,7 +948,10 @@ double *MFTLNeighborAllgatherDoubles(const MFTL_Domain *domain, const double *se
   MFTL_ASSERT(total <= (size_t) 0x7fffffff && "MFTLNeighborAllgatherDoubles: neighbour payload exceeds an MPI int count");
 
   double *const recv = (double *) MFTLMallocOrDie(MFTL_MAX(total, (size_t) 1) * sizeof(double), "MFTLNeighborAllgatherDoubles");
-  MPI_Neighbor_allgatherv(send, n_send, MPI_DOUBLE, recv, rcount, rdispl, MPI_DOUBLE, domain->comm_graph);
+  if (request != MFTL_NULL)
+    MPI_Ineighbor_allgatherv(send, n_send, MPI_DOUBLE, recv, rcount, rdispl, MPI_DOUBLE, domain->comm_graph, request);
+  else
+    MPI_Neighbor_allgatherv(send, n_send, MPI_DOUBLE, recv, rcount, rdispl, MPI_DOUBLE, domain->comm_graph);
 
   *n_recv = (int) total;
   return recv;

@@ -580,14 +580,11 @@ void MFTLRemeshMeasureBodies(MFTL_Ensemble *ens, double *centroid, double *radiu
 /* ═══════════════════════════════════════════════════════════════════════════
  * 4. Neighbourhood exchange
  *
- * Three shapes, none of which can carry a payload indexed by the body id space
- * or by the rank space -- see remesh_comm.h for why that is the point.
+ * Two fixed-length shapes (the variable-length one is the library's
+ * MFTLNeighborAllgatherDoubles()), none of which can carry a payload indexed by
+ * the body id space or by the rank space -- see remesh_comm.h for why that is
+ * the point.
  * ═══════════════════════════════════════════════════════════════════════════ */
-
-double *MFTLRemeshNeighborGather(const MFTL_Domain *domain, const double *send, int n_send, int *rcount, int *rdispl, int *n_recv)
-{
-  return MFTLNeighborAllgatherDoubles(domain, send, n_send, rcount, rdispl, n_recv);
-}
 
 void MFTLRemeshNeighborAllgather(const MFTL_Domain *domain, const double *send, int n, double *recv)
 {

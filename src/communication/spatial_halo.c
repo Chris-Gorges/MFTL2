@@ -18,9 +18,9 @@
  *   6. derive the candidate pairs (near mode); prune the directory
  *
  * Work is organised per BODY, not per pair, so a triangle wanted by two
- * partners on the same destination is packed -- and reported -- once. Two
- * allocations per call are `[nproc]` send-buffer descriptor arrays (only
- * neighbour entries are ever filled).
+ * partners on the same destination is packed -- and reported -- once. The
+ * exchange is pinned to the graph route, so its send buffers are one per graph
+ * slot: nothing per call is sized by the process count.
  */
 
 #include "mftl_communication.h"
@@ -78,13 +78,10 @@ static inline bool interval_is_empty(const double *h) { return h[0] < 0.0; }
  */
 static inline bool interval_overlap(const MFTL_Domain *domain, const double *ca, const double *ha, const double *cb, const double *hb)
 {
+  double delta[3];
+  MFTLGetMinimumImageVector(domain, delta, cb, ca);
   for (int k = 0; k < 3; ++k)
-  {
-    double delta = ca[k] - cb[k];
-    if (domain->is_periodic[k]) delta -= domain->domain_size[k] * nearbyint(delta * domain->inv_domain_size[k]);
-    if (delta < 0.0) delta = -delta;
-    if (delta > ha[k] + hb[k]) return MFTL_FALSE;
-  }
+    if (fabs(delta[k]) > ha[k] + hb[k]) return MFTL_FALSE;
   return MFTL_TRUE;
 }
 
@@ -202,40 +199,35 @@ static void halo_pair_add(MFTL_SpatialHalo *h, int a, int b)
 }
 
 /**
- * @brief Orders pairs by (A, B), so removing duplicates is one linear sweep.
- * @param x First element.
- * @param y Second element.
- * @return Negative, zero or positive in the usual qsort sense.
- */
-static int pair_cmp(const void *x, const void *y)
-{
-  const MFTL_SpatialHaloPair *const a = (const MFTL_SpatialHaloPair *) x;
-  const MFTL_SpatialHaloPair *const b = (const MFTL_SpatialHaloPair *) y;
-  if (a->body_a != b->body_a) return (a->body_a < b->body_a) ? -1 : 1;
-  if (a->body_b != b->body_b) return (a->body_b < b->body_b) ? -1 : 1;
-  return 0;
-}
-
-/**
- * @brief Sorts the pair list and removes duplicates in place. A pair produced
- *        twice (local-local and via a patch) would otherwise report every
- *        contact twice.
+ * @brief Sorts the pair list by (A, B) and removes duplicates in place. A pair
+ *        produced twice (local-local and via a patch) would otherwise report
+ *        every contact twice.
+ *
+ * Body ids are non-negative ints, so `(A << 32) | B` is one 64-bit key in
+ * (A, B) order: the library's radix sort and unique scan, no comparison sort.
  *
  * @param h The halo.
  */
 static void halo_pairs_finish(MFTL_SpatialHalo *h)
 {
-  if (h->n_pairs < 2) return;
+  const int n = h->n_pairs;
+  if (n < 2) return;
 
-  qsort(h->pair, (size_t) h->n_pairs, sizeof(MFTL_SpatialHaloPair), pair_cmp);
-
-  int w = 1;
-  for (int i = 1; i < h->n_pairs; ++i)
+  uint64_t *const key = (uint64_t *) MFTLMallocOrDie(2 * (size_t) n * sizeof(uint64_t), "spatial halo pair keys");
+  for (int i = 0; i < n; ++i)
   {
-    if (h->pair[i].body_a == h->pair[w - 1].body_a && h->pair[i].body_b == h->pair[w - 1].body_b) continue;
-    h->pair[w++] = h->pair[i];
+    MFTL_ASSERT(h->pair[i].body_a >= 0 && h->pair[i].body_b >= 0);
+    key[i] = ((uint64_t) (uint32_t) h->pair[i].body_a << 32) | (uint64_t) (uint32_t) h->pair[i].body_b;
   }
-  h->n_pairs = w;
+  MFTLRadixSort64(key, key + n, n);
+  const int m = (int) MFTLUniqueU64Array(key, n);
+  for (int i = 0; i < m; ++i)
+  {
+    h->pair[i].body_a = (int) (key[i] >> 32);
+    h->pair[i].body_b = (int) (uint32_t) key[i];
+  }
+  h->n_pairs = m;
+  free(key);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -337,7 +329,7 @@ int MFTLSpatialHaloResolveRadii(MFTL_Ensemble *ens, MFTL_SpatialHalo *halo)
   int *const rdispl = (int *) MFTLMallocOrDie((size_t) nn * sizeof(int), "spatial halo radius displacements");
 
   int n_recv = 0;
-  double *const recv = MFTLNeighborAllgatherDoubles(dom, send, 2 * b, rcount, rdispl, &n_recv);
+  double *const recv = MFTLNeighborAllgatherDoubles(dom, send, 2 * b, rcount, rdispl, &n_recv, MFTL_NULL);
   const size_t total = (size_t) n_recv;
 
   /* MAX: a held body already has the (bit-identical) reduced value. */
@@ -1000,28 +992,11 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
    * overlapped with step 4 (the only work independent of the answer). */
   int *const rcount = (int *) MFTLCallocOrDie((size_t) MFTL_MAX(nn, 1), sizeof(int), "spatial halo record counts");
   int *const rdispl = (int *) MFTLCallocOrDie((size_t) MFTL_MAX(nn, 1), sizeof(int), "spatial halo record displacements");
-  double *nb_rec = MFTL_NULL;
-  int n_nb_rec = 0;
   MPI_Request rec_req = MPI_REQUEST_NULL;
-  const int scount = n_my * MFTL_HALO_REC;
   const bool exchanging = (nproc > 1 && nn > 0);
-
-  if (exchanging)
-  {
-    MPI_Neighbor_allgather(&scount, 1, MPI_INT, rcount, 1, MPI_INT, domain->comm_graph);
-
-    size_t total = 0;
-    for (int i = 0; i < nn; ++i)
-    {
-      rdispl[i] = (int) total;
-      total += (size_t) rcount[i];
-    }
-    MFTL_ASSERT(total <= (size_t) 0x7fffffff && "MFTLExtendSpatialHalo: neighbour record payload exceeds an MPI int count");
-
-    nb_rec = (double *) MFTLMallocOrDie(MFTL_MAX(total, (size_t) 1) * sizeof(double), "spatial halo neighbour records");
-    n_nb_rec = (int) (total / MFTL_HALO_REC);
-    MPI_Ineighbor_allgatherv(my_rec, scount, MPI_DOUBLE, nb_rec, rcount, rdispl, MPI_DOUBLE, domain->comm_graph, &rec_req);
-  }
+  int n_nb_dbl = 0;
+  double *const nb_rec = MFTLNeighborAllgatherDoubles(domain, my_rec, n_my * MFTL_HALO_REC, rcount, rdispl, &n_nb_dbl, &rec_req);
+  const int n_nb_rec = n_nb_dbl / MFTL_HALO_REC;
 
   /* ── 3. Which held bodies may travel, and their margins (by local slot). A
    * request naming a body not held here is ignored. */
@@ -1096,8 +1071,8 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
 
   /* ── 5. Classify and pack, against the WIDEST envelope any matched partner
    * needs (erring towards sending more is the safe direction). */
-  MFTL_SendBuffer *const send_t = (MFTL_SendBuffer *) MFTLCallocOrDie((size_t) nproc, sizeof(MFTL_SendBuffer), "spatial halo triangle buffers");
-  MFTL_SendBuffer *const send_v = (MFTL_SendBuffer *) MFTLCallocOrDie((size_t) nproc, sizeof(MFTL_SendBuffer), "spatial halo vertex buffers");
+  MFTL_SendBuffer *const send_t = (MFTL_SendBuffer *) MFTLCallocOrDie((size_t) MFTL_MAX(nn, 1), sizeof(MFTL_SendBuffer), "spatial halo triangle buffers");
+  MFTL_SendBuffer *const send_v = (MFTL_SendBuffer *) MFTLCallocOrDie((size_t) MFTL_MAX(nn, 1), sizeof(MFTL_SendBuffer), "spatial halo vertex buffers");
 
   if (exchanging)
   {
@@ -1269,8 +1244,6 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
         const int np = mat_off[i + 1] - mat_off[i];
         if (np == 0) continue;
 
-        const int dest = domain->neighbors[i];
-
         /* Partner extents with the margin folded into the half-width. */
         for (int j = 0; j < np; ++j)
         {
@@ -1315,7 +1288,7 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
             ib_add(&pack_v, v);
           }
         }
-        append_destination(obj, gb, &pack_t, &pack_v, &send_t[dest], &send_v[dest], MFTL_FALSE);
+        append_destination(obj, gb, &pack_t, &pack_v, &send_t[i], &send_v[i], MFTL_FALSE);  // by graph slot
       }
     }
 
@@ -1360,7 +1333,7 @@ static int extend_impl(MFTL_Ensemble *ens, const MFTL_SpatialHaloRequest *reques
     MFTLExchangeWait(&ctx, 0);
     MFTLExchangeWait(&ctx, 1);
 
-    for (int i = 0; i < nproc; ++i)
+    for (int i = 0; i < nn; ++i)
     {
       free(send_v[i].buffer);
       free(send_t[i].buffer);

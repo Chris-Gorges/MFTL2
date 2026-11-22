@@ -261,10 +261,11 @@ cheaply.
 Every "send these elements to those ranks" of the library goes through one
 engine in `exchange.c`: redistribution and the spatial halo
 (`MFTLExchangeStart`, up to four typed payloads, non-blocking), the topology
-change's node and label exchanges (`MFTLExchangeRecords`, records grouped by
-destination, and `MFTLExchangeReply`), the remesher's projection halo
-(`MFTLExchangeRecordsTo`, records that each name their destination), and the
-ghost pull's three exchanges. Each is a count exchange and then the data, on one of two routes:
+change's node and label exchanges and the remesher's projection halo
+(`MFTLExchangeRecordsTo`, records that each name their destination, and for the
+labels `MFTLExchangeReply`), records already grouped by destination
+(`MFTLExchangeRecords`), and the ghost pull's three exchanges. Each is a count
+exchange and then the data, on one of two routes:
 
 | Route | When | Counts | Data | Cost per call |
 |---|---|---|---|---|
@@ -297,10 +298,22 @@ record exchange; they never touch the wire), then one block per source, graph
 neighbours in `domain->neighbors` order, global-route sources ascending. Those
 are the orders the dense collectives produced, so redistribution's pool order,
 which follows arrival order, did not change. **A reply needs no vote and no
-count exchange**: `MFTLExchangeRecords` returns a plan (peers, counts and
+count exchange**: both record exchanges return a plan (peers, counts and
 displacements both ways) and `MFTLExchangeReply` runs it backwards, delivering
-reply `i` where forward record `i` was sent from. The topology change's label
-rounds use it; they used to pay a second vote and count exchange per round.
+reply `i` for forward record `i` (for `MFTLExchangeRecordsTo` the plan keeps
+where its stable sort put each record, so the replies come back in input
+order). The topology change's label rounds use it; they used to pay a second
+vote and count exchange per round.
+
+**Nothing per call is sized by the process count on the graph route.**
+`MFTLExchangeRecordsTo` finds a destination's block through its graph slot and
+builds a rank-indexed table only for a destination outside the neighbourhood
+(the call is then on the global route anyway). `MFTLExchangeStart` pinned to
+`MFTL_ROUTE_GRAPH` takes its send buffers one per graph slot; under
+`MFTL_ROUTE_AUTO`, which may go global, one per rank (redistribution keeps
+those in its persistent workspace). The topology change used to group its
+records into `[nproc]` arrays per round, and the spatial halo allocated two
+`[nproc]` descriptor arrays per call.
 
 ---
 
@@ -390,14 +403,9 @@ table).
 
 ## Known limitations {#comm_deferred}
 
-1. The halo exchange allocates two `[nproc]` send-buffer descriptor arrays per
-   call — $O(P)$ per rank and timestep, harmless at the tested scales but a
-   candidate for the persistent workspace at $P$ in the thousands. (The ghost
-   pull's rank-to-neighbour table is built once per ensemble; only its global
-   route counts by $P$, locally; its messages are NBX's.)
-2. The ghost exchange rebuilds its schedule every call; it could be cached for a
+1. The ghost exchange rebuilds its schedule every call; it could be cached for a
    solver that redistributes only every $N$ steps.
-3. The geometry pass after a redistribution runs on freshly rewritten pools and is
+2. The geometry pass after a redistribution runs on freshly rewritten pools and is
    bound by first touch (6.4 ns/triangle against 2.9 on a resident mesh);
    fusing it into the rebuild was not attempted.
 4. Nothing has been measured above 4 ranks on real hardware; the scaling of the

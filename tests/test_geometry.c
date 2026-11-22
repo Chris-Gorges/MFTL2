@@ -635,7 +635,7 @@ static int test_closest_point_matches_an_independent_reference(void)
 
     double q[3];
     MFTL_TriangleFeature f;
-    const double d2 = MFTLClosestPointOnTriangle(p, T, q, &f);
+    const double d2 = MFTLClosestPointOnTriangle(p, T, q, &f, MFTL_NULL);
     const double r2 = ref_triangle_dist_sq(p, T);
 
     TEST_ASSERT(isfinite(d2));
@@ -669,7 +669,7 @@ static int test_closest_point_reports_every_feature(void)
   {
     double q[3];
     MFTL_TriangleFeature f;
-    MFTLClosestPointOnTriangle(cases[i].p, T, q, &f);
+    MFTLClosestPointOnTriangle(cases[i].p, T, q, &f, MFTL_NULL);
     TEST_ASSERT_EQUAL_INT(cases[i].f, f);
     for (int k = 0; k < 3; ++k) TEST_ASSERT_EQUAL_DOUBLE(cases[i].q[k], q[k], 1e-15);
   }
@@ -690,7 +690,7 @@ static int test_closest_point_lies_on_the_feature_it_reports(void)
 
     double q[3];
     MFTL_TriangleFeature f;
-    MFTLClosestPointOnTriangle(p, T, q, &f);
+    MFTLClosestPointOnTriangle(p, T, q, &f, MFTL_NULL);
     seen[f]++;
 
     if (f >= MFTL_TRI_FEATURE_VERTEX0 && f <= MFTL_TRI_FEATURE_VERTEX2)
@@ -738,31 +738,31 @@ static int test_closest_point_on_degenerate_triangles(void)
   const double line[3][3] = {{0.0, 0.0, 0.0}, {2.0, 0.0, 0.0}, {1.0, 0.0, 0.0}};
   double q[3];
   MFTL_TriangleFeature f;
-  double d2 = MFTLClosestPointOnTriangle(p, line, q, &f);
+  double d2 = MFTLClosestPointOnTriangle(p, line, q, &f, MFTL_NULL);
   TEST_ASSERT(isfinite(d2) && isfinite(q[0]) && isfinite(q[1]) && isfinite(q[2]));
   TEST_ASSERT_EQUAL_DOUBLE(0.7 * 0.7 + 0.4 * 0.4, d2, 1e-14);
 
   /* Two coincident corners. */
   const double spike[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 3.0, 0.0}};
-  d2 = MFTLClosestPointOnTriangle(p, spike, q, &f);
+  d2 = MFTLClosestPointOnTriangle(p, spike, q, &f, MFTL_NULL);
   TEST_ASSERT(isfinite(d2));
   TEST_ASSERT_EQUAL_DOUBLE(0.3 * 0.3 + 0.4 * 0.4, d2, 1e-14);
 
   /* A triangle collapsed to a point reports that point as corner 0. */
   const double dot[3][3] = {{1.0, 1.0, 1.0}, {1.0, 1.0, 1.0}, {1.0, 1.0, 1.0}};
-  d2 = MFTLClosestPointOnTriangle(p, dot, q, &f);
+  d2 = MFTLClosestPointOnTriangle(p, dot, q, &f, MFTL_NULL);
   TEST_ASSERT_EQUAL_INT(MFTL_TRI_FEATURE_VERTEX0, f);
   TEST_ASSERT_EQUAL_DOUBLE(0.7 * 0.7 + 0.3 * 0.3 + 1.4 * 1.4, d2, 1e-14);
 
   /* A sliver just above the degeneracy threshold is still answered as a face. */
   const double sliver[3][3] = {{0.0, 0.0, 0.0}, {1.0, 0.0, 0.0}, {0.5, 1e-6, 0.0}};
   const double above[3] = {0.5, 0.5e-6, 1.0};
-  d2 = MFTLClosestPointOnTriangle(above, sliver, q, &f);
+  d2 = MFTLClosestPointOnTriangle(above, sliver, q, &f, MFTL_NULL);
   TEST_ASSERT_EQUAL_INT(MFTL_TRI_FEATURE_FACE, f);
   TEST_ASSERT_EQUAL_DOUBLE(1.0, d2, 1e-12);
 
   /* NULL outputs are allowed. */
-  d2 = MFTLClosestPointOnTriangle(p, line, MFTL_NULL, MFTL_NULL);
+  d2 = MFTLClosestPointOnTriangle(p, line, MFTL_NULL, MFTL_NULL, MFTL_NULL);
   TEST_ASSERT(isfinite(d2));
   return 0;
 }
@@ -774,7 +774,7 @@ static int test_closest_point_is_scale_and_translation_invariant(void)
 
   double q0[3];
   MFTL_TriangleFeature f0;
-  const double d0 = MFTLClosestPointOnTriangle(bp, base, q0, &f0);
+  const double d0 = MFTLClosestPointOnTriangle(bp, base, q0, &f0, MFTL_NULL);
 
   const double scales[] = {1e-8, 1e-4, 1.0, 1e4, 1e8};
   const double offset = 1.0e6;
@@ -787,7 +787,7 @@ static int test_closest_point_is_scale_and_translation_invariant(void)
     for (int k = 0; k < 3; ++k) p[k] = bp[k] * L;
 
     MFTL_TriangleFeature f;
-    const double d = MFTLClosestPointOnTriangle(p, T, MFTL_NULL, &f);
+    const double d = MFTLClosestPointOnTriangle(p, T, MFTL_NULL, &f, MFTL_NULL);
     TEST_ASSERT_EQUAL_INT(f0, f);
     TEST_ASSERT(fabs(d / (L * L) - d0) <= 1e-12 * d0);
 
@@ -798,7 +798,7 @@ static int test_closest_point_is_scale_and_translation_invariant(void)
       for (int c = 0; c < 3; ++c)
         for (int k = 0; k < 3; ++k) T[c][k] += offset;
       for (int k = 0; k < 3; ++k) p[k] += offset;
-      const double dt = MFTLClosestPointOnTriangle(p, T, MFTL_NULL, &f);
+      const double dt = MFTLClosestPointOnTriangle(p, T, MFTL_NULL, &f, MFTL_NULL);
       TEST_ASSERT_EQUAL_INT(f0, f);
       TEST_ASSERT(fabs(sqrt(dt) - sqrt(d0) * L) <= 1e-9 * (offset + L));
     }
@@ -814,7 +814,7 @@ static int test_a_point_on_the_triangle_is_at_distance_zero(void)
   {
     double p[3];
     for (int k = 0; k < 3; ++k) p[k] = bary[i][0] * T[0][k] + bary[i][1] * T[1][k] + bary[i][2] * T[2][k];
-    const double d2 = MFTLClosestPointOnTriangle(p, T, MFTL_NULL, MFTL_NULL);
+    const double d2 = MFTLClosestPointOnTriangle(p, T, MFTL_NULL, MFTL_NULL, MFTL_NULL);
     TEST_ASSERT(d2 <= 1e-28);
   }
   return 0;
@@ -999,7 +999,7 @@ static int test_point_face_distance_is_accurate_on_slivers(void)
             if (4.0 * w * w > 1e-14)
             {
               MFTL_TriangleFeature ft;
-              const double dp = sqrt(MFTLClosestPointOnTriangle(P[3], S, MFTL_NULL, &ft));
+              const double dp = sqrt(MFTLClosestPointOnTriangle(P[3], S, MFTL_NULL, &ft, MFTL_NULL));
               TEST_ASSERT_EQUAL_INT(MFTL_TRI_FEATURE_FACE, ft);
               worst = fmax(worst, fabs(dp - expect) / (GEOM_EPS * L));
               TEST_ASSERT(fabs(dp - expect) <= 16.0 * GEOM_EPS * L);
@@ -1008,6 +1008,124 @@ static int test_point_face_distance_is_accurate_on_slivers(void)
           }
   TEST_ASSERT(n >= 4 * skipped);  // non-vacuity: the exact frames are the bulk
   printf("[%d configurations (%d not representable), worst %.2f eps*L] ", n, skipped, worst);
+  return 0;
+}
+
+/**
+ * @brief The closest point's barycentric weights describe the point it returns:
+ *        they rebuild it, sum to one, lie in [0, 1] and vanish off its feature
+ *        (one-hot at a corner, exactly zero at the corner off an edge), on
+ *        random triangles and on degenerate ones.
+ */
+static int test_closest_point_weights_rebuild_the_point(void)
+{
+  unsigned seed = 4242u;
+  int seen[7] = {0, 0, 0, 0, 0, 0, 0};
+  double worst = 0.0;
+  for (int trial = 0; trial < 20000; ++trial)
+  {
+    double T[3][3], p[3];
+    for (int c = 0; c < 3; ++c)
+      for (int k = 0; k < 3; ++k) T[c][k] = cp_rand(&seed, -1.0, 1.0);
+    for (int k = 0; k < 3; ++k) p[k] = cp_rand(&seed, -1.5, 1.5);
+
+    double q[3], w[3];
+    MFTL_TriangleFeature f;
+    MFTLClosestPointOnTriangle(p, T, q, &f, w);
+    seen[f]++;
+
+    TEST_ASSERT(fabs(w[0] + w[1] + w[2] - 1.0) <= 4.0 * GEOM_EPS);
+    for (int c = 0; c < 3; ++c) TEST_ASSERT(w[c] >= -4.0 * GEOM_EPS && w[c] <= 1.0 + 4.0 * GEOM_EPS);
+    if (f >= MFTL_TRI_FEATURE_VERTEX0 && f <= MFTL_TRI_FEATURE_VERTEX2)
+    {
+      const int c = f - MFTL_TRI_FEATURE_VERTEX0;
+      for (int j = 0; j < 3; ++j) TEST_ASSERT(w[j] == (j == c ? 1.0 : 0.0));
+    }
+    else if (f >= MFTL_TRI_FEATURE_EDGE0)
+      TEST_ASSERT(w[(f - MFTL_TRI_FEATURE_EDGE0 + 2) % 3] == 0.0);
+
+    const double L = diameter((const double(*)[3]) T, 3);
+    for (int k = 0; k < 3; ++k)
+    {
+      const double r = w[0] * T[0][k] + w[1] * T[1][k] + w[2] * T[2][k];
+      worst = fmax(worst, fabs(r - q[k]) / (GEOM_EPS * L));
+      TEST_ASSERT(fabs(r - q[k]) <= 16.0 * GEOM_EPS * L);
+    }
+  }
+  for (int i = 0; i < 7; ++i) TEST_ASSERT(seen[i] > 100);  // non-vacuity: every region
+
+  /* Degenerate triangles are answered by their edges, weights included. */
+  const double line[3][3] = {{0.0, 0.0, 0.0}, {2.0, 0.0, 0.0}, {1.0, 0.0, 0.0}};
+  const double dot[3][3] = {{1.0, 1.0, 1.0}, {1.0, 1.0, 1.0}, {1.0, 1.0, 1.0}};
+  const double p[3] = {0.3, 0.7, -0.4};
+  double q[3], w[3];
+  MFTL_TriangleFeature f;
+  MFTLClosestPointOnTriangle(p, line, q, &f, w);
+  for (int k = 0; k < 3; ++k) TEST_ASSERT_EQUAL_DOUBLE(q[k], w[0] * line[0][k] + w[1] * line[1][k] + w[2] * line[2][k], 1e-15);
+  MFTLClosestPointOnTriangle(p, dot, q, &f, w);
+  TEST_ASSERT(w[0] == 1.0 && w[1] == 0.0 && w[2] == 0.0);
+  printf("[worst rebuild %.2f eps*L] ", worst);
+  return 0;
+}
+
+/**
+ * @brief On a sliver the weights of a face point are EXACT, where the foot's
+ *        2x2 normal equations -- what the Phong projection and the remesher's
+ *        field transfer solved before -- lose digits as the square of the
+ *        aspect ratio (a Gram determinant a c - b^2 that cancels).
+ *
+ * The corner hovers over the sliver (0,0,0), (1,0,0), (1/2, w, 0) at (x, y),
+ * whose barycentric coordinates are dyadic, mapped by the exactly representable
+ * scaled rotations; barycentric coordinates are affine invariants.
+ */
+static int test_closest_point_weights_are_exact_on_slivers(void)
+{
+  const int width_exp[] = {1, 7, 13, 19, 24};
+  double worst = 0.0, worst_gram = 0.0;
+  int n = 0, skipped = 0;
+  for (int f = 0; f < 3; ++f)
+    for (size_t iw = 0; iw < sizeof width_exp / sizeof width_exp[0]; ++iw)
+      for (int ih = 1; ih <= 12; ih += 3)
+      {
+        const double w = ldexp(1.0, -width_exp[iw]), x = 0.3125, y = ldexp(2.0 * w * x, -ih);
+        const double l2 = ldexp(0.625, -ih), l1 = x - 0.5 * l2, exact[3] = {1.0 - l1 - l2, l1, l2};
+        const double base[4][3] = {{0, 0, 0}, {1, 0, 0}, {0.5, w, 0}, {x, y, ldexp(1.0, -12)}};
+        const double zero[3] = {0.0, 0.0, 0.0};
+        double P[4][3];
+        int ok = 1;
+        for (int i = 0; i < 4; ++i) ok &= exact_map(&k_frames[f], zero, base[i], P[i]);
+        if (!ok)
+        {
+          skipped++;
+          continue;
+        }
+        const double S[3][3] = {{P[0][0], P[0][1], P[0][2]}, {P[1][0], P[1][1], P[1][2]}, {P[2][0], P[2][1], P[2][2]}};
+        double q[3], wt[3];
+        MFTL_TriangleFeature ft;
+        MFTLClosestPointOnTriangle(P[3], S, q, &ft, wt);
+        TEST_ASSERT_EQUAL_INT(MFTL_TRI_FEATURE_FACE, ft);
+
+        /* The control: the normal equations of the returned foot. */
+        double aa = 0.0, ab = 0.0, bb = 0.0, aq = 0.0, bq = 0.0;
+        for (int k = 0; k < 3; ++k)
+        {
+          const double a = S[1][k] - S[0][k], b = S[2][k] - S[0][k], r = q[k] - S[0][k];
+          aa += a * a, ab += a * b, bb += b * b, aq += a * r, bq += b * r;
+        }
+        const double det = aa * bb - ab * ab;
+        const double g1 = (bb * aq - ab * bq) / det, g2 = (aa * bq - ab * aq) / det;
+        const double gram[3] = {1.0 - g1 - g2, g1, g2};
+        for (int c = 0; c < 3; ++c)
+        {
+          worst = fmax(worst, fabs(wt[c] - exact[c]) / GEOM_EPS);
+          worst_gram = fmax(worst_gram, fabs(gram[c] - exact[c]));
+          TEST_ASSERT(fabs(wt[c] - exact[c]) <= 8.0 * GEOM_EPS);
+        }
+        n++;
+      }
+  TEST_ASSERT(n >= 4 * skipped);
+  TEST_ASSERT(worst_gram > 1e-4);  // the control: the replaced solve is off on these slivers
+  printf("[%d configurations, worst %.2f eps; normal equations off by %.1e] ", n, worst, worst_gram);
   return 0;
 }
 
@@ -1291,6 +1409,8 @@ int main(int argc, char **argv)
   RUN_TEST(test_a_point_on_the_triangle_is_at_distance_zero);
   RUN_TEST(test_segment_distance_is_accurate_at_every_angle);
   RUN_TEST(test_point_face_distance_is_accurate_on_slivers);
+  RUN_TEST(test_closest_point_weights_rebuild_the_point);
+  RUN_TEST(test_closest_point_weights_are_exact_on_slivers);
   RUN_TEST(test_segment_distance_degenerate_cases);
   RUN_TEST(test_triangle_distance_matches_a_double_double_reference);
 

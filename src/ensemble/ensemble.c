@@ -107,8 +107,7 @@ static int domain_init_comm(MFTL_Domain *domain)
         {
           if (periods[i])
           {
-            // Periodic wrap-around; the + cuts handles negative results correctly.
-            nc[i] = (nc[i] + domain->cuts[i]) % domain->cuts[i];
+            nc[i] = MFTLWrapIndex(nc[i], domain->cuts[i]);
           }
           else if (nc[i] < 0 || nc[i] >= domain->cuts[i])
           {
@@ -511,10 +510,7 @@ int MFTLDomainRanksOfCells(const MFTL_Domain *domain, const int lo[3], const int
       for (int x = c0[0]; x <= c1[0]; ++x)
       {
         /* Only a periodic range can leave [0, cuts), and by less than cuts. */
-        const int i = ((x % domain->cuts[0]) + domain->cuts[0]) % domain->cuts[0];
-        const int j = ((y % domain->cuts[1]) + domain->cuts[1]) % domain->cuts[1];
-        const int k = ((z % domain->cuts[2]) + domain->cuts[2]) % domain->cuts[2];
-        out[n++] = MFTLDomainCellRank(domain, i, j, k);
+        out[n++] = MFTLDomainCellRank(domain, MFTLWrapIndex(x, domain->cuts[0]), MFTLWrapIndex(y, domain->cuts[1]), MFTLWrapIndex(z, domain->cuts[2]));
       }
   MFTLSortIds(out, n);
   return n;

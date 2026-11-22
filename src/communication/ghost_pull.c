@@ -33,7 +33,8 @@
  * per request. One `MPI_Allreduce` more under the AUTO route (the library's
  * route vote), none under GRAPH. Nothing per call
  * is sized by the process count on the graph route (the rank-to-neighbour
- * table lives in the communication workspace) or by a large body's id range:
+ * table is the domain's, MFTL_Domain::neighbor_slot, built once at creation)
+ * or by a large body's id range:
  * the owner keys its lookup by the REQUESTS and streams its owned ids past it
  * (resolve_ids()), so its table is a bounded direct one for a small body and
  * O(requests) for a large one, and the owned ids are read once, sequentially.

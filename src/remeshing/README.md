@@ -637,7 +637,9 @@ $$
 $$
 
 $\mathbf p_\flat$ the closest point on the reference's flat triangles, $u_i$ its
-barycentrics, $\mathbf n_i$ the reference's angle-weighted normals.
+barycentrics (`MFTLClosestPointOnTriangle`'s own: exact on an edge or a corner,
+the longest-edge frame's on the face, never the foot's 2x2 normal equations),
+$\mathbf n_i$ the reference's angle-weighted normals.
 
 - **Why the call's input, and why curved.** Botsch & Kobbelt project onto the
   original surface kept as a mesh, fixed and usually finer. In front tracking
@@ -1283,7 +1285,7 @@ both directions on a $\{P,1,1\}$ grid.
 | `MFTLRemeshMigrateToRanks` | `MFTLRedistributeWithOwnersCarrying` | whole bodies |
 | `MFTLAllreduceInts` (the library's small reduction) | Allreduce(SUM) | 3 ints per placement; the dispersed gates |
 | `MFTLAllreduceDoubles` / `Ints`, `MFTLRemeshAgreeProfile` | Allreduce | a few scalars |
-| `MFTLRemeshNeighborGather` / `Allgather` / `Alltoall` | `comm_graph` | 3 doubles per body a rank speaks for or moves; 1–2 doubles per neighbour per round |
+| the library's `MFTLNeighborAllgatherDoubles`, `MFTLRemeshNeighborAllgather` / `Alltoall` | `comm_graph` | 3 doubles per body a rank speaks for or moves; 1–2 doubles per neighbour per round |
 | `MFTLRemeshMeasureBodies` | 2 × `MFTLEnsembleReduceBodies` + scalar `MPI_MAX` | 9 + 1 doubles per local body |
 | `MFTLRemeshSyncGhostIds` | `MFTLGhostPull` on `MFTL_ROUTE_AUTO`: LOR + request/reply over `comm_graph` (global route) | 4 B per ghost vertex |
 | `MFTLRemeshSyncGhostPositions` | `MFTLUpdateGhostColumns` (positions), the same route | 32 B per ghost vertex, once per smoothing sweep outside a placement (NESTED; ONCE's band) |

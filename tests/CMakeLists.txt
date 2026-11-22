@@ -706,7 +706,7 @@ if(BUILD_EXAMPLES)
   #                96 x 24, not 64 x 16: at 64 x 16 the plunging lip is three
   #                edges thick and whether it reconnects, and whether the
   #                post-reconstruction remesh leaves a transient fold at a wall
-  #                (a remesher weakness at creases, docs/analysis.md §9), is
+  #                (a remesher weakness at creases), is
   #                chaotic -- 4 of 20 neighbouring (steepness, ripple) points
   #                passed on the code this test was tuned on, this one among
   #                them, and 1 of 20 once the rim curve changed the trajectory.

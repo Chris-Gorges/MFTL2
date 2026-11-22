@@ -232,14 +232,7 @@ const MFTL_MarchingCubesCase *MFTLMarchingCubesCase(int mask)
  * @param g    Global node index, unwrapped.
  * @return The wrapped index (unchanged on a non-periodic axis).
  */
-static inline int wrap_node(const MFTL_SdfGrid *grid, int k, int g)
-{
-  if (!grid->periodic[k]) return g;
-  const int n = grid->n_global[k];
-  int w = g % n;
-  if (w < 0) w += n;
-  return w;
-}
+static inline int wrap_node(const MFTL_SdfGrid *grid, int k, int g) { return grid->periodic[k] ? MFTLWrapIndex(g, grid->n_global[k]) : g; }
 
 /**
  * @brief Linear lattice key of the WRAPPED node (gx, gy, gz).
@@ -412,11 +405,7 @@ int MFTLExtractLevelSet(const MFTL_SdfGrid *grid, const int cell_lo[3], const in
             for (int k = 0; k < 3; ++k)
             {
               double x = out->pos[3 * (size_t) vid[cs->poly[p][i]] + k];
-              if (grid->periodic[k])
-              {
-                const double period = grid->n_global[k] * grid->spacing[k];
-                x -= period * nearbyint((x - first[k]) / period);
-              }
+              if (grid->periodic[k]) x += MFTLPeriodicImageShift(x, first[k], grid->n_global[k] * grid->spacing[k]);
               q[k] += x;
             }
           for (int k = 0; k < 3; ++k) q[k] /= (double) cs->poly_len[p];

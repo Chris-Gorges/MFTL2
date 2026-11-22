@@ -701,6 +701,42 @@ static int test_statuses_say_what_cannot_be_measured(void)
   return 0;
 }
 
+/**
+ * @brief MFTLBodyFluxAxis() is the one rule for a body and for a topology
+ *        cluster: in a box periodic in x and y, a rim on the CEILING alone is
+ *        measured from the ceiling (the cluster rule before it was shared took
+ *        only lower walls and left such a cluster uncorrected), a closed
+ *        surface without its area vector (a cluster) about its centre along an
+ *        axis it does not cover, and a sheet with its area vector (a body) from
+ *        a wall, which a fully periodic box does not have.
+ */
+static int test_one_flux_rule_for_bodies_and_clusters(void)
+{
+  const double lo[3] = {0.0, 0.0, -1.0}, hi[3] = {1.0, 1.0, 2.0};
+  MFTL_Ensemble *box = make_ens(lo, hi, (const bool[3]){MFTL_TRUE, MFTL_TRUE, MFTL_FALSE});
+  MFTL_Ensemble *cell = make_ens(lo, hi, (const bool[3]){MFTL_TRUE, MFTL_TRUE, MFTL_TRUE});
+  const MFTL_Domain *const d = &box->domain, *const dp = &cell->domain;
+  const bool none[3] = {MFTL_FALSE, MFTL_FALSE, MFTL_FALSE}, xy[3] = {MFTL_TRUE, MFTL_TRUE, MFTL_FALSE};
+  const bool all[3] = {MFTL_TRUE, MFTL_TRUE, MFTL_TRUE};
+  const double c[3] = {0.25, 0.5, 0.75}, up[3] = {0.0, 0.0, 1.0};
+  const int floor_wall = 1 << 4, ceiling = 1 << 5;
+  double r = -9.0;
+  bool ok = MFTL_TRUE;
+
+  ok = ok && MFTLBodyFluxAxis(d, ceiling, xy, c, MFTL_NULL, &r) == 2 && r == hi[2];  // hanging from the ceiling
+  ok = ok && MFTLBodyFluxAxis(d, floor_wall, xy, c, MFTL_NULL, &r) == 2 && r == lo[2];  // standing on the floor
+  ok = ok && MFTLBodyFluxAxis(d, floor_wall | ceiling, xy, c, MFTL_NULL, &r) == -1 && r == 0.0;  // a bridge: no wall left
+  ok = ok && MFTLBodyFluxAxis(d, 0, none, c, MFTL_NULL, &r) == 0 && r == c[0];  // enclosing: the first axis, its centre
+  ok = ok && MFTLBodyFluxAxis(d, 0, xy, c, MFTL_NULL, &r) == 2 && r == c[2];  // a cluster sheet: about its centre
+  ok = ok && MFTLBodyFluxAxis(d, 0, xy, c, up, &r) == 2 && r == lo[2];  // a body sheet: from the floor
+  ok = ok && MFTLBodyFluxAxis(dp, 0, xy, c, up, &r) == -1;  // ... which a periodic cell does not have
+  ok = ok && MFTLBodyFluxAxis(dp, 0, all, c, MFTL_NULL, &r) == -1;  // covers every axis
+  MFTLEnsembleDestroy(&cell);
+  MFTLEnsembleDestroy(&box);
+  TEST_ASSERT(agreed(ok, MPI_COMM_WORLD));
+  return 0;
+}
+
 static int test_no_bodies_and_bad_arguments(void)
 {
   const double lo[3] = {0.0, 0.0, 0.0}, hi[3] = {1.0, 1.0, 1.0};
@@ -725,6 +761,7 @@ int main(int argc, char **argv)
   RUN_TEST(test_wall_closed_bodies_match_their_regions);
   RUN_TEST(test_a_periodic_wave_has_no_centroid_along_its_period);
   RUN_TEST(test_statuses_say_what_cannot_be_measured);
+  RUN_TEST(test_one_flux_rule_for_bodies_and_clusters);
   RUN_TEST(test_no_bodies_and_bad_arguments);
 
   if (g_rank == 0) TEST_REPORT();

@@ -106,54 +106,12 @@ int MFTLEnsembleBodyIntegrals(MFTL_Ensemble *ens, MFTL_BodyIntegrals *out)
       /* A rim off the walls: no wall closes the surface, there is no region. */
       bi->volume_status = MFTL_INTEGRAL_UNDEFINED;
     }
-    else if (encloses)
-    {
-      /* About its own centre, along any axis it does not cover. */
-      for (int k = 0; k < 3 && bi->axis < 0; ++k)
-        if (!(dom->is_periodic[k] && x.covers[k]))
-        {
-          bi->axis = k;
-          bi->reference = x.centre[k];
-        }
-    }
-    else if (bi->closed)
-    {
-      /* A closed sheet across periodic axes separates the box along the one
-       * its area vector points along; that axis needs a wall to measure from. */
-      int k = 0;
-      for (int j = 1; j < 3; ++j)
-        if (fabs(S[j]) > fabs(S[k])) k = j;
-      if (!dom->is_periodic[k])
-      {
-        bi->axis = k;
-        bi->reference = dom->global_min[k];
-      }
-    }
     else
     {
-      /* Open, every rim on a wall. The field must vanish or be tangent on every
-       * wall patch that closes the region: walls across the other axes are
-       * tangent, and on the flux axis only the reference wall may carry a rim.
-       * First choice, the wall the body stands on -- rims on exactly one wall of
-       * an axis, measured from it (a jet's nozzle, a drop on the floor or
-       * hanging from the ceiling); then an axis with neither wall touched, from
-       * its lower wall (an interface spanning the box between side walls). */
-      for (int pass = 0; pass < 2 && bi->axis < 0; ++pass)
-        for (int k = 0; k < 3 && bi->axis < 0; ++k)
-        {
-          if (dom->is_periodic[k]) continue;
-          const bool lo = r[MFTL_INT_WALLS + 2 * k] > 0.0, hi = r[MFTL_INT_WALLS + 2 * k + 1] > 0.0;
-          if (pass == 0 && lo != hi)
-          {
-            bi->axis = k;
-            bi->reference = lo ? dom->global_min[k] : dom->global_max[k];
-          }
-          else if (pass == 1 && !lo && !hi)
-          {
-            bi->axis = k;
-            bi->reference = dom->global_min[k];
-          }
-        }
+      int walls = 0;
+      for (int w = 0; w < 6; ++w)
+        if (r[MFTL_INT_WALLS + w] > 0.0) walls |= 1 << w;
+      bi->axis = MFTLBodyFluxAxis(dom, walls, x.covers, x.centre, encloses ? MFTL_NULL : S, &bi->reference);
     }
     if (bi->axis >= 0) bi->volume_status = MFTL_INTEGRAL_DEFINED;
     for (int k = 0; k < 3; ++k)
@@ -197,8 +155,7 @@ int MFTLEnsembleBodyIntegrals(MFTL_Ensemble *ens, MFTL_BodyIntegrals *out)
     for (int j = 0; j < 3; ++j)
     {
       if (!dom->is_periodic[j] || bi->centroid_status[j] != MFTL_INTEGRAL_DEFINED) continue;
-      const double L = dom->domain_size[j];
-      bi->centroid[j] -= L * floor((bi->centroid[j] - dom->global_min[j]) / L);
+      bi->centroid[j] = MFTLPeriodicWrapCoordinate(bi->centroid[j], dom->global_min[j], dom->domain_size[j]);
     }
   }
 

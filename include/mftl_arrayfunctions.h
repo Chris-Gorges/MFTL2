@@ -4,7 +4,7 @@
  * @date 2025-08-12
  * @ingroup mftl_arrayfunctions
  *
- * @brief Flat-array utilities: LSD radix sort and duplicate removal.
+ * @brief Flat-array utilities: LSD radix sort, duplicate removal and a byte hash.
  *
  * Layer 0, no MFTL types. The sorts are least-significant-digit radix sorts
  * over 8-bit digits, \f$O(n)\f$ for a fixed key width (a stable insertion sort
@@ -336,6 +336,33 @@ static inline int MFTLUniquePairs(int *keys, int *values, int n)
     }
   }
   return dest + 1;
+}
+
+/** @brief The FNV-1a 64-bit offset basis: the seed of MFTLHashBytes(). */
+#define MFTL_HASH_SEED 0xcbf29ce484222325ull
+
+/**
+ * @brief FNV-1a, 64 bit: folds @p n bytes into the running hash @p h.
+ *
+ * The library's one byte hash, for agreement checks and signatures, where only
+ * equality is asked of it (not a hash-map hash, not cryptographic). Chain calls
+ * to hash several blocks; start from #MFTL_HASH_SEED. A struct's bytes include
+ * its padding, so a struct to be hashed is zeroed before it is filled.
+ *
+ * @param h    The running hash (#MFTL_HASH_SEED for the first block).
+ * @param data The bytes. May be NULL when @p n is 0.
+ * @param n    Their number.
+ * @return The hash with the bytes folded in.
+ */
+static inline uint64_t MFTLHashBytes(uint64_t h, const void *data, size_t n)
+{
+  const unsigned char *const p = (const unsigned char *) data;
+  for (size_t i = 0; i < n; ++i)
+  {
+    h ^= p[i];
+    h *= 0x100000001b3ull;
+  }
+  return h;
 }
 
 #ifdef __cplusplus
